@@ -42,21 +42,32 @@ class MPS:
     """
     Minimal owner for a non-Abelian matrix product state.
 
-    The optimization code still operates on site lists internally. This wrapper
-    makes state-level metadata explicit without moving solver logic into the
-    state object.
+    ``tensors`` is the ordered sequence of rank-three site tensors.  The state
+    is also directly indexable, so ``mps[i]`` returns ``mps.tensors[i]``.
     """
 
-    sites: list
+    tensors: list
     center: int | None = None
     target_sector: object | None = None
 
     def __post_init__(self):
-        self.sites = _validate_sites(self.sites)
+        self.tensors = _validate_sites(self.tensors)
         if self.center is not None:
             self.center = int(self.center)
-            if not 0 <= self.center < len(self.sites):
-                raise IndexError(f"Center {self.center} out of range for chain length {len(self.sites)}.")
+            if not 0 <= self.center < len(self.tensors):
+                raise IndexError(
+                    f"Center {self.center} out of range for chain length {len(self.tensors)}."
+                )
+
+    @property
+    def sites(self):
+        """Internal alias for the site-tensor sequence."""
+
+        return self.tensors
+
+    @sites.setter
+    def sites(self, tensors):
+        self.tensors = _validate_sites(tensors)
 
     @classmethod
     def from_sites(cls, sites, *, center=None, target_sector=None):
@@ -70,17 +81,17 @@ class MPS:
         return cls(list(sites), center=center, target_sector=target_sector)
 
     def __len__(self):
-        return len(self.sites)
+        return len(self.tensors)
 
     def __iter__(self):
-        return iter(self.sites)
+        return iter(self.tensors)
 
     def __getitem__(self, item):
-        return self.sites[item]
+        return self.tensors[item]
 
     def copy(self):
         return MPS(
-            [site.copy() for site in self.sites],
+            [site.copy() for site in self.tensors],
             center=self.center,
             target_sector=self.target_sector,
         )
@@ -101,8 +112,8 @@ class MPS:
         max_bond_mode="states",
         bond_coupling="left",
     ):
-        self.sites = mixed_canonicalize_sites(
-            self.sites,
+        self.tensors = mixed_canonicalize_sites(
+            self.tensors,
             int(center),
             cutoff=cutoff,
             max_bond=max_bond,
@@ -120,14 +131,14 @@ class MPS:
         max_bond_mode="states",
         bond_coupling="left",
     ):
-        self.sites = left_canonicalize_sites(
-            self.sites,
+        self.tensors = left_canonicalize_sites(
+            self.tensors,
             cutoff=cutoff,
             max_bond=max_bond,
             max_bond_mode=max_bond_mode,
             bond_coupling=bond_coupling,
         )
-        self.center = len(self.sites) - 1 if self.sites else None
+        self.center = len(self.tensors) - 1 if self.tensors else None
         return self
 
     def right_canonicalize(
@@ -138,47 +149,47 @@ class MPS:
         max_bond_mode="states",
         bond_coupling="left",
     ):
-        self.sites = right_canonicalize_sites(
-            self.sites,
+        self.tensors = right_canonicalize_sites(
+            self.tensors,
             cutoff=cutoff,
             max_bond=max_bond,
             max_bond_mode=max_bond_mode,
             bond_coupling=bond_coupling,
         )
-        self.center = 0 if self.sites else None
+        self.center = 0 if self.tensors else None
         return self
 
     def canonical_errors(self, center=None):
         center = self.center if center is None else int(center)
         if center is None:
             raise ValueError("canonical_errors requires an explicit center or MPS.center.")
-        return mixed_canonical_errors(self.sites, center)
+        return mixed_canonical_errors(self.tensors, center)
 
     def assert_canonical(self, center=None, *, tol=1e-10):
         center = self.center if center is None else int(center)
         if center is None:
             raise ValueError("assert_canonical requires an explicit center or MPS.center.")
-        assert_mixed_canonical_sites(self.sites, center, tol=tol)
+        assert_mixed_canonical_sites(self.tensors, center, tol=tol)
         return self
 
     def left_error(self, site):
-        return left_canonical_error(self.sites[int(site)])
+        return left_canonical_error(self.tensors[int(site)])
 
     def right_error(self, site):
-        return right_canonical_error(self.sites[int(site)])
+        return right_canonical_error(self.tensors[int(site)])
 
     def merge_bond(self, bond):
         bond = int(bond)
-        if bond < 0 or bond + 1 >= len(self.sites):
-            raise IndexError(f"Bond {bond} out of range for chain length {len(self.sites)}.")
-        return merge_mps_sites(self.sites[bond], self.sites[bond + 1])
+        if bond < 0 or bond + 1 >= len(self.tensors):
+            raise IndexError(f"Bond {bond} out of range for chain length {len(self.tensors)}.")
+        return merge_mps_sites(self.tensors[bond], self.tensors[bond + 1])
 
     def site_bases(self, site):
         """
         Return explicit ``(left, physical, right)`` bases for one MPS site.
         """
         site = int(site)
-        tensor = self.sites[site]
+        tensor = self.tensors[site]
         return (
             _bond_basis_for_axis(tensor, 0, name=f"site-{site}-left"),
             SiteBasis.from_tensor_axis(tensor, 1, name=f"site-{site}-physical"),
@@ -190,8 +201,8 @@ class MPS:
         Return the explicit virtual basis on the bond between ``bond`` and ``bond + 1``.
         """
         bond = int(bond)
-        if bond < 0 or bond + 1 >= len(self.sites):
-            raise IndexError(f"Bond {bond} out of range for chain length {len(self.sites)}.")
+        if bond < 0 or bond + 1 >= len(self.tensors):
+            raise IndexError(f"Bond {bond} out of range for chain length {len(self.tensors)}.")
         right = self.site_bases(bond)[2]
         left = self.site_bases(bond + 1)[0]
         if not right.dual_compatible_with(left):
@@ -209,4 +220,4 @@ class MPS:
         return TwoSiteBasis.from_tensor_and_layout(merged, layout)
 
     def expectation(self, mpo_factors):
-        return contract_chain_expectation(self.sites, mpo_factors)
+        return contract_chain_expectation(self.tensors, mpo_factors)

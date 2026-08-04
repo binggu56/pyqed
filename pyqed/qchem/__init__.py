@@ -118,7 +118,7 @@ except (ImportError, OSError):
 try:
     from .vibronic import (
         LVC,
-        build_linear_vibronic_model,
+        QVC,
         build_lvc,
         compare_lvc_to_sharc,
         load_sharc_lvc_template,
@@ -129,7 +129,7 @@ try:
     )
 except (ImportError, OSError):
     LVC = None
-    build_linear_vibronic_model = None
+    QVC = None
     build_lvc = None
     compare_lvc_to_sharc = None
     load_sharc_lvc_template = None

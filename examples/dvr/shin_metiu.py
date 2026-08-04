@@ -6,7 +6,7 @@ Created on Thu Mar 19 13:47:15 2026
 @author: gugroup
 """
 
-from pyqed.wpd import SPO2
+from pyqed.dvr import DVR
 import numpy as np 
 
 def sho(x, y, k = 1., x0 = 0., y0 = 0.):
@@ -26,10 +26,11 @@ def sho(x, y, k = 1., x0 = 0., y0 = 0.):
     return 0.5 * (x - x0)**2 + 0.5 * (y - y0)**2 + 2*x*y + x**2 * y + x * y**2 + x**2*y**2
     
 nx, ny = 15, 15
-dvr = DVR2((-6,6), (-6,6), nx, ny)
+dvr = DVR(
+    domains=((-6, 6), (-6, 6)),
+    npts=(nx, ny),
+    names=("x", "y"),
+)
 
 
-dvr.v(sho)
-E, U = dvr.run(k=3)
-
-
+E, U = dvr.run(sho, k=3)

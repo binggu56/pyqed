@@ -217,19 +217,19 @@ def _fresh_casci_like(source):
                 "spatial_exact_component_compression_max_group_size",
                 64,
             ),
-            spatial_enable_native_boundary_p=getattr(
+            spatial_enable_cpp_boundary_p=getattr(
                 source,
-                "spatial_enable_native_boundary_p",
+                "spatial_enable_cpp_boundary_p",
                 True,
             ),
-            spatial_validate_native_boundary_p=getattr(
+            spatial_validate_cpp_boundary_p=getattr(
                 source,
-                "spatial_validate_native_boundary_p",
+                "spatial_validate_cpp_boundary_p",
                 True,
             ),
-            spatial_native_boundary_p_validation_policy=getattr(
+            spatial_cpp_boundary_p_validation_policy=getattr(
                 source,
-                "spatial_native_boundary_p_validation_policy",
+                "spatial_cpp_boundary_p_validation_policy",
                 "first_pass",
             ),
             spatial_direct_operator_batch_min_entries=getattr(

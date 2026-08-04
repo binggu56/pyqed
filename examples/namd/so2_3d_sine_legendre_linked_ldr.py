@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SO2 3D sine/Legendre DVR-LDR test with linked AM1/MECI overlaps."""
+"""SO2 3D sine/Legendre DVR-LDR test with linked electronic overlaps."""
 
 from __future__ import annotations
 
@@ -301,7 +301,14 @@ def main():
     parser.add_argument("--nt", type=int, default=80)
     parser.add_argument("--nout", type=int, default=2)
     parser.add_argument("--n-workers", type=int, default=1)
+    parser.add_argument(
+        "--electronic-method",
+        choices=("am1/meci", "uam1/meci", "casci", "rohf/casci"),
+        default="am1/meci",
+    )
+    parser.add_argument("--basis", default="631g*")
     parser.add_argument("--ncas", type=int, default=4)
+    parser.add_argument("--nelecas", type=int, default=None)
     parser.add_argument("--scf-tol", type=float, default=1.0e-8)
     parser.add_argument("--max-cycle", type=int, default=120)
     parser.add_argument("--damping", type=float, default=0.0)
@@ -329,6 +336,7 @@ def main():
     solver = Triatom(
         so2_body_frame(args.center_r1, center[2]),
         nstates=args.nstates,
+        basis=args.basis,
         charge=0,
         spin=0,
         unit="bohr",
@@ -345,6 +353,13 @@ def main():
         f"{n_r1} x {n_r2} x {args.n_theta} ({np.prod(solver.nx)} nuclear points)"
     )
     print("[theta] Legendre nodes/deg =", np.array2string(np.rad2deg(solver.x[2]), precision=4))
+    nelecas = args.nelecas
+    if nelecas is None:
+        nelecas = 2 if args.electronic_method in ("am1/meci", "uam1/meci") else args.ncas
+    print(
+        "[electronic] method="
+        f"{args.electronic_method}, basis={args.basis}, ncas={args.ncas}, nelecas={nelecas}"
+    )
 
     scan_start = time.perf_counter()
     with working_directory(outdir):
@@ -353,10 +368,11 @@ def main():
             print(f"[scan] Reused APES and overlap links from {outdir}")
         else:
             solver.scan_pes(
-                electronic_method="am1/meci",
+                electronic_method=args.electronic_method,
+                basis=args.basis,
                 nstates=args.nstates,
                 ncas=args.ncas,
-                nelecas=2,
+                nelecas=nelecas,
                 overlap_method="link-only",
                 unitarize_overlap_links=args.unitarize_overlap_links,
                 n_workers=args.n_workers,

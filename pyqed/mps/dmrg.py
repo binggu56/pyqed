@@ -257,11 +257,10 @@ def dmrg_matvec_options(policy="auto"):
                 "generator_table_precompute_contextual_boundaries_min_records": 0,
                 "generator_table_planned_contextual_without_precompute": True,
                 "generator_table_planned_contextual_without_precompute_table_lookup": True,
-                "generator_table_packed_direct_family_entries": True,
+                "generator_table_packed_direct_family_entries": False,
                 "generator_table_packed_direct_family_entries_reason": (
-                    "enabled for exact planned packed contextual route"
+                    "disabled because mixed packed P routes require planned entries"
                 ),
-                "generator_table_allow_planned_packed_contextual_entries": True,
                 "generator_table_prebuild_same_side_native_p": True,
                 "generator_table_incremental_same_side_pair_prebuild": True,
                 "generator_table_use_disjoint_same_side_native_p": False,
@@ -426,7 +425,8 @@ class DMRG:
                 site_qn_maps=None, checkpoint_path=None, resume_from=None,
                 checkpoint_interval=1, recenter_final=True,
                 final_expectation=True, performance="auto",
-                abelian_matvec_options=None):
+                abelian_matvec_options=None,
+                converge_on_full_sweeps=False):
         """
         Parameters
         ----------
@@ -446,6 +446,7 @@ class DMRG:
         self.L = len(self._factor_list(H))
         self.D = D
         self.nsweeps = nsweeps
+        self.converge_on_full_sweeps = bool(converge_on_full_sweeps)
         self.sweep_tol = float(sweep_tol)
         self.davidson_tol = float(davidson_tol)
         self.davidson_max_iter = int(davidson_max_iter)
@@ -508,6 +509,11 @@ class DMRG:
         self.states = None       # Holds list of all Roots
         self.not_conv_err = not_conv_err
         self.converged = False
+        self.ncompleted = 0
+        self.ncompleted_half_sweeps = 0
+        self.max_sweeps = 0
+        self.success = False
+        self.message = "not run"
         self.verbose = int(verbose)
         self.sweep_callback = sweep_callback
         self.sweep_history = []
@@ -672,7 +678,8 @@ class DMRG:
                         post_energy = float(np.real(np.asarray(post_energy).reshape(-1)[0]))
                         if "local_energy" not in row:
                             row["local_energy"] = local_energy
-                        row["energy"] = post_energy
+                        if row.get("direction") != "h2-local":
+                            row["energy"] = post_energy
                         row["post_truncation_energy"] = post_energy
                     except Exception as exc:
                         row["post_truncation_energy_error"] = str(exc)
@@ -717,6 +724,7 @@ class DMRG:
                 site_qn_maps=self.site_qn_maps,
                 recenter_final=self.recenter_final,
                 abelian_matvec_options=self.abelian_matvec_options,
+                converge_on_full_sweeps=self.converge_on_full_sweeps,
             )
             e_elec, mps_out, self.gauge, self.converged = res
             if not self.sweep_history:
@@ -792,7 +800,8 @@ class DMRG:
                 if "energy" in final_row and "local_energy" not in final_row:
                     final_row["local_energy"] = final_row["energy"]
                 if self.nstates == 1:
-                    final_row["energy"] = float(np.real(self.e_tot))
+                    if final_row.get("direction") != "h2-local":
+                        final_row["energy"] = float(np.real(self.e_tot))
                     final_row["post_truncation_energy"] = float(np.real(self.e_tot))
                 else:
                     energies = [

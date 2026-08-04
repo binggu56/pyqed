@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Plot the 6x6 J1-tied LETTA scan for the frustrated Heisenberg model."""
+"""Plot the converged 6x6 MPS and projected-U(1) J1-tied LETTA scan."""
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
@@ -15,20 +16,10 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE / "results"
 DEFAULT_OUTPUT = RESULTS / "frontier_letta_j1_tied_6x6_scan"
+DEFAULT_DATA = DEFAULT_OUTPUT.with_suffix(".csv")
 MANUSCRIPT_FIGURES = (
     HERE.parents[1] / "docs" / "variational_letta_latex" / "figures"
 )
-
-INPUTS = {
-    0.0: RESULTS / "frontier_letta_j1_tied_6x6_j2_0p0.json",
-    0.25: RESULTS / "frontier_letta_j1_tied_6x6_j2_0p25.json",
-    0.5: RESULTS / "frontier_letta_block_sparse_6x6.json",
-    0.7: RESULTS / "frontier_letta_j1_tied_6x6_j2_0p7.json",
-    0.75: RESULTS / "frontier_letta_j1_tied_6x6_j2_0p75.json",
-    0.8: RESULTS / "frontier_letta_j1_tied_6x6_j2_0p8.json",
-    1.0: RESULTS / "frontier_letta_j1_tied_6x6_j2_1p0.json",
-}
-J2_HALF_REFERENCES = RESULTS / "frontier_letta_block_sparse_6x6_mps_references.json"
 
 METHODS = {
     "mps_d8": {
@@ -53,7 +44,7 @@ METHODS = {
         "open_marker": False,
     },
     "letta_d4": {
-        "label": r"$J_1$-LETTA $D=4$ (3,752)",
+        "label": r"$U(1)$-LETTA $D=4$ (4,008)",
         "color": "#D55E00",
         "linestyle": "-",
         "marker": "s",
@@ -62,50 +53,64 @@ METHODS = {
 }
 
 
-def _load(path):
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+def _display_path(path):
+    path = Path(path).resolve()
+    try:
+        return str(path.relative_to(HERE.parents[1]))
+    except ValueError:
+        return str(path)
 
 
-def _result_rows():
+def _as_bool(value):
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"invalid Boolean value: {value!r}")
+
+
+def _result_rows(path=DEFAULT_DATA):
+    path = Path(path)
     rows = []
-    for ratio, path in INPUTS.items():
-        data = _load(path)
-        results = dict(data["results"])
-        if np.isclose(ratio, 0.5):
-            reference_data = _load(J2_HALF_REFERENCES)
-            for key in ("mps_d16", "mps_d32"):
-                results[key] = reference_data["results"][key]
-        convergence = data.get("convergence", {})
-        for method in METHODS:
-            result = results[method]
+    with path.open(newline="", encoding="utf-8") as stream:
+        for result in csv.DictReader(stream):
+            method = result["method"]
+            if method not in METHODS:
+                raise ValueError(f"unknown method in {path}: {method}")
             energy = float(result["energy"])
+            gain_per_site = float(result["final_gain_per_site"])
             rows.append(
                 {
-                    "j2_ratio": float(ratio),
+                    "j2_ratio": float(result["j2_ratio"]),
                     "method": method,
                     "energy": energy,
-                    "energy_per_site": float(result.get("energy_per_site", energy / 36)),
-                    "parameters": int(
-                        result.get(
-                            "parameters",
-                            result.get(
-                                "stored_parameters",
-                                result.get("parameter_capacity"),
-                            ),
-                        )
-                    ),
-                    "converged": bool(result.get("converged", False)),
+                    "energy_per_site": float(result["energy_per_site"]),
+                    "parameters": int(result["parameters"]),
+                    "converged": _as_bool(result["converged"]),
                     "directional_passes_completed": int(
-                        result.get("directional_passes_completed", 0)
+                        result["directional_passes_completed"]
                     ),
-                    "final_delta_energy": result.get("final_delta_energy"),
-                    "cycle_gain_per_site": (
-                        convergence.get("cycle_records", [{}])[-1].get("gain_per_site")
-                        if method == "letta_d4"
-                        else None
-                    ),
+                    "final_delta_energy": 36.0 * gain_per_site,
+                    "final_delta_energy_per_site": gain_per_site,
+                    "cycle_gain_per_site": gain_per_site,
+                    "source_run": result["source_run"],
+                    "source_file": _display_path(path),
                 }
             )
+
+    grids = {
+        method: {
+            row["j2_ratio"] for row in rows if row["method"] == method
+        }
+        for method in METHODS
+    }
+    if any(not grid for grid in grids.values()):
+        raise ValueError(f"scan is missing a plotted method: {grids}")
+    reference_grid = grids["mps_d32"]
+    if any(grid != reference_grid for grid in grids.values()):
+        raise ValueError(f"methods do not share a common J2 grid: {grids}")
+
     d32_by_ratio = {
         row["j2_ratio"]: row["energy_per_site"]
         for row in rows
@@ -118,20 +123,36 @@ def _result_rows():
     return rows
 
 
-def write_data(path, rows):
+def write_data(path, rows, source_data=DEFAULT_DATA):
+    ratios = sorted({row["j2_ratio"] for row in rows})
     payload = {
         "model": {
             "nrows": 6,
             "ncols": 6,
             "j1": 1.0,
-            "j2_ratios": sorted(INPUTS),
+            "j2_ratios": ratios,
             "boundary": "open",
             "site_order": "row-wise snake",
             "letta_tie_graph": "all nearest-neighbor J1 bonds",
         },
+        "letta_protocol_note": (
+            "LETTA rows use exact variation-after-projection U(1), retain all "
+            "unrestricted A-tensor coordinates, and optimize with directional "
+            "one-site sweeps and exact identity-block frontier contractions."
+        ),
+        "mps_protocol_note": (
+            "MPS rows use unrestricted progressive-D two-site DMRG. Every "
+            "D=4,8,16,32 stage reached its requested actual bond dimension."
+        ),
+        "convergence_note": (
+            "Converged points require two directional-cycle gains per site "
+            "below 1e-6. LETTA points at J2/J1=0.8,0.9,1.0 reached the "
+            "200-pass cap and are marked separately."
+        ),
         "reference_note": (
             "MPS D=32 is a finite-D reference, not an exact ground-state energy."
         ),
+        "source_data": _display_path(source_data),
         "records": rows,
     }
     path = Path(path)
@@ -248,8 +269,8 @@ def plot_scan(rows, output_stem):
     energy_axis.set_ylabel(r"$E/N$")
     offset_axis.set_ylabel(r"$[E-E_{\mathrm{MPS}\,D=32}]/N$")
     offset_axis.axhline(0.0, color="#202020", linewidth=0.8, linestyle=":")
-    offset_axis.set_ylim(-0.0045, 0.043)
-    offset_axis.set_yticks((-0.004, 0.0, 0.01, 0.02, 0.03, 0.04))
+    offset_axis.set_ylim(-0.008, 0.043)
+    offset_axis.set_yticks((-0.006, 0.0, 0.01, 0.02, 0.03, 0.04))
     for axis in (energy_axis, offset_axis):
         axis.yaxis.set_label_position("left")
         axis.yaxis.tick_left()
@@ -275,18 +296,22 @@ def plot_scan(rows, output_stem):
         )
         for style in METHODS.values()
     ]
-    handles.append(
-        Line2D(
-            [0],
-            [0],
-            color="#8c2d04",
-            linestyle="None",
-            marker="x",
-            markersize=4.8,
-            markeredgewidth=1.2,
-            label=r"LETTA not at $10^{-6}$/site criterion",
+    if any(row["method"] == "letta_d4" and not row["converged"] for row in rows):
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                color="#8c2d04",
+                linestyle="None",
+                marker="x",
+                markersize=4.8,
+                markeredgewidth=1.2,
+                label=r"LETTA reached 200-pass cap",
+            )
         )
-    )
+        # Matplotlib fills multi-row legends column-first: keep all MPS
+        # entries on the first row and the LETTA entries on the second.
+        handles = [handles[0], handles[3], handles[1], handles[4], handles[2]]
     figure.legend(
         handles,
         [handle.get_label() for handle in handles],
@@ -307,6 +332,7 @@ def plot_scan(rows, output_stem):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, default=DEFAULT_DATA)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
         "--manuscript-output",
@@ -314,11 +340,15 @@ def main():
         default=MANUSCRIPT_FIGURES / "heisenberg_6x6_j1_letta_scan",
     )
     args = parser.parse_args()
-    rows = _result_rows()
-    write_data(args.output.with_suffix(".json"), rows)
+    rows = _result_rows(args.data)
+    write_data(args.output.with_suffix(".json"), rows, args.data)
     plot_scan(rows, args.output)
     if args.manuscript_output:
-        write_data(args.manuscript_output.with_suffix(".json"), rows)
+        write_data(
+            args.manuscript_output.with_suffix(".json"),
+            rows,
+            args.data,
+        )
         plot_scan(rows, args.manuscript_output)
 
 

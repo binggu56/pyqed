@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
 import numpy as np
 
 from pyqed.mps.nonabelian import (
@@ -16,6 +16,7 @@ from pyqed.mps.nonabelian import (
     spatial_target_sector,
 )
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
+from pyqed.mps.nonabelian.su2_kernel import cpp_available as su2_cpp_available
 from pyqed.mps.nonabelian.renormalized import (
     configure_complementary_family_kernel_policy,
     configure_direct_factorized_orthonormal_kernel_policy,
@@ -29,19 +30,36 @@ from pyqed.mps.nonabelian.renormalized import (
 ORTHONORMALIZED_OPERATOR_ITERMAX_DEFAULT = 30
 
 
-@dataclass
-class NonAbelianDMRGResult:
-    """Small result object matching the attributes used by the qchem wrapper."""
+class SU2DMRG:
+    """Stateful owner for one spatial-orbital SU(2) DMRG calculation."""
 
-    e_tot: float | list[float]
-    ground_state: MPS
-    states: list[MPS]
-    history: list[dict]
-    converged: bool
-    ncompleted: int
-    target_sector: object
-    multiroot_state: MultiRootMPS | None = None
-    backend: str = "nonabelian"
+    backend = "su2"
+
+    def __init__(self):
+        self.engine = None
+        self.energy = None
+        self.energies = None
+        self.nstates = 0
+        self.weights = None
+        self.state_average_energy = None
+        self.e_active = None
+        self.e_core = None
+        self.e_tot = None
+        self.ground_state = None
+        self.states = []
+        self.history = []
+        self.diagnostics = {}
+        self.converged = False
+        self.ncompleted = 0
+        self.ncompleted_half_sweeps = 0
+        self.max_sweeps = 0
+        self.target_sector = None
+        self.success = False
+        self.message = "not run"
+
+    def run(self, qcdmrg, **kwargs):
+        _run_spatial_qchem_dmrg(self, qcdmrg, **kwargs)
+        return self
 
 
 def _qchem_sweep_measure(sweep_result):
@@ -90,7 +108,14 @@ def _hf_spatial_labels(nelecas, ncas, spin):
     return labels
 
 
-def _make_initial_mps(qcdmrg, *, target_sector, initial_guess=None, bond_multiplicity=2, seed=7):
+def _make_initial_mps(
+    qcdmrg,
+    *,
+    target_sector,
+    initial_guess=None,
+    bond_multiplicity=2,
+    seed=7,
+):
     guess = qcdmrg.init_guess if initial_guess is None else initial_guess
     if isinstance(guess, MPS):
         mps = guess.copy()
@@ -214,8 +239,17 @@ def _make_state_average_multiroot_mps(
     )
 
 
-def _expectation_from_nonabelian_mps(state, mpo_factors):
-    numerator = contract_chain_expectation(state.sites, mpo_factors)
+def _expectation_from_nonabelian_mps(
+    state,
+    mpo_factors,
+    *,
+    moving_environment=None,
+):
+    numerator = contract_chain_expectation(
+        state.sites,
+        mpo_factors,
+        moving_environment=moving_environment,
+    )
     denominator = contract_chain_expectation(
         state.sites,
         _identity_mpo_factors_for_sites_and_mpo(state.sites, mpo_factors),
@@ -240,6 +274,7 @@ def _finalize_spin_targeted_roots(
     compute_s2=True,
     select_by_spin=False,
     spin_tol=1.0e-6,
+    precomputed_energies=None,
 ):
     """
     Select and report final state-averaged SU(2) roots.
@@ -261,6 +296,9 @@ def _finalize_spin_targeted_roots(
         spaces while still filtering the candidate root buffer.
     spin_tol
         Absolute tolerance for accepting candidate roots by ``<S^2>``.
+    precomputed_energies
+        Optional normalized root expectations already evaluated by the C++
+        moving environment after terminal truncation.
 
     Returns
     -------
@@ -274,14 +312,24 @@ def _finalize_spin_targeted_roots(
     candidate_energies = []
     candidate_source_indices = []
     discarded_zero_norm_roots = []
+    provided_energies = None
+    if precomputed_energies is not None:
+        provided_energies = np.asarray(precomputed_energies, dtype=float).reshape(-1)
+        if provided_energies.size != len(root_mps):
+            raise ValueError(
+                "C++ state-average energies must match the exported roots."
+            )
     for root_idx, state in enumerate(root_mps):
-        try:
-            energy = _expectation_from_nonabelian_mps(state, qcdmrg.H)
-        except ValueError as exc:
-            if "State norm is numerically zero" not in str(exc):
-                raise
-            discarded_zero_norm_roots.append(int(root_idx))
-            continue
+        if provided_energies is not None:
+            energy = float(provided_energies[root_idx])
+        else:
+            try:
+                energy = _expectation_from_nonabelian_mps(state, qcdmrg.H)
+            except ValueError as exc:
+                if "State norm is numerically zero" not in str(exc):
+                    raise
+                discarded_zero_norm_roots.append(int(root_idx))
+                continue
         candidate_source_indices.append(int(root_idx))
         candidate_roots.append(state)
         candidate_energies.append(energy)
@@ -343,7 +391,13 @@ def _finalize_spin_targeted_roots(
     )
 
 
-def run_spatial_qchem_dmrg(
+def run_spatial_qchem_dmrg(qcdmrg, **kwargs):
+    """Create, run, and return an :class:`SU2DMRG` solver."""
+    return SU2DMRG().run(qcdmrg, **kwargs)
+
+
+def _run_spatial_qchem_dmrg(
+    solver,
     qcdmrg,
     *,
     nsweeps=50,
@@ -363,8 +417,12 @@ def run_spatial_qchem_dmrg(
 
     The qchem wrapper owns chemistry concerns: active-space integrals, core
     energy, physical site ordering, and reporting. This adapter only converts
-    those objects to the non-Abelian MPS sweep API.
+    those objects to the non-Abelian MPS sweep API. ``nsweeps`` counts complete
+    left-to-right plus right-to-left sweeps.
     """
+    nsweeps = int(nsweeps)
+    if nsweeps < 1:
+        raise ValueError("nsweeps must be positive.")
     if qcdmrg.site != "spatial":
         raise NotImplementedError("The non-Abelian qchem DMRG backend currently requires site='spatial'.")
     if qcdmrg.H is None:
@@ -378,6 +436,26 @@ def run_spatial_qchem_dmrg(
         if active_hamiltonian is not None
         else None
     )
+    normal_complementary_production = bool(
+        active_hamiltonian is not None
+        and (getattr(active_hamiltonian, "info", None) or {}).get(
+            "normal_complementary_production",
+            False,
+        )
+    )
+    if (
+        normal_complementary_production
+        and not bool(
+            sweep_kwargs.pop(
+                "su2_reference_complementary_families",
+                False,
+            )
+        )
+    ):
+        # The NC MPO and its C++ moving environment already own the complete
+        # S/R/A/P/B/Q operator graph.  Building the historical Python family
+        # stack as well duplicates its routes and numeric payloads.
+        complementary_operator_families = None
     nstates = int(nstates)
     if nstates < 1:
         raise ValueError("nstates must be positive.")
@@ -387,7 +465,14 @@ def run_spatial_qchem_dmrg(
         weights = np.asarray(weights, dtype=float).reshape(-1)
         if weights.size != nstates:
             raise ValueError("weights must match nstates.")
-        weights = weights / np.sum(weights)
+        if not np.all(np.isfinite(weights)):
+            raise ValueError("weights must be finite.")
+        if np.any(weights < 0.0):
+            raise ValueError("weights must be nonnegative.")
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 0.0:
+            raise ValueError("weights must have a positive sum.")
+        weights = weights / weight_sum
 
     target_sector = spatial_target_sector(qcdmrg.nelecas, int(qcdmrg.spin))
     if max_bond is None:
@@ -442,6 +527,19 @@ def run_spatial_qchem_dmrg(
             "local_basis_policy must be 'mixed_canonical_standard', "
             "'block2_like', 'orthonormalized_operator', or 'legacy_generalized'."
         )
+    dual_right_environment = bool(
+        sweep_kwargs.pop(
+            "su2_dual_right_environment",
+            fully_reduced_sites,
+        )
+    )
+    for factor in mpo_factors:
+        if getattr(factor, "normal_complementary_plan", None) is not None:
+            object.__setattr__(
+                factor,
+                "normal_complementary_right_dual",
+                dual_right_environment,
+            )
     allow_experimental_block2_state_average = bool(
         sweep_kwargs.pop("allow_experimental_block2_state_average", False)
         or allow_experimental_su2_state_average
@@ -463,15 +561,43 @@ def run_spatial_qchem_dmrg(
         "orthonormalize_generalized_dim",
         None,
     )
-    orthonormalized_operator_dim = int(
-        sweep_kwargs.pop("orthonormalized_operator_dim", 512)
+    su2_kernel_backend = sweep_kwargs.pop("su2_kernel_backend", "auto")
+    if (
+        int(nstates) > 1
+        and str(su2_kernel_backend).lower() == "cpp"
+        and not fully_reduced_sites
+    ):
+        raise RuntimeError(
+            "The C++ state-averaged SU(2) engine requires "
+            "spatial_site_basis='fully_reduced'. Use su2_kernel_backend='python' "
+            "only for the canonical-site reference implementation."
+        )
+    packed_cpp_local_solver = bool(
+        normal_complementary_production
+        and (int(nstates) == 1 or fully_reduced_sites)
+        and str(su2_kernel_backend).lower() != "python"
+        and su2_cpp_available()
     )
+    cpp_block2_owned_policy = bool(
+        packed_cpp_local_solver
+        and requested_policy_name in {"block2", "block2_like"}
+    )
+    orthonormalized_operator_dim = int(
+        sweep_kwargs.pop(
+            "orthonormalized_operator_dim",
+            0 if packed_cpp_local_solver else 512,
+        )
+    )
+    state_initialization_started = time.perf_counter()
     mps0 = _make_initial_mps(
         qcdmrg,
         target_sector=target_sector,
         initial_guess=initial_guess,
         bond_multiplicity=bond_multiplicity,
         seed=seed,
+    )
+    state_initialization_seconds = (
+        time.perf_counter() - state_initialization_started
     )
     if nstates > 1:
         orthonormalize_generalized_dim = (
@@ -502,11 +628,23 @@ def run_spatial_qchem_dmrg(
             # solving a standard Davidson problem in that basis. Larger bonds
             # stay on the packed metric-Krylov path unless callers raise this
             # cap explicitly.
-            orthonormalize_generalized_dim = orthonormalized_operator_dim
+            orthonormalize_generalized_dim = (
+                0
+                if cpp_block2_owned_policy
+                else orthonormalized_operator_dim
+            )
         elif local_basis_policy == "mixed_canonical_standard":
             # The packed Davidson path metric-orthonormalizes its local Krylov
             # basis when a norm operator is present. That gives the block-DMRG
             # algorithmic structure without forcing dense metric transforms.
+            orthonormalize_generalized_dim = 0
+        elif packed_cpp_local_solver:
+            # Keep every bond, including the small edge problems, on the
+            # persistent complementary-family action and canonical metric
+            # owned by C++.  Diverting low-dimensional edges through the
+            # Python orthonormal-operator builder prevents a fully owned
+            # half sweep and duplicates topology already present in the
+            # moving environment.
             orthonormalize_generalized_dim = None
         else:
             orthonormalize_generalized_dim = 256 if int(qcdmrg.ncas) >= 6 else None
@@ -522,21 +660,44 @@ def run_spatial_qchem_dmrg(
                 if local_basis_policy == "orthonormalized_operator"
                 else 40
             ),
-            "max_space": 96 if local_basis_policy == "orthonormalized_operator" else 48,
+            "max_space": (
+                48
+                if cpp_block2_owned_policy
+                else (
+                    96
+                    if local_basis_policy == "orthonormalized_operator"
+                    else 48
+                )
+            ),
             "dense_fallback_dim": 512,
             "orthonormalized_dense_dim": (
-                256 if local_basis_policy == "orthonormalized_operator" else None
+                256
+                if (
+                    local_basis_policy == "orthonormalized_operator"
+                    and not cpp_block2_owned_policy
+                )
+                else None
             ),
             "orthonormalize_generalized_dim": orthonormalize_generalized_dim,
             "orthonormalize_generalized_operator": (
                 local_basis_policy == "orthonormalized_operator"
+                and not cpp_block2_owned_policy
             ),
             "use_block_preconditioner": True,
         }
     solver_kwargs.update(local_solver_kwargs or {})
+    solver_kwargs.setdefault(
+        "couple_physical",
+        bool(int(qcdmrg.ncas) >= 10 and not fully_reduced_sites),
+    )
     candidate_nstates = nstates
     if nstates > 1:
-        root_selection_buffer = int(sweep_kwargs.pop("state_average_root_buffer", 2))
+        root_selection_buffer = int(
+            sweep_kwargs.pop(
+                "state_average_root_buffer",
+                0 if fully_reduced_sites else 2,
+            )
+        )
         candidate_nstates = int(
             sweep_kwargs.pop(
                 "state_average_candidate_roots",
@@ -636,7 +797,10 @@ def run_spatial_qchem_dmrg(
     )
     if su2_qchem_direct_parent_blocks is None:
         su2_qchem_direct_parent_blocks = default_qchem_direct_parent_blocks
-    su2_kernel_backend = sweep_kwargs.pop("su2_kernel_backend", "auto")
+    direct_parent_block_max_elements = sweep_kwargs.pop(
+        "su2_qchem_direct_parent_block_max_elements",
+        None,
+    )
     debug_su2_kernel_check = bool(
         sweep_kwargs.pop("debug_su2_kernel_check", False)
     )
@@ -664,6 +828,7 @@ def run_spatial_qchem_dmrg(
         orthonormal_block_max_elements=direct_block_max_elements,
         orthonormal_dense_max_elements=direct_dense_max_elements,
         su2_qchem_direct_parent_blocks=su2_qchem_direct_parent_blocks,
+        su2_qchem_direct_parent_block_max_elements=direct_parent_block_max_elements,
     )
     direct_policy_active = get_direct_factorized_orthonormal_kernel_policy()
     su2_kernel_previous = configure_su2_kernel_policy(
@@ -672,6 +837,37 @@ def run_spatial_qchem_dmrg(
         debug_check_tol=debug_su2_kernel_check_tol,
     )
     su2_kernel_active = get_su2_kernel_policy()
+    su2_moving_environment = (
+        getattr(active_hamiltonian, "moving_environment", None)
+        if active_hamiltonian is not None
+        and su2_kernel_active.get("actual") == "cpp"
+        else None
+    )
+    if (
+        su2_kernel_active.get("actual") == "cpp"
+        and su2_moving_environment is None
+        and packed_cpp_local_solver
+    ):
+        raise RuntimeError(
+            "The C++ SU(2) backend is available but the active Hamiltonian "
+            "does not own an SU2MovingEnvironment."
+        )
+    cpp_state_average = bool(
+        packed_cpp_local_solver
+        and int(nstates) > 1
+        and fully_reduced_sites
+    )
+    if cpp_state_average:
+        initial_multiroot_mps.canonicalize_shared(
+            0,
+            max_bond=int(max_bond),
+            max_bond_mode="reduced",
+        )
+        su2_moving_environment.install_state_average_mps(
+            initial_multiroot_mps.roots,
+            initial_multiroot_mps.weights,
+            0,
+        )
     if complementary_operator_families is not None:
         object.__setattr__(
             complementary_operator_families,
@@ -680,48 +876,97 @@ def run_spatial_qchem_dmrg(
         )
     if local_basis_policy == "orthonormalized_operator":
         default_max_bond_mode = "per_sector"
-    elif block2_like_state_average:
+    elif block2_like_state_average and not cpp_state_average:
         default_max_bond_mode = "states"
     else:
         default_max_bond_mode = "reduced"
     max_bond_mode = sweep_kwargs.pop("max_bond_mode", default_max_bond_mode)
-    default_mixer_scale = 0.0 if local_basis_policy == "orthonormalized_operator" else 1.0e-5
+    default_mixer_scale = (
+        0.0
+        if local_basis_policy == "orthonormalized_operator"
+        or cpp_state_average
+        else 1.0e-5
+    )
 
     try:
         sweep_initial_state = initial_multiroot_mps if initial_multiroot_mps is not None else mps0
         result = run_sweeps(
             sweep_initial_state,
-            nsweeps=int(nsweeps),
+            nsweeps=2 * nsweeps,
+            converge_on_full_sweeps=True,
             mpo_factors=mpo_factors,
             root_target_mpo_factors=root_target_mpo_factors,
             max_bond=int(max_bond),
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=sweep_kwargs.pop(
+                "retain_sector_topology",
+                False,
+            ),
             canonical_local_norm=canonical_local_norm,
             prefer_reduced_local_operator=sweep_kwargs.pop("prefer_reduced_local_operator", True),
             store_orthonormal_renormalized_operators=(
                 local_basis_policy == "orthonormalized_operator"
+                and not cpp_block2_owned_policy
             ),
             require_block_sparse_renormalized_operator_table=(
-                local_basis_policy == "orthonormalized_operator" and nstates > 1
+                local_basis_policy == "orthonormalized_operator"
+                and not cpp_block2_owned_policy
+                and nstates > 1
             ),
             require_symbolic_renormalized_operators=(
                 local_basis_policy == "orthonormalized_operator"
+                and not cpp_block2_owned_policy
             ),
             complementary_operator_families=complementary_operator_families,
-            warm_start_bonds=sweep_kwargs.pop("warm_start_bonds", True),
+            materialize_complementary_family_operator_tables=bool(
+                su2_kernel_active.get("actual") != "cpp"
+                or su2_force_family_table
+            ),
+            su2_moving_environment=(
+                su2_moving_environment
+                if packed_cpp_local_solver
+                else None
+            ),
+            renormalized_operator_cache_max_size=int(
+                sweep_kwargs.pop(
+                    "renormalized_operator_cache_max_size",
+                    1 if su2_moving_environment is not None else 256,
+                )
+            ),
+            warm_start_bonds=sweep_kwargs.pop(
+                "warm_start_bonds",
+                su2_kernel_active.get("actual") != "cpp",
+            ),
+            compact_history_updates=sweep_kwargs.pop(
+                "compact_history_updates",
+                su2_kernel_active.get("actual") == "cpp",
+            ),
             mixer_zero_block_noise_scale=sweep_kwargs.pop(
                 "mixer_zero_block_noise_scale",
                 default_mixer_scale,
             ),
             mixer_zero_block_noise_seed=sweep_kwargs.pop("mixer_zero_block_noise_seed", seed + 4),
-            mixer_nsweeps=sweep_kwargs.pop("mixer_nsweeps", 2),
+            mixer_nsweeps=2 * int(sweep_kwargs.pop("mixer_nsweeps", 2)),
             record_post_update_energy=sweep_kwargs.pop(
                 "record_post_update_energy",
                 debug_state_average,
             ),
+            compute_final_expectation=sweep_kwargs.pop(
+                "compute_final_expectation",
+                not (normal_complementary_production and int(nstates) == 1),
+            ),
             state_average_local_norm=sweep_kwargs.pop(
                 "state_average_local_norm",
-                nstates > 1,
+                nstates > 1
+                and not fully_reduced_sites
+                and not cpp_state_average,
+            ),
+            state_average_root_environments=sweep_kwargs.pop(
+                "state_average_root_environments",
+                nstates > 1
+                and not fully_reduced_sites
+                and int(qcdmrg.ncas) > 2
+                and not cpp_state_average,
             ),
             conv_tol=conv_tol,
             measure=sweep_kwargs.pop("measure", _qchem_sweep_measure),
@@ -760,7 +1005,12 @@ def run_spatial_qchem_dmrg(
                 "block2_like" if block2_like_state_average else local_basis_policy,
             )
             table_stats = objective.get("renormalized_operator_table_stats") or {}
-            if table_stats.get("su2_kernel_backend_actual") is not None:
+            if bool(
+                objective.get("cpp_davidson")
+                or objective.get("no_python_bond_callbacks")
+            ):
+                local_backend_actuals.append("cpp")
+            elif table_stats.get("su2_kernel_backend_actual") is not None:
                 local_backend_actuals.append(
                     str(table_stats.get("su2_kernel_backend_actual"))
                 )
@@ -793,6 +1043,9 @@ def run_spatial_qchem_dmrg(
     if state_energies is not None:
         state_energies = [float(np.real(x)) for x in state_energies]
     if active_hamiltonian is not None and result["history"]:
+        result["history"][-1]["state_initialization_seconds"] = float(
+            state_initialization_seconds
+        )
         result["history"][-1]["hamiltonian_system"] = active_hamiltonian.initialize_system_kwargs()
         result["history"][-1]["hamiltonian_symmetry"] = active_hamiltonian.symmetry
         if complementary_operator_families is not None and hasattr(
@@ -805,7 +1058,15 @@ def run_spatial_qchem_dmrg(
     ground_state = result["mps"]
     if nstates == 1:
         if verify_returned_energy:
-            returned_energy = _expectation_from_nonabelian_mps(ground_state, mpo_factors)
+            returned_energy = _expectation_from_nonabelian_mps(
+                ground_state,
+                mpo_factors,
+                moving_environment=(
+                    None
+                    if active_hamiltonian is None
+                    else active_hamiltonian.moving_environment
+                ),
+            )
             if result["history"]:
                 result["history"][-1]["returned_mps_energy"] = float(returned_energy)
             energy = float(returned_energy)
@@ -829,7 +1090,14 @@ def run_spatial_qchem_dmrg(
                 )
             ),
             spin_tol=state_average_spin_tol,
+            precomputed_energies=(state_energies if cpp_state_average else None),
         )
+        if fully_reduced_sites and state_s2 is None:
+            target_s = 0.5 * abs(float(qcdmrg.spin))
+            target_s2 = target_s * (target_s + 1.0)
+            state_s2 = [float(target_s2)] * len(state_energies)
+            root_selection_info["candidate_state_s2"] = list(state_s2)
+            root_selection_info["target_spin_valid"] = True
         if result["history"]:
             n_selected = len(state_energies)
             selected_weights = np.asarray(weights[:n_selected], dtype=float).reshape(-1)
@@ -868,7 +1136,12 @@ def run_spatial_qchem_dmrg(
                 "disable state_average_validate_spin if contaminated roots are acceptable, "
                 "or compare against pyqed.qchem.mcscf.direct_ci.CASCI as a separate reference."
             )
-    active_energy = state_energies if state_energies is not None else energy
+    ncompleted_half_sweeps = int(result["ncompleted"])
+    ncompleted_sweeps = ncompleted_half_sweeps // 2
+    for half_index, row in enumerate(result["history"]):
+        row["half_sweep"] = half_index + 1
+        row["sweep"] = half_index // 2 + 1
+        row["sweep_complete"] = bool(half_index % 2 == 1)
     if int(verbose) >= 1 and result["history"]:
         final_metric = result["history"][-1].get("metric")
         metric_text = "-" if final_metric is None else f"{float(final_metric):.3e}"
@@ -878,17 +1151,61 @@ def run_spatial_qchem_dmrg(
             "  DMRG convergence: "
             f"backend={backend_text} | "
             f"converged={bool(result['converged'])} | "
-            f"sweeps={int(result['ncompleted'])} | "
+            f"sweeps={ncompleted_sweeps} | "
             f"metric={metric_text} | "
             f"conv_tol={tol_text}"
         )
-    return NonAbelianDMRGResult(
-        e_tot=active_energy,
-        ground_state=ground_state,
-        states=root_mps if root_mps is not None else [ground_state.copy() for _ in range(nstates)],
-        history=result["history"],
-        converged=bool(result["converged"]),
-        ncompleted=int(result["ncompleted"]),
-        target_sector=target_sector,
-        multiroot_state=result.get("multiroot_mps"),
+    states = list(root_mps) if root_mps is not None else [ground_state]
+    energies = np.asarray(
+        state_energies if state_energies is not None else [energy],
+        dtype=float,
+    ).reshape(-1)
+    selected_weights = np.asarray(weights[: len(energies)], dtype=float)
+    selected_weight_sum = float(np.sum(selected_weights))
+    if selected_weight_sum <= 0.0:
+        selected_weights = np.ones(len(energies), dtype=float) / len(energies)
+    else:
+        selected_weights /= selected_weight_sum
+
+    solver.engine = su2_moving_environment
+    solver.energy = float(energies[0])
+    solver.energies = energies
+    solver.nstates = len(states)
+    solver.weights = selected_weights
+    solver.state_average_energy = float(np.dot(selected_weights, energies))
+    solver.e_active = float(energies[0]) if nstates == 1 else energies.copy()
+    solver.e_tot = solver.e_active
+    solver.ground_state = states[0]
+    solver.states = states
+    solver.history = result["history"]
+    solver.converged = bool(result["converged"])
+    solver.ncompleted = ncompleted_sweeps
+    solver.ncompleted_half_sweeps = ncompleted_half_sweeps
+    solver.max_sweeps = nsweeps
+    solver.target_sector = target_sector
+    solver.success = bool(result["converged"])
+    solver.message = (
+        "converged"
+        if result["converged"]
+        else "completed requested SU(2) complete sweeps without convergence"
     )
+    final_history = solver.history[-1] if solver.history else {}
+    moving_stats = final_history.get("moving_environment_stats") or {}
+    engine_stats = moving_stats.get("su2_moving_environment") or {}
+    solver.diagnostics = {
+        "kernel_backend": final_history.get("su2_kernel_backend_actual"),
+        "kernel_policy": final_history.get("su2_kernel_policy"),
+        "timing": final_history.get("timing"),
+        "state_initialization_seconds": float(state_initialization_seconds),
+        "memory_bytes": engine_stats.get("memory_bytes"),
+        "route_count": engine_stats.get("factor_route_count"),
+        "matvec_calls": engine_stats.get("matvec_calls"),
+        "davidson_iterations": engine_stats.get("davidson_iterations"),
+        "truncation_seconds": engine_stats.get("truncation_seconds"),
+        "environment_seconds": engine_stats.get("boundary_update_seconds"),
+        "owned_half_sweep_bonds": engine_stats.get("owned_half_sweep_bonds"),
+        "python_bond_callbacks": engine_stats.get(
+            "half_sweep_python_bond_callbacks"
+        ),
+    }
+    return solver

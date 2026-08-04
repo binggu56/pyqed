@@ -235,8 +235,7 @@ class Pyrrole:
 
     def eigenstates(self, nstates=0, method='dvr'):
         
-        # from pyqed.dvr.dvr_2d import DVR2
-        # DVR2()    
+        # from pyqed.dvr import DVR
         pass
     
 
@@ -472,6 +471,5 @@ if __name__=='__main__':
 
     # for j in range(len(r.times)):
     #     export(str('{:f2}'.format(r.times[j]*au2fs))+'.mat', r.psilist[j])
-
 
 

@@ -54,7 +54,7 @@ class TDMPS:
         interaction_propagator_builder=None,
         local_sectors=None,
         target_sector=None,
-        tdvp_projection_backend=None,
+        projection=None,
         tdvp_split_dynamic_block_sparse=False,
     ):
         """
@@ -74,7 +74,7 @@ class TDMPS:
         self.interaction_propagator_builder = interaction_propagator_builder
         self.local_sectors = local_sectors
         self.target_sector = target_sector
-        self.tdvp_projection_backend = tdvp_projection_backend
+        self.projection = projection
         self.tdvp_split_dynamic_block_sparse = bool(tdvp_split_dynamic_block_sparse)
         # self.dt = dt
         self.bond_dim = self.D = D
@@ -99,6 +99,8 @@ class TDMPS:
         self.energy_drift = None
         self.time_reversal_diagnostic = None
         self.tdvp_truncation_errors = None
+        self.bond_dimensions = None
+        self.integrator_history = None
         self._last_step_pre_normalization_norms = ()
         self._last_step_pre_normalization_norm2 = ()
         self._last_step_tdvp_truncation_error = 0.0
@@ -187,6 +189,7 @@ class TDMPS:
         krylov_tol=1.0e-13,
         krylov_method="lanczos",
         diagonal_fast_path=False,
+        cutoff=0.0,
         tdvp_dynamic_mode="split",
         sparse_threshold=0.0,
         sparse_vectorized=True,
@@ -195,11 +198,11 @@ class TDMPS:
     ):
         H_eff = self.H if H_mpo is None else H_mpo
         sector_backend = None
-        if self.tdvp_projection_backend is not None:
-            sector_backend = str(self.tdvp_projection_backend).lower().replace("_", "-")
+        if self.projection is not None:
+            sector_backend = str(self.projection).lower().replace("_", "-")
         use_symmetric_tdvp = (
             sector_backend is not None
-            and integrator == "tdvp"
+            and integrator in {"tdvp", "tdvp2"}
             and self.local_sectors is not None
             and self.target_sector is not None
         )
@@ -218,6 +221,7 @@ class TDMPS:
                 float(krylov_tol),
                 str(krylov_method).lower().replace("_", "-"),
                 bool(diagonal_fast_path),
+                float(cutoff),
                 float(sparse_threshold),
                 bool(sparse_vectorized),
                 bool(canonicalize_each_step),
@@ -230,7 +234,9 @@ class TDMPS:
                         H_eff,
                         local_sectors=self.local_sectors,
                         target_sector=self.target_sector,
+                        integrator=integrator,
                         max_bond=self.D,
+                        cutoff=cutoff,
                         krylov_dim=krylov_dim,
                         krylov_tol=krylov_tol,
                         krylov_method=krylov_method,
@@ -243,6 +249,7 @@ class TDMPS:
                         H_eff,
                         integrator=integrator,
                         max_bond=self.D,
+                        cutoff=cutoff,
                         krylov_dim=krylov_dim,
                         krylov_tol=krylov_tol,
                         krylov_method=krylov_method,
@@ -255,12 +262,29 @@ class TDMPS:
             elif use_symmetric_tdvp and affine_meta is not None:
                 engine.update_mpo_source(H_eff)
             psi, info = engine.step(psi, dt, normalize=True, return_info=True)
+        elif use_symmetric_tdvp:
+            engine = SymmetricTDVP(
+                H_eff,
+                local_sectors=self.local_sectors,
+                target_sector=self.target_sector,
+                integrator=integrator,
+                max_bond=self.D,
+                cutoff=cutoff,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                diagonal_fast_path=diagonal_fast_path,
+                projection_backend=sector_backend,
+                canonicalize_each_step=canonicalize_each_step,
+            )
+            psi, info = engine.step(psi, dt, normalize=True, return_info=True)
         elif integrator == "tdvp2":
             psi, info = two_site_tdvp_step(
                 psi,
                 H_eff,
                 dt,
                 max_bond=self.D,
+                cutoff=cutoff,
                 krylov_dim=krylov_dim,
                 krylov_tol=krylov_tol,
                 krylov_method=krylov_method,
@@ -270,20 +294,6 @@ class TDMPS:
                 normalize=True,
                 return_info=True,
             )
-        elif use_symmetric_tdvp:
-            engine = SymmetricTDVP(
-                H_eff,
-                local_sectors=self.local_sectors,
-                target_sector=self.target_sector,
-                max_bond=self.D,
-                krylov_dim=krylov_dim,
-                krylov_tol=krylov_tol,
-                krylov_method=krylov_method,
-                diagonal_fast_path=diagonal_fast_path,
-                projection_backend=sector_backend,
-                canonicalize_each_step=canonicalize_each_step,
-            )
-            psi, info = engine.step(psi, dt, normalize=True, return_info=True)
         else:
             psi, info = one_site_tdvp_step(
                 psi,
@@ -310,8 +320,8 @@ class TDMPS:
         if self.local_sectors is None or self.target_sector is None:
             return psi
         sector_backend = None
-        if self.tdvp_projection_backend is not None:
-            sector_backend = str(self.tdvp_projection_backend).lower().replace("_", "-")
+        if self.projection is not None:
+            sector_backend = str(self.projection).lower().replace("_", "-")
         if sector_backend not in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}:
             return psi
         projector = SymmetricTDVP(
@@ -672,6 +682,7 @@ class TDMPS:
         krylov_tol=1.0e-13,
         krylov_method="lanczos",
         diagonal_fast_path=False,
+        cutoff=0.0,
         tdvp_dynamic_mode="split",
         sparse_threshold=0.0,
         sparse_vectorized=True,
@@ -691,8 +702,8 @@ class TDMPS:
             if split_dynamic:
                 dynamic_mode = str(tdvp_dynamic_mode).lower().replace("_", "-")
                 if (
-                    self.tdvp_projection_backend is not None
-                    and str(self.tdvp_projection_backend).lower().replace("_", "-")
+                    self.projection is not None
+                    and str(self.projection).lower().replace("_", "-")
                     in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
                     and dynamic_mode in {"split", "strang", "split-operator"}
                     and not self.tdvp_split_dynamic_block_sparse
@@ -722,6 +733,7 @@ class TDMPS:
                             krylov_tol=krylov_tol,
                             krylov_method=krylov_method,
                             diagonal_fast_path=diagonal_fast_path,
+                            cutoff=cutoff,
                             sparse_threshold=sparse_threshold,
                             sparse_vectorized=sparse_vectorized,
                             reuse_tdvp_engine=reuse_tdvp_engine,
@@ -757,6 +769,7 @@ class TDMPS:
                         krylov_tol=krylov_tol,
                         krylov_method=krylov_method,
                         diagonal_fast_path=diagonal_fast_path,
+                        cutoff=cutoff,
                         tdvp_dynamic_mode=tdvp_dynamic_mode,
                         sparse_threshold=sparse_threshold,
                         sparse_vectorized=sparse_vectorized,
@@ -781,6 +794,7 @@ class TDMPS:
                         krylov_tol=krylov_tol,
                         krylov_method=krylov_method,
                         diagonal_fast_path=diagonal_fast_path,
+                        cutoff=cutoff,
                         sparse_threshold=sparse_threshold,
                         sparse_vectorized=sparse_vectorized,
                         reuse_tdvp_engine=reuse_tdvp_engine,
@@ -795,6 +809,7 @@ class TDMPS:
                     krylov_tol=krylov_tol,
                     krylov_method=krylov_method,
                     diagonal_fast_path=diagonal_fast_path,
+                    cutoff=cutoff,
                     sparse_threshold=sparse_threshold,
                     sparse_vectorized=sparse_vectorized,
                     reuse_tdvp_engine=reuse_tdvp_engine,
@@ -811,6 +826,7 @@ class TDMPS:
                     krylov_tol=krylov_tol,
                     krylov_method=krylov_method,
                     diagonal_fast_path=diagonal_fast_path,
+                    cutoff=cutoff,
                     sparse_threshold=sparse_threshold,
                     sparse_vectorized=sparse_vectorized,
                     reuse_tdvp_engine=reuse_tdvp_engine,
@@ -825,6 +841,7 @@ class TDMPS:
                 krylov_tol=krylov_tol,
                 krylov_method=krylov_method,
                 diagonal_fast_path=diagonal_fast_path,
+                cutoff=cutoff,
                 sparse_threshold=sparse_threshold,
                 sparse_vectorized=sparse_vectorized,
                 reuse_tdvp_engine=reuse_tdvp_engine,
@@ -876,6 +893,7 @@ class TDMPS:
         krylov_tol=1.0e-13,
         krylov_method="lanczos",
         diagonal_fast_path=False,
+        cutoff=0.0,
         tdvp_dynamic_mode="split",
         sparse_threshold=0.0,
         sparse_vectorized=True,
@@ -923,6 +941,7 @@ class TDMPS:
                     krylov_tol=krylov_tol,
                     krylov_method=krylov_method,
                     diagonal_fast_path=diagonal_fast_path,
+                    cutoff=cutoff,
                     tdvp_dynamic_mode=tdvp_dynamic_mode,
                     sparse_threshold=sparse_threshold,
                     sparse_vectorized=sparse_vectorized,
@@ -940,6 +959,7 @@ class TDMPS:
                     krylov_tol=krylov_tol,
                     krylov_method=krylov_method,
                     diagonal_fast_path=diagonal_fast_path,
+                    cutoff=cutoff,
                     sparse_threshold=sparse_threshold,
                     sparse_vectorized=sparse_vectorized,
                     reuse_tdvp_engine=reuse_tdvp_engine,
@@ -964,6 +984,7 @@ class TDMPS:
         krylov_tol=1.0e-13,
         krylov_method="lanczos",
         diagonal_fast_path=False,
+        cutoff=0.0,
         tdvp_dynamic_mode="split",
         sparse_threshold=0.0,
         sparse_vectorized=True,
@@ -984,6 +1005,7 @@ class TDMPS:
             krylov_tol=krylov_tol,
             krylov_method=krylov_method,
             diagonal_fast_path=diagonal_fast_path,
+            cutoff=cutoff,
             tdvp_dynamic_mode=tdvp_dynamic_mode,
             sparse_threshold=sparse_threshold,
             sparse_vectorized=sparse_vectorized,
@@ -1003,6 +1025,7 @@ class TDMPS:
             krylov_tol=krylov_tol,
             krylov_method=krylov_method,
             diagonal_fast_path=diagonal_fast_path,
+            cutoff=cutoff,
             tdvp_dynamic_mode=tdvp_dynamic_mode,
             sparse_threshold=sparse_threshold,
             sparse_vectorized=sparse_vectorized,
@@ -1038,6 +1061,7 @@ class TDMPS:
         krylov_tol=1.0e-13,
         krylov_method="lanczos",
         diagonal_fast_path=False,
+        cutoff=0.0,
         tdvp_dynamic_mode="split",
         sparse_threshold=0.0,
         sparse_vectorized=True,
@@ -1046,6 +1070,8 @@ class TDMPS:
         measure_observables=True,
         track_energy=True,
         progress=True,
+        hybrid_warmup_steps=5,
+        hybrid_tdvp2_interval=10,
     ):
         """
         Run time evolution.
@@ -1058,6 +1084,15 @@ class TDMPS:
             list of MPOs for observables. The default is [].
         interval : TYPE, optional
             DESCRIPTION. The default is 1.
+        cutoff : float, optional
+            Absolute singular-value cutoff used by two-site TDVP. ``D`` remains
+            the maximum bond dimension; smaller bonds are retained whenever
+            singular values fall below this threshold.
+        hybrid_warmup_steps : int, optional
+            Initial two-site TDVP steps when ``integrator="hybrid"``.
+        hybrid_tdvp2_interval : int, optional
+            Use one two-site enrichment step after each block of this many
+            post-warmup steps. Other post-warmup steps use one-site TDVP.
 
         Returns
         -------
@@ -1071,6 +1106,12 @@ class TDMPS:
             raise ValueError("steps must be non-negative.")
         if interval <= 0:
             raise ValueError("interval must be a positive integer.")
+        if cutoff < 0.0:
+            raise ValueError("cutoff must be non-negative.")
+        if hybrid_warmup_steps < 0:
+            raise ValueError("hybrid_warmup_steps must be non-negative.")
+        if hybrid_tdvp2_interval <= 0:
+            raise ValueError("hybrid_tdvp2_interval must be positive.")
         if e_ops is None:
             e_ops = []
             
@@ -1079,7 +1120,11 @@ class TDMPS:
             self.interaction_mpo is not None
             and ((field is not None) or (self.field is not None))
         )
-        integrator = _normalize_integrator(integrator)
+        integrator_key = str(integrator).lower().replace("_", "-")
+        if integrator_key in {"hybrid", "hybrid-tdvp", "tdvp-hybrid"}:
+            integrator = "hybrid"
+        else:
+            integrator = _normalize_integrator(integrator)
 
         if integrator == "taylor" and not dynamic_hamiltonian:
             self.build_propagator(dt, order=order, scale=scale)
@@ -1108,13 +1153,29 @@ class TDMPS:
             
         psi = psi0
         static_energies = [self.static_energy(psi) if track_energy else np.nan]
+        bond_dimensions = [tuple(int(value) for value in psi.bond_orders())]
         completed_steps = 0
         total_step = 0
         time = float(t0)
+        integrator_history = []
         if reuse_tdvp_engine:
             self._reset_tdvp_engines()
         for i, checkpoint in enumerate(checkpoints):
             for _ in range(checkpoint - completed_steps):
+                step_integrator = integrator
+                if integrator == "hybrid":
+                    if total_step < hybrid_warmup_steps:
+                        step_integrator = "tdvp2"
+                    else:
+                        post_warmup_step = (
+                            total_step - hybrid_warmup_steps + 1
+                        )
+                        step_integrator = (
+                            "tdvp2"
+                            if post_warmup_step % hybrid_tdvp2_interval == 0
+                            else "tdvp"
+                        )
+                integrator_history.append(step_integrator)
                 if dynamic_hamiltonian:
                     field_step = step_fields[total_step] if step_fields is not None else field
                     psi = self.step(
@@ -1125,35 +1186,37 @@ class TDMPS:
                         order=order,
                         scale=scale,
                         split_dynamic=True,
-                        integrator=integrator,
+                        integrator=step_integrator,
                         krylov_dim=krylov_dim,
                         krylov_tol=krylov_tol,
                         krylov_method=krylov_method,
                         diagonal_fast_path=diagonal_fast_path,
+                        cutoff=cutoff,
                         tdvp_dynamic_mode=tdvp_dynamic_mode,
                         sparse_threshold=sparse_threshold,
                         sparse_vectorized=sparse_vectorized,
                         reuse_tdvp_engine=reuse_tdvp_engine,
                         canonicalize_each_step=canonicalize_each_step,
                     )
-                elif integrator in {"tdvp", "tdvp2"}:
+                elif step_integrator in {"tdvp", "tdvp2"}:
                     psi = self.step(
                         psi,
                         dt=dt,
                         order=order,
                         scale=scale,
-                        integrator=integrator,
+                        integrator=step_integrator,
                         krylov_dim=krylov_dim,
                         krylov_tol=krylov_tol,
                         krylov_method=krylov_method,
                         diagonal_fast_path=diagonal_fast_path,
+                        cutoff=cutoff,
                         sparse_threshold=sparse_threshold,
                         sparse_vectorized=sparse_vectorized,
                         reuse_tdvp_engine=reuse_tdvp_engine,
                         canonicalize_each_step=canonicalize_each_step,
                     )
                 else:
-                    psi = self.step(psi, integrator=integrator)
+                    psi = self.step(psi, integrator=step_integrator)
                 step_norm2 = tuple(getattr(self, "_last_step_pre_normalization_norm2", ()))
                 if step_norm2:
                     full_step_norm2 = float(np.prod(step_norm2))
@@ -1166,6 +1229,9 @@ class TDMPS:
                 time += dt
                 total_step += 1
             completed_steps = checkpoint
+            bond_dimensions.append(
+                tuple(int(value) for value in psi.bond_orders())
+            )
 
             if measure_observables:
                 observables[i] = [self._expectation(psi, e) for e in e_ops]
@@ -1192,6 +1258,8 @@ class TDMPS:
         self.pre_normalization_norm2 = pre_norm2
         self.substep_pre_normalization_norms = None
         self.tdvp_truncation_errors = tdvp_truncation_errors
+        self.bond_dimensions = np.asarray(bond_dimensions, dtype=int)
+        self.integrator_history = np.asarray(integrator_history, dtype="U5")
         self.energy_times = np.asarray(energy_times, dtype=float)
         self.static_energies = np.asarray(static_energies, dtype=complex)
         self.energy_drift = self.static_energies - self.static_energies[0]

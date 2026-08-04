@@ -5,14 +5,20 @@ from scipy.linalg import expm
 from pyqed.mps.bose_gas_2d import (
     D2M1HierarchicalCLETTA2D,
     D2M1NestedCLETTA2D,
+    D2TripletHNC2D,
     DiluteBoseGas2D,
+    FunctionalD2HNC2D,
     GaussianPotentialBoseGas2D,
+    HNCELBoseGas2D,
     HierarchicalShellContraction,
+    JastrowHNC2D,
     RankOneDensityTransferChannel2D,
     fixed_density_gns_nested_hletta_state,
     fixed_density_nested_hletta_state,
     optimize_condensate_gns_hletta_fixed_density,
     optimize_condensate_nested_hletta_fixed_density,
+    optimize_d2_triplet_hnc,
+    optimize_gaussian_jastrow_hnc,
     optimize_nested_hletta_fixed_density,
 )
 
@@ -65,6 +71,315 @@ def test_gaussian_2d_bose_gas_bogoliubov_relations():
     assert model.bogoliubov_energy_correction_density() < 0.0
     assert model.bogoliubov_energy_density < model.mean_field_energy_density
     assert model.depletion_density() > 0.0
+
+
+def test_gaussian_real_space_potential_has_requested_fourier_weight():
+    model = GaussianPotentialBoseGas2D(
+        density=0.3,
+        interaction_strength=0.8,
+        interaction_range=0.9,
+    )
+    nodes, weights = leggauss(80)
+    cutoff = 9.0 * model.interaction_range
+    radii = 0.5 * cutoff * (nodes + 1.0)
+    radial_weights = 0.5 * cutoff * weights
+    integrated = (
+        2.0
+        * np.pi
+        * radial_weights
+        @ (radii * model.interaction_real_space(radii))
+    )
+
+    np.testing.assert_allclose(
+        integrated,
+        model.interaction_strength,
+        rtol=2.0e-14,
+        atol=2.0e-14,
+    )
+
+
+def test_hnc_zero_jastrow_is_the_uniform_condensate():
+    model = GaussianPotentialBoseGas2D(
+        density=0.4,
+        interaction_strength=0.7,
+        interaction_range=0.8,
+    )
+    state = JastrowHNC2D.gaussian(
+        model,
+        jastrow_amplitude=0.0,
+        jastrow_range=1.0,
+        quadrature_points=64,
+        tolerance=1.0e-11,
+    ).solve()
+
+    assert state.success
+    np.testing.assert_allclose(state.pair_distribution, 1.0, atol=0.0)
+    np.testing.assert_allclose(state.kinetic_energy_density, 0.0, atol=0.0)
+    np.testing.assert_allclose(
+        state.potential_energy_density,
+        model.mean_field_energy_density,
+        rtol=2.0e-13,
+        atol=2.0e-14,
+    )
+    np.testing.assert_allclose(state.structure_factor, 1.0, atol=0.0)
+
+
+def test_hnc_gaussian_jastrow_is_direct_and_quadrature_converged():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+
+    def solve(points):
+        return JastrowHNC2D.gaussian(
+            model,
+            jastrow_amplitude=0.05,
+            jastrow_range=1.5,
+            quadrature_points=points,
+            tolerance=1.0e-10,
+        ).solve()
+
+    coarse = solve(64)
+    fine = solve(96)
+
+    assert coarse.success
+    assert fine.success
+    assert fine.pair_distribution[0] < 1.0
+    assert np.min(fine.structure_factor) > 0.0
+    assert fine.kinetic_energy_density > 0.0
+    assert fine.potential_energy_density < model.mean_field_energy_density
+    assert fine.energy_density < model.mean_field_energy_density
+    np.testing.assert_allclose(
+        coarse.energy_density,
+        fine.energy_density,
+        rtol=5.0e-9,
+        atol=2.0e-10,
+    )
+
+
+def test_hnc_gaussian_jastrow_optimization_lowers_mean_field_energy():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+    state = optimize_gaussian_jastrow_hnc(
+        model,
+        optimization_quadrature_points=64,
+        quadrature_points=96,
+        tolerance=1.0e-8,
+        maxiter=50,
+    )
+
+    assert state.success
+    assert state.optimization_success
+    assert state.energy_density < model.mean_field_energy_density
+    assert state.optimized_parameters["jastrow_amplitude"] > 0.0
+    assert state.optimized_parameters["jastrow_range"] > 0.0
+
+
+def test_hncel_free_function_generates_the_phonon_tail():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+    coarse = HNCELBoseGas2D(
+        model,
+        quadrature_points=128,
+        tolerance=1.0e-9,
+    ).solve()
+    fine = HNCELBoseGas2D(
+        model,
+        quadrature_points=160,
+        tolerance=1.0e-9,
+    ).solve()
+
+    assert coarse.success
+    assert fine.success
+    assert coarse.structure_factor[0] < 0.01
+    assert abs(coarse.infrared_exponent - 1.0) < 0.02
+    assert coarse.infrared_slope_relative_spread < 0.02
+    assert coarse.jastrow_tail_amplitude > 0.0
+    assert coarse.energy_density < model.mean_field_energy_density
+    np.testing.assert_allclose(
+        coarse.energy_density,
+        fine.energy_density,
+        rtol=1.0e-5,
+        atol=3.0e-7,
+    )
+
+
+def test_free_d2_triplet_function_exposes_hnc3_boundary_runaway():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+    state = FunctionalD2HNC2D(
+        model,
+        quadrature_points=64,
+        angular_points=8,
+        structure_basis_size=16,
+        transverse_basis_size=4,
+        transverse_coefficient_bound=0.01,
+        initial_transverse_amplitude=0.005,
+    ).optimize(maxiter=80, gtol=1.0e-6)
+
+    assert state.scalar_reference.success
+    assert state.transverse_boundary_limited
+    assert not state.controlled_d2_stationary_point
+    assert not state.success
+    assert np.max(np.abs(state.transverse_coefficients)) >= 0.00999
+
+
+def test_d2_triplet_kernel_is_the_connected_virtual_cumulant():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+    state = D2TripletHNC2D.gaussian(
+        model,
+        jastrow_amplitude=0.04,
+        jastrow_range=1.4,
+        transverse_amplitude=0.08,
+        transverse_range=0.5,
+        virtual_metric=-1.0,
+        quadrature_points=32,
+        angular_points=8,
+    )
+    first = state.virtual_kernel(0.3)
+    second = state.virtual_kernel(0.9)
+
+    def boundary(matrix):
+        return matrix[0, 0]
+
+    explicit = (
+        0.5 * boundary(first @ second + second @ first)
+        - boundary(first) * boundary(second)
+    )
+    commutator = first @ second - second @ first
+
+    np.testing.assert_allclose(
+        explicit,
+        state.connected_virtual_cumulant(0.3, 0.9),
+        atol=2.0e-18,
+    )
+    assert np.linalg.norm(commutator) > 1.0e-6
+
+    positions = np.array(
+        [
+            [0.0, 0.0],
+            [0.73, 0.0],
+            [0.91 * np.cos(0.84), 0.91 * np.sin(0.84)],
+        ]
+    )
+
+    def triplet_value(coordinates):
+        first_distance = np.linalg.norm(coordinates[0] - coordinates[1])
+        second_distance = np.linalg.norm(coordinates[0] - coordinates[2])
+        third_distance = np.linalg.norm(coordinates[1] - coordinates[2])
+        return state.triplet_kernel(
+            first_distance,
+            second_distance,
+            third_distance,
+        )
+
+    step = 1.0e-4
+    numerical_laplacian = 0.0
+    for particle in range(3):
+        for direction in range(2):
+            plus = positions.copy()
+            minus = positions.copy()
+            plus[particle, direction] += step
+            minus[particle, direction] -= step
+            numerical_laplacian += (
+                triplet_value(plus)
+                - 2.0 * triplet_value(positions)
+                + triplet_value(minus)
+            ) / step**2
+    distances = (
+        np.linalg.norm(positions[0] - positions[1]),
+        np.linalg.norm(positions[0] - positions[2]),
+        np.linalg.norm(positions[1] - positions[2]),
+    )
+    np.testing.assert_allclose(
+        state.triplet_total_laplacian(*distances),
+        numerical_laplacian,
+        rtol=2.0e-6,
+        atol=2.0e-8,
+    )
+
+
+def test_d2_zero_transverse_channel_reduces_to_scalar_hnc():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+    scalar = JastrowHNC2D.gaussian(
+        model,
+        jastrow_amplitude=0.046,
+        jastrow_range=1.46,
+        quadrature_points=64,
+        tolerance=1.0e-9,
+    ).solve()
+    d2_state = D2TripletHNC2D.gaussian(
+        model,
+        jastrow_amplitude=0.046,
+        jastrow_range=1.46,
+        transverse_amplitude=0.0,
+        transverse_range=0.5,
+        quadrature_points=64,
+        tolerance=1.0e-9,
+    ).solve()
+
+    assert scalar.success
+    assert d2_state.success
+    np.testing.assert_allclose(
+        d2_state.energy_density,
+        scalar.energy_density,
+        rtol=0.0,
+        atol=1.0e-10,
+    )
+    np.testing.assert_allclose(
+        d2_state.triplet_kinetic_energy_density,
+        0.0,
+        atol=0.0,
+    )
+
+
+def test_d2_triplet_hnc_lowers_the_scalar_hnc_estimate():
+    model = GaussianPotentialBoseGas2D(
+        density=1.0,
+        interaction_strength=0.5,
+        interaction_range=0.7,
+    )
+    pair_state = JastrowHNC2D.gaussian(
+        model,
+        jastrow_amplitude=0.04633314744327184,
+        jastrow_range=1.460054540531644,
+        quadrature_points=96,
+        tolerance=1.0e-9,
+    ).solve()
+    state = optimize_d2_triplet_hnc(
+        model,
+        pair_state=pair_state,
+        optimization_quadrature_points=64,
+        optimization_angular_points=12,
+        quadrature_points=96,
+        angular_points=20,
+        tolerance=1.0e-8,
+        maxiter=35,
+    )
+
+    assert state.success
+    assert state.d2_energy_gain_density > 5.0e-5
+    assert state.triplet_kinetic_energy_density > 0.0
+    assert state.potential_energy_density < pair_state.potential_energy_density
+    assert state.optimized_parameters["transverse_amplitude"] > 0.0
 
 
 def test_exact_squeezing_minimizes_quadratic_bogoliubov_energy():

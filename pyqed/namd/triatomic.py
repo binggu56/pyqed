@@ -42,6 +42,9 @@ from pyqed.namd.keo import (
 warnings.filterwarnings("ignore", message="AM1 model is under testing")
 
 
+SQRT2 = np.sqrt(2.0)
+
+
 if njit is not None:
     @njit(cache=True)
     def _compiled_rovibronic_block_matvec(
@@ -526,11 +529,15 @@ class Triatom(Molecule):
             "jacobi": "jacobi-h-oh",
             "h-oh": "jacobi-h-oh",
             "jacobi-hoh": "jacobi-h-oh",
+            "qsqa": "qs-qa-theta",
+            "qs-qa": "qs-qa-theta",
+            "symmetric-antisymmetric": "qs-qa-theta",
         }
         coordinates = aliases.get(coordinates, coordinates)
-        if coordinates not in ("valence", "jacobi-h-oh"):
+        if coordinates not in ("valence", "jacobi-h-oh", "qs-qa-theta"):
             raise ValueError(
-                "coordinates must be 'valence' or 'jacobi-h-oh'."
+                "coordinates must be 'valence', 'jacobi-h-oh', or "
+                "'qs-qa-theta'."
             )
         return coordinates
 
@@ -538,6 +545,8 @@ class Triatom(Molecule):
     def coordinate_labels(self):
         if self.coordinates == "jacobi-h-oh":
             return ("r", "R", "gamma")
+        if self.coordinates == "qs-qa-theta":
+            return ("qs", "qa", "theta")
         return ("r1", "r2", "theta")
 
     def atom_mass_list(mol):
@@ -1447,6 +1456,12 @@ class Triatom(Molecule):
         """
         if self.coordinates == "jacobi-h-oh":
             return self._buildK_jacobi_h_oh(J=J, sparse=sparse)
+        if self.coordinates == "qs-qa-theta":
+            return self.buildK_qs_qa_theta_from_product_terms(
+                J=J,
+                sparse=sparse,
+                symmetrize=True,
+            )
 
         J = self.J if J is None else int(J)
         if J > 0:
@@ -1456,7 +1471,11 @@ class Triatom(Molecule):
                 )
             return self.build_rovibrational_keo(J=J, verbose=True)
 
-        self.M_end1, self.M_center, self.M_end2 = self.mass[0], self.mass[1], self.mass[2]
+        self.M_end1, self.M_center, self.M_end2 = (
+            self.mass[0],
+            self.mass[1],
+            self.mass[2],
+        )
         M_Y, M_X1, M_X2 = self.M_center, self.M_end1, self.M_end2
         dvrs = self.dvrs
 
@@ -1686,6 +1705,351 @@ class Triatom(Molecule):
             block = coef * kron3(A, B, C)
             T = block if T is None else T + block
         return T.tocsr() if sparse else T
+
+    def buildK_product_mpo(self, J=None, max_rank=None, symmetrize=False):
+        """Return the J=0 valence-coordinate product-term KEO as an MPO."""
+        from pyqed.mps.mpo import sop_to_mpo
+
+        if self.coordinates == "qs-qa-theta":
+            terms = self.buildK_qs_qa_theta_terms(
+                J=J,
+                sparse=False,
+                symmetrize=symmetrize,
+            )
+            return sop_to_mpo(self.nx, terms, max_rank=max_rank)
+        if self.coordinates != "valence":
+            raise NotImplementedError(
+                "Product-term KEO MPO is currently implemented for valence "
+                "and q_s/q_a/theta triatomic coordinates."
+            )
+        terms = self.buildK_product_terms(
+            J=J,
+            sparse=False,
+            symmetrize=symmetrize,
+        )
+        return sop_to_mpo(self.nx, terms, max_rank=max_rank)
+
+    def buildK_qsqa_terms(
+        self,
+        dvrs,
+        J=None,
+        sparse=False,
+        symmetrize=False,
+        svd_tol=0.0,
+    ):
+        r"""Return the valence KEO transformed to ``(q_s, theta, q_a)``.
+
+        The coordinate map is
+
+        .. math::
+
+            r_1 = (q_s + q_a) / \sqrt{2}, \qquad
+            r_2 = (q_s - q_a) / \sqrt{2}.
+
+        The returned SOP terms use site order ``(q_s, theta, q_a)`` and the
+        same sandwich ordering as :meth:`buildK_product_terms`.  Coefficients
+        depending jointly on ``(q_s, q_a)`` are represented by an SVD sum of
+        diagonal factors on those two sites.
+        """
+        J = self.J if J is None else int(J)
+        if J > 0:
+            raise NotImplementedError(
+                "Transformed product-term KEO is not implemented for J > 0."
+            )
+        if self.coordinates not in ("valence", "qs-qa-theta"):
+            raise NotImplementedError(
+                "Transformed q_s/q_a KEO is currently implemented for valence "
+                "triatomic coordinates."
+            )
+        dvrs = tuple(dvrs)
+        if len(dvrs) != 3:
+            raise ValueError("dvrs must be ordered as (q_s, theta, q_a).")
+
+        self.M_end1, self.M_center, self.M_end2 = self.mass[0], self.mass[1], self.mass[2]
+        M_Y, M_X1, M_X2 = self.M_center, self.M_end1, self.M_end2
+
+        def momentum_matrix(dvr):
+            if sparse:
+                try:
+                    return dvr.momentum(sparse=True)
+                except TypeError:
+                    return sp.csr_matrix(dvr.momentum())
+            return dvr.momentum()
+
+        def eye(n):
+            if sparse:
+                return sp.eye(n, format="csr", dtype=complex)
+            return np.eye(n, dtype=complex)
+
+        def diag(values):
+            values = np.asarray(values, dtype=complex)
+            if sparse:
+                return sp.diags(values, format="csr")
+            return np.diag(values)
+
+        def matmul(*ops):
+            out = ops[0]
+            for op in ops[1:]:
+                out = out @ op
+            return out
+
+        def adjoint(op):
+            return op.getH() if sp.issparse(op) else op.conj().T
+
+        def finite_diagonal(values, label):
+            values = np.asarray(values, dtype=float)
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{label} contains non-finite values.")
+            return values
+
+        p_s = momentum_matrix(dvrs[0])
+        p_th = momentum_matrix(dvrs[1])
+        p_a = momentum_matrix(dvrs[2])
+
+        qs_grid = np.asarray(dvrs[0].x, dtype=float)
+        th_grid = np.asarray(dvrs[1].x, dtype=float)
+        qa_grid = np.asarray(dvrs[2].x, dtype=float)
+        if qs_grid.ndim != 1 or th_grid.ndim != 1 or qa_grid.ndim != 1:
+            raise ValueError("All DVR grids must be one-dimensional.")
+
+        q_s, q_a = np.meshgrid(qs_grid, qa_grid, indexing="ij")
+        r1 = finite_diagonal((q_s + q_a) / SQRT2, "r1(q_s,q_a)")
+        r2 = finite_diagonal((q_s - q_a) / SQRT2, "r2(q_s,q_a)")
+        if np.any(r1 <= 0.0) or np.any(r2 <= 0.0):
+            raise ValueError(
+                "The q_s/q_a grid maps outside positive valence bond lengths."
+            )
+
+        I_s = eye(len(qs_grid))
+        I_th = eye(len(th_grid))
+        I_a = eye(len(qa_grid))
+        D_cos = diag(np.cos(th_grid))
+        D_sin = diag(np.sin(th_grid))
+        D_csc_metric = diag(1.0 + 1.0 / np.sin(th_grid) ** 2)
+
+        inv_mu1 = 1.0 / M_X1 + 1.0 / M_Y
+        inv_mu2 = 1.0 / M_X2 + 1.0 / M_Y
+        inv_mu_sum = inv_mu1 + inv_mu2
+        inv_mu_diff = inv_mu1 - inv_mu2
+        terms = []
+
+        def add(label, coef, A, B, C):
+            coef = complex(coef)
+            if coef == 0.0:
+                return
+            terms.append((label, coef, A, B, C))
+
+        def split_qsqa(values, label):
+            values = np.asarray(values, dtype=float)
+            if values.shape != (len(qs_grid), len(qa_grid)):
+                raise ValueError(f"{label} has shape {values.shape}.")
+            u, singular_values, vh = np.linalg.svd(values, full_matrices=False)
+            if singular_values.size == 0:
+                return
+            cutoff = float(svd_tol) * float(singular_values[0])
+            for rank, singular_value in enumerate(singular_values):
+                if singular_value <= cutoff:
+                    continue
+                yield rank, float(singular_value), diag(u[:, rank]), diag(vh[rank])
+
+        def add_qsqa(label, coef, values, theta_op, s_left=None, a_left=None):
+            for rank, weight, D_s, D_a in split_qsqa(values, label):
+                A = D_s if s_left is None else matmul(s_left, D_s)
+                C = D_a if a_left is None else matmul(a_left, D_a)
+                add(f"{label}_svd{rank}", coef * weight, A, theta_op, C)
+
+        def add_qsqa_right(label, coef, values, theta_op, s_right=None, a_right=None):
+            for rank, weight, D_s, D_a in split_qsqa(values, label):
+                A = D_s if s_right is None else matmul(D_s, s_right)
+                C = D_a if a_right is None else matmul(D_a, a_right)
+                add(f"{label}_svd{rank}", coef * weight, A, theta_op, C)
+
+        r1_inv = 1.0 / r1
+        r2_inv = 1.0 / r2
+        r1_inv2 = r1_inv**2
+        r2_inv2 = r2_inv**2
+        r12_inv = r1_inv * r2_inv
+        r_inv_sum = r1_inv + r2_inv
+        r_inv_diff = r2_inv - r1_inv
+
+        # G_ss and G_aa: 0.5 * p_i^dagger G_ii p_i.
+        add(
+            "ps_Gss_const_ps",
+            0.25 * inv_mu_sum,
+            matmul(adjoint(p_s), p_s),
+            I_th,
+            I_a,
+        )
+        add("ps_Gss_cos_ps", 0.5 / M_Y, matmul(adjoint(p_s), p_s), D_cos, I_a)
+        add(
+            "pa_Gaa_const_pa",
+            0.25 * inv_mu_sum,
+            I_s,
+            I_th,
+            matmul(adjoint(p_a), p_a),
+        )
+        add("pa_Gaa_cos_pa", -0.5 / M_Y, I_s, D_cos, matmul(adjoint(p_a), p_a))
+
+        # G_sa = (G_11 - G_22) / 2, included for non-identical terminal atoms.
+        g_sa = 0.5 * inv_mu_diff
+        add("ps_Gsa_pa", 0.5 * g_sa, adjoint(p_s), I_th, p_a)
+        add("pa_Gas_ps", 0.5 * g_sa, p_s, I_th, adjoint(p_a))
+
+        # Theta kinetic: 0.5 * p_theta^dagger G_thetatheta p_theta.
+        add_qsqa(
+            "pth_Gtt_r1_pth",
+            0.5 * inv_mu1,
+            r1_inv2,
+            matmul(adjoint(p_th), p_th),
+        )
+        add_qsqa(
+            "pth_Gtt_r2_pth",
+            0.5 * inv_mu2,
+            r2_inv2,
+            matmul(adjoint(p_th), p_th),
+        )
+        add_qsqa(
+            "pth_Gtt_r12_pth",
+            -1.0 / M_Y,
+            r12_inv,
+            matmul(adjoint(p_th), D_cos, p_th),
+        )
+
+        # Stretch/bend couplings.
+        add_qsqa(
+            "ps_Gst_pth",
+            -0.5 / (SQRT2 * M_Y),
+            r_inv_sum,
+            matmul(D_sin, p_th),
+            s_left=adjoint(p_s),
+        )
+        add_qsqa_right(
+            "pth_Gts_ps",
+            -0.5 / (SQRT2 * M_Y),
+            r_inv_sum,
+            matmul(adjoint(p_th), D_sin),
+            s_right=p_s,
+        )
+        add_qsqa(
+            "pa_Gat_pth",
+            -0.5 / (SQRT2 * M_Y),
+            r_inv_diff,
+            matmul(D_sin, p_th),
+            a_left=adjoint(p_a),
+        )
+        add_qsqa_right(
+            "pth_Gta_pa",
+            -0.5 / (SQRT2 * M_Y),
+            r_inv_diff,
+            matmul(adjoint(p_th), D_sin),
+            a_right=p_a,
+        )
+
+        # Metric potential after the orthogonal r1/r2 -> q_s/q_a transform.
+        add_qsqa("V_metric_r1", -0.125 * inv_mu1, r1_inv2, D_csc_metric)
+        add_qsqa("V_metric_r2", -0.125 * inv_mu2, r2_inv2, D_csc_metric)
+        add_qsqa(
+            "V_metric_r12_csc",
+            0.25 / M_Y,
+            r12_inv,
+            matmul(D_cos, D_csc_metric),
+        )
+        add_qsqa("V_metric_r12_cos", -0.5 / M_Y, r12_inv, D_cos)
+
+        if symmetrize:
+            hermitian_terms = []
+            for label, coef, A, B, C in terms:
+                hermitian_terms.append((label, 0.5 * coef, A, B, C))
+                hermitian_terms.append(
+                    (
+                        f"{label}_adjoint",
+                        0.5 * coef.conjugate(),
+                        adjoint(A),
+                        adjoint(B),
+                        adjoint(C),
+                    )
+                )
+            terms = hermitian_terms
+
+        return terms
+
+    def buildK_qsqa_mpo(
+        self,
+        dvrs,
+        J=None,
+        max_rank=None,
+        symmetrize=False,
+        svd_tol=0.0,
+    ):
+        """Return the transformed J=0 KEO MPO in ``(q_s, theta, q_a)`` order."""
+        from pyqed.mps.mpo import sop_to_mpo
+
+        dvrs = tuple(dvrs)
+        terms = self.buildK_qsqa_terms(
+            dvrs,
+            J=J,
+            sparse=False,
+            symmetrize=symmetrize,
+            svd_tol=svd_tol,
+        )
+        dims = tuple(int(dvr.npts) for dvr in dvrs)
+        return sop_to_mpo(dims, terms, max_rank=max_rank)
+
+    def buildK_qs_qa_theta_terms(
+        self,
+        J=None,
+        sparse=False,
+        symmetrize=False,
+        svd_tol=0.0,
+    ):
+        """Return transformed KEO terms ordered as ``(q_s, q_a, theta)``."""
+        if self.coordinates != "qs-qa-theta":
+            raise ValueError(
+                "buildK_qs_qa_theta_terms requires coordinates='qs-qa-theta'."
+            )
+        qs_axis, qa_axis, theta_axis = self.dvrs
+        terms = self.buildK_qsqa_terms(
+            (qs_axis, theta_axis, qa_axis),
+            J=J,
+            sparse=sparse,
+            symmetrize=symmetrize,
+            svd_tol=svd_tol,
+        )
+        return [
+            (label, coefficient, qs_operator, qa_operator, theta_operator)
+            for label, coefficient, qs_operator, theta_operator, qa_operator
+            in terms
+        ]
+
+    def buildK_qs_qa_theta_from_product_terms(
+        self,
+        J=None,
+        sparse=False,
+        symmetrize=False,
+        svd_tol=0.0,
+    ):
+        """Materialize the transformed KEO in ``(q_s, q_a, theta)`` order."""
+        terms = self.buildK_qs_qa_theta_terms(
+            J=J,
+            sparse=sparse,
+            symmetrize=symmetrize,
+            svd_tol=svd_tol,
+        )
+
+        def kron3(A, B, C):
+            if sparse:
+                return sp.kron(
+                    A,
+                    sp.kron(B, C, format="csr"),
+                    format="csr",
+                )
+            return np.kron(A, np.kron(B, C))
+
+        kinetic = None
+        for _label, coefficient, A, B, C in terms:
+            block = coefficient * kron3(A, B, C)
+            kinetic = block if kinetic is None else kinetic + block
+        return kinetic.tocsr() if sparse else kinetic
 
     def applyK_product_terms(
         self,
@@ -2886,6 +3250,8 @@ class Triatom(Molecule):
         For ``coordinates='jacobi-h-oh'``, ``(q0, q1, q2) = (r, R, gamma)``
         in the H + OH arrangement.  The atom order is always the molecule atom
         order, typically ``[H, O, H]`` for the H2O examples.
+        For ``coordinates='qs-qa-theta'``, the coordinates are the symmetric
+        stretch, antisymmetric stretch, and valence angle.
         """
         if self.coordinates == "jacobi-h-oh":
             r, R, gamma = q0, q1, q2
@@ -2895,6 +3261,15 @@ class Triatom(Molecule):
             B = np.array([-m_c / m_bc * r, 0.0, 0.0])
             C = np.array([m_b / m_bc * r, 0.0, 0.0])
             A = np.array([R * np.cos(gamma), R * np.sin(gamma), 0.0])
+            return np.array([A, B, C])
+
+        if self.coordinates == "qs-qa-theta":
+            qs, qa, theta = q0, q1, q2
+            r1 = (qs + qa) / SQRT2
+            r2 = (qs - qa) / SQRT2
+            B = np.array([0.0, 0.0, 0.0])
+            A = np.array([r1, 0.0, 0.0])
+            C = np.array([r2 * np.cos(theta), r2 * np.sin(theta), 0.0])
             return np.array([A, B, C])
 
         r1, r2, theta = q0, q1, q2

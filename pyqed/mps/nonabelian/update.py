@@ -13,9 +13,14 @@ import numpy as np
 
 from pyqed.mps.su2 import SpinChargeSector, fuse_charge_spin_sectors
 
-from .contraction import merge_mps_sites, normalize_site_tensor_layout
+from .contraction import (
+    merge_mps_sites,
+    normalize_site_tensor_layout,
+    split_mps_sites_from_packed,
+)
 from .decompose import state_averaged_svd_two_site, svd_two_site
 from .linalg import sector_state_weight
+from .renormalized import FactorizedRouteMetricBlock, KroneckerMetricBlock
 from .solver import LocalOperator, TwoSiteEffectiveH, solve_local_two_site
 from .tensor import FusionPipe, FusionPipeEntry, FusionLeg
 from .tensor import NonabelianTensor
@@ -27,6 +32,9 @@ def _sector_dim_from_data(tensor, axis):
         dims.setdefault(key[axis], int(block.shape[axis]))
     for sector in tensor.qns[axis]:
         if sector in dims:
+            continue
+        if axis == 1 and (tensor.metadata or {}).get("physical_basis") == "fully_reduced_su2":
+            dims[sector] = 1
             continue
         dim = getattr(sector, "dim", None)
         dims[sector] = int(dim) if dim is not None else 1
@@ -73,6 +81,20 @@ def _expand_two_site_support(A, B, merged):
     phys2_dims = _sector_dim_from_data(B, 1)
 
     data = {key: np.array(block, copy=True) for key, block in merged.data.items()}
+    channel_blocks_current = bool(
+        merged.metadata.get("contracted_channel_blocks_current", False)
+    )
+    channel_blocks = (
+        {
+            tuple(key): np.array(block, copy=True)
+            for key, block in merged.metadata.get(
+                "contracted_channel_blocks",
+                {},
+            ).items()
+        }
+        if channel_blocks_current
+        else {}
+    )
     seeded_channel_map = {}
     channel_map = defaultdict(set)
     for key, value in merged.metadata.get("contracted_channels", {}).items():
@@ -147,6 +169,25 @@ def _expand_two_site_support(A, B, merged):
         for key, channels in sorted(channel_map.items())
     }
     metadata["contracted_channels"] = contracted_channels
+    if channel_blocks_current:
+        for key, channels in contracted_channels.items():
+            shape = tuple(int(dim) for dim in data[key].shape)
+            for q_mid in channels:
+                channel_key = (
+                    key[0],
+                    key[1],
+                    q_mid,
+                    key[2],
+                    key[3],
+                )
+                channel_blocks.setdefault(
+                    channel_key,
+                    np.zeros(shape, dtype=np.asarray(data[key]).dtype),
+                )
+        metadata["contracted_channel_blocks"] = channel_blocks
+        metadata["contracted_channel_blocks_current"] = True
+    else:
+        metadata["contracted_channel_blocks_current"] = False
     if projected_weight > 0.0:
         metadata["projected_invalid_weight"] = projected_weight
 
@@ -306,6 +347,288 @@ def _prefer_reduced_local_operator(operator, norm_operator=None):
     return operator, norm_operator
 
 
+def _component_problem_metric_factors(problem):
+    """Recover compact boundary factors retained by a component metric basis."""
+
+    component_basis = getattr(problem, "component_basis", None)
+    if component_basis is None:
+        return None, None
+    basis = component_basis.parent_basis
+    entries = tuple(basis)
+
+    def entry_at(index):
+        index = int(index)
+        for entry_idx, entry in enumerate(entries):
+            if int(entry.offset) <= index < int(entry.offset) + int(entry.size):
+                return entry_idx, entry
+        return None, None
+
+    factor_blocks = {}
+    factor_routes = []
+    dense_components = []
+    for indices, metric_block in zip(
+        component_basis.component_indices,
+        component_basis.metric_blocks,
+    ):
+        indices = np.asarray(indices, dtype=int)
+        if isinstance(metric_block, KroneckerMetricBlock):
+            _entry_idx, entry = entry_at(indices[0])
+            if entry is not None and int(indices.size) == int(entry.size):
+                factor_blocks[entry.key] = (
+                    metric_block.left,
+                    metric_block.right,
+                )
+            continue
+        if isinstance(metric_block, np.ndarray):
+            _entry_idx, entry = entry_at(indices[0])
+            if (
+                entry is not None
+                and int(indices.size) == int(entry.size)
+                and np.array_equal(
+                    indices,
+                    np.arange(
+                        int(entry.offset),
+                        int(entry.offset) + int(entry.size),
+                    ),
+                )
+            ):
+                d_left, d_phys1, d_phys2, d_right = (
+                    int(value) for value in entry.shape
+                )
+                dense = np.asarray(metric_block).reshape(
+                    d_left,
+                    d_phys1,
+                    d_phys2,
+                    d_right,
+                    d_left,
+                    d_phys1,
+                    d_phys2,
+                    d_right,
+                )
+                virtual = np.zeros(
+                    (d_left, d_right, d_left, d_right),
+                    dtype=dense.dtype,
+                )
+                for p1 in range(d_phys1):
+                    for p2 in range(d_phys2):
+                        virtual += dense[:, p1, p2, :, :, p1, p2, :]
+                virtual /= float(d_phys1 * d_phys2)
+                left = np.einsum("aqbq->ab", virtual, optimize=True)
+                right = np.einsum("aqas->qs", virtual, optimize=True)
+                trace = float(np.real(np.trace(left)))
+                if trace > 1.0e-14:
+                    scale = np.sqrt(trace)
+                    left = left / scale
+                    right = right / scale
+                    reconstructed = np.kron(
+                        np.kron(
+                            np.kron(left, np.eye(d_phys1)),
+                            np.eye(d_phys2),
+                        ),
+                        right,
+                    )
+                    if np.allclose(
+                        reconstructed,
+                        metric_block,
+                        rtol=1.0e-10,
+                        atol=1.0e-12,
+                    ):
+                        factor_blocks[entry.key] = (left, right)
+            dense_components.append((indices, np.asarray(metric_block)))
+            continue
+        if not isinstance(metric_block, FactorizedRouteMetricBlock):
+            continue
+        for (
+            in_slice,
+            out_slice,
+            _in_shape,
+            _out_shape,
+            left,
+            right,
+        ) in metric_block.routes:
+            in_global = int(indices[int(in_slice.start)])
+            out_global = int(indices[int(out_slice.start)])
+            in_idx, in_entry = entry_at(in_global)
+            out_idx, out_entry = entry_at(out_global)
+            if in_entry is None or out_entry is None:
+                continue
+            factor_routes.append(
+                (
+                    int(in_idx),
+                    int(out_idx),
+                    in_entry,
+                    out_entry,
+                    left,
+                    right,
+                )
+            )
+
+    dense_edges = []
+    for indices, metric_block in dense_components:
+        local_position = {
+            int(global_index): int(local_index)
+            for local_index, global_index in enumerate(indices)
+        }
+        component_entries = []
+        for entry_idx, entry in enumerate(entries):
+            global_indices = tuple(
+                range(
+                    int(entry.offset),
+                    int(entry.offset) + int(entry.size),
+                )
+            )
+            if all(index in local_position for index in global_indices):
+                component_entries.append(
+                    (
+                        int(entry_idx),
+                        entry,
+                        np.asarray(
+                            [local_position[index] for index in global_indices],
+                            dtype=int,
+                        ),
+                    )
+                )
+        for in_idx, in_entry, in_positions in component_entries:
+            for out_idx, out_entry, out_positions in component_entries:
+                in_physical = (
+                    in_entry.key[1:4]
+                    if len(in_entry.key) == 5
+                    else in_entry.key[1:3]
+                )
+                out_physical = (
+                    out_entry.key[1:4]
+                    if len(out_entry.key) == 5
+                    else out_entry.key[1:3]
+                )
+                if in_physical != out_physical:
+                    continue
+                block = metric_block[np.ix_(out_positions, in_positions)]
+                if np.linalg.norm(block.reshape(-1)) <= 1.0e-14:
+                    continue
+                dl_out, dp1_out, dp2_out, dr_out = (
+                    int(value) for value in out_entry.shape
+                )
+                dl_in, dp1_in, dp2_in, dr_in = (
+                    int(value) for value in in_entry.shape
+                )
+                if dp1_out != dp1_in or dp2_out != dp2_in:
+                    continue
+                tensor = block.reshape(
+                    dl_out,
+                    dp1_out,
+                    dp2_out,
+                    dr_out,
+                    dl_in,
+                    dp1_in,
+                    dp2_in,
+                    dr_in,
+                )
+                virtual = np.zeros(
+                    (dl_out, dr_out, dl_in, dr_in),
+                    dtype=tensor.dtype,
+                )
+                for p1 in range(dp1_out):
+                    for p2 in range(dp2_out):
+                        virtual += tensor[:, p1, p2, :, :, p1, p2, :]
+                virtual /= float(dp1_out * dp2_out)
+                rearranged = virtual.transpose(0, 2, 1, 3).reshape(
+                    dl_out * dl_in,
+                    dr_out * dr_in,
+                )
+                if np.linalg.norm(rearranged) <= 1.0e-14:
+                    continue
+                left_key = (out_entry.key[0], in_entry.key[0])
+                right_key = (out_entry.key[-1], in_entry.key[-1])
+                dense_edges.append(
+                    {
+                        "left_key": left_key,
+                        "right_key": right_key,
+                        "matrix": rearranged,
+                        "left_shape": (dl_out, dl_in),
+                        "right_shape": (dr_out, dr_in),
+                        "in_idx": in_idx,
+                        "out_idx": out_idx,
+                        "in_entry": in_entry,
+                        "out_entry": out_entry,
+                    }
+                )
+
+    if dense_edges:
+        left_vectors = {}
+        right_vectors = {}
+        remaining = set(range(len(dense_edges)))
+        while remaining:
+            progressed = False
+            for edge_idx in tuple(remaining):
+                edge = dense_edges[edge_idx]
+                matrix = edge["matrix"]
+                left_key = edge["left_key"]
+                right_key = edge["right_key"]
+                left_vector = left_vectors.get(left_key)
+                right_vector = right_vectors.get(right_key)
+                if left_vector is not None:
+                    denom = float(np.vdot(left_vector, left_vector).real)
+                    if denom <= 1.0e-15:
+                        continue
+                    candidate = left_vector.conj() @ matrix / denom
+                    if right_vector is None:
+                        right_vectors[right_key] = candidate
+                    remaining.remove(edge_idx)
+                    progressed = True
+                elif right_vector is not None:
+                    denom = float(np.vdot(right_vector, right_vector).real)
+                    if denom <= 1.0e-15:
+                        continue
+                    candidate = matrix @ right_vector.conj() / denom
+                    left_vectors[left_key] = candidate
+                    remaining.remove(edge_idx)
+                    progressed = True
+            if progressed:
+                continue
+            edge_idx = next(iter(remaining))
+            edge = dense_edges[edge_idx]
+            u, singular_values, vh = np.linalg.svd(
+                edge["matrix"],
+                full_matrices=False,
+            )
+            if singular_values.size == 0 or float(singular_values[0]) <= 1.0e-15:
+                remaining.remove(edge_idx)
+                continue
+            scale = np.sqrt(float(singular_values[0]))
+            left_vectors[edge["left_key"]] = u[:, 0] * scale
+            right_vectors[edge["right_key"]] = vh[0, :] * scale
+
+        for edge in dense_edges:
+            left_vector = left_vectors.get(edge["left_key"])
+            right_vector = right_vectors.get(edge["right_key"])
+            if left_vector is None or right_vector is None:
+                continue
+            left_vector = np.real_if_close(left_vector, tol=1000)
+            right_vector = np.real_if_close(right_vector, tol=1000)
+            reconstructed = left_vector[:, None] * right_vector[None, :]
+            if not np.allclose(
+                reconstructed,
+                edge["matrix"],
+                rtol=1.0e-9,
+                atol=1.0e-11,
+            ):
+                continue
+            factor_routes.append(
+                (
+                    edge["in_idx"],
+                    edge["out_idx"],
+                    edge["in_entry"],
+                    edge["out_entry"],
+                    left_vector.reshape(edge["left_shape"]),
+                    right_vector.reshape(edge["right_shape"]),
+                )
+            )
+    return (
+        (None if factor_routes else (factor_blocks or None)),
+        tuple(factor_routes) if factor_routes else None,
+    )
+
+
 def _project_guess_to_merged_layout(guess, merged):
     """
     Project a cached rank-4 guess tensor onto the current merged layout.
@@ -377,6 +700,7 @@ def two_site_update(
     A,
     B,
     *,
+    merged_two_site=None,
     optimized_two_site=None,
     solver=None,
     local_operator=None,
@@ -388,8 +712,10 @@ def two_site_update(
     max_bond=None,
     max_bond_mode="reduced",
     cutoff=1e-10,
+    retain_sector_topology=False,
     absorb="right",
     profile=False,
+    lifecycle_owner=None,
 ):
     """
     Perform one minimal non-Abelian two-site update step.
@@ -403,6 +729,9 @@ def two_site_update(
     optimized_two_site
         Optional rank-4 merged two-site tensor to split back into updated site
         tensors. If omitted, the current merged tensor is reused.
+    merged_two_site
+        Optional precontracted current two-site tensor. The C++ sweep owner uses
+        this to avoid repeating the active-bond merge in Python.
     solver
         Optional callable taking the current merged two-site tensor and
         returning either an optimized merged tensor, ``(tensor, objective)``,
@@ -442,7 +771,18 @@ def two_site_update(
     total_t0 = time.perf_counter() if profile else None
 
     t0 = time.perf_counter() if profile else None
-    merged = _expand_two_site_support(A, B, merge_mps_sites(A, B))
+    if merged_two_site is not None:
+        if (
+            not isinstance(merged_two_site, NonabelianTensor)
+            or merged_two_site.rank != 4
+        ):
+            raise ValueError(
+                "merged_two_site must be a rank-4 NonabelianTensor."
+            )
+        current_merged = merged_two_site
+    else:
+        current_merged = merge_mps_sites(A, B)
+    merged = _expand_two_site_support(A, B, current_merged)
     if profile:
         timing["merge_expand"] += time.perf_counter() - t0
 
@@ -497,6 +837,10 @@ def two_site_update(
             profile=profile,
             **solver_kwargs,
         )
+        del operator_spec, norm_operator
+        if lifecycle_owner is not None:
+            lifecycle_owner.release_operator_numeric()
+            lifecycle_owner.clear_local_operator()
         if profile:
             timing["local_solve"] += time.perf_counter() - t0
     elif optimized_two_site is not None:
@@ -506,7 +850,23 @@ def two_site_update(
 
     if not isinstance(optimized, NonabelianTensor) or optimized.rank != 4:
         raise ValueError("two_site_update requires a rank-4 NonabelianTensor as the optimized two-site tensor.")
-    if optimized is not merged:
+    split_owner = (
+        None
+        if lifecycle_owner is None
+        else getattr(lifecycle_owner, "su2_moving_environment", None)
+    )
+    cpp_bond_transaction = bool(
+        split_owner is not None
+        and hasattr(split_owner, "stage_bond_update")
+    )
+    if lifecycle_owner is not None and not cpp_bond_transaction:
+        lifecycle_owner.mark_bond_solved()
+    if (
+        optimized is not merged
+        and not bool(
+            local_objective.get("cpp_active_solution_owned", False)
+        )
+    ):
         t0 = time.perf_counter() if profile else None
         optimized = _expand_two_site_support(A, B, optimized)
         if profile:
@@ -515,7 +875,56 @@ def two_site_update(
     optimized_roots = None
     if isinstance(local_objective, dict):
         optimized_roots = local_objective.pop("optimized_roots", None)
-    if optimized_roots is not None:
+    cpp_split_result = None
+    cpp_split_staged = False
+    direct_cpp_split = (
+        optimized_roots is None
+        and isinstance(local_objective, dict)
+        and bool(
+            local_objective.get("direct_complementary_action_executor", False)
+        )
+        and split_owner is not None
+        and callable(
+            getattr(split_owner, "active_bond_solution_ready", None)
+        )
+        and callable(
+            getattr(split_owner, "split_active_bond_solution", None)
+        )
+        and split_owner.active_bond_solution_ready()
+    )
+    if direct_cpp_split:
+        root_site_pairs = None
+        t0 = time.perf_counter() if profile else None
+        cpp_split_result = split_owner.split_active_bond_solution(
+            cutoff=float(cutoff),
+            max_bond=max_bond,
+            max_bond_mode=max_bond_mode,
+            retain_sector_topology=bool(retain_sector_topology),
+            absorb=absorb,
+        )
+        left, right, singular_values = split_mps_sites_from_packed(
+            A,
+            B,
+            cpp_split_result,
+        )
+        active_bond = int(split_owner.active_bond)
+        split_owner.record_cpp_split_site(
+            active_bond,
+            left,
+            cpp_split_result["left_revision"],
+        )
+        split_owner.record_cpp_split_site(
+            active_bond + 1,
+            right,
+            cpp_split_result["right_revision"],
+        )
+        trunc_err = float(cpp_split_result["truncation_error"])
+        kept = int(np.sum(cpp_split_result["bond_dims"]))
+        cpp_split_staged = True
+        local_objective["cpp_active_bond_split"] = True
+        if profile:
+            timing["svd"] += time.perf_counter() - t0
+    elif optimized_roots is not None:
         t0 = time.perf_counter() if profile else None
         optimized_roots = [
             _expand_two_site_support(A, B, root) if root is not merged else root
@@ -544,6 +953,7 @@ def two_site_update(
             max_bond=max_bond,
             max_bond_mode=max_bond_mode,
             cutoff=cutoff,
+            retain_sector_topology=retain_sector_topology,
             absorb=absorb,
         )
         if profile:
@@ -552,13 +962,24 @@ def two_site_update(
     else:
         root_site_pairs = None
         t0 = time.perf_counter() if profile else None
+        # Component metrics belong to the transient Davidson coordinates.
+        # Feeding them into only the bonds that use a component-local solver
+        # creates a mixed persistent MPS gauge when a larger bond falls back
+        # to the generalized solver.  Always split the returned parent tensor
+        # in the chain's reduced canonical metric.
         left, right, singular_values, trunc_err, kept = svd_two_site(
             optimized,
             bond_coupling=bond_coupling,
             max_bond=max_bond,
             max_bond_mode=max_bond_mode,
             cutoff=cutoff,
+            retain_sector_topology=retain_sector_topology,
             absorb=absorb,
+            sweep_engine=(
+                None
+                if lifecycle_owner is None
+                else getattr(lifecycle_owner, "su2_moving_environment", None)
+            ),
         )
         if profile:
             timing["svd"] += time.perf_counter() - t0
@@ -566,8 +987,91 @@ def two_site_update(
         sector_state_weight(q_mid) * int(block.shape[0])
         for q_mid, block in singular_values.items()
     )
+    if lifecycle_owner is not None:
+        if cpp_bond_transaction and not cpp_split_staged:
+            try:
+                split_owner.stage_bond_update(
+                    left,
+                    right,
+                    kept_states=int(kept_states),
+                    truncation_seconds=(
+                        float(timing["svd"]) if profile else 0.0
+                    ),
+                )
+            except ValueError as error:
+                maximum_imaginary = max(
+                    (
+                        float(np.max(np.abs(np.asarray(block).imag)))
+                        for tensor in (left, right)
+                        for block in tensor.data.values()
+                        if np.iscomplexobj(block) and np.asarray(block).size
+                    ),
+                    default=0.0,
+                )
+                raise ValueError(
+                    "C++ split-site staging failed at bond "
+                    f"{int(split_owner.active_bond)} "
+                    f"(maximum imaginary value {maximum_imaginary:.3e})."
+                ) from error
+        elif not cpp_split_staged and (
+            split_owner is not None
+            and hasattr(split_owner, "install_split_site")
+        ):
+            active_bond = int(split_owner.active_bond)
+            split_owner.install_split_site(active_bond, left)
+            split_owner.install_split_site(active_bond + 1, right)
+        if not cpp_bond_transaction:
+            lifecycle_owner.mark_bond_split(
+                int(kept_states),
+                float(timing["svd"]) if profile else 0.0,
+            )
     if isinstance(local_objective, dict):
         local_objective = dict(local_objective)
+        if profile and optimized_roots is None:
+            reconstructed = merge_mps_sites(left, right)
+            optimized_blocks = (
+                optimized.metadata.get("contracted_channel_blocks", {})
+                if optimized.metadata.get(
+                    "contracted_channel_blocks_current",
+                    False,
+                )
+                else optimized.data
+            )
+            reconstructed_blocks = (
+                reconstructed.metadata.get("contracted_channel_blocks", {})
+                if reconstructed.metadata.get(
+                    "contracted_channel_blocks_current",
+                    False,
+                )
+                else reconstructed.data
+            )
+            difference_sq = 0.0
+            reference_sq = 0.0
+            for key in set(optimized_blocks) | set(reconstructed_blocks):
+                optimized_block = np.asarray(optimized_blocks.get(key, 0.0))
+                reconstructed_block = np.asarray(
+                    reconstructed_blocks.get(key, 0.0)
+                )
+                difference_sq += float(
+                    np.linalg.norm(
+                        reconstructed_block - optimized_block
+                    ) ** 2
+                )
+                reference_sq += float(np.linalg.norm(optimized_block) ** 2)
+            local_objective["split_reconstruction_error"] = float(
+                np.sqrt(difference_sq)
+            )
+            local_objective["split_relative_reconstruction_error"] = float(
+                np.sqrt(difference_sq / max(reference_sq, 1.0e-300))
+            )
+        local_objective.setdefault(
+            "metric_weighted_split",
+            bool(
+                left.metadata.get("canonical_metric") == "factorized_boundary"
+                or right.metadata.get("canonical_metric")
+                == "factorized_boundary"
+            ),
+        )
         local_objective.setdefault("trunc_err", float(trunc_err))
         if isinstance(kept, dict):
             objective_kept = {key: list(value) for key, value in kept.items()}

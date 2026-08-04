@@ -47,6 +47,7 @@ from .mpo import (
     RankCoupledChannelTerm,
     RankCoupledMPO,
     as_rank_coupled_mpo,
+    compress_rank_coupled_mpo_chain,
     direct_sum_rank_coupled_mpo,
     sum_mpo_chains,
 )
@@ -78,6 +79,7 @@ from .operators import (
 )
 from .models import (
     SpatialSpinFreeERIBuilder,
+    add_cpp_spatial_spinfree_family_terms,
     add_spatial_one_body_terms,
     build_spatial_one_body_reduced_mpo,
     add_spatial_spinfree_eri_terms,
@@ -172,6 +174,7 @@ from .renormalized import (
     SymbolicRenormalizedOperatorTerm,
     symbolic_mpo_core_transitions,
 )
+from .su2_qchem_plan import SU2OperatorEngine
 from .environment import (
     DenseEnvironmentChain,
     DenseEnvironmentSweep,

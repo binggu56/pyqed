@@ -11,6 +11,16 @@ from pyqed.narg.qchem.orbopt import (
 )
 
 
+def _build_cpp_integrals(molecule):
+    molecule.build(
+        driver="builtin",
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    return molecule
+
+
 def test_active_active_orbital_pairs_are_explicit():
     pairs = orbital_rotation_pairs("active_active", ncore=2, ncas=3, nmo=8)
 
@@ -274,7 +284,7 @@ def test_orbital_pair_packers_include_active_active_pairs():
 
 def test_narg_orbital_optimizer_lowers_core_active_distortion():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
 
     kappa = np.zeros_like(mf.mo_coeff)
@@ -313,7 +323,7 @@ def test_narg_orbital_optimizer_lowers_core_active_distortion():
 
 def test_nargscf_rdm_gradient_lowers_core_active_distortion():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
 
     kappa = np.zeros_like(mf.mo_coeff)
@@ -363,7 +373,7 @@ def test_nargscf_rdm_gradient_lowers_core_active_distortion():
 
 def test_nargscf_converges_on_gradient_tolerance():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
 
     mc = NARGSCF(

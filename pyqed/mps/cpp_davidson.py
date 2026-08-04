@@ -36,8 +36,10 @@ abelian_left_environment_advance_data = None
 abelian_right_environment_advance_data = None
 abelian_tdvp_site_heff_data = None
 abelian_tdvp_bond_heff_data = None
+abelian_tdvp_two_site_lanczos = None
 AbelianTDVPSiteHeffPlan = None
 AbelianTDVPBondHeffPlan = None
+AbelianTDVPTwoSiteHeffPlan = None
 AbelianEnvironmentAdvancePlan = None
 BlockTable = None
 RenormalizedTable = None
@@ -51,6 +53,9 @@ NamedRawPayloadPlan = None
 PlannedDirectPayloadPlan = None
 DirectFamilyRoutePlan = None
 MovingEnvironment = None
+SU2ParentBlockTable = None
+SU2FactorizedFamilyTable = None
+SU2PackedFactorizedFamilyTable = None
 direct_left_stack = None
 direct_right_stack = None
 identity_channel_left_stack = None
@@ -89,6 +94,8 @@ build_spatial_qchem_family_term_maps = None
 build_spatial_qchem_family_mpos = None
 build_spatial_block2_carrier_mpo = None
 build_spatial_qchem_block2_setup = None
+pack_rank_coupled_factor_routes = None
+rank_coupled_reduced_actions = None
 
 
 def _disabled(value):
@@ -144,6 +151,7 @@ def _compile_extension():
         return None
 
     source = Path(__file__).with_name("davidson.cpp")
+    core_header = Path(__file__).with_name("dmrg_linalg_core.hpp")
     if not source.exists():
         CPP_DAVIDSON_BUILD_ERROR = f"source file not found: {source}"
         return None
@@ -156,10 +164,13 @@ def _compile_extension():
     stamp_path = build_dir / "_cpp_davidson.stamp"
     fail_stamp_path = build_dir / "_cpp_davidson.failed"
     source_mtime = str(source.stat().st_mtime_ns)
+    core_mtime = str(core_header.stat().st_mtime_ns) if core_header.exists() else "missing"
     compile_signature = "|".join(
         [
             source.name,
             source_mtime,
+            core_header.name,
+            core_mtime,
             sys.version.split()[0],
             sysconfig.get_config_var("CXX") or "",
             os.environ.get("CXX", ""),
@@ -266,8 +277,10 @@ def _initialize():
     global abelian_right_environment_advance_data
     global abelian_tdvp_site_heff_data
     global abelian_tdvp_bond_heff_data
+    global abelian_tdvp_two_site_lanczos
     global AbelianTDVPSiteHeffPlan
     global AbelianTDVPBondHeffPlan
+    global AbelianTDVPTwoSiteHeffPlan
     global AbelianEnvironmentAdvancePlan
     global BlockTable
     global RenormalizedTable
@@ -281,6 +294,9 @@ def _initialize():
     global PlannedDirectPayloadPlan
     global DirectFamilyRoutePlan
     global MovingEnvironment
+    global SU2ParentBlockTable
+    global SU2FactorizedFamilyTable
+    global SU2PackedFactorizedFamilyTable
     global direct_left_stack
     global direct_right_stack
     global identity_channel_left_stack
@@ -319,6 +335,8 @@ def _initialize():
     global build_spatial_qchem_family_mpos
     global build_spatial_block2_carrier_mpo
     global build_spatial_qchem_block2_setup
+    global pack_rank_coupled_factor_routes
+    global rank_coupled_reduced_actions
 
     if _disabled(os.environ.get("PYQED_MPS_DISABLE_CPP_DAVIDSON", "0")):
         return
@@ -415,6 +433,11 @@ def _initialize():
         "abelian_tdvp_bond_heff_data",
         None,
     )
+    abelian_tdvp_two_site_lanczos = getattr(
+        module,
+        "abelian_tdvp_two_site_lanczos",
+        None,
+    )
     AbelianTDVPSiteHeffPlan = getattr(
         module,
         "AbelianTDVPSiteHeffPlan",
@@ -423,6 +446,11 @@ def _initialize():
     AbelianTDVPBondHeffPlan = getattr(
         module,
         "AbelianTDVPBondHeffPlan",
+        None,
+    )
+    AbelianTDVPTwoSiteHeffPlan = getattr(
+        module,
+        "AbelianTDVPTwoSiteHeffPlan",
         None,
     )
     AbelianEnvironmentAdvancePlan = getattr(
@@ -622,6 +650,27 @@ def _initialize():
     build_spatial_qchem_block2_setup = getattr(
         module,
         "build_spatial_qchem_block2_setup",
+        None,
+    )
+    pack_rank_coupled_factor_routes = getattr(
+        module,
+        "pack_rank_coupled_factor_routes",
+        None,
+    )
+    rank_coupled_reduced_actions = getattr(
+        module,
+        "rank_coupled_reduced_actions",
+        None,
+    )
+    SU2ParentBlockTable = getattr(module, "SU2ParentBlockTable", None)
+    SU2FactorizedFamilyTable = getattr(
+        module,
+        "SU2FactorizedFamilyTable",
+        None,
+    )
+    SU2PackedFactorizedFamilyTable = getattr(
+        module,
+        "SU2PackedFactorizedFamilyTable",
         None,
     )
     CPP_DAVIDSON_AVAILABLE = True

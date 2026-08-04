@@ -8,6 +8,105 @@ import numpy as np
 from scipy.sparse import csr_matrix
 
 
+def _is_site_like(value) -> bool:
+    return hasattr(value, "dim") or hasattr(value, "d")
+
+
+def _normalize_sites(value):
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return None
+    try:
+        values = tuple(value)
+    except TypeError as error:
+        raise TypeError("sites must be a sequence.") from error
+
+    if not values:
+        return ()
+    if not all(_is_site_like(item) for item in values):
+        return None
+    normalized = []
+    for site in values:
+        if hasattr(site, "dim"):
+            dim = int(site.dim)
+        else:
+            dim = int(site.d)
+        if dim < 1:
+            raise ValueError("site dimensions must be positive.")
+        normalized.append(site)
+    return tuple(normalized)
+
+
+def _normalize_site_charges(site_charges, *, site_index: int, dim: int):
+    normalized = tuple(_as_charge_tuple(charge) for charge in site_charges)
+    if len(normalized) != dim:
+        raise ValueError(
+            f"site {site_index} charges must contain one entry per local basis state."
+        )
+    if normalized:
+        rank = len(normalized[0])
+        if any(len(charge) != rank for charge in normalized):
+            raise ValueError(
+                f"site {site_index} local charges must all have the same rank."
+            )
+    return normalized
+
+
+def local_charges_from_sites(sites, *, require: bool = False):
+    """Return local charges from site metadata when available.
+
+    ``require=False`` returns ``None`` when no complete metadata is present.
+    """
+    if sites is None:
+        if require:
+            raise ValueError(
+                "site-wise local charges are required but no sites are attached."
+            )
+        return None
+    sites = tuple(sites)
+    if not sites:
+        if require:
+            raise ValueError("site-wise local charges are required for non-empty systems.")
+        return ()
+
+    collected = []
+    for index, site in enumerate(sites):
+        raw_charges = None
+        for candidate in (
+            getattr(site, "local_charges", None),
+            getattr(site, "charges", None),
+        ):
+            if candidate is not None:
+                raw_charges = candidate
+                break
+        dim = int(getattr(site, "dim", getattr(site, "d")))
+        if raw_charges is None:
+            if require:
+                raise ValueError(
+                    f"site {index} has no local charge metadata."
+                )
+            return None
+        collected.append(_normalize_site_charges(raw_charges, site_index=index, dim=dim))
+    return tuple(collected)
+
+
+def _normalized_dims(dims):
+    if dims is None:
+        raise ValueError("dims is required when sites are not provided.")
+    if isinstance(dims, (int, np.integer)):
+        dims = (dims,)
+    try:
+        dims = tuple(int(value) for value in dims)
+    except TypeError as error:
+        raise TypeError("dims must be a positive integer or a sequence of positive integers.") from error
+    if not dims or any(dim < 1 for dim in dims):
+        raise ValueError("dims must contain positive local dimensions.")
+    return tuple(dims)
+
+
 @dataclass(frozen=True)
 class LocalTerm:
     r"""An operator acting on an ordered tuple of physical sites.
@@ -85,6 +184,35 @@ class LocalMPO:
             input_dim *= dim
             environment = value.reshape(tensor.shape[1], output_dim, input_dim)
         return environment[0]
+
+    def compose(self, other: "LocalMPO") -> "LocalMPO":
+        r"""Return the exact operator product ``self @ other``.
+
+        The physical ket index of ``self`` is contracted with the physical
+        bra index of ``other`` at every site.  The two MPO bond spaces are
+        fused without truncation.
+        """
+        if not isinstance(other, LocalMPO):
+            raise TypeError("other must be a LocalMPO.")
+        if self.dims != other.dims:
+            raise ValueError("MPO dimensions must match for composition.")
+        tensors = []
+        for left, right in zip(self.tensors, other.tensors):
+            product = np.einsum(
+                "absi,cdik->acbdsk",
+                left,
+                right,
+                optimize=True,
+            )
+            tensors.append(
+                product.reshape(
+                    left.shape[0] * right.shape[0],
+                    left.shape[1] * right.shape[1],
+                    left.shape[2],
+                    right.shape[3],
+                )
+            )
+        return LocalMPO(self.dims, tensors)
 
     def compress(self, rtol=None) -> "LocalMPO":
         """Return a canonicalized MPO with redundant bond channels removed.
@@ -176,6 +304,245 @@ class LocalMPO:
         return LocalMPO(self.dims, cores)
 
 
+@dataclass(frozen=True)
+class LocalMPOProduct:
+    """Lazy exact product of two MPOs with unfused bond channels.
+
+    This stores ``left @ right`` without allocating the dense Kronecker
+    product of their MPO bonds.  Identity-aware contractors can consume the
+    two factors directly; :meth:`materialize` remains available for small
+    reference calculations and backends that require ordinary MPO tensors.
+    """
+
+    left: LocalMPO
+    right: LocalMPO
+
+    def __init__(self, left, right):
+        if not isinstance(left, LocalMPO) or not isinstance(right, LocalMPO):
+            raise TypeError("left and right must be LocalMPO objects.")
+        if left.dims != right.dims:
+            raise ValueError("MPO dimensions must match for composition.")
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "right", right)
+
+    @property
+    def dims(self) -> tuple[int, ...]:
+        return self.left.dims
+
+    @property
+    def bond_dims(self) -> tuple[int, ...]:
+        return tuple(
+            left * right
+            for left, right in zip(self.left.bond_dims, self.right.bond_dims)
+        )
+
+    @property
+    def dtype(self):
+        return np.dtype(np.result_type(self.left.dtype, self.right.dtype))
+
+    @property
+    def materialized_elements(self) -> int:
+        return int(
+            sum(
+                left_bond
+                * right_bond
+                * next_left
+                * next_right
+                * dim**2
+                for left_bond, right_bond, next_left, next_right, dim in zip(
+                    self.left.bond_dims[:-1],
+                    self.right.bond_dims[:-1],
+                    self.left.bond_dims[1:],
+                    self.right.bond_dims[1:],
+                    self.dims,
+                )
+            )
+        )
+
+    def materialize(self) -> LocalMPO:
+        """Allocate the ordinary fused-bond MPO for ``left @ right``."""
+        return self.left.compose(self.right)
+
+    def to_dense(self) -> np.ndarray:
+        """Materialize the many-body matrix for small-system validation."""
+        return self.left.to_dense() @ self.right.to_dense()
+
+
+def _as_charge_tuple(value) -> tuple[int, ...]:
+    if hasattr(value, "charge"):
+        value = value.charge
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (tuple, list)):
+        return tuple(int(component) for component in value)
+    return (int(value),)
+
+
+def _add_charge_tuples(left, right) -> tuple[int, ...]:
+    left = _as_charge_tuple(left)
+    right = _as_charge_tuple(right)
+    if len(left) != len(right):
+        raise ValueError("all Abelian charges must have the same rank.")
+    return tuple(a + b for a, b in zip(left, right))
+
+
+def _normalized_local_charges(dims, local_charges, target):
+    dims = tuple(int(dim) for dim in dims)
+    if len(local_charges) != len(dims):
+        raise ValueError("local_charges must contain one entry per site.")
+    charges = tuple(
+        tuple(_as_charge_tuple(charge) for charge in site_charges)
+        for site_charges in local_charges
+    )
+    if any(len(site_charges) != dim for site_charges, dim in zip(charges, dims)):
+        raise ValueError(
+            "each local_charges entry must contain one charge per local state."
+        )
+    target = _as_charge_tuple(target)
+    if any(
+        len(charge) != len(target)
+        for site_charges in charges
+        for charge in site_charges
+    ):
+        raise ValueError("all local charges must have the target charge rank.")
+    return dims, charges, target
+
+
+def fixed_charge_projector_mpo(
+    dims,
+    local_charges,
+    target,
+    *,
+    left_boundary=None,
+) -> LocalMPO:
+    r"""Build the exact diagonal projector onto one total Abelian charge.
+
+    The MPO bond is the running charge.  At each cut, unreachable prefixes and
+    prefixes that cannot be completed to ``target`` are removed exactly.  The
+    projector acts once on each physical site; repeated tied-leg occurrences
+    in a graph LETTA tensor are not separate charge carriers.
+    """
+    dims, local_charges, target = _normalized_local_charges(
+        dims,
+        local_charges,
+        target,
+    )
+    rank = len(target)
+    if left_boundary is None:
+        left_boundary = tuple(0 for _ in range(rank))
+    left_boundary = _as_charge_tuple(left_boundary)
+    if len(left_boundary) != rank:
+        raise ValueError("left_boundary and target must have the same charge rank.")
+
+    nsites = len(dims)
+    prefixes = [set() for _ in range(nsites + 1)]
+    prefixes[0].add(left_boundary)
+    for site, charges in enumerate(local_charges):
+        prefixes[site + 1] = {
+            _add_charge_tuples(prefix, charge)
+            for prefix in prefixes[site]
+            for charge in charges
+        }
+
+    zero = tuple(0 for _ in range(rank))
+    suffixes = [set() for _ in range(nsites + 1)]
+    suffixes[-1].add(zero)
+    for site in range(nsites - 1, -1, -1):
+        suffixes[site] = {
+            _add_charge_tuples(charge, suffix)
+            for charge in local_charges[site]
+            for suffix in suffixes[site + 1]
+        }
+
+    bond_charges = []
+    for cut in range(nsites + 1):
+        completable = {
+            prefix
+            for prefix in prefixes[cut]
+            if any(
+                _add_charge_tuples(prefix, suffix) == target
+                for suffix in suffixes[cut]
+            )
+        }
+        if cut == 0:
+            completable &= {left_boundary}
+        if cut == nsites:
+            completable &= {target}
+        states = tuple(sorted(completable))
+        if not states:
+            raise ValueError("no product configurations have the requested charge.")
+        bond_charges.append(states)
+
+    tensors = []
+    for site, (dim, charges) in enumerate(zip(dims, local_charges)):
+        left_states = bond_charges[site]
+        right_states = bond_charges[site + 1]
+        right_lookup = {charge: index for index, charge in enumerate(right_states)}
+        tensor = np.zeros(
+            (len(left_states), len(right_states), dim, dim),
+            dtype=float,
+        )
+        for left_index, left_charge in enumerate(left_states):
+            for physical, charge in enumerate(charges):
+                right_charge = _add_charge_tuples(left_charge, charge)
+                right_index = right_lookup.get(right_charge)
+                if right_index is not None:
+                    tensor[left_index, right_index, physical, physical] = 1.0
+        tensors.append(tensor)
+    return LocalMPO(dims, tensors)
+
+
+def validate_charge_conservation(
+    hamiltonian: "LocalHamiltonian",
+    local_charges=None,
+    *,
+    atol=None,
+) -> None:
+    r"""Raise unless every local term conserves all supplied Abelian charges."""
+    if not isinstance(hamiltonian, LocalHamiltonian):
+        raise TypeError("hamiltonian must be a LocalHamiltonian.")
+    if local_charges is None:
+        local_charges = local_charges_from_sites(
+            hamiltonian.sites,
+            require=True,
+        )
+    dims, local_charges, target = _normalized_local_charges(
+        hamiltonian.dims,
+        local_charges,
+        tuple(0 for _ in _as_charge_tuple(local_charges[0][0])),
+    )
+    del dims, target
+    eps = np.finfo(float).eps
+    for term in hamiltonian.terms:
+        support_dims = tuple(hamiltonian.dims[site] for site in term.sites)
+        for component in range(len(local_charges[0][0])):
+            diagonal = np.empty(int(np.prod(support_dims)), dtype=float)
+            for row, configuration in enumerate(np.ndindex(*support_dims)):
+                diagonal[row] = sum(
+                    local_charges[site][physical][component]
+                    for site, physical in zip(term.sites, configuration)
+                )
+            commutator = (
+                diagonal[:, None] * term.operator
+                - term.operator * diagonal[None, :]
+            )
+            scale = max(float(np.linalg.norm(term.operator, ord=np.inf)), 1.0)
+            tolerance = (
+                512.0 * eps * max(term.operator.shape) * scale
+                if atol is None
+                else float(atol)
+            )
+            if not np.isfinite(tolerance) or tolerance < 0.0:
+                raise ValueError("atol must be finite and nonnegative.")
+            error = float(np.linalg.norm(commutator, ord=np.inf))
+            if error > tolerance:
+                raise ValueError(
+                    f"Hamiltonian term on sites {term.sites} does not conserve "
+                    f"charge component {component}: commutator norm "
+                    f"{error:.3e} exceeds {tolerance:.3e}."
+                )
+
+
 def _operator_tt_cores(sites, operator, dims):
     """Factor one finite-support operator into exact-to-roundoff TT cores."""
     support_dims = tuple(dims[site] for site in sites)
@@ -230,10 +597,35 @@ class LocalHamiltonian:
     contractions consume the local terms directly.
     """
 
-    def __init__(self, dims, terms=(), *, constant=0.0):
-        self.dims = tuple(int(dim) for dim in dims)
-        if not self.dims or any(dim < 1 for dim in self.dims):
-            raise ValueError("dims must contain positive local dimensions.")
+    def __init__(self, dims=None, terms=(), *, constant=0.0, sites=None):
+        explicit_sites = _normalize_sites(sites)
+        inferred_sites = _normalize_sites(dims)
+        if explicit_sites is not None and inferred_sites is not None:
+            raise TypeError("provide either dims or sites, not both.")
+        if explicit_sites is not None:
+            self.sites = explicit_sites
+            dims = tuple(int(getattr(site, "dim", site.d)) for site in self.sites)
+        elif inferred_sites is not None:
+            self.sites = inferred_sites
+            dims = tuple(int(getattr(site, "dim", site.d)) for site in self.sites)
+        else:
+            self.sites = None
+
+        self.dims = _normalized_dims(dims)
+        if self.sites is not None and len(self.sites) != len(self.dims):
+            raise ValueError("the number of sites must match dims.")
+        local_charges = local_charges_from_sites(self.sites)
+        if local_charges is not None and len(local_charges) != len(self.dims):
+            raise ValueError("local charge metadata must cover every site.")
+        self.local_charges = local_charges
+        self.physical_legs = (
+            tuple(
+                site.physical_leg if hasattr(site, "physical_leg") else None
+                for site in self.sites
+            )
+            if self.sites is not None
+            else None
+        )
 
         constant = np.asarray(constant).item()
         if not np.isfinite(constant):
@@ -494,4 +886,12 @@ class LocalHamiltonian:
         return csr_matrix(self.to_dense())
 
 
-__all__ = ["LocalHamiltonian", "LocalMPO", "LocalTerm"]
+__all__ = [
+    "LocalHamiltonian",
+    "LocalMPO",
+    "LocalMPOProduct",
+    "LocalTerm",
+    "local_charges_from_sites",
+    "fixed_charge_projector_mpo",
+    "validate_charge_conservation",
+]

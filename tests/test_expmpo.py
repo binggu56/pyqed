@@ -83,6 +83,28 @@ def test_expmpo_matches_dense_expm_for_small_nonhermitian_mpo():
     np.testing.assert_allclose(_mpo_to_dense(u_mpo), expm(0.31 * h_dense), atol=1e-10, rtol=1e-10)
 
 
+def test_expmpo_compressed_taylor_path_preserves_coefficients():
+    rng = np.random.default_rng(17)
+    base = rng.normal(size=(8, 8))
+    h_dense = 0.05 * (base + base.T)
+    h_mpo = _dense_to_mpo(h_dense, nsites=3)
+
+    u_mpo = expmpo(
+        h_mpo,
+        constant=-0.03j,
+        D=16,
+        order=4,
+        scale=2,
+    )
+
+    np.testing.assert_allclose(
+        _mpo_to_dense(u_mpo),
+        expm(-0.03j * h_dense),
+        atol=1.0e-10,
+        rtol=1.0e-10,
+    )
+
+
 def test_expmpo_matches_dense_expm_and_state_action_on_small_three_site_case():
     rng = np.random.default_rng(19)
     base = rng.normal(size=(8, 8))

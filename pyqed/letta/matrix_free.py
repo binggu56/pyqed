@@ -26,6 +26,32 @@ class DavidsonDiagnostics:
     residual_history: tuple[float, ...]
 
 
+@dataclass(frozen=True)
+class BlockDavidsonDiagnostics:
+    """Convergence and action accounting for a recycled block solve."""
+
+    converged: bool
+    message: str
+    iterations: int
+    hamiltonian_action_calls: int
+    hamiltonian_vector_products: int
+    batch_action_calls: int
+    scalar_action_calls: int
+    restarts: int
+    deterministic_augmentations: int
+    residual_norm: float
+    relative_residual: float
+    subspace_dimension: int
+    recycle_dimension: int
+    energy_history: tuple[float, ...]
+    residual_history: tuple[float, ...]
+
+    @property
+    def hamiltonian_matvecs(self):
+        """Number of vectors acted on, including batched columns."""
+        return self.hamiltonian_vector_products
+
+
 def _as_finite_vector(value, size, *, name):
     vector = np.asarray(value)
     if vector.shape != (size,):
@@ -33,6 +59,15 @@ def _as_finite_vector(value, size, *, name):
     if np.any(~np.isfinite(vector)):
         raise ValueError(f"{name} returned a nonfinite vector.")
     return vector
+
+
+def _as_finite_matrix(value, shape, *, name):
+    matrix = np.asarray(value)
+    if matrix.shape != shape:
+        raise ValueError(f"{name} must return an array with shape {shape}.")
+    if np.any(~np.isfinite(matrix)):
+        raise ValueError(f"{name} returned a nonfinite array.")
+    return matrix
 
 
 def _orthogonalize(vector, basis, *, tolerance):
@@ -50,6 +85,415 @@ def _orthogonalize(vector, basis, *, tolerance):
     if not np.isfinite(norm) or norm <= tolerance:
         return None
     return vector / norm
+
+
+def _canonicalize_columns(vectors):
+    vectors = np.array(vectors, copy=True)
+    for column in range(vectors.shape[1]):
+        pivot = int(np.argmax(np.abs(vectors[:, column])))
+        value = vectors[pivot, column]
+        if value != 0:
+            vectors[:, column] *= np.conj(value) / abs(value)
+    return vectors
+
+
+def _prepare_preconditioner_blocks(blocks, size):
+    prepared = []
+    occupied = np.zeros(size, dtype=bool)
+    for entry in () if blocks is None else blocks:
+        if len(entry) != 2:
+            raise ValueError(
+                "each preconditioner block must be an (indices, matrix) pair."
+            )
+        indices, matrix = entry
+        if isinstance(indices, slice):
+            indices = np.arange(size)[indices]
+        else:
+            indices = np.asarray(indices, dtype=int)
+        if indices.ndim != 1 or indices.size == 0:
+            raise ValueError("preconditioner block indices must be nonempty and 1D.")
+        if np.any(indices < 0) or np.any(indices >= size):
+            raise ValueError("preconditioner block index is out of range.")
+        if np.unique(indices).size != indices.size or np.any(occupied[indices]):
+            raise ValueError("preconditioner blocks must contain disjoint indices.")
+        matrix = np.asarray(matrix)
+        if matrix.shape != (indices.size, indices.size):
+            raise ValueError(
+                "a preconditioner block matrix must match its index count."
+            )
+        if np.any(~np.isfinite(matrix)):
+            raise ValueError("preconditioner block contains nonfinite values.")
+        occupied[indices] = True
+        matrix = 0.5 * (matrix + matrix.T.conj())
+        values, vectors = linalg.eigh(matrix, check_finite=False)
+        prepared.append((indices, values, vectors))
+    return prepared
+
+
+def lowest_recycled_block_davidson(
+    hamiltonian_action,
+    initial_vectors,
+    *,
+    hamiltonian_batch_action=None,
+    diagonal=None,
+    preconditioner_blocks=None,
+    block_size: int = 4,
+    recycle_dimension: int = 4,
+    tol: float = 1.0e-10,
+    atol: float = 0.0,
+    maxiter: int | None = None,
+    max_subspace: int = 32,
+    random_seed: int | None = 0,
+):
+    r"""Find the lowest eigenpair of a Hermitian operator by block Davidson.
+
+    Trial and recycled vectors are columns of ``initial_vectors``.  New
+    vectors are submitted together to ``hamiltonian_batch_action`` when that
+    callback is supplied; otherwise ``hamiltonian_action`` is called once per
+    column.  The returned recycled space contains the lowest Ritz vectors and
+    can be passed directly as ``initial_vectors`` to the next solve.
+
+    ``diagonal`` and ``preconditioner_blocks`` are optional Jacobi data.
+    A block is an ``(indices, matrix)`` pair, where ``indices`` is a slice or a
+    one-dimensional integer array.  Blocks must be disjoint and override the
+    diagonal preconditioner on their support.
+
+    The initial space is augmented by a deterministic DCT-probe block, which
+    prevents immediate false convergence inside an exact invariant subspace.
+    Correction breakdowns use the same complete deterministic probe sequence,
+    offset by ``random_seed``, so a missed direction is eventually reached
+    without stochastic behavior.
+
+    Returns
+    -------
+    energy, eigenvector, recycle_vectors, diagnostics
+        ``eigenvector`` and the columns of ``recycle_vectors`` have unit
+        Euclidean norm.  Final energy and residual diagnostics use a fresh
+        operator action.
+    """
+    initial_vectors = np.asarray(initial_vectors)
+    if initial_vectors.ndim == 1:
+        initial_vectors = initial_vectors[:, None]
+    if (
+        initial_vectors.ndim != 2
+        or initial_vectors.shape[0] == 0
+        or initial_vectors.shape[1] == 0
+    ):
+        raise ValueError(
+            "initial_vectors must have shape (size, count) with nonzero dimensions."
+        )
+    if np.any(~np.isfinite(initial_vectors)):
+        raise ValueError("initial_vectors must contain only finite values.")
+    size = initial_vectors.shape[0]
+    tol = float(tol)
+    atol = float(atol)
+    if not np.isfinite(tol) or tol < 0.0:
+        raise ValueError("tol must be finite and nonnegative.")
+    if not np.isfinite(atol) or atol < 0.0:
+        raise ValueError("atol must be finite and nonnegative.")
+    block_size = min(size, int(block_size))
+    recycle_dimension = min(size, int(recycle_dimension))
+    if block_size < 1:
+        raise ValueError("block_size must be positive.")
+    if recycle_dimension < 1:
+        raise ValueError("recycle_dimension must be positive.")
+    maxiter = max(50, 4 * size) if maxiter is None else int(maxiter)
+    if maxiter < 1:
+        raise ValueError("maxiter must be positive.")
+    max_subspace = min(size, int(max_subspace))
+    if max_subspace < min(size, 2):
+        raise ValueError("max_subspace must be at least two for a nontrivial problem.")
+
+    if diagonal is not None:
+        diagonal = np.asarray(diagonal)
+        if diagonal.shape != (size,):
+            raise ValueError(f"diagonal must have shape {(size,)}.")
+        if np.any(~np.isfinite(diagonal)):
+            raise ValueError("diagonal must contain only finite values.")
+    preconditioner_blocks = _prepare_preconditioner_blocks(
+        preconditioner_blocks,
+        size,
+    )
+    probe_cursor = 0 if random_seed is None else int(random_seed) % size
+
+    action_calls = 0
+    action_vectors = 0
+    batch_calls = 0
+    scalar_calls = 0
+
+    def apply(vectors):
+        nonlocal action_calls, action_vectors, batch_calls, scalar_calls
+        vectors = np.asarray(vectors)
+        if vectors.ndim == 1:
+            vectors = vectors[:, None]
+        count = vectors.shape[1]
+        if hamiltonian_batch_action is not None:
+            result = _as_finite_matrix(
+                hamiltonian_batch_action(vectors),
+                vectors.shape,
+                name="hamiltonian_batch_action",
+            )
+            batch_calls += 1
+            action_calls += 1
+        else:
+            result = np.column_stack(
+                [
+                    _as_finite_vector(
+                        hamiltonian_action(vectors[:, column]),
+                        size,
+                        name="hamiltonian_action",
+                    )
+                    for column in range(count)
+                ]
+            )
+            scalar_calls += count
+            action_calls += count
+        action_vectors += count
+        return result
+
+    breakdown_tolerance = 128.0 * np.finfo(float).eps * np.sqrt(size)
+
+    def orthonormalize(candidates, basis, *, limit=None):
+        candidates = np.asarray(candidates)
+        if candidates.ndim == 1:
+            candidates = candidates[:, None]
+        accepted = []
+        against = [basis[:, column] for column in range(basis.shape[1])]
+        for column in range(candidates.shape[1]):
+            vector = _orthogonalize(
+                candidates[:, column],
+                against + accepted,
+                tolerance=breakdown_tolerance,
+            )
+            if vector is not None:
+                accepted.append(vector)
+            if limit is not None and len(accepted) >= limit:
+                break
+        if not accepted:
+            return np.empty((size, 0), dtype=candidates.dtype)
+        return np.column_stack(accepted)
+
+    empty_basis = np.empty((size, 0), dtype=initial_vectors.dtype)
+    initial_limit = max_subspace - min(block_size, max(0, max_subspace - 1))
+    basis = orthonormalize(
+        initial_vectors,
+        empty_basis,
+        limit=initial_limit,
+    )
+    if basis.shape[1] == 0:
+        raise ValueError("initial_vectors are numerically zero or dependent.")
+
+    augmentations = 0
+    restarts = 0
+
+    def deterministic_candidates(count):
+        nonlocal probe_cursor
+        grid = np.arange(size, dtype=float) + 0.5
+        candidates = []
+        while len(candidates) < count:
+            frequency = probe_cursor % size
+            probe_cursor += 1
+            probe = np.cos(np.pi * grid * frequency / size)
+            if np.iscomplexobj(basis):
+                probe = probe.astype(np.result_type(basis.dtype, complex))
+            candidates.append(probe)
+        if not candidates:
+            return np.empty((size, 0), dtype=basis.dtype)
+        return np.column_stack(candidates)
+
+    guard = orthonormalize(
+        deterministic_candidates(size),
+        basis,
+        limit=min(block_size, max_subspace - basis.shape[1]),
+    )
+    if guard.shape[1]:
+        basis = np.column_stack((basis, guard))
+        augmentations += guard.shape[1]
+    hamiltonian_basis = apply(basis)
+
+    def append(candidates, *, deterministic=False, limit=None):
+        nonlocal basis, hamiltonian_basis, augmentations
+        capacity = max_subspace - basis.shape[1]
+        if capacity <= 0:
+            return 0
+        if limit is not None:
+            capacity = min(capacity, int(limit))
+        candidates = orthonormalize(candidates, basis, limit=capacity)
+        if candidates.shape[1] == 0:
+            return 0
+        actions = apply(candidates)
+        basis = np.column_stack((basis, candidates))
+        hamiltonian_basis = np.column_stack((hamiltonian_basis, actions))
+        if deterministic:
+            augmentations += candidates.shape[1]
+        return candidates.shape[1]
+
+    def precondition(residual, energy):
+        correction = np.array(residual, copy=True)
+        if diagonal is not None:
+            denominator = energy - diagonal
+            scale = np.maximum.reduce(
+                (
+                    np.abs(diagonal),
+                    np.full(size, abs(energy)),
+                    np.ones(size),
+                )
+            )
+            safe = np.abs(denominator) > np.sqrt(np.finfo(float).eps) * scale
+            correction[safe] = residual[safe] / denominator[safe]
+            correction[~safe] = residual[~safe]
+        for indices, values, vectors in preconditioner_blocks:
+            denominator = energy - values
+            scale = max(
+                float(np.max(np.abs(values), initial=0.0)),
+                abs(float(energy)),
+                1.0,
+            )
+            cutoff = np.sqrt(np.finfo(float).eps) * scale
+            inverse = np.zeros_like(denominator)
+            safe = np.abs(denominator) > cutoff
+            inverse[safe] = 1.0 / denominator[safe]
+            correction[indices] = (
+                vectors
+                @ (inverse * (vectors.T.conj() @ residual[indices]))
+            )
+        return correction
+
+    energy_history = []
+    residual_history = []
+    current_energy = np.nan
+    current_vector = None
+    current_residual = None
+    current_scale = np.finfo(float).tiny
+    projected_vectors = None
+    projected_values = None
+    converged = False
+    message = "maximum iterations reached"
+    iterations = 0
+
+    for iteration in range(1, maxiter + 1):
+        iterations = iteration
+        projected = basis.T.conj() @ hamiltonian_basis
+        projected = 0.5 * (projected + projected.T.conj())
+        projected_values, coefficients = linalg.eigh(projected, check_finite=False)
+        root_count = min(block_size, basis.shape[1])
+        projected_vectors = basis @ coefficients[:, :root_count]
+        projected_actions = hamiltonian_basis @ coefficients[:, :root_count]
+        residuals = (
+            projected_actions
+            - projected_vectors * projected_values[None, :root_count]
+        )
+        residual_norms = np.linalg.norm(residuals, axis=0)
+        scales = np.maximum.reduce(
+            (
+                np.linalg.norm(projected_actions, axis=0),
+                np.abs(projected_values[:root_count]),
+                np.full(root_count, np.finfo(float).tiny),
+            )
+        )
+        current_energy = float(np.real(projected_values[0]))
+        current_vector = projected_vectors[:, 0]
+        current_residual = residuals[:, 0]
+        current_scale = float(scales[0])
+        residual_norm = float(residual_norms[0])
+        energy_history.append(current_energy)
+        residual_history.append(residual_norm)
+        root_converged = residual_norm <= atol + tol * current_scale
+
+        if root_converged:
+            converged = True
+            message = "converged"
+            break
+        if iteration == maxiter:
+            break
+
+        corrections = []
+        for root in range(root_count):
+            if residual_norms[root] <= atol + tol * scales[root]:
+                continue
+            corrections.append(
+                precondition(residuals[:, root], float(projected_values[root]))
+            )
+        correction_block = (
+            np.column_stack(corrections)
+            if corrections
+            else np.empty((size, 0), dtype=basis.dtype)
+        )
+
+        needed = max(1, min(block_size, max_subspace - recycle_dimension))
+        if (
+            basis.shape[1] + correction_block.shape[1] > max_subspace
+            or basis.shape[1] == max_subspace
+        ):
+            retain = min(
+                recycle_dimension,
+                coefficients.shape[1],
+                max(1, max_subspace - needed),
+            )
+            basis = basis @ coefficients[:, :retain]
+            hamiltonian_basis = hamiltonian_basis @ coefficients[:, :retain]
+            restarts += 1
+
+        added = append(correction_block)
+        if added:
+            continue
+        raw_residuals = residuals[
+            :,
+            residual_norms > atol + tol * scales,
+        ]
+        added = append(raw_residuals)
+        if added:
+            continue
+        probes = deterministic_candidates(size)
+        if append(probes, deterministic=True, limit=block_size):
+            continue
+        message = "Davidson search space exhausted before convergence"
+        break
+
+    if current_vector is None:
+        raise ValueError(message)
+
+    current_vector = current_vector / np.linalg.norm(current_vector)
+    current_vector = _canonicalize_columns(current_vector[:, None])[:, 0]
+    final_action = apply(current_vector[:, None])[:, 0]
+    current_energy = float(np.real(np.vdot(current_vector, final_action)))
+    current_residual = final_action - current_energy * current_vector
+    residual_norm = float(np.linalg.norm(current_residual))
+    current_scale = max(
+        float(np.linalg.norm(final_action)),
+        abs(current_energy),
+        np.finfo(float).tiny,
+    )
+    relative_residual = residual_norm / current_scale
+    converged = residual_norm <= atol + tol * current_scale
+    if converged:
+        message = "converged"
+    elif message == "converged":
+        message = "fresh final residual exceeds tolerance"
+
+    projected = basis.T.conj() @ hamiltonian_basis
+    projected = 0.5 * (projected + projected.T.conj())
+    _, coefficients = linalg.eigh(projected, check_finite=False)
+    retained = min(recycle_dimension, basis.shape[1])
+    recycle_vectors = _canonicalize_columns(basis @ coefficients[:, :retained])
+    diagnostics = BlockDavidsonDiagnostics(
+        converged=bool(converged),
+        message=message,
+        iterations=iterations,
+        hamiltonian_action_calls=action_calls,
+        hamiltonian_vector_products=action_vectors,
+        batch_action_calls=batch_calls,
+        scalar_action_calls=scalar_calls,
+        restarts=restarts,
+        deterministic_augmentations=augmentations,
+        residual_norm=residual_norm,
+        relative_residual=relative_residual,
+        subspace_dimension=basis.shape[1],
+        recycle_dimension=recycle_vectors.shape[1],
+        energy_history=tuple(energy_history),
+        residual_history=tuple(residual_history),
+    )
+    return current_energy, current_vector, recycle_vectors, diagnostics
 
 
 def _projected_lowest(hamiltonian, metric, *, metric_tol):
@@ -358,4 +802,9 @@ def lowest_generalized_davidson(
     return current_energy, current_vector, diagnostics
 
 
-__all__ = ["DavidsonDiagnostics", "lowest_generalized_davidson"]
+__all__ = [
+    "BlockDavidsonDiagnostics",
+    "DavidsonDiagnostics",
+    "lowest_generalized_davidson",
+    "lowest_recycled_block_davidson",
+]

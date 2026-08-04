@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from pyqed.tn import TTN
+from pyqed.letta import LocalHamiltonian, LocalTerm
+from pyqed.tn import TTN, balanced_ttn
 
 
 def _path_mps_amplitude(tensors, configuration):
@@ -200,3 +201,43 @@ def test_ttn_canonicalize_preserves_state_and_makes_branches_isometric():
             np.eye(matrix.shape[1]),
             atol=1.0e-12,
         )
+
+
+def _critical_ising_hamiltonian(state, nspins):
+    x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    z = np.diag([1.0, -1.0])
+    terms = [LocalTerm((site,), -z) for site in range(nspins)]
+    terms.extend(
+        LocalTerm((site, site + 1), -np.kron(x, x))
+        for site in range(nspins - 1)
+    )
+    return LocalHamiltonian(state.dims, terms)
+
+
+def test_local_hamiltonian_expectation_matches_dense_reference():
+    state = balanced_ttn(4, physical_dim=2, bond_dim=3, seed=21)
+    hamiltonian = _critical_ising_hamiltonian(state, 4)
+    vector = state.state_vector()
+
+    np.testing.assert_allclose(
+        state.expectation(hamiltonian),
+        hamiltonian.expectation(vector),
+        atol=1.0e-12,
+    )
+
+
+def test_full_rank_balanced_ttn_recovers_four_site_critical_ising_ground_state():
+    state = balanced_ttn(4, physical_dim=2, bond_dim=4, seed=9)
+    hamiltonian = _critical_ising_hamiltonian(state, 4)
+    exact = np.linalg.eigvalsh(hamiltonian.to_dense())[0]
+    initial = state.expectation(hamiltonian)
+
+    state.run(hamiltonian, nsweeps=4, tol=1.0e-11)
+
+    assert state.energy <= initial + 1.0e-12
+    np.testing.assert_allclose(state.energy, exact, atol=1.0e-10)
+    assert all(update.accepted for update in state.site_updates)
+    assert all(
+        later["energy"] <= earlier["energy"] + 1.0e-12
+        for earlier, later in zip(state.history, state.history[1:])
+    )

@@ -12,7 +12,16 @@ from functools import lru_cache
 
 import numpy as np
 
-from .basis import _basis_cy, electron_repulsion, kinetic, nuclear_attraction, overlap
+from .basis import (
+    _basis_cy,
+    _builtin_worker_count,
+    _integrals_cpp,
+    _pack_signatures_for_numba,
+    electron_repulsion,
+    kinetic,
+    nuclear_attraction,
+    overlap,
+)
 
 
 def _basis_and_transform(mol):
@@ -709,7 +718,7 @@ def _one_second_element(fn_p, fn_q, atom_p, atom_q, atom_a, axis_a, atom_b, axis
     return value
 
 
-def one_electron_derivatives(mol, kernel="hcore", order=1):
+def one_electron_derivatives(mol, kernel="hcore", order=1, backend="auto"):
     """
     Return builtin one-electron integral derivatives in the molecule AO basis.
 
@@ -722,6 +731,8 @@ def one_electron_derivatives(mol, kernel="hcore", order=1):
         centers and charges. ``'hcore'`` is kinetic plus nuclear attraction.
     order : {1, 2}
         Nuclear derivative order.
+    backend : {'auto', 'native', 'python', 'pyscf'}
+        Integral implementation. ``auto`` prefers native C++.
 
     Returns
     -------
@@ -734,10 +745,27 @@ def one_electron_derivatives(mol, kernel="hcore", order=1):
         raise ValueError("kernel must be 'overlap', 'kinetic', 'nuclear', or 'hcore'.")
     if order not in (1, 2):
         raise ValueError("order must be 1 or 2.")
+    backend = str(backend).lower()
+    if backend not in {"auto", "native", "python", "pyscf"}:
+        raise ValueError("backend must be 'auto', 'native', 'python', or 'pyscf'.")
+    if backend != "python":
+        natm = int(mol.natom)
+        directions = np.eye(3 * natm, dtype=float).reshape(3 * natm, natm, 3)
+        projected = directional_one_electron_derivatives(
+            mol,
+            directions,
+            kernel=kernel,
+            order=order,
+            backend=backend,
+        )
+        nao = projected.shape[-1]
+        if order == 1:
+            return projected.reshape(natm, 3, nao, nao)
+        return projected.reshape(natm, 3, natm, 3, nao, nao)
     if kernel == "hcore":
         return (
-            one_electron_derivatives(mol, "kinetic", order=order)
-            + one_electron_derivatives(mol, "nuclear", order=order)
+            one_electron_derivatives(mol, "kinetic", order=order, backend="python")
+            + one_electron_derivatives(mol, "nuclear", order=order, backend="python")
         )
 
     basis, transform = _basis_and_transform(mol)
@@ -786,9 +814,254 @@ def one_electron_derivatives(mol, kernel="hcore", order=1):
     return _transform_one(out, transform)
 
 
-def one_index_one_electron_derivatives(mol, kernel="overlap", index="ket"):
+def _as_direction_matrix(directions, natm):
+    vec = np.asarray(directions, dtype=float)
+    ncart = 3 * int(natm)
+    if vec.ndim == 3:
+        if vec.shape[1:] != (natm, 3):
+            raise ValueError(
+                f"directions shape {vec.shape} is incompatible with (nmodes, {natm}, 3)."
+            )
+        return vec.reshape(vec.shape[0], ncart)
+    if vec.ndim == 2:
+        if vec.shape[1] == ncart:
+            return vec
+        if vec.shape[0] == ncart:
+            return vec.T
+    if vec.ndim == 1 and vec.size == ncart:
+        return vec.reshape(1, ncart)
+    raise ValueError(
+        "directions must have shape (nmodes, natm, 3), (nmodes, 3*natm), "
+        "(3*natm, nmodes), or (3*natm,)."
+    )
+
+
+def _directional_hcore_derivatives_pyscf(mol, directions, order):
+    pmol = mol.topyscf()
+    pmf = pmol.RHF()
+    natm = int(pmol.natm)
+    direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
+    nmodes = direction.shape[0]
+    nao = pmol.nao_nr()
+
+    if order == 1:
+        generator = pmf.nuc_grad_method().hcore_generator(pmol)
+        out = np.zeros((nmodes, nao, nao), dtype=float)
+        for atom in range(natm):
+            out += np.einsum(
+                "ma,apq->mpq",
+                direction[:, atom],
+                generator(atom),
+                optimize=True,
+            )
+        return out
+
+    generator = pmf.Hessian().hcore_generator(pmol)
+    out = np.zeros((nmodes, nmodes, nao, nao), dtype=float)
+    for atom_a in range(natm):
+        for atom_b in range(natm):
+            out += np.einsum(
+                "ma,nb,abpq->mnpq",
+                direction[:, atom_a],
+                direction[:, atom_b],
+                generator(atom_a, atom_b),
+                optimize=True,
+            )
+    return 0.5 * (out + out.swapaxes(0, 1))
+
+
+def _directional_one_electron_derivatives_python(
+    mol,
+    directions,
+    kernel="hcore",
+    order=1,
+):
     """
-    Return one-index first derivatives of one-electron AO integrals.
+    Return one-electron integral derivatives projected onto nuclear directions.
+
+    ``directions`` contains Cartesian displacement coefficients. First-order
+    output has shape ``(nmodes, nao, nao)``; second-order output has shape
+    ``(nmodes, nmodes, nao, nao)``.
+    """
+    kernel = str(kernel).lower()
+    if kernel not in {"overlap", "kinetic", "nuclear", "hcore"}:
+        raise ValueError("kernel must be 'overlap', 'kinetic', 'nuclear', or 'hcore'.")
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
+    if kernel == "hcore":
+        return (
+            _directional_one_electron_derivatives_python(
+                mol, directions, "kinetic", order=order
+            )
+            + _directional_one_electron_derivatives_python(
+                mol, directions, "nuclear", order=order
+            )
+        )
+
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    charges = np.asarray(mol.atom_charges(), dtype=float)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    natm = coords.shape[0]
+    nao_cart = len(basis)
+    direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
+    nmodes = direction.shape[0]
+
+    if order == 1:
+        out = np.zeros((nmodes, nao_cart, nao_cart), dtype=float)
+        for p, fn_p in enumerate(basis):
+            for q, fn_q in enumerate(basis[: p + 1]):
+                cart_deriv = np.empty((natm, 3), dtype=float)
+                for atom in range(natm):
+                    for axis in range(3):
+                        cart_deriv[atom, axis] = _one_deriv_element(
+                            fn_p,
+                            fn_q,
+                            atom_ids[p],
+                            atom_ids[q],
+                            atom,
+                            axis,
+                            kernel,
+                            charges,
+                            coords,
+                        )
+                values = np.einsum("mAx,Ax->m", direction, cart_deriv, optimize=True)
+                out[:, p, q] = values
+                out[:, q, p] = values
+        return _transform_one(out, transform)
+
+    out = np.zeros((nmodes, nmodes, nao_cart, nao_cart), dtype=float)
+    perturbations = [(atom, axis) for atom in range(natm) for axis in range(3)]
+    for p, fn_p in enumerate(basis):
+        for q, fn_q in enumerate(basis[: p + 1]):
+            cart_second = np.empty((natm, 3, natm, 3), dtype=float)
+            for atom_a, axis_a in perturbations:
+                for atom_b, axis_b in perturbations:
+                    cart_second[atom_a, axis_a, atom_b, axis_b] = _one_second_element(
+                        fn_p,
+                        fn_q,
+                        atom_ids[p],
+                        atom_ids[q],
+                        atom_a,
+                        axis_a,
+                        atom_b,
+                        axis_b,
+                        kernel,
+                        charges,
+                        coords,
+                    )
+            values = np.einsum(
+                "mAx,nBy,AxBy->mn",
+                direction,
+                direction,
+                cart_second,
+                optimize=True,
+            )
+            out[:, :, p, q] = values
+            out[:, :, q, p] = values
+    return _transform_one(out, transform)
+
+
+def _directional_one_electron_derivatives_cpp(
+    mol,
+    directions,
+    kernel="hcore",
+    order=1,
+):
+    if _integrals_cpp is None or not hasattr(
+        _integrals_cpp, "compute_directional_one_electron_derivatives"
+    ):
+        raise ImportError("The C++ Gaussian integral extension is unavailable.")
+
+    kernel_ids = {"overlap": 0, "kinetic": 1, "nuclear": 2, "hcore": 3}
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    charges = np.asarray(mol.atom_charges(), dtype=float)
+    natm = coords.shape[0]
+    direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    workers = _builtin_worker_count(mol, len(basis))
+    out = _integrals_cpp.compute_directional_one_electron_derivatives(
+        np.ascontiguousarray(shells, dtype=np.int64),
+        np.ascontiguousarray(origins, dtype=np.float64),
+        np.ascontiguousarray(exps, dtype=np.float64),
+        np.ascontiguousarray(weights, dtype=np.float64),
+        np.ascontiguousarray(nprim, dtype=np.int64),
+        np.ascontiguousarray(atom_ids, dtype=np.int64),
+        np.ascontiguousarray(coords, dtype=np.float64),
+        np.ascontiguousarray(charges, dtype=np.float64),
+        np.ascontiguousarray(direction, dtype=np.float64),
+        int(kernel_ids[kernel]),
+        int(order),
+        int(workers),
+    )
+    return _transform_one(np.asarray(out, dtype=float), transform)
+
+
+def directional_one_electron_derivatives(
+    mol,
+    directions,
+    kernel="hcore",
+    order=1,
+    backend="auto",
+):
+    """
+    Return directional nuclear derivatives of one-electron AO integrals.
+
+    ``backend='auto'`` prefers the native C++ Gaussian implementation.
+    ``backend='native'`` requires it, while ``backend='python'`` selects the
+    scalar reference implementation. PySCF/libcint is available for hcore.
+    Outputs have shape ``(nmodes, nao, nao)`` at first order and
+    ``(nmodes, nmodes, nao, nao)`` at second order.
+    """
+    kernel = str(kernel).lower()
+    if kernel not in {"overlap", "kinetic", "nuclear", "hcore"}:
+        raise ValueError("kernel must be 'overlap', 'kinetic', 'nuclear', or 'hcore'.")
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
+    backend = str(backend).lower()
+    if backend not in {"auto", "native", "python", "pyscf"}:
+        raise ValueError("backend must be 'auto', 'native', 'python', or 'pyscf'.")
+
+    if backend == "pyscf":
+        if kernel != "hcore":
+            raise NotImplementedError(
+                "The PySCF directional one-electron backend supports hcore only."
+            )
+        if callable(getattr(mol, "topyscf", None)):
+            return _directional_hcore_derivatives_pyscf(mol, directions, order)
+        raise ImportError("The PySCF backend requires mol.topyscf().")
+    if backend == "python":
+        return _directional_one_electron_derivatives_python(
+            mol, directions, kernel=kernel, order=order
+        )
+    try:
+        return _directional_one_electron_derivatives_cpp(
+            mol, directions, kernel=kernel, order=order
+        )
+    except ImportError:
+        if backend == "native":
+            raise
+    if kernel == "hcore" and callable(getattr(mol, "topyscf", None)):
+        try:
+            return _directional_hcore_derivatives_pyscf(mol, directions, order)
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            pass
+    return _directional_one_electron_derivatives_python(
+        mol, directions, kernel=kernel, order=order
+    )
+
+
+def _one_index_one_electron_derivatives_python(
+    mol,
+    kernel="overlap",
+    index="ket",
+    order=1,
+):
+    """
+    Return one-index derivatives of one-electron AO integrals.
 
     Only one AO center is differentiated.  For ``index='ket'`` this returns
     ``<chi_p | d chi_q / d R_A>`` for basis functions ``q`` on atom ``A``;
@@ -804,11 +1077,14 @@ def one_index_one_electron_derivatives(mol, kernel="overlap", index="ket"):
         nuclear charge centers.
     index : {'bra', 'ket'}
         AO index whose Gaussian center is differentiated.
+    order : {1, 2}
+        Nuclear derivative order on the selected AO index.
 
     Returns
     -------
     ndarray
-        Shape ``(natm, 3, nao, nao)``.
+        Shape ``(natm, 3, nao, nao)`` for first order or
+        ``(natm, 3, natm, 3, nao, nao)`` for second order.
     """
 
     kernel = str(kernel).lower()
@@ -817,6 +1093,9 @@ def one_index_one_electron_derivatives(mol, kernel="overlap", index="ket"):
     index = str(index).lower()
     if index not in {"bra", "ket"}:
         raise ValueError("index must be 'bra' or 'ket'.")
+    order = int(order)
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
 
     basis, transform = _basis_and_transform(mol)
     coords = np.asarray(mol.atom_coords(), dtype=float)
@@ -824,18 +1103,111 @@ def one_index_one_electron_derivatives(mol, kernel="overlap", index="ket"):
     natm = coords.shape[0]
     nao_cart = len(basis)
 
-    out = np.zeros((natm, 3, nao_cart, nao_cart), dtype=float)
+    shape = (
+        (natm, 3, nao_cart, nao_cart)
+        if order == 1
+        else (natm, 3, natm, 3, nao_cart, nao_cart)
+    )
+    out = np.zeros(shape, dtype=float)
     for p, fn_p in enumerate(basis):
         for q, fn_q in enumerate(basis):
             atom = atom_ids[p] if index == "bra" else atom_ids[q]
-            for axis in range(3):
-                order = _axis_order(axis)
-                if index == "bra":
-                    value = _contracted_one_deriv(fn_p, fn_q, kernel, order_a=order)
-                else:
-                    value = _contracted_one_deriv(fn_p, fn_q, kernel, order_b=order)
-                out[atom, axis, p, q] = value
+            if order == 1:
+                for axis in range(3):
+                    derivative = _axis_order(axis)
+                    if index == "bra":
+                        value = _contracted_one_deriv(
+                            fn_p, fn_q, kernel, order_a=derivative
+                        )
+                    else:
+                        value = _contracted_one_deriv(
+                            fn_p, fn_q, kernel, order_b=derivative
+                        )
+                    out[atom, axis, p, q] = value
+            else:
+                for axis_a in range(3):
+                    for axis_b in range(3):
+                        derivative = _second_order(axis_a, axis_b)
+                        if index == "bra":
+                            value = _contracted_one_deriv(
+                                fn_p, fn_q, kernel, order_a=derivative
+                            )
+                        else:
+                            value = _contracted_one_deriv(
+                                fn_p, fn_q, kernel, order_b=derivative
+                            )
+                        out[atom, axis_a, atom, axis_b, p, q] = value
     return _transform_one(out, transform)
+
+
+def _one_index_one_electron_derivatives_cpp(
+    mol,
+    kernel="overlap",
+    index="ket",
+    order=1,
+):
+    if _integrals_cpp is None or not hasattr(
+        _integrals_cpp, "compute_one_index_one_electron_derivatives"
+    ):
+        raise ImportError("The C++ Gaussian integral extension is unavailable.")
+
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    workers = _builtin_worker_count(mol, len(basis))
+    out = _integrals_cpp.compute_one_index_one_electron_derivatives(
+        np.ascontiguousarray(shells, dtype=np.int64),
+        np.ascontiguousarray(origins, dtype=np.float64),
+        np.ascontiguousarray(exps, dtype=np.float64),
+        np.ascontiguousarray(weights, dtype=np.float64),
+        np.ascontiguousarray(nprim, dtype=np.int64),
+        np.ascontiguousarray(atom_ids, dtype=np.int64),
+        int(coords.shape[0]),
+        int({"overlap": 0, "kinetic": 1}[kernel]),
+        int({"bra": 0, "ket": 1}[index]),
+        int(order),
+        int(workers),
+    )
+    return _transform_one(np.asarray(out, dtype=float), transform)
+
+
+def one_index_one_electron_derivatives(
+    mol,
+    kernel="overlap",
+    index="ket",
+    order=1,
+    backend="auto",
+):
+    """Return one-index overlap or kinetic derivatives in the AO basis."""
+
+    kernel = str(kernel).lower()
+    if kernel not in {"overlap", "kinetic"}:
+        raise ValueError("kernel must be 'overlap' or 'kinetic'.")
+    index = str(index).lower()
+    if index not in {"bra", "ket"}:
+        raise ValueError("index must be 'bra' or 'ket'.")
+    order = int(order)
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
+    backend = str(backend).lower()
+    if backend not in {"auto", "native", "python"}:
+        raise ValueError("backend must be 'auto', 'native', or 'python'.")
+    if backend == "python":
+        return _one_index_one_electron_derivatives_python(
+            mol, kernel=kernel, index=index, order=order
+        )
+    try:
+        return _one_index_one_electron_derivatives_cpp(
+            mol, kernel=kernel, index=index, order=order
+        )
+    except ImportError:
+        if backend == "native":
+            raise
+    return _one_index_one_electron_derivatives_python(
+        mol, kernel=kernel, index=index, order=order
+    )
 
 
 def position_derivatives(mol, center=None):
@@ -1175,6 +1547,263 @@ def one_index_eri_derivatives(mol, aosym="s1", convention="center"):
     if aosym == "s2kl":
         out = _pack_eri_s2kl(out)
     return out
+
+
+_ERI_SLOT_PERMUTATIONS = {
+    0: (0, 1, 2, 3),
+    1: (1, 0, 2, 3),
+    2: (2, 3, 0, 1),
+    3: (3, 2, 0, 1),
+}
+
+_ERI_PAIR_PERMUTATIONS = {
+    (0, 1): (0, 1, 2, 3),
+    (1, 0): (1, 0, 2, 3),
+    (2, 3): (2, 3, 0, 1),
+    (3, 2): (3, 2, 0, 1),
+}
+
+_ERI_CROSS_PERMUTATIONS = {
+    (0, 2): (0, 1, 2, 3),
+    (0, 3): (0, 1, 3, 2),
+    (1, 2): (1, 0, 2, 3),
+    (1, 3): (1, 0, 3, 2),
+    (2, 0): (2, 3, 0, 1),
+    (2, 1): (2, 3, 1, 0),
+    (3, 0): (3, 2, 0, 1),
+    (3, 1): (3, 2, 1, 0),
+}
+
+
+def _pyscf_ao_atoms(pmol):
+    atoms = np.empty(pmol.nao_nr(), dtype=int)
+    for atom, (_shell0, _shell1, ao0, ao1) in enumerate(pmol.aoslice_by_atom()):
+        atoms[ao0:ao1] = atom
+    return atoms
+
+
+def _permute_eri_slots(tensor, permutation, component_axes):
+    inverse = np.argsort(permutation)
+    return tensor.transpose(*range(component_axes), *(component_axes + inverse))
+
+
+def _directional_eri_derivatives_pyscf(mol, directions, order):
+    pmol = mol.topyscf()
+    natm = int(pmol.natm)
+    direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
+    coefficients = direction[:, _pyscf_ao_atoms(pmol), :]
+    nmodes = direction.shape[0]
+    nao = pmol.nao_nr()
+    labels = "pqrs"
+
+    if order == 1:
+        base = -pmol.intor("int2e_ip1", comp=3, aosym="s1").reshape(
+            3, nao, nao, nao, nao
+        )
+        out = np.zeros((nmodes, nao, nao, nao, nao), dtype=float)
+        for slot, permutation in _ERI_SLOT_PERMUTATIONS.items():
+            label = labels[slot]
+            kernel = _permute_eri_slots(base, permutation, 1)
+            out += np.einsum(
+                f"m{label}a,apqrs->mpqrs",
+                coefficients,
+                kernel,
+                optimize=True,
+            )
+        return out
+
+    out = np.zeros((nmodes, nmodes, nao, nao, nao, nao), dtype=float)
+    kernel_specs = (
+        (
+            "int2e_ipip1",
+            (
+                (slot, slot, permutation)
+                for slot, permutation in _ERI_SLOT_PERMUTATIONS.items()
+            ),
+        ),
+        (
+            "int2e_ipvip1",
+            (
+                (left, right, permutation)
+                for (left, right), permutation in _ERI_PAIR_PERMUTATIONS.items()
+            ),
+        ),
+        (
+            "int2e_ip1ip2",
+            (
+                (left, right, permutation)
+                for (left, right), permutation in _ERI_CROSS_PERMUTATIONS.items()
+            ),
+        ),
+    )
+    for intor, terms in kernel_specs:
+        base = pmol.intor(intor, comp=9, aosym="s1").reshape(
+            3, 3, nao, nao, nao, nao
+        )
+        for left, right, permutation in terms:
+            left_label = labels[left]
+            right_label = labels[right]
+            kernel = _permute_eri_slots(base, permutation, 2)
+            out += np.einsum(
+                f"m{left_label}a,n{right_label}b,abpqrs->mnpqrs",
+                coefficients,
+                coefficients,
+                kernel,
+                optimize=True,
+            )
+        del kernel, base
+    return 0.5 * (out + out.swapaxes(0, 1))
+
+
+def _directional_eri_derivatives_cpp(mol, directions, order):
+    if _integrals_cpp is None or not hasattr(
+        _integrals_cpp, "compute_directional_eri_derivatives"
+    ):
+        raise ImportError("The C++ Gaussian integral extension is unavailable.")
+
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    natm = coords.shape[0]
+    direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    workers = _builtin_worker_count(mol, len(basis))
+    out = _integrals_cpp.compute_directional_eri_derivatives(
+        np.ascontiguousarray(shells, dtype=np.int64),
+        np.ascontiguousarray(origins, dtype=np.float64),
+        np.ascontiguousarray(exps, dtype=np.float64),
+        np.ascontiguousarray(weights, dtype=np.float64),
+        np.ascontiguousarray(nprim, dtype=np.int64),
+        np.ascontiguousarray(atom_ids, dtype=np.int64),
+        np.ascontiguousarray(direction, dtype=np.float64),
+        int(order),
+        int(workers),
+    )
+    return _transform_eri(np.asarray(out, dtype=float), transform)
+
+
+def _directional_eri_derivatives_python(mol, directions, order=1):
+    """
+    Return ERI derivatives projected onto nuclear displacement directions.
+
+    First-order output has shape ``(nmodes, nao, nao, nao, nao)``. Second-order
+    output has shape ``(nmodes, nmodes, nao, nao, nao, nao)``.
+    """
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
+
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    natm = coords.shape[0]
+    nao_cart = len(basis)
+    direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
+    nmodes = direction.shape[0]
+    ao_pairs = _ao_pair_indices(nao_cart)
+
+    if order == 1:
+        out = np.zeros((nmodes, nao_cart, nao_cart, nao_cart, nao_cart), dtype=float)
+        for pair_pq, (p, q) in enumerate(ao_pairs):
+            for pair_rs, (r, s) in enumerate(ao_pairs[: pair_pq + 1]):
+                centers = (atom_ids[p], atom_ids[q], atom_ids[r], atom_ids[s])
+                fns = (basis[p], basis[q], basis[r], basis[s])
+                perms = tuple(_eri_permutations(p, q, r, s))
+                cache = {}
+
+                def eval_orders(orders):
+                    key = tuple(orders)
+                    if key not in cache:
+                        cache[key] = _contracted_eri_deriv(*fns, *orders)
+                    return cache[key]
+
+                values = np.zeros(nmodes, dtype=float)
+                for atom in sorted(set(centers)):
+                    for axis in range(3):
+                        coeff = direction[:, atom, axis]
+                        if not np.any(coeff):
+                            continue
+                        values += coeff * _eri_first_derivative_value(
+                            centers,
+                            eval_orders,
+                            atom,
+                            axis,
+                        )
+                for idx in perms:
+                    out[(slice(None),) + idx] = values
+        return _transform_eri(out, transform)
+
+    out = np.zeros((nmodes, nmodes, nao_cart, nao_cart, nao_cart, nao_cart), dtype=float)
+    for pair_pq, (p, q) in enumerate(ao_pairs):
+        for pair_rs, (r, s) in enumerate(ao_pairs[: pair_pq + 1]):
+            centers = (atom_ids[p], atom_ids[q], atom_ids[r], atom_ids[s])
+            fns = (basis[p], basis[q], basis[r], basis[s])
+            perms = tuple(_eri_permutations(p, q, r, s))
+            perturbations = [(atom, axis) for atom in sorted(set(centers)) for axis in range(3)]
+            cache = {}
+
+            def eval_orders(orders):
+                key = tuple(orders)
+                if key not in cache:
+                    cache[key] = _contracted_eri_deriv(*fns, *orders)
+                return cache[key]
+
+            values = np.zeros((nmodes, nmodes), dtype=float)
+            for atom_a, axis_a in perturbations:
+                coeff_a = direction[:, atom_a, axis_a]
+                if not np.any(coeff_a):
+                    continue
+                for atom_b, axis_b in perturbations:
+                    coeff_b = direction[:, atom_b, axis_b]
+                    if not np.any(coeff_b):
+                        continue
+                    value = _eri_second_derivative_value(
+                        centers,
+                        eval_orders,
+                        atom_a,
+                        axis_a,
+                        atom_b,
+                        axis_b,
+                    )
+                    values += value * np.outer(coeff_a, coeff_b)
+            values = 0.5 * (values + values.T)
+            for idx in perms:
+                out[(slice(None), slice(None)) + idx] = values
+    return _transform_eri(out, transform)
+
+
+def directional_eri_derivatives(mol, directions, order=1, backend="auto"):
+    """
+    Return directional nuclear derivatives of AO electron-repulsion integrals.
+
+    ``backend='native'`` uses the project-local C++ Obara--Saika shell engine,
+    while ``'python'`` is its independent reference implementation.
+    ``backend='auto'`` currently prefers libcint through PySCF and falls back to
+    the native implementation. First-order output has shape
+    ``(nmodes, nao, nao, nao, nao)``; second-order output has shape
+    ``(nmodes, nmodes, nao, nao, nao, nao)``.
+    """
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
+    backend = str(backend).lower()
+    if backend not in {"auto", "native", "python", "pyscf"}:
+        raise ValueError(
+            "backend must be 'auto', 'native', 'python', or 'pyscf'."
+        )
+    if backend == "python":
+        return _directional_eri_derivatives_python(mol, directions, order=order)
+    if backend == "native":
+        return _directional_eri_derivatives_cpp(mol, directions, order)
+    if backend == "pyscf" or callable(getattr(mol, "topyscf", None)):
+        try:
+            return _directional_eri_derivatives_pyscf(mol, directions, order)
+        except (ImportError, ModuleNotFoundError, AttributeError):
+            if backend == "pyscf":
+                raise
+    try:
+        return _directional_eri_derivatives_cpp(mol, directions, order)
+    except (ImportError, AttributeError, NotImplementedError):
+        return _directional_eri_derivatives_python(mol, directions, order=order)
 
 
 def eri_derivatives(mol, order=1, compact=False):

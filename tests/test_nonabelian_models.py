@@ -1,5 +1,6 @@
 import numpy as np
 import pytest
+from itertools import permutations
 
 from pyqed.mps.nonabelian import (
     AutoMPO,
@@ -39,9 +40,10 @@ from pyqed.mps.nonabelian import (
     spatial_target_sector,
     as_rank_coupled_mpo,
 )
-from pyqed.mps.su2 import SpatialOrbitalSite, SU2Irrep
+from pyqed.mps.su2 import SpatialOrbitalSite, SpinChargeSector, SU2Irrep
 from pyqed.mps.nonabelian.coupling import ordered_two_m_values
 from pyqed.mps.nonabelian.states import _fuse_spatial_sectors
+from pyqed.mps.nonabelian import models as nonabelian_models
 
 
 def _spatial_chain():
@@ -362,6 +364,7 @@ def _contract_chain_transition(bra_sites, mpo_factors, ket_sites):
         _initial_left_env_blocks_rank_coupled,
         _is_rank_coupled_chain,
         _normalize_block_sparse_mpo_factors,
+        _rank_coupled_channel_expectation,
         _tensor_dense_layout,
     )
 
@@ -394,7 +397,441 @@ def _contract_chain_transition(bra_sites, mpo_factors, ket_sites):
                 ket_sites[idx],
                 phys_slice_maps[idx],
             )
+    if (
+        rank_coupled
+        and getattr(
+            sparse_mpo_factors[0],
+            "normal_complementary_plan",
+            None,
+        )
+        is not None
+    ):
+        return _rank_coupled_channel_expectation(env, 0)
     return _environment_map_expectation(env, rank_coupled=rank_coupled)
+
+
+def test_fully_reduced_normal_complementary_matrix_matches_dense_reference():
+    try:
+        from pyqed.mps.nonabelian._su2_kernel import SU2MovingEnvironment
+    except ImportError:
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    from pyqed.qchem.dmrg.backends.reduced import (
+        build_su2_normal_complementary_mpo,
+    )
+    from pyqed.mps.nonabelian.environment import (
+        LeftBlock,
+        RightBlock,
+        _initial_left_env_blocks_rank_coupled,
+        _initial_right_env_blocks_rank_coupled,
+        _rank_coupled_channel_expectation,
+        _rank_coupled_cut_expectation,
+        _tensor_dense_layout,
+    )
+
+    nsites = 4
+    rng = np.random.default_rng(20260726)
+    one_body = rng.normal(scale=0.03, size=(nsites, nsites))
+    one_body = 0.5 * (one_body + one_body.T)
+    cholesky = rng.normal(scale=0.02, size=(nsites, nsites, 5))
+    cholesky = 0.5 * (cholesky + cholesky.swapaxes(0, 1))
+    eri = np.einsum("pqL,rsL->pqrs", cholesky, cholesky)
+
+    owner = SU2MovingEnvironment(
+        one_body,
+        eri,
+        4,
+        two_s=0,
+        cutoff=1.0e-12,
+        include_half=True,
+    )
+    mpo = build_su2_normal_complementary_mpo(
+        owner,
+        fully_reduced=True,
+    )
+    for factor in mpo:
+        object.__setattr__(
+            factor,
+            "normal_complementary_right_dual",
+            True,
+        )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(
+        _reduced_spatial_path_specs(
+            nsites,
+            spatial_target_sector(4, 0),
+        )
+    )
+    dense_hamiltonian = (
+        _dense_spatial_one_body_hamiltonian(one_body)
+        + _dense_spatial_spinfree_eri_hamiltonian(eri)
+    )
+    reference = np.asarray(
+        [
+            [
+                _contract_chain_transition(bra, mpo, ket)
+                for ket in basis_states
+            ]
+            for bra in basis_states
+        ]
+    )
+    revision = 0
+
+    def direct_transition(bra, ket):
+        nonlocal revision
+        revision += 1
+        owner.clear_boundaries()
+        env = LeftBlock(
+            _initial_left_env_blocks_rank_coupled(
+                _tensor_dense_layout(ket[0]),
+                mpo[0],
+            ),
+            rank_coupled=True,
+        )
+        for site, (core, bra_site, ket_site) in enumerate(
+            zip(mpo, bra, ket)
+        ):
+            env = env.advance(
+                core,
+                bra_site,
+                ket_site,
+                moving_environment=owner,
+                parent_bond=site,
+                child_bond=site + 1,
+                numeric_revision=revision * nsites + site + 1,
+            )
+        return _rank_coupled_channel_expectation(env, 0)
+
+    direct = np.asarray(
+        [
+            [direct_transition(bra, ket) for ket in basis_states]
+            for bra in basis_states
+        ]
+    )
+
+    def direct_right_transition(bra, ket):
+        nonlocal revision
+        revision += 1
+        owner.clear_boundaries()
+        env = RightBlock(
+            _initial_right_env_blocks_rank_coupled(
+                _tensor_dense_layout(ket[-1]),
+                mpo[-1],
+            ),
+            rank_coupled=True,
+        )
+        for site in range(nsites - 1, -1, -1):
+            env = env.advance(
+                mpo[site],
+                bra[site],
+                ket[site],
+                moving_environment=owner,
+                parent_bond=site + 1,
+                child_bond=site,
+                numeric_revision=revision * nsites + nsites - site,
+            )
+        return _rank_coupled_channel_expectation(env, 1)
+
+    direct_right = np.asarray(
+        [
+            [direct_right_transition(bra, ket) for ket in basis_states]
+            for bra in basis_states
+        ]
+    )
+
+    def interior_cut_transition(bra, ket, *, moving_environment):
+        nonlocal revision
+        revision += 1
+        if moving_environment is not None:
+            moving_environment.clear_boundaries()
+        cut = 2
+        left = LeftBlock(
+            _initial_left_env_blocks_rank_coupled(
+                _tensor_dense_layout(ket[0]),
+                mpo[0],
+            ),
+            rank_coupled=True,
+        )
+        for site in range(cut):
+            left = left.advance(
+                mpo[site],
+                bra[site],
+                ket[site],
+                moving_environment=moving_environment,
+                parent_bond=site,
+                child_bond=site + 1,
+                numeric_revision=revision * nsites + site + 1,
+            )
+        right = RightBlock(
+            _initial_right_env_blocks_rank_coupled(
+                _tensor_dense_layout(ket[-1]),
+                mpo[-1],
+            ),
+            rank_coupled=True,
+        )
+        for site in range(nsites - 1, cut - 1, -1):
+            right = right.advance(
+                mpo[site],
+                bra[site],
+                ket[site],
+                moving_environment=moving_environment,
+                parent_bond=site + 1,
+                child_bond=site,
+                numeric_revision=revision * nsites + nsites - site,
+            )
+        return _rank_coupled_cut_expectation(
+            left,
+            right,
+            mpo[cut - 1].right_channel_irreps,
+        )
+
+    cut_cpp = np.asarray(
+        [
+            [
+                interior_cut_transition(
+                    bra,
+                    ket,
+                    moving_environment=owner,
+                )
+                for ket in basis_states
+            ]
+            for bra in basis_states
+        ]
+    )
+    cut_python = np.asarray(
+        [
+            [
+                interior_cut_transition(
+                    bra,
+                    ket,
+                    moving_environment=None,
+                )
+                for ket in basis_states
+            ]
+            for bra in basis_states
+        ]
+    )
+
+    expected = np.asarray(
+        [
+            [
+                np.vdot(bra, dense_hamiltonian @ ket)
+                for ket in dense_vectors
+            ]
+            for bra in dense_vectors
+        ]
+    )
+
+    np.testing.assert_allclose(
+        reference,
+        expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        direct,
+        expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        direct_right,
+        expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        cut_cpp,
+        expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        cut_python,
+        expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+
+
+def test_normal_complementary_pair_adjoint_survives_rank_one_transport():
+    try:
+        from pyqed.mps.nonabelian._su2_kernel import SU2MovingEnvironment
+    except ImportError:
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    from pyqed.mps.nonabelian.environment import (
+        LeftBlock,
+        _initial_left_env_blocks_rank_coupled,
+        _rank_coupled_channel_expectation,
+        _tensor_dense_layout,
+    )
+    from pyqed.qchem.dmrg.backends.reduced import (
+        build_su2_normal_complementary_mpo,
+    )
+
+    nsites = 6
+    eri = np.zeros((nsites, nsites, nsites, nsites))
+    p, q, r, s = 4, 1, 5, 2
+    for index in {
+        (p, q, r, s),
+        (q, p, r, s),
+        (p, q, s, r),
+        (q, p, s, r),
+        (r, s, p, q),
+        (s, r, p, q),
+        (r, s, q, p),
+        (s, r, q, p),
+    }:
+        eri[index] = 1.0
+
+    owner = SU2MovingEnvironment(
+        np.zeros((nsites, nsites)),
+        eri,
+        6,
+        two_s=0,
+        cutoff=1.0e-12,
+        include_half=True,
+    )
+    mpo = build_su2_normal_complementary_mpo(owner, fully_reduced=True)
+    for factor in mpo:
+        object.__setattr__(
+            factor,
+            "normal_complementary_right_dual",
+            True,
+        )
+    specs = _reduced_spatial_path_specs(
+        nsites,
+        spatial_target_sector(6, 0),
+    )
+    by_labels = {labels: bonds for labels, bonds in specs}
+    bra = _reduced_spatial_path_mps(
+        (2, 1, 1, 0, 1, 1),
+        by_labels[(2, 1, 1, 0, 1, 1)],
+    )
+    ket = _reduced_spatial_path_mps(
+        (2, 2, 2, 0, 0, 0),
+        by_labels[(2, 2, 2, 0, 0, 0)],
+    )
+    revision = 0
+
+    def transition(left_state, right_state):
+        nonlocal revision
+        revision += 1
+        owner.clear_boundaries()
+        env = LeftBlock(
+            _initial_left_env_blocks_rank_coupled(
+                _tensor_dense_layout(right_state[0]),
+                mpo[0],
+            ),
+            rank_coupled=True,
+        )
+        for site, (core, bra_site, ket_site) in enumerate(
+            zip(mpo, left_state, right_state)
+        ):
+            env = env.advance(
+                core,
+                bra_site,
+                ket_site,
+                moving_environment=owner,
+                parent_bond=site,
+                child_bond=site + 1,
+                numeric_revision=revision * nsites + site + 1,
+            )
+        return _rank_coupled_channel_expectation(env, 0)
+
+    expected = -np.sqrt(3.0)
+    assert transition(bra, ket) == pytest.approx(expected, abs=1.0e-12)
+    assert transition(ket, bra) == pytest.approx(expected, abs=1.0e-12)
+
+
+def test_cpp_contextual_right_core_matches_reduced_reference_orientation():
+    try:
+        from pyqed.mps.nonabelian._su2_kernel import SU2MovingEnvironment
+    except ImportError:
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    from pyqed.mps.nonabelian.environment import (
+        _component_basis_norm,
+        _right_reduced_rank_coupled_block,
+    )
+    from pyqed.qchem.dmrg.backends.reduced import (
+        build_su2_normal_complementary_mpo,
+    )
+
+    rng = np.random.default_rng(20260727)
+    nsites = 4
+    one_body = rng.normal(scale=0.03, size=(nsites, nsites))
+    one_body = 0.5 * (one_body + one_body.T)
+    cholesky = rng.normal(scale=0.02, size=(nsites, nsites, 4))
+    cholesky = 0.5 * (cholesky + cholesky.swapaxes(0, 1))
+    eri = np.einsum("pqL,rsL->pqrs", cholesky, cholesky)
+    owner = SU2MovingEnvironment(
+        one_body,
+        eri,
+        4,
+        two_s=0,
+        cutoff=1.0e-12,
+        include_half=True,
+    )
+    mpo = build_su2_normal_complementary_mpo(owner, fully_reduced=True)
+    for factor in mpo:
+        object.__setattr__(
+            factor,
+            "normal_complementary_right_dual",
+            True,
+        )
+
+    factor = mpo[-1]
+    physical = {sector.charge: sector for sector in factor.phys_in_leg.sectors}
+    inner_bra = SpinChargeSector(0, SU2Irrep(1))
+    inner_ket = SpinChargeSector(0, SU2Irrep(1))
+    outer_bra = SpinChargeSector(0, SU2Irrep(0))
+    outer_ket = SpinChargeSector(0, SU2Irrep(0))
+    sectors = (
+        inner_bra,
+        inner_ket,
+        physical[1],
+        physical[1],
+        outer_bra,
+        outer_ket,
+    )
+    reference = _right_reduced_rank_coupled_block(factor, *sectors)
+    connected_reference = {}
+    for (source, target), block in reference.items():
+        source_irrep = factor.left_channel_irreps[source]
+        weights = np.asarray(
+            [
+                _component_basis_norm(
+                    inner_bra,
+                    inner_ket,
+                    source_irrep,
+                    two_m,
+                )
+                for two_m in ordered_two_m_values(source_irrep)
+            ]
+        )
+        connected_reference[(source, target)] = (
+            np.asarray(block) * weights[:, None, None, None]
+        )
+
+    actual = owner.contextual_core(
+        nsites - 1,
+        1,
+        1,
+        outer_bra.irrep.two_j,
+        outer_ket.irrep.two_j,
+        physical[1].irrep.two_j,
+        physical[1].irrep.two_j,
+        inner_bra.irrep.two_j,
+        inner_ket.irrep.two_j,
+        False,
+        True,
+    )
+    assert actual.keys() == connected_reference.keys()
+    for key, expected in connected_reference.items():
+        np.testing.assert_allclose(
+            actual[key],
+            expected,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
 
 
 def test_fully_reduced_two_site_exchange_eri_matrix_matches_exact_reduced_cg_reference():
@@ -567,6 +1004,16 @@ def test_fully_reduced_one_body_embedded_matrix_matches_exact_reduced_cg_referen
                 assert actual == pytest.approx(expected, abs=1.0e-12)
 
 
+def test_fully_reduced_four_distinct_eri_refuses_inexact_recursive_growth():
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    eri = np.zeros((4, 4, 4, 4))
+    eri[0, 2, 1, 3] = 0.07
+    autompo = AutoMPO([phys_leg] * 4)
+
+    with pytest.raises(NotImplementedError, match="four-site recoupling data"):
+        add_spatial_spinfree_eri_terms(autompo, eri)
+
+
 def test_build_spatial_density_mpo_matches_dense_reference():
     A, B, C = _spatial_chain()
     mu = 1.2
@@ -727,6 +1174,38 @@ def test_spatial_spinfree_eri_builder_uses_reduced_we_for_four_distinct_terms():
     assert info["scalar_product_terms"] == 0
     assert any(getattr(core, "reduced_terms", ()) for core in built)
     np.testing.assert_allclose(built_dense, ref_dense, atol=1e-12)
+
+
+def test_analytic_four_site_recoupling_matches_dense_reference_projection():
+    for order in permutations(range(4)):
+        analytic = nonabelian_models._spinfree_we_recoupling_coefficients(order)
+        reference = nonabelian_models._reference_spinfree_we_recoupling_coefficients(order)
+        np.testing.assert_allclose(analytic, reference, atol=1e-12)
+
+
+def test_analytic_exchange_recoupling_matches_dense_reference_projection():
+    for pattern in nonabelian_models._SPINFREE_EXCHANGE_CHANNELS:
+        analytic = nonabelian_models._spinfree_exchange_recoupling_coefficients(pattern)
+        reference = nonabelian_models._reference_spinfree_exchange_recoupling_coefficients(pattern)
+        assert [ranks for _coeff, ranks in analytic] == [ranks for _coeff, ranks in reference]
+        np.testing.assert_allclose(
+            [coeff for coeff, _ranks in analytic],
+            [coeff for coeff, _ranks in reference],
+            atol=1e-12,
+        )
+
+
+def test_active_spinfree_builder_does_not_use_dense_recoupling_projection(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise AssertionError("dense recoupling reference entered the active builder")
+
+    monkeypatch.setattr(nonabelian_models, "_spinfree_component_target_dense", fail)
+    monkeypatch.setattr(nonabelian_models, "_spinfree_component_target_dense_for_sites", fail)
+    eri = np.zeros((4, 4, 4, 4))
+    eri[0, 2, 1, 3] = 0.07
+    eri[0, 1, 1, 2] = -0.03
+    built = nonabelian_models.build_spatial_spinfree_eri_mpo(4, eri)
+    assert built
 
 
 def test_reduced_channels_expand_through_trailing_scalar_only_cores():

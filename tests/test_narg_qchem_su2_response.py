@@ -78,6 +78,16 @@ from pyqed.qchem.mcscf.casci import h1e_for_cas
 from pyqed.qchem.mcscf.orbopt import rotate_orbitals
 
 
+def _build_cpp_integrals(molecule):
+    molecule.build(
+        driver="builtin",
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    return molecule
+
+
 class DummyMol:
     def __init__(self, nelec, spin):
         self.nelec = (nelec // 2, nelec // 2)
@@ -2419,7 +2429,7 @@ def test_active_symmetric_adjoint_arrays_from_complex_values_match_coefficients(
 
 def test_full_cas_integral_response_matches_nonredundant_finite_difference():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
     mo = np.asarray(mf.mo_coeff)
     h1_mo = mf.get_hcore_mo(mo)
@@ -2561,7 +2571,7 @@ def test_active_kappa_terminal_response_matches_finite_difference_vector():
 
 def test_nargscf_accepts_terminal_response_ah_for_active_pairs():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
 
     mc = NARGSCF(
@@ -2589,7 +2599,7 @@ def test_nargscf_accepts_terminal_response_ah_for_active_pairs():
 
 def test_nargscf_accepts_recursive_response_ah():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
 
     mc = NARGSCF(
@@ -2622,7 +2632,7 @@ def test_nargscf_accepts_recursive_response_ah():
 
 def test_nargscf_recursive_response_hessian_matches_relaxed_fd_for_two_site_cas():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = mol.RHF().run()
 
     mc = NARGSCF(

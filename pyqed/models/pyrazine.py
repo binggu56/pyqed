@@ -43,7 +43,7 @@ PYRAZINE_2MODE_LVC_CM = {
 }
 
 
-def pyrazine_2mode_lvc(units="hartree"):
+def lvc(units="hartree"):
     """Return the standard three-state, two-mode pyrazine LVC model.
 
     The mode order is ``(nu_10a coupling, nu_6a tuning)``.  Coordinates are
@@ -67,10 +67,168 @@ def pyrazine_2mode_lvc(units="hartree"):
     couplings[1, 2, 0] = couplings[2, 1, 0] = data["interstate_coupling"] * factor
 
     return LVC(
-        reference_energies=data["reference_energies"] * factor,
-        mode_frequencies=data["frequencies"] * factor,
-        couplings=couplings,
+        E=data["reference_energies"] * factor,
+        omega=data["frequencies"] * factor,
+        linear_couplings=couplings,
         mode_ids=np.array([10, 6]),
+    )
+
+
+def qvc(units="hartree"):
+    """Return the full two-state, 24-mode quadratic pyrazine model.
+
+    The parameter ordering and coefficients reproduce the quadratic
+    Hamiltonian previously distributed as ``H_val``.  The QVC tensor follows
+    the Hessian convention
+
+    ``H(Q) = diag(E) + A_m Q_m + 0.5 * B_mn Q_m Q_n``.
+    """
+
+    from pyqed.qchem.vibronic import QVC
+
+    units = units.lower()
+    if units in ("hartree", "au", "a.u."):
+        factor = 1.0 / au2ev
+    elif units in ("ev", "electronvolt", "electronvolts"):
+        factor = 1.0
+    else:
+        raise ValueError("units must be 'hartree' or 'eV'.")
+
+    omega = np.array(
+        [
+            0.1139, 0.0739, 0.1258, 0.1525, 0.1961, 0.3788,
+            0.0937, 0.1219, 0.0873, 0.1669, 0.1891, 0.3769,
+            0.0423, 0.1190, 0.1266, 0.1408, 0.1840, 0.3734,
+            0.1318, 0.1425, 0.1756, 0.3798, 0.0521, 0.0973,
+        ],
+        dtype=float,
+    )
+    delta = 0.8460 / 2.0
+    E = np.array([-delta, delta], dtype=float)
+
+    linear = np.zeros((2, 2, 24), dtype=float)
+    linear[0, 0, 1:6] = [-0.0981, -0.0503, 0.1452, -0.0445, 0.0247]
+    linear[1, 1, 1:6] = [0.1355, -0.1710, 0.0375, 0.0168, 0.0162]
+    linear[0, 1, 0] = linear[1, 0, 0] = 0.2080
+
+    diagonal_groups = [
+        [1, 2, 3, 4, 5],
+        [0],
+        [6, 7],
+        [8, 9, 10, 11],
+        [12, 13],
+        [14, 15, 16, 17],
+        [18, 19, 20, 21],
+        [22, 23],
+    ]
+    lower_blocks = [
+        [
+            [0, 0.00108, -0.00204, -0.00135, -0.00285],
+            [0.00108, 0, 0.00474, 0.00154, -0.00163],
+            [-0.00204, 0.00474, 0, 0.00872, -0.00474],
+            [-0.00135, 0.00154, 0.00872, 0, -0.00143],
+            [-0.00285, -0.00163, -0.00474, -0.00143, 0],
+        ],
+        [[-0.01159]],
+        [[-0.02252, -0.00049], [-0.00049, -0.01825]],
+        [
+            [-0.00741, 0.01321, -0.00717, 0.00515],
+            [0.01321, 0.05183, -0.03942, 0.00170],
+            [-0.00717, -0.03942, -0.05733, -0.00204],
+            [0.00515, 0.00170, -0.00204, -0.00333],
+        ],
+        [[0.01145, 0.00100], [0.00100, -0.02040]],
+        [
+            [-0.04819, 0.00525, -0.00485, -0.00326],
+            [0.00525, -0.00792, 0.00852, 0.00888],
+            [-0.00485, 0.00852, -0.02429, -0.00443],
+            [-0.00326, 0.00888, -0.00443, -0.00492],
+        ],
+        [
+            [-0.00277, 0.00016, -0.00250, 0.00357],
+            [0.00016, 0.03924, -0.00197, -0.00355],
+            [-0.00250, -0.00197, 0.00992, 0.00623],
+            [0.00357, -0.00355, 0.00623, -0.00110],
+        ],
+        [[-0.02176, -0.00624], [-0.00624, 0.00315]],
+    ]
+    upper_blocks = [
+        [
+            [0, -0.00298, -0.00189, -0.00203, -0.00128],
+            [-0.00298, 0, 0.00155, 0.00311, -0.00600],
+            [-0.00189, 0.00155, 0, 0.01194, -0.00334],
+            [-0.00203, 0.00311, 0.01194, 0, -0.00713],
+            [-0.00128, -0.00600, -0.00334, -0.00713, 0],
+        ],
+        [[-0.01159]],
+        [[-0.03445, 0.00911], [0.00911, -0.00265]],
+        [
+            [-0.00385, -0.00661, 0.00429, -0.00246],
+            [-0.00661, 0.04842, -0.03034, -0.00185],
+            [0.00429, -0.03034, -0.06332, -0.00388],
+            [-0.00246, -0.00185, -0.00388, -0.00040],
+        ],
+        [[-0.01459, -0.00091], [-0.00091, -0.00618]],
+        [
+            [-0.00840, 0.00536, -0.00097, 0.00034],
+            [0.00536, 0.00429, 0.00209, -0.00049],
+            [-0.00097, 0.00209, -0.00734, 0.00346],
+            [0.00034, -0.00049, 0.00346, 0.00062],
+        ],
+        [
+            [-0.01179, -0.00844, 0.07000, -0.01249],
+            [-0.00844, 0.04000, -0.05000, 0.00265],
+            [0.07000, -0.05000, 0.01246, -0.00422],
+            [-0.01249, 0.00265, -0.00422, 0.00069],
+        ],
+        [[-0.02214, -0.00261], [-0.00261, -0.00496]],
+    ]
+
+    quadratic = np.zeros((2, 2, 24, 24), dtype=float)
+    for state, blocks in enumerate((lower_blocks, upper_blocks)):
+        for modes, block in zip(diagonal_groups, blocks):
+            block = np.asarray(block, dtype=float)
+            quadratic[state, state][np.ix_(modes, modes)] = 2.0 * block
+
+    interstate_groups = [
+        ([0], [1, 2, 3, 4, 5]),
+        ([6, 7], [8, 9, 10, 11]),
+        ([12, 13], [14, 15, 16, 17]),
+        ([22, 23], [18, 19, 20, 21]),
+    ]
+    interstate_blocks = [
+        [[-0.01000, -0.00551, 0.00127, 0.00799, -0.00512]],
+        [
+            [-0.01372, -0.00466, 0.00329, -0.00031],
+            [0.00598, -0.00914, 0.00961, 0.00500],
+        ],
+        [
+            [-0.01056, 0.00559, 0.00401, -0.00226],
+            [-0.01200, -0.00213, 0.00328, -0.00396],
+        ],
+        [
+            [0.00118, -0.00009, -0.00285, -0.00095],
+            [0.01281, -0.01780, 0.00134, -0.00481],
+        ],
+    ]
+    for (left_modes, right_modes), block in zip(
+        interstate_groups, interstate_blocks
+    ):
+        block = np.asarray(block, dtype=float)
+        for left_local, left in enumerate(left_modes):
+            for right_local, right in enumerate(right_modes):
+                value = block[left_local, right_local]
+                quadratic[0, 1, left, right] = value
+                quadratic[0, 1, right, left] = value
+                quadratic[1, 0, left, right] = value
+                quadratic[1, 0, right, left] = value
+
+    return QVC(
+        E=E * factor,
+        omega=omega * factor,
+        linear_couplings=linear * factor,
+        quadratic_couplings=quadratic * factor,
+        mode_ids=np.arange(1, 25),
     )
 
 
@@ -591,5 +749,3 @@ if __name__ == '__main__':
     # contour()
     # cut()
     # plot3d()
-
-

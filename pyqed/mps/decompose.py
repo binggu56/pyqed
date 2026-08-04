@@ -12,20 +12,32 @@ https://github.com/tensorly/tensorly
 
 """
 
-import tensorly as tl
-from tensorly import random, validate_tt_rank
-from tensorly.tenalg import inner
-from tensorly.decomposition import tensor_train
-
-
-
-# from lime.phys import dag
-
 import numpy as np
 import warnings
 from scipy.linalg import svd
 
 import logging
+
+
+def _validate_tt_rank(tensor_shape, rank):
+    """Return boundary-complete TT ranks for a NumPy tensor."""
+    n_dim = len(tensor_shape)
+    if isinstance(rank, (int, np.integer)):
+        if int(rank) <= 0:
+            raise ValueError("rank must be positive.")
+        return [1] + [int(rank)] * max(0, n_dim - 1) + [1]
+
+    ranks = [int(value) for value in rank]
+    if len(ranks) != n_dim + 1:
+        raise ValueError(
+            f"Expected {n_dim + 1} TT ranks for a {n_dim}-way tensor; "
+            f"got {len(ranks)}."
+        )
+    if ranks[0] != 1 or ranks[-1] != 1:
+        raise ValueError("The first and last TT ranks must both be one.")
+    if any(value <= 0 for value in ranks):
+        raise ValueError("All TT ranks must be positive.")
+    return ranks
 
 '''
     Function that makes the following contractions (numbers denote leg order):
@@ -89,7 +101,7 @@ def decompose(input_tensor, rank, verbose=False):
     """
 
 
-    rank = validate_tt_rank(tl.shape(input_tensor), rank=rank)
+    rank = _validate_tt_rank(np.shape(input_tensor), rank=rank)
     tensor_size = input_tensor.shape # list of phys dims
     
     n_dim = len(tensor_size)
@@ -109,7 +121,7 @@ def decompose(input_tensor, rank, verbose=False):
 
         # Reshape the unfolding matrix of the remaining factors
         n_row = int(rank[k] * tensor_size[k])
-        unfolding = tl.reshape(unfolding, (n_row, -1))
+        unfolding = np.reshape(unfolding, (n_row, -1))
 
         # SVD of unfolding matrix
         (n_row, n_column) = unfolding.shape
@@ -123,7 +135,7 @@ def decompose(input_tensor, rank, verbose=False):
         # print('schmidt coeff', tl.norm(S))
 
         # Get kth TT factor
-        factors[k] = tl.reshape(U, (rank[k], tensor_size[k], rank[k+1]))
+        factors[k] = np.reshape(U, (rank[k], tensor_size[k], rank[k+1]))
 
         if verbose is True:
             print(
@@ -132,7 +144,7 @@ def decompose(input_tensor, rank, verbose=False):
         # logging.info("TT factor " + str(k) + " computed with shape " + str(factors[k].shape))
 
         # Get new unfolding matrix for the remaining factors
-        unfolding= tl.reshape(S, (-1, 1))*V
+        unfolding = np.reshape(S, (-1, 1)) * V
         # unfolding = V
 
     # Getting the last factor
@@ -226,22 +238,22 @@ def tt_to_tensor(factors):
         return factors
 
     full_shape = [f.shape[1] for f in factors]
-    full_tensor = tl.reshape(factors[0], (full_shape[0], -1))
+    full_tensor = np.reshape(factors[0], (full_shape[0], -1))
 
     for factor in factors[1:]:
         rank_prev, _, rank_next = factor.shape
-        factor = tl.reshape(factor, (rank_prev, -1))
-        full_tensor = tl.dot(full_tensor, factor)
-        full_tensor = tl.reshape(full_tensor, (-1, rank_next))
+        factor = np.reshape(factor, (rank_prev, -1))
+        full_tensor = np.dot(full_tensor, factor)
+        full_tensor = np.reshape(full_tensor, (-1, rank_next))
 
-    return tl.reshape(full_tensor, full_shape)
+    return np.reshape(full_tensor, full_shape)
 
 def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
-    """
-    
-    Compress MPS by reducing the bond dimension.
-    
-    States are renormalized to ensure norm.
+    """Compress an MPS by reducing its bond dimensions.
+
+    ``renormalize=True`` retains the historical behavior of normalizing the
+    retained singular values during the sweep.  Set it to ``False`` when the
+    overall scale carries information, such as after applying an MPO.
 
     Parameters
     ----------
@@ -261,7 +273,11 @@ def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
 
     """
 
-    # d = B_list[0].shape[0]
+    if not isinstance(chi_max, (int, np.integer)) or int(chi_max) <= 0:
+        raise ValueError("chi_max must be a positive integer.")
+    chi_max = int(chi_max)
+
+    B_list = list(B_list)
     L = len(B_list)
     s_list  = [None] * L
     # for p in [0,1]:
@@ -291,22 +307,31 @@ def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
         # C = theta.copy()
 
         # Schmidt decomposition X Y Z^T = theta
-        X, Y, Z = svd(theta)
+        X, Y, Z = svd(theta, full_matrices=False)
         # Z=Z.T # d2*chi3, chi2
 
         # W = np.dot(C,Z.T.conj())
-        chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
+        relative_cutoff = 10.0**(-8) * Y[0] if len(Y) else 0.0
+        numerical_rank = int(np.sum(Y > relative_cutoff))
+        # Retain a one-dimensional zero bond for the zero state instead of
+        # producing empty tensors and dividing by zero.
+        chi2 = min(max(1, numerical_rank), chi_max, len(Y))
 
         # Obtain the new values for B and l #
-        invsq = np.sqrt(sum(Y[:chi2]**2))
+        retained = Y[:chi2].copy()
+        retained_norm = np.linalg.norm(retained)
+        if renormalize and retained_norm > 0.0:
+            retained /= retained_norm
 
-        s_list[i2] = Y[:chi2]/invsq
+        s_list[i2] = retained
 
         # B_list[i1] = np.reshape(W[:,:chi2],(chi1, d1, chi2))/invsq
 
         B_list[i1] = np.reshape(X[:,:chi2],(chi1, d1, chi2))
 
-        B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
+        B_list[i2] = np.reshape(
+            np.diag(retained) @ Z[:chi2, :], (chi2, d2, chi3)
+        )
 
     if return_singular_values:
         return B_list, s_list

@@ -487,12 +487,16 @@ def _constructor_options(state):
     return {
         "frontier_backend": state.frontier_backend,
         "path_optimizer": state.path_optimizer,
-        "tt_max_rank": state.tt_options["max_rank"],
-        "tt_rtol": state.tt_options["rtol"],
-        "tt_atol": state.tt_options["atol"],
-        "tt_transfer_max_rank": state.tt_options["transfer_max_rank"],
-        "tt_transfer_rtol": state.tt_options["transfer_rtol"],
-        "tt_transfer_atol": state.tt_options["transfer_atol"],
+        "local_backend": state.local_backend,
+        "local_rank": state.local_options["rank"],
+        "local_rtol": state.local_options["rtol"],
+        "local_atol": state.local_options["atol"],
+        "max_rank": state.tt_options["max_rank"],
+        "rtol": state.tt_options["rtol"],
+        "atol": state.tt_options["atol"],
+        "transfer_max_rank": state.tt_options["transfer_max_rank"],
+        "transfer_rtol": state.tt_options["transfer_rtol"],
+        "transfer_atol": state.tt_options["transfer_atol"],
         "tt_absorption": state.tt_options["absorption"],
         "tt_norm_backend": state.tt_norm_backend,
         "tt_hermitize": state.tt_hermitize,
@@ -511,14 +515,10 @@ def state_with_tie_graph_proposal(
     it is not state preserving and is accepted only after the global energy
     safeguard in :func:`evaluate_tie_graph_proposal`.
     """
-    # Import lazily so ``frontier_abelian`` can continue to depend on the base
-    # frontier implementation without creating a module-import cycle.
-    from .frontier_abelian import AbelianFrontierTiedLETTA
-
-    if type(state) not in {FrontierTiedLETTA, AbelianFrontierTiedLETTA}:
+    if type(state) is not FrontierTiedLETTA:
         raise TypeError(
-            "graph migration supports FrontierTiedLETTA and "
-            "AbelianFrontierTiedLETTA exactly; another subclass must provide "
+            "graph migration supports unrestricted FrontierTiedLETTA exactly; "
+            "a projected subclass must provide "
             "its own structure-preserving tensor migration."
         )
     if not isinstance(proposal, TieGraphProposal):
@@ -543,8 +543,6 @@ def state_with_tie_graph_proposal(
         raise ValueError("proposal operation must be 'add' or 'remove'.")
 
     constructor_options = _constructor_options(state)
-    if isinstance(state, AbelianFrontierTiedLETTA):
-        constructor_options["abelian_layout"] = state.abelian_layout
     candidate = type(state)(
         state.hamiltonian,
         state.dims,
@@ -645,12 +643,10 @@ def adaptive_tie_graph_step(
     residual_weight: float = 1.0,
 ) -> AdaptiveTieGraphStep:
     """Perform one oracle-free adaptive graph selection step."""
-    from .frontier_abelian import AbelianFrontierTiedLETTA
-
-    if type(state) not in {FrontierTiedLETTA, AbelianFrontierTiedLETTA}:
+    if type(state) is not FrontierTiedLETTA:
         raise TypeError(
-            "adaptive graph migration supports FrontierTiedLETTA and "
-            "AbelianFrontierTiedLETTA exactly."
+            "adaptive graph migration supports unrestricted "
+            "FrontierTiedLETTA exactly."
         )
     shortlist = int(shortlist)
     if shortlist < 1:

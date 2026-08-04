@@ -30,7 +30,11 @@ from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate
             create, Is #, jordan_wigner_two_body
 
 
-from pyqed.qchem.hf.rhf import ao2mo, get_or_build_low_rank_eri_factors
+from pyqed.qchem.hf.rhf import (
+    _cross_ao_overlap_matrix,
+    ao2mo,
+    get_or_build_low_rank_eri_factors,
+)
 from pyqed.qchem.soc import (
     get_soc_1e_spin_orbital,
     get_soc_somf_spin_orbital,
@@ -2140,11 +2144,51 @@ class CASCI:
             return C @ D @ C.conj().T
         return D
 
+    def vibronic_gradients(
+        self,
+        state_ids=None,
+        modes=None,
+        moving_basis="symmetric",
+        projected_only=None,
+        return_terms=False,
+        backend="auto",
+    ):
+        """First-order electronic Hamiltonian derivatives without Hessians."""
+        from pyqed.qchem.geometric import bo_hamiltonian_derivatives
+
+        if projected_only is None:
+            projected_only = modes is not None
+        terms = bo_hamiltonian_derivatives(
+            self,
+            state_ids=state_ids,
+            mode_vectors=modes,
+            moving_basis=moving_basis,
+            projected_only=projected_only,
+            derivative_order=1,
+            backend=backend,
+        )
+        if modes is not None:
+            gradients = np.moveaxis(terms.F_projected, 0, -1)
+        else:
+            natom = self.mol.natom
+            cartesian = terms.F_cartesian.reshape(
+                natom,
+                3,
+                *terms.F_cartesian.shape[1:],
+            )
+            gradients = np.moveaxis(cartesian, (0, 1), (-2, -1))
+        if return_terms:
+            return gradients, terms
+        return gradients
+
     def vibronic_couplings(
         self,
         state_ids=None,
         modes=None,
+        moving_basis="symmetric",
+        projected_only=None,
         return_terms=False,
+        backend="auto",
     ):
         """
         First- and second-order electronic Hamiltonian derivatives.
@@ -2158,9 +2202,17 @@ class CASCI:
             Normal-mode or other collective-coordinate vectors with shape
             ``(nmodes, natom, 3)``, ``(nmodes, 3*natom)``, or
             ``(3*natom, nmodes)``.
+        moving_basis : {False, True, 'symmetric'}, optional
+            Include symmetric AO-overlap/Pulay transport in the local MO frame.
+        projected_only : bool, optional
+            If true and ``modes`` is supplied, avoid building full Cartesian
+            derivative tensors and compute only the requested mode derivatives.
+            By default this is enabled whenever ``modes`` is supplied.
         return_terms : bool, optional
             If true, also return the underlying ``BOHamiltonianDerivatives``
             object.
+        backend : {'auto', 'native', 'python', 'pyscf'}, optional
+            Directional derivative-integral backend.
 
         Returns
         -------
@@ -2173,10 +2225,15 @@ class CASCI:
         """
         from pyqed.qchem.geometric import bo_hamiltonian_derivatives
 
+        if projected_only is None:
+            projected_only = modes is not None
         terms = bo_hamiltonian_derivatives(
             self,
             state_ids=state_ids,
             mode_vectors=modes,
+            moving_basis=moving_basis,
+            projected_only=projected_only,
+            backend=backend,
         )
         if modes is not None:
             f = np.moveaxis(terms.F_projected, 0, -1)
@@ -3137,16 +3194,17 @@ def _compute_ci_mo_overlap(cibra, ciket, s=None):
         return s
 
     try:
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
-    except (ImportError, AttributeError, TypeError):
+        s = _cross_ao_overlap_matrix(cibra.mol, ciket.mol)
+    except (AttributeError, TypeError, ValueError):
         from pyscf import gto
         mol_bra = cibra.mol.topyscf()
         mol_ket = ciket.mol.topyscf()
         mol_bra.build()
         mol_ket.build()
         s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
-    return reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
+    bra_mo = getattr(cibra, "mo_coeff", cibra.mf.mo_coeff)
+    ket_mo = getattr(ciket, "mo_coeff", ciket.mf.mo_coeff)
+    return reduce(np.dot, (bra_mo.T.conj(), s, ket_mo))
 
 
 def _as_state_ci_matrix(ci, ndet):

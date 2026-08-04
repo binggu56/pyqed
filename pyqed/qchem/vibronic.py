@@ -1,7 +1,7 @@
 """Ab-initio ingredients for linear vibronic-coupling Hamiltonians.
 
-The central object is :class:`LVC`.  Its linear electronic-mode terms are stored
-as a single tensor returned by ``vibronic_couplings()``:
+The central objects are :class:`LVC` and :class:`QVC`.  Their electronic-mode
+coefficients are stored as ``linear_couplings`` and ``quadratic_couplings``:
 
 ``V[a, b, m]``
     Linear coefficient multiplying normal coordinate ``Q_m`` in electronic
@@ -29,11 +29,11 @@ class LVC:
 
     Parameters
     ----------
-    reference_energies
+    E
         Electronic energies at the reference geometry, shape ``(nstates,)``.
-    mode_frequencies
+    omega
         Harmonic frequencies for the selected normal modes, shape ``(nmodes,)``.
-    couplings
+    linear_couplings
         Linear vibronic coefficients ``V[a, b, m]``, shape
         ``(nstates, nstates, nmodes)``.
     normal_modes
@@ -45,9 +45,9 @@ class LVC:
         Optional reference Cartesian geometry.
     """
 
-    reference_energies: np.ndarray
-    mode_frequencies: np.ndarray
-    couplings: np.ndarray
+    E: np.ndarray
+    omega: np.ndarray
+    linear_couplings: np.ndarray
     normal_modes: np.ndarray | None = None
     mode_ids: np.ndarray | None = None
     reference_geometry: np.ndarray | None = None
@@ -57,7 +57,7 @@ class LVC:
         cls,
         mc,
         modes,
-        frequencies,
+        omega,
         state_ids=None,
         mode_ids=None,
         reference_geometry=None,
@@ -82,9 +82,9 @@ class LVC:
             reference_geometry = np.asarray(mc.mol.atom_coords(), dtype=float)
 
         model = cls(
-            reference_energies=energies,
-            mode_frequencies=frequencies,
-            couplings=f,
+            E=energies,
+            omega=omega,
+            linear_couplings=f,
             normal_modes=modes,
             mode_ids=mode_ids,
             reference_geometry=reference_geometry,
@@ -94,9 +94,13 @@ class LVC:
         return model
 
     def __post_init__(self):
-        object.__setattr__(self, "reference_energies", _as_1d(self.reference_energies, "reference_energies"))
-        object.__setattr__(self, "mode_frequencies", _as_1d(self.mode_frequencies, "mode_frequencies"))
-        object.__setattr__(self, "couplings", np.asarray(self.couplings, dtype=float))
+        object.__setattr__(self, "E", _as_1d(self.E, "E"))
+        object.__setattr__(self, "omega", _as_1d(self.omega, "omega"))
+        object.__setattr__(
+            self,
+            "linear_couplings",
+            np.asarray(self.linear_couplings, dtype=float),
+        )
         if self.normal_modes is not None:
             object.__setattr__(self, "normal_modes", np.asarray(self.normal_modes, dtype=float))
         if self.mode_ids is not None:
@@ -111,38 +115,42 @@ class LVC:
 
     @property
     def nstates(self) -> int:
-        return int(self.reference_energies.size)
+        return int(self.E.size)
 
     @property
     def nmodes(self) -> int:
-        return int(self.mode_frequencies.size)
+        return int(self.omega.size)
 
     @property
     def state_forces(self) -> np.ndarray:
         """Return diagonal force coefficients, ``-dE_state/dQ_mode``."""
 
-        return -np.diagonal(self.couplings, axis1=0, axis2=1).T
+        return -np.diagonal(self.linear_couplings, axis1=0, axis2=1).T
 
-    def vibronic_couplings(self, copy=True) -> np.ndarray:
-        """Return the full linear vibronic-coupling tensor ``V[a, b, m]``."""
+    def __call__(self, q: ArrayLike) -> np.ndarray:
+        """Evaluate the electronic Hamiltonian without the common harmonic term."""
 
-        return self.couplings.copy() if copy else self.couplings
+        return self.electronic_hamiltonian(q)
 
     def electronic_hamiltonian(self, q: ArrayLike, include_harmonic=False) -> np.ndarray:
         """Evaluate the electronic vibronic matrix at normal coordinates ``q``.
 
         ``include_harmonic=True`` adds the common harmonic nuclear energy
-        ``0.5 * sum_m omega_m**2 * q_m**2`` to every diagonal state.
+        ``0.5 * sum_m omega_m * q_m**2`` to every diagonal state.
         """
 
         q = _as_1d(q, "q")
         if q.size != self.nmodes:
             raise ValueError(f"q must have shape ({self.nmodes},), got {q.shape}.")
 
-        h = np.diag(self.reference_energies).astype(float)
-        h += np.einsum("abm,m->ab", self.couplings, q, optimize=True)
+        h = np.diag(self.E).astype(float)
+        h += np.einsum(
+            "abm,m->ab", self.linear_couplings, q, optimize=True
+        )
         if include_harmonic:
-            h[np.diag_indices(self.nstates)] += 0.5 * np.dot(self.mode_frequencies**2, q**2)
+            h[np.diag_indices(self.nstates)] += 0.5 * np.dot(
+                self.omega, q**2
+            )
         return h
 
     def adiabatic_energies(self, q: ArrayLike, include_harmonic=False) -> np.ndarray:
@@ -151,15 +159,21 @@ class LVC:
         return np.linalg.eigvalsh(self.electronic_hamiltonian(q, include_harmonic=include_harmonic))
 
     def _validate_shapes(self):
-        nstates = self.reference_energies.size
-        nmodes = self.mode_frequencies.size
-        if self.couplings.shape != (nstates, nstates, nmodes):
+        nstates = self.E.size
+        nmodes = self.omega.size
+        if self.linear_couplings.shape != (nstates, nstates, nmodes):
             raise ValueError(
-                "couplings must have shape "
-                f"({nstates}, {nstates}, {nmodes}), got {self.couplings.shape}."
+                "linear_couplings must have shape "
+                f"({nstates}, {nstates}, {nmodes}), "
+                f"got {self.linear_couplings.shape}."
             )
-        if not np.allclose(self.couplings, self.couplings.swapaxes(0, 1)):
-            raise ValueError("couplings must be symmetric in the state indices.")
+        if not np.allclose(
+            self.linear_couplings,
+            self.linear_couplings.swapaxes(0, 1),
+        ):
+            raise ValueError(
+                "linear_couplings must be symmetric in the state indices."
+            )
         if self.normal_modes is not None and self.normal_modes.shape[0] != nmodes:
             raise ValueError(
                 f"normal_modes must have {nmodes} modes in axis 0, got {self.normal_modes.shape}."
@@ -170,10 +184,245 @@ class LVC:
             if len(set(self.mode_ids.tolist())) != nmodes:
                 raise ValueError("mode_ids must be unique.")
 
+    def TDDMRG(
+        self,
+        nbas=10,
+        D=40,
+        *,
+        basis="fock",
+        dvrs=None,
+        domains=None,
+        include_harmonic=True,
+        step=1.0,
+        potential_tol=0.0,
+        mpo_tol=1.0e-12,
+    ):
+        """Return a ``TDMPS`` driver for this vibronic Hamiltonian.
+
+        The default Fock representation uses dimensionless normal coordinates.
+        For a sine-DVR representation, set ``basis="dvr"`` and provide
+        ``domains`` as one ``(minimum, maximum)`` pair per mode.  ``nbas`` then
+        controls the number of DVR points.  Alternatively, pass explicit
+        ``dvrs`` for custom coordinate bases.
+        """
+
+        from pyqed.mps.lvc import (
+            dvr_potential_mpo,
+            fock_hamiltonian_mpo,
+            full_hamiltonian_mpo,
+        )
+        from pyqed.mps.tdmps import TDMPS
+
+        basis = str(basis).lower()
+        if basis == "fock":
+            hamiltonian = fock_hamiltonian_mpo(
+                self,
+                nbas=nbas,
+                include_harmonic=include_harmonic,
+                tol=mpo_tol,
+            )
+            driver = TDMPS(hamiltonian, D=D)
+            driver.model = self
+            driver.basis = "fock"
+            driver.nbas = np.broadcast_to(nbas, (self.nmodes,)).astype(int)
+            return driver
+        if basis != "dvr":
+            raise ValueError("basis must be 'fock' or 'dvr'.")
+        if dvrs is not None and domains is not None:
+            raise ValueError("Provide either dvrs or domains, not both.")
+        if dvrs is None:
+            if domains is None:
+                raise ValueError(
+                    "domains or explicit dvrs must be provided when "
+                    "basis='dvr'."
+                )
+            from pyqed.dvr.dvr_1d import SineDVR
+
+            domains = np.asarray(domains, dtype=float)
+            if domains.shape == (2,):
+                domains = np.broadcast_to(domains, (self.nmodes, 2))
+            if domains.shape != (self.nmodes, 2):
+                raise ValueError(
+                    "domains must have shape "
+                    f"({self.nmodes}, 2), got {domains.shape}."
+                )
+            if np.any(~np.isfinite(domains)) or np.any(
+                domains[:, 1] <= domains[:, 0]
+            ):
+                raise ValueError(
+                    "Every DVR domain must contain finite increasing bounds."
+                )
+            counts = np.broadcast_to(nbas, (self.nmodes,)).astype(int)
+            if np.any(counts <= 0):
+                raise ValueError("Every DVR basis size must be positive.")
+            if np.any(self.omega <= 0.0):
+                raise ValueError(
+                    "Automatic dimensionless normal-mode DVRs require "
+                    "positive omega."
+                )
+            dvrs = [
+                SineDVR(
+                    xmin=lower,
+                    xmax=upper,
+                    npts=count,
+                    mass=1.0 / frequency,
+                )
+                for (lower, upper), count, frequency in zip(
+                    domains, counts, self.omega
+                )
+            ]
+
+        dvrs = list(dvrs)
+        if len(dvrs) != self.nmodes:
+            raise ValueError(
+                f"Expected {self.nmodes} DVRs, got {len(dvrs)}."
+            )
+
+        grids = []
+        for mode, dvr in enumerate(dvrs):
+            if not hasattr(dvr, "x"):
+                raise TypeError(
+                    f"DVR {mode} does not expose a coordinate grid 'x'."
+                )
+            grids.append(np.asarray(dvr.x, dtype=float))
+
+        potential = dvr_potential_mpo(
+            lambda q: self.electronic_hamiltonian(
+                q, include_harmonic=include_harmonic
+            ),
+            grids,
+            step=step,
+            tol=potential_tol,
+            mpo_tol=mpo_tol,
+        )
+        hamiltonian = full_hamiltonian_mpo(potential, dvrs)
+        driver = TDMPS(hamiltonian, D=D)
+        driver.model = self
+        driver.basis = "dvr"
+        driver.potential = potential
+        driver.dvrs = dvrs
+        driver.grids = grids
+        driver.nbas = np.asarray([grid.size for grid in grids], dtype=int)
+        return driver
+
+
+@dataclass(frozen=True, kw_only=True)
+class QVC(LVC):
+    r"""Quadratic vibronic-coupling model.
+
+    ``quadratic_couplings[a, b, m, n]`` stores the electronic-space Hessian
+
+    .. math::
+
+        B_{ab,mn}
+        =
+        \left.
+        \frac{\partial^2 H_{ab}}
+        {\partial Q_m\partial Q_n}
+        \right|_{\mathbf Q=0}.
+
+    The electronic Hamiltonian is evaluated using
+
+    .. math::
+
+        \mathbf H(\mathbf Q)
+        =
+        \mathbf H_0
+        + \sum_m \mathbf A_m Q_m
+        + \frac{1}{2}\sum_{mn}\mathbf B_{mn}Q_mQ_n.
+
+    Consequently, mixed-mode entries may be supplied symmetrically as
+    ``B[:, :, m, n] == B[:, :, n, m]`` without double-counting.
+    """
+
+    quadratic_couplings: np.ndarray
+
+    @classmethod
+    def from_casci(
+        cls,
+        mc,
+        modes,
+        omega,
+        state_ids=None,
+        mode_ids=None,
+        reference_geometry=None,
+    ) -> "QVC":
+        """Build a ``QVC`` model from CASCI first and second derivatives."""
+
+        linear, quadratic = LVC.from_casci(
+            mc,
+            modes=modes,
+            omega=omega,
+            state_ids=state_ids,
+            mode_ids=mode_ids,
+            reference_geometry=reference_geometry,
+            return_quadratic=True,
+        )
+        return cls.from_lvc(linear, quadratic)
+
+    def __post_init__(self):
+        super().__post_init__()
+        quadratic = np.asarray(self.quadratic_couplings, dtype=float)
+        object.__setattr__(self, "quadratic_couplings", quadratic)
+
+        expected = (self.nstates, self.nstates, self.nmodes, self.nmodes)
+        if quadratic.shape != expected:
+            raise ValueError(
+                f"quadratic_couplings must have shape {expected}, "
+                f"got {quadratic.shape}."
+            )
+        if not np.allclose(quadratic, quadratic.swapaxes(0, 1)):
+            raise ValueError(
+                "quadratic_couplings must be symmetric in the state indices."
+            )
+        if not np.allclose(quadratic, quadratic.swapaxes(2, 3)):
+            raise ValueError(
+                "quadratic_couplings must be symmetric in the mode indices."
+            )
+
+    @classmethod
+    def from_lvc(cls, model: LVC, quadratic_couplings) -> "QVC":
+        """Promote an :class:`LVC` model by adding its electronic Hessian."""
+
+        return cls(
+            E=model.E,
+            omega=model.omega,
+            linear_couplings=model.linear_couplings,
+            normal_modes=model.normal_modes,
+            mode_ids=model.mode_ids,
+            reference_geometry=model.reference_geometry,
+            quadratic_couplings=quadratic_couplings,
+        )
+
+    def electronic_hamiltonian(
+        self,
+        q: ArrayLike,
+        include_harmonic=False,
+    ) -> np.ndarray:
+        """Evaluate the quadratic electronic vibronic Hamiltonian."""
+
+        q = _as_1d(q, "q")
+        if q.size != self.nmodes:
+            raise ValueError(f"q must have shape ({self.nmodes},), got {q.shape}.")
+
+        h = super().electronic_hamiltonian(q, include_harmonic=False)
+        h += 0.5 * np.einsum(
+            "abmn,m,n->ab",
+            self.quadratic_couplings,
+            q,
+            q,
+            optimize=True,
+        )
+        if include_harmonic:
+            h[np.diag_indices(self.nstates)] += 0.5 * np.dot(
+                self.omega, q**2
+            )
+        return h
+
 
 def build_lvc(
-    reference_energies,
-    mode_frequencies,
+    E,
+    omega,
     normal_modes,
     state_gradients,
     derivative_couplings=None,
@@ -193,21 +442,21 @@ def build_lvc(
     ``V[a, b, m] = (E_b - E_a) <psi_a | d/dQ_m | psi_b>``
     """
 
-    reference_energies = _as_1d(reference_energies, "reference_energies")
-    mode_frequencies = _as_1d(mode_frequencies, "mode_frequencies")
+    E = _as_1d(E, "E")
+    omega = _as_1d(omega, "omega")
     normal_modes = np.asarray(normal_modes, dtype=float)
     state_gradients = np.asarray(state_gradients, dtype=float)
 
     diagonal = project_cartesian_to_modes(state_gradients, normal_modes)
-    if diagonal.shape != (reference_energies.size, mode_frequencies.size):
+    if diagonal.shape != (E.size, omega.size):
         raise ValueError(
             "Projected state gradients must have shape "
-            f"({reference_energies.size}, {mode_frequencies.size}), got {diagonal.shape}."
+            f"({E.size}, {omega.size}), got {diagonal.shape}."
         )
 
     if vibronic_couplings is None:
         couplings = vibronic_couplings_from_derivative_couplings(
-            reference_energies,
+            E,
             normal_modes=normal_modes,
             derivative_couplings=derivative_couplings,
             mode_derivative_couplings=mode_derivative_couplings,
@@ -215,24 +464,17 @@ def build_lvc(
     else:
         couplings = np.asarray(vibronic_couplings, dtype=float).copy()
 
-    for state in range(reference_energies.size):
+    for state in range(E.size):
         couplings[state, state] = diagonal[state]
 
     return LVC(
-        reference_energies=reference_energies,
-        mode_frequencies=mode_frequencies,
-        couplings=couplings,
+        E=E,
+        omega=omega,
+        linear_couplings=couplings,
         normal_modes=normal_modes,
         mode_ids=mode_ids,
         reference_geometry=reference_geometry,
     )
-
-
-def build_linear_vibronic_model(*args, **kwargs):
-    """Backward-compatible alias for :func:`build_lvc`."""
-
-    return build_lvc(*args, **kwargs)
-
 
 def project_cartesian_to_modes(cartesian_values, normal_modes):
     """Project Cartesian derivatives onto normal coordinates.
@@ -255,7 +497,7 @@ def project_cartesian_to_modes(cartesian_values, normal_modes):
 
 
 def vibronic_couplings_from_derivative_couplings(
-    reference_energies,
+    E,
     normal_modes=None,
     derivative_couplings=None,
     mode_derivative_couplings=None,
@@ -269,8 +511,8 @@ def vibronic_couplings_from_derivative_couplings(
     because they are supplied by projected state gradients in :func:`build_lvc`.
     """
 
-    reference_energies = _as_1d(reference_energies, "reference_energies")
-    nstates = reference_energies.size
+    E = _as_1d(E, "E")
+    nstates = E.size
 
     if mode_derivative_couplings is None:
         if derivative_couplings is None:
@@ -297,7 +539,7 @@ def vibronic_couplings_from_derivative_couplings(
     couplings = np.zeros((nstates, nstates, nmodes), dtype=float)
     for i in range(nstates):
         for j in range(i + 1, nstates):
-            value = (reference_energies[j] - reference_energies[i]) * mode_derivative_couplings[i, j]
+            value = (E[j] - E[i]) * mode_derivative_couplings[i, j]
             couplings[i, j] = value
             couplings[j, i] = value
     return couplings
@@ -326,7 +568,7 @@ def mode_derivative_couplings_from_overlaps(overlaps_minus, overlaps_plus, step)
 
 def load_sharc_lvc_template(
     path,
-    mode_frequencies=None,
+    omega=None,
     normal_modes=None,
     reference_geometry=None,
 ):
@@ -339,7 +581,7 @@ def load_sharc_lvc_template(
     text = Path(path).read_text()
     return lvc_from_sharc_template(
         text,
-        mode_frequencies=mode_frequencies,
+        omega=omega,
         normal_modes=normal_modes,
         reference_geometry=reference_geometry,
     )
@@ -347,7 +589,7 @@ def load_sharc_lvc_template(
 
 def lvc_from_sharc_template(
     text,
-    mode_frequencies=None,
+    omega=None,
     normal_modes=None,
     reference_geometry=None,
 ):
@@ -364,7 +606,7 @@ def lvc_from_sharc_template(
 
     mode_ids = _sharc_mode_ids(sections)
     mode_index = {mode_id: idx for idx, mode_id in enumerate(mode_ids)}
-    frequencies = _select_mode_frequencies(mode_frequencies, mode_ids)
+    frequencies = _select_omega(omega, mode_ids)
     couplings = np.zeros((len(state_keys), len(state_keys), len(mode_ids)), dtype=float)
 
     for row in sections.get("kappa", []):
@@ -384,9 +626,9 @@ def lvc_from_sharc_template(
         couplings[right, left, mode] = value
 
     return LVC(
-        reference_energies=energies,
-        mode_frequencies=frequencies,
-        couplings=couplings,
+        E=energies,
+        omega=frequencies,
+        linear_couplings=couplings,
         normal_modes=normal_modes,
         mode_ids=mode_ids,
         reference_geometry=reference_geometry,
@@ -406,14 +648,18 @@ def compare_lvc_to_sharc(model, sharc_template, atol=1e-10, rtol=1e-8):
     else:
         template_text = str(sharc_template)
         if "\n" in template_text:
-            reference = lvc_from_sharc_template(template_text, mode_frequencies=model.mode_frequencies)
+            reference = lvc_from_sharc_template(
+                template_text, omega=model.omega
+            )
         else:
-            reference = load_sharc_lvc_template(template_text, mode_frequencies=model.mode_frequencies)
+            reference = load_sharc_lvc_template(
+                template_text, omega=model.omega
+            )
 
-    energies = np.asarray(model.reference_energies, dtype=float)
-    ref_energies = np.asarray(reference.reference_energies, dtype=float)
-    couplings = np.asarray(model.vibronic_couplings(), dtype=float)
-    ref_couplings = np.asarray(reference.vibronic_couplings(), dtype=float)
+    energies = np.asarray(model.E, dtype=float)
+    ref_energies = np.asarray(reference.E, dtype=float)
+    couplings = np.asarray(model.linear_couplings, dtype=float)
+    ref_couplings = np.asarray(reference.linear_couplings, dtype=float)
 
     if energies.shape != ref_energies.shape:
         raise ValueError(f"Energy shapes differ: {energies.shape} != {ref_energies.shape}.")
@@ -479,18 +725,18 @@ def _sharc_mode_ids(sections):
     return np.array(sorted(set(ids)), dtype=int)
 
 
-def _select_mode_frequencies(mode_frequencies, mode_ids):
-    if mode_frequencies is None:
+def _select_omega(omega, mode_ids):
+    if omega is None:
         return np.zeros(len(mode_ids), dtype=float)
 
-    mode_frequencies = _as_1d(mode_frequencies, "mode_frequencies")
-    if mode_frequencies.size == len(mode_ids):
-        return mode_frequencies
-    if mode_ids.size and mode_frequencies.size >= int(np.max(mode_ids)):
-        return mode_frequencies[mode_ids - 1]
+    omega = _as_1d(omega, "omega")
+    if omega.size == len(mode_ids):
+        return omega
+    if mode_ids.size and omega.size >= int(np.max(mode_ids)):
+        return omega[mode_ids - 1]
     raise ValueError(
-        "mode_frequencies must either match the number of SHARC modes or contain "
-        "all 1-based SHARC mode ids."
+        "omega must either match the number of SHARC modes or contain all "
+        "1-based SHARC mode ids."
     )
 
 
@@ -510,7 +756,7 @@ def _as_1d(values, name):
 
 __all__ = [
     "LVC",
-    "build_linear_vibronic_model",
+    "QVC",
     "build_lvc",
     "compare_lvc_to_sharc",
     "load_sharc_lvc_template",

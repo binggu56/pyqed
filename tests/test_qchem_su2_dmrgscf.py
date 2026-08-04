@@ -9,11 +9,16 @@ from pyqed.qchem.hf import RHF
 
 def _h2_rhf():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build(
+        driver="builtin",
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
     return RHF(mol).run()
 
 
-def test_state_averaged_su2_dmrgscf_preserves_nonabelian_backend():
+def test_state_averaged_su2_dmrgscf_preserves_su2_solver():
     mf = _h2_rhf()
     mc = DMRGSCF(
         mf,
@@ -32,7 +37,7 @@ def test_state_averaged_su2_dmrgscf_preserves_nonabelian_backend():
         mixer_zero_block_noise_scale=0.0,
     )
 
-    assert mc.dmrg.backend == "nonabelian"
+    assert mc.dmrg.backend == "su2"
     assert mc.dmrg_conv_tol == 1.0e-7
     assert mc.macro_converged is True
     assert mc.solver_converged == mc.dmrg.converged

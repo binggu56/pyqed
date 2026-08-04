@@ -20,8 +20,8 @@ from examples.mps.frontier_tied_letta_j1j2_all_nn import (
     heisenberg_local_hamiltonian,
 )
 from pyqed.letta import (
-    FrontierAbelianLayout,
     FrontierTiedLETTA,
+    SymmetryLayout,
     abelian_frontier_tied_letta_from_mps,
 )
 from pyqed.mps import (
@@ -147,7 +147,7 @@ def _u1_mps_run(dense_mpo, initial_cores, *, bond_dim, sweeps, tolerance):
         for tensor in factors
     )
     local_qns = tuple((((0,), (1,))) for _ in range(nsites))
-    layout = FrontierAbelianLayout(
+    layout = SymmetryLayout(
         local_qns=local_qns,
         bond_qns=tuple(bond_qns),
         target=(nsites // 2,),

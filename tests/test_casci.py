@@ -7,8 +7,6 @@ from pyqed.qchem import Molecule, bo_hamiltonian_derivatives
 from pyqed.qchem.geometric import (
     BOHamiltonianDerivatives,
     GeometricFGTerms,
-    _build_cbasis_from_reference,
-    _contract_ao_operator_with_state_model,
     dipole_exponential_ci_overlap,
     dipole_orbital_rotation_unitary,
     orbital_rotation_ci_overlap,
@@ -638,7 +636,7 @@ def test_orbital_ci_coupling_matches_ci_finite_difference():
 
 def test_bo_hamiltonian_derivatives_match_manual_tdm_contractions():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -646,24 +644,44 @@ def test_bo_hamiltonian_derivatives_match_manual_tdm_contractions():
     terms = bo_hamiltonian_derivatives(mc, state_ids=[0, 1])
 
     cart = 2
-    manual_offdiag_f = _contract_ao_operator_with_state_model(mc, 1, 0, terms.h1_ao_cartesian[cart])
+    tdm1 = mc.make_tdm1(1, 0)
+    tdm2 = mc.make_tdm2(1, 0)
+    overlap = np.vdot(mc.ci[1], mc.ci[0])
+    manual_offdiag_f = (
+        terms.core_gradient_cartesian[cart] * overlap
+        + np.einsum("pq,qp->", terms.h1_mo_cartesian[cart], tdm1, optimize=True)
+        + 0.5 * np.einsum("pqrs,pqrs->", terms.eri1_mo_cartesian[cart], tdm2, optimize=True)
+    )
+    rdm1 = mc.make_rdm1(0)
+    rdm2 = mc.make_rdm2(0)
     manual_diag_f = (
-        _contract_ao_operator_with_state_model(mc, 0, 0, terms.h1_ao_cartesian[cart])
-        + terms.vnn_gradient_cartesian[cart]
+        terms.core_gradient_cartesian[cart]
+        + np.einsum("pq,qp->", terms.h1_mo_cartesian[cart], rdm1, optimize=True)
+        + 0.5 * np.einsum("pqrs,pqrs->", terms.eri1_mo_cartesian[cart], rdm2, optimize=True)
     )
 
     np.testing.assert_allclose(terms.F_cartesian[cart, 1, 0], manual_offdiag_f, atol=1e-10)
     np.testing.assert_allclose(terms.F_cartesian[cart, 0, 0], manual_diag_f, atol=1e-10)
 
-    manual_offdiag_g = _contract_ao_operator_with_state_model(
-        mc,
-        1,
-        0,
-        terms.h2_ao_cartesian[cart, cart],
+    manual_offdiag_g = (
+        terms.core_hessian_cartesian[cart, cart] * overlap
+        + np.einsum("pq,qp->", terms.h2_mo_cartesian[cart, cart], tdm1, optimize=True)
+        + 0.5 * np.einsum(
+            "pqrs,pqrs->",
+            terms.eri2_mo_cartesian[cart, cart],
+            tdm2,
+            optimize=True,
+        )
     )
     manual_diag_g = (
-        _contract_ao_operator_with_state_model(mc, 0, 0, terms.h2_ao_cartesian[cart, cart])
-        + terms.vnn_hessian_cartesian[cart, cart]
+        terms.core_hessian_cartesian[cart, cart]
+        + np.einsum("pq,qp->", terms.h2_mo_cartesian[cart, cart], rdm1, optimize=True)
+        + 0.5 * np.einsum(
+            "pqrs,pqrs->",
+            terms.eri2_mo_cartesian[cart, cart],
+            rdm2,
+            optimize=True,
+        )
     )
 
     np.testing.assert_allclose(terms.G_cartesian[cart, cart, 1, 0], manual_offdiag_g, atol=1e-10)
@@ -672,7 +690,7 @@ def test_bo_hamiltonian_derivatives_match_manual_tdm_contractions():
 
 def test_bo_hamiltonian_derivatives_projection_matches_cartesian_contraction():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -697,9 +715,34 @@ def test_bo_hamiltonian_derivatives_projection_matches_cartesian_contraction():
     np.testing.assert_allclose(terms.G_projected, expected_g, atol=1e-10)
 
 
+def test_bo_hamiltonian_derivatives_projected_only_matches_cartesian_projection():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin', eri='dense')
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+
+    mode = np.zeros((1, mol.natom, 3))
+    mode[0, 0, 2] = -1.0
+    mode[0, 1, 2] = 1.0
+
+    full = bo_hamiltonian_derivatives(mc, state_ids=[0, 1], mode_vectors=mode)
+    projected = bo_hamiltonian_derivatives(
+        mc,
+        state_ids=[0, 1],
+        mode_vectors=mode,
+        projected_only=True,
+    )
+
+    assert projected.F_cartesian is None
+    assert projected.G_cartesian is None
+    np.testing.assert_allclose(projected.F_projected, full.F_projected, atol=1.0e-10)
+    np.testing.assert_allclose(projected.G_projected, full.G_projected, atol=1.0e-10)
+
+
 def test_casci_vibronic_couplings_return_projected_f_and_g():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -724,9 +767,63 @@ def test_casci_vibronic_couplings_return_projected_f_and_g():
     )
 
 
+def test_casci_vibronic_gradients_match_full_first_order_terms():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(driver='builtin', eri='dense')
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+    mode = np.zeros((1, mol.natom, 3))
+    mode[0, 0, 2] = -1.0
+    mode[0, 1, 2] = 1.0
+
+    full = bo_hamiltonian_derivatives(
+        mc,
+        state_ids=[0, 1],
+        mode_vectors=mode,
+        projected_only=True,
+    )
+    gradients, first = mc.vibronic_gradients(
+        state_ids=[0, 1],
+        modes=mode,
+        return_terms=True,
+    )
+
+    np.testing.assert_allclose(first.F_projected, full.F_projected, atol=1e-10)
+    np.testing.assert_allclose(
+        gradients,
+        np.moveaxis(full.F_projected, 0, -1),
+        atol=1e-10,
+    )
+    assert first.G_projected is None
+    assert first.h2_ao_cartesian is None
+    assert first.eri2_mo_cartesian is None
+
+
+def test_casci_vibronic_hessian_is_symmetric_between_two_modes():
+    mol = Molecule(
+        atom="H 0 0 0; H 1.4 0 0; H 0.2 1.3 0",
+        unit="bohr",
+        basis="sto-3g",
+        charge=1,
+    )
+    mol.build(driver="builtin", eri="dense")
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=3, nelecas=2).run(nstates=3)
+    modes = np.zeros((2, mol.natom, 3))
+    modes[0, 0, 0] = -1.0
+    modes[0, 1, 0] = 1.0
+    modes[1, 0, 1] = -1.0
+    modes[1, 2, 1] = 1.0
+
+    _, g = mc.vibronic_couplings(state_ids=[1, 2], modes=modes)
+
+    np.testing.assert_allclose(g, g.swapaxes(-1, -2), atol=1e-10)
+
+
 def test_casci_vibronic_couplings_modes_are_cartesian_displacement_coefficients():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -759,7 +856,7 @@ def test_casci_vibronic_couplings_modes_are_cartesian_displacement_coefficients(
 
 def test_casci_vibronic_couplings_return_cartesian_f_and_g_without_modes():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -782,26 +879,24 @@ def test_casci_vibronic_couplings_return_cartesian_f_and_g_without_modes():
     np.testing.assert_allclose(g, expected_g, atol=1e-10)
 
 
-def test_bo_hamiltonian_derivatives_match_fixed_basis_finite_difference():
+def test_bo_hamiltonian_derivatives_hcore_ao_terms_match_finite_difference():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
     terms = bo_hamiltonian_derivatives(mc, state_ids=[0, 1])
 
-    cbas = _build_cbasis_from_reference(mol)
     coords = np.asarray(mol.atom_coords(), dtype=float)
-    charges = np.asarray(mol.atom_charges(), dtype=float)
 
-    def electron_nuclear_operator(test_coords):
-        v = np.zeros((cbas.nbfn, cbas.nbfn), dtype=float)
-        for atom_id, charge in enumerate(charges):
-            v -= charge * cbas.int1e(
-                'int1e_rinv',
-                inv_origin=np.asarray(test_coords[atom_id], dtype=float),
-            )
-        return v
+    def hcore_at(test_coords):
+        atom = [
+            [mol.atom_symbol(atom_id), *test_coords[atom_id]]
+            for atom_id in range(mol.natom)
+        ]
+        displaced = Molecule(atom=atom, unit="bohr", basis="sto-3g")
+        displaced.build(driver="builtin", eri="dense")
+        return displaced.hcore
 
     atom_id = 1
     axis = 2
@@ -813,12 +908,12 @@ def test_bo_hamiltonian_derivatives_match_fixed_basis_finite_difference():
     coords_plus[atom_id, axis] += delta
     coords_minus[atom_id, axis] -= delta
 
-    v0 = electron_nuclear_operator(coords)
-    v_plus = electron_nuclear_operator(coords_plus)
-    v_minus = electron_nuclear_operator(coords_minus)
+    h0 = hcore_at(coords)
+    h_plus = hcore_at(coords_plus)
+    h_minus = hcore_at(coords_minus)
 
-    fd_first = (v_plus - v_minus) / (2.0 * delta)
-    fd_second = (v_plus - 2.0 * v0 + v_minus) / (delta ** 2)
+    fd_first = (h_plus - h_minus) / (2.0 * delta)
+    fd_second = (h_plus - 2.0 * h0 + h_minus) / (delta ** 2)
 
     np.testing.assert_allclose(
         terms.h1_ao_cartesian[cart].real,
@@ -852,7 +947,7 @@ def test_bo_hamiltonian_derivatives_work_with_builtin_factor_only_reference():
 
 def test_bo_hamiltonian_derivatives_backward_aliases_remain_available():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build(driver='builtin', eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -1350,3 +1445,16 @@ def test_public_overlap_matches_slow_reference_for_displaced_casci_pair():
     fast = mc1.overlap(mc2)
 
     np.testing.assert_allclose(fast, exact, atol=1e-10)
+
+
+def test_builtin_casci_overlap_self_is_identity_with_p_orbitals():
+    mol = Molecule(
+        atom='O 0 0 0; H 0 -1.4 1.1; H 0 1.4 1.1',
+        unit='bohr',
+        basis='sto-3g',
+    )
+    mol.build(driver='builtin', eri='dense')
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+
+    np.testing.assert_allclose(mc.overlap(mc), np.eye(2), atol=1e-10)

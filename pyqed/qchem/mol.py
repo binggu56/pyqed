@@ -87,7 +87,6 @@ _BUILTIN_OPTION_SPECS = (
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
     ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 1.0e-10),
     ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
-    ("shellwise_spherical", "builtin_shellwise_spherical", "native_shellwise_spherical", bool, False),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "auto"),
     ("aosym", "builtin_aosym", "native_aosym", lambda v: None if v is None else str(v), "s8"),
     ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: None if v is None else str(v), None),
@@ -1278,7 +1277,6 @@ class Molecule:
         self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
         self.builtin_eri_backend = self.builtin_options["eri_backend"]
-        self.builtin_shellwise_spherical = self.builtin_options["shellwise_spherical"]
         self.builtin_eri_representation = self.builtin_options["eri_representation"]
         self.builtin_aosym = self.builtin_options["aosym"]
         self.builtin_auxbasis = self.builtin_options["auxbasis"]
@@ -1305,7 +1303,6 @@ class Molecule:
         self.native_parallel_min_nao = self.builtin_parallel_min_nao
         self.native_eri_screen_tol = self.builtin_eri_screen_tol
         self.native_eri_backend = self.builtin_eri_backend
-        self.native_shellwise_spherical = self.builtin_shellwise_spherical
         self.native_eri_representation = self.builtin_eri_representation
         self.native_aosym = self.builtin_aosym
         self.native_auxbasis = self.builtin_auxbasis

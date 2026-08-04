@@ -337,6 +337,12 @@ def test_triatomic_product_term_keo_matches_dense_buildK():
     product_dense = mol.buildK_from_product_terms(sparse=False)
     product_dense_sym = mol.buildK_from_product_terms(sparse=False, symmetrize=True)
     product_sparse = mol.buildK_from_product_terms(sparse=True).toarray()
+    from pyqed.mps.mps import _mpo_to_dense_operator
+
+    product_mpo_dense = _mpo_to_dense_operator(mol.buildK_product_mpo())
+    product_mpo_sym_dense = _mpo_to_dense_operator(
+        mol.buildK_product_mpo(symmetrize=True)
+    )
     rng = np.random.default_rng(7)
     psi = rng.normal(size=(*mol.nx, 2)) + 1j * rng.normal(size=(*mol.nx, 2))
     dense_action = (dense @ psi.reshape(np.prod(mol.nx), 2)).reshape(*mol.nx, 2)
@@ -375,6 +381,12 @@ def test_triatomic_product_term_keo_matches_dense_buildK():
     np.testing.assert_allclose(product_dense, dense, atol=1.0e-12)
     np.testing.assert_allclose(product_dense_sym, dense_sym, atol=1.0e-12)
     np.testing.assert_allclose(product_sparse, dense, atol=1.0e-12)
+    np.testing.assert_allclose(product_mpo_dense, product_dense, atol=1.0e-12)
+    np.testing.assert_allclose(
+        product_mpo_sym_dense,
+        product_dense_sym,
+        atol=1.0e-12,
+    )
     np.testing.assert_allclose(product_action, dense_action, atol=1.0e-12)
     np.testing.assert_allclose(product_sym_action, dense_sym_action, atol=1.0e-12)
     np.testing.assert_allclose(sparse_product_action, dense_action, atol=1.0e-12)
@@ -394,6 +406,158 @@ def test_triatomic_product_term_keo_matches_dense_buildK():
         dense_linked_ldr @ psi.reshape(-1),
         atol=1.0e-12,
     )
+
+
+def test_triatomic_qsqa_transformed_keo_mpo_matches_dense_sandwich():
+    _prefer_source_package()
+    from pyqed.dvr.dvr_1d import LegendreDVR, SineDVR
+    from pyqed.mps.mps import _mpo_to_dense_operator
+    from pyqed.namd.triatomic import Triatom
+
+    atom = [
+        ["H", (1.0, 0.0, 0.0)],
+        ["O", (0.0, 0.0, 0.0)],
+        ["N", (0.0, 1.0, 0.0)],
+    ]
+    mol = Triatom(
+        atom,
+        nstates=1,
+        charge=0,
+        spin=0,
+        unit="bohr",
+        dvr_type=["sine", "legendre", "sine"],
+    )
+    dvrs = (
+        SineDVR(3.45, 4.15, 3),
+        LegendreDVR(1.75, 2.25, 3),
+        SineDVR(-0.35, 0.35, 4),
+    )
+
+    def kron3(A, B, C):
+        return np.kron(A, np.kron(B, C))
+
+    p_s, p_th, p_a = (dvr.momentum() for dvr in dvrs)
+    qs, theta, qa = (np.asarray(dvr.x, dtype=float) for dvr in dvrs)
+    I_s = np.eye(len(qs), dtype=complex)
+    I_th = np.eye(len(theta), dtype=complex)
+    I_a = np.eye(len(qa), dtype=complex)
+    P_s = kron3(p_s, I_th, I_a)
+    P_th = kron3(I_s, p_th, I_a)
+    P_a = kron3(I_s, I_th, p_a)
+
+    q_s_grid, th_grid, q_a_grid = np.meshgrid(qs, theta, qa, indexing="ij")
+    sqrt2 = np.sqrt(2.0)
+    r1 = (q_s_grid + q_a_grid) / sqrt2
+    r2 = (q_s_grid - q_a_grid) / sqrt2
+    sin_th = np.sin(th_grid)
+    cos_th = np.cos(th_grid)
+    M_end1, M_center, M_end2 = mol.mass[0], mol.mass[1], mol.mass[2]
+    inv_mu1 = 1.0 / M_end1 + 1.0 / M_center
+    inv_mu2 = 1.0 / M_end2 + 1.0 / M_center
+
+    Gss = 0.5 * (inv_mu1 + inv_mu2) + cos_th / M_center
+    Gaa = 0.5 * (inv_mu1 + inv_mu2) - cos_th / M_center
+    Gsa = np.full_like(Gss, 0.5 * (inv_mu1 - inv_mu2))
+    Gst = -sin_th / (sqrt2 * M_center) * (1.0 / r1 + 1.0 / r2)
+    Gat = -sin_th / (sqrt2 * M_center) * (1.0 / r2 - 1.0 / r1)
+    Gtt = (
+        inv_mu1 / r1**2
+        + inv_mu2 / r2**2
+        - 2.0 * cos_th / (M_center * r1 * r2)
+    )
+    metric = (
+        -0.125 * Gtt * (1.0 + 1.0 / sin_th**2)
+        - 0.5 * cos_th / (M_center * r1 * r2)
+    ).reshape(-1)
+
+    momenta = (P_s, P_th, P_a)
+    metric_terms = (
+        (Gss, Gst, Gsa),
+        (Gst, Gtt, Gat),
+        (Gsa, Gat, Gaa),
+    )
+    dense = np.diag(metric.astype(complex))
+    for left in range(3):
+        for right in range(3):
+            values = metric_terms[left][right].reshape(-1)
+            dense += (
+                0.5
+                * momenta[left].conj().T
+                @ np.diag(values.astype(complex))
+                @ momenta[right]
+            )
+
+    terms = mol.buildK_qsqa_terms(dvrs)
+    dense_from_terms = None
+    for _label, coef, A, B, C in terms:
+        block = coef * kron3(A, B, C)
+        dense_from_terms = (
+            block
+            if dense_from_terms is None
+            else dense_from_terms + block
+        )
+    mpo_dense = _mpo_to_dense_operator(mol.buildK_qsqa_mpo(dvrs))
+
+    np.testing.assert_allclose(dense_from_terms, dense, atol=1.0e-11)
+    np.testing.assert_allclose(mpo_dense, dense, atol=1.0e-11)
+
+
+def test_triatomic_native_qs_qa_theta_coordinates_match_transformed_valence():
+    _prefer_source_package()
+    from pyqed.dvr.dvr_1d import LegendreDVR, SineDVR
+    from pyqed.namd.triatomic import Triatom
+
+    atom = [
+        ["O", (2.7, 0.0, 0.0)],
+        ["S", (0.0, 0.0, 0.0)],
+        ["O", (-1.3, 2.3, 0.0)],
+    ]
+    qs_axis = SineDVR(3.45, 4.15, 3)
+    qa_axis = SineDVR(-0.35, 0.35, 4)
+    theta_axis = LegendreDVR(1.75, 2.25, 3)
+    transformed = Triatom(
+        atom,
+        unit="bohr",
+        coordinates="qs-qa-theta",
+        dvr_type=["sine", "sine", "legendre"],
+    )
+    transformed.set_dvr(dvrs=(qs_axis, qa_axis, theta_axis))
+
+    valence = Triatom(atom, unit="bohr")
+    expected = valence.buildK_qsqa_terms(
+        (qs_axis, theta_axis, qa_axis),
+        symmetrize=True,
+    )
+    actual = transformed.buildK_qs_qa_theta_terms(symmetrize=True)
+
+    for actual_term, expected_term in zip(actual, expected):
+        assert actual_term[:2] == expected_term[:2]
+        np.testing.assert_allclose(actual_term[2], expected_term[2])
+        np.testing.assert_allclose(actual_term[3], expected_term[4])
+        np.testing.assert_allclose(actual_term[4], expected_term[3])
+
+    dense_from_terms = sum(
+        coefficient * np.kron(A, np.kron(B, C))
+        for _label, coefficient, A, B, C in actual
+    )
+    np.testing.assert_allclose(
+        transformed.buildK(),
+        dense_from_terms,
+        atol=1.0e-12,
+    )
+
+    qs = 3.82
+    qa = 0.14
+    theta = 2.05
+    xyz = transformed.internal_to_xyz(qs, qa, theta)
+    r1 = (qs + qa) / np.sqrt(2.0)
+    r2 = (qs - qa) / np.sqrt(2.0)
+    np.testing.assert_allclose(xyz[0], [r1, 0.0, 0.0])
+    np.testing.assert_allclose(
+        xyz[2],
+        [r2 * np.cos(theta), r2 * np.sin(theta), 0.0],
+    )
+    assert transformed.coordinate_labels == ("qs", "qa", "theta")
 
 
 def test_triatomic_projected_initial_packet_uses_dense_or_linked_overlap():

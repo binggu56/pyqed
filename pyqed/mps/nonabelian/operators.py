@@ -737,6 +737,8 @@ def physical_leg_from_spatial_orbital(site=None):
                 "physical_leg_from_spatial_orbital expects a rank-3 NonabelianTensor site tensor."
             )
         site = normalize_site_tensor_layout(site)
+        if site.metadata.get("physical_basis") == "fully_reduced_su2":
+            return reduced_leg
         dims = {}
         for key, block in site.data.items():
             sector = key[1]

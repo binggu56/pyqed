@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <limits>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -543,6 +544,768 @@ double boys(int n, double T) {
     return value;
 }
 
+void fill_boys_values(int max_n, double T, double* values) {
+    if (T < 1.0e-14) {
+        for (int n = 0; n <= max_n; ++n) {
+            values[n] = 1.0 / (2.0 * n + 1.0);
+        }
+        return;
+    }
+
+    const double exp_T = std::exp(-T);
+    if (T < 4.0) {
+        long double value = 1.0L / (2.0L * max_n + 1.0L);
+        long double term = 1.0L;
+        const long double t_ld = static_cast<long double>(T);
+        for (int k = 1; k < 300; ++k) {
+            term *= -t_ld / k;
+            const long double add = term / (2.0L * max_n + 2.0L * k + 1.0L);
+            value += add;
+            if (std::abs(static_cast<double>(add)) < 1.0e-18) {
+                break;
+            }
+        }
+        values[max_n] = static_cast<double>(value);
+        for (int n = max_n - 1; n >= 0; --n) {
+            values[n] = (2.0 * T * values[n + 1] + exp_T) / (2.0 * n + 1.0);
+        }
+        return;
+    }
+
+    values[0] = boys0(T);
+    for (int n = 0; n < max_n; ++n) {
+        values[n + 1] = ((2.0 * n + 1.0) * values[n] - exp_T) / (2.0 * T);
+    }
+}
+
+enum OneElectronKernel {
+    ONE_OVERLAP = 0,
+    ONE_KINETIC = 1,
+    ONE_NUCLEAR = 2,
+    ONE_HCORE = 3,
+};
+
+double primitive_overlap_cartesian(
+    double a,
+    const int* angular_a,
+    const double* A,
+    double b,
+    const int* angular_b,
+    const double* B
+) {
+    for (int axis = 0; axis < 3; ++axis) {
+        if (angular_a[axis] < 0 || angular_b[axis] < 0) {
+            return 0.0;
+        }
+    }
+    HermiteEMemo ex(angular_a[0], angular_b[0], A[0] - B[0], a, b);
+    HermiteEMemo ey(angular_a[1], angular_b[1], A[1] - B[1], a, b);
+    HermiteEMemo ez(angular_a[2], angular_b[2], A[2] - B[2], a, b);
+    return ex.value(angular_a[0], angular_b[0], 0)
+        * ey.value(angular_a[1], angular_b[1], 0)
+        * ez.value(angular_a[2], angular_b[2], 0)
+        * std::pow(PI / (a + b), 1.5);
+}
+
+double primitive_kinetic_cartesian(
+    double a,
+    const int* angular_a,
+    const double* A,
+    double b,
+    const int* angular_b,
+    const double* B
+) {
+    for (int axis = 0; axis < 3; ++axis) {
+        if (angular_a[axis] < 0 || angular_b[axis] < 0) {
+            return 0.0;
+        }
+    }
+    HermiteEMemo ex(angular_a[0], angular_b[0] + 2, A[0] - B[0], a, b);
+    HermiteEMemo ey(angular_a[1], angular_b[1] + 2, A[1] - B[1], a, b);
+    HermiteEMemo ez(angular_a[2], angular_b[2] + 2, A[2] - B[2], a, b);
+    const double scale = std::sqrt(PI / (a + b));
+    auto sx = [&](int j) {
+        return j < 0 ? 0.0 : scale * ex.value(angular_a[0], j, 0);
+    };
+    auto sy = [&](int j) {
+        return j < 0 ? 0.0 : scale * ey.value(angular_a[1], j, 0);
+    };
+    auto sz = [&](int j) {
+        return j < 0 ? 0.0 : scale * ez.value(angular_a[2], j, 0);
+    };
+
+    const int lx = angular_b[0];
+    const int ly = angular_b[1];
+    const int lz = angular_b[2];
+    const double base = sx(lx) * sy(ly) * sz(lz);
+    const double raised =
+        sx(lx + 2) * sy(ly) * sz(lz)
+        + sx(lx) * sy(ly + 2) * sz(lz)
+        + sx(lx) * sy(ly) * sz(lz + 2);
+    const double lowered =
+        lx * (lx - 1.0) * sx(lx - 2) * sy(ly) * sz(lz)
+        + ly * (ly - 1.0) * sx(lx) * sy(ly - 2) * sz(lz)
+        + lz * (lz - 1.0) * sx(lx) * sy(ly) * sz(lz - 2);
+    return b * (2.0 * (lx + ly + lz) + 3.0) * base
+        - 2.0 * b * b * raised
+        - 0.5 * lowered;
+}
+
+class OneCoulombRMemo {
+public:
+    OneCoulombRMemo(int tx, int uy, int vz, double p, const double* PC)
+        : uy_(uy),
+          vz_(vz),
+          nmax_(tx + uy + vz),
+          p_(p),
+          pc_{PC[0], PC[1], PC[2]},
+          T_(p * (PC[0] * PC[0] + PC[1] * PC[1] + PC[2] * PC[2])),
+          values_(
+              static_cast<std::size_t>(tx + 1)
+                  * static_cast<std::size_t>(uy + 1)
+                  * static_cast<std::size_t>(vz + 1)
+                  * static_cast<std::size_t>(nmax_ + 1),
+              std::numeric_limits<double>::quiet_NaN()
+          ) {}
+
+    double value(int t, int u, int v, int n) {
+        if (t < 0 || u < 0 || v < 0 || n < 0 || n > nmax_) {
+            return 0.0;
+        }
+        double& cached = values_[index(t, u, v, n)];
+        if (!std::isnan(cached)) {
+            return cached;
+        }
+        if (t == 0 && u == 0 && v == 0) {
+            cached = std::pow(-2.0 * p_, n) * boys(n, T_);
+        } else if (t == 0 && u == 0) {
+            cached = pc_[2] * value(t, u, v - 1, n + 1);
+            if (v > 1) {
+                cached += (v - 1.0) * value(t, u, v - 2, n + 1);
+            }
+        } else if (t == 0) {
+            cached = pc_[1] * value(t, u - 1, v, n + 1);
+            if (u > 1) {
+                cached += (u - 1.0) * value(t, u - 2, v, n + 1);
+            }
+        } else {
+            cached = pc_[0] * value(t - 1, u, v, n + 1);
+            if (t > 1) {
+                cached += (t - 1.0) * value(t - 2, u, v, n + 1);
+            }
+        }
+        return cached;
+    }
+
+private:
+    std::size_t index(int t, int u, int v, int n) const {
+        return (((static_cast<std::size_t>(t) * (uy_ + 1) + u) * (vz_ + 1) + v)
+            * (nmax_ + 1) + n);
+    }
+
+    int uy_;
+    int vz_;
+    int nmax_;
+    double p_;
+    std::array<double, 3> pc_;
+    double T_;
+    std::vector<double> values_;
+};
+
+double primitive_nuclear_cartesian(
+    double a,
+    const int* angular_a,
+    const double* A,
+    double b,
+    const int* angular_b,
+    const double* B,
+    const double* C
+) {
+    for (int axis = 0; axis < 3; ++axis) {
+        if (angular_a[axis] < 0 || angular_b[axis] < 0) {
+            return 0.0;
+        }
+    }
+    const double p = a + b;
+    const double P[3] = {
+        (a * A[0] + b * B[0]) / p,
+        (a * A[1] + b * B[1]) / p,
+        (a * A[2] + b * B[2]) / p,
+    };
+    const double PC[3] = {P[0] - C[0], P[1] - C[1], P[2] - C[2]};
+    const int tx = angular_a[0] + angular_b[0];
+    const int uy = angular_a[1] + angular_b[1];
+    const int vz = angular_a[2] + angular_b[2];
+    HermiteEMemo ex(angular_a[0], angular_b[0], A[0] - B[0], a, b);
+    HermiteEMemo ey(angular_a[1], angular_b[1], A[1] - B[1], a, b);
+    HermiteEMemo ez(angular_a[2], angular_b[2], A[2] - B[2], a, b);
+    OneCoulombRMemo r(tx, uy, vz, p, PC);
+    double value = 0.0;
+    for (int t = 0; t <= tx; ++t) {
+        const double vx = ex.value(angular_a[0], angular_b[0], t);
+        for (int u = 0; u <= uy; ++u) {
+            const double vxy = vx * ey.value(angular_a[1], angular_b[1], u);
+            for (int v = 0; v <= vz; ++v) {
+                value += vxy * ez.value(angular_a[2], angular_b[2], v)
+                    * r.value(t, u, v, 0);
+            }
+        }
+    }
+    return value * (2.0 * PI / p);
+}
+
+struct OneElectronIntegralEntry {
+    std::array<int, 6> angular;
+    double value;
+};
+
+class OneElectronPrimitiveCache {
+public:
+    OneElectronPrimitiveCache(
+        int kernel,
+        double a,
+        const int* angular_a,
+        const double* A,
+        double b,
+        const int* angular_b,
+        const double* B,
+        const double* C = nullptr
+    ) : kernel_(kernel), a_(a), b_(b), A_(A), B_(B), C_(C) {
+        for (int axis = 0; axis < 3; ++axis) {
+            base_[axis] = angular_a[axis];
+            base_[3 + axis] = angular_b[axis];
+        }
+        entries_.reserve(80);
+    }
+
+    const std::array<int, 6>& base() const {
+        return base_;
+    }
+
+    double value(const std::array<int, 6>& angular) {
+        for (const OneElectronIntegralEntry& entry : entries_) {
+            if (entry.angular == angular) {
+                return entry.value;
+            }
+        }
+        const double evaluated = evaluate(angular);
+        entries_.push_back({angular, evaluated});
+        return evaluated;
+    }
+
+private:
+    double evaluate(const std::array<int, 6>& angular) const {
+        if (kernel_ == ONE_OVERLAP) {
+            return primitive_overlap_cartesian(a_, angular.data(), A_, b_, angular.data() + 3, B_);
+        }
+        if (kernel_ == ONE_KINETIC) {
+            return primitive_kinetic_cartesian(a_, angular.data(), A_, b_, angular.data() + 3, B_);
+        }
+        return primitive_nuclear_cartesian(
+            a_, angular.data(), A_, b_, angular.data() + 3, B_, C_
+        );
+    }
+
+    int kernel_;
+    double a_;
+    double b_;
+    const double* A_;
+    const double* B_;
+    const double* C_;
+    std::array<int, 6> base_;
+    std::vector<OneElectronIntegralEntry> entries_;
+};
+
+double one_center_first_derivative(
+    OneElectronPrimitiveCache& cache,
+    int slot,
+    int axis,
+    double exponent
+) {
+    std::array<int, 6> angular = cache.base();
+    const int idx = 3 * slot + axis;
+    const int power = angular[idx];
+    angular[idx] += 1;
+    double value = 2.0 * exponent * cache.value(angular);
+    if (power > 0) {
+        angular[idx] -= 2;
+        value -= power * cache.value(angular);
+    }
+    return value;
+}
+
+double one_center_second_derivative(
+    OneElectronPrimitiveCache& cache,
+    int slot_a,
+    int axis_a,
+    double exponent_a,
+    int slot_b,
+    int axis_b,
+    double exponent_b
+) {
+    const int idx_a = 3 * slot_a + axis_a;
+    const int idx_b = 3 * slot_b + axis_b;
+    const int power_a = cache.base()[idx_a];
+    const int power_b = cache.base()[idx_b];
+    std::array<int, 6> angular = cache.base();
+    if (idx_a == idx_b) {
+        angular[idx_a] += 2;
+        double value = 4.0 * exponent_a * exponent_a * cache.value(angular);
+        angular[idx_a] -= 2;
+        value -= 2.0 * exponent_a * (2.0 * power_a + 1.0) * cache.value(angular);
+        if (power_a > 1) {
+            angular[idx_a] -= 2;
+            value += power_a * (power_a - 1.0) * cache.value(angular);
+        }
+        return value;
+    }
+
+    angular[idx_a] += 1;
+    angular[idx_b] += 1;
+    double value = 4.0 * exponent_a * exponent_b * cache.value(angular);
+    if (power_b > 0) {
+        angular[idx_b] -= 2;
+        value -= 2.0 * exponent_a * power_b * cache.value(angular);
+        angular[idx_b] += 2;
+    }
+    if (power_a > 0) {
+        angular[idx_a] -= 2;
+        value -= 2.0 * exponent_b * power_a * cache.value(angular);
+        angular[idx_a] += 2;
+    }
+    if (power_a > 0 && power_b > 0) {
+        angular[idx_a] -= 2;
+        angular[idx_b] -= 2;
+        value += power_a * power_b * cache.value(angular);
+    }
+    return value;
+}
+
+inline double one_direction_component(
+    const double* directions,
+    npy_intp natm,
+    npy_intp mode,
+    npy_intp atom,
+    int axis
+) {
+    return directions[(mode * natm + atom) * 3 + axis];
+}
+
+void accumulate_directional_one_primitive(
+    OneElectronPrimitiveCache& cache,
+    double exponent_a,
+    double exponent_b,
+    npy_intp atom_a,
+    npy_intp atom_b,
+    npy_intp charge_atom,
+    bool relative_to_charge,
+    const double* directions,
+    npy_intp natm,
+    npy_intp nmodes,
+    int order,
+    double scale,
+    double* values
+) {
+    const npy_intp atoms[2] = {atom_a, atom_b};
+    auto coefficient = [&](int slot, npy_intp mode, int axis) {
+        double value = one_direction_component(
+            directions, natm, mode, atoms[slot], axis
+        );
+        if (relative_to_charge) {
+            value -= one_direction_component(
+                directions, natm, mode, charge_atom, axis
+            );
+        }
+        return value;
+    };
+
+    if (order == 1) {
+        double gradient[2][3];
+        for (int slot = 0; slot < 2; ++slot) {
+            const double exponent = slot == 0 ? exponent_a : exponent_b;
+            for (int axis = 0; axis < 3; ++axis) {
+                gradient[slot][axis] = one_center_first_derivative(
+                    cache, slot, axis, exponent
+                );
+            }
+        }
+        for (npy_intp mode = 0; mode < nmodes; ++mode) {
+            double contracted = 0.0;
+            for (int slot = 0; slot < 2; ++slot) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    contracted += coefficient(slot, mode, axis) * gradient[slot][axis];
+                }
+            }
+            values[mode] += scale * contracted;
+        }
+        return;
+    }
+
+    double hessian[2][3][2][3];
+    for (int slot_a = 0; slot_a < 2; ++slot_a) {
+        const double exp_a = slot_a == 0 ? exponent_a : exponent_b;
+        for (int axis_a = 0; axis_a < 3; ++axis_a) {
+            for (int slot_b = 0; slot_b < 2; ++slot_b) {
+                const double exp_b = slot_b == 0 ? exponent_a : exponent_b;
+                for (int axis_b = 0; axis_b < 3; ++axis_b) {
+                    hessian[slot_a][axis_a][slot_b][axis_b] =
+                        one_center_second_derivative(
+                            cache,
+                            slot_a,
+                            axis_a,
+                            exp_a,
+                            slot_b,
+                            axis_b,
+                            exp_b
+                        );
+                }
+            }
+        }
+    }
+    for (npy_intp mode_a = 0; mode_a < nmodes; ++mode_a) {
+        for (npy_intp mode_b = 0; mode_b <= mode_a; ++mode_b) {
+            double contracted = 0.0;
+            for (int slot_a = 0; slot_a < 2; ++slot_a) {
+                for (int axis_a = 0; axis_a < 3; ++axis_a) {
+                    const double ca = coefficient(slot_a, mode_a, axis_a);
+                    for (int slot_b = 0; slot_b < 2; ++slot_b) {
+                        for (int axis_b = 0; axis_b < 3; ++axis_b) {
+                            contracted += ca
+                                * coefficient(slot_b, mode_b, axis_b)
+                                * hessian[slot_a][axis_a][slot_b][axis_b];
+                        }
+                    }
+                }
+            }
+            values[mode_a * nmodes + mode_b] += scale * contracted;
+            if (mode_a != mode_b) {
+                values[mode_b * nmodes + mode_a] += scale * contracted;
+            }
+        }
+    }
+}
+
+bool compute_directional_one_electron_derivatives_native(
+    const std::int64_t* shells,
+    const double* origins,
+    const double* exps,
+    const double* weights,
+    const std::int64_t* nprim,
+    const std::int64_t* atom_ids,
+    const double* atom_coords,
+    const double* charges,
+    const double* directions,
+    npy_intp natm,
+    npy_intp nmodes,
+    npy_intp nao,
+    npy_intp max_prim,
+    int kernel,
+    int order,
+    int workers,
+    double* out
+) {
+    try {
+        std::vector<std::pair<npy_intp, npy_intp>> pairs;
+        pairs.reserve(static_cast<std::size_t>(nao * (nao + 1) / 2));
+        for (npy_intp p = 0; p < nao; ++p) {
+            for (npy_intp q = 0; q <= p; ++q) {
+                pairs.emplace_back(p, q);
+            }
+        }
+
+        const int nthread = std::min(
+            std::max(1, workers),
+            std::max(1, static_cast<int>(pairs.size()))
+        );
+        std::atomic<std::size_t> next_pair{0};
+        std::atomic<bool> failed{false};
+        auto run_worker = [&]() {
+            try {
+                std::vector<double> pair_values(
+                    order == 1
+                        ? static_cast<std::size_t>(nmodes)
+                        : static_cast<std::size_t>(nmodes) * nmodes,
+                    0.0
+                );
+                while (!failed.load(std::memory_order_relaxed)) {
+                    const std::size_t pair_index = next_pair.fetch_add(
+                        1, std::memory_order_relaxed
+                    );
+                    if (pair_index >= pairs.size()) {
+                        break;
+                    }
+                    const npy_intp p = pairs[pair_index].first;
+                    const npy_intp q = pairs[pair_index].second;
+                    std::fill(pair_values.begin(), pair_values.end(), 0.0);
+                    const int angular_p[3] = {
+                        static_cast<int>(shells[3 * p]),
+                        static_cast<int>(shells[3 * p + 1]),
+                        static_cast<int>(shells[3 * p + 2]),
+                    };
+                    const int angular_q[3] = {
+                        static_cast<int>(shells[3 * q]),
+                        static_cast<int>(shells[3 * q + 1]),
+                        static_cast<int>(shells[3 * q + 2]),
+                    };
+                    const double* A = origins + 3 * p;
+                    const double* B = origins + 3 * q;
+                    for (std::int64_t ip = 0; ip < nprim[p]; ++ip) {
+                        const double a = exps[p * max_prim + ip];
+                        const double wa = weights[p * max_prim + ip];
+                        for (std::int64_t iq = 0; iq < nprim[q]; ++iq) {
+                            const double b = exps[q * max_prim + iq];
+                            const double prefactor = wa * weights[q * max_prim + iq];
+                            if (kernel == ONE_OVERLAP || kernel == ONE_KINETIC || kernel == ONE_HCORE) {
+                                const int primitive_kernel = kernel == ONE_OVERLAP
+                                    ? ONE_OVERLAP
+                                    : ONE_KINETIC;
+                                OneElectronPrimitiveCache cache(
+                                    primitive_kernel,
+                                    a,
+                                    angular_p,
+                                    A,
+                                    b,
+                                    angular_q,
+                                    B
+                                );
+                                accumulate_directional_one_primitive(
+                                    cache,
+                                    a,
+                                    b,
+                                    atom_ids[p],
+                                    atom_ids[q],
+                                    0,
+                                    false,
+                                    directions,
+                                    natm,
+                                    nmodes,
+                                    order,
+                                    prefactor,
+                                    pair_values.data()
+                                );
+                            }
+                            if (kernel == ONE_NUCLEAR || kernel == ONE_HCORE) {
+                                for (npy_intp charge_atom = 0; charge_atom < natm; ++charge_atom) {
+                                    if (charges[charge_atom] == 0.0) {
+                                        continue;
+                                    }
+                                    OneElectronPrimitiveCache cache(
+                                        ONE_NUCLEAR,
+                                        a,
+                                        angular_p,
+                                        A,
+                                        b,
+                                        angular_q,
+                                        B,
+                                        atom_coords + 3 * charge_atom
+                                    );
+                                    accumulate_directional_one_primitive(
+                                        cache,
+                                        a,
+                                        b,
+                                        atom_ids[p],
+                                        atom_ids[q],
+                                        charge_atom,
+                                        true,
+                                        directions,
+                                        natm,
+                                        nmodes,
+                                        order,
+                                        -charges[charge_atom] * prefactor,
+                                        pair_values.data()
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    if (order == 1) {
+                        for (npy_intp mode = 0; mode < nmodes; ++mode) {
+                            const double value = pair_values[mode];
+                            out[(mode * nao + p) * nao + q] = value;
+                            out[(mode * nao + q) * nao + p] = value;
+                        }
+                    } else {
+                        for (npy_intp mode_a = 0; mode_a < nmodes; ++mode_a) {
+                            for (npy_intp mode_b = 0; mode_b < nmodes; ++mode_b) {
+                                const double value = pair_values[mode_a * nmodes + mode_b];
+                                const std::size_t offset =
+                                    (static_cast<std::size_t>(mode_a) * nmodes + mode_b)
+                                    * static_cast<std::size_t>(nao) * nao;
+                                out[offset + p * nao + q] = value;
+                                out[offset + q * nao + p] = value;
+                            }
+                        }
+                    }
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        };
+
+        if (nthread == 1) {
+            run_worker();
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<std::size_t>(nthread));
+            try {
+                for (int tid = 0; tid < nthread; ++tid) {
+                    threads.emplace_back(run_worker);
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+            for (std::thread& thread : threads) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        }
+        return !failed.load(std::memory_order_relaxed);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool compute_one_index_one_electron_derivatives_native(
+    const std::int64_t* shells,
+    const double* origins,
+    const double* exps,
+    const double* weights,
+    const std::int64_t* nprim,
+    const std::int64_t* atom_ids,
+    npy_intp natm,
+    npy_intp nao,
+    npy_intp max_prim,
+    int kernel,
+    int index_slot,
+    int order,
+    int workers,
+    double* out
+) {
+    try {
+        const std::size_t npair = static_cast<std::size_t>(nao) * nao;
+        const int nthread = std::min(
+            std::max(1, workers),
+            std::max(1, static_cast<int>(npair))
+        );
+        std::atomic<std::size_t> next_pair{0};
+        std::atomic<bool> failed{false};
+        auto run_worker = [&]() {
+            try {
+                while (!failed.load(std::memory_order_relaxed)) {
+                    const std::size_t pair = next_pair.fetch_add(1, std::memory_order_relaxed);
+                    if (pair >= npair) {
+                        break;
+                    }
+                    const npy_intp p = static_cast<npy_intp>(pair / nao);
+                    const npy_intp q = static_cast<npy_intp>(pair % nao);
+                    const int angular_p[3] = {
+                        static_cast<int>(shells[3 * p]),
+                        static_cast<int>(shells[3 * p + 1]),
+                        static_cast<int>(shells[3 * p + 2]),
+                    };
+                    const int angular_q[3] = {
+                        static_cast<int>(shells[3 * q]),
+                        static_cast<int>(shells[3 * q + 1]),
+                        static_cast<int>(shells[3 * q + 2]),
+                    };
+                    const double* A = origins + 3 * p;
+                    const double* B = origins + 3 * q;
+                    double gradient[3] = {0.0, 0.0, 0.0};
+                    double hessian[3][3] = {};
+                    for (std::int64_t ip = 0; ip < nprim[p]; ++ip) {
+                        const double a = exps[p * max_prim + ip];
+                        const double wa = weights[p * max_prim + ip];
+                        for (std::int64_t iq = 0; iq < nprim[q]; ++iq) {
+                            const double b = exps[q * max_prim + iq];
+                            const double prefactor = wa * weights[q * max_prim + iq];
+                            OneElectronPrimitiveCache cache(
+                                kernel,
+                                a,
+                                angular_p,
+                                A,
+                                b,
+                                angular_q,
+                                B
+                            );
+                            const double exponent = index_slot == 0 ? a : b;
+                            if (order == 1) {
+                                for (int axis = 0; axis < 3; ++axis) {
+                                    gradient[axis] += prefactor * one_center_first_derivative(
+                                        cache, index_slot, axis, exponent
+                                    );
+                                }
+                            } else {
+                                for (int axis_a = 0; axis_a < 3; ++axis_a) {
+                                    for (int axis_b = 0; axis_b < 3; ++axis_b) {
+                                        hessian[axis_a][axis_b] += prefactor
+                                            * one_center_second_derivative(
+                                                cache,
+                                                index_slot,
+                                                axis_a,
+                                                exponent,
+                                                index_slot,
+                                                axis_b,
+                                                exponent
+                                            );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    const npy_intp atom = atom_ids[index_slot == 0 ? p : q];
+                    if (order == 1) {
+                        for (int axis = 0; axis < 3; ++axis) {
+                            const std::size_t offset =
+                                (static_cast<std::size_t>(atom) * 3 + axis)
+                                * static_cast<std::size_t>(nao) * nao;
+                            out[offset + p * nao + q] = gradient[axis];
+                        }
+                    } else {
+                        const std::size_t ncart = static_cast<std::size_t>(natm) * 3;
+                        for (int axis_a = 0; axis_a < 3; ++axis_a) {
+                            const std::size_t cart_a = static_cast<std::size_t>(atom) * 3 + axis_a;
+                            for (int axis_b = 0; axis_b < 3; ++axis_b) {
+                                const std::size_t cart_b = static_cast<std::size_t>(atom) * 3 + axis_b;
+                                const std::size_t offset =
+                                    (cart_a * ncart + cart_b)
+                                    * static_cast<std::size_t>(nao) * nao;
+                                out[offset + p * nao + q] = hessian[axis_a][axis_b];
+                            }
+                        }
+                    }
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        };
+
+        if (nthread == 1) {
+            run_worker();
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<std::size_t>(nthread));
+            try {
+                for (int tid = 0; tid < nthread; ++tid) {
+                    threads.emplace_back(run_worker);
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+            for (std::thread& thread : threads) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        }
+        return !failed.load(std::memory_order_relaxed);
+    } catch (...) {
+        return false;
+    }
+}
+
 inline int os_axis_of_max3(int a, int b, int c) {
     if (a >= b && a >= c) {
         return 0;
@@ -619,22 +1382,32 @@ void os_fill_vrr_table(
     const int cdim = max_c + 1;
     const int mdim = max_m + 1;
 
+    double boys_values[2 * OS_VRR_PAIR_MAX_L + 1];
+    fill_boys_values(max_m, T, boys_values);
     for (int m = 0; m <= max_m; ++m) {
-        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, base_pref * boys(m, T));
+        os_vrr_set(
+            table,
+            0, 0, 0,
+            0, 0, 0,
+            m,
+            adim,
+            cdim,
+            mdim,
+            base_pref * boys_values[m]
+        );
     }
 
     for (int total = 1; total <= max_m; ++total) {
-        for (int ax = 0; ax <= max_a; ++ax) {
-            for (int ay = 0; ay <= max_a - ax; ++ay) {
-                for (int az = 0; az <= max_a - ax - ay; ++az) {
-                    const int asum = ax + ay + az;
-                    for (int cx = 0; cx <= max_c; ++cx) {
-                        for (int cy = 0; cy <= max_c - cx; ++cy) {
-                            for (int cz = 0; cz <= max_c - cx - cy; ++cz) {
-                                const int csum = cx + cy + cz;
-                                if (asum + csum != total) {
-                                    continue;
-                                }
+        const int asum_min = std::max(0, total - max_c);
+        const int asum_max = std::min(max_a, total);
+        for (int asum = asum_min; asum <= asum_max; ++asum) {
+            const int csum = total - asum;
+            for (int ax = 0; ax <= asum; ++ax) {
+                for (int ay = 0; ay <= asum - ax; ++ay) {
+                    const int az = asum - ax - ay;
+                    for (int cx = 0; cx <= csum; ++cx) {
+                        for (int cy = 0; cy <= csum - cx; ++cy) {
+                            const int cz = csum - cx - cy;
                                 for (int m = 0; m <= max_m - total; ++m) {
                                     double value = 0.0;
                                     if (asum > 0) {
@@ -718,7 +1491,6 @@ void os_fill_vrr_table(
                                     }
                                     os_vrr_set(table, ax, ay, az, cx, cy, cz, m, adim, cdim, mdim, value);
                                 }
-                            }
                         }
                     }
                 }
@@ -2774,6 +3546,983 @@ bool compute_eri_s8_cartesian_blocked(
     return true;
 }
 
+inline int target_angular_power(const ShellQuartetTarget& target, int index) {
+    const int angular[12] = {
+        target.ax, target.ay, target.az,
+        target.bx, target.by, target.bz,
+        target.cx, target.cy, target.cz,
+        target.dx, target.dy, target.dz,
+    };
+    return angular[index];
+}
+
+struct HrrExpansionTerm {
+    std::size_t index;
+    double coefficient;
+};
+
+struct HrrExpansion {
+    std::size_t offset;
+    std::size_t size;
+};
+
+struct HrrExpansionCache {
+    std::unordered_map<std::uint64_t, int> lookup;
+    std::vector<HrrExpansion> expansions;
+    std::vector<HrrExpansionTerm> terms;
+
+    void clear() {
+        lookup.clear();
+        expansions.clear();
+        terms.clear();
+        if (lookup.bucket_count() < 512) {
+            lookup.reserve(512);
+        }
+    }
+};
+
+struct HrrFirstDerivativeRecipe {
+    int high = -1;
+    int low = -1;
+    int power = 0;
+};
+
+struct HrrSecondDerivativeRecipe {
+    int pp = -1;
+    int pm = -1;
+    int mp = -1;
+    int mm = -1;
+    int power_a = 0;
+    int power_b = 0;
+    bool same = false;
+};
+
+inline std::uint64_t hrr_angular_key(const std::array<int, 12>& angular) {
+    std::uint64_t key = 0;
+    for (int value : angular) {
+        key = key * 8U + static_cast<std::uint64_t>(value);
+    }
+    return key;
+}
+
+int get_hrr_expansion(
+    HrrExpansionCache& cache,
+    const std::array<int, 12>& angular,
+    int max_a_l,
+    int max_c_l,
+    int max_m_l,
+    const double* AB,
+    const double* CD
+) {
+    for (int value : angular) {
+        if (value < 0) {
+            return -1;
+        }
+    }
+    const std::uint64_t key = hrr_angular_key(angular);
+    const auto found = cache.lookup.find(key);
+    if (found != cache.lookup.end()) {
+        return found->second;
+    }
+
+    const int adim = max_a_l + 1;
+    const int cdim = max_c_l + 1;
+    const int mdim = max_m_l + 1;
+    const std::size_t offset = cache.terms.size();
+    const int ax = angular[0];
+    const int ay = angular[1];
+    const int az = angular[2];
+    const int bx = angular[3];
+    const int by = angular[4];
+    const int bz = angular[5];
+    const int cx = angular[6];
+    const int cy = angular[7];
+    const int cz = angular[8];
+    const int dx = angular[9];
+    const int dy = angular[10];
+    const int dz = angular[11];
+    for (int ix = 0; ix <= bx; ++ix) {
+        for (int iy = 0; iy <= by; ++iy) {
+            for (int iz = 0; iz <= bz; ++iz) {
+                const double coeff_b =
+                    os_binom_small(bx, ix) * os_pow_small(AB[0], bx - ix)
+                    * os_binom_small(by, iy) * os_pow_small(AB[1], by - iy)
+                    * os_binom_small(bz, iz) * os_pow_small(AB[2], bz - iz);
+                if (coeff_b == 0.0) {
+                    continue;
+                }
+                for (int jx = 0; jx <= dx; ++jx) {
+                    for (int jy = 0; jy <= dy; ++jy) {
+                        for (int jz = 0; jz <= dz; ++jz) {
+                            const double coefficient = coeff_b
+                                * os_binom_small(dx, jx) * os_pow_small(CD[0], dx - jx)
+                                * os_binom_small(dy, jy) * os_pow_small(CD[1], dy - jy)
+                                * os_binom_small(dz, jz) * os_pow_small(CD[2], dz - jz);
+                            if (coefficient == 0.0) {
+                                continue;
+                            }
+                            cache.terms.push_back({
+                                os_vrr_idx(
+                                    ax + ix,
+                                    ay + iy,
+                                    az + iz,
+                                    cx + jx,
+                                    cy + jy,
+                                    cz + jz,
+                                    0,
+                                    adim,
+                                    cdim,
+                                    mdim
+                                ),
+                                coefficient,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    const int expansion = static_cast<int>(cache.expansions.size());
+    cache.expansions.push_back({offset, cache.terms.size() - offset});
+    cache.lookup.emplace(key, expansion);
+    return expansion;
+}
+
+inline double evaluate_hrr_expansion(
+    const HrrExpansionCache& cache,
+    int expansion,
+    const double* table
+) {
+    if (expansion < 0) {
+        return 0.0;
+    }
+    const HrrExpansion& entry = cache.expansions[static_cast<std::size_t>(expansion)];
+    const HrrExpansionTerm* terms = cache.terms.data() + entry.offset;
+    double value = 0.0;
+    for (std::size_t i = 0; i < entry.size; ++i) {
+        value += terms[i].coefficient * table[terms[i].index];
+    }
+    return value;
+}
+
+int get_shifted_hrr_expansion(
+    HrrExpansionCache& cache,
+    const ShellQuartetTarget& target,
+    int slot_a,
+    int axis_a,
+    int shift_a,
+    int slot_b,
+    int axis_b,
+    int shift_b,
+    int max_a_l,
+    int max_c_l,
+    int max_m_l,
+    const double* AB,
+    const double* CD
+) {
+    std::array<int, 12> angular = {
+        target.ax, target.ay, target.az,
+        target.bx, target.by, target.bz,
+        target.cx, target.cy, target.cz,
+        target.dx, target.dy, target.dz,
+    };
+    angular[3 * slot_a + axis_a] += shift_a;
+    if (slot_b >= 0) {
+        angular[3 * slot_b + axis_b] += shift_b;
+    }
+    return get_hrr_expansion(
+        cache, angular, max_a_l, max_c_l, max_m_l, AB, CD
+    );
+}
+
+HrrFirstDerivativeRecipe build_hrr_first_recipe(
+    HrrExpansionCache& cache,
+    const ShellQuartetTarget& target,
+    int slot,
+    int axis,
+    int max_a_l,
+    int max_c_l,
+    int max_m_l,
+    const double* AB,
+    const double* CD
+) {
+    HrrFirstDerivativeRecipe recipe;
+    recipe.power = target_angular_power(target, 3 * slot + axis);
+    recipe.high = get_shifted_hrr_expansion(
+        cache, target, slot, axis, 1, -1, 0, 0,
+        max_a_l, max_c_l, max_m_l, AB, CD
+    );
+    if (recipe.power > 0) {
+        recipe.low = get_shifted_hrr_expansion(
+            cache, target, slot, axis, -1, -1, 0, 0,
+            max_a_l, max_c_l, max_m_l, AB, CD
+        );
+    }
+    return recipe;
+}
+
+HrrSecondDerivativeRecipe build_hrr_second_recipe(
+    HrrExpansionCache& cache,
+    const ShellQuartetTarget& target,
+    int slot_a,
+    int axis_a,
+    int slot_b,
+    int axis_b,
+    int max_a_l,
+    int max_c_l,
+    int max_m_l,
+    const double* AB,
+    const double* CD
+) {
+    HrrSecondDerivativeRecipe recipe;
+    const int idx_a = 3 * slot_a + axis_a;
+    const int idx_b = 3 * slot_b + axis_b;
+    recipe.power_a = target_angular_power(target, idx_a);
+    recipe.power_b = target_angular_power(target, idx_b);
+    recipe.same = idx_a == idx_b;
+    if (recipe.same) {
+        recipe.pp = get_shifted_hrr_expansion(
+            cache, target, slot_a, axis_a, 2, -1, 0, 0,
+            max_a_l, max_c_l, max_m_l, AB, CD
+        );
+        recipe.pm = get_shifted_hrr_expansion(
+            cache, target, slot_a, axis_a, 0, -1, 0, 0,
+            max_a_l, max_c_l, max_m_l, AB, CD
+        );
+        if (recipe.power_a > 1) {
+            recipe.mm = get_shifted_hrr_expansion(
+                cache, target, slot_a, axis_a, -2, -1, 0, 0,
+                max_a_l, max_c_l, max_m_l, AB, CD
+            );
+        }
+        return recipe;
+    }
+
+    recipe.pp = get_shifted_hrr_expansion(
+        cache, target, slot_a, axis_a, 1, slot_b, axis_b, 1,
+        max_a_l, max_c_l, max_m_l, AB, CD
+    );
+    if (recipe.power_b > 0) {
+        recipe.pm = get_shifted_hrr_expansion(
+            cache, target, slot_a, axis_a, 1, slot_b, axis_b, -1,
+            max_a_l, max_c_l, max_m_l, AB, CD
+        );
+    }
+    if (recipe.power_a > 0) {
+        recipe.mp = get_shifted_hrr_expansion(
+            cache, target, slot_a, axis_a, -1, slot_b, axis_b, 1,
+            max_a_l, max_c_l, max_m_l, AB, CD
+        );
+    }
+    if (recipe.power_a > 0 && recipe.power_b > 0) {
+        recipe.mm = get_shifted_hrr_expansion(
+            cache, target, slot_a, axis_a, -1, slot_b, axis_b, -1,
+            max_a_l, max_c_l, max_m_l, AB, CD
+        );
+    }
+    return recipe;
+}
+
+inline double evaluate_hrr_first_recipe(
+    const HrrExpansionCache& cache,
+    const HrrFirstDerivativeRecipe& recipe,
+    double exponent,
+    const double* table
+) {
+    return 2.0 * exponent * evaluate_hrr_expansion(cache, recipe.high, table)
+        - recipe.power * evaluate_hrr_expansion(cache, recipe.low, table);
+}
+
+inline double evaluate_hrr_second_recipe(
+    const HrrExpansionCache& cache,
+    const HrrSecondDerivativeRecipe& recipe,
+    double exponent_a,
+    double exponent_b,
+    const double* table
+) {
+    if (recipe.same) {
+        return 4.0 * exponent_a * exponent_a
+                * evaluate_hrr_expansion(cache, recipe.pp, table)
+            - 2.0 * exponent_a * (2.0 * recipe.power_a + 1.0)
+                * evaluate_hrr_expansion(cache, recipe.pm, table)
+            + recipe.power_a * (recipe.power_a - 1.0)
+                * evaluate_hrr_expansion(cache, recipe.mm, table);
+    }
+    return 4.0 * exponent_a * exponent_b
+            * evaluate_hrr_expansion(cache, recipe.pp, table)
+        - 2.0 * exponent_a * recipe.power_b
+            * evaluate_hrr_expansion(cache, recipe.pm, table)
+        - 2.0 * exponent_b * recipe.power_a
+            * evaluate_hrr_expansion(cache, recipe.mp, table)
+        + recipe.power_a * recipe.power_b
+            * evaluate_hrr_expansion(cache, recipe.mm, table);
+}
+
+inline double primitive_eri_target_angular(
+    const ShellQuartetTarget& target,
+    const int* angular,
+    const double* exponents,
+    const double* origins
+) {
+    return primitive_eri_cartesian(
+        exponents[0],
+        angular[0], angular[1], angular[2],
+        origins + 3 * target.ao_p,
+        exponents[1],
+        angular[3], angular[4], angular[5],
+        origins + 3 * target.ao_q,
+        exponents[2],
+        angular[6], angular[7], angular[8],
+        origins + 3 * target.ao_r,
+        exponents[3],
+        angular[9], angular[10], angular[11],
+        origins + 3 * target.ao_s
+    );
+}
+
+inline double primitive_center_first_derivative_target(
+    const ShellQuartetTarget& target,
+    int slot,
+    int axis,
+    const double* exponents,
+    const double* origins
+) {
+    int angular[12] = {
+        target.ax, target.ay, target.az,
+        target.bx, target.by, target.bz,
+        target.cx, target.cy, target.cz,
+        target.dx, target.dy, target.dz,
+    };
+    const int idx = 3 * slot + axis;
+    const int power = angular[idx];
+    angular[idx] += 1;
+    double value = 2.0 * exponents[slot] * primitive_eri_target_angular(
+        target, angular, exponents, origins
+    );
+    if (power > 0) {
+        angular[idx] -= 2;
+        value -= power * primitive_eri_target_angular(
+            target, angular, exponents, origins
+        );
+    }
+    return value;
+}
+
+inline double primitive_center_second_derivative_target(
+    const ShellQuartetTarget& target,
+    int slot_a,
+    int axis_a,
+    int slot_b,
+    int axis_b,
+    const double* exponents,
+    const double* origins
+) {
+    int angular[12] = {
+        target.ax, target.ay, target.az,
+        target.bx, target.by, target.bz,
+        target.cx, target.cy, target.cz,
+        target.dx, target.dy, target.dz,
+    };
+    const int idx_a = 3 * slot_a + axis_a;
+    const int idx_b = 3 * slot_b + axis_b;
+    const int power_a = angular[idx_a];
+    const int power_b = angular[idx_b];
+    if (idx_a == idx_b) {
+        angular[idx_a] += 2;
+        double value = 4.0 * exponents[slot_a] * exponents[slot_a] *
+            primitive_eri_target_angular(target, angular, exponents, origins);
+        angular[idx_a] -= 2;
+        value -= 2.0 * exponents[slot_a] * (2.0 * power_a + 1.0) *
+            primitive_eri_target_angular(target, angular, exponents, origins);
+        if (power_a > 1) {
+            angular[idx_a] -= 2;
+            value += power_a * (power_a - 1.0) *
+                primitive_eri_target_angular(target, angular, exponents, origins);
+        }
+        return value;
+    }
+
+    angular[idx_a] += 1;
+    angular[idx_b] += 1;
+    double value = 4.0 * exponents[slot_a] * exponents[slot_b] *
+        primitive_eri_target_angular(target, angular, exponents, origins);
+    angular[idx_a] -= 1;
+    angular[idx_b] -= 1;
+    if (power_b > 0) {
+        angular[idx_a] += 1;
+        angular[idx_b] -= 1;
+        value -= 2.0 * exponents[slot_a] * power_b *
+            primitive_eri_target_angular(target, angular, exponents, origins);
+        angular[idx_a] -= 1;
+        angular[idx_b] += 1;
+    }
+    if (power_a > 0) {
+        angular[idx_a] -= 1;
+        angular[idx_b] += 1;
+        value -= 2.0 * exponents[slot_b] * power_a *
+            primitive_eri_target_angular(target, angular, exponents, origins);
+        angular[idx_a] += 1;
+        angular[idx_b] -= 1;
+    }
+    if (power_a > 0 && power_b > 0) {
+        angular[idx_a] -= 1;
+        angular[idx_b] -= 1;
+        value += power_a * power_b *
+            primitive_eri_target_angular(target, angular, exponents, origins);
+    }
+    return value;
+}
+
+bool compute_directional_shell_quartet_derivatives(
+    const std::int64_t* shells,
+    const double* origins,
+    const double* weights,
+    const std::int64_t* nprim,
+    const std::int64_t* atom_ids,
+    const double* directions,
+    npy_intp natm,
+    npy_intp nmodes,
+    npy_intp nao,
+    npy_intp max_prim,
+    const ShellBlock& pblk,
+    const ShellBlock& qblk,
+    const ShellBlock& rblk,
+    const ShellBlock& sblk,
+    bool same_shell_pair,
+    const double* pq_a,
+    const double* pq_b,
+    const double* pq_p,
+    const double* pq_px,
+    const double* pq_py,
+    const double* pq_pz,
+    const double* pq_k,
+    int npq,
+    const double* rs_a,
+    const double* rs_b,
+    const double* rs_p,
+    const double* rs_px,
+    const double* rs_py,
+    const double* rs_pz,
+    const double* rs_k,
+    int nrs,
+    int order,
+    double* out,
+    std::vector<double>& vrr_table,
+    std::vector<ShellQuartetTarget>& targets,
+    std::vector<double>& derivative_block,
+    std::vector<double>& mode_coeffs,
+    HrrExpansionCache& hrr_cache,
+    std::vector<HrrFirstDerivativeRecipe>& first_recipes,
+    std::vector<HrrSecondDerivativeRecipe>& second_recipes
+) {
+    const int max_a_l = pblk.l + qblk.l + order;
+    const int max_c_l = rblk.l + sblk.l + order;
+    const int max_m_l = max_a_l + max_c_l;
+    const bool use_vrr =
+        max_a_l <= OS_VRR_PAIR_MAX_L && max_c_l <= OS_VRR_PAIR_MAX_L;
+
+    targets.clear();
+    const std::size_t target_cap =
+        static_cast<std::size_t>(pblk.stop - pblk.start) *
+        static_cast<std::size_t>(qblk.stop - qblk.start) *
+        static_cast<std::size_t>(rblk.stop - rblk.start) *
+        static_cast<std::size_t>(sblk.stop - sblk.start);
+    targets.reserve(target_cap);
+    for (npy_intp ao_p = pblk.start; ao_p < pblk.stop; ++ao_p) {
+        for (npy_intp ao_q = qblk.start; ao_q < qblk.stop; ++ao_q) {
+            if (ao_p < ao_q) {
+                continue;
+            }
+            const npy_intp pair_pq = pair_index(static_cast<int>(ao_p), static_cast<int>(ao_q));
+            for (npy_intp ao_r = rblk.start; ao_r < rblk.stop; ++ao_r) {
+                for (npy_intp ao_s = sblk.start; ao_s < sblk.stop; ++ao_s) {
+                    if (ao_r < ao_s) {
+                        continue;
+                    }
+                    const npy_intp pair_rs = pair_index(static_cast<int>(ao_r), static_cast<int>(ao_s));
+                    if (same_shell_pair && pair_pq < pair_rs) {
+                        continue;
+                    }
+                    targets.push_back({
+                        static_cast<int>(shells[3 * ao_p]),
+                        static_cast<int>(shells[3 * ao_p + 1]),
+                        static_cast<int>(shells[3 * ao_p + 2]),
+                        static_cast<int>(shells[3 * ao_q]),
+                        static_cast<int>(shells[3 * ao_q + 1]),
+                        static_cast<int>(shells[3 * ao_q + 2]),
+                        static_cast<int>(shells[3 * ao_r]),
+                        static_cast<int>(shells[3 * ao_r + 1]),
+                        static_cast<int>(shells[3 * ao_r + 2]),
+                        static_cast<int>(shells[3 * ao_s]),
+                        static_cast<int>(shells[3 * ao_s + 1]),
+                        static_cast<int>(shells[3 * ao_s + 2]),
+                        ao_p,
+                        ao_q,
+                        ao_r,
+                        ao_s,
+                        ao_p * max_prim,
+                        ao_q * max_prim,
+                        ao_r * max_prim,
+                        ao_s * max_prim,
+                        pair_pair_index(pair_pq, pair_rs),
+                    });
+                }
+            }
+        }
+    }
+    if (targets.empty()) {
+        return true;
+    }
+
+    constexpr int ncenter_derivatives = 9;
+    const int nderiv = order == 1 ? ncenter_derivatives : ncenter_derivatives * ncenter_derivatives;
+    derivative_block.assign(targets.size() * static_cast<std::size_t>(nderiv), 0.0);
+    mode_coeffs.assign(static_cast<std::size_t>(nmodes) * ncenter_derivatives, 0.0);
+    bool derivative_active[ncenter_derivatives] = {};
+    const npy_intp atom_slots[4] = {
+        atom_ids[pblk.start],
+        atom_ids[qblk.start],
+        atom_ids[rblk.start],
+        atom_ids[sblk.start],
+    };
+    int reference_slot = 3;
+    int reference_count = 0;
+    int reference_hrr_cost = std::numeric_limits<int>::max();
+    for (int candidate = 0; candidate < 4; ++candidate) {
+        int count = 0;
+        int hrr_cost = 0;
+        for (int slot = 0; slot < 4; ++slot) {
+            count += atom_slots[slot] == atom_slots[candidate];
+            if (atom_slots[slot] != atom_slots[candidate]) {
+                hrr_cost += (slot == 1 || slot == 3) ? 4 : 1;
+            }
+        }
+        if (
+            count > reference_count
+            || (count == reference_count && hrr_cost < reference_hrr_cost)
+        ) {
+            reference_slot = candidate;
+            reference_count = count;
+            reference_hrr_cost = hrr_cost;
+        }
+    }
+    int derivative_slots[3];
+    int derivative_slot_count = 0;
+    for (int slot = 0; slot < 4; ++slot) {
+        if (slot != reference_slot) {
+            derivative_slots[derivative_slot_count++] = slot;
+        }
+    }
+    for (int derivative = 0; derivative < ncenter_derivatives; ++derivative) {
+        const int slot = derivative_slots[derivative / 3];
+        const int axis = derivative % 3;
+        for (npy_intp mode = 0; mode < nmodes; ++mode) {
+            const double coeff =
+                directions[(mode * natm + atom_slots[slot]) * 3 + axis] -
+                directions[(mode * natm + atom_slots[reference_slot]) * 3 + axis];
+            mode_coeffs[static_cast<std::size_t>(mode) * ncenter_derivatives + derivative] = coeff;
+            derivative_active[derivative] = derivative_active[derivative] || coeff != 0.0;
+        }
+    }
+
+    const double AB[3] = {
+        origins[3 * pblk.start] - origins[3 * qblk.start],
+        origins[3 * pblk.start + 1] - origins[3 * qblk.start + 1],
+        origins[3 * pblk.start + 2] - origins[3 * qblk.start + 2],
+    };
+    const double CD[3] = {
+        origins[3 * rblk.start] - origins[3 * sblk.start],
+        origins[3 * rblk.start + 1] - origins[3 * sblk.start + 1],
+        origins[3 * rblk.start + 2] - origins[3 * sblk.start + 2],
+    };
+    hrr_cache.clear();
+    first_recipes.clear();
+    second_recipes.clear();
+    if (use_vrr && order == 1) {
+        first_recipes.resize(targets.size() * ncenter_derivatives);
+        for (std::size_t it = 0; it < targets.size(); ++it) {
+            for (int derivative = 0; derivative < ncenter_derivatives; ++derivative) {
+                if (!derivative_active[derivative]) {
+                    continue;
+                }
+                first_recipes[it * ncenter_derivatives + derivative] =
+                    build_hrr_first_recipe(
+                        hrr_cache,
+                        targets[it],
+                        derivative_slots[derivative / 3],
+                        derivative % 3,
+                        max_a_l,
+                        max_c_l,
+                        max_m_l,
+                        AB,
+                        CD
+                    );
+            }
+        }
+    } else if (use_vrr) {
+        second_recipes.resize(
+            targets.size() * ncenter_derivatives * ncenter_derivatives
+        );
+        for (std::size_t it = 0; it < targets.size(); ++it) {
+            for (int derivative_a = 0; derivative_a < ncenter_derivatives; ++derivative_a) {
+                if (!derivative_active[derivative_a]) {
+                    continue;
+                }
+                for (int derivative_b = 0; derivative_b <= derivative_a; ++derivative_b) {
+                    if (!derivative_active[derivative_b]) {
+                        continue;
+                    }
+                    second_recipes[
+                        (it * ncenter_derivatives + derivative_a)
+                            * ncenter_derivatives + derivative_b
+                    ] = build_hrr_second_recipe(
+                        hrr_cache,
+                        targets[it],
+                        derivative_slots[derivative_a / 3],
+                        derivative_a % 3,
+                        derivative_slots[derivative_b / 3],
+                        derivative_b % 3,
+                        max_a_l,
+                        max_c_l,
+                        max_m_l,
+                        AB,
+                        CD
+                    );
+                }
+            }
+        }
+    }
+    const int nprim_q = static_cast<int>(nprim[qblk.start]);
+    const int nprim_s = static_cast<int>(nprim[sblk.start]);
+    for (int idx_pq = 0; idx_pq < npq; ++idx_pq) {
+        const int ip = idx_pq / nprim_q;
+        const int iq = idx_pq - ip * nprim_q;
+        for (int idx_rs = 0; idx_rs < nrs; ++idx_rs) {
+            const int ir = idx_rs / nprim_s;
+            const int is = idx_rs - ir * nprim_s;
+            const double zeta = pq_p[idx_pq] + rs_p[idx_rs];
+            const double alpha = pq_p[idx_pq] * rs_p[idx_rs] / zeta;
+            const double pqx = pq_px[idx_pq] - rs_px[idx_rs];
+            const double pqy = pq_py[idx_pq] - rs_py[idx_rs];
+            const double pqz = pq_pz[idx_pq] - rs_pz[idx_rs];
+            const double base_pref =
+                ERI_PREFAC * pq_k[idx_pq] * rs_k[idx_rs] /
+                (pq_p[idx_pq] * rs_p[idx_rs] * std::sqrt(zeta));
+            const double PA[3] = {
+                pq_px[idx_pq] - origins[3 * pblk.start],
+                pq_py[idx_pq] - origins[3 * pblk.start + 1],
+                pq_pz[idx_pq] - origins[3 * pblk.start + 2],
+            };
+            const double QC[3] = {
+                rs_px[idx_rs] - origins[3 * rblk.start],
+                rs_py[idx_rs] - origins[3 * rblk.start + 1],
+                rs_pz[idx_rs] - origins[3 * rblk.start + 2],
+            };
+            const double PQ[3] = {pqx, pqy, pqz};
+            if (use_vrr) {
+                os_fill_vrr_table(
+                    vrr_table.data(),
+                    max_a_l,
+                    max_c_l,
+                    max_m_l,
+                    pq_p[idx_pq],
+                    rs_p[idx_rs],
+                    zeta,
+                    alpha * (pqx * pqx + pqy * pqy + pqz * pqz),
+                    base_pref,
+                    PA,
+                    QC,
+                    PQ
+                );
+            }
+            const double exponents[4] = {
+                pq_a[idx_pq], pq_b[idx_pq], rs_a[idx_rs], rs_b[idx_rs]
+            };
+
+            for (std::size_t it = 0; it < targets.size(); ++it) {
+                const ShellQuartetTarget& target = targets[it];
+                const double prefac =
+                    weights[target.weight_p + ip] *
+                    weights[target.weight_q + iq] *
+                    weights[target.weight_r + ir] *
+                    weights[target.weight_s + is];
+                if (order == 1) {
+                    for (int derivative = 0; derivative < ncenter_derivatives; ++derivative) {
+                        if (!derivative_active[derivative]) {
+                            continue;
+                        }
+                        const int slot = derivative_slots[derivative / 3];
+                        const int axis = derivative % 3;
+                        const double derivative_value = use_vrr
+                            ? evaluate_hrr_first_recipe(
+                                hrr_cache,
+                                first_recipes[it * ncenter_derivatives + derivative],
+                                exponents[slot],
+                                vrr_table.data()
+                            )
+                            : primitive_center_first_derivative_target(
+                                target,
+                                slot,
+                                axis,
+                                exponents,
+                                origins
+                            );
+                        derivative_block[it * ncenter_derivatives + derivative] +=
+                            prefac * derivative_value;
+                    }
+                } else {
+                    for (int derivative_a = 0; derivative_a < ncenter_derivatives; ++derivative_a) {
+                        if (!derivative_active[derivative_a]) {
+                            continue;
+                        }
+                        const int slot_a = derivative_slots[derivative_a / 3];
+                        const int axis_a = derivative_a % 3;
+                        for (int derivative_b = 0; derivative_b <= derivative_a; ++derivative_b) {
+                            if (!derivative_active[derivative_b]) {
+                                continue;
+                            }
+                            const int slot_b = derivative_slots[derivative_b / 3];
+                            const int axis_b = derivative_b % 3;
+                            const double derivative_value = use_vrr
+                                ? evaluate_hrr_second_recipe(
+                                    hrr_cache,
+                                    second_recipes[
+                                        (it * ncenter_derivatives + derivative_a)
+                                            * ncenter_derivatives + derivative_b
+                                    ],
+                                    exponents[slot_a],
+                                    exponents[slot_b],
+                                    vrr_table.data()
+                                )
+                                : primitive_center_second_derivative_target(
+                                    target,
+                                    slot_a,
+                                    axis_a,
+                                    slot_b,
+                                    axis_b,
+                                    exponents,
+                                    origins
+                                );
+                            const double value = prefac * derivative_value;
+                            derivative_block[
+                                (it * ncenter_derivatives + derivative_a) * ncenter_derivatives + derivative_b
+                            ] += value;
+                            if (derivative_a != derivative_b) {
+                                derivative_block[
+                                    (it * ncenter_derivatives + derivative_b) * ncenter_derivatives + derivative_a
+                                ] += value;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    const std::size_t eri_size =
+        static_cast<std::size_t>(nao) * nao * nao * nao;
+    for (std::size_t it = 0; it < targets.size(); ++it) {
+        const ShellQuartetTarget& target = targets[it];
+        if (order == 1) {
+            for (npy_intp mode = 0; mode < nmodes; ++mode) {
+                double value = 0.0;
+                for (int derivative = 0; derivative < ncenter_derivatives; ++derivative) {
+                    value +=
+                        mode_coeffs[static_cast<std::size_t>(mode) * ncenter_derivatives + derivative] *
+                        derivative_block[it * ncenter_derivatives + derivative];
+                }
+                add_eri_symmetries_unique(
+                    out + static_cast<std::size_t>(mode) * eri_size,
+                    nao,
+                    target.ao_p,
+                    target.ao_q,
+                    target.ao_r,
+                    target.ao_s,
+                    value
+                );
+            }
+        } else {
+            for (npy_intp mode_a = 0; mode_a < nmodes; ++mode_a) {
+                for (npy_intp mode_b = 0; mode_b < nmodes; ++mode_b) {
+                    double value = 0.0;
+                    for (int derivative_a = 0; derivative_a < ncenter_derivatives; ++derivative_a) {
+                        const double coeff_a = mode_coeffs[
+                            static_cast<std::size_t>(mode_a) * ncenter_derivatives + derivative_a
+                        ];
+                        if (coeff_a == 0.0) {
+                            continue;
+                        }
+                        for (int derivative_b = 0; derivative_b < ncenter_derivatives; ++derivative_b) {
+                            value += coeff_a * mode_coeffs[
+                                static_cast<std::size_t>(mode_b) * ncenter_derivatives + derivative_b
+                            ] * derivative_block[
+                                (it * ncenter_derivatives + derivative_a) * ncenter_derivatives + derivative_b
+                            ];
+                        }
+                    }
+                    add_eri_symmetries_unique(
+                        out + (static_cast<std::size_t>(mode_a) * nmodes + mode_b) * eri_size,
+                        nao,
+                        target.ao_p,
+                        target.ao_q,
+                        target.ao_r,
+                        target.ao_s,
+                        value
+                    );
+                }
+            }
+        }
+    }
+    return true;
+}
+
+bool compute_directional_eri_derivatives_blocked(
+    const std::int64_t* shells,
+    const double* origins,
+    const double* exps,
+    const double* weights,
+    const std::int64_t* nprim,
+    const std::int64_t* atom_ids,
+    const double* directions,
+    npy_intp natm,
+    npy_intp nmodes,
+    npy_intp nao,
+    npy_intp max_prim,
+    int order,
+    int workers,
+    double* out,
+    const std::vector<ShellBlock>& shell_blocks
+) {
+    try {
+        const int nshell = static_cast<int>(shell_blocks.size());
+        const ShellPairGeomData& pair_geom = get_primary_shell_pair_geom(
+            shell_blocks, shells, origins, exps, nprim, nao, max_prim
+        );
+        const npy_intp pair_cap = pair_geom.pair_cap;
+        std::vector<double> shell_pair_bounds(
+            static_cast<std::size_t>(nshell) * nshell,
+            1.0
+        );
+        std::vector<ShellQuartetTask> tasks;
+        long long shell_screened = 0;
+        get_shell_quartet_tasks_cached(
+            shell_blocks,
+            shell_pair_bounds,
+            nshell,
+            0.0,
+            tasks,
+            shell_screened
+        );
+
+        const std::size_t vrr_table_cap =
+            static_cast<std::size_t>(OS_VRR_PAIR_MAX_L + 1) *
+            static_cast<std::size_t>(OS_VRR_PAIR_MAX_L + 1) *
+            static_cast<std::size_t>(OS_VRR_PAIR_MAX_L + 1) *
+            static_cast<std::size_t>(OS_VRR_PAIR_MAX_L + 1) *
+            static_cast<std::size_t>(OS_VRR_PAIR_MAX_L + 1) *
+            static_cast<std::size_t>(OS_VRR_PAIR_MAX_L + 1) *
+            static_cast<std::size_t>(2 * OS_VRR_PAIR_MAX_L + 1);
+        const int nthread = std::min(
+            std::max(1, workers),
+            std::max(1, static_cast<int>(tasks.size()))
+        );
+        std::atomic<std::size_t> next_task{0};
+        std::atomic<bool> failed{false};
+
+        auto run_worker = [&]() {
+            std::vector<double> vrr_table(vrr_table_cap, 0.0);
+            std::vector<ShellQuartetTarget> targets;
+            std::vector<double> derivative_block;
+            std::vector<double> mode_coeffs;
+            HrrExpansionCache hrr_cache;
+            std::vector<HrrFirstDerivativeRecipe> first_recipes;
+            std::vector<HrrSecondDerivativeRecipe> second_recipes;
+            try {
+                while (!failed.load(std::memory_order_relaxed)) {
+                    const std::size_t task_index = next_task.fetch_add(1, std::memory_order_relaxed);
+                    if (task_index >= tasks.size()) {
+                        break;
+                    }
+                    const ShellQuartetTask& task = tasks[task_index];
+                    const std::size_t pq_pair_idx = static_cast<std::size_t>(task.ish) * nshell + task.jsh;
+                    const std::size_t rs_pair_idx = static_cast<std::size_t>(task.ksh) * nshell + task.lsh;
+                    const std::size_t pq_offset = pq_pair_idx * pair_cap;
+                    const std::size_t rs_offset = rs_pair_idx * pair_cap;
+                    if (!compute_directional_shell_quartet_derivatives(
+                            shells,
+                            origins,
+                            weights,
+                            nprim,
+                            atom_ids,
+                            directions,
+                            natm,
+                            nmodes,
+                            nao,
+                            max_prim,
+                            shell_blocks[task.ish],
+                            shell_blocks[task.jsh],
+                            shell_blocks[task.ksh],
+                            shell_blocks[task.lsh],
+                            task.ish == task.ksh && task.jsh == task.lsh,
+                            pair_geom.a.data() + pq_offset,
+                            pair_geom.b.data() + pq_offset,
+                            pair_geom.p.data() + pq_offset,
+                            pair_geom.px.data() + pq_offset,
+                            pair_geom.py.data() + pq_offset,
+                            pair_geom.pz.data() + pq_offset,
+                            pair_geom.k.data() + pq_offset,
+                            pair_geom.n[pq_pair_idx],
+                            pair_geom.a.data() + rs_offset,
+                            pair_geom.b.data() + rs_offset,
+                            pair_geom.p.data() + rs_offset,
+                            pair_geom.px.data() + rs_offset,
+                            pair_geom.py.data() + rs_offset,
+                            pair_geom.pz.data() + rs_offset,
+                            pair_geom.k.data() + rs_offset,
+                            pair_geom.n[rs_pair_idx],
+                            order,
+                            out,
+                            vrr_table,
+                            targets,
+                            derivative_block,
+                            mode_coeffs,
+                            hrr_cache,
+                            first_recipes,
+                            second_recipes
+                        )) {
+                        failed.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+        };
+
+        if (nthread == 1) {
+            run_worker();
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(static_cast<std::size_t>(nthread));
+            try {
+                for (int tid = 0; tid < nthread; ++tid) {
+                    threads.emplace_back(run_worker);
+                }
+            } catch (...) {
+                failed.store(true, std::memory_order_relaxed);
+            }
+            for (std::thread& thread : threads) {
+                if (thread.joinable()) {
+                    thread.join();
+                }
+            }
+        }
+        return !failed.load(std::memory_order_relaxed);
+    } catch (const std::bad_alloc&) {
+        return false;
+    }
+}
+
 void fill_symmetric_eri(
     double* eri,
     npy_intp nao,
@@ -2853,6 +4602,71 @@ bool validate_cartesian_shell_lmax(PyArrayObject* shells, int max_l) {
         }
         if (lx + ly + lz > max_l) {
             PyErr_SetString(PyExc_NotImplementedError, "C++ ERI backend currently supports Cartesian shells only through the requested max_l.");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validate_nprim_bounds(PyArrayObject* nprim, npy_intp ncenter, npy_intp max_prim, const char* name);
+bool validate_nonnegative_shells(PyArrayObject* shells, const char* name);
+
+bool validate_directional_eri_inputs(
+    PyArrayObject* shells,
+    PyArrayObject* origins,
+    PyArrayObject* exps,
+    PyArrayObject* weights,
+    PyArrayObject* nprim,
+    PyArrayObject* atom_ids,
+    PyArrayObject* directions
+) {
+    if (
+        PyArray_NDIM(shells) != 2 ||
+        PyArray_NDIM(origins) != 2 ||
+        PyArray_NDIM(exps) != 2 ||
+        PyArray_NDIM(weights) != 2 ||
+        PyArray_NDIM(nprim) != 1 ||
+        PyArray_NDIM(atom_ids) != 1 ||
+        PyArray_NDIM(directions) != 3
+    ) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "directional ERI derivatives received arrays with invalid dimensions."
+        );
+        return false;
+    }
+
+    const npy_intp nao = PyArray_DIM(shells, 0);
+    const npy_intp max_prim = PyArray_DIM(exps, 1);
+    const npy_intp natm = PyArray_DIM(directions, 1);
+    if (
+        PyArray_DIM(shells, 1) != 3 ||
+        PyArray_DIM(origins, 0) != nao ||
+        PyArray_DIM(origins, 1) != 3 ||
+        PyArray_DIM(exps, 0) != nao ||
+        PyArray_DIM(weights, 0) != nao ||
+        PyArray_DIM(weights, 1) != max_prim ||
+        PyArray_DIM(nprim, 0) != nao ||
+        PyArray_DIM(atom_ids, 0) != nao ||
+        PyArray_DIM(directions, 2) != 3
+    ) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "directional ERI derivatives received inconsistent array shapes."
+        );
+        return false;
+    }
+    if (!validate_nprim_bounds(nprim, nao, max_prim, "nprim")) {
+        return false;
+    }
+    if (!validate_nonnegative_shells(shells, "primary")) {
+        return false;
+    }
+
+    const auto* atom_data = static_cast<const std::int64_t*>(PyArray_DATA(atom_ids));
+    for (npy_intp ao = 0; ao < nao; ++ao) {
+        if (atom_data[ao] < 0 || atom_data[ao] >= natm) {
+            PyErr_SetString(PyExc_ValueError, "atom_ids entries must index the directions atom axis.");
             return false;
         }
     }
@@ -3284,6 +5098,388 @@ PyObject* compute_eri_s8_cartesian(PyObject*, PyObject* args) {
     }
 
     return Py_BuildValue("NLL", eri_obj, computed, skipped);
+}
+
+PyObject* compute_directional_eri_derivatives(PyObject*, PyObject* args) {
+    PyObject* shells_obj = nullptr;
+    PyObject* origins_obj = nullptr;
+    PyObject* exps_obj = nullptr;
+    PyObject* weights_obj = nullptr;
+    PyObject* nprim_obj = nullptr;
+    PyObject* atom_ids_obj = nullptr;
+    PyObject* directions_obj = nullptr;
+    int order = 1;
+    int workers = 1;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOOOOi|i",
+            &shells_obj,
+            &origins_obj,
+            &exps_obj,
+            &weights_obj,
+            &nprim_obj,
+            &atom_ids_obj,
+            &directions_obj,
+            &order,
+            &workers
+        )) {
+        return nullptr;
+    }
+    if (order != 1 && order != 2) {
+        PyErr_SetString(PyExc_ValueError, "order must be 1 or 2.");
+        return nullptr;
+    }
+
+    ArrayRef shells(shells_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef origins(origins_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef exps(exps_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef weights(weights_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef nprim(nprim_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef atom_ids(atom_ids_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef directions(directions_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!shells || !origins || !exps || !weights || !nprim || !atom_ids || !directions) {
+        return nullptr;
+    }
+    if (!validate_directional_eri_inputs(
+            shells.obj,
+            origins.obj,
+            exps.obj,
+            weights.obj,
+            nprim.obj,
+            atom_ids.obj,
+            directions.obj
+        )) {
+        return nullptr;
+    }
+
+    const npy_intp nao = PyArray_DIM(shells.obj, 0);
+    const npy_intp max_prim = PyArray_DIM(exps.obj, 1);
+    const npy_intp nmodes = PyArray_DIM(directions.obj, 0);
+    const npy_intp natm = PyArray_DIM(directions.obj, 1);
+    const auto* shells_data = static_cast<const std::int64_t*>(PyArray_DATA(shells.obj));
+    const auto* origins_data = static_cast<const double*>(PyArray_DATA(origins.obj));
+    const auto* exps_data = static_cast<const double*>(PyArray_DATA(exps.obj));
+    const auto* weights_data = static_cast<const double*>(PyArray_DATA(weights.obj));
+    const auto* nprim_data = static_cast<const std::int64_t*>(PyArray_DATA(nprim.obj));
+    const auto* atom_ids_data = static_cast<const std::int64_t*>(PyArray_DATA(atom_ids.obj));
+    const auto* directions_data = static_cast<const double*>(PyArray_DATA(directions.obj));
+
+    std::vector<ShellBlock> shell_blocks;
+    if (!try_build_shell_blocks(
+            shells_data,
+            origins_data,
+            exps_data,
+            nprim_data,
+            nao,
+            max_prim,
+            shell_blocks
+        )) {
+        PyErr_SetString(
+            PyExc_NotImplementedError,
+            "C++ directional ERI derivatives require contiguous complete Cartesian shell blocks."
+        );
+        return nullptr;
+    }
+    npy_intp dims1[5] = {nmodes, nao, nao, nao, nao};
+    npy_intp dims2[6] = {nmodes, nmodes, nao, nao, nao, nao};
+    PyObject* out_obj = PyArray_ZEROS(
+        order == 1 ? 5 : 6,
+        order == 1 ? dims1 : dims2,
+        NPY_DOUBLE,
+        0
+    );
+    if (out_obj == nullptr) {
+        return nullptr;
+    }
+    auto* out = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(out_obj)));
+    bool ok = false;
+    Py_BEGIN_ALLOW_THREADS
+    ok = compute_directional_eri_derivatives_blocked(
+        shells_data,
+        origins_data,
+        exps_data,
+        weights_data,
+        nprim_data,
+        atom_ids_data,
+        directions_data,
+        natm,
+        nmodes,
+        nao,
+        max_prim,
+        order,
+        std::max(1, workers),
+        out,
+        shell_blocks
+    );
+    Py_END_ALLOW_THREADS
+    if (!ok) {
+        Py_DECREF(out_obj);
+        PyErr_SetString(PyExc_RuntimeError, "C++ directional ERI derivative evaluation failed.");
+        return nullptr;
+    }
+    return out_obj;
+}
+
+PyObject* compute_directional_one_electron_derivatives(PyObject*, PyObject* args) {
+    PyObject* shells_obj = nullptr;
+    PyObject* origins_obj = nullptr;
+    PyObject* exps_obj = nullptr;
+    PyObject* weights_obj = nullptr;
+    PyObject* nprim_obj = nullptr;
+    PyObject* atom_ids_obj = nullptr;
+    PyObject* atom_coords_obj = nullptr;
+    PyObject* charges_obj = nullptr;
+    PyObject* directions_obj = nullptr;
+    int kernel = ONE_HCORE;
+    int order = 1;
+    int workers = 1;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOOOOOOiii",
+            &shells_obj,
+            &origins_obj,
+            &exps_obj,
+            &weights_obj,
+            &nprim_obj,
+            &atom_ids_obj,
+            &atom_coords_obj,
+            &charges_obj,
+            &directions_obj,
+            &kernel,
+            &order,
+            &workers
+        )) {
+        return nullptr;
+    }
+    if (kernel < ONE_OVERLAP || kernel > ONE_HCORE) {
+        PyErr_SetString(PyExc_ValueError, "unknown one-electron integral kernel.");
+        return nullptr;
+    }
+    if (order != 1 && order != 2) {
+        PyErr_SetString(PyExc_ValueError, "order must be 1 or 2.");
+        return nullptr;
+    }
+
+    ArrayRef shells(shells_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef origins(origins_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef exps(exps_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef weights(weights_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef nprim(nprim_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef atom_ids(atom_ids_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef atom_coords(atom_coords_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef charges(charges_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef directions(directions_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (
+        !shells || !origins || !exps || !weights || !nprim || !atom_ids
+        || !atom_coords || !charges || !directions
+    ) {
+        return nullptr;
+    }
+    if (!validate_directional_eri_inputs(
+            shells.obj,
+            origins.obj,
+            exps.obj,
+            weights.obj,
+            nprim.obj,
+            atom_ids.obj,
+            directions.obj
+        )) {
+        return nullptr;
+    }
+    const npy_intp natm = PyArray_DIM(directions.obj, 1);
+    if (
+        PyArray_NDIM(atom_coords.obj) != 2
+        || PyArray_DIM(atom_coords.obj, 0) != natm
+        || PyArray_DIM(atom_coords.obj, 1) != 3
+        || PyArray_NDIM(charges.obj) != 1
+        || PyArray_DIM(charges.obj, 0) != natm
+    ) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "atom_coords and charges are inconsistent with the directions atom axis."
+        );
+        return nullptr;
+    }
+
+    const npy_intp nao = PyArray_DIM(shells.obj, 0);
+    const npy_intp max_prim = PyArray_DIM(exps.obj, 1);
+    const npy_intp nmodes = PyArray_DIM(directions.obj, 0);
+    npy_intp dims1[3] = {nmodes, nao, nao};
+    npy_intp dims2[4] = {nmodes, nmodes, nao, nao};
+    PyObject* out_obj = PyArray_ZEROS(
+        order == 1 ? 3 : 4,
+        order == 1 ? dims1 : dims2,
+        NPY_DOUBLE,
+        0
+    );
+    if (out_obj == nullptr) {
+        return nullptr;
+    }
+
+    bool ok = false;
+    Py_BEGIN_ALLOW_THREADS
+    ok = compute_directional_one_electron_derivatives_native(
+        static_cast<const std::int64_t*>(PyArray_DATA(shells.obj)),
+        static_cast<const double*>(PyArray_DATA(origins.obj)),
+        static_cast<const double*>(PyArray_DATA(exps.obj)),
+        static_cast<const double*>(PyArray_DATA(weights.obj)),
+        static_cast<const std::int64_t*>(PyArray_DATA(nprim.obj)),
+        static_cast<const std::int64_t*>(PyArray_DATA(atom_ids.obj)),
+        static_cast<const double*>(PyArray_DATA(atom_coords.obj)),
+        static_cast<const double*>(PyArray_DATA(charges.obj)),
+        static_cast<const double*>(PyArray_DATA(directions.obj)),
+        natm,
+        nmodes,
+        nao,
+        max_prim,
+        kernel,
+        order,
+        std::max(1, workers),
+        static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(out_obj)))
+    );
+    Py_END_ALLOW_THREADS
+    if (!ok) {
+        Py_DECREF(out_obj);
+        PyErr_SetString(
+            PyExc_RuntimeError,
+            "C++ directional one-electron derivative evaluation failed."
+        );
+        return nullptr;
+    }
+    return out_obj;
+}
+
+PyObject* compute_one_index_one_electron_derivatives(PyObject*, PyObject* args) {
+    PyObject* shells_obj = nullptr;
+    PyObject* origins_obj = nullptr;
+    PyObject* exps_obj = nullptr;
+    PyObject* weights_obj = nullptr;
+    PyObject* nprim_obj = nullptr;
+    PyObject* atom_ids_obj = nullptr;
+    int natm = 0;
+    int kernel = ONE_OVERLAP;
+    int index_slot = 1;
+    int order = 1;
+    int workers = 1;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOOOiiiii",
+            &shells_obj,
+            &origins_obj,
+            &exps_obj,
+            &weights_obj,
+            &nprim_obj,
+            &atom_ids_obj,
+            &natm,
+            &kernel,
+            &index_slot,
+            &order,
+            &workers
+        )) {
+        return nullptr;
+    }
+    if (natm <= 0) {
+        PyErr_SetString(PyExc_ValueError, "natm must be positive.");
+        return nullptr;
+    }
+    if (kernel != ONE_OVERLAP && kernel != ONE_KINETIC) {
+        PyErr_SetString(PyExc_ValueError, "one-index derivatives support overlap or kinetic.");
+        return nullptr;
+    }
+    if (index_slot != 0 && index_slot != 1) {
+        PyErr_SetString(PyExc_ValueError, "index_slot must be 0 (bra) or 1 (ket).");
+        return nullptr;
+    }
+    if (order != 1 && order != 2) {
+        PyErr_SetString(PyExc_ValueError, "order must be 1 or 2.");
+        return nullptr;
+    }
+
+    ArrayRef shells(shells_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef origins(origins_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef exps(exps_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef weights(weights_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef nprim(nprim_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef atom_ids(atom_ids_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    if (!shells || !origins || !exps || !weights || !nprim || !atom_ids) {
+        return nullptr;
+    }
+    if (
+        PyArray_NDIM(shells.obj) != 2
+        || PyArray_NDIM(origins.obj) != 2
+        || PyArray_NDIM(exps.obj) != 2
+        || PyArray_NDIM(weights.obj) != 2
+        || PyArray_NDIM(nprim.obj) != 1
+        || PyArray_NDIM(atom_ids.obj) != 1
+    ) {
+        PyErr_SetString(PyExc_ValueError, "one-index derivative arrays have invalid dimensions.");
+        return nullptr;
+    }
+    const npy_intp nao = PyArray_DIM(shells.obj, 0);
+    const npy_intp max_prim = PyArray_DIM(exps.obj, 1);
+    if (
+        PyArray_DIM(shells.obj, 1) != 3
+        || PyArray_DIM(origins.obj, 0) != nao
+        || PyArray_DIM(origins.obj, 1) != 3
+        || PyArray_DIM(exps.obj, 0) != nao
+        || PyArray_DIM(weights.obj, 0) != nao
+        || PyArray_DIM(weights.obj, 1) != max_prim
+        || PyArray_DIM(nprim.obj, 0) != nao
+        || PyArray_DIM(atom_ids.obj, 0) != nao
+    ) {
+        PyErr_SetString(PyExc_ValueError, "one-index derivative arrays have inconsistent shapes.");
+        return nullptr;
+    }
+    if (
+        !validate_nprim_bounds(nprim.obj, nao, max_prim, "nprim")
+        || !validate_nonnegative_shells(shells.obj, "primary")
+    ) {
+        return nullptr;
+    }
+    const auto* atom_data = static_cast<const std::int64_t*>(PyArray_DATA(atom_ids.obj));
+    for (npy_intp ao = 0; ao < nao; ++ao) {
+        if (atom_data[ao] < 0 || atom_data[ao] >= natm) {
+            PyErr_SetString(PyExc_ValueError, "atom_ids entries must be valid atom indices.");
+            return nullptr;
+        }
+    }
+
+    npy_intp dims1[4] = {natm, 3, nao, nao};
+    npy_intp dims2[6] = {natm, 3, natm, 3, nao, nao};
+    PyObject* out_obj = PyArray_ZEROS(
+        order == 1 ? 4 : 6,
+        order == 1 ? dims1 : dims2,
+        NPY_DOUBLE,
+        0
+    );
+    if (out_obj == nullptr) {
+        return nullptr;
+    }
+    bool ok = false;
+    Py_BEGIN_ALLOW_THREADS
+    ok = compute_one_index_one_electron_derivatives_native(
+        static_cast<const std::int64_t*>(PyArray_DATA(shells.obj)),
+        static_cast<const double*>(PyArray_DATA(origins.obj)),
+        static_cast<const double*>(PyArray_DATA(exps.obj)),
+        static_cast<const double*>(PyArray_DATA(weights.obj)),
+        static_cast<const std::int64_t*>(PyArray_DATA(nprim.obj)),
+        atom_data,
+        natm,
+        nao,
+        max_prim,
+        kernel,
+        index_slot,
+        order,
+        std::max(1, workers),
+        static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(out_obj)))
+    );
+    Py_END_ALLOW_THREADS
+    if (!ok) {
+        Py_DECREF(out_obj);
+        PyErr_SetString(PyExc_RuntimeError, "C++ one-index derivative evaluation failed.");
+        return nullptr;
+    }
+    return out_obj;
 }
 
 inline bool direct_perm_seen(
@@ -5295,6 +7491,9 @@ PyMethodDef methods[] = {
     {"compute_dense_eri_ssss", compute_dense_eri_ssss, METH_VARARGS, "Compute dense Cartesian s-shell ERIs."},
     {"compute_dense_eri_cartesian", compute_dense_eri_cartesian, METH_VARARGS, "Compute dense Cartesian ERIs through max_l with scalar fallback for unsupported shell-block quartets."},
     {"compute_eri_s8_cartesian", compute_eri_s8_cartesian, METH_VARARGS, "Compute eight-fold packed Cartesian ERIs through max_l."},
+    {"compute_directional_eri_derivatives", compute_directional_eri_derivatives, METH_VARARGS, "Compute first or second directional Cartesian ERI derivatives."},
+    {"compute_directional_one_electron_derivatives", compute_directional_one_electron_derivatives, METH_VARARGS, "Compute first or second directional Cartesian one-electron derivatives."},
+    {"compute_one_index_one_electron_derivatives", compute_one_index_one_electron_derivatives, METH_VARARGS, "Compute first or second one-index Cartesian overlap or kinetic derivatives."},
     {"direct_jk_cartesian", direct_jk_cartesian, METH_VARARGS, "Compute direct Cartesian J/K from AO shell data and a density matrix."},
     {"direct_veff_cartesian", direct_veff_cartesian, METH_VARARGS, "Compute direct Cartesian RHF J - 0.5 K from AO shell data and a density matrix."},
     {"compute_ri_tensors_packed", compute_ri_tensors_packed, METH_VARARGS, "Compute packed RI three-center tensors and the auxiliary Coulomb metric."},

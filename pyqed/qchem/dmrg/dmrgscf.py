@@ -134,7 +134,11 @@ class DMRGSCF(QCDMRG):
         tr_max = kwargs.pop("macro_trust_max", 1.0)
         tr_dn = kwargs.pop("macro_trust_shrink", 0.5)
         tr_up = kwargs.pop("macro_trust_grow", 1.5)
-        warm = kwargs.pop("warm_start_dmrg", True)
+        symmetry_labels = tuple(getattr(self, "symmetry", ()) or ())
+        default_warm_start = not (
+            int(nstates or self.nstates) > 1 and "su2" in symmetry_labels
+        )
+        warm = kwargs.pop("warm_start_dmrg", default_warm_start)
         sw_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.dmrg_conv_tol))
         ldense = kwargs.pop("local_dense_max_dim", 0)
 
@@ -238,19 +242,19 @@ class DMRGSCF(QCDMRG):
                 "spatial_exact_component_compression_max_group_size",
                 64,
             ),
-            spatial_enable_native_boundary_p=getattr(
+            spatial_enable_cpp_boundary_p=getattr(
                 self,
-                "spatial_enable_native_boundary_p",
+                "spatial_enable_cpp_boundary_p",
                 True,
             ),
-            spatial_validate_native_boundary_p=getattr(
+            spatial_validate_cpp_boundary_p=getattr(
                 self,
-                "spatial_validate_native_boundary_p",
+                "spatial_validate_cpp_boundary_p",
                 True,
             ),
-            spatial_native_boundary_p_validation_policy=getattr(
+            spatial_cpp_boundary_p_validation_policy=getattr(
                 self,
-                "spatial_native_boundary_p_validation_policy",
+                "spatial_cpp_boundary_p_validation_policy",
                 "first_pass",
             ),
             spatial_direct_operator_batch_min_entries=getattr(
@@ -291,15 +295,11 @@ class DMRGSCF(QCDMRG):
 
         kwargs.setdefault("sweep_tol", sw_tol)
         kwargs.setdefault("local_dense_max_dim", ldense)
+        # DMRGSCF owns the final convergence policy so it can distinguish the
+        # active-space solve from macro-iteration convergence in its error.
+        kwargs["require_convergence"] = False
 
         mc.run(nstates=self.nstates, weights=self.weights, mo_coeff=C0, **kwargs)
-        if require_conv and not bool(getattr(getattr(mc, "dmrg", None), "converged", False)):
-            raise RuntimeError(
-                "Initial DMRGSCF active-space DMRG did not converge. "
-                "Increase nsweeps or D, loosen dmrg_conv_tol/conv_tol, or pass "
-                "require_conv=False for debugging."
-            )
-
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo(C0)
         eri = mf.get_eri_mo(C0)

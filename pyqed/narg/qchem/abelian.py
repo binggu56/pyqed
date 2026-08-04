@@ -3090,6 +3090,269 @@ def _compressed_superblock_one_site_lloo(
     return h_lloo, primitive_qn
 
 
+def detached_frame_transition_projector(
+    h_lloo,
+    input_qn,
+    *,
+    frame_dim,
+    bond_dim,
+    allowed_frame_qn=None,
+    allowed_output_qn=None,
+    use_irrep_tensor=False,
+    adapt_tol=None,
+    max_frame_rank=None,
+    expand_dim=1,
+):
+    r"""Construct a one-site isometry from mutually orthogonal detached frames.
+
+    The conditional frames satisfy
+
+    .. math::
+
+        W_s^\dagger W_t = \delta_{st} I,
+
+    while the retained state uses all frame/occupation combinations,
+
+    .. math::
+
+        \Omega = (W \otimes I_d) C.
+
+    Frames are built sequentially in Abelian sectors by diagonalizing each
+    diagonal occupation block in the complement of all earlier frames.
+    """
+    h_lloo = np.asarray(h_lloo)
+    input_qn = qn_array(input_qn)
+    local_dim, local_dim_ket, old_dim, old_dim_ket = h_lloo.shape
+    if local_dim != local_dim_ket or old_dim != old_dim_ket:
+        raise ValueError(
+            "h_lloo must have shape (local_dim, local_dim, old_dim, old_dim)."
+        )
+    if local_dim != len(LOCAL_QN) or len(input_qn) != old_dim:
+        raise ValueError("detached frames are incompatible with the local or block labels.")
+    frame_dim = int(frame_dim)
+    bond_dim = int(bond_dim)
+    if frame_dim < 1 or bond_dim < 1:
+        raise ValueError("frame_dim and bond_dim must be positive.")
+    if adapt_tol is not None and float(adapt_tol) < 0.0:
+        raise ValueError("adapt_tol must be non-negative when provided.")
+    expand_dim = int(expand_dim)
+    if expand_dim < 1:
+        raise ValueError("expand_dim must be positive.")
+    max_frame_rank = (
+        old_dim if max_frame_rank is None else min(int(max_frame_rank), old_dim)
+    )
+    if max_frame_rank < 1:
+        raise ValueError("max_frame_rank must be positive.")
+
+    allowed_frames = (
+        None
+        if allowed_frame_qn is None
+        else {qn_key(qn) for qn in allowed_frame_qn}
+    )
+    valid = valid_qn_mask(input_qn)
+    sectors = {
+        charge: np.flatnonzero(valid & np.all(input_qn == np.asarray(charge), axis=1))
+        for charge in sorted({qn_key(row) for row in input_qn[valid]})
+        if allowed_frames is None or charge in allowed_frames
+    }
+    occupied = {}
+    frames = []
+    frame_labels = []
+    branch_ranks = []
+
+    for local_state in range(local_dim):
+        candidates = []
+        for charge, rows in sectors.items():
+            used = occupied.get(charge)
+            if used is None:
+                complement = np.eye(rows.size)
+            else:
+                rank = used.shape[1]
+                if rank >= rows.size:
+                    continue
+                complement = np.linalg.qr(used, mode="complete")[0][:, rank:]
+            h_sector = h_lloo[local_state, local_state][np.ix_(rows, rows)]
+            h_reduced = complement.conj().T @ (h_sector @ complement)
+            h_reduced = 0.5 * (h_reduced + h_reduced.T.conj())
+            energies, vectors = np.linalg.eigh(h_reduced)
+            vectors = complement @ vectors
+            candidates.extend(
+                (float(np.real(energy)), charge, rows, vectors[:, column])
+                for column, energy in enumerate(energies)
+            )
+
+        candidates.sort(key=lambda item: item[0])
+        selected = candidates[:frame_dim]
+        branch = np.zeros(
+            (old_dim, len(selected)),
+            dtype=np.result_type(h_lloo, complex),
+        )
+        labels = np.empty((len(selected), input_qn.shape[1]), dtype=int)
+        additions = {}
+        for column, (_energy, charge, rows, vector) in enumerate(selected):
+            branch[rows, column] = vector
+            labels[column] = charge
+            additions.setdefault(charge, []).append(vector)
+        for charge, vectors in additions.items():
+            new = np.column_stack(vectors)
+            occupied[charge] = (
+                new if charge not in occupied else np.column_stack((occupied[charge], new))
+            )
+        frames.append(branch)
+        frame_labels.append(labels)
+        branch_ranks.append(len(selected))
+
+    frame_basis = np.column_stack(frames)
+    frame_qn = np.concatenate(frame_labels, axis=0)
+    frame_rank = frame_basis.shape[1]
+    if frame_rank == 0:
+        raise ValueError("no feasible detached-frame states were found.")
+    h_full = np.ascontiguousarray(
+        h_lloo.transpose(2, 0, 3, 1)
+    ).reshape(old_dim * local_dim, old_dim * local_dim)
+
+    def solve(current_basis, current_qn):
+        current_rank = current_basis.shape[1]
+        base = np.zeros(
+            (old_dim, local_dim, local_dim * current_rank),
+            dtype=np.result_type(current_basis, complex),
+        )
+        detached_qn = np.empty(
+            (local_dim * current_rank, input_qn.shape[1]),
+            dtype=int,
+        )
+        for local_state in range(local_dim):
+            columns = slice(
+                local_state * current_rank,
+                (local_state + 1) * current_rank,
+            )
+            base[:, local_state, columns] = current_basis
+            detached_qn[columns] = current_qn + LOCAL_QN[local_state]
+        base_matrix = base.reshape(
+            old_dim * local_dim, local_dim * current_rank
+        )
+        h_detached = base_matrix.conj().T @ (h_full @ base_matrix)
+        h_detached = 0.5 * (h_detached + h_detached.T.conj())
+        energies, coefficients, output_qn = diagonalize_by_qn(
+            h_detached,
+            detached_qn,
+            min(bond_dim, h_detached.shape[0]),
+            allowed_qn=allowed_output_qn,
+            use_irrep_tensor=use_irrep_tensor,
+            allow_empty=True,
+        )
+        if coefficients.shape[1] == 0:
+            raise ValueError(
+                "no feasible output states remain in the detached-frame space."
+            )
+        projector = (base_matrix @ coefficients).reshape(
+            old_dim, local_dim, coefficients.shape[1]
+        )
+        h_new = coefficients.conj().T @ (h_detached @ coefficients)
+        h_new = 0.5 * (h_new + h_new.T.conj())
+        return h_new, projector, output_qn, energies
+
+    def residual_expansion(current_basis, projector, output_qn):
+        nstate = projector.shape[2]
+        action = (h_full @ projector.reshape(old_dim * local_dim, nstate)).reshape(
+            old_dim, local_dim, nstate
+        )
+        grouped = {}
+        residual_sq = 0.0
+        for local_state in range(local_dim):
+            residual = action[:, local_state, :]
+            residual -= current_basis @ (current_basis.conj().T @ residual)
+            residual_sq += float(np.vdot(residual, residual).real)
+            for state in range(nstate):
+                charge = qn_key(output_qn[state] - LOCAL_QN[local_state])
+                rows = sectors.get(charge)
+                if rows is None:
+                    continue
+                vector = residual[rows, state]
+                if np.linalg.norm(vector) > 1.0e-14:
+                    grouped.setdefault(charge, []).append(vector)
+
+        candidates = []
+        for charge, vectors in grouped.items():
+            matrix = np.column_stack(vectors)
+            left, singular_values, _right = np.linalg.svd(
+                matrix, full_matrices=False
+            )
+            rows = sectors[charge]
+            for column, singular_value in enumerate(singular_values):
+                if singular_value <= 1.0e-14:
+                    continue
+                vector = np.zeros(old_dim, dtype=np.result_type(matrix, complex))
+                vector[rows] = left[:, column]
+                candidates.append((float(singular_value), charge, vector))
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        residual_norm = np.sqrt(residual_sq / max(nstate, 1))
+        return residual_norm, candidates
+
+    initial_frame_rank = frame_rank
+    residual_history = []
+    adapt_iterations = 0
+    while True:
+        h_new, projector, output_qn, energies = solve(frame_basis, frame_qn)
+        residual_norm, candidates = residual_expansion(
+            frame_basis, projector, output_qn
+        )
+        residual_history.append(float(residual_norm))
+        if (
+            adapt_tol is None
+            or residual_norm <= float(adapt_tol)
+            or frame_basis.shape[1] >= max_frame_rank
+            or not candidates
+        ):
+            break
+
+        additions = []
+        addition_qn = []
+        room = max_frame_rank - frame_basis.shape[1]
+        for _singular_value, charge, vector in candidates:
+            vector = vector - frame_basis @ (frame_basis.conj().T @ vector)
+            if additions:
+                added = np.column_stack(additions)
+                vector = vector - added @ (added.conj().T @ vector)
+            norm = np.linalg.norm(vector)
+            if norm <= 1.0e-12:
+                continue
+            additions.append(vector / norm)
+            addition_qn.append(charge)
+            if len(additions) >= min(expand_dim, room):
+                break
+        if not additions:
+            break
+        frame_basis = np.column_stack((frame_basis, *additions))
+        frame_qn = np.vstack(
+            (frame_qn, np.asarray(addition_qn, dtype=int))
+        )
+        adapt_iterations += 1
+
+    frame_rank = frame_basis.shape[1]
+    overlap = frame_basis.conj().T @ frame_basis
+    orthogonality_error = float(
+        np.linalg.norm(overlap - np.eye(frame_rank), ord=np.inf)
+    )
+    if orthogonality_error > 1.0e-8:
+        raise RuntimeError("detached conditional frames are not orthonormal.")
+    diagnostics = {
+        "frame_dim": frame_dim,
+        "branch_ranks": tuple(branch_ranks),
+        "frame_rank": frame_rank,
+        "initial_frame_rank": initial_frame_rank,
+        "adapted_rank": frame_rank - initial_frame_rank,
+        "adapt_iterations": adapt_iterations,
+        "detached_dim": local_dim * frame_rank,
+        "retained_dim": projector.shape[2],
+        "orthogonality_error": orthogonality_error,
+        "frame_residual_norm": residual_history[-1],
+        "frame_residual_history": tuple(residual_history),
+        "lowest_energy": float(energies[0]),
+    }
+    return h_new, projector, output_qn, diagnostics
+
+
 def _compressed_superblock_two_site_lloo(H0, input_qn, table, residuals, first_site, h1e, eri):
     """Exact compressed Hamiltonian as ``(local, local, old, old)`` blocks."""
     first_site = int(first_site)
@@ -3998,6 +4261,10 @@ def kernel(
     use_sparse_operator_projection='auto',
     two_site_mode='supersite',
     dressing=None,
+    chi=None,
+    frame_adapt_tol=None,
+    frame_max_dim=None,
+    frame_expand_dim=1,
     cc_level_shift=0.0,
     cc_response_tol=1.0e-10,
     cc_max_responses=None,
@@ -4057,8 +4324,16 @@ def kernel(
         "transition_cc",
     }:
         dressing_key = "conditional_cc"
+    elif dressing_key in {
+        "detached",
+        "detached_frame",
+        "detached_frames",
+    }:
+        dressing_key = "detached_frames"
     else:
-        raise ValueError("dressing must be None or 'conditional_cc'.")
+        raise ValueError(
+            "dressing must be None, 'conditional_cc', or 'detached_frames'."
+        )
     if (
         dressing_key != "none"
         and growth_sites in {2, "auto"}
@@ -4068,6 +4343,37 @@ def kernel(
             "conditional_cc with paired supersite growth is not implemented; "
             "use growth_sites=1 or two_site_mode='rolling'."
         )
+    if dressing_key == "detached_frames":
+        if growth_sites != 1:
+            raise ValueError("detached_frames currently requires growth_sites=1.")
+        frame_space = len(LOCAL_QN) * int(D)
+        detached_space = len(LOCAL_QN) * frame_space
+        chi = 2 * frame_space if chi is None else int(chi)
+        if not frame_space < chi <= detached_space:
+            raise ValueError(
+                f"detached_frames requires {frame_space} < chi <= {detached_space} "
+                f"for D={int(D)}."
+            )
+        if frame_adapt_tol is not None and float(frame_adapt_tol) < 0.0:
+            raise ValueError("frame_adapt_tol must be non-negative when provided.")
+        if frame_max_dim is not None:
+            frame_max_dim = int(frame_max_dim)
+            if not frame_space <= frame_max_dim <= chi:
+                raise ValueError(
+                    f"frame_max_dim must satisfy {frame_space} <= "
+                    f"frame_max_dim <= chi={chi}."
+                )
+        frame_expand_dim = int(frame_expand_dim)
+        if frame_expand_dim < 1:
+            raise ValueError("frame_expand_dim must be positive.")
+    elif chi is not None:
+        raise ValueError("chi is only used with dressing='detached_frames'.")
+    elif (
+        frame_adapt_tol is not None
+        or frame_max_dim is not None
+        or int(frame_expand_dim) != 1
+    ):
+        raise ValueError("frame adaptation options require dressing='detached_frames'.")
     cc_response_tol = float(cc_response_tol)
     if cc_response_tol < 0.0:
         raise ValueError("cc_response_tol must be non-negative.")
@@ -4090,11 +4396,11 @@ def kernel(
     need_spin = target_spin is not None or return_spin or verbose
     if dressing_key != "none" and need_spin:
         raise NotImplementedError(
-            "conditional_cc dressing does not yet project spin observables."
+            "general-projector dressing does not yet project spin observables."
         )
     if dressing_key != "none" and use_irrep_operator_table:
         raise NotImplementedError(
-            "conditional_cc dressing requires the dense/sparse Abelian operator table."
+            "general-projector dressing requires the dense/sparse Abelian operator table."
         )
     if two_site_mode == "rolling" and need_spin:
         raise NotImplementedError("rolling two-site qchem NARG does not yet support spin observables.")
@@ -4718,6 +5024,46 @@ def kernel(
 
     def append_one_site(H0, H0_irrep, input_qn, table, irrep_table, residuals, irrep_residuals, site_id, keep):
         keep = min(int(keep), H0.shape[0])
+        if dressing_key == "detached_frames":
+            h_grown, _primitive_qn = _compressed_superblock_one_site_lloo(
+                H0,
+                input_qn,
+                table,
+                residuals,
+                site_id,
+                h1e,
+                eri,
+                pair_terms,
+            )
+            output_allowed = allowed(site_id + 1)
+            frame_allowed = {
+                qn_key(np.asarray(output_charge) - local_charge)
+                for output_charge in output_allowed
+                for local_charge in LOCAL_QN
+            }
+            Hnew, projector, output_qn, diagnostics = (
+                detached_frame_transition_projector(
+                    h_grown,
+                    input_qn,
+                    frame_dim=keep,
+                    bond_dim=chi,
+                    allowed_frame_qn=frame_allowed,
+                    allowed_output_qn=output_allowed,
+                    use_irrep_tensor=use_irrep_tensor,
+                    adapt_tol=frame_adapt_tol,
+                    max_frame_rank=frame_max_dim,
+                    expand_dim=frame_expand_dim,
+                )
+            )
+            return (
+                Hnew,
+                None,
+                None,
+                output_qn,
+                None,
+                projector,
+                diagnostics,
+            )
         direct_irrep_hamiltonian = False
         if use_irrep_operator_table:
             pair_sums_irrep = build_pair_sums_irrep(irrep_table, pair_terms, site_id)
@@ -5025,12 +5371,17 @@ def kernel(
             meta = {}
             if cc_diagnostics is not None:
                 meta["dressing"] = dressing_key
-                meta["cc_diagnostics"] = dict(cc_diagnostics)
+                diagnostics_key = (
+                    "cc_diagnostics"
+                    if dressing_key == "conditional_cc"
+                    else "detached_diagnostics"
+                )
+                meta[diagnostics_key] = dict(cc_diagnostics)
                 meta["general_projector"] = True
             return Step(
                 site=site,
                 block=Block(h=h_new, qn=qn, tensor=tensor),
-                tensor=tensor.copy(),
+                tensor=None if tensor is None else tensor.copy(),
                 qn=branch_qn,
                 meta=meta,
             )
@@ -5225,20 +5576,25 @@ def kernel(
     if return_spin:
         result.append(spin_info)
     if return_tensors or return_tensor_qns:
-        final_bond_dim = narg_tensors[-1].shape[1]
-        final_local_shape = tuple(int(dim) for dim in narg_tensors[-1].shape[2:])
-        final_local_dim = int(np.prod(final_local_shape))
-        final_x_rows = np.asarray(X).shape[0]
-        if final_x_rows == final_local_dim * final_bond_dim:
-            terminal_local_shape = final_local_shape
-            terminal_local_dim = final_local_dim
-        elif final_local_shape and final_x_rows == final_local_shape[-1] * final_bond_dim:
-            terminal_local_shape = (final_local_shape[-1],)
-            terminal_local_dim = final_local_shape[-1]
+        if tensor_qns[-1].get("general_projector", False):
+            terminal_local_shape = (1,)
+            terminal_local_dim = 1
+            final_bond_dim = len(htot_qn)
         else:
-            raise ValueError(
-                "final eigenvector shape is incompatible with the returned NARG tensor dimensions."
-            )
+            final_bond_dim = narg_tensors[-1].shape[1]
+            final_local_shape = tuple(int(dim) for dim in narg_tensors[-1].shape[2:])
+            final_local_dim = int(np.prod(final_local_shape))
+            final_x_rows = np.asarray(X).shape[0]
+            if final_x_rows == final_local_dim * final_bond_dim:
+                terminal_local_shape = final_local_shape
+                terminal_local_dim = final_local_dim
+            elif final_local_shape and final_x_rows == final_local_shape[-1] * final_bond_dim:
+                terminal_local_shape = (final_local_shape[-1],)
+                terminal_local_dim = final_local_shape[-1]
+            else:
+                raise ValueError(
+                    "final eigenvector shape is incompatible with the returned NARG tensor dimensions."
+                )
     if return_tensors:
         coeff = np.asarray(X).reshape(terminal_local_dim, final_bond_dim, X.shape[1])
         result.append(narg_tensors + [coeff])
@@ -5311,6 +5667,10 @@ class NARG:
         "use_sparse_operator_projection": "auto",
         "two_site_mode": "supersite",
         "dressing": None,
+        "chi": None,
+        "frame_adapt_tol": None,
+        "frame_max_dim": None,
+        "frame_expand_dim": 1,
         "cc_level_shift": 0.0,
         "cc_response_tol": 1.0e-10,
         "cc_max_responses": None,
@@ -5338,6 +5698,7 @@ class NARG:
         self.local_dims = None
         self.orbital_blocks = None
         self.dressing_history = []
+        self.detached_history = []
         self.site = "spatial"
         self.n0 = None
         self.active_space = None
@@ -5483,6 +5844,7 @@ class NARG:
             self.local_dims = tuple(4 ** len(block) for block in orbital_blocks)
             self.orbital_blocks = orbital_blocks
             self.dressing_history = []
+            self.detached_history = []
             return self.result
 
         return_metadata = store_tensors or dressing_requested
@@ -5517,6 +5879,11 @@ class NARG:
             dict(factor["cc_diagnostics"])
             for factor in factors
             if "cc_diagnostics" in factor
+        ]
+        self.detached_history = [
+            dict(factor["detached_diagnostics"])
+            for factor in factors
+            if "detached_diagnostics" in factor
         ]
         return self.result
 

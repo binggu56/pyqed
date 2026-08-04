@@ -61,9 +61,11 @@ class MPOFrontier:
             ):
                 raise ValueError(f"MPO tensor {site} has an invalid shape.")
             if site not in self.paired_sites:
-                identity = np.eye(self.dims[site], dtype=mpo.dtype)
-                channel = np.trace(mpo, axis1=2, axis2=3) / self.dims[site]
-                reconstructed = channel[:, :, None, None] * identity
+                reconstructed = np.zeros_like(mpo)
+                diagonal = np.arange(self.dims[site])
+                reconstructed[:, :, diagonal, diagonal] = mpo[
+                    :, :, diagonal, diagonal
+                ]
                 scale = max(float(np.linalg.norm(mpo)), 1.0)
                 if not np.allclose(
                     mpo,
@@ -72,7 +74,7 @@ class MPOFrontier:
                     atol=256.0 * np.finfo(float).eps * scale,
                 ):
                     raise ValueError(
-                        f"unpaired MPO site {site} is not proportional to identity."
+                        f"unpaired MPO site {site} is not diagonal."
                     )
         if self.virtual_bonds[0] != 1 or self.virtual_bonds[-1] != 1:
             raise ValueError("frontier virtual boundary dimensions must be one.")
@@ -229,7 +231,9 @@ class MPOFrontier:
         return messages
 
     def scalar(self, tensors):
-        value = self.build_left(tensors)[-1]
+        value = self.left_boundary()
+        for site in range(self.nsites):
+            value = self.advance_left(value, tensors, site)
         return np.asarray(value).reshape(()).item()
 
     def _hole_expression(self, mode, site):
@@ -428,6 +432,46 @@ class MPOFrontier:
         )
         virtual_size = self.virtual_bonds[site] * self.virtual_bonds[site + 1]
         return np.asarray(value).reshape(virtual_size, virtual_size)
+
+    def hole_blocks(self, site, left, right, configuration_pairs):
+        """Return several fixed-physical blocks while reusing local setup."""
+        site = int(site)
+        expression = self._hole_block_expression(site)
+        identities = [
+            self._identities[physical_site]
+            for physical_site in self.physical_sites[site][1:]
+            if physical_site not in self.paired_sites
+        ]
+        virtual_size = self.virtual_bonds[site] * self.virtual_bonds[site + 1]
+        result = {}
+        for row, column, bra_configuration, ket_configuration in configuration_pairs:
+            bra_configuration = self._validated_physical_configuration(
+                site, bra_configuration, name="bra_configuration"
+            )
+            ket_configuration = self._validated_physical_configuration(
+                site, ket_configuration, name="ket_configuration"
+            )
+            selectors = []
+            for physical_site, bra_value, ket_value in zip(
+                self.physical_sites[site], bra_configuration, ket_configuration
+            ):
+                selectors.extend(
+                    (
+                        self._identities[physical_site][bra_value],
+                        self._identities[physical_site][ket_value],
+                    )
+                )
+            value = expression(
+                left,
+                right,
+                self.mpo_tensors[site],
+                *identities,
+                *selectors,
+            )
+            result[(int(row), int(column))] = np.asarray(value).reshape(
+                virtual_size, virtual_size
+            )
+        return result
 
     def hole_action(self, site, left, right, vector):
         site = int(site)

@@ -11,7 +11,10 @@ from pyqed.letta import (
     FrontierTwoSiteUpdate,
     LocalHamiltonian,
     LocalTerm,
+    PhysicalBlockLinearOperator,
 )
+from pyqed.letta.physical_blocks import PhysicalBlockLayout
+import pyqed.letta.physical_blocks as physical_blocks_module
 
 
 def _local_hamiltonian():
@@ -52,6 +55,74 @@ def _states(seed=5):
     dense.tensors = [tensor.copy() for tensor in frontier.tensors]
     dense.energy = dense.expectation()
     return frontier, dense
+
+
+def _temporary_pair_local_operators(state, site):
+    """Reference the historical merged-pair temporary-state contraction."""
+    following = site + 1
+    merged, union_sites = state._merged_pair_tensor(site)
+    right_dimension = state.bond_dims[following + 1]
+    right_sites = state.physical_sites[following]
+    identity = np.eye(right_dimension, dtype=merged.dtype)
+    identity_tensor = np.broadcast_to(
+        identity.reshape(
+            right_dimension,
+            right_dimension,
+            *((1,) * len(right_sites)),
+        ),
+        (
+            right_dimension,
+            right_dimension,
+            *(state.dims[index] for index in right_sites),
+        ),
+    ).copy()
+    temporary_tensors = [tensor.copy() for tensor in state.tensors]
+    temporary_tensors[site] = merged
+    temporary_tensors[following] = identity_tensor
+    temporary_parents = list(state.parent_sets)
+    temporary_parents[site] = tuple(index for index in union_sites if index != site)
+    temporary_bonds = list(state.bond_dims)
+    temporary_bonds[following] = right_dimension
+    temporary = FrontierTiedLETTA(
+        state.hamiltonian,
+        state.dims,
+        tuple(temporary_parents),
+        bond_dims=tuple(temporary_bonds),
+        tensors=temporary_tensors,
+        frontier_backend=state.frontier_backend,
+        path_optimizer=state.path_optimizer,
+    )
+    # Construction balances gauges.  Restore the exact reference tensors used
+    # by the former two-site implementation before forming its local pencil.
+    temporary.tensors = temporary_tensors
+    return temporary.local_operators(site)
+
+
+def test_physical_block_native_matvec_matches_python_reference():
+    if physical_blocks_module._physical_blocks_cpp is None:
+        pytest.skip("optional physical-block C++ extension is not built")
+    rng = np.random.default_rng(123)
+    layout = PhysicalBlockLayout((3, 4, 2, 2))
+    blocks = {
+        (0, 0): rng.normal(size=(12, 12)),
+        (3, 1): rng.normal(size=(12, 12)),
+        (2, 3): rng.normal(size=(12, 12)),
+    }
+    for key in blocks:
+        blocks[key] = blocks[key] + 1j * rng.normal(size=(12, 12))
+    operator = PhysicalBlockLinearOperator(layout, blocks)
+    vector = rng.normal(size=layout.size) + 1j * rng.normal(size=layout.size)
+    native = physical_blocks_module._physical_blocks_cpp
+    native_matvec = operator.matvec(vector)
+    native_rmatvec = operator.rmatvec(vector)
+    physical_blocks_module._physical_blocks_cpp = None
+    try:
+        reference_matvec = operator.matvec(vector)
+        reference_rmatvec = operator.rmatvec(vector)
+    finally:
+        physical_blocks_module._physical_blocks_cpp = native
+    np.testing.assert_allclose(native_matvec, reference_matvec, atol=1.0e-12)
+    np.testing.assert_allclose(native_rmatvec, reference_rmatvec, atol=1.0e-12)
 
 
 def test_local_hamiltonian_combines_supports_and_matches_dense_matvec():
@@ -402,6 +473,309 @@ def test_two_site_merge_split_preserves_overlapping_graph_pair_and_variable_bond
     np.testing.assert_allclose(error, 0.0, atol=2.0e-14)
 
 
+@pytest.mark.parametrize("frontier_backend", ["compressed", "identity_block"])
+def test_cached_pair_local_operators_match_temporary_state_reference(
+    frontier_backend,
+):
+    hamiltonian = _local_hamiltonian()
+    state = FrontierTiedLETTA(
+        hamiltonian,
+        hamiltonian.dims,
+        ((1, 3), (2,), (3,), ()),
+        bond_dim=2,
+        seed=45,
+        frontier_backend=frontier_backend,
+    )
+
+    for site in range(len(state.dims) - 1):
+        metric, effective = state.pair_local_operators(site)
+        reference_metric, reference_effective = _temporary_pair_local_operators(
+            state,
+            site,
+        )
+        merged, union_sites = state._merged_pair_tensor(site)
+
+        assert state.pair_environment(site).union_sites == union_sites
+        assert metric.shape == (merged.size, merged.size)
+        assert effective.shape == (merged.size, merged.size)
+        np.testing.assert_allclose(metric, reference_metric, atol=3.0e-13)
+        np.testing.assert_allclose(effective, reference_effective, atol=8.0e-13)
+
+
+@pytest.mark.parametrize(
+    "sweep_offset,sites",
+    [(0, range(3)), (1, range(2, -1, -1))],
+)
+def test_cached_two_site_directional_sweep_matches_rebuilt_environments(
+    sweep_offset,
+    sites,
+):
+    cached, _dense = _states(seed=47)
+    initial_energy = cached.expectation()
+    rebuilt = cached.copy()
+    options = {
+        "solver": "whitened",
+        "outer_cycles": 1,
+        "factor_solver": "dense",
+        "split_random_starts": 0,
+    }
+
+    rebuilt_updates = [rebuilt.optimize_two_sites(site, **options) for site in sites]
+    cached.run_two_site(
+        nsweeps=1,
+        sweep_offset=sweep_offset,
+        verify_pair_energies=False,
+        **options,
+    )
+    cached_updates = cached.history[0]["updates"]
+
+    assert cached.history[0]["accepted"]
+    assert cached.history[0]["energy"] <= initial_energy + 3.0e-13
+    np.testing.assert_allclose(
+        [update.energy for update in cached_updates],
+        [update.energy for update in rebuilt_updates],
+        atol=2.0e-11,
+    )
+    np.testing.assert_allclose(
+        cached.expectation(),
+        rebuilt.expectation(),
+        atol=2.0e-11,
+    )
+
+
+def test_cached_two_site_sweep_rolls_back_an_increased_endpoint(monkeypatch):
+    state, _dense = _states(seed=48)
+    tensors = [tensor.copy() for tensor in state.tensors]
+    energy = state.expectation()
+    completed = state._completed_frontier_scalar
+
+    def inflated_endpoint(frontier, message, cut):
+        if frontier is state._hamiltonian_frontier:
+            return 1.0e6
+        return completed(frontier, message, cut)
+
+    monkeypatch.setattr(state, "_completed_frontier_scalar", inflated_endpoint)
+    state.run_two_site(
+        nsweeps=1,
+        outer_cycles=1,
+        factor_solver="dense",
+    )
+
+    assert not state.history[0]["accepted"]
+    np.testing.assert_allclose(state.energy, energy, atol=0.0)
+    for tensor, reference in zip(state.tensors, tensors):
+        np.testing.assert_array_equal(tensor, reference)
+
+
+def test_cached_two_site_sweep_retains_both_directional_history_rows():
+    state, _dense = _states(seed=50)
+    reference = state.copy()
+    options = {
+        "solver": "whitened",
+        "outer_cycles": 1,
+        "factor_solver": "dense",
+        "split_random_starts": 0,
+        "tol": 0.0,
+    }
+
+    state.run_two_site(nsweeps=2, **options)
+    reference_rows = []
+    for sweep_offset in range(2):
+        reference.run_two_site(
+            nsweeps=1,
+            sweep_offset=sweep_offset,
+            **options,
+        )
+        reference_rows.append(reference.history[0])
+
+    assert [row["sweep"] for row in state.history] == [0, 1]
+    assert [row["direction"] for row in state.history] == [
+        "left_to_right",
+        "right_to_left",
+    ]
+    np.testing.assert_allclose(
+        [row["energy"] for row in state.history],
+        [row["energy"] for row in reference_rows],
+        atol=2.0e-11,
+    )
+    np.testing.assert_allclose(state.energy, reference.energy, atol=2.0e-11)
+    for tensor, expected in zip(state.tensors, reference.tensors):
+        np.testing.assert_allclose(tensor, expected, atol=2.0e-11)
+
+
+def test_pair_conditional_blocks_reconstruct_dense_operators():
+    state, _dense = _states(seed=49)
+    metric, effective = state.pair_local_operators(1)
+    problem = state.pair_local_block_problem(1)
+
+    np.testing.assert_allclose(problem.metric.to_dense(), metric, atol=3.0e-13)
+    np.testing.assert_allclose(
+        problem.hamiltonian.to_dense(),
+        effective,
+        atol=3.0e-13,
+    )
+    assert problem.stored_elements < metric.size + effective.size
+
+
+def test_pair_conditional_blocks_contract_one_hermitian_orientation(monkeypatch):
+    state, _dense = _states(seed=49)
+    plan = state._pair_plan(1)
+    original = plan.hamiltonian_engine.hole_blocks
+    requested = []
+
+    def record_requests(site, left, right, configuration_pairs):
+        requested.extend(configuration_pairs)
+        return original(site, left, right, configuration_pairs)
+
+    monkeypatch.setattr(
+        plan.hamiltonian_engine,
+        "hole_blocks",
+        record_requests,
+    )
+    problem = state.pair_local_block_problem(1)
+
+    assert requested
+    assert all(row <= column for row, column, _bra, _ket in requested)
+    assert len(requested) < len(problem.hamiltonian.blocks)
+    np.testing.assert_allclose(
+        problem.hamiltonian.to_dense(),
+        state.pair_local_operators(1)[1],
+        atol=3.0e-13,
+    )
+
+
+def test_auto_pair_backend_reuses_dense_pencil_for_factor_solve(monkeypatch):
+    state, _dense = _states(seed=51)
+    original = state._variational_split_merged_pair
+    observed = {}
+
+    def record_factor_solver(*args, **kwargs):
+        observed["factor_solver"] = kwargs["factor_solver"]
+        observed["has_metric"] = args[3] is not None
+        observed["has_effective"] = args[4] is not None
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state,
+        "_variational_split_merged_pair",
+        record_factor_solver,
+    )
+    update = state.optimize_two_sites(
+        1,
+        pair_operator_backend="auto",
+        factor_solver="auto",
+        pair_dense_max_elements=4_000_000,
+        pair_operator_workers=2,
+        outer_cycles=1,
+    )
+
+    itemsize = np.dtype(
+        np.result_type(state.hamiltonian.dtype, *state.tensors)
+    ).itemsize
+    assert update.accepted
+    assert update.pair_operator_requested_backend == "auto"
+    assert update.pair_operator_backend == "dense"
+    assert update.factor_solver == "dense"
+    assert update.pair_operator_workers == 2
+    assert observed == {
+        "factor_solver": "dense",
+        "has_metric": True,
+        "has_effective": True,
+    }
+    assert update.pair_operator_stored_elements == 2 * update.raw_merged_dim**2
+    assert (
+        update.pair_operator_stored_bytes
+        == update.pair_operator_stored_elements * itemsize
+    )
+    assert "fit within" in update.pair_operator_selection_reason
+
+
+def test_auto_pair_backend_uses_matrix_free_factors_above_dense_budget(
+    monkeypatch,
+):
+    state, _dense = _states(seed=52)
+    original = state._variational_split_merged_pair
+    observed = {}
+
+    def record_factor_solver(*args, **kwargs):
+        observed["factor_solver"] = kwargs["factor_solver"]
+        observed["has_metric"] = args[3] is not None
+        observed["has_effective"] = args[4] is not None
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        state,
+        "_variational_split_merged_pair",
+        record_factor_solver,
+    )
+    update = state.optimize_two_sites(
+        1,
+        pair_operator_backend="auto",
+        factor_solver="auto",
+        pair_dense_max_elements=1,
+        outer_cycles=1,
+    )
+
+    assert update.accepted
+    assert update.pair_operator_backend == "block"
+    assert update.factor_solver == "matrix_free"
+    assert observed == {
+        "factor_solver": "matrix_free",
+        "has_metric": False,
+        "has_effective": False,
+    }
+    assert "exceed" in update.pair_operator_selection_reason
+
+
+def test_block_pair_update_uses_no_dense_pair_operators_or_design(
+    monkeypatch,
+):
+    state, _dense = _states(seed=51)
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("dense pair storage is forbidden in block mode")
+
+    monkeypatch.setattr(state, "pair_local_operators", forbidden)
+    monkeypatch.setattr(state, "_pair_factor_design", forbidden)
+    monkeypatch.setattr(PhysicalBlockLinearOperator, "to_dense", forbidden)
+
+    update = state.optimize_two_sites(
+        1,
+        pair_operator_backend="block",
+        factor_solver="matrix_free",
+        outer_cycles=2,
+    )
+
+    assert update.accepted
+    assert update.merged_solve.verified
+    assert update.merged_solve.lowest_root_certified
+    assert not update.merged_solve.dense_fallback
+    assert update.pair_operator_backend == "block"
+    assert np.isfinite(update.metric_projection_error)
+    assert update.pair_operator_stored_elements < 2 * update.raw_merged_dim**2
+
+
+def test_cached_pair_plan_is_reused_and_invalidated_after_bond_expansion():
+    state, _dense = _states(seed=46)
+    site = 1
+    first = state._pair_plan(site)
+    metric_before, _effective_before = state.pair_local_operators(site)
+
+    assert state._pair_plan(site) is first
+    assert state._pair_plan_cache[site] is first
+
+    state.expand_bond(3, 3, strategy="zero")
+
+    assert state._pair_plan_cache == {}
+    second = state._pair_plan(site)
+    metric_after, _effective_after = state.pair_local_operators(site)
+    merged_after, _union_sites = state._merged_pair_tensor(site)
+    assert second is not first
+    assert second.fingerprint != first.fingerprint
+    assert metric_after.shape == (merged_after.size, merged_after.size)
+    assert metric_after.shape[0] > metric_before.shape[0]
+
+
 def test_two_site_design_maps_merge_complex_tied_overlap_and_nonuniform_bonds():
     hamiltonian = _local_hamiltonian()
     state = FrontierTiedLETTA(
@@ -434,6 +808,68 @@ def test_two_site_design_maps_merge_complex_tied_overlap_and_nonuniform_bonds():
         )
         reconstructed = (design @ factor.reshape(-1)).reshape(merged.shape)
         np.testing.assert_allclose(reconstructed, merged, atol=3.0e-14)
+
+
+def test_two_site_direct_factor_actions_match_design_and_are_adjoint():
+    hamiltonian = _local_hamiltonian()
+    state = FrontierTiedLETTA(
+        hamiltonian,
+        hamiltonian.dims,
+        ((1, 3), (2,), (3,), ()),
+        bond_dims=(1, 2, 3, 2, 1),
+        seed=49,
+    )
+    rng = np.random.default_rng(50)
+    state.tensors = [
+        tensor.astype(complex) + 0.2j * rng.normal(size=tensor.shape)
+        for tensor in state.tensors
+    ]
+    site = 1
+    merged, union_sites = state._merged_pair_tensor(site)
+    left_tensor = state.tensors[site]
+    right_tensor = state.tensors[site + 1]
+    cotangent = rng.normal(size=merged.size) + 1j * rng.normal(size=merged.size)
+
+    for variable, factor in (
+        ("left", left_tensor),
+        ("right", right_tensor),
+    ):
+        variation = rng.normal(size=factor.size) + 1j * rng.normal(size=factor.size)
+        design = state._pair_factor_design(
+            site,
+            union_sites,
+            left_tensor,
+            right_tensor,
+            variable=variable,
+        )
+        action = state._pair_factor_action(
+            site,
+            union_sites,
+            left_tensor,
+            right_tensor,
+            variation,
+            variable=variable,
+        )
+        adjoint = state._pair_factor_adjoint(
+            site,
+            union_sites,
+            left_tensor,
+            right_tensor,
+            cotangent,
+            variable=variable,
+        )
+
+        np.testing.assert_allclose(action, design @ variation, atol=3.0e-14)
+        np.testing.assert_allclose(
+            adjoint,
+            design.T.conj() @ cotangent,
+            atol=3.0e-14,
+        )
+        np.testing.assert_allclose(
+            np.vdot(action, cotangent),
+            np.vdot(variation, adjoint),
+            atol=3.0e-13,
+        )
 
 
 def test_two_site_variational_split_is_covariant_to_environment_scale():
@@ -492,6 +928,14 @@ def test_two_site_update_rejects_harmful_truncation_and_restores_tensors():
 
     assert update.local_update.accepted
     assert not update.accepted
+    assert update.merged_solve.verified
+    assert update.merged_solve.dense_fallback
+    assert update.merged_solve.method == "dense_certified"
+    assert update.merged_solve.attempts == (
+        "warm_davidson",
+        "dense_certification",
+    )
+    assert update.merged_solve.metric_dual_relative_residual < 1.0e-12
     np.testing.assert_allclose(update.energy_before, 1.0, atol=2.0e-12)
     np.testing.assert_allclose(update.merged_energy, 0.0, atol=2.0e-12)
     np.testing.assert_allclose(update.attempted_energy, 3.6, atol=2.0e-12)
@@ -502,6 +946,188 @@ def test_two_site_update_rejects_harmful_truncation_and_restores_tensors():
     )
     for tensor, reference in zip(state.tensors, tensors):
         np.testing.assert_array_equal(tensor, reference)
+
+
+def test_verified_pair_solver_certifies_beyond_warm_invariant_subspace():
+    state, _dense = _states(seed=53)
+    metric = np.eye(4)
+    effective = np.diag([0.0, 1.0, 2.0, 3.0])
+    warm = np.array([0.0, 0.0, 1.0, 1.0])
+
+    energy, _vector, update, diagnostics = state._solve_verified_pair_pencil(
+        0,
+        metric,
+        effective,
+        warm,
+        metric_tol=1.0e-12,
+        eig_tol=1.0e-12,
+        maxiter=50,
+        max_subspace=4,
+        dense_fallback_dim=4,
+    )
+
+    np.testing.assert_allclose(energy, 0.0, atol=1.0e-14)
+    assert update.solver_converged
+    assert diagnostics.verified
+    assert diagnostics.lowest_root_certified
+    assert diagnostics.method == "dense_certified"
+    assert diagnostics.dense_fallback
+
+
+def test_verified_pair_solver_skips_redundant_full_rank_davidson():
+    state, _dense = _states(seed=53)
+    metric = np.eye(4)
+    effective = np.diag([0.0, 1.0, 2.0, 3.0])
+    warm = np.array([0.0, 0.0, 1.0, 1.0])
+
+    reference = state._solve_verified_pair_pencil(
+        0,
+        metric,
+        effective,
+        warm,
+        metric_tol=1.0e-12,
+        eig_tol=1.0e-12,
+        maxiter=50,
+        max_subspace=4,
+        dense_fallback_dim=4,
+    )
+    skipped = state._solve_verified_pair_pencil(
+        0,
+        metric,
+        effective,
+        warm,
+        metric_tol=1.0e-12,
+        eig_tol=1.0e-12,
+        maxiter=50,
+        max_subspace=4,
+        dense_fallback_dim=4,
+        skip_redundant_full_rank_davidson=True,
+    )
+
+    np.testing.assert_allclose(skipped[0], reference[0], atol=1.0e-14)
+    np.testing.assert_allclose(
+        abs(np.vdot(skipped[1], reference[1])),
+        1.0,
+        atol=1.0e-14,
+    )
+    assert skipped[2].solver_converged
+    assert skipped[3].lowest_root_certified
+    assert skipped[3].attempts == (
+        "warm_davidson_skipped_full_rank",
+        "dense_certification",
+    )
+
+    below_threshold = state._solve_verified_pair_pencil(
+        0,
+        metric,
+        effective,
+        warm,
+        metric_tol=1.0e-12,
+        eig_tol=1.0e-12,
+        maxiter=50,
+        max_subspace=4,
+        dense_fallback_dim=4,
+        skip_redundant_full_rank_davidson=True,
+        redundant_full_rank_davidson_min_dimension=5,
+    )
+    assert below_threshold[3].attempts == (
+        "warm_davidson",
+        "dense_certification",
+    )
+
+    rank_deficient = state._solve_verified_pair_pencil(
+        0,
+        np.diag([1.0, 0.0]),
+        np.diag([0.0, 1.0]),
+        np.array([1.0, 0.0]),
+        metric_tol=1.0e-12,
+        eig_tol=1.0e-12,
+        maxiter=50,
+        max_subspace=4,
+        dense_fallback_dim=4,
+        skip_redundant_full_rank_davidson=True,
+    )
+    assert rank_deficient[3].attempts == (
+        "warm_davidson",
+        "dense_certification",
+    )
+
+
+def test_verified_pair_solver_distinguishes_regularized_and_numerical_support():
+    state, _dense = _states(seed=54)
+    metric = np.diag([1.0, 5.0e-14])
+    effective = np.diag([0.0, -5.0e-13])
+    warm = np.array([1.0, 0.0])
+    rows = {}
+
+    for support in ("regularized", "numerical"):
+        rows[support] = state._solve_verified_pair_pencil(
+            0,
+            metric,
+            effective,
+            warm,
+            metric_tol=1.0e-12,
+            eig_tol=1.0e-12,
+            maxiter=20,
+            max_subspace=2,
+            dense_fallback_dim=2,
+            metric_support=support,
+        )
+
+    regularized_energy, _vector, regularized_update, regularized = rows["regularized"]
+    numerical_energy, _vector, numerical_update, numerical = rows["numerical"]
+    np.testing.assert_allclose(regularized_energy, 0.0, atol=1.0e-14)
+    assert regularized_update.metric_rank == 1
+    assert regularized_update.metric_rank_is_projected
+    assert regularized.metric_support == "regularized"
+    np.testing.assert_allclose(numerical_energy, -10.0, atol=1.0e-12)
+    assert numerical_update.metric_rank == 2
+    assert not numerical_update.metric_rank_is_projected
+    assert numerical.metric_support == "numerical"
+
+
+def test_verified_pair_solver_retains_verified_warm_below_support_root(
+    monkeypatch,
+):
+    state, _dense = _states(seed=55)
+    metric = np.diag([1.0, 5.0e-14])
+    effective = np.diag([0.0, -5.0e-14])
+    warm = np.array([0.0, 1.0])
+
+    def failed_davidson(*_args, **_kwargs):
+        raise ValueError("forced Davidson failure")
+
+    monkeypatch.setattr(
+        "pyqed.letta.frontier_tying.lowest_generalized_davidson",
+        failed_davidson,
+    )
+    energy, vector, update, diagnostics = state._solve_verified_pair_pencil(
+        0,
+        metric,
+        effective,
+        warm,
+        metric_tol=1.0e-12,
+        eig_tol=1.0e-12,
+        maxiter=20,
+        max_subspace=2,
+        dense_fallback_dim=2,
+        metric_support="regularized",
+    )
+
+    np.testing.assert_allclose(energy, -1.0, atol=1.0e-14)
+    np.testing.assert_allclose(
+        state._pair_rayleigh(vector, metric, effective),
+        -1.0,
+        atol=1.0e-14,
+    )
+    assert diagnostics.method == "warm"
+    assert diagnostics.verified
+    assert diagnostics.lowest_root_certified
+    assert diagnostics.metric_requested_rank == 1
+    assert diagnostics.metric_numerical_rank == 2
+    assert "above the retained variational state" in diagnostics.fallback_reason
+    assert update.solver_converged
+    assert "retained residual-verified warm pair" in update.message
 
 
 def test_two_site_variational_tangent_escapes_coordinate_saddle():
@@ -527,6 +1153,14 @@ def test_two_site_variational_tangent_escapes_coordinate_saddle():
             np.array([[[0.0, 1.0]]], dtype=complex),
         ),
     )
+    single_cycle = state.copy()
+
+    single_update = single_cycle.optimize_two_sites(
+        0,
+        solver="whitened",
+        split_random_starts=0,
+        outer_cycles=1,
+    )
 
     update = state.optimize_two_sites(
         0,
@@ -538,6 +1172,9 @@ def test_two_site_variational_tangent_escapes_coordinate_saddle():
     assert update.split_strategy == "variational"
     assert update.selected_start.startswith("tangent(")
     assert update.factor_random_starts == 0
+    assert update.outer_cycles > 1
+    assert update.energy <= single_update.energy
+    assert np.all(np.diff(update.factor_energy_history) <= 2.0e-12)
     assert update.energy < 0.8
     np.testing.assert_allclose(update.energy, 0.65259042733, atol=1.0e-5)
     np.testing.assert_allclose(state.expectation(), update.energy, atol=2.0e-12)
@@ -703,6 +1340,48 @@ def test_cached_bidirectional_frontier_sweep_energies_match_explicit_updates():
     )
 
 
+def test_checkpointed_frontier_sweeps_match_full_cache_in_both_directions():
+    reference, _dense = _states(seed=41)
+    full = reference.copy()
+    checkpointed = reference.copy()
+
+    full.run(
+        nsweeps=2,
+        tol=0.0,
+        solver="direct",
+        environment_cache="full",
+    )
+    checkpointed.run(
+        nsweeps=2,
+        tol=0.0,
+        solver="direct",
+        environment_cache="checkpointed",
+        environment_checkpoint_interval=2,
+    )
+
+    np.testing.assert_allclose(
+        [record["energy"] for record in checkpointed.history],
+        [record["energy"] for record in full.history],
+        atol=4.0e-11,
+    )
+    assert all(
+        record["environment_cache"] == "checkpointed" for record in checkpointed.history
+    )
+    assert checkpointed.fixed_environment_cache_elements(
+        interval=2
+    ) <= checkpointed.fixed_environment_cache_elements(mode="full")
+    assert (
+        len(
+            checkpointed._build_environment_checkpoints(
+                checkpointed._norm_frontier,
+                direction="right",
+                interval=2,
+            )
+        )
+        == 3
+    )
+
+
 def test_frontier_sweep_does_not_claim_convergence_after_solver_failures(
     monkeypatch,
 ):
@@ -758,4 +1437,71 @@ def test_identity_block_backend_matches_compressed_backend_and_uses_less_memory(
     assert (
         block.hamiltonian_peak_frontier_elements
         < compressed.hamiltonian_peak_frontier_elements
+    )
+
+
+def test_identity_block_exact_local_tt_matches_dense_local_absorption():
+    dense_local, _dense = _states(seed=35)
+    dense_local = FrontierTiedLETTA(
+        dense_local.hamiltonian,
+        dense_local.dims,
+        dense_local.parent_sets,
+        bond_dim=dense_local.bond_dim,
+        tensors=dense_local.tensors,
+        frontier_backend="identity_block",
+        local_backend="dense",
+    )
+    sequential = FrontierTiedLETTA(
+        dense_local.hamiltonian,
+        dense_local.dims,
+        dense_local.parent_sets,
+        bond_dim=dense_local.bond_dim,
+        tensors=dense_local.tensors,
+        frontier_backend="identity_block",
+        local_backend="tensor_train",
+    )
+    dense_local.tensors = [tensor.copy() for tensor in sequential.tensors]
+    dense_local.energy = dense_local.expectation()
+
+    np.testing.assert_allclose(
+        sequential.expectation(), dense_local.expectation(), atol=2.0e-12
+    )
+    sequential.run(nsweeps=1, tol=0.0, solver="direct")
+    dense_local.run(nsweeps=1, tol=0.0, solver="direct")
+    np.testing.assert_allclose(sequential.energy, dense_local.energy, atol=4.0e-11)
+
+
+def test_identity_block_truncated_local_tt_uses_exact_energy_gate():
+    reference, _dense = _states(seed=37)
+    exact = FrontierTiedLETTA(
+        reference.hamiltonian,
+        reference.dims,
+        reference.parent_sets,
+        bond_dim=reference.bond_dim,
+        tensors=reference.tensors,
+        frontier_backend="identity_block",
+    )
+    approximate = FrontierTiedLETTA(
+        reference.hamiltonian,
+        reference.dims,
+        reference.parent_sets,
+        bond_dim=reference.bond_dim,
+        tensors=reference.tensors,
+        frontier_backend="identity_block",
+        local_backend="tensor_train",
+        local_rank=1,
+    )
+
+    assert not approximate.hamiltonian_contraction_is_exact
+    np.testing.assert_allclose(
+        approximate.expectation(), exact.expectation(), atol=2e-13
+    )
+    energy_before = approximate.energy
+    approximate.run(nsweeps=1, tol=0.0, solver="direct")
+    assert approximate.energy <= energy_before + 2.0e-12
+    assert (
+        approximate.history[0]["tt_diagnostics"]["hamiltonian"][
+            "max_relative_discarded_norm"
+        ]
+        > 0.0
     )

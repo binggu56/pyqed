@@ -1964,15 +1964,25 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
         return contract_veff_ri(eri_factors, ddm, mol.nao) + np.asarray(vhf_last)
 
     if getattr(mol, 'eri_s8', None) is not None:
-        from pyqed.qchem.basis import _builtin_worker_count, contract_veff_s8
+        from pyqed.qchem.basis import (
+            _builtin_worker_count,
+            contract_jk_s8,
+            contract_veff_s8,
+        )
 
         workers = _builtin_worker_count(mol, mol.nao)
         if dm_last is None:
+            if np.iscomplexobj(dm):
+                vj, vk = contract_jk_s8(mol.eri_s8, np.asarray(dm), mol.nao, workers=workers)
+                return vj - 0.5 * vk
             veff = contract_veff_s8(mol.eri_s8, np.asarray(dm), mol.nao, workers=workers)
             if veff is not None:
                 return veff
         else:
             ddm = np.asarray(dm) - np.asarray(dm_last)
+            if np.iscomplexobj(ddm):
+                vj, vk = contract_jk_s8(mol.eri_s8, ddm, mol.nao, workers=workers)
+                return vj - 0.5 * vk + np.asarray(vhf_last)
             veff = contract_veff_s8(mol.eri_s8, ddm, mol.nao, workers=workers)
             if veff is not None:
                 return veff + np.asarray(vhf_last)

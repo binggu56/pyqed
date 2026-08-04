@@ -1,7 +1,13 @@
 *.pyc
-pyqed/__pycache__/
-pyqed/pyqed/__pycache__/
+__pycache__/
 build/
+*.o
+*.so
+*.egg-info/
+.venv/
+.ipynb_checkpoints/
+.virtual_documents/
+*.tsbuildinfo
 *.pdf
 *.pyc
 *.npz
@@ -27,6 +33,11 @@ pyqed/qchem/dvr/rhf-Bing的Mac Studio.py
 venv/
 .eggs/
 
+# OneDrive conflict copies named after the syncing Mac.
+*MacBook Pro*
+*Mac Pro*
+*Mac Studio*
+
 MacBook_local_data
 local_data
 dataset
@@ -46,10 +57,19 @@ Scan_Results_Nz_32
 .vscode
 *.png
 *.csv
-*.png
+!examples/mps/results/frontier_letta_j1_tied_6x6_scan.csv
 *.aux
 *.bbl
 *.blg
 *.fdb_latexmk
 *.fls
 *.tex
+
+# Local LETTA cluster-controller registries and source manifests.
+/hpc_runs/
+/.letta_hpc/
+/.sources/
+
+# A separately versioned site checkout and local benchmark run output.
+/website/
+/examples/mps/results/*.json

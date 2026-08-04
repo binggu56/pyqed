@@ -83,6 +83,11 @@ def _charge_spin_sector(charge, two_j):
     return Sector(("charge", "su2"), (charge, SU2Irrep(two_j)))
 
 
+def test_product_sector_reports_nonabelian_su2_factor():
+    assert _charge_spin_sector(2, 0).is_abelian is False
+    assert Sector(("charge", "sz"), (2, 0)).is_abelian is True
+
+
 def test_nonabelian_tensor_accepts_charge_su2_sector_labels():
     vac = _charge_spin_sector(0, 0)
     dbl = _charge_spin_sector(1, 1)
@@ -133,6 +138,16 @@ def test_merge_mps_sites_preserves_multiple_intermediate_su2_channels():
         (mid_singlet,),
         (mid_triplet,),
     }
+    channel_blocks = merged.metadata["contracted_channel_blocks"]
+    np.testing.assert_allclose(
+        channel_blocks[(left, phys, mid_singlet, phys, right)],
+        3.0,
+    )
+    np.testing.assert_allclose(
+        channel_blocks[(left, phys, mid_triplet, phys, right)],
+        10.0,
+    )
+    np.testing.assert_allclose(merged.data[key], 13.0)
 
 
 def test_explicit_basis_descriptors_recover_tensor_axis_layouts():
@@ -720,6 +735,47 @@ def test_state_averaged_svd_keeps_sectors_present_only_in_excited_roots():
     assert len(root_pairs) == 2
 
 
+def test_state_averaged_svd_unions_different_root_multiplicities():
+    left = _charge_spin_sector(0, 0)
+    bond = _charge_spin_sector(1, 1)
+    right = _charge_spin_sector(2, 0)
+    phys_left = _charge_spin_sector(1, 1)
+    phys_right = _charge_spin_sector(1, 1)
+    bond_leg = FusionLeg(child_legs=(0, 2))
+    A = NonabelianTensor(
+        {(left, bond, phys_left): np.ones((1, 1, 1))},
+        [[left], [bond], [phys_left]],
+        [-1, 1, 1],
+        fusion_legs=[None, bond_leg, None],
+    )
+    B = NonabelianTensor(
+        {(bond, right, phys_right): np.ones((1, 1, 1))},
+        [[bond], [right], [phys_right]],
+        [-1, 1, 1],
+        fusion_legs=[bond_leg, None, None],
+    )
+    root_a = merge_mps_sites(A, B)
+    key = next(iter(root_a.data))
+    wide_block = np.zeros((2, 1, 1, 1))
+    wide_block[1] = root_a.data[key][0]
+    root_b = NonabelianTensor(
+        {key: wide_block},
+        [[left, left], root_a.qns[1][:], root_a.qns[2][:], root_a.qns[3][:]],
+        root_a.dirs[:],
+        fusion_legs=root_a.fusion_legs[:],
+        metadata=root_a.metadata.copy(),
+    )
+
+    _, _, _, _, _, root_pairs = state_averaged_svd_two_site(
+        [root_a, root_b],
+        [0.5, 0.5],
+        max_bond=8,
+        cutoff=0.0,
+    )
+
+    assert all(pair[0].qns[0].count(left) == 2 for pair in root_pairs)
+
+
 def test_svd_two_site_handles_multi_channel_reduced_bases(monkeypatch):
     import pyqed.mps.nonabelian.decompose as decompose_module
     from pyqed.mps.nonabelian import CouplingChannel, ReducedBondSpace
@@ -1264,8 +1320,8 @@ def test_solve_local_two_site_tensor_generalized_norm_uses_tensor_davidson():
     assert objective["energy"] == pytest.approx(0.0)
     assert objective["generalized_norm"] is True
     assert objective["tensor_davidson"] is True
-    assert objective["reduced_krylov"] is True
-    assert objective["preconditioner_mode"] == "reduced_diagonal"
+    assert objective["packed_krylov"] is True
+    assert objective["preconditioner_mode"] == "packed_diagonal"
 
 
 def test_packed_block_preconditioner_solves_per_block_systems():
@@ -1501,7 +1557,7 @@ def test_solve_local_two_site_accepts_reduced_local_operator():
     assert objective["energy"] == pytest.approx(0.0)
     assert objective["operator_representation"] == "reduced"
     assert objective["norm_operator_representation"] == "reduced"
-    assert objective["reduced_krylov"] is True
+    assert objective["packed_krylov"] is True
     assert objective["dense_fallback"] is False
 
 
@@ -1578,6 +1634,50 @@ def test_solve_local_two_site_effective_h_can_skip_identity_norm_operator():
     assert objective.get("generalized_norm", False) is False
 
 
+def test_kronecker_basis_transform_matches_dense_reference():
+    rng = np.random.default_rng(20260725)
+    block = solver_mod._KroneckerBasisTransformBlock(
+        row_slice=slice(1, 13),
+        orthonormal_indices=np.asarray(
+            [1, 3, 6, 8, 10, 12, 15, 17],
+            dtype=np.int64,
+        ),
+        left_dim=2,
+        selected_dim=3,
+        local_dim=2,
+        right_dim=2,
+        local_transform=rng.normal(size=(3, 2)),
+    )
+    structured = solver_mod._StructuredBasisTransform(
+        blocks=(block,),
+        uncoupled_size=14,
+        coupled_size=19,
+    )
+    dense = np.asarray(structured)
+    vector = rng.normal(size=19) + 1j * rng.normal(size=19)
+    parent = rng.normal(size=14) + 1j * rng.normal(size=14)
+    diagonal = rng.normal(size=14)
+
+    np.testing.assert_allclose(
+        structured @ vector,
+        dense @ vector,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        structured.adjoint_apply(parent),
+        dense.conj().T @ parent,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        structured.project_diagonal(diagonal),
+        (np.abs(dense) ** 2).T @ diagonal,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
 def test_solve_local_two_site_can_optimize_in_cg_coupled_basis():
     left = _charge_spin_sector(0, 0)
     phys_left = _charge_spin_sector(1, 1)
@@ -1611,10 +1711,14 @@ def test_solve_local_two_site_can_optimize_in_cg_coupled_basis():
     assert objective_coupled["coupled_physical"] is True
     assert objective_coupled["coupled_physical_used"] is True
     assert objective_coupled["tensor_davidson"] is True
-    assert objective_coupled["reduced_krylov"] is True
-    assert objective_coupled["preconditioner_mode"] == "reduced_diagonal"
-    assert objective_coupled["reduced_preconditioner"] is True
+    assert objective_coupled["packed_krylov"] is True
+    assert objective_coupled["preconditioner_mode"] == "packed_diagonal"
+    assert objective_coupled["reduced_preconditioner"] is False
     assert objective_coupled["dense_fallback"] is False
+    assert isinstance(
+        merged.metadata["_basis_transform_cache"]["transform"],
+        solver_mod._StructuredBasisTransform,
+    )
     assert objective_coupled["energy"] == pytest.approx(objective_uncoupled["energy"])
     np.testing.assert_allclose(
         optimized_coupled.data[(left, phys_left, phys_right, right)],
@@ -2774,9 +2878,9 @@ def test_sweep_once_builds_hamiltonian_and_norm_environments_once_per_sweep(monk
     calls = []
     original_build = BlockSparseEnvironmentChain.build.__func__
 
-    def spy_build(cls, sites, mpo_factors):
+    def spy_build(cls, sites, mpo_factors, **kwargs):
         calls.append(len(sites))
-        return original_build(cls, sites, mpo_factors)
+        return original_build(cls, sites, mpo_factors, **kwargs)
 
     monkeypatch.setattr(BlockSparseEnvironmentChain, "build", classmethod(spy_build))
     result = sweep_once(
@@ -2871,6 +2975,35 @@ def test_run_sweeps_records_bond_objectives_and_energy_summary():
     ]
     assert history["energy"] == pytest.approx(-10.5)
     assert history["objective_metric"] == pytest.approx(0.15)
+
+
+@pytest.mark.parametrize(
+    "start_direction, expected_directions",
+    [("lr", ["lr", "rl"]), ("rl", ["rl", "lr"])],
+)
+def test_run_sweeps_converges_only_after_complete_sweep(
+    start_direction,
+    expected_directions,
+):
+    A, B, C = _three_site_chain()
+
+    def solver(_bond, merged):
+        return {"optimized": merged, "metric": 0.0}
+
+    result = run_sweeps(
+        [A, B, C],
+        nsweeps=3,
+        start_direction=start_direction,
+        solver=solver,
+        conv_tol=1.0e-12,
+        converge_on_full_sweeps=True,
+    )
+
+    assert result["converged"] is True
+    assert result["ncompleted"] == 2
+    assert [row["direction"] for row in result["history"]] == expected_directions
+    assert "converged" not in result["history"][0]
+    assert result["history"][1]["converged"] is True
 
 
 def test_run_sweeps_verbose_can_print_sweep_and_bond_updates(capsys):
@@ -2993,6 +3126,24 @@ def test_run_sweeps_can_disable_same_bond_warm_start_guesses(monkeypatch):
     )
 
 
+def test_run_sweeps_can_retain_compact_update_history():
+    A, B, C = _three_site_chain()
+    result = run_sweeps(
+        [A, B, C],
+        nsweeps=1,
+        start_direction="lr",
+        compact_history_updates=True,
+    )
+
+    updates = result["history"][0]["updates"]
+    assert [update["bond"] for update in updates] == [0, 1]
+    assert all(update["payload"] == "compact" for update in updates)
+    assert all("left" not in update for update in updates)
+    assert all("right" not in update for update in updates)
+    assert all("merged" not in update for update in updates)
+    assert all("optimized" not in update for update in updates)
+
+
 def test_run_sweeps_uses_default_adaptive_schedule_for_mpo_path(monkeypatch):
     A, B, C = _three_site_chain()
     mpo = _three_site_dense_mpo()
@@ -3066,20 +3217,27 @@ def test_mps_wrapper_owns_sites_and_can_merge_bonds():
     merged = mps.merge_bond(1)
 
     assert len(mps) == 3
+    assert mps.tensors == [A, B, C]
+    assert mps[1] is mps.tensors[1]
+    assert list(mps) == mps.tensors
+    assert mps.sites is mps.tensors
     assert copied is not mps
-    assert copied.sites is not mps.sites
+    assert copied.tensors is not mps.tensors
     assert copied.target_sector == mps.target_sector
     assert merged.rank == 4
 
 
 def test_run_sweeps_accepts_mps_wrapper():
     A, B, C = _three_site_chain()
-    mps = MPS([A, B, C])
+    target = _charge_spin_sector(2, 0)
+    mps = MPS([A, B, C], center=0, target_sector=target)
 
     result = run_sweeps(mps, nsweeps=1, start_direction="lr")
 
     assert isinstance(result["mps"], MPS)
     assert result["mps"].sites == result["sites"]
+    assert result["mps"].center == 2
+    assert result["mps"].target_sector == target
     assert result["history"][0]["direction"] == "lr"
 
 
@@ -3638,6 +3796,41 @@ def test_svd_two_site_irrep_aware_max_bond_uses_su2_state_budget():
     assert singlet not in singular_values_reduced
     assert singlet in singular_values_states
     assert doublet not in singular_values_states
+
+
+def test_svd_two_site_can_retain_zero_weight_sector_topology():
+    singlet = _charge_spin_sector(0, 0)
+    doublet = _charge_spin_sector(1, 1)
+    right = _charge_spin_sector(0, 0)
+    phys = _charge_spin_sector(0, 0)
+    merged = NonabelianTensor(
+        data={
+            (singlet, phys, right, phys): np.array([[[[1.0]]]]),
+            (doublet, phys, right, phys): np.array([[[[0.0]]]]),
+        },
+        qns=[[singlet, doublet], [phys], [right], [phys]],
+        dirs=[-1, 1, 1, 1],
+        metadata={
+            "contracted_channels": {
+                (singlet, phys, right, phys): (singlet,),
+                (doublet, phys, right, phys): (doublet,),
+            },
+        },
+    )
+
+    left, right_site, singular_values, _, kept = svd_two_site(
+        merged,
+        max_bond=2,
+        cutoff=1.0e-10,
+        retain_sector_topology=True,
+        absorb="right",
+    )
+
+    assert kept == 2
+    assert tuple(singular_values) == (singlet, doublet)
+    assert singular_values[doublet][0, 0] == pytest.approx(0.0)
+    assert doublet in left.qns[2]
+    assert doublet in right_site.qns[0]
 
 
 def test_reduced_truncation_helper_uses_shared_su2_state_budget():

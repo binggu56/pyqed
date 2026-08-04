@@ -14,6 +14,7 @@ Quantum Chemitry DMRG with U(1) particle number Symmetry Support
 import numpy as np
 import scipy.constants as const
 import hashlib
+import operator
 
 from scipy.sparse.linalg import eigsh
 
@@ -1888,11 +1889,11 @@ class DMRG(CASCI):
                  spatial_exact_component_compression_validation_vectors=1,
                  spatial_exact_component_compression_min_reduction=1,
                  spatial_exact_component_compression_max_group_size=64,
-                 spatial_enable_native_boundary_r=False,
-                 spatial_validate_native_boundary_r=True,
-                 spatial_enable_native_boundary_p=True,
-                 spatial_validate_native_boundary_p=False,
-                 spatial_native_boundary_p_validation_policy="off",
+                 spatial_enable_cpp_boundary_r=False,
+                 spatial_validate_cpp_boundary_r=True,
+                 spatial_enable_cpp_boundary_p=True,
+                 spatial_validate_cpp_boundary_p=False,
+                 spatial_cpp_boundary_p_validation_policy="off",
                  spatial_direct_operator_batch_min_entries=2,
                  dmrg_performance="block2-like",
                  abelian_matvec_options=None,
@@ -2000,6 +2001,19 @@ class DMRG(CASCI):
         ###
         self.e_tot = None
         self.e_core = None # core energy
+        self.energy = None
+        self.energies = None
+        self.state_average_energy = None
+        self.ground_state = None
+        self.states = []
+        self.history = []
+        self.dmrg = None
+        self.converged = False
+        self.success = False
+        self.message = "not run"
+        self.ncompleted = 0
+        self.ncompleted_half_sweeps = 0
+        self.max_sweeps = 0
         self.ci = None # CI coefficients
         self.H = None
         self.H_raw = None
@@ -2087,19 +2101,19 @@ class DMRG(CASCI):
         self.spatial_exact_component_compression_max_group_size = int(
             spatial_exact_component_compression_max_group_size
         )
-        self.spatial_enable_native_boundary_r = bool(
-            spatial_enable_native_boundary_r
+        self.spatial_enable_cpp_boundary_r = bool(
+            spatial_enable_cpp_boundary_r
         )
-        self.spatial_validate_native_boundary_r = bool(
-            spatial_validate_native_boundary_r
+        self.spatial_validate_cpp_boundary_r = bool(
+            spatial_validate_cpp_boundary_r
         )
-        self.spatial_enable_native_boundary_p = bool(
-            spatial_enable_native_boundary_p
+        self.spatial_enable_cpp_boundary_p = bool(
+            spatial_enable_cpp_boundary_p
         )
-        self.spatial_validate_native_boundary_p = bool(
-            spatial_validate_native_boundary_p
+        self.spatial_validate_cpp_boundary_p = bool(
+            spatial_validate_cpp_boundary_p
         )
-        policy = str(spatial_native_boundary_p_validation_policy or "off")
+        policy = str(spatial_cpp_boundary_p_validation_policy or "off")
         policy = policy.lower().replace("-", "_")
         if policy in {"true", "yes", "on"}:
             policy = "first_pass"
@@ -2107,7 +2121,7 @@ class DMRG(CASCI):
             policy = "off"
         if policy not in {"off", "first_pass", "always"}:
             policy = "off"
-        self.spatial_native_boundary_p_validation_policy = policy
+        self.spatial_cpp_boundary_p_validation_policy = policy
         self.spatial_direct_operator_batch_min_entries = max(
             2,
             int(spatial_direct_operator_batch_min_entries),
@@ -2179,6 +2193,52 @@ class DMRG(CASCI):
     def _log(self, message, level=1):
         if self.verbose >= level:
             print(message)
+
+    def _invalidate_hamiltonian_mpo(self):
+        """Drop representation-dependent Hamiltonian state before rebuilding."""
+        self.H = None
+        self.H_raw = None
+        self._hamiltonian_mpo_cache_key = None
+        self._symmetric_mpo_cache = {}
+        self._s2_mpo_cache = {}
+        self._spatial_operator_cache = None
+        self._active_hamiltonian = None
+        self.complementary_operators = None
+        self.complementary_operator_mpos = None
+        self.complementary_operator_term_maps = None
+        self.complementary_operator_generator_entries = None
+
+    def _require_su2_cpp_integral_reference(self):
+        mol = getattr(self.mf, "mol", None)
+        driver = str(getattr(mol, "_build_driver", "") or "").lower()
+        info = getattr(mol, "_builtin_build_info", None)
+        info = info if isinstance(info, dict) else {}
+        eri_backend = str(info.get("eri_backend", "") or "").lower()
+        dense_builder = str(info.get("dense_builder", "") or "").lower()
+        factor_builder = str(info.get("factor_builder", "") or "").lower()
+        ri_info = info.get("ri")
+        ri_info = ri_info if isinstance(ri_info, dict) else {}
+        ri_builder = " ".join(
+            str(ri_info.get(key, "") or "").lower()
+            for key in (
+                "tensor_backend",
+                "three_center_builder",
+                "metric_builder",
+            )
+        )
+        compiled_builder = bool(
+            eri_backend == "cpp"
+            or "cpp" in dense_builder
+            or "cpp" in factor_builder
+            or "cpp" in ri_builder
+            or "native" in ri_builder
+        )
+        if driver != "builtin" or not compiled_builder:
+            raise RuntimeError(
+                "SU(2) DMRG requires Molecule.build(driver='builtin', ...) "
+                "with PyQED's compiled C++ integral builder; GBasis, PySCF, "
+                "and uncompiled integral references are not supported."
+            )
 
     def export_ground_state(self, state=0, dense=False):
         """Return a reusable copy of a converged DMRG state."""
@@ -2942,14 +3002,14 @@ class DMRG(CASCI):
                     exact_component_compression_max_group_size=(
                         self.spatial_exact_component_compression_max_group_size
                     ),
-                    enable_native_boundary_r=self.spatial_enable_native_boundary_r,
-                    validate_native_boundary_r=(
-                        self.spatial_validate_native_boundary_r
+                    enable_cpp_boundary_r=self.spatial_enable_cpp_boundary_r,
+                    validate_cpp_boundary_r=(
+                        self.spatial_validate_cpp_boundary_r
                     ),
-                    enable_native_boundary_p=self.spatial_enable_native_boundary_p,
-                    validate_native_boundary_p=self.spatial_validate_native_boundary_p,
-                    native_boundary_p_validation_policy=(
-                        self.spatial_native_boundary_p_validation_policy
+                    enable_cpp_boundary_p=self.spatial_enable_cpp_boundary_p,
+                    validate_cpp_boundary_p=self.spatial_validate_cpp_boundary_p,
+                    cpp_boundary_p_validation_policy=(
+                        self.spatial_cpp_boundary_p_validation_policy
                     ),
                     direct_operator_batch_min_entries=(
                         self.spatial_direct_operator_batch_min_entries
@@ -2992,12 +3052,12 @@ class DMRG(CASCI):
                 exact_component_compression_max_group_size=(
                     self.spatial_exact_component_compression_max_group_size
                 ),
-                enable_native_boundary_r=self.spatial_enable_native_boundary_r,
-                validate_native_boundary_r=self.spatial_validate_native_boundary_r,
-                enable_native_boundary_p=self.spatial_enable_native_boundary_p,
-                validate_native_boundary_p=self.spatial_validate_native_boundary_p,
-                native_boundary_p_validation_policy=(
-                    self.spatial_native_boundary_p_validation_policy
+                enable_cpp_boundary_r=self.spatial_enable_cpp_boundary_r,
+                validate_cpp_boundary_r=self.spatial_validate_cpp_boundary_r,
+                enable_cpp_boundary_p=self.spatial_enable_cpp_boundary_p,
+                validate_cpp_boundary_p=self.spatial_validate_cpp_boundary_p,
+                cpp_boundary_p_validation_policy=(
+                    self.spatial_cpp_boundary_p_validation_policy
                 ),
                 direct_operator_batch_min_entries=(
                     self.spatial_direct_operator_batch_min_entries
@@ -3210,7 +3270,7 @@ class DMRG(CASCI):
             except Exception as exc:
                 if backend == "block2_native":
                     raise RuntimeError(
-                        "Native spin-free generator family MPO build failed."
+                        "C++ spin-free generator family MPO build failed."
                     ) from exc
                 warnings.warn(
                     "Falling back to symbolic R/P family MPOs after native "
@@ -3518,6 +3578,8 @@ class DMRG(CASCI):
         return metadata
 
     def build(self, mo_coeff=None):
+        if self.symmetry is not None and "su2" in self.symmetry:
+            self._require_su2_cpp_integral_reference()
 
         # 1. Extract Integrals & dims
         # mol = mf.mol
@@ -3588,11 +3650,11 @@ class DMRG(CASCI):
             self.spatial_exact_component_compression_validation_vectors,
             self.spatial_exact_component_compression_min_reduction,
             self.spatial_exact_component_compression_max_group_size,
-            self.spatial_enable_native_boundary_r,
-            self.spatial_validate_native_boundary_r,
-            self.spatial_enable_native_boundary_p,
-            self.spatial_validate_native_boundary_p,
-            self.spatial_native_boundary_p_validation_policy,
+            self.spatial_enable_cpp_boundary_r,
+            self.spatial_validate_cpp_boundary_r,
+            self.spatial_enable_cpp_boundary_p,
+            self.spatial_validate_cpp_boundary_p,
+            self.spatial_cpp_boundary_p_validation_policy,
             self.spatial_direct_operator_batch_min_entries,
             self.debug_complementary_action_check,
             self.debug_complementary_action_check_tol,
@@ -3603,7 +3665,14 @@ class DMRG(CASCI):
             self._log("  Reusing Hamiltonian MPO cache.")
             return self
 
-        cached = _GLOBAL_HAMILTONIAN_MPO_CACHE.get(cache_key)
+        owns_su2_solver_state = bool(
+            self.site == "spatial" and self.spatial_reduced_mpo
+        )
+        cached = (
+            None
+            if owns_su2_solver_state
+            else _GLOBAL_HAMILTONIAN_MPO_CACHE.get(cache_key)
+        )
         if cached is not None:
             self._log("  Reusing global Hamiltonian MPO cache.")
             self._spatial_operator_cache = None
@@ -3643,7 +3712,11 @@ class DMRG(CASCI):
                     raise NotImplementedError(
                         "spatial_reduced_mpo does not support spin-purification penalties."
                     )
-                cached = _GLOBAL_HAMILTONIAN_MPO_CACHE.get(cache_key)
+                cached = (
+                    None
+                    if owns_su2_solver_state
+                    else _GLOBAL_HAMILTONIAN_MPO_CACHE.get(cache_key)
+                )
                 if cached is not None:
                     self._log("  Reusing global spatial reduced Hamiltonian MPO cache.")
                     self._spatial_operator_cache = None
@@ -3681,12 +3754,13 @@ class DMRG(CASCI):
                 self._hamiltonian_mpo_cache_key = cache_key
                 self._symmetric_mpo_cache = {}
                 self._active_integral_build_info.update(reduced_hamiltonian.info)
-                _store_global_hamiltonian_mpo_cache(
-                    cache_key,
-                    factors=reduced_hamiltonian.factors,
-                    info=reduced_hamiltonian.info,
-                    hamiltonian=reduced_hamiltonian,
-                )
+                if not owns_su2_solver_state:
+                    _store_global_hamiltonian_mpo_cache(
+                        cache_key,
+                        factors=reduced_hamiltonian.factors,
+                        info=reduced_hamiltonian.info,
+                        hamiltonian=reduced_hamiltonian,
+                    )
                 return self
 
             if self.spatial_abelian_mpo == "direct":
@@ -4260,6 +4334,9 @@ class DMRG(CASCI):
             if len(sweep_list) != len(d_list):
                 raise ValueError("nsweeps_schedule must match D_schedule length.")
 
+        if any(value < 1 for value in sweep_list):
+            raise ValueError("Every DMRG schedule stage requires at least one complete sweep.")
+
         return list(zip(d_list, sweep_list))
 
     def run(
@@ -4275,6 +4352,9 @@ class DMRG(CASCI):
         initial_guess=None,
         mo_coeff=None,
         compute_s2=False,
+        *,
+        su2_kernel_backend="auto",
+        require_convergence=True,
         **kwargs,
     ):
         """
@@ -4287,7 +4367,62 @@ class DMRG(CASCI):
             Abelian symmetry, and ``None``/``False`` for dense DMRG.
         symmetry_list : list of strings or bool
             Backward-compatible explicit labels such as ``['charge', 'sz']``.
+        nstates : int
+            Number of roots. Values larger than one run state-averaged DMRG.
+        weights : array_like, optional
+            Nonnegative state-average weights. They are normalized internally.
+        su2_kernel_backend : {"auto", "cpp", "python"}
+            SU(2) execution backend. ``"cpp"`` requires the compiled engine;
+            ``"python"`` selects the slower reference implementation.
+        nsweeps : int
+            Maximum number of complete sweeps. One complete sweep is a
+            left-to-right pass followed by a right-to-left pass. The default
+            is 50 and the solver may stop earlier after a converged complete
+            sweep.
+        require_convergence : bool
+            Raise ``RuntimeError`` if the solver reaches ``nsweeps`` without
+            converging. Set this to ``False`` only for forced-sweep benchmarks
+            or diagnostic runs.
+
+        Returns
+        -------
+        SU2DMRG or TensorDMRG
+            The backend solver. For SU(2) this is an ``SU2DMRG`` owner with
+            ``energy``, ``energies``, ``state_average_energy``, ``states``,
+            ``history``, status fields, and compact ``diagnostics``.
         """
+        if isinstance(nstates, (bool, np.bool_)):
+            raise TypeError("nstates must be a positive integer.")
+        try:
+            nstates = operator.index(nstates)
+        except TypeError as exc:
+            raise TypeError("nstates must be a positive integer.") from exc
+        if nstates < 1:
+            raise ValueError("nstates must be positive.")
+        if isinstance(nsweeps, (bool, np.bool_)):
+            raise TypeError("nsweeps must be a positive integer.")
+        try:
+            nsweeps = operator.index(nsweeps)
+        except TypeError as exc:
+            raise TypeError("nsweeps must be a positive integer.") from exc
+        if nsweeps < 1:
+            raise ValueError("nsweeps must be positive.")
+        self.max_sweeps = int(nsweeps)
+        complete_sweep_limit = (
+            f"{nsweeps} complete "
+            f"{'sweep' if nsweeps == 1 else 'sweeps'}"
+        )
+        su2_kernel_backend = str(su2_kernel_backend).lower()
+        if su2_kernel_backend not in {"auto", "cpp", "python"}:
+            raise ValueError(
+                "su2_kernel_backend must be 'auto', 'cpp', or 'python'."
+            )
+        if "fully_reduced_state_average" in kwargs:
+            raise TypeError(
+                "fully_reduced_state_average was removed. State-averaged "
+                "SU(2) uses the fully reduced C++ representation automatically; "
+                "use su2_kernel_backend='python' for the canonical reference path."
+            )
         if D is not None:
             self.D = self.m = int(D)
             if self.m_warmup is None:
@@ -4302,7 +4437,19 @@ class DMRG(CASCI):
         if weights is None:
             self.weights = np.ones(nstates) / nstates
         else:
-            self.weights = np.array(weights)
+            self.weights = np.asarray(weights, dtype=float).reshape(-1)
+            if self.weights.size != int(nstates):
+                raise ValueError("weights must match nstates.")
+            if not np.all(np.isfinite(self.weights)):
+                raise ValueError("weights must be finite.")
+            if np.any(self.weights < 0.0):
+                raise ValueError("weights must be nonnegative.")
+            weight_sum = float(np.sum(self.weights))
+            if weight_sum <= 0.0:
+                raise ValueError("weights must have a positive sum.")
+            self.weights = self.weights / weight_sum
+        previous_symmetry = tuple(self.symmetry or ())
+        symmetry_was_explicit = symmetry is not None or symmetry_list is not None
         if symmetry is not None:
             normalized_symmetry = _normalize_dmrg_symmetry(symmetry)
             if symmetry_list is not None:
@@ -4322,6 +4469,42 @@ class DMRG(CASCI):
             symmetry_list = getattr(self, 'saved_symmetry_list', None)
             symmetry_list = _normalize_dmrg_symmetry(symmetry_list=symmetry_list)
             self.symmetry = symmetry_list
+        has_su2 = bool(symmetry_list and "su2" in symmetry_list)
+        if not has_su2 and su2_kernel_backend != "auto":
+            raise ValueError(
+                "su2_kernel_backend is only valid when symmetry='su2'."
+            )
+        if has_su2:
+            self._require_su2_cpp_integral_reference()
+        if (
+            has_su2
+            and su2_kernel_backend != "python"
+            and self.spatial_site_basis != "fully_reduced"
+        ):
+            # Production SU(2) uses one genuinely reduced site representation.
+            # The canonical four-state representation retains explicit magnetic
+            # components and is reserved for the Python reference backend.
+            self.spatial_site_basis = "fully_reduced"
+            self.spatial_reduced_mpo = True
+            self.d = 3
+            self._invalidate_hamiltonian_mpo()
+        if symmetry_was_explicit:
+            if has_su2:
+                self.site = self.site_basis = self.orbital_layout = "spatial"
+                self.spatial_reduced_mpo = True
+            elif "su2" in previous_symmetry:
+                self.spatial_reduced_mpo = False
+            self.d = (
+                3
+                if self.site == "spatial" and self.spatial_site_basis == "fully_reduced"
+                else 4 if self.site == "spatial" else 2
+            )
+            representation_changed = (
+                tuple(symmetry_list or ()) != previous_symmetry
+                or (has_su2 and self.site != "spatial")
+            )
+            if representation_changed:
+                self._invalidate_hamiltonian_mpo()
         if initial_guess is not None:
             self.init_guess = initial_guess
         if mo_coeff is not None:
@@ -4329,7 +4512,12 @@ class DMRG(CASCI):
         if self.H_raw is None:
             self.build()
         sweep_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.tol))
-        davidson_tol = kwargs.pop("davidson_tol", 1.0e-5)
+        davidson_tol_explicit = "davidson_tol" in kwargs
+        davidson_max_iter_explicit = "davidson_max_iter" in kwargs
+        davidson_tol = kwargs.pop(
+            "davidson_tol",
+            1.0e-3 if has_su2 else 1.0e-5,
+        )
         davidson_max_iter = kwargs.pop("davidson_max_iter", 30)
         noise = kwargs.pop("noise", 1.0e-4)
         noise_decay = kwargs.pop("noise_decay", 0.1)
@@ -4366,6 +4554,36 @@ class DMRG(CASCI):
                     raise NotImplementedError("Non-Abelian qchem DMRG currently requires site='spatial'.")
                 from pyqed.qchem.dmrg.backends.nonabelian import run_spatial_qchem_dmrg
 
+                local_solver_kwargs = dict(
+                    kwargs.pop("local_solver_kwargs", {}) or {}
+                )
+                local_tol_explicit = "tol" in local_solver_kwargs
+                local_itermax_explicit = "itermax" in local_solver_kwargs
+                local_solver_kwargs.setdefault("tol", davidson_tol)
+                local_solver_kwargs.setdefault("itermax", davidson_max_iter)
+                if (
+                    has_su2
+                    and not davidson_tol_explicit
+                    and not local_tol_explicit
+                    and "local_solver_schedule" not in kwargs
+                ):
+                    tolerances = [1.0e-3] * 4 + [1.0e-5] * 4 + [1.0e-8]
+                    if davidson_max_iter_explicit or local_itermax_explicit:
+                        kwargs["local_solver_schedule"] = [
+                            {"tol": tolerance}
+                            for tolerance in tolerances
+                            for _ in range(2)
+                        ]
+                    else:
+                        iterations = [30] * 4 + [60] * 4 + [100]
+                        kwargs["local_solver_schedule"] = [
+                            {"tol": tolerance, "itermax": itermax}
+                            for tolerance, itermax in zip(
+                                tolerances,
+                                iterations,
+                            )
+                            for _ in range(2)
+                        ]
                 t0 = time.time()
                 self._log(f"  [Symmetry] Enabled: {self.sym_mgr.sym_types}")
                 dmrg = run_spatial_qchem_dmrg(
@@ -4376,21 +4594,52 @@ class DMRG(CASCI):
                     conv_tol=sweep_tol,
                     nstates=nstates,
                     weights=self.weights,
+                    local_solver_kwargs=local_solver_kwargs,
+                    su2_kernel_backend=su2_kernel_backend,
                     verbose=self.verbose,
                     **kwargs,
                 )
                 self.dmrg = dmrg
-                e_dmrg_total = np.asarray(dmrg.e_tot, dtype=float) + self.e_core
+                includes_core_energy = bool(
+                    (self._active_integral_build_info or {}).get(
+                        "includes_core_energy",
+                        False,
+                    )
+                )
+                raw_dmrg_energy = np.asarray(dmrg.e_tot, dtype=float)
+                if includes_core_energy:
+                    e_dmrg_total = raw_dmrg_energy
+                    e_dmrg_active = raw_dmrg_energy - self.e_core
+                else:
+                    e_dmrg_total = raw_dmrg_energy + self.e_core
+                    e_dmrg_active = raw_dmrg_energy
                 if nstates == 1:
                     e_dmrg_total = float(e_dmrg_total)
+                    e_dmrg_active = float(e_dmrg_active)
                 self.e_tot = e_dmrg_total
                 if compute_s2:
                     s = abs(float(self.spin)) / 2.0
                     self.s2 = s * (s + 1.0)
                     dmrg.s2 = self.s2
-                dmrg.e_active = dmrg.e_tot
+                dmrg.e_active = e_dmrg_active
                 dmrg.e_core = self.e_core
                 dmrg.e_tot = self.e_tot
+                dmrg.energies = np.asarray(e_dmrg_total, dtype=float).reshape(-1)
+                dmrg.energy = float(dmrg.energies[0])
+                dmrg.state_average_energy = float(
+                    np.dot(self.weights, dmrg.energies)
+                )
+                self.energy = dmrg.energy
+                self.energies = dmrg.energies
+                self.state_average_energy = dmrg.state_average_energy
+                self.ground_state = dmrg.ground_state
+                self.states = dmrg.states
+                self.history = dmrg.history
+                self.ncompleted = dmrg.ncompleted
+                self.ncompleted_half_sweeps = dmrg.ncompleted_half_sweeps
+                self.converged = bool(dmrg.converged)
+                self.success = bool(dmrg.success)
+                self.message = str(dmrg.message)
                 if self.verbose >= 1:
                     print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
                     if nstates == 1:
@@ -4402,6 +4651,13 @@ class DMRG(CASCI):
                     if compute_s2:
                         print(f"  <S^2> =             {self.s2:.6f}")
                     print(f"  Time:               {time.time()-t0:.2f} s")
+                if require_convergence and not dmrg.converged:
+                    raise RuntimeError(
+                        "SU(2) DMRG did not converge within "
+                        f"{complete_sweep_limit}. Increase nsweeps or D, "
+                        "loosen sweep_tol, or pass require_convergence=False "
+                        "for a forced-sweep diagnostic run."
+                    )
                 return dmrg
             if self.site == "spatial" and "charge" not in self.sym_mgr.sym_types:
                 raise NotImplementedError(
@@ -4705,15 +4961,21 @@ class DMRG(CASCI):
         schedule = self._normalize_dmrg_schedule(self.D, nsweeps, D_schedule=D_schedule, nsweeps_schedule=nsweeps_schedule)
         t0 = time.time()
         current_guess = mps0
+        all_stage_history = []
+        completed_sweeps = 0
+        completed_half_sweeps = 0
         for stage_idx, (stage_D, stage_sweeps) in enumerate(schedule, start=1):
             if len(schedule) == 1:
-                self._log(f"  Starting Sweeps (D={stage_D})...")
+                self._log(f"  Starting Complete Sweeps (D={stage_D})...")
             else:
-                self._log(f"  Starting Sweeps Stage {stage_idx}/{len(schedule)} (D={stage_D}, nsweeps={stage_sweeps})...")
+                self._log(
+                    f"  Starting Complete Sweeps Stage {stage_idx}/{len(schedule)} "
+                    f"(D={stage_D}, complete_sweeps={stage_sweeps})..."
+                )
             dmrg = TensorDMRG(
                 final_H,
                 D=stage_D,
-                nsweeps=stage_sweeps,
+                nsweeps=2 * stage_sweeps,
                 init_guess=current_guess,
                 symmetry=use_symmetry,
                 target_qn=target_qn,
@@ -4739,6 +5001,7 @@ class DMRG(CASCI):
                 final_expectation=(
                     True if final_expectation is None else bool(final_expectation)
                 ),
+                converge_on_full_sweeps=True,
             )
             if self._active_integral_build_info is not None:
                 self._active_integral_build_info[
@@ -4747,7 +5010,46 @@ class DMRG(CASCI):
                     getattr(dmrg, "abelian_matvec_options", {}) or {}
                 )
             dmrg.run()
+            half_rows = [
+                row
+                for row in dmrg.sweep_history
+                if row.get("direction") in {"lr", "rl"}
+            ]
+            for half_index, row in enumerate(half_rows):
+                row["half_sweep"] = half_index + 1
+                row["stage_sweep"] = half_index // 2 + 1
+                row["sweep"] = completed_sweeps + row["stage_sweep"]
+                row["sweep_complete"] = row.get("direction") == "rl"
+                row["stage"] = stage_idx
+            stage_completed_half_sweeps = len(half_rows)
+            stage_completed_sweeps = stage_completed_half_sweeps // 2
+            for row in dmrg.sweep_history:
+                if row.get("direction") not in {"lr", "rl"}:
+                    row["half_sweep"] = None
+                    row["stage_sweep"] = stage_completed_sweeps
+                    row["sweep"] = completed_sweeps + stage_completed_sweeps
+                    row["sweep_complete"] = False
+                    row["stage"] = stage_idx
+            if not half_rows and dmrg.converged and dmrg.sweep_history:
+                stage_completed_sweeps = 1
+                dmrg.sweep_history[-1]["stage_sweep"] = 1
+                dmrg.sweep_history[-1]["sweep"] = completed_sweeps + 1
+                dmrg.sweep_history[-1]["sweep_complete"] = True
+                dmrg.sweep_history[-1]["stage"] = stage_idx
+            completed_sweeps += stage_completed_sweeps
+            completed_half_sweeps += stage_completed_half_sweeps
+            all_stage_history.extend(dmrg.sweep_history)
+            dmrg.ncompleted = completed_sweeps
+            dmrg.ncompleted_half_sweeps = completed_half_sweeps
+            dmrg.max_sweeps = int(nsweeps)
+            dmrg.success = bool(dmrg.converged)
+            dmrg.message = (
+                "converged"
+                if dmrg.converged
+                else "completed requested DMRG complete sweeps without convergence"
+            )
             current_guess = dmrg.ground_state.copy()
+        dmrg.sweep_history = all_stage_history
         self.dmrg = dmrg
         # Report
         e_dmrg_total = dmrg.e_tot + self.e_core
@@ -4757,6 +5059,17 @@ class DMRG(CASCI):
         if self.spin_purification:
             e_dmrg_total -= self.shift * s2_val
         self.e_tot = e_dmrg_total
+        self.energies = np.asarray(e_dmrg_total, dtype=float).reshape(-1)
+        self.energy = float(self.energies[0])
+        self.state_average_energy = float(np.dot(self.weights, self.energies))
+        self.ground_state = dmrg.ground_state
+        self.states = dmrg.states
+        self.history = dmrg.sweep_history
+        self.ncompleted = dmrg.ncompleted
+        self.ncompleted_half_sweeps = dmrg.ncompleted_half_sweeps
+        self.converged = bool(dmrg.converged)
+        self.success = bool(dmrg.success)
+        self.message = str(dmrg.message)
         if self.verbose >= 1:
             print(f"  RHF Energy:         {self.mf.e_tot:.8f} Ha")
             if self.nstates == 1:
@@ -4776,6 +5089,13 @@ class DMRG(CASCI):
             print(f"  Time:               {time.time()-t0:.2f} s")
         if use_symmetry and self.verbose >= 1:
             self.check_abelian_symmetry()
+        if require_convergence and not dmrg.converged:
+            raise RuntimeError(
+                "DMRG did not converge within "
+                f"{complete_sweep_limit}. Increase nsweeps or D, loosen "
+                "sweep_tol, or pass require_convergence=False for a "
+                "forced-sweep diagnostic run."
+            )
         return dmrg
 
     def dump(self):
@@ -4869,8 +5189,108 @@ class DMRG(CASCI):
             self._spatial_operator_cache = _build_spatial_fermion_operators(self.ncas)
         return self._spatial_operator_cache
 
+    def _fully_reduced_spatial_expectation(self, state, *, h1=None, eri=None):
+        """Evaluate a spin-free operator directly in the reduced SU(2) MPS."""
+        from pyqed.mps.nonabelian.environment import contract_chain_expectation
+        from pyqed.mps.nonabelian.models import (
+            build_spatial_one_body_reduced_mpo,
+            build_spatial_spinfree_eri_mpo,
+        )
+        from pyqed.qchem.dmrg.backends.nonabelian import (
+            _identity_mpo_factors_for_sites_and_mpo,
+        )
+
+        sites = state.sites
+        if h1 is not None:
+            mpo = build_spatial_one_body_reduced_mpo(sites, h1)
+        elif eri is not None:
+            mpo = build_spatial_spinfree_eri_mpo(
+                sites,
+                eri,
+                include_half=False,
+            )
+        else:
+            raise ValueError("A reduced one- or two-body operator is required.")
+        numerator = contract_chain_expectation(sites, mpo)
+        identity = _identity_mpo_factors_for_sites_and_mpo(sites, mpo)
+        denominator = contract_chain_expectation(sites, identity)
+        if abs(denominator) <= 1.0e-14:
+            raise ValueError("Cannot build RDMs from a zero-norm MPS.")
+        return float(np.real(numerator / denominator))
+
+    def _make_fully_reduced_spatial_rdm1(self, state_id=0, spatial=False, with_core=False):
+        state = self._get_state_for_rdm(state_id)
+        gamma = np.zeros((self.ncas, self.ncas), dtype=float)
+        for p in range(self.ncas):
+            for q in range(self.ncas):
+                h1 = np.zeros((self.ncas, self.ncas), dtype=float)
+                h1[p, q] = 1.0
+                gamma[q, p] = self._fully_reduced_spatial_expectation(state, h1=h1)
+        if spatial or with_core:
+            out = gamma
+        else:
+            out = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=float)
+            for p in range(self.ncas):
+                for q in range(self.ncas):
+                    out[2 * p, 2 * q] = 0.5 * gamma[p, q]
+                    out[2 * p + 1, 2 * q + 1] = 0.5 * gamma[p, q]
+        if not with_core:
+            return out
+        norb = self.ncore + self.ncas
+        embedded = np.zeros((norb, norb), dtype=float)
+        np.fill_diagonal(embedded[:self.ncore, :self.ncore], 2.0)
+        embedded[self.ncore:norb, self.ncore:norb] = gamma
+        return embedded
+
+    def _make_fully_reduced_spatial_rdm2(self, state_id=0, spatial=False, with_core=False):
+        state = self._get_state_for_rdm(state_id)
+        gamma2 = np.zeros((self.ncas,) * 4, dtype=float)
+        for p in range(self.ncas):
+            for q in range(self.ncas):
+                for r in range(self.ncas):
+                    for s in range(self.ncas):
+                        eri = np.zeros((self.ncas,) * 4, dtype=float)
+                        eri[p, q, r, s] = 1.0
+                        gamma2[p, q, r, s] = self._fully_reduced_spatial_expectation(
+                            state,
+                            eri=eri,
+                        )
+        if not (spatial or with_core):
+            raise NotImplementedError(
+                "The fully reduced SU(2) backend exposes the spin-traced spatial 2-RDM only."
+            )
+        if not with_core:
+            return gamma2
+        ncore = self.ncore
+        norb = ncore + self.ncas
+        embedded = np.zeros((norb,) * 4, dtype=float)
+        if ncore > 0:
+            eye = np.eye(ncore)
+            embedded[:ncore, :ncore, :ncore, :ncore] = (
+                4 * np.einsum('ij,kl->ijkl', eye, eye)
+                - 2 * np.einsum('ps,rq->pqrs', eye, eye)
+            )
+            dm1 = self._make_fully_reduced_spatial_rdm1(
+                state_id,
+                spatial=True,
+                with_core=False,
+            )
+            for i in range(ncore):
+                embedded[i, i, ncore:norb, ncore:norb] = 2 * dm1
+                embedded[ncore:norb, ncore:norb, i, i] = 2 * dm1
+                embedded[i, ncore:norb, i, ncore:norb] = -dm1
+                embedded[ncore:norb, i, ncore:norb, i] = -dm1
+        embedded[ncore:norb, ncore:norb, ncore:norb, ncore:norb] = gamma2
+        return embedded
+
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
+        if self.spatial_site_basis == "fully_reduced":
+            return self._make_fully_reduced_spatial_rdm1(
+                state_id,
+                spatial=spatial,
+                with_core=with_core,
+            )
         state = self._get_state_for_rdm(state_id)
         mps_state = _spatial_rdm_dense_mps(
             state,
@@ -4933,6 +5353,16 @@ class DMRG(CASCI):
 
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
+        if self.spatial_site_basis == "fully_reduced":
+            if idx_pairs is not None:
+                raise NotImplementedError(
+                    "idx_pairs is not implemented for the fully reduced SU(2) 2-RDM."
+                )
+            return self._make_fully_reduced_spatial_rdm2(
+                state_id,
+                spatial=spatial,
+                with_core=with_core,
+            )
         state = self._get_state_for_rdm(state_id)
         mps_state = _spatial_rdm_dense_mps(
             state,

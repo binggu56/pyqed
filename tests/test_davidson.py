@@ -52,6 +52,34 @@ def test_davidson_supports_matrix_free_matvec():
     assert v.shape == (16, 2)
 
 
+def test_davidson_uses_matrix_free_block_action():
+    h = _random_symmetric(18, seed=91)
+    w_ref, _ = np.linalg.eigh(h)
+    calls = {"matvec": 0, "matmat": 0, "columns": 0}
+
+    def matvec(x):
+        calls["matvec"] += 1
+        return h @ x
+
+    def matmat(x):
+        calls["matmat"] += 1
+        calls["columns"] += int(x.shape[1])
+        return h @ x
+
+    matvec.matmat = matmat
+    w, _ = davidson(
+        matvec,
+        neigen=3,
+        diag=np.diag(h),
+        tol=1.0e-10,
+        itermax=80,
+    )
+
+    np.testing.assert_allclose(w, w_ref[:3], atol=1.0e-9, rtol=1.0e-9)
+    assert calls["matmat"] > 0
+    assert calls["columns"] >= 3
+
+
 def test_davidson_solver_wrapper_matches_davidson():
     h = _random_symmetric(12, seed=12)
     w1, v1 = davidson(h, neigen=2, tol=1e-9, itermax=60)

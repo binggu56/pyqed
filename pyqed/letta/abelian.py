@@ -323,6 +323,298 @@ class Layout:
 
 
 @dataclass(frozen=True)
+class TiedFrontierLayout:
+    """Conditional charge sectors for an overlapping-pair LETTA chain.
+
+    ``frontier_qns[i][s][a]`` is the cumulative charge carried by channel
+    ``a`` after pair tensor ``i``, conditional on the shared physical state
+    ``s`` at site ``i + 1``.  Conditioning avoids charging that shared site
+    again when the next overlapping pair tensor is applied.
+    """
+
+    local_qns: list[list[tuple[int, ...]]]
+    frontier_qns: list[list[list[tuple[int, ...]]]]
+    target: tuple[int, ...]
+    left_boundary: tuple[int, ...] | None = None
+
+    def __post_init__(self):
+        local_qns = [[_as_charge(qn) for qn in site] for site in self.local_qns]
+        frontier_qns = [
+            [[_as_charge(qn) for qn in channels] for channels in frontier]
+            for frontier in self.frontier_qns
+        ]
+        target = _as_charge(self.target)
+        left_boundary = self.left_boundary
+        if left_boundary is None:
+            left_boundary = tuple(0 for _ in target)
+        left_boundary = _as_charge(left_boundary)
+
+        if len(local_qns) < 2:
+            raise ValueError("tied-frontier LETTA layout needs at least two physical sites.")
+        if any(not site for site in local_qns):
+            raise ValueError("every physical site must contain at least one charge label.")
+        if len(frontier_qns) != len(local_qns) - 2:
+            raise ValueError("frontier_qns must have len(local_qns)-2 entries.")
+        for bond, frontier in enumerate(frontier_qns):
+            if len(frontier) != len(local_qns[bond + 1]):
+                raise ValueError(
+                    f"frontier_qns[{bond}] must have one conditional entry "
+                    f"for each state of shared site {bond + 1}."
+                )
+            dims = {len(channels) for channels in frontier}
+            if len(dims) != 1 or not dims or next(iter(dims)) < 1:
+                raise ValueError("all shared states on a frontier must have the same positive channel dimension.")
+
+        rank = len(target)
+        all_charges = [target, left_boundary]
+        all_charges.extend(qn for site in local_qns for qn in site)
+        all_charges.extend(qn for frontier in frontier_qns for channels in frontier for qn in channels)
+        if any(len(qn) != rank for qn in all_charges):
+            raise ValueError("all Abelian charges must have the same rank as target.")
+
+        object.__setattr__(self, "local_qns", local_qns)
+        object.__setattr__(self, "frontier_qns", frontier_qns)
+        object.__setattr__(self, "target", target)
+        object.__setattr__(self, "left_boundary", left_boundary)
+
+    @property
+    def nsites(self) -> int:
+        return len(self.local_qns)
+
+    @property
+    def nlocal_tensors(self) -> int:
+        return self.nsites - 1
+
+    @property
+    def bond_dims(self) -> tuple[int, ...]:
+        return tuple(len(frontier[0]) for frontier in self.frontier_qns)
+
+    def frontier_labels(
+        self,
+        bond: int,
+        shared_state: int | None = None,
+    ) -> tuple[tuple[int, ...], ...] | tuple[tuple[tuple[int, ...], ...], ...]:
+        """Return labels at fixed shared state, or each channel's signature."""
+        bond = int(bond)
+        if bond < 0 or bond >= len(self.frontier_qns):
+            raise IndexError("bond out of range.")
+        frontier = self.frontier_qns[bond]
+        if shared_state is not None:
+            shared_state = int(shared_state)
+            if shared_state < 0 or shared_state >= len(frontier):
+                raise IndexError("shared_state out of range.")
+            return tuple(frontier[shared_state])
+        return tuple(tuple(channels[channel] for channels in frontier) for channel in range(len(frontier[0])))
+
+    def local_masks(self) -> list[np.ndarray]:
+        """Return dense masks obeying conditional cumulative-charge flow."""
+        if self.nsites == 2:
+            mask = np.zeros((1, len(self.local_qns[0]), len(self.local_qns[1]), 1), dtype=bool)
+            for s0, q0 in enumerate(self.local_qns[0]):
+                for s1, q1 in enumerate(self.local_qns[1]):
+                    mask[0, s0, s1, 0] = _add_charges(self.left_boundary, q0, q1) == self.target
+            return [mask]
+
+        masks = []
+        first = np.zeros(
+            (1, len(self.local_qns[0]), len(self.local_qns[1]), self.bond_dims[0]),
+            dtype=bool,
+        )
+        for s0, q0 in enumerate(self.local_qns[0]):
+            for s1, q1 in enumerate(self.local_qns[1]):
+                needed = _add_charges(self.left_boundary, q0, q1)
+                for right, q_right in enumerate(self.frontier_qns[0][s1]):
+                    first[0, s0, s1, right] = q_right == needed
+        masks.append(first)
+
+        for tensor in range(1, self.nlocal_tensors - 1):
+            mask = np.zeros(
+                (
+                    self.bond_dims[tensor - 1],
+                    len(self.local_qns[tensor]),
+                    len(self.local_qns[tensor + 1]),
+                    self.bond_dims[tensor],
+                ),
+                dtype=bool,
+            )
+            for left in range(self.bond_dims[tensor - 1]):
+                for old_shared in range(len(self.local_qns[tensor])):
+                    q_left = self.frontier_qns[tensor - 1][old_shared][left]
+                    for new_shared, q_new in enumerate(self.local_qns[tensor + 1]):
+                        needed = _add_charges(q_left, q_new)
+                        for right, q_right in enumerate(self.frontier_qns[tensor][new_shared]):
+                            mask[left, old_shared, new_shared, right] = q_right == needed
+            masks.append(mask)
+
+        final = np.zeros(
+            (self.bond_dims[-1], len(self.local_qns[-2]), len(self.local_qns[-1]), 1),
+            dtype=bool,
+        )
+        for left in range(self.bond_dims[-1]):
+            for shared in range(len(self.local_qns[-2])):
+                q_left = self.frontier_qns[-1][shared][left]
+                for last, q_last in enumerate(self.local_qns[-1]):
+                    final[left, shared, last, 0] = _add_charges(q_left, q_last) == self.target
+        masks.append(final)
+        return masks
+
+    def structural_support_sizes(self) -> tuple[int, ...]:
+        return tuple(int(np.count_nonzero(mask)) for mask in self.local_masks())
+
+    @classmethod
+    def from_state_vector(
+        cls,
+        state,
+        local_qns,
+        target,
+        *,
+        bond_dims=None,
+        left_boundary=None,
+        project: bool = False,
+        sector_rtol: float = 1e-10,
+        sector_atol: float = 0.0,
+        truncate: bool = False,
+    ) -> "TiedFrontierLayout":
+        """Infer conditional frontier sectors from charge-block Schmidt ranks.
+
+        At frontier ``i`` and fixed shared state ``s_{i+1}``, the state is
+        reshaped between sites ``0..i`` and ``i+2..L-1``.  Each nonzero
+        charge-block singular value contributes one channel carrying the
+        cumulative charge through the fixed shared state.
+        """
+        local_qns = [[_as_charge(qn) for qn in site] for site in local_qns]
+        target = _as_charge(target)
+        if left_boundary is None:
+            left_boundary = tuple(0 for _ in target)
+        left_boundary = _as_charge(left_boundary)
+        if len(local_qns) < 2 or any(not site for site in local_qns):
+            raise ValueError("local_qns must describe at least two nonempty physical sites.")
+        rank = len(target)
+        if len(left_boundary) != rank or any(len(qn) != rank for site in local_qns for qn in site):
+            raise ValueError("all Abelian charges must have the same rank as target.")
+        if sector_rtol < 0 or sector_atol < 0:
+            raise ValueError("sector tolerances must be nonnegative.")
+
+        dims = tuple(len(site) for site in local_qns)
+        state = np.asarray(state)
+        if state.size != int(np.prod(dims, dtype=np.int64)):
+            raise ValueError(f"state has size {state.size}, expected {int(np.prod(dims))}.")
+        state = np.array(state.reshape(dims), copy=True)
+        state_norm = float(np.linalg.norm(state.ravel()))
+        if state_norm == 0.0:
+            raise ValueError("state vector must be nonzero.")
+
+        sector_mask = np.zeros(dims, dtype=bool)
+        for config in np.ndindex(*dims):
+            total = _add_charges(left_boundary, *(local_qns[site][s] for site, s in enumerate(config)))
+            sector_mask[config] = total == target
+        leakage = float(np.linalg.norm(state[~sector_mask]))
+        tolerance = max(float(sector_atol), float(sector_rtol) * state_norm)
+        if leakage > tolerance and not project:
+            raise ValueError(
+                f"state has target-sector leakage {leakage:.3e}; "
+                "pass project=True to discard incompatible amplitudes."
+            )
+        state[~sector_mask] = 0
+        if float(np.linalg.norm(state.ravel())) <= tolerance:
+            raise ValueError("the target-sector projection of state is zero.")
+
+        nfrontiers = len(local_qns) - 2
+        if bond_dims is None:
+            requested_dims = None
+        elif np.isscalar(bond_dims):
+            requested_dims = (int(bond_dims),) * nfrontiers
+        else:
+            requested_dims = tuple(int(dim) for dim in bond_dims)
+            if len(requested_dims) != nfrontiers:
+                raise ValueError("bond_dims must have one entry for each tied frontier.")
+        if requested_dims is not None and any(dim < 1 for dim in requested_dims):
+            raise ValueError("bond dimensions must be positive.")
+
+        inferred = []
+        for cut in range(nfrontiers):
+            by_shared = []
+            for shared, q_shared in enumerate(local_qns[cut + 1]):
+                matrix = np.take(state, shared, axis=cut + 1).reshape(
+                    int(np.prod(dims[: cut + 1], dtype=np.int64)),
+                    int(np.prod(dims[cut + 2 :], dtype=np.int64)),
+                )
+                row_labels = []
+                for config in np.ndindex(*dims[: cut + 1]):
+                    row_labels.append(
+                        _add_charges(
+                            left_boundary,
+                            *(local_qns[site][s] for site, s in enumerate(config)),
+                            q_shared,
+                        )
+                    )
+                column_labels = []
+                for config in np.ndindex(*dims[cut + 2 :]):
+                    column_labels.append(
+                        _add_charges(
+                            *(local_qns[cut + 2 + site][s] for site, s in enumerate(config))
+                        )
+                    )
+
+                row_sectors = {charge: [] for charge in row_labels}
+                column_sectors = {charge: [] for charge in column_labels}
+                for index, charge in enumerate(row_labels):
+                    row_sectors[charge].append(index)
+                for index, charge in enumerate(column_labels):
+                    column_sectors[charge].append(index)
+                feasible = [
+                    charge
+                    for charge in _unique_sorted_charges(row_labels)
+                    if _sub_charges(target, charge) in column_sectors
+                ]
+
+                spectra = []
+                for charge in feasible:
+                    rows = row_sectors[charge]
+                    columns = column_sectors[_sub_charges(target, charge)]
+                    values = np.linalg.svd(matrix[np.ix_(rows, columns)], compute_uv=False)
+                    spectra.extend((float(value), charge) for value in values)
+                scale = max((value for value, _ in spectra), default=0.0)
+                cutoff = max(float(sector_atol), float(sector_rtol) * scale)
+                active = [(value, charge) for value, charge in spectra if value > cutoff]
+                active.sort(key=lambda item: (-item[0], item[1]))
+                by_shared.append((active, feasible))
+            inferred.append(by_shared)
+
+        if requested_dims is None:
+            requested_dims = tuple(max(len(active) for active, _ in frontier) for frontier in inferred)
+
+        frontier_qns = []
+        for cut, (frontier, dim) in enumerate(zip(inferred, requested_dims)):
+            conditional = []
+            for shared, (active, feasible) in enumerate(frontier):
+                if len(active) > dim and not truncate:
+                    raise ValueError(
+                        f"bond dimension {dim} truncates rank {len(active)} "
+                        f"at frontier {cut}, shared state {shared}; pass truncate=True to allow it."
+                    )
+                labels = [charge for _, charge in active[:dim]]
+                if len(labels) < dim:
+                    if not feasible:
+                        raise ValueError(
+                            f"frontier {cut}, shared state {shared} has no charge compatible with target."
+                        )
+                    extra = 0
+                    while len(labels) < dim:
+                        labels.append(feasible[extra % len(feasible)])
+                        extra += 1
+                conditional.append(labels)
+            frontier_qns.append(conditional)
+
+        return cls(
+            local_qns=local_qns,
+            frontier_qns=frontier_qns,
+            target=target,
+            left_boundary=left_boundary,
+        )
+
+
+@dataclass(frozen=True)
 class XLayout:
     """Charge-sector layout for dense masked Abelian XLETTA.
 

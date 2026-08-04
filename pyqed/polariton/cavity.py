@@ -1154,7 +1154,7 @@ class VibronicPolariton2:
         # else:
         #     # construct the ground-state polaritonic PES
 
-        from pyqed.dvr.dvr_2d import DVR2
+        from pyqed.dvr import DVR
 
         x = self.x
         y = self.y
@@ -1162,7 +1162,12 @@ class VibronicPolariton2:
         if self.va is None:
             self.ppes()
 
-        dvr = DVR2(x, y, mass=self.mol.mass) # for normal coordinates
+        dvr = DVR(
+            domains=((x[0], x[-1]), (y[0], y[-1])),
+            npts=(len(x), len(y)),
+            mass=self.mol.mass,
+            names=("x", "y"),
+        )
 
         if representation == 'adiabatic':
             V = self.va[:, :, 0]

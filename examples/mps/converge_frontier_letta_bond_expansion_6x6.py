@@ -43,14 +43,16 @@ def _state_from_snapshot(model, snapshot_path):
             np.array(archive[f"tensor_{site:03d}"], copy=True)
             for site in range(36)
         ]
-    return FrontierTiedLETTA(
+    state = FrontierTiedLETTA(
         hamiltonian,
         hamiltonian.dims,
         parent_sets_from_edges(36, nearest),
         bond_dims=bond_dims,
         tensors=tensors,
         frontier_backend="identity_block",
+        _balance_initial_gauges=False,
     )
+    return state
 
 
 def _save_snapshot(path, state):

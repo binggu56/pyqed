@@ -631,6 +631,32 @@ def test_gdvr_tddmrg_runs_against_direct_mpo():
     assert reversal["state_error"] < 1.0e-10
 
 
+def test_gdvr_tddmrg_compressed_taylor_path_densifies_block_mpo():
+    mf = _ToyGDVRRHF()
+    td = TDDMRG(mf).build()
+    td._use_exact_dense_td = lambda: False
+    psi0 = rhf_determinant_mps(mf, max_bond=16)
+    h_dense = _mpo_to_dense_matrix(td._get_td_hamiltonian())
+    vec0 = np.asarray(tt_to_tensor(psi0.factors), dtype=complex).reshape(-1)
+
+    td.run(
+        psi0=psi0,
+        dt=0.01,
+        steps=2,
+        e_ops=[],
+        integrator="taylor",
+        order=4,
+        scale=2,
+        D=16,
+        progress=False,
+    )
+
+    expected = expm(-0.02j * h_dense) @ vec0
+    actual = np.asarray(tt_to_tensor(td.final_state.factors), dtype=complex).reshape(-1)
+    np.testing.assert_allclose(actual, expected, atol=1.0e-10, rtol=1.0e-10)
+    np.testing.assert_allclose(td.pre_normalization_norms, np.ones(2), atol=1.0e-10)
+
+
 def test_gdvr_tddmrg_accepts_direct_force_mpo_observable():
     mf = _ToyGDVRRHF()
     td = TDDMRG(mf).build()
@@ -798,7 +824,7 @@ def test_gdvr_tddmrg_ensure_dense_preserves_spatial_local_order():
     np.testing.assert_allclose(dense.factors[0][0, :, 0], [0.0, 3.0, 7.0, 0.0])
 
 
-def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
+def test_direct_gdvr_tddmrg_defaults_to_block_sparse_tdvp(monkeypatch):
     import pyqed.qchem.dmrg.tddmrg as qchem_tddmrg_module
     import pyqed.mps.tdvp as tdvp_module
 
@@ -818,13 +844,13 @@ def test_direct_gdvr_tddmrg_can_use_block_sparse_tdvp_backend(monkeypatch):
         steps=1,
         e_ops=[],
         integrator="tdvp",
-        tdvp_projection_backend="block-sparse",
         measure_observables=False,
         track_energy=False,
         progress=False,
         D=4,
     )
 
+    assert td.tdmps.projection == "block-sparse"
     assert hasattr(td.final_state.factors[0], "qns")
     np.testing.assert_allclose(td.pre_normalization_norms, np.ones(1), atol=1.0e-12)
 
@@ -842,13 +868,13 @@ def test_direct_gdvr_tddmrg_block_sparse_field_uses_local_phase():
         e_ops=[],
         cap={"width": 0.5, "strength": 0.4, "order": 2},
         cap_mode="local-phase",
-        tdvp_projection_backend="block-sparse",
         measure_observables=False,
         track_energy=False,
         progress=False,
         D=4,
     )
 
+    assert td.tdmps.projection == "block-sparse"
     assert hasattr(td.final_state.factors[0], "qns")
     assert td.tdmps.tdvp_split_dynamic_block_sparse is True
     assert td.cap_settings is None

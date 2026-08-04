@@ -139,7 +139,7 @@ def kinetic(x, mass=1, dvr='sinc'):
 
     return T
 
-class DVR(object):
+class _DVR1D:
 
 
     def v(self, V):
@@ -325,7 +325,7 @@ class DVR(object):
 
 
 
-class SincDVR(DVR):
+class SincDVR(_DVR1D):
     r"""Sinc function basis for non-periodic functions over an interval
     `x0 +- L/2` with `npts` points.
     Usage:
@@ -553,7 +553,7 @@ class ExponentialDVR(SincDVR):
 
 
 
-class SineDVR(DVR):
+class SineDVR(_DVR1D):
     r"""Sine function basis for non-periodic functions over an interval
     `x_min ... x_max` with `npts` points.
     Usage:
@@ -709,7 +709,7 @@ class SineDVR(DVR):
 
 
     def fbr2dvr(self):
-        """
+        r"""
         transformation matrix from FBR to DVR
 
         .. math::
@@ -795,7 +795,7 @@ class SineDVR(DVR):
 #         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
 
 
-class PODVR(DVR):
+class PODVR(_DVR1D):
     r"""Potential-optimized DVR built from a primitive sine DVR.
 
     The DVR is built by:
@@ -953,7 +953,7 @@ class PODVR(DVR):
         return E, U
 
 
-class FEDVR(DVR):
+class FEDVR(_DVR1D):
     r"""One-dimensional finite-element DVR with Gauss-Lobatto points.
 
     The interval ``[xmin, xmax]`` is split into ``n_elements`` finite elements.
@@ -1139,7 +1139,7 @@ class FEDVR(DVR):
         return E, U
 
 
-class LegendreDVR(DVR):
+class LegendreDVR(_DVR1D):
     r"""Gauss-Legendre DVR on a finite interval.
 
     This DVR is useful for bounded angular coordinates.  The grid points are
@@ -1234,106 +1234,122 @@ class LegendreDVR(DVR):
         return basis
 
 
-class HermiteDVR(DVR):
-    r"""Hermite function basis for non-periodic functions over an interval
-    `-x_max ... x_max` with `npts` points.
-    Usage:
-        d = sincDVR1D(npts, xmax, [x0])
+class HermiteDVR(_DVR1D):
+    r"""Harmonic-oscillator DVR on scaled Gauss--Hermite nodes.
 
-    @param[in] npts number of points
-    @param[in] xmax "right" end of interval
-    @param[in] x0 shifted center of interval
-    @param[in] mass particle mass used by the kinetic energy matrix
-    @attribute a step size
-    @attribute n vector of x-domain indices
-    @attribute x discretized x-domain
-    @attribute w quadrature weights
-    @attribute k_max cutoff frequency
-    @attribute L size of x-domain
-    @method h return hamiltonian matrix
-    @method f return DVR basis vectors
+    ``omega`` defines the finite harmonic-oscillator basis used to construct
+    the coordinate, kinetic-energy, and momentum matrices. The coordinate
+    scale is
+
+    .. math::
+
+        \alpha = \sqrt{m\omega}, \qquad
+        x_i = x_\mathrm{center} + y_i/\alpha,
+
+    where ``y_i`` are the roots of the physicists' Hermite polynomial
+    :math:`H_N`. Atomic units with :math:`\hbar=1` are used.
     """
-    def __init__(self, npts, xmax=None, x0=0., mass=1.):
-        assert (npts < 269), \
-            "Must make npts < 269 for numpy to find quadrature points."
-        self.npts = npts
-        self.x0 = float(x0)
-        self._mass = mass
-        self.n = np.arange(npts)
-        c = np.zeros(npts+1)
-        c[-1] = 1.
-        self.x = np.polynomial.hermite.hermroots(c)
-        if xmax is None:
-            self.gamma = 1.
-        else:
-            assert xmax is None, "Sorry, xmax is currently broken"
-            self.gamma = self.x.max() / float(xmax)
 
-        self.x = self.x0 + self.x / self.gamma
-        self.w = np.exp(-np.square(self.x))
-        self.L = self.x.max() - self.x.min()
+    def __init__(self, npts, mass, omega, center=0.0):
+        if not isinstance(npts, (int, np.integer)) or npts <= 0:
+            raise ValueError("npts must be a positive integer")
+        if npts >= 269:
+            raise ValueError("npts must be smaller than 269")
+        mass = float(mass)
+        omega = float(omega)
+        center = float(center)
+        if not np.isfinite(mass) or mass <= 0.0:
+            raise ValueError("mass must be finite and positive")
+        if not np.isfinite(omega) or omega <= 0.0:
+            raise ValueError("omega must be finite and positive")
+        if not np.isfinite(center):
+            raise ValueError("center must be finite")
+
+        self.npts = npts
+        self.n = np.arange(npts)
+        self.mass = mass
+        self.omega = omega
+        self.center = center
+        self.alpha = np.sqrt(mass * omega)
+
+        raising = np.zeros((npts, npts))
+        if npts > 1:
+            raising[self.n[1:], self.n[:-1]] = np.sqrt(self.n[1:])
+        coordinate_fbr = (
+            raising + raising.T
+        ) / (np.sqrt(2.0) * self.alpha)
+        relative_nodes, transform = np.linalg.eigh(coordinate_fbr)
+        signs = np.where(transform[0] < 0.0, -1.0, 1.0)
+        self.transform = transform * signs
+        self.x = center + relative_nodes
+
+        hermite_nodes, hermite_weights = np.polynomial.hermite.hermgauss(
+            npts
+        )
+        if not np.allclose(
+            self.alpha * relative_nodes,
+            hermite_nodes,
+            atol=2.0e-13,
+            rtol=2.0e-13,
+        ):
+            raise RuntimeError("Hermite coordinate diagonalization failed")
+        self.w = (
+            hermite_weights
+            * np.exp(hermite_nodes**2)
+            / self.alpha
+        )
+
+        kinetic_fbr = np.diag(0.25 * omega * (2 * self.n + 1))
+        if npts > 2:
+            second_off_diagonal = (
+                -0.25
+                * omega
+                * np.sqrt((self.n[:-2] + 1) * (self.n[:-2] + 2))
+            )
+            kinetic_fbr[self.n[:-2], self.n[2:]] = second_off_diagonal
+            kinetic_fbr[self.n[2:], self.n[:-2]] = second_off_diagonal
+        momentum_fbr = (
+            1j
+            * np.sqrt(0.5 * mass * omega)
+            * (raising - raising.T)
+        )
+
+        self.T = self.transform.T @ kinetic_fbr @ self.transform
+        self.P = self.transform.T @ momentum_fbr @ self.transform
+        self.T = 0.5 * (self.T + self.T.T)
+        self.P = 0.5 * (self.P + self.P.conj().T)
+        self._kinetic_energies, self._kinetic_states = np.linalg.eigh(self.T)
+        self.L = float(self.x[-1] - self.x[0])
         self.a = None
         self.k_max = None
-        self.T = None
-        self.P = None
 
-    @property
-    def mass(self):
-        return self._mass
+    def t(self):
+        """Return the kinetic-energy matrix in the Hermite DVR."""
+        return self.T.copy()
 
-    @mass.setter
-    def mass(self, value):
-        self._mass = value
+    def momentum(self):
+        """Return the Hermitian momentum matrix in the Hermite DVR."""
+        return self.P.copy()
 
-    def t(self, hc=1.):
-        """Return the kinetic energy matrix.
-        Usage:
-            T = self.t(V)
+    def expT(self, dt=1.0):
+        """Return the exact finite-basis kinetic propagator."""
+        dt = float(dt)
+        if not np.isfinite(dt):
+            raise ValueError("dt must be finite")
+        phases = np.exp(-1j * dt * self._kinetic_energies)
+        return (
+            self._kinetic_states * phases[np.newaxis, :]
+        ) @ self._kinetic_states.conj().T
 
-        @returns T kinetic energy matrix
-        """
-        _i = self.n[:, np.newaxis]
-        _j = self.n[np.newaxis, :]
-        _xi = self.x[:, np.newaxis]
-        _xj = self.x[np.newaxis, :]
+    def harmonic_state(self, level=0):
+        """Return one reference-oscillator eigenstate in DVR coefficients."""
+        if not isinstance(level, (int, np.integer)) or not 0 <= level < self.npts:
+            raise ValueError(
+                f"level must be an integer in [0, {self.npts})"
+            )
+        return self.transform[int(level)].copy()
 
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            T = 2.*(-1.)**(_i-_j)/(_xi-_xj)**2.
-
-        T[self.n, self.n] = 0.
-        T += np.diag((2. * self.npts + 1.
-                      - np.square(self.x)) / 3.)
-        T *= self.gamma
-        T *= 0.5 * hc**2. / self.mass   # (pc)^2 / (2 mc^2)
-        self.T = T
-        return T
-
-    def momentum(self, hbar=1.):
-        """Return the Hermite DVR momentum matrix."""
-        _i = self.n[:, np.newaxis]
-        _j = self.n[np.newaxis, :]
-        _xi = self.x[:, np.newaxis]
-        _xj = self.x[np.newaxis, :]
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            D = (-1.)**(_i-_j) / (_xi-_xj)
-
-        D[self.n, self.n] = 0.
-        self.P = -1j * hbar * D
-        return self.P
-
-#     def f(self, x=None):
-#         """Return the DVR basis vectors"""
-#         if x is None:
-#             x_m = self.x[:, np.newaxis]
-#         else:
-#             x_m = np.asarray(x)[:, np.newaxis]
-#         x_n = self.x[np.newaxis, :]
-#         return np.sinc((x_m-x_n)/self.a)/np.sqrt(self.a)
-
-class BesselDVR(DVR):
+class BesselDVR(_DVR1D):
     r"""Bessel function basis for non-periodic functions over an interval
     `0 ... R` with `npts` points, `dim` dimensions, `lam` angular
     momentum number.
@@ -1469,9 +1485,9 @@ class BesselDVR(DVR):
                               (z**2 - zn**2)) / F_n
         return F
 
-class LaguerreDVR(DVR):
+class LaguerreDVR(_DVR1D):
     def __init__(self, N, alpha=0):
-        """
+        r"""
         for radial coordinate x \in [0, \infty]
         
         .. math::
@@ -1493,7 +1509,7 @@ class LaguerreDVR(DVR):
         
         pass
 
-class ChebDVR(DVR):
+class ChebDVR(_DVR1D):
     pass
 
 # Factory functions to build different potentials:
@@ -1674,7 +1690,7 @@ if __name__ == '__main__':
     def test_sincdvr():
         # dvr = SincDVR(npts=20, L=10)
 
-        dvr = HermiteDVR(npts=10)
+        dvr = HermiteDVR(npts=10, mass=1.0, omega=1.0)
         x = dvr.x
 
 

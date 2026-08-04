@@ -128,6 +128,7 @@ from .nonabelian import (  # noqa: F401
 # Legacy exports: available only when optional deps exist.
 try:  # pragma: no cover
     from .mps import *  # noqa: F401,F403
+    from .mpo import sop_to_mpo  # noqa: F401
     from .dmrg import (  # noqa: F401
         DMRG,
         dmrg_matvec_options,
@@ -137,6 +138,7 @@ try:  # pragma: no cover
     from .tdvp import (  # noqa: F401
         SymmetricTDVP,
         block_sparse_one_site_tdvp_step,
+        block_sparse_two_site_tdvp_step,
         one_site_tdvp_step,
         spatial_fermion_number_sz_sectors,
         two_site_tdvp_step,
@@ -202,8 +204,11 @@ from .cylinder import (  # noqa: F401,E402
     unpack_commuting_cylinder_parameters,
 )
 from .luttinger import (  # noqa: F401,E402
+    CoulombLuttingerModel,
     ExponentialLuttingerModel,
     GaussianLuttingerCLETTA,
+    cletta_luttinger_spectra_hierarchy,
+    cmps_luttinger_density_correlation,
     cmps_luttinger_energy_shift_density,
     cmps_luttinger_parameter,
     cmps_luttinger_spectra,
@@ -221,13 +226,19 @@ from .pip_pairing import (  # noqa: F401,E402
 from .bose_gas_2d import (  # noqa: F401,E402
     D2M1HierarchicalCLETTA2D,
     D2M1NestedCLETTA2D,
+    D2TripletHNC2D,
     DiluteBoseGas2D,
+    FunctionalD2HNC2D,
     GaussianPotentialBoseGas2D,
+    HNCELBoseGas2D,
     HierarchicalShellContraction,
+    JastrowHNC2D,
     RankOneDensityTransferChannel2D,
     fixed_density_gns_nested_hletta_state,
     fixed_density_nested_hletta_state,
     optimize_condensate_gns_hletta_fixed_density,
     optimize_condensate_nested_hletta_fixed_density,
+    optimize_d2_triplet_hnc,
+    optimize_gaussian_jastrow_hnc,
     optimize_nested_hletta_fixed_density,
 )

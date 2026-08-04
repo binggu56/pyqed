@@ -156,6 +156,13 @@ class TTN:
             self.tensors = [np.asarray(tensor).copy() for tensor in tensors]
 
         self.center: int | None = None
+        self.energy: float | None = None
+        self.history: list[dict] = []
+        self.site_updates = []
+        self.ncompleted = 0
+        self.converged = False
+        self.success = False
+        self.message = "not optimized"
         self.validate()
 
     @property
@@ -230,6 +237,13 @@ class TTN:
             tensors=[tensor.copy() for tensor in self.tensors],
         )
         result.center = self.center
+        result.energy = self.energy
+        result.history = list(self.history)
+        result.site_updates = list(self.site_updates)
+        result.ncompleted = self.ncompleted
+        result.converged = self.converged
+        result.success = self.success
+        result.message = self.message
         return result
 
     def amplitude(self, configuration) -> complex:
@@ -488,6 +502,37 @@ class TTN:
                 raise ValueError("cannot normalize an expectation for a zero TTN state.")
             value = value / norm_squared
         return np.real_if_close(value).item()
+
+    def expectation(self, hamiltonian) -> float:
+        """Return the exact tree-contracted ``LocalHamiltonian`` energy."""
+        from .optimization import expectation
+
+        return expectation(self, hamiltonian)
+
+    def optimize_site(self, site, hamiltonian, *, metric_tol=1.0e-12):
+        """Optimize one tensor in the environment of all other tensors."""
+        from .optimization import optimize_site
+
+        return optimize_site(self, site, hamiltonian, metric_tol=metric_tol)
+
+    def run(
+        self,
+        hamiltonian,
+        *,
+        nsweeps: int = 10,
+        tol: float = 1.0e-9,
+        metric_tol: float = 1.0e-12,
+    ) -> "TTN":
+        """Run alternating exact one-tensor variational sweeps."""
+        from .optimization import run
+
+        return run(
+            self,
+            hamiltonian,
+            nsweeps=nsweeps,
+            tol=tol,
+            metric_tol=metric_tol,
+        )
 
     def norm_squared(self) -> float:
         """Contract ``<psi|psi>`` exactly by tree messages."""

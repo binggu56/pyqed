@@ -1670,8 +1670,32 @@ class XLETTA:
     def optimize_w_mpo(self, mpo, shared_index: int) -> dict:
         return self.optimize_variable_mpo(mpo, "w", int(shared_index))
 
-    def sweep(self, direction: str = "lr", *, symmetric: bool = True, metric_tol: float = 1.0e-12) -> list[dict]:
-        """Run one dense local variational sweep."""
+    def sweep(
+        self,
+        direction: str = "lr",
+        operator=None,
+        *,
+        symmetric: bool = True,
+        cached: bool = True,
+        metric_tol: float = 1.0e-12,
+        w_copy_mix: float = 0.0,
+    ) -> list[dict]:
+        """Run one variational sweep.
+
+        If ``operator`` is provided, it is treated as an MPO and optimized with
+        cached environment updates. Without an operator, this performs the dense
+        local tensor sweep.
+        """
+        if operator is not None:
+            return self.sweep_mpo(
+                operator,
+                direction,
+                symmetric=symmetric,
+                cached=cached,
+                metric_tol=metric_tol,
+                w_copy_mix=w_copy_mix,
+            )
+
         return [
             self.optimize_variable(kind, index, metric_tol=metric_tol)
             for kind, index in self.variable_order(direction, symmetric=symmetric)
@@ -1805,7 +1829,10 @@ class XLETTA:
         metric_tol: float = 1.0e-12,
         w_copy_mix: float = 0.0,
     ) -> list[dict]:
-        """Run one local variational sweep using MPO environments."""
+        """Run one local variational sweep using MPO environments.
+
+        Compatibility entrypoint; new code should call ``sweep(..., operator=mpo)``.
+        """
         mpo = _validate_mpo(mpo, self.dims)
         if not cached:
             return [
@@ -1905,9 +1932,9 @@ class XLETTA:
                 did_canonicalize = True
             w_copy_mix = float(w_regularization) * (float(w_regularization_decay) ** sweep_idx)
             if self.operator_mpo is not None:
-                updates = self.sweep_mpo(
-                    self.operator_mpo,
+                updates = self.sweep(
                     direction,
+                    self.operator_mpo,
                     symmetric=symmetric,
                     cached=cached_mpo,
                     metric_tol=metric_tol,

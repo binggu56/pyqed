@@ -27,7 +27,7 @@ def _require_jax():
         import jax.numpy as jnp
     except ModuleNotFoundError as exc:
         raise ModuleNotFoundError(
-            "JAX is required for ARNN. Install pyqed[ml] to use it."
+            "JAX is required for neural quantum states. Install pyqed[ml] to use them."
         ) from exc
     return jax, jnp
 

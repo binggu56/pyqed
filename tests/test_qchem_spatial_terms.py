@@ -248,9 +248,9 @@ def test_qchem_spatial_abelian_auto_defaults_to_block2_carrier_when_possible():
     assert dmrg.spatial_exact_component_compression_validation_vectors == 1
     assert dmrg.spatial_exact_component_compression_min_reduction == 1
     assert dmrg.spatial_exact_component_compression_max_group_size == 64
-    assert dmrg.spatial_enable_native_boundary_p is True
-    assert dmrg.spatial_validate_native_boundary_p is False
-    assert dmrg.spatial_native_boundary_p_validation_policy == "off"
+    assert dmrg.spatial_enable_cpp_boundary_p is True
+    assert dmrg.spatial_validate_cpp_boundary_p is False
+    assert dmrg.spatial_cpp_boundary_p_validation_policy == "off"
     assert dmrg.spatial_direct_operator_batch_min_entries == 2
     assert dmrg.spatial_reduced_mpo is False
     assert dmrg._can_use_spatial_block2_carrier() is True
@@ -985,6 +985,8 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
             self.abelian_matvec_options = {"native_site_storage": True}
             self.ground_state = DummyState()
             self.e_tot = 0.0
+            self.converged = True
+            self.sweep_history = []
 
         def run(self):
             captured["run_called"] = True
@@ -999,7 +1001,10 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
     dmrg.dmrg_performance = "block2-like"
     dmrg.abelian_matvec_options = None
     dmrg.saved_symmetry_list = ["charge"]
+    dmrg.symmetry = ["charge"]
     dmrg.site = "spatial"
+    dmrg.site_basis = dmrg.orbital_layout = "spatial"
+    dmrg.spatial_site_basis = "canonical"
     dmrg.ncas = 2
     dmrg.nelecas = 2
     dmrg.spin = 0
@@ -1020,6 +1025,8 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
     dmrg.run(nsweeps=1, symmetry="charge")
 
     assert captured["run_called"] is True
+    assert captured["kwargs"]["nsweeps"] == 2
+    assert captured["kwargs"]["converge_on_full_sweeps"] is True
     assert all(isinstance(site, AbelianSiteTensorData) for site in captured["H"])
     assert not any(isinstance(site, BlockTensor) for site in captured["H"])
     init_guess = captured["kwargs"]["init_guess"]
@@ -1046,6 +1053,8 @@ def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch)
             self.abelian_matvec_options = {"native_site_storage": True}
             self.ground_state = DummyState()
             self.e_tot = 0.0
+            self.converged = True
+            self.sweep_history = []
 
         def run(self):
             return self
@@ -1060,7 +1069,10 @@ def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch)
         dmrg.dmrg_performance = "block2-like"
         dmrg.abelian_matvec_options = None
         dmrg.saved_symmetry_list = ["charge"]
+        dmrg.symmetry = ["charge"]
         dmrg.site = "spatial"
+        dmrg.site_basis = dmrg.orbital_layout = "spatial"
+        dmrg.spatial_site_basis = "canonical"
         dmrg.ncas = 2
         dmrg.nelecas = 2
         dmrg.spin = 0
@@ -4928,9 +4940,9 @@ def test_fresh_casci_like_preserves_spatial_block2_table_settings():
         spatial_exact_component_compression_validation_vectors=5,
         spatial_exact_component_compression_min_reduction=3,
         spatial_exact_component_compression_max_group_size=11,
-        spatial_enable_native_boundary_p=False,
-        spatial_validate_native_boundary_p=False,
-        spatial_native_boundary_p_validation_policy="always",
+        spatial_enable_cpp_boundary_p=False,
+        spatial_validate_cpp_boundary_p=False,
+        spatial_cpp_boundary_p_validation_policy="always",
         spatial_direct_operator_batch_min_entries=5,
         dmrg_performance="packed-compiled-fast",
         abelian_matvec_options={"packed_local_davidson_restart_dim": 12},
@@ -4958,9 +4970,9 @@ def test_fresh_casci_like_preserves_spatial_block2_table_settings():
     assert fresh.spatial_exact_component_compression_validation_vectors == 5
     assert fresh.spatial_exact_component_compression_min_reduction == 3
     assert fresh.spatial_exact_component_compression_max_group_size == 11
-    assert fresh.spatial_enable_native_boundary_p is False
-    assert fresh.spatial_validate_native_boundary_p is False
-    assert fresh.spatial_native_boundary_p_validation_policy == "always"
+    assert fresh.spatial_enable_cpp_boundary_p is False
+    assert fresh.spatial_validate_cpp_boundary_p is False
+    assert fresh.spatial_cpp_boundary_p_validation_policy == "always"
     assert fresh.spatial_direct_operator_batch_min_entries == 5
     assert fresh.dmrg_performance == "packed-compiled-fast"
     assert fresh.abelian_matvec_options == {"packed_local_davidson_restart_dim": 12}
@@ -5010,10 +5022,10 @@ def test_spatial_complementary_operator_families_group_integrals():
     assert (0, 1) in families["A"].entries
     assert (1, 2) in families["A"].entries
     assert families.as_metadata()["families"]["P"]["n_terms"] == 2
-    assert families.as_metadata()["enable_native_boundary_p"] is True
-    assert families.as_metadata()["validate_native_boundary_p"] is False
+    assert families.as_metadata()["enable_cpp_boundary_p"] is True
+    assert families.as_metadata()["validate_cpp_boundary_p"] is False
     assert (
-        families.as_metadata()["native_boundary_p_validation_policy"]
+        families.as_metadata()["cpp_boundary_p_validation_policy"]
         == "off"
     )
     assert families.as_metadata()["direct_operator_batch_min_entries"] == 2

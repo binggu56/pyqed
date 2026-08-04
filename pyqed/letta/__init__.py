@@ -3,11 +3,12 @@
 from .core import (
     LETTA,
     LETTAOperatorPackage,
+    SequentialLETTA,
 )
 from .range import NNNLETTA
 from .uniform import ULETTA, UniformLETTA
 from .xletta import AbelianXLETTA, XLETTA
-from .abelian import Layout, XLayout
+from .abelian import Layout, TiedFrontierLayout, XLayout
 from .physical_tying import (
     PhysicalTieState,
     PhysicalTieStep,
@@ -16,29 +17,46 @@ from .physical_tying import (
     fixed_range_parent_sets,
 )
 from .cp import CPDecomposition, cp_als
+from .conditional_cp import ConditionalCPDecomposition, conditional_cp_decompose
 from .cp_tying import CPBlockUpdate, CPTiedLETTA
 from .dense_tying import DenseSiteUpdate, DenseTiedLETTA
 from .block_mpo_frontier import BlockFrontierMessage, BlockMPOFrontier
+from .renormalized_frontier import (
+    TermRenormalizedFrontier,
+    renormalized_operator_mpo,
+)
 from .frontier_tying import (
     FrontierBondExpansion,
     FrontierGaugeUpdate,
+    FrontierMergedSolveDiagnostics,
     FrontierNaturalGradientUpdate,
+    FrontierPairEnvironment,
     FrontierSiteEnvironment,
     FrontierSiteUpdate,
     FrontierTiedLETTA,
     FrontierTwoSiteUpdate,
+    GraphLETTA,
 )
-from .frontier_abelian import (
-    AbelianFrontierTiedLETTA,
-    FrontierAbelianLayout,
-    abelian_frontier_tied_letta_from_mps,
+from .projected_frontier import ProjectedLETTA, SectorProjectedLETTA, SectorProjection
+from .local_terms import (
+    LocalHamiltonian,
+    LocalMPO,
+    LocalMPOProduct,
+    LocalTerm,
+    local_charges_from_sites,
+    fixed_charge_projector_mpo,
+    validate_charge_conservation,
 )
-from .local_terms import LocalHamiltonian, LocalMPO, LocalTerm
 from .initialization import (
     frontier_tensors_from_mps,
     frontier_tied_letta_from_mps,
 )
-from .matrix_free import DavidsonDiagnostics, lowest_generalized_davidson
+from .matrix_free import (
+    BlockDavidsonDiagnostics,
+    DavidsonDiagnostics,
+    lowest_generalized_davidson,
+    lowest_recycled_block_davidson,
+)
 from .physical_blocks import (
     PhysicalBlockGeneralizedProblem,
     PhysicalBlockLayout,
@@ -101,32 +119,42 @@ __all__ = [
     "AdaptiveTieGraphStep",
     "LETTA",
     "LETTAOperatorPackage",
+    "SequentialLETTA",
     "NNNLETTA",
     "CPBlockUpdate",
     "BlockFrontierMessage",
     "BlockMPOFrontier",
     "CPDecomposition",
+    "ConditionalCPDecomposition",
     "CPTiedLETTA",
     "ConfigurationActionOperator",
     "DenseSiteUpdate",
     "DenseTiedLETTA",
     "DavidsonDiagnostics",
+    "BlockDavidsonDiagnostics",
     "FrontierSiteEnvironment",
     "FrontierSiteUpdate",
     "FrontierTiedLETTA",
+    "GraphLETTA",
     "FrontierTwoSiteUpdate",
-    "AbelianFrontierTiedLETTA",
-    "FrontierAbelianLayout",
+    "SectorProjectedLETTA",
+    "ProjectedLETTA",
+    "SectorProjection",
+    "TiedFrontierLayout",
     "FrontierBondExpansion",
     "FrontierGaugeUpdate",
+    "FrontierMergedSolveDiagnostics",
     "FrontierNaturalGradientUpdate",
+    "FrontierPairEnvironment",
     "EnergyEstimate",
     "LETTAProductCache",
     "LETTAVMC",
     "LETTAWavefunction",
     "LocalHamiltonian",
     "LocalMPO",
+    "LocalMPOProduct",
     "LocalTerm",
+    "local_charges_from_sites",
     "LocalHamiltonianActions",
     "MetropolisDiagnostics",
     "MetropolisSampler",
@@ -139,6 +167,7 @@ __all__ = [
     "SRDirection",
     "SRProposal",
     "TermwiseTTMPOFrontier",
+    "TermRenormalizedFrontier",
     "TTAdvanceDiagnostics",
     "TTContractionDiagnostics",
     "TTFrontier",
@@ -159,15 +188,16 @@ __all__ = [
     "XLayout",
     "XLETTA",
     "VMCSamples",
-    "abelian_frontier_tied_letta_from_mps",
     "adapt_tie_graph",
     "adaptive_tie_graph_step",
     "compress_physical_ties",
     "cp_als",
+    "conditional_cp_decompose",
     "evaluate_tie_graph_proposal",
     "fixed_range_parent_sets",
     "frontier_tensors_from_mps",
     "frontier_tied_letta_from_mps",
+    "fixed_charge_projector_mpo",
     "graph_signals_from_samples",
     "hamiltonian_physical_connectivity",
     "heuristic_heisenberg_block_order",
@@ -175,11 +205,14 @@ __all__ = [
     "heisenberg_block_frontier_profile",
     "heisenberg_frontier_profile",
     "lowest_generalized_davidson",
+    "lowest_recycled_block_davidson",
     "optimize_heisenberg_block_order",
     "optimize_heisenberg_order",
     "rank_tie_graph_proposals",
+    "renormalized_operator_mpo",
     "sample_tie_signals",
     "state_with_tie_graph_proposal",
     "tie_edges",
     "tie_frontier_cost",
+    "validate_charge_conservation",
 ]

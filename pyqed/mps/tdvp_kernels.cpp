@@ -596,6 +596,546 @@ static py::array_t<cdouble> site_lanczos(
     return out;
 }
 
+#if PYQED_TDVP_HAS_BLAS
+struct TwoSitePhysicalGroup {
+    std::vector<ssize_t> outputs;
+    std::vector<cdouble> blocks;
+};
+
+static std::vector<cdouble> grouped_sparse_two_site_lanczos_apply(
+    const std::vector<cdouble>& vec,
+    double dt,
+    int krylov_dim,
+    double tol,
+    const cdouble* left_ptr,
+    const cdouble* W_left_ptr,
+    const cdouble* W_right_ptr,
+    const cdouble* right_ptr,
+    ssize_t A,
+    ssize_t B,
+    ssize_t Q,
+    ssize_t S,
+    ssize_t D,
+    ssize_t M,
+    ssize_t N,
+    ssize_t O,
+    ssize_t P,
+    ssize_t R,
+    ssize_t C,
+    double cutoff
+) {
+    std::vector<TwoSitePhysicalGroup> left_groups(
+        static_cast<std::size_t>(N) * Q
+    );
+    std::vector<TwoSitePhysicalGroup> right_groups(
+        static_cast<std::size_t>(N) * S
+    );
+
+    std::vector<cdouble> block_left(static_cast<std::size_t>(A) * B);
+    for (ssize_t n = 0; n < N; ++n) {
+        for (ssize_t q = 0; q < Q; ++q) {
+            TwoSitePhysicalGroup& group =
+                left_groups[static_cast<std::size_t>(n) * Q + q];
+            for (ssize_t p = 0; p < P; ++p) {
+                double max_abs = 0.0;
+                for (ssize_t a = 0; a < A; ++a) {
+                    for (ssize_t b = 0; b < B; ++b) {
+                        cdouble value = 0.0;
+                        for (ssize_t m = 0; m < M; ++m) {
+                            value +=
+                                left_ptr[(a * M + m) * B + b]
+                                * W_left_ptr[((m * N + n) * P + p) * Q + q];
+                        }
+                        block_left[static_cast<std::size_t>(a) * B + b] = value;
+                        max_abs = std::max(max_abs, std::abs(value));
+                    }
+                }
+                if (max_abs <= cutoff) {
+                    continue;
+                }
+                group.outputs.push_back(p);
+                group.blocks.insert(
+                    group.blocks.end(),
+                    block_left.begin(),
+                    block_left.end()
+                );
+            }
+        }
+    }
+
+    std::vector<cdouble> block_right(static_cast<std::size_t>(C) * D);
+    for (ssize_t n = 0; n < N; ++n) {
+        for (ssize_t s = 0; s < S; ++s) {
+            TwoSitePhysicalGroup& group =
+                right_groups[static_cast<std::size_t>(n) * S + s];
+            for (ssize_t r = 0; r < R; ++r) {
+                double max_abs = 0.0;
+                for (ssize_t c = 0; c < C; ++c) {
+                    for (ssize_t d = 0; d < D; ++d) {
+                        cdouble value = 0.0;
+                        for (ssize_t o = 0; o < O; ++o) {
+                            value +=
+                                W_right_ptr[((n * O + o) * R + r) * S + s]
+                                * right_ptr[(c * O + o) * D + d];
+                        }
+                        block_right[static_cast<std::size_t>(c) * D + d] = value;
+                        max_abs = std::max(max_abs, std::abs(value));
+                    }
+                }
+                if (max_abs <= cutoff) {
+                    continue;
+                }
+                group.outputs.push_back(r);
+                group.blocks.insert(
+                    group.blocks.end(),
+                    block_right.begin(),
+                    block_right.end()
+                );
+            }
+        }
+    }
+
+    std::size_t max_left_rows = 0;
+    std::size_t max_right_rows = 0;
+    for (const auto& group : left_groups) {
+        max_left_rows = std::max(
+            max_left_rows,
+            group.outputs.size() * static_cast<std::size_t>(A)
+        );
+    }
+    for (const auto& group : right_groups) {
+        max_right_rows = std::max(
+            max_right_rows,
+            group.outputs.size() * static_cast<std::size_t>(C)
+        );
+    }
+
+    const std::size_t dim = static_cast<std::size_t>(B) * Q * S * D;
+    const ssize_t AP = A * P;
+    const ssize_t SD = S * D;
+    std::vector<cdouble> x_by_q(
+        static_cast<std::size_t>(Q) * B * SD,
+        0.0
+    );
+    std::vector<cdouble> intermediate(
+        static_cast<std::size_t>(AP) * SD,
+        0.0
+    );
+    std::vector<cdouble> left_contribution(
+        max_left_rows * static_cast<std::size_t>(SD),
+        0.0
+    );
+    std::vector<cdouble> intermediate_s(
+        static_cast<std::size_t>(AP) * D,
+        0.0
+    );
+    std::vector<cdouble> right_contribution(
+        static_cast<std::size_t>(AP) * max_right_rows,
+        0.0
+    );
+    const cdouble one(1.0, 0.0);
+    const cdouble zero(0.0, 0.0);
+
+    auto matvec = [&](const std::vector<cdouble>& local, std::vector<cdouble>& out) {
+        out.assign(dim, cdouble(0.0, 0.0));
+        for (ssize_t q = 0; q < Q; ++q) {
+            cdouble* x_q =
+                x_by_q.data() + static_cast<std::size_t>(q) * B * SD;
+            for (ssize_t b = 0; b < B; ++b) {
+                for (ssize_t s = 0; s < S; ++s) {
+                    for (ssize_t d = 0; d < D; ++d) {
+                        x_q[(b * S + s) * D + d] =
+                            local[((b * Q + q) * S + s) * D + d];
+                    }
+                }
+            }
+        }
+        for (ssize_t n = 0; n < N; ++n) {
+            std::fill(
+                intermediate.begin(),
+                intermediate.end(),
+                cdouble(0.0, 0.0)
+            );
+            for (ssize_t q = 0; q < Q; ++q) {
+                const TwoSitePhysicalGroup& left_group =
+                    left_groups[static_cast<std::size_t>(n) * Q + q];
+                if (left_group.outputs.empty()) {
+                    continue;
+                }
+                const ssize_t left_rows =
+                    static_cast<ssize_t>(left_group.outputs.size()) * A;
+                cblas_zgemm(
+                    CblasRowMajor,
+                    CblasNoTrans,
+                    CblasNoTrans,
+                    static_cast<int>(left_rows),
+                    static_cast<int>(SD),
+                    static_cast<int>(B),
+                    &one,
+                    left_group.blocks.data(),
+                    static_cast<int>(B),
+                    x_by_q.data() + static_cast<std::size_t>(q) * B * SD,
+                    static_cast<int>(SD),
+                    &zero,
+                    left_contribution.data(),
+                    static_cast<int>(SD)
+                );
+                for (
+                    std::size_t lp = 0;
+                    lp < left_group.outputs.size();
+                    ++lp
+                ) {
+                    const ssize_t p = left_group.outputs[lp];
+                    for (ssize_t a = 0; a < A; ++a) {
+                        const cdouble* source =
+                            left_contribution.data()
+                            + (static_cast<ssize_t>(lp) * A + a) * SD;
+                        cdouble* target =
+                            intermediate.data() + (p * A + a) * SD;
+                        for (ssize_t sd = 0; sd < SD; ++sd) {
+                            target[sd] += source[sd];
+                        }
+                    }
+                }
+            }
+            for (ssize_t s = 0; s < S; ++s) {
+                const TwoSitePhysicalGroup& right_group =
+                    right_groups[static_cast<std::size_t>(n) * S + s];
+                if (right_group.outputs.empty()) {
+                    continue;
+                }
+                const ssize_t right_rows =
+                    static_cast<ssize_t>(right_group.outputs.size()) * C;
+                for (ssize_t ap = 0; ap < AP; ++ap) {
+                    const cdouble* source =
+                        intermediate.data() + ap * SD + s * D;
+                    cdouble* target = intermediate_s.data() + ap * D;
+                    for (ssize_t d = 0; d < D; ++d) {
+                        target[d] = source[d];
+                    }
+                }
+                cblas_zgemm(
+                    CblasRowMajor,
+                    CblasNoTrans,
+                    CblasTrans,
+                    static_cast<int>(AP),
+                    static_cast<int>(right_rows),
+                    static_cast<int>(D),
+                    &one,
+                    intermediate_s.data(),
+                    static_cast<int>(D),
+                    right_group.blocks.data(),
+                    static_cast<int>(D),
+                    &zero,
+                    right_contribution.data(),
+                    static_cast<int>(right_rows)
+                );
+                for (ssize_t p = 0; p < P; ++p) {
+                    for (ssize_t a = 0; a < A; ++a) {
+                        const ssize_t ap = p * A + a;
+                        for (
+                            std::size_t rr = 0;
+                            rr < right_group.outputs.size();
+                            ++rr
+                        ) {
+                            const ssize_t r = right_group.outputs[rr];
+                            for (ssize_t c = 0; c < C; ++c) {
+                                out[((a * P + p) * R + r) * C + c] +=
+                                    right_contribution[
+                                        static_cast<std::size_t>(ap) * right_rows
+                                        + static_cast<ssize_t>(rr) * C
+                                        + c
+                                    ];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    return lanczos_apply(vec, dt, krylov_dim, tol, matvec);
+}
+#endif
+
+static py::array_t<cdouble> two_site_lanczos(
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> theta,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> left,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W_left,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> W_right,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> right,
+    double dt,
+    int krylov_dim,
+    double tol
+) {
+    if (
+        theta.ndim() != 4
+        || left.ndim() != 3
+        || W_left.ndim() != 4
+        || W_right.ndim() != 4
+        || right.ndim() != 3
+    ) {
+        throw std::runtime_error(
+            "two_site_lanczos expects theta(4), left(3), W_left(4), "
+            "W_right(4), right(3)"
+        );
+    }
+
+    const ssize_t B = theta.shape(0);
+    const ssize_t Q = theta.shape(1);
+    const ssize_t S = theta.shape(2);
+    const ssize_t D = theta.shape(3);
+    const ssize_t A = left.shape(0);
+    const ssize_t M = left.shape(1);
+    const ssize_t N = W_left.shape(1);
+    const ssize_t P = W_left.shape(2);
+    const ssize_t O = W_right.shape(1);
+    const ssize_t R = W_right.shape(2);
+    const ssize_t C = right.shape(0);
+
+    if (
+        left.shape(2) != B
+        || W_left.shape(0) != M
+        || W_left.shape(3) != Q
+        || W_right.shape(0) != N
+        || W_right.shape(3) != S
+        || right.shape(1) != O
+        || right.shape(2) != D
+    ) {
+        throw std::runtime_error("two_site_lanczos input shapes are incompatible");
+    }
+    if (A != B || P != Q || R != S || C != D) {
+        throw std::runtime_error("two_site_lanczos requires a square effective local space");
+    }
+
+    const cdouble* theta_ptr = theta.data();
+    const cdouble* left_ptr = left.data();
+    const cdouble* W_left_ptr = W_left.data();
+    const cdouble* W_right_ptr = W_right.data();
+    const cdouble* right_ptr = right.data();
+    const ssize_t AP = A * P;
+    const ssize_t BQ = B * Q;
+    const ssize_t SD = S * D;
+    const ssize_t RC = R * C;
+    const std::size_t dim = static_cast<std::size_t>(BQ) * SD;
+
+    std::vector<cdouble> vec(dim);
+    std::copy(theta_ptr, theta_ptr + static_cast<ssize_t>(dim), vec.begin());
+    std::vector<cdouble> result;
+
+    {
+        py::gil_scoped_release release;
+#if PYQED_TDVP_HAS_BLAS
+        const double physical_cutoff = 1.0e-14;
+        std::vector<std::size_t> left_transition_counts(
+            static_cast<std::size_t>(N),
+            0
+        );
+        std::vector<std::size_t> right_transition_counts(
+            static_cast<std::size_t>(N),
+            0
+        );
+        for (ssize_t m = 0; m < M; ++m) {
+            for (ssize_t n = 0; n < N; ++n) {
+                for (ssize_t p = 0; p < P; ++p) {
+                    for (ssize_t q = 0; q < Q; ++q) {
+                        if (
+                            std::abs(
+                                W_left_ptr[((m * N + n) * P + p) * Q + q]
+                            ) > physical_cutoff
+                        ) {
+                            ++left_transition_counts[static_cast<std::size_t>(n)];
+                        }
+                    }
+                }
+            }
+        }
+        for (ssize_t n = 0; n < N; ++n) {
+            for (ssize_t o = 0; o < O; ++o) {
+                for (ssize_t r = 0; r < R; ++r) {
+                    for (ssize_t s = 0; s < S; ++s) {
+                        if (
+                            std::abs(
+                                W_right_ptr[((n * O + o) * R + r) * S + s]
+                            ) > physical_cutoff
+                        ) {
+                            ++right_transition_counts[static_cast<std::size_t>(n)];
+                        }
+                    }
+                }
+            }
+        }
+        std::size_t sparse_routes = 0;
+        for (ssize_t n = 0; n < N; ++n) {
+            sparse_routes +=
+                left_transition_counts[static_cast<std::size_t>(n)]
+                * right_transition_counts[static_cast<std::size_t>(n)];
+        }
+        const std::size_t dense_routes =
+            static_cast<std::size_t>(N) * M * P * Q * O * R * S;
+        if (
+            sparse_routes > 0
+            && sparse_routes * 4 < dense_routes
+            && A * P <= static_cast<ssize_t>(INT_MAX)
+            && B <= static_cast<ssize_t>(INT_MAX)
+            && C * R <= static_cast<ssize_t>(INT_MAX)
+            && D <= static_cast<ssize_t>(INT_MAX)
+        ) {
+            result = grouped_sparse_two_site_lanczos_apply(
+                vec,
+                dt,
+                krylov_dim,
+                tol,
+                left_ptr,
+                W_left_ptr,
+                W_right_ptr,
+                right_ptr,
+                A,
+                B,
+                Q,
+                S,
+                D,
+                M,
+                N,
+                O,
+                P,
+                R,
+                C,
+                physical_cutoff
+            );
+        } else {
+#endif
+        std::vector<cdouble> left_eff(
+            static_cast<std::size_t>(N) * AP * BQ,
+            0.0
+        );
+        std::vector<cdouble> right_eff(
+            static_cast<std::size_t>(N) * RC * SD,
+            0.0
+        );
+
+        for (ssize_t n = 0; n < N; ++n) {
+            cdouble* block = left_eff.data() + static_cast<std::size_t>(n) * AP * BQ;
+            for (ssize_t a = 0; a < A; ++a) {
+                for (ssize_t p = 0; p < P; ++p) {
+                    const ssize_t row = a * P + p;
+                    for (ssize_t b = 0; b < B; ++b) {
+                        for (ssize_t q = 0; q < Q; ++q) {
+                            cdouble value = 0.0;
+                            for (ssize_t m = 0; m < M; ++m) {
+                                value +=
+                                    left_ptr[(a * M + m) * B + b]
+                                    * W_left_ptr[((m * N + n) * P + p) * Q + q];
+                            }
+                            block[row * BQ + b * Q + q] = value;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (ssize_t n = 0; n < N; ++n) {
+            cdouble* block = right_eff.data() + static_cast<std::size_t>(n) * RC * SD;
+            for (ssize_t r = 0; r < R; ++r) {
+                for (ssize_t c = 0; c < C; ++c) {
+                    const ssize_t row = r * C + c;
+                    for (ssize_t s = 0; s < S; ++s) {
+                        for (ssize_t d = 0; d < D; ++d) {
+                            cdouble value = 0.0;
+                            for (ssize_t o = 0; o < O; ++o) {
+                                value +=
+                                    W_right_ptr[((n * O + o) * R + r) * S + s]
+                                    * right_ptr[(c * O + o) * D + d];
+                            }
+                            block[row * SD + s * D + d] = value;
+                        }
+                    }
+                }
+            }
+        }
+
+        std::vector<cdouble> temporary(static_cast<std::size_t>(AP) * SD, 0.0);
+        auto matvec = [&](const std::vector<cdouble>& local, std::vector<cdouble>& out) {
+            out.assign(static_cast<std::size_t>(AP) * RC, cdouble(0.0, 0.0));
+#if PYQED_TDVP_HAS_BLAS
+            const cdouble one(1.0, 0.0);
+            const cdouble zero(0.0, 0.0);
+            for (ssize_t n = 0; n < N; ++n) {
+                const cdouble* left_block =
+                    left_eff.data() + static_cast<std::size_t>(n) * AP * BQ;
+                const cdouble* right_block =
+                    right_eff.data() + static_cast<std::size_t>(n) * RC * SD;
+                cblas_zgemm(
+                    CblasRowMajor,
+                    CblasNoTrans,
+                    CblasNoTrans,
+                    static_cast<int>(AP),
+                    static_cast<int>(SD),
+                    static_cast<int>(BQ),
+                    &one,
+                    left_block,
+                    static_cast<int>(BQ),
+                    local.data(),
+                    static_cast<int>(SD),
+                    &zero,
+                    temporary.data(),
+                    static_cast<int>(SD)
+                );
+                cblas_zgemm(
+                    CblasRowMajor,
+                    CblasNoTrans,
+                    CblasTrans,
+                    static_cast<int>(AP),
+                    static_cast<int>(RC),
+                    static_cast<int>(SD),
+                    &one,
+                    temporary.data(),
+                    static_cast<int>(SD),
+                    right_block,
+                    static_cast<int>(SD),
+                    n == 0 ? &zero : &one,
+                    out.data(),
+                    static_cast<int>(RC)
+                );
+            }
+#else
+            for (ssize_t n = 0; n < N; ++n) {
+                const cdouble* left_block =
+                    left_eff.data() + static_cast<std::size_t>(n) * AP * BQ;
+                const cdouble* right_block =
+                    right_eff.data() + static_cast<std::size_t>(n) * RC * SD;
+                for (ssize_t ap = 0; ap < AP; ++ap) {
+                    for (ssize_t sd = 0; sd < SD; ++sd) {
+                        cdouble value = 0.0;
+                        for (ssize_t bq = 0; bq < BQ; ++bq) {
+                            value += left_block[ap * BQ + bq] * local[bq * SD + sd];
+                        }
+                        temporary[ap * SD + sd] = value;
+                    }
+                }
+                for (ssize_t ap = 0; ap < AP; ++ap) {
+                    for (ssize_t rc = 0; rc < RC; ++rc) {
+                        cdouble value = 0.0;
+                        for (ssize_t sd = 0; sd < SD; ++sd) {
+                            value += temporary[ap * SD + sd] * right_block[rc * SD + sd];
+                        }
+                        out[ap * RC + rc] += value;
+                    }
+                }
+            }
+#endif
+        };
+        result = lanczos_apply(vec, dt, krylov_dim, tol, matvec);
+#if PYQED_TDVP_HAS_BLAS
+        }
+#endif
+    }
+
+    py::array_t<cdouble> out({A, P, R, C});
+    std::copy(result.begin(), result.end(), out.mutable_data());
+    return out;
+}
+
 static py::array_t<cdouble> bond_lanczos(
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> center,
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> left,
@@ -734,5 +1274,10 @@ PYBIND11_MODULE(_cpp_tdvp, m) {
     m.doc() = "C++ dense TDVP local evolution kernels";
     m.attr("HAS_BLAS") = bool(PYQED_TDVP_HAS_BLAS);
     m.def("site_lanczos", &site_lanczos, "Lanczos evolution for one TDVP site tensor");
+    m.def(
+        "two_site_lanczos",
+        &two_site_lanczos,
+        "Lanczos evolution for one TDVP two-site tensor"
+    );
     m.def("bond_lanczos", &bond_lanczos, "Lanczos evolution for one TDVP bond-center tensor");
 }

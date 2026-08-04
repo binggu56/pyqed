@@ -20,7 +20,11 @@ import numpy as np
 import scipy.sparse as sparse
 from scipy.linalg import expm
 from scipy.sparse.linalg import eigsh
-from tensorly.decomposition import tensor_train_matrix
+
+try:
+    from tensorly.decomposition import tensor_train_matrix
+except ImportError:  # tensorly is needed only for dense-operator MPO factoring.
+    tensor_train_matrix = None
 
 from pyqed.mps.decompose import compress, decompose
 from pyqed.mps.dense_canonical import LeftCanonical, RightCanonical
@@ -100,6 +104,7 @@ from pyqed.mps.abelian_direct import (
     AbelianSameSidePRouteIdentityEntries,
     AbelianSameSidePRoutePlan,
     AbelianSpatialLocalOperatorBuilder,
+    AbelianTwoSiteSplitResult,
     AbelianTwoSiteUpdateData,
     abelian_axis_sector_dims,
     abelian_contract_from_left_data,
@@ -672,7 +677,7 @@ def _make_complementary_boundary_stack(families, nsites):
             n_terms = 0 if payload is None else int(payload.n_terms)
             cross_terms = 0 if payload is None else int(payload.cross_terms)
             channels = (int(channel),) if cross_terms > 0 else ()
-            payload_keys = () if payload is None else tuple(key for key, _value in payload.entries)
+            payload_keys = () if payload is None else tuple(payload.entries)
             blocks[str(name)] = ComplementaryFamilyRenormalizedOperatorBlock(
                 family_name=str(name),
                 channels=channels,
@@ -14391,6 +14396,11 @@ class MovingEnvironment:
         self._dense_operatorless_local_problem_active = False
         self._local_profile_stats = {}
         self._dense_local_profile_stats = {}
+        self.last_owner_local_profile = None
+        self.last_owner_local_flat_guess = None
+        self.last_owner_local_update = None
+        self.last_owner_local_flat = None
+        self.last_owner_local_layout = None
         self._dense_operatorless_key = None
         self.bond = None
         self.left_environments = None
@@ -16059,13 +16069,7 @@ class MovingEnvironment:
             self._option_value(
                 self.matvec_options,
                 "moving_environment_cpp_owner_half_sweep_step_records",
-                bool(
-                    self._option_value(
-                        self.matvec_options,
-                        "moving_environment_cpp_state_owner",
-                        False,
-                    )
-                ),
+                False,
             )
         ) and hasattr(owner, "install_owner_bond_step") and hasattr(
             owner,
@@ -18744,6 +18748,9 @@ class MovingEnvironment:
         self.moving_profile_stats["solve_local_calls"] = int(
             self.moving_profile_stats.get("solve_local_calls", 0)
         ) + 1
+        self.last_owner_local_update = None
+        self.last_owner_local_flat = None
+        self.last_owner_local_layout = None
         if not bool(getattr(local_operator, "_packed_local_davidson", False)):
             self.moving_profile_stats["solve_local_rejections"] = int(
                 self.moving_profile_stats.get("solve_local_rejections", 0)
@@ -18782,6 +18789,21 @@ class MovingEnvironment:
             self.moving_profile_stats["solve_local_accepts"] = int(
                 self.moving_profile_stats.get("solve_local_accepts", 0)
             ) + 1
+            self.last_owner_local_update = getattr(
+                local_operator,
+                "last_packed_davidson_solution_update",
+                None,
+            )
+            self.last_owner_local_flat = getattr(
+                local_operator,
+                "last_packed_davidson_solution_flat",
+                None,
+            )
+            self.last_owner_local_layout = getattr(
+                local_operator,
+                "last_packed_davidson_solution_layout",
+                None,
+            )
         return result
 
     def _record_dense_operatorless_path(self, name, elapsed, calls):
@@ -27551,9 +27573,11 @@ class MPS:
         return self.right_canonicalize()
 
     def compress(self, chi_max):
-        """Return a normalized dense MPS truncated to ``chi_max``."""
+        """Return a scale-preserving dense MPS truncated to ``chi_max``."""
         dense_factors = [self._get_std_B(i) for i in range(self.L)]
-        compressed_factors = compress(dense_factors, chi_max)
+        compressed_factors = compress(
+            dense_factors, chi_max, renormalize=False
+        )
         if isinstance(compressed_factors, tuple):
             compressed_factors = compressed_factors[0]
         return type(self)(compressed_factors)
@@ -28177,6 +28201,26 @@ class MPO:
         """Return right bond dimensions for each site."""
         return [int(tensor.shape[1]) for tensor in self.factors]
 
+    def compress(self, chi_max):
+        """Return a scale-preserving MPO truncated to ``chi_max``."""
+        mps_factors = []
+        physical_dims = []
+        for W in self.factors:
+            left, right, d_out, d_in = W.shape
+            physical_dims.append((d_out, d_in))
+            mps_factors.append(
+                W.reshape(left, right, d_out * d_in).transpose(0, 2, 1)
+            )
+
+        compressed = compress(mps_factors, chi_max, renormalize=False)
+        factors = []
+        for B, (d_out, d_in) in zip(compressed, physical_dims):
+            left, _, right = B.shape
+            factors.append(
+                B.transpose(0, 2, 1).reshape(left, right, d_out, d_in)
+            )
+        return type(self)(factors, target_qn=self.target_qn)
+
     def dot(self, mps, D=None):
         """Apply this MPO and compress the resulting MPS."""
         if not isinstance(mps, MPS):
@@ -28184,11 +28228,7 @@ class MPO:
         if D is None:
             D = 2 * max(mps.bond_orders())
 
-        factors = apply_mpo(
-            self.factors,
-            [mps._get_std_B(i) for i in range(mps.L)],
-            D,
-        )
+        factors = apply_mpo(self, mps, D)
         return MPS(factors)
 
 
@@ -28208,53 +28248,13 @@ class MPO:
                 # expmpo(..., D=None), which expect an untruncated Taylor build.
                 return self.__matmul__(other)
 
-            # 1. Compute raw product
-            # Output format of product_MPO is (Left, Right, Up, Down)
-            raw_factors = product_MPO(self.factors, other.factors)
-
-            # 2. Prepare for compress
-            # decompose.py strictly requires shape: (Left, Physical, Right)
-            # But our MPO product produces: (Left, Right, Up, Down)
-            mps_factors = []
-            phys_dims = []
-
-            for W in raw_factors:
-                s = W.shape
-                # Store original physical dims (d_up, d_down)
-                phys_dims.append((s[2], s[3]))
-
-                # Step A: Merge physical legs -> (Left, Right, Phys_Combined)
-                W_flat = W.reshape(s[0], s[1], s[2] * s[3])
-
-                # Step B: Transpose to match decompose.py -> (Left, Phys_Combined, Right)
-                W_ready = W_flat.transpose(0, 2, 1)
-
-                mps_factors.append(W_ready)
-
-            # 3. Compress (Input is Left, Phys, Right)
-            # The output B will also be (Left, Phys, Right)
-            compressed_factors = compress(mps_factors, chi_max)
-
-            # 4. Restore MPO format
-            final_factors = []
-            for i, B in enumerate(compressed_factors):
-                # B shape: (new_chi_L, d_combined, new_chi_R)
-
-                # Step A: Transpose back -> (new_chi_L, new_chi_R, d_combined)
-                B_transposed = B.transpose(0, 2, 1)
-
-                # Step B: Split physical legs -> (new_chi_L, new_chi_R, d_up, d_down)
-                d_up, d_down = phys_dims[i]
-                W_final = B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down)
-
-                final_factors.append(W_final)
-
-            return MPO(final_factors)
+            raw_product = MPO(product_MPO(self.factors, other.factors))
+            return raw_product.compress(chi_max)
 
         elif isinstance(other, MPS):
             if chi_max is None:
-                chi_max = max(self.bond_orders()) * 2
-            new_factors = apply_mpo(self.factors, other.factors, chi_max)
+                return self.__matmul__(other)
+            new_factors = apply_mpo(self, other, chi_max)
             return MPS(new_factors)
 
         raise TypeError(f"Unsupported operand type: {type(other)}")
@@ -28316,41 +28316,8 @@ class MPO:
 
             return MPO(final_factors)
 
-        elif isinstance(other, MPS): # MPO @ MPS
-
-            L = other.L
-            if L != self.L:
-                raise ValueError(f"MPO length does not match ({self.L}) and MPS ({L}).")
-
-            factors = []
-            for i in range(L):
-                W = self.factors[i] # Shape: (wL, wR, pOut, pIn)
-                # B = psi_mps._get_std_B(i) # MPS to (Left, Phys, Right)
-                B = other.factors[i]
-
-                # psi = U @ psi
-                # B: (bL, pIn, bR)
-                # W: (wL, wR, pOut, pIn)
-                # Contract B[Phys] (axis 1) with W[PhysIn] (axis 3)
-                T = np.tensordot(B, W, axes=(1, 3))
-
-                # Result T: (bL, bR, wL, wR, pOut)
-                # rearrange to: (NewLeft, NewPhys, NewRight)
-                # NewLeft  = (bL, wL) -> Indices (0, 2)
-                # NewPhys  = (pOut)   -> Index   (4)
-                # NewRight = (bR, wR) -> Indices (1, 3)
-                # Transpose: (0, 2, 4, 1, 3)
-                T = T.transpose(0, 2, 4, 1, 3)
-
-                # Fuse Bonds
-                s = T.shape
-                dim_L = s[0] * s[1]
-                dim_P = s[2]
-                dim_R = s[3] * s[4]
-                T_flat = T.reshape(dim_L, dim_P, dim_R)
-                factors.append(T_flat)
-
-            return MPS(factors)
+        elif isinstance(other, MPS):
+            return MPS(_apply_mpo_uncompressed(self, other))
 
 
     def __mul__(self, other):
@@ -28472,7 +28439,109 @@ class MPO:
 
         """
 
-        return expmpo(self.H, constant, method='taylor', order=4, scale=0)
+        return expmpo(
+            self,
+            constant=constant,
+            D=D,
+            method=method,
+            order=order,
+            scale=scale,
+        )
+
+def fock_state(nbas, *, state=0, nstates=2, occupations=0):
+    """Return an electronic basis state times local Fock occupations."""
+    counts = np.atleast_1d(nbas).astype(int)
+    occupation = np.broadcast_to(occupations, counts.shape).astype(int)
+    if np.any(counts <= 0):
+        raise ValueError("Every Fock basis size must be positive.")
+    if nstates <= 0 or not 0 <= state < nstates:
+        raise ValueError("state must index the electronic basis.")
+    if np.any(occupation < 0) or np.any(occupation >= counts):
+        raise ValueError("Each occupation must lie inside its Fock basis.")
+
+    electronic = np.zeros(nstates, dtype=complex)
+    electronic[state] = 1.0
+    factors = [electronic.reshape(1, nstates, 1)]
+    for count, number in zip(counts, occupation):
+        local = np.zeros(count, dtype=complex)
+        local[number] = 1.0
+        factors.append(local.reshape(1, count, 1))
+    return MPS(factors)
+
+
+def gaussian_state(
+    grids,
+    *,
+    state=0,
+    nstates=2,
+    center=0.0,
+    width=1.0,
+    momentum=0.0,
+    weights=None,
+):
+    """Return an electronic basis state times Gaussian DVR wave packets.
+
+    ``weights`` contains the quadrature weights for each grid.  When supplied,
+    the returned MPS stores quadrature-normalized DVR coefficients,
+    ``sqrt(weights) * psi(grid)``.
+    """
+    grids = [np.asarray(grid, dtype=float) for grid in grids]
+    if any(grid.ndim != 1 or grid.size == 0 for grid in grids):
+        raise ValueError(
+            "Each DVR grid must be a non-empty one-dimensional array."
+        )
+    if nstates <= 0 or not 0 <= state < nstates:
+        raise ValueError("state must index the electronic basis.")
+
+    nmodes = len(grids)
+    try:
+        centers, widths, momenta = [
+            np.broadcast_to(value, (nmodes,)).astype(float)
+            for value in (center, width, momentum)
+        ]
+    except ValueError as error:
+        raise ValueError(
+            "center, width, and momentum must broadcast over all modes."
+        ) from error
+    if np.any(~np.isfinite(widths)) or np.any(widths <= 0.0):
+        raise ValueError("Gaussian widths must be finite and positive.")
+    if weights is None:
+        grid_weights = [None] * nmodes
+    else:
+        if len(weights) != nmodes:
+            raise ValueError("weights must contain one array per DVR grid.")
+        grid_weights = []
+        for grid, values in zip(grids, weights):
+            values = np.asarray(values, dtype=float)
+            if values.shape != grid.shape:
+                raise ValueError(
+                    "Each quadrature-weight array must match its DVR grid."
+                )
+            if np.any(~np.isfinite(values)) or np.any(values <= 0.0):
+                raise ValueError(
+                    "Quadrature weights must be finite and positive."
+                )
+            grid_weights.append(values)
+
+    electronic = np.zeros(nstates, dtype=complex)
+    electronic[state] = 1.0
+    factors = [electronic.reshape(1, nstates, 1)]
+    for grid, packet_center, packet_width, packet_momentum, quadrature_weights in zip(
+        grids, centers, widths, momenta, grid_weights
+    ):
+        packet = np.exp(
+            -0.5 * ((grid - packet_center) / packet_width) ** 2
+            + 1j * packet_momentum * grid
+        )
+        if quadrature_weights is not None:
+            packet *= np.sqrt(quadrature_weights)
+        norm = np.linalg.norm(packet)
+        if not np.isfinite(norm) or norm == 0.0:
+            raise ValueError("The Gaussian is numerically zero on a DVR grid.")
+        packet /= norm
+        factors.append(packet.reshape(1, grid.size, 1))
+    return MPS(factors)
+
 
 def gwp_mps(coord, nstates=None, inistates=0, a=None, x0=None, p0=0., dx=None, **kwargs):
     r"""
@@ -28660,6 +28729,10 @@ def _mpo_to_dense_operator(mpo):
 
 def _dense_operator_to_mpo(matrix, dims):
     """Factor a dense operator into an MPO exactly on small Hilbert spaces."""
+    if tensor_train_matrix is None:
+        raise ImportError(
+            "tensorly is required to factor a dense operator into an MPO."
+        )
     matrix = np.asarray(matrix, dtype=complex)
     tensor = matrix.reshape(tuple(dims) + tuple(dims))
     tt = tensor_train_matrix(tensor, rank=matrix.shape[0])
@@ -28739,11 +28812,69 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
         factorial = factorial * k
         coefficient = (scaled_constant ** k) / factorial
         result = result + (term * coefficient)
+        if D is not None:
+            # Bound the direct-sum growth before scaling-and-squaring.  Waiting
+            # until the square forms a raw product can create O((order*D)^2)
+            # virtual bonds and an intractably large SVD.
+            result = result.compress(D)
 
     for _ in range(scale):
         result = result.matmul(result, chi_max=D)
 
     return result
+
+def _apply_mpo_uncompressed(w_list, B_list):
+    """Contract a dense MPO and MPS into standard-order MPS tensors."""
+    mpo_factors = w_list.factors if isinstance(w_list, MPO) else list(w_list)
+    if isinstance(B_list, MPS):
+        mps_factors = [B_list._get_std_B(i) for i in range(B_list.L)]
+    else:
+        mps_factors = list(B_list)
+
+    if len(mpo_factors) != len(mps_factors):
+        raise ValueError(
+            "MPO and MPS lengths must match; got "
+            f"{len(mpo_factors)} and {len(mps_factors)}."
+        )
+    if not mpo_factors:
+        raise ValueError("MPO and MPS must contain at least one site.")
+
+    result = []
+    previous_mpo_right = previous_mps_right = None
+    for site, (W, B) in enumerate(zip(mpo_factors, mps_factors)):
+        if getattr(W, "ndim", None) != 4:
+            raise ValueError(f"MPO site {site} must have rank 4.")
+        if getattr(B, "ndim", None) != 3:
+            raise ValueError(f"MPS site {site} must have rank 3.")
+
+        b_left, b_right, d_out, d_in_mpo = W.shape
+        chi_left, d_in_mps, chi_right = B.shape
+        if d_in_mpo != d_in_mps:
+            raise ValueError(
+                f"Physical input dimension mismatch at site {site}: "
+                f"MPO has {d_in_mpo}, MPS has {d_in_mps}."
+            )
+        if site and b_left != previous_mpo_right:
+            raise ValueError(f"Incompatible MPO virtual bond before site {site}.")
+        if site and chi_left != previous_mps_right:
+            raise ValueError(f"Incompatible MPS virtual bond before site {site}.")
+
+        # Fuse virtual legs in the same order on both sides: (MPS, MPO).
+        # Mixing (MPO, MPS) on the left with (MPS, MPO) on the right silently
+        # scrambles the next-site contraction when both bonds are nontrivial.
+        contracted = np.einsum("abij,kjl->kailb", W, B, optimize=True)
+        result.append(
+            contracted.reshape(
+                b_left * chi_left,
+                d_out,
+                chi_right * b_right,
+            )
+        )
+        previous_mpo_right = b_right
+        previous_mps_right = chi_right
+
+    return result
+
 
 def apply_mpo(w_list, B_list, chi_max):
     """
@@ -28763,47 +28894,16 @@ def apply_mpo(w_list, B_list, chi_max):
 
     Returns
     -------
-    tuple
-        (compressed_mps, truncation_error)
+    list
+        Compressed MPS tensors in ``(left, physical, right)`` order.  The
+        contraction and truncation preserve the state's overall scale.
 
     Note
     ----
     This function does NOT modify the input B_list.
     """
-    if isinstance(w_list, MPO):
-        w_list_copy = w_list.factors
-    else:
-        w_list_copy = w_list
-
-    if isinstance(B_list, MPS):
-        B_list_copy = B_list.factors
-    else:
-        B_list_copy = B_list
-
-    L = len(w_list_copy)
-    if L > len(B_list_copy):
-        raise ValueError("MPO must have the same or shorter length than MPS.")
-
-    result = [B.copy() for B in B_list_copy]
-
-    for i_site in range(L):
-        # B: [chi_L, d_in, chi_R]
-        # W: [b_L, b_R, d_out, d_in]
-        chi_L, d_in_mps, chi_R = result[i_site].shape
-        b_L, b_R, d_out, d_in_mpo = w_list_copy[i_site].shape
-
-        # Contract W's In (j) with B's Phys (j)
-        # W: abij (a=b_L, b=b_R, i=d_out, j=d_in)
-        # B: kjl (k=chi_L, j=d_in, l=chi_R)
-        # einsum: 'abij,kjl->akilb' -> (b_L, chi_L, d_out, chi_R, b_R)
-        B_new = np.einsum('abij,kjl->akilb', w_list_copy[i_site], result[i_site])
-
-        # Reshape to strictly [Left, Phys, Right] for the compress function
-        B_new = np.reshape(B_new, (b_L * chi_L, d_out, chi_R * b_R))
-        result[i_site] = B_new
-
-    # compress strictly expects [Left, Phys, Right]
-    return compress(result, chi_max)
+    result = _apply_mpo_uncompressed(w_list, B_list)
+    return compress(result, chi_max, renormalize=False)
 
 
 
@@ -30102,6 +30202,44 @@ def is_abelian_flat_two_site_guess(value):
     return bool(getattr(value, "_pyqed_abelian_flat_two_site_guess", False))
 
 
+def _publish_owner_local_optimize_diagnostics(moving_environment):
+    update = getattr(moving_environment, "last_owner_local_update", None)
+    if not isinstance(update, AbelianTwoSiteUpdateData):
+        return False
+    flat = getattr(moving_environment, "last_owner_local_flat", None)
+    layout = getattr(moving_environment, "last_owner_local_layout", None)
+    optimize_two_sites.last_profile = getattr(
+        moving_environment,
+        "last_owner_local_profile",
+        None,
+    )
+    optimize_two_sites.last_AA = None
+    optimize_two_sites.last_AA_flat = None if flat is None else np.asarray(flat)
+    optimize_two_sites.last_AA_layout = (
+        None if layout is None else tuple(layout)
+    )
+    optimize_two_sites.last_split_result = AbelianTwoSiteSplitResult(
+        a_data=update.left.data,
+        b_data=update.right.data,
+        a_qns=[list(axis_qns) for axis_qns in update.left.qns],
+        b_qns=[list(axis_qns) for axis_qns in update.right.qns],
+        a_dirs=list(update.left.dirs),
+        b_dirs=list(update.right.dirs),
+        s_data=update.s_data,
+        bond_qns=list(update.bond_qns),
+        truncation_error=float(update.truncation_error),
+        kept_states=int(update.kept_states),
+    )
+    optimize_two_sites.last_native_site_tensors = update
+    optimize_two_sites.last_AA_flat_guess = getattr(
+        moving_environment,
+        "last_owner_local_flat_guess",
+        None,
+    )
+    optimize_two_sites.last_split_legacy_wrapped = False
+    return True
+
+
 def optimize_two_sites(
     A,
     B,
@@ -30829,6 +30967,7 @@ def two_site_dmrg(
     site_qn_maps=None,
     recenter_final=True,
     abelian_matvec_options=None,
+    converge_on_full_sweeps=False,
 ):
     """
     Driver function to perform sweeps of 2-site DMRG
@@ -38467,12 +38606,12 @@ def two_site_dmrg(
             enable_native_r = bool(
                 getattr(
                     complementary_operator_families,
-                    "enable_native_boundary_r",
+                    "enable_cpp_boundary_r",
                     False,
                 )
             ) or bool(
                 abelian_matvec_options.get(
-                    "generator_table_enable_native_boundary_r",
+                    "generator_table_enable_cpp_boundary_r",
                     False,
                 )
             )
@@ -38486,7 +38625,7 @@ def two_site_dmrg(
                 bool(
                     getattr(
                         complementary_operator_families,
-                        "enable_native_boundary_p",
+                        "enable_cpp_boundary_p",
                         False,
                     )
                 )
@@ -38526,14 +38665,14 @@ def two_site_dmrg(
             validate = bool(
                 getattr(
                     complementary_operator_families,
-                    "validate_native_boundary_r",
+                    "validate_cpp_boundary_r",
                     True,
                 )
             )
-            if "generator_table_validate_native_boundary_r" in abelian_matvec_options:
+            if "generator_table_validate_cpp_boundary_r" in abelian_matvec_options:
                 validate = bool(
                     abelian_matvec_options.get(
-                        "generator_table_validate_native_boundary_r",
+                        "generator_table_validate_cpp_boundary_r",
                         validate,
                     )
                 )
@@ -38681,7 +38820,7 @@ def two_site_dmrg(
             if not bool(
                 getattr(
                     complementary_operator_families,
-                    "enable_native_boundary_p",
+                    "enable_cpp_boundary_p",
                     False,
                 )
             ):
@@ -38787,14 +38926,14 @@ def two_site_dmrg(
             validate = bool(
                 getattr(
                     complementary_operator_families,
-                    "validate_native_boundary_p",
+                    "validate_cpp_boundary_p",
                     True,
                 )
             )
             validation_policy = str(
                 getattr(
                     complementary_operator_families,
-                    "native_boundary_p_validation_policy",
+                    "cpp_boundary_p_validation_policy",
                     "first_pass",
                 )
                 or "first_pass"
@@ -38809,13 +38948,13 @@ def two_site_dmrg(
                 validation_policy = "first_pass"
             validate_native_p_raw_table = bool(
                 abelian_matvec_options.get(
-                    "generator_table_validate_native_boundary_p_raw_table",
+                    "generator_table_validate_cpp_boundary_p_raw_table",
                     True,
                 )
             )
             native_p_raw_table_validation_vectors = int(
                 abelian_matvec_options.get(
-                    "generator_table_validate_native_boundary_p_raw_table_vectors",
+                    "generator_table_validate_cpp_boundary_p_raw_table_vectors",
                     2,
                 )
                 or 2
@@ -48737,6 +48876,7 @@ def two_site_dmrg(
                 Energy, left_site, right_site, trunc, states = h2_owner_result
                 _set_active_site_pair(0, left_site, right_site)
                 _sync_cpp_owner_site_chain(force=True)
+                _publish_owner_local_optimize_diagnostics(moving_environment)
             else:
                 Energy, MPS[0], MPS[1], trunc, states = optimize_two_sites(
                     MPS[0], MPS[1], MPO[0], MPO[1], E[-1], F[-1], m, 'right',
@@ -49351,6 +49491,7 @@ def two_site_dmrg(
                     None,
                 )
                 if owner_profile is not None:
+                    _publish_owner_local_optimize_diagnostics(moving_environment)
                     matvec_profile = owner_profile
                     moving_environment.last_owner_local_profile = None
             update = {
@@ -50257,6 +50398,7 @@ def two_site_dmrg(
                 None,
                 float(np.real(np.asarray(Eold).reshape(-1)[0])),
                 float(conv),
+                2 if converge_on_full_sweeps else 1,
             )
             if owner_site_chain_key:
                 _mark_cpp_owner_site_chain_dirty()
@@ -50563,12 +50705,12 @@ def two_site_dmrg(
         )
         gauge = "Left"
 
-        if abs(e_avg - Eold) < conv:
+        if not converge_on_full_sweeps and abs(e_avg - Eold) < conv:
             if verbose >= 1:
                 print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
             converged = True
             break
-        else:
+        elif not converge_on_full_sweeps:
             Eold = e_avg
         if sweep * 2 + 1 >= nsweep_half:
             break
@@ -50729,11 +50871,17 @@ def two_site_dmrg(
 
     if not_conv_err == True:
         if converged == False:
-            raise ValueError("DMRG did not converge within the given number of sweeps, if you wish to disable this error, set not_conv_err = False. or you should increase the number of sweeps.")
+            raise ValueError(
+                "DMRG did not converge within the requested directional passes; "
+                "increase sweeps or set not_conv_err=False for diagnostics."
+            )
     else:
         if converged == False:
             if verbose >= 1:
-                print("DMRG did not converge within {sweeps} sweeps, returning the last result.")
+                print(
+                    f"DMRG did not converge within {nsweep_half} directional "
+                    "passes; returning the last result."
+                )
     if gauge == None:
         gauge = "Right"
 

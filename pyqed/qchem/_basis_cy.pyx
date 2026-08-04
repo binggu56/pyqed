@@ -1189,6 +1189,33 @@ cdef inline int os_hash_slot(uint64_t key) noexcept nogil:
     return <int>(key & <uint64_t>(OS_HASH_CAP - 1))
 
 
+cdef inline void os_seed_boys_hash(
+    int max_m,
+    double T,
+    double base_pref,
+    uint64_t* keys,
+    double* values,
+    int* nstates,
+) noexcept nogil:
+    cdef int m, slot
+    cdef int zero_ang[12]
+    cdef uint64_t key
+    cdef double value = base_pref * boys_fn(max_m, T)
+    cdef double exp_value = base_pref * exp(-T)
+
+    memset(zero_ang, 0, 12 * sizeof(int))
+    for m in range(max_m, -1, -1):
+        key = os_pack_key(zero_ang, m)
+        slot = os_hash_slot(key)
+        while keys[slot] != 0:
+            slot = (slot + 1) & (OS_HASH_CAP - 1)
+        keys[slot] = key
+        values[slot] = value
+        nstates[0] += 1
+        if m > 0:
+            value = (2.0 * T * value + exp_value) / (2.0 * m - 1.0)
+
+
 cdef inline size_t os_vrr_idx(
     int ax, int ay, int az,
     int cx, int cy, int cz,
@@ -1266,10 +1293,13 @@ cdef void os_fill_vrr_table(
     cdef int cdim = max_c + 1
     cdef int mdim = max_m + 1
     cdef int m, total, ax, ay, az, cx, cy, cz, asum, csum, axis
-    cdef double value
+    cdef double value, exp_value = base_pref * exp(-T)
 
-    for m in range(max_m + 1):
-        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, base_pref * boys_fn(m, T))
+    value = base_pref * boys_fn(max_m, T)
+    for m in range(max_m, -1, -1):
+        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, value)
+        if m > 0:
+            value = (2.0 * T * value + exp_value) / (2.0 * m - 1.0)
 
     for total in range(1, max_m + 1):
         for ax in range(max_a + 1):
@@ -1380,13 +1410,16 @@ cdef void os_fill_vrr_table_kernel(
     cdef int cdim = max_c + 1
     cdef int mdim = max_m + 1
     cdef int m, total, ax, ay, az, cx, cy, cz, asum, csum, axis
-    cdef double value
+    cdef double value, exp_value = base_pref * exp(-T)
     cdef double alpha_over_p = alpha_kernel / p
     cdef double alpha_over_q = alpha_kernel / q
     cdef double cross = alpha_kernel / (2.0 * p * q)
 
-    for m in range(max_m + 1):
-        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, base_pref * boys_fn(m, T))
+    value = base_pref * boys_fn(max_m, T)
+    for m in range(max_m, -1, -1):
+        os_vrr_set(table, 0, 0, 0, 0, 0, 0, m, adim, cdim, mdim, value)
+        if m > 0:
+            value = (2.0 * T * value + exp_value) / (2.0 * m - 1.0)
 
     for total in range(1, max_m + 1):
         for ax in range(max_a + 1):
@@ -5084,6 +5117,9 @@ cpdef compute_cartesian_shell_quartet_block(
                     else:
                         os_nstates[0] = 0
                         memset(os_keys, 0, OS_HASH_CAP * sizeof(uint64_t))
+                        os_seed_boys_hash(
+                            max_m_l, T, base_pref, os_keys, os_values, os_nstates
+                        )
 
                     for ia in range(np_):
                         ao_p = p0 + ia

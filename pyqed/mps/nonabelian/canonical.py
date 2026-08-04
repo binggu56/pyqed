@@ -200,6 +200,7 @@ def left_canonicalize_sites(
     max_bond=None,
     max_bond_mode="states",
     bond_coupling="left",
+    retain_sector_topology=False,
 ):
     """
     Put a chain into left-canonical form by exact two-site gauge moves.
@@ -216,6 +217,7 @@ def left_canonicalize_sites(
             absorb="right",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("left_canonicalize_sites would truncate the state; increase max_bond or lower cutoff.")
@@ -230,6 +232,7 @@ def right_canonicalize_sites(
     max_bond=None,
     max_bond_mode="states",
     bond_coupling="left",
+    retain_sector_topology=False,
 ):
     """
     Put a chain into right-canonical form by exact two-site gauge moves.
@@ -246,6 +249,7 @@ def right_canonicalize_sites(
             absorb="left",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("right_canonicalize_sites would truncate the state; increase max_bond or lower cutoff.")
@@ -261,6 +265,7 @@ def mixed_canonicalize_sites(
     max_bond=None,
     max_bond_mode="states",
     bond_coupling="left",
+    retain_sector_topology=False,
 ):
     """
     Put a chain into mixed canonical form with orthogonality center at ``center``.
@@ -277,6 +282,7 @@ def mixed_canonicalize_sites(
             absorb="right",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("mixed_canonicalize_sites would truncate the state on the left pass.")
@@ -290,6 +296,7 @@ def mixed_canonicalize_sites(
             absorb="left",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("mixed_canonicalize_sites would truncate the state on the right pass.")

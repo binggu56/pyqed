@@ -1721,7 +1721,7 @@ def test_abelian_generator_table_native_build_avoids_blocktensor_constructor(mon
         complementary_operator_generator_entries={"R": {(0, 1): 0.5}},
         abelian_matvec_options={
             "native_site_storage": True,
-            "generator_table_enable_native_boundary_r": True,
+            "generator_table_enable_cpp_boundary_r": True,
             "generator_table_allow_reference_validation_fallback": True,
             "generator_table_packed_boundary_tensors": False,
         },

@@ -13,11 +13,19 @@ from .contraction import split_legs
 from .coupling import normalize_coupling_scheme, reduced_bond_space
 from .linalg import (
     ReducedProjectedSVD,
+    ReducedTruncation,
     normalize_max_bond_mode,
     project_reduced_sector,
+    sector_state_weight,
     truncate_reduced_svds,
 )
-from .tensor import FusionLeg, FusionPipe, FusionPipeEntry, NonabelianTensor
+from .tensor import (
+    FusionLeg,
+    FusionPipe,
+    FusionPipeEntry,
+    IdentityBasisTransform,
+    NonabelianTensor,
+)
 
 
 def _bond_basis_from_singular_values(singular_values, *, direction, name=None):
@@ -79,11 +87,11 @@ def _internal_bond_entries(two_site):
     if contracted_channels:
         entries = []
         for key, q_mid_tuple in contracted_channels.items():
-            if q_mid_tuple is None or len(q_mid_tuple) != 1:
+            if q_mid_tuple is None or len(q_mid_tuple) == 0:
                 raise ValueError(
-                    f"Expected a single contracted bond sector for key {key!r}, got {q_mid_tuple!r}."
+                    f"Expected contracted bond sectors for key {key!r}, got {q_mid_tuple!r}."
                 )
-            entries.append((tuple(key), q_mid_tuple[0]))
+            entries.extend((tuple(key), q_mid) for q_mid in q_mid_tuple)
         return tuple(entries)
 
     raise ValueError(
@@ -99,6 +107,99 @@ def _internal_bond_channel_map(two_site):
         key: tuple(sorted(channels))
         for key, channels in channel_map.items()
     }
+
+
+def _align_state_average_root_layouts(roots):
+    """Pad reduced two-site roots into their common sector-block union."""
+
+    reference = roots[0]
+    if any(root.dirs != reference.dirs for root in roots[1:]):
+        raise ValueError("State-average roots must use the same leg directions.")
+
+    common_qns = []
+    for axis in range(reference.rank):
+        sector_order = []
+        multiplicities = {}
+        for root in roots:
+            counts = {}
+            for sector in root.qns[axis]:
+                counts[sector] = counts.get(sector, 0) + 1
+                if sector not in sector_order:
+                    sector_order.append(sector)
+            for sector, count in counts.items():
+                multiplicities[sector] = max(
+                    multiplicities.get(sector, 0),
+                    count,
+                )
+        common_qns.append(
+            [
+                sector
+                for sector in sector_order
+                for _ in range(multiplicities[sector])
+            ]
+        )
+
+    keys = sorted(
+        set().union(*(root.data for root in roots)),
+    )
+    shapes = {}
+    channels = {}
+    for root in roots:
+        root_channels = _internal_bond_channel_map(root)
+        for key, root_channels_for_key in root_channels.items():
+            channels.setdefault(key, set()).update(root_channels_for_key)
+        for key, block in root.data.items():
+            shape = tuple(int(value) for value in np.asarray(block).shape)
+            previous = shapes.get(key)
+            shapes[key] = shape if previous is None else tuple(
+                max(left, right) for left, right in zip(previous, shape)
+            )
+
+    physical_basis = None
+    for root in roots:
+        metadata = root.metadata or {}
+        if (
+            metadata.get("physical_basis") == "fully_reduced_su2"
+            or (metadata.get("left_metadata") or {}).get("physical_basis")
+                == "fully_reduced_su2"
+            or (metadata.get("right_metadata") or {}).get("physical_basis")
+                == "fully_reduced_su2"
+        ):
+            physical_basis = "fully_reduced_su2"
+            break
+    common_metadata = {
+        "contracted_channels": {
+            key: tuple(sorted(values)) for key, values in channels.items()
+        },
+        "contracted_channel_blocks_current": False,
+        **({"physical_basis": physical_basis} if physical_basis else {}),
+    }
+
+    aligned = []
+    for root in roots:
+        dtype = np.result_type(
+            *[np.asarray(block).dtype for block in root.data.values()],
+            float,
+        )
+        data = {}
+        for key in keys:
+            target_shape = shapes[key]
+            target = np.zeros(target_shape, dtype=dtype)
+            source = root.data.get(key)
+            if source is not None:
+                source = np.asarray(source)
+                target[tuple(slice(0, size) for size in source.shape)] = source
+            data[key] = target
+        aligned.append(
+            NonabelianTensor(
+                data,
+                [leg[:] for leg in common_qns],
+                reference.dirs[:],
+                fusion_legs=reference.fusion_legs[:],
+                metadata=common_metadata.copy(),
+            )
+        )
+    return aligned
 
 
 def _get_site_bond_layout(two_site, *, side, axis):
@@ -186,7 +287,7 @@ def _build_side_pipe(entries, q_mid, *, side, coupling="left", source_layouts=No
                 selected_shape=selected_shape,
             )
         )
-        basis_map[(child_sectors, selected_shape, 0)] = np.eye(local_dim, dtype=float)
+        basis_map[(child_sectors, selected_shape, 0)] = IdentityBasisTransform(local_dim)
         channel_map[(child_sectors, selected_shape, 0)] = None
         offset += local_dim
 
@@ -322,6 +423,184 @@ def _right_metric_weighted_projected_svd(
     )
 
 
+def _boundary_metric_factor_maps(metric_factor_blocks, metric_factor_routes):
+    """Recover left/right boundary metric blocks from compact local routes."""
+
+    left = {}
+    right = {}
+
+    def put(mapping, key, value):
+        value = np.asarray(value)
+        previous = mapping.get(key)
+        if previous is None:
+            mapping[key] = value
+            return True
+        return bool(np.allclose(previous, value, rtol=1.0e-11, atol=1.0e-13))
+
+    for key, factors in dict(metric_factor_blocks or {}).items():
+        q_left, q_right = key[0], key[-1]
+        if not put(left, (q_left, q_left), factors[0]):
+            return None
+        if not put(right, (q_right, q_right), factors[1]):
+            return None
+
+    for route in tuple(metric_factor_routes or ()):
+        _in_idx, _out_idx, in_entry, out_entry, left_factor, right_factor = route
+        if not put(
+            left,
+            (out_entry.key[0], in_entry.key[0]),
+            left_factor,
+        ):
+            return None
+        if not put(
+            right,
+            (out_entry.key[-1], in_entry.key[-1]),
+            right_factor,
+        ):
+            return None
+    if not left or not right:
+        return None
+    return left, right
+
+
+def _projected_side_metric(entries, factors, *, side):
+    """Assemble one exact boundary-factor metric in projected SVD coordinates."""
+
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'.")
+    dim = max(
+        (int(entry.offset) + int(entry.local_dim) for entry in entries),
+        default=0,
+    )
+    metric = np.zeros(
+        (dim, dim),
+        dtype=np.result_type(*(np.asarray(value).dtype for value in factors.values())),
+    )
+    for out_entry in entries:
+        for in_entry in entries:
+            if side == "left":
+                q_out, p_out = out_entry.child_sectors
+                q_in, p_in = in_entry.child_sectors
+                if p_out != p_in:
+                    continue
+                factor = factors.get((q_out, q_in))
+                if factor is None:
+                    continue
+                p_dim_out = int(out_entry.selected_shape[1])
+                p_dim_in = int(in_entry.selected_shape[1])
+                if p_dim_out != p_dim_in:
+                    continue
+                block = np.kron(
+                    np.asarray(factor),
+                    np.eye(p_dim_out, dtype=metric.dtype),
+                )
+            else:
+                p_out, q_out = out_entry.child_sectors
+                p_in, q_in = in_entry.child_sectors
+                if p_out != p_in:
+                    continue
+                factor = factors.get((q_out, q_in))
+                if factor is None:
+                    continue
+                p_dim_out = int(out_entry.selected_shape[0])
+                p_dim_in = int(in_entry.selected_shape[0])
+                if p_dim_out != p_dim_in:
+                    continue
+                block = np.kron(
+                    np.eye(p_dim_out, dtype=metric.dtype),
+                    np.asarray(factor),
+                )
+            if block.shape != (
+                int(out_entry.local_dim),
+                int(in_entry.local_dim),
+            ):
+                return None
+            out_slice = slice(
+                int(out_entry.offset),
+                int(out_entry.offset) + int(out_entry.local_dim),
+            )
+            in_slice = slice(
+                int(in_entry.offset),
+                int(in_entry.offset) + int(in_entry.local_dim),
+            )
+            metric[out_slice, in_slice] = block
+    return 0.5 * (metric + metric.conj().T)
+
+
+def _positive_metric_sqrt(metric, *, tol=1.0e-12):
+    """Return a Hermitian square root and pseudoinverse square root."""
+
+    metric = np.asarray(metric)
+    if np.iscomplexobj(metric):
+        scale = max(1.0, float(np.max(np.abs(metric.real), initial=0.0)))
+        if float(np.max(np.abs(metric.imag), initial=0.0)) <= float(tol) * scale:
+            metric = np.asarray(metric.real)
+    values, vectors = np.linalg.eigh(metric)
+    scale = max(1.0, float(np.max(np.abs(values), initial=0.0)))
+    keep = values > float(tol) * scale
+    if not np.any(keep):
+        return None
+    positive_vectors = vectors[:, keep]
+    positive_values = np.real(values[keep])
+    sqrt_metric = (
+        positive_vectors * np.sqrt(positive_values)[None, :]
+    ) @ positive_vectors.conj().T
+    inverse_sqrt = (
+        positive_vectors * (1.0 / np.sqrt(positive_values))[None, :]
+    ) @ positive_vectors.conj().T
+    return sqrt_metric, inverse_sqrt
+
+
+def _factor_metric_weighted_projected_svd(
+    projection,
+    *,
+    left_factors,
+    right_factors,
+    full_matrices=False,
+    tol=1.0e-12,
+):
+    """SVD a sector using the exact factorized left/right norm metric."""
+
+    left_metric = _projected_side_metric(
+        projection.left_entries,
+        left_factors,
+        side="left",
+    )
+    right_metric = _projected_side_metric(
+        projection.right_entries,
+        right_factors,
+        side="right",
+    )
+    if left_metric is None or right_metric is None:
+        return None
+    left_pair = _positive_metric_sqrt(left_metric, tol=tol)
+    right_pair = _positive_metric_sqrt(right_metric, tol=tol)
+    if left_pair is None or right_pair is None:
+        return None
+    left_sqrt, left_inverse_sqrt = left_pair
+    right_sqrt, right_inverse_sqrt = right_pair
+    weighted = (
+        left_sqrt
+        @ projection.as_matrix()
+        @ right_sqrt.T
+    )
+    if np.iscomplexobj(weighted):
+        scale = max(1.0, float(np.max(np.abs(weighted.real), initial=0.0)))
+        if float(np.max(np.abs(weighted.imag), initial=0.0)) <= float(tol) * scale:
+            weighted = np.asarray(weighted.real)
+    U_weighted, singular_values, Vh_weighted = np.linalg.svd(
+        weighted,
+        full_matrices=full_matrices,
+    )
+    return ReducedProjectedSVD(
+        projection=projection,
+        singular_values=singular_values,
+        U=left_inverse_sqrt @ U_weighted,
+        Vh=Vh_weighted @ right_inverse_sqrt.T,
+        state_weight_override=1,
+    )
+
+
 def svd_two_site(
     two_site,
     max_bond=None,
@@ -329,6 +608,10 @@ def svd_two_site(
     absorb="right",
     bond_coupling="left",
     max_bond_mode="reduced",
+    metric_factor_blocks=None,
+    metric_factor_routes=None,
+    retain_sector_topology=False,
+    sweep_engine=None,
 ):
     """
     Reduced SVD/truncation helper for a merged two-site tensor.
@@ -345,25 +628,45 @@ def svd_two_site(
         or right_meta.get("physical_basis") == "fully_reduced_su2"
         or (two_site.metadata or {}).get("physical_basis") == "fully_reduced_su2"
     )
+    physical_basis = "fully_reduced_su2" if use_reduced_right_metric else None
 
     blocks_by_mid = {}
-    bond_entries = _internal_bond_channel_map(two_site)
-    for key, block in two_site.data.items():
-        q_mids = bond_entries.get(key)
-        if not q_mids:
-            raise ValueError(f"Missing contracted bond sector for key {key!r}.")
-        if not use_reduced_right_metric and len(q_mids) > 1:
-            q_mids = (q_mids[0],)
-        for q_mid in q_mids:
+    if bool(
+        two_site.metadata.get("contracted_channel_blocks_current", False)
+    ):
+        for channel_key, block in two_site.metadata.get(
+            "contracted_channel_blocks",
+            {},
+        ).items():
+            q_left, q_phys1, q_mid, q_phys2, q_right = channel_key
+            key = (q_left, q_phys1, q_phys2, q_right)
             blocks_by_mid.setdefault(q_mid, []).append((key, block))
+    else:
+        bond_entries = _internal_bond_channel_map(two_site)
+        for key, block in two_site.data.items():
+            q_mids = bond_entries.get(key)
+            if not q_mids:
+                raise ValueError(
+                    f"Missing contracted bond sector for key {key!r}."
+                )
+            if not use_reduced_right_metric and len(q_mids) > 1:
+                q_mids = (q_mids[0],)
+            for q_mid in q_mids:
+                blocks_by_mid.setdefault(q_mid, []).append((key, block))
 
     sector_svds = {}
+    sector_projections = {}
     left_source_layouts = _get_site_bond_layout(two_site, side="left", axis=1)
     right_source_layouts = _get_site_bond_layout(two_site, side="right", axis=0)
     left_output_layouts = {}
     right_output_layouts = {}
 
     bond_coupling = normalize_coupling_scheme(bond_coupling, default="left")
+    metric_factor_maps = _boundary_metric_factor_maps(
+        metric_factor_blocks,
+        metric_factor_routes,
+    )
+    used_factor_metric = False
 
     for q_mid, entries in blocks_by_mid.items():
         left_pipe, left_basis_map, _left_channel_map = _build_side_pipe(
@@ -398,19 +701,92 @@ def svd_two_site(
             left_basis_map,
             right_basis_map,
         )
-        svd_result = _right_metric_weighted_projected_svd(
-            reduced_sector,
-            full_matrices=False,
-            apply_reduced_metric=use_reduced_right_metric,
-        )
-        sector_svds[q_mid] = svd_result
+        sector_projections[q_mid] = reduced_sector
 
-    truncation = truncate_reduced_svds(
-        sector_svds,
-        cutoff=cutoff,
-        max_bond=max_bond,
-        mode=max_bond_mode,
+    cpp_blockwise_svd = (
+        None
+        if sweep_engine is None
+        else getattr(sweep_engine, "blockwise_svd", None)
     )
+    if cpp_blockwise_svd is not None and metric_factor_maps is None:
+        ordered_sectors = list(sector_projections)
+        matrices = []
+        inverse_right_scales = []
+        for q_mid in ordered_sectors:
+            projection = sector_projections[q_mid]
+            matrix = projection.as_matrix()
+            inverse_scale = None
+            if use_reduced_right_metric:
+                right_metric = _right_reduced_physical_metric(projection)
+                if not np.allclose(right_metric, 1.0):
+                    sqrt_metric = np.sqrt(right_metric)
+                    matrix = matrix * sqrt_metric[None, :]
+                    inverse_scale = 1.0 / sqrt_metric
+            matrices.append(matrix)
+            inverse_right_scales.append(inverse_scale)
+        cpp_result = cpp_blockwise_svd(
+            matrices,
+            [sector_state_weight(q_mid) for q_mid in ordered_sectors],
+            cutoff=cutoff,
+            max_bond=max_bond,
+            max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
+        )
+        kept_indices_by_sector = {}
+        for index, q_mid in enumerate(ordered_sectors):
+            Vh = np.asarray(cpp_result["right"][index])
+            inverse_scale = inverse_right_scales[index]
+            if inverse_scale is not None:
+                Vh = Vh * inverse_scale[None, :]
+            sector_svds[q_mid] = ReducedProjectedSVD(
+                projection=sector_projections[q_mid],
+                singular_values=np.asarray(
+                    cpp_result["singular_values"][index],
+                    dtype=float,
+                ),
+                U=np.asarray(cpp_result["left"][index]),
+                Vh=Vh,
+            )
+            indices = tuple(
+                int(value) for value in cpp_result["kept_indices"][index]
+            )
+            if indices:
+                kept_indices_by_sector[q_mid] = indices
+        truncation = ReducedTruncation(
+            sector_svds=sector_svds,
+            kept_indices_by_sector=kept_indices_by_sector,
+            trunc_err=float(cpp_result["truncation_error"]),
+            full_sq_norm=float(cpp_result["full_squared_norm"]),
+            kept_sq_norm=float(cpp_result["kept_squared_norm"]),
+            mode=max_bond_mode,
+        )
+    else:
+        for q_mid, reduced_sector in sector_projections.items():
+            svd_result = None
+            if metric_factor_maps is not None:
+                svd_result = _factor_metric_weighted_projected_svd(
+                    reduced_sector,
+                    left_factors=metric_factor_maps[0],
+                    right_factors=metric_factor_maps[1],
+                    full_matrices=False,
+                )
+                used_factor_metric = bool(
+                    svd_result is not None or used_factor_metric
+                )
+            if svd_result is None:
+                svd_result = _right_metric_weighted_projected_svd(
+                    reduced_sector,
+                    full_matrices=False,
+                    apply_reduced_metric=use_reduced_right_metric,
+                )
+            sector_svds[q_mid] = svd_result
+        truncation = truncate_reduced_svds(
+            sector_svds,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
+        )
     kept = {
         q_mid: list(idxs)
         for q_mid, idxs in truncation.kept_indices_by_sector.items()
@@ -567,6 +943,12 @@ def svd_two_site(
         metadata={
             "svd_role": "left",
             "source": "svd_two_site",
+            **(
+                {"canonical_metric": "factorized_boundary"}
+                if used_factor_metric
+                else {}
+            ),
+            **({"physical_basis": physical_basis} if physical_basis else {}),
             "bond_layouts": {2: left_output_layouts},
             "bond_bases": {2: right_bond_basis},
         },
@@ -579,6 +961,12 @@ def svd_two_site(
         metadata={
             "svd_role": "right",
             "source": "svd_two_site",
+            **(
+                {"canonical_metric": "factorized_boundary"}
+                if used_factor_metric
+                else {}
+            ),
+            **({"physical_basis": physical_basis} if physical_basis else {}),
             "bond_layouts": {0: right_output_layouts},
             "bond_bases": {0: left_bond_basis},
         },
@@ -596,6 +984,7 @@ def state_averaged_svd_two_site(
     absorb="right",
     bond_coupling="left",
     max_bond_mode="reduced",
+    retain_sector_topology=False,
 ):
     """
     State-averaged reduced SVD/truncation for optimized two-site root tensors.
@@ -621,8 +1010,9 @@ def state_averaged_svd_two_site(
     for root in roots[1:]:
         if not isinstance(root, NonabelianTensor) or root.rank != 4:
             raise ValueError("state_averaged_svd_two_site expects rank-4 NonabelianTensor roots.")
-        if root.qns != ref.qns or root.dirs != ref.dirs:
-            raise ValueError("State-average roots must share the same reduced layout.")
+    if any(root.qns != ref.qns or root.dirs != ref.dirs for root in roots[1:]):
+        roots = _align_state_average_root_layouts(roots)
+        ref = roots[0]
     if absorb not in {"left", "right"}:
         raise ValueError("absorb must be 'left' or 'right'.")
     max_bond_mode = normalize_max_bond_mode(max_bond_mode, default="reduced")
@@ -633,6 +1023,7 @@ def state_averaged_svd_two_site(
         or right_meta.get("physical_basis") == "fully_reduced_su2"
         or (ref.metadata or {}).get("physical_basis") == "fully_reduced_su2"
     )
+    physical_basis = "fully_reduced_su2" if use_reduced_right_metric else None
 
     blocks_by_mid = {}
     mid_by_key = {}
@@ -756,6 +1147,7 @@ def state_averaged_svd_two_site(
         cutoff=cutoff,
         max_bond=max_bond,
         mode=max_bond_mode,
+        retain_sector_topology=retain_sector_topology,
     )
     kept = {q_mid: list(idxs) for q_mid, idxs in truncation.kept_indices_by_sector.items()}
 
@@ -900,6 +1292,7 @@ def state_averaged_svd_two_site(
             metadata={
                 "svd_role": "left",
                 "source": source,
+                **({"physical_basis": physical_basis} if physical_basis else {}),
                 "bond_layouts": {2: left_output_layouts},
                 "bond_bases": {2: right_bond_basis},
             },
@@ -912,6 +1305,7 @@ def state_averaged_svd_two_site(
             metadata={
                 "svd_role": "right",
                 "source": source,
+                **({"physical_basis": physical_basis} if physical_basis else {}),
                 "bond_layouts": {0: right_output_layouts},
                 "bond_bases": {0: left_bond_basis},
             },

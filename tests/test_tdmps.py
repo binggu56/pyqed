@@ -1,3 +1,4 @@
+import sys
 import types
 
 import numpy as np
@@ -249,6 +250,33 @@ def test_tdmps_tdvp_matches_exact_dense_for_full_two_site_manifold():
     assert reversal["state_error"] < 1.0e-7
 
 
+def test_tdmps_compressed_taylor_step_matches_exact_dense():
+    model = Heisenberg(L=2)
+    H = model.build_H_mpo()
+    rng = np.random.default_rng(37)
+    vec0 = rng.normal(size=4) + 1j * rng.normal(size=4)
+    vec0 /= np.linalg.norm(vec0)
+    psi0 = MPS(decompose(vec0.reshape(2, 2), rank=2))
+
+    dt = 0.03
+    td = TDMPS(H, D=8)
+    td.run(
+        psi0,
+        dt=dt,
+        steps=1,
+        e_ops=[],
+        integrator="taylor",
+        order=4,
+        scale=2,
+        progress=False,
+    )
+
+    exact = expm(-1j * dt * _mpo_to_dense_operator(H)) @ vec0
+    actual = np.asarray(tt_to_tensor(td.final_state.factors), dtype=complex).reshape(-1)
+    np.testing.assert_allclose(actual, exact, atol=1.0e-10, rtol=1.0e-10)
+    np.testing.assert_allclose(td.pre_normalization_norms, np.ones(1), atol=1.0e-10)
+
+
 def test_tdmps_two_site_tdvp_grows_product_state_bond_and_matches_exact():
     model = Heisenberg(L=2)
     H = model.build_H_mpo()
@@ -271,6 +299,68 @@ def test_tdmps_two_site_tdvp_grows_product_state_bond_and_matches_exact():
 
     reversal = td.time_reversal_error(psi0, dt=dt, steps=1, integrator="tdvp2")
     assert reversal["state_error"] < 1.0e-7
+
+
+def test_tdmps_two_site_cutoff_adapts_bonds_below_hard_limit():
+    model = Heisenberg(L=6)
+    H = model.build_H_mpo()
+    psi0 = model.build_neel_state()
+
+    full = TDMPS(H, D=64).run(
+        psi0,
+        dt=0.1,
+        steps=2,
+        integrator="tdvp2",
+        cutoff=0.0,
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+    adaptive = TDMPS(H, D=64).run(
+        psi0,
+        dt=0.1,
+        steps=2,
+        integrator="tdvp2",
+        cutoff=1.0e-6,
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    assert max(adaptive.final_state.bond_orders()) < max(
+        full.final_state.bond_orders()
+    )
+    assert np.max(adaptive.bond_dimensions) <= 64
+    assert adaptive.bond_dimensions.shape == (3, 6)
+    assert np.max(adaptive.tdvp_truncation_errors) > 0.0
+
+
+def test_tdmps_hybrid_integrator_records_warmup_and_enrichment_schedule():
+    model = Heisenberg(L=4)
+    driver = TDMPS(model.build_H_mpo(), D=8).run(
+        model.build_neel_state(),
+        dt=0.02,
+        steps=8,
+        integrator="hybrid",
+        hybrid_warmup_steps=2,
+        hybrid_tdvp2_interval=3,
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    assert driver.integrator_history.tolist() == [
+        "tdvp2",
+        "tdvp2",
+        "tdvp",
+        "tdvp",
+        "tdvp2",
+        "tdvp",
+        "tdvp",
+        "tdvp2",
+    ]
+    np.testing.assert_allclose(driver.final_state.norm(), 1.0, atol=1.0e-12)
+    assert max(driver.final_state.bond_orders()) > 1
 
 
 def test_tdmps_lanczos_krylov_matches_arnoldi_backend():
@@ -373,6 +463,65 @@ def test_cpp_tdvp_sparse_site_lanczos_matches_python_backend(monkeypatch):
     np.testing.assert_allclose(actual, expected, atol=1.0e-12, rtol=1.0e-12)
 
 
+def test_cpp_tdvp_two_site_lanczos_matches_python_backend(monkeypatch):
+    tdvp_cpp = _cpp_tdvp_or_skip()
+    rng = np.random.default_rng(35)
+    bond_dim = 2
+    phys_dim = 3
+    raw_left = rng.normal(size=(phys_dim, phys_dim)) + 1j * rng.normal(
+        size=(phys_dim, phys_dim)
+    )
+    raw_right = rng.normal(size=(phys_dim, phys_dim)) + 1j * rng.normal(
+        size=(phys_dim, phys_dim)
+    )
+    h_left = 0.5 * (raw_left + raw_left.conj().T)
+    h_right = 0.5 * (raw_right + raw_right.conj().T)
+    identity = np.eye(phys_dim)
+    W_left = np.stack((h_left, identity), axis=0).reshape(
+        1, 2, phys_dim, phys_dim
+    )
+    W_right = np.stack((identity, h_right), axis=0).reshape(
+        2, 1, phys_dim, phys_dim
+    )
+    theta = rng.normal(
+        size=(bond_dim, phys_dim, phys_dim, bond_dim)
+    ) + 1j * rng.normal(size=(bond_dim, phys_dim, phys_dim, bond_dim))
+    raw_left_env = rng.normal(size=(bond_dim, bond_dim)) + 1j * rng.normal(
+        size=(bond_dim, bond_dim)
+    )
+    raw_right_env = rng.normal(size=(bond_dim, bond_dim)) + 1j * rng.normal(
+        size=(bond_dim, bond_dim)
+    )
+    left = (0.5 * (raw_left_env + raw_left_env.conj().T))[:, None, :]
+    right = (0.5 * (raw_right_env + raw_right_env.conj().T))[:, None, :]
+
+    monkeypatch.setattr(tdvp_module, "_tdvp_cpp", None)
+    monkeypatch.setattr(tdvp_module, "_tdvp_cpp_tried", True)
+    krylov_dim = int(np.prod(theta.shape))
+    expected = tdvp_module._evolve_two_site(
+        theta,
+        left,
+        W_left,
+        W_right,
+        right,
+        0.03,
+        krylov_dim=krylov_dim,
+        krylov_tol=1.0e-14,
+    )
+
+    actual = tdvp_cpp.two_site_lanczos(
+        theta,
+        left,
+        W_left,
+        W_right,
+        right,
+        0.03,
+        krylov_dim,
+        1.0e-14,
+    )
+    np.testing.assert_allclose(actual, expected, atol=1.0e-11, rtol=1.0e-11)
+
+
 def test_cpp_tdvp_bond_lanczos_matches_python_backend(monkeypatch):
     tdvp_cpp = _cpp_tdvp_or_skip()
     rng = np.random.default_rng(32)
@@ -448,6 +597,53 @@ def test_tdmps_one_site_tdvp_cpp_backend_matches_python(monkeypatch):
         cpp_td.final_state.norm(),
     )
     assert diagnostic["state_error"] < 1.0e-7
+
+
+def test_tdmps_two_site_tdvp_cpp_backend_matches_python(monkeypatch):
+    tdvp_cpp = _cpp_tdvp_or_skip()
+    model = Heisenberg(L=3)
+    H = model.build_H_mpo()
+    rng = np.random.default_rng(36)
+    vec0 = rng.normal(size=8) + 1j * rng.normal(size=8)
+    vec0 /= np.linalg.norm(vec0)
+    psi0 = MPS(
+        decompose(vec0.reshape(2, 2, 2), rank=8),
+        labels=["lv", "p", "rv"],
+    ).normalize()
+
+    monkeypatch.setattr(tdvp_module, "_tdvp_cpp", None)
+    monkeypatch.setattr(tdvp_module, "_tdvp_cpp_tried", True)
+    python_td = TDMPS(H, D=8)
+    python_td.run(
+        psi0,
+        dt=0.04,
+        steps=2,
+        integrator="tdvp2",
+        krylov_dim=8,
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    monkeypatch.setattr(tdvp_module, "_tdvp_cpp", tdvp_cpp)
+    cpp_td = TDMPS(H, D=8)
+    cpp_td.run(
+        psi0,
+        dt=0.04,
+        steps=2,
+        integrator="tdvp2",
+        krylov_dim=8,
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    diagnostic = TDMPS.overlap_diagnostic(
+        TDMPS.state_overlap(python_td.final_state, cpp_td.final_state),
+        python_td.final_state.norm(),
+        cpp_td.final_state.norm(),
+    )
+    assert diagnostic["state_error"] < 1.0e-8
 
 
 def test_tdmps_can_skip_measurements_for_fair_propagation_timing():
@@ -616,6 +812,47 @@ def test_symmetric_tdvp_block_sparse_step_matches_exact_fixed_sector():
     np.testing.assert_allclose(abs(np.vdot(exact, actual)), 1.0, atol=1.0e-12)
 
 
+def test_block_sparse_tdvp_canonicalizes_initial_state_and_conserves_energy():
+    nsites = 6
+    bond = 4
+    rng = np.random.default_rng(17)
+    vec = np.zeros(2**nsites, dtype=complex)
+    for index in range(vec.size):
+        if index.bit_count() == nsites // 2:
+            vec[index] = rng.normal() + 1j * rng.normal()
+    vec /= np.linalg.norm(vec)
+
+    psi = MPS(
+        decompose(vec.reshape((2,) * nsites), rank=bond),
+        labels=["lv", "p", "rv"],
+    )
+    h_mpo = Heisenberg(nsites).build_H_mpo()
+    h_dense = _mpo_to_dense_operator(h_mpo)
+    engine = SymmetricTDVP(
+        h_mpo,
+        local_sectors=[0, 1],
+        target_sector=nsites // 2,
+        projection_backend="block-sparse",
+        max_bond=bond,
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+    )
+
+    state = engine.project(psi)
+    dense = tdvp_module.symmetric_to_dense(state)
+    initial = np.asarray(tt_to_tensor(dense.factors), dtype=complex).reshape(-1)
+    energy0 = np.vdot(initial, h_dense @ initial)
+    for _ in range(3):
+        state, _ = engine.step(state, 0.01, return_info=True)
+    dense = tdvp_module.symmetric_to_dense(state)
+    final = np.asarray(tt_to_tensor(dense.factors), dtype=complex).reshape(-1)
+    energy1 = np.vdot(final, h_dense @ final)
+
+    assert engine.canonicalize_first is True
+    np.testing.assert_allclose(np.linalg.norm(final), 1.0, atol=1.0e-12)
+    np.testing.assert_allclose(energy1, energy0, atol=1.0e-11)
+
+
 def test_block_sparse_tdvp_native_one_site_sweep_matches_python(monkeypatch):
     _cpp_davidson_or_skip()
 
@@ -661,6 +898,278 @@ def test_block_sparse_tdvp_native_one_site_sweep_matches_python(monkeypatch):
     assert native_info["cpp_one_site_engine"] is True
     assert native_info["cpp_one_site_engine_native_kernels"] is True
     np.testing.assert_allclose(native_tensor, py_tensor, atol=1.0e-12)
+
+
+def test_block_sparse_tdvp_native_adaptive_krylov_matches_full_dimension():
+    _cpp_davidson_or_skip()
+
+    nsites = 6
+    bond = 4
+    rng = np.random.default_rng(17)
+    vec = np.zeros(2**nsites, dtype=complex)
+    for index in range(vec.size):
+        if index.bit_count() == nsites // 2:
+            vec[index] = rng.normal() + 1j * rng.normal()
+    vec /= np.linalg.norm(vec)
+    psi = MPS(
+        decompose(vec.reshape((2,) * nsites), rank=bond),
+        labels=["lv", "p", "rv"],
+    )
+    h_mpo = Heisenberg(nsites).build_H_mpo()
+
+    def run(krylov_tol):
+        engine = SymmetricTDVP(
+            h_mpo,
+            local_sectors=[0, 1],
+            target_sector=nsites // 2,
+            projection_backend="block-sparse",
+            max_bond=bond,
+            krylov_dim=12,
+            krylov_tol=krylov_tol,
+        )
+        state = engine.project(psi)
+        info = {}
+        for _ in range(2):
+            state, info = engine.step(state, 0.01, return_info=True)
+        dense = tdvp_module.symmetric_to_dense(state)
+        tensor = np.asarray(tt_to_tensor(dense.factors), dtype=complex).reshape(-1)
+        return tensor, info
+
+    full, full_info = run(0.0)
+    adaptive, adaptive_info = run(1.0e-13)
+    phase = np.vdot(full, adaptive)
+    phase /= abs(phase)
+
+    np.testing.assert_allclose(adaptive, phase * full, atol=1.0e-12)
+    assert adaptive_info["cpp_one_site_engine_site_matvecs"] < full_info[
+        "cpp_one_site_engine_site_matvecs"
+    ]
+    assert adaptive_info["cpp_one_site_engine_bond_matvecs"] < full_info[
+        "cpp_one_site_engine_bond_matvecs"
+    ]
+
+
+def test_block_sparse_two_site_tdvp_grows_bond_and_matches_exact():
+    model = Heisenberg(2)
+    psi = model.build_neel_state()
+    h_mpo = model.build_H_mpo()
+    initial = np.asarray(tt_to_tensor(psi.factors), dtype=complex).reshape(-1)
+    engine = SymmetricTDVP(
+        h_mpo,
+        local_sectors=[0, 1],
+        target_sector=1,
+        integrator="tdvp2",
+        projection_backend="block-sparse",
+        max_bond=2,
+        krylov_dim=8,
+    )
+
+    out, info = engine.step(psi, 0.1, return_info=True)
+    dense = tdvp_module.symmetric_to_dense(out)
+    actual = np.asarray(tt_to_tensor(dense.factors), dtype=complex).reshape(-1)
+    exact = expm(-0.1j * _mpo_to_dense_operator(h_mpo)) @ initial
+
+    assert hasattr(out.factors[0], "qns")
+    assert out.bond_orders()[0] == 2
+    assert info["integrator"] == "tdvp2"
+    assert info["max_kept_states"] == 2
+    np.testing.assert_allclose(actual, exact, atol=1.0e-12)
+
+
+def test_block_sparse_two_site_tdvp_matches_dense_two_site_sweep():
+    model = Heisenberg(4)
+    psi = model.build_neel_state()
+    h_mpo = model.build_H_mpo()
+    dense_engine = tdvp_module.TDVPEngine(
+        h_mpo,
+        integrator="tdvp2",
+        max_bond=4,
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+    )
+    block_engine = SymmetricTDVP(
+        h_mpo,
+        local_sectors=[0, 1],
+        target_sector=2,
+        integrator="tdvp2",
+        projection_backend="block-sparse",
+        max_bond=4,
+        krylov_dim=12,
+        krylov_tol=1.0e-13,
+    )
+
+    dense, _ = dense_engine.step(psi, 0.03, return_info=True)
+    block, info = block_engine.step(psi, 0.03, return_info=True)
+    dense_vector = np.asarray(tt_to_tensor(dense.factors), dtype=complex).reshape(-1)
+    block_vector = np.asarray(
+        tt_to_tensor(tdvp_module.symmetric_to_dense(block).factors),
+        dtype=complex,
+    ).reshape(-1)
+
+    np.testing.assert_allclose(block_vector, dense_vector, atol=1.0e-12)
+    assert block.bond_orders() == dense.bond_orders()
+    assert info["truncation_error"] == pytest.approx(0.0, abs=1.0e-14)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="dense native TDVP workspace uses Accelerate",
+)
+def test_dense_tdvp_workspace_matches_local_kernel_and_reuses_mpo_plan():
+    _cpp_davidson_or_skip()
+    rng = np.random.default_rng(31)
+    factors = [
+        rng.normal(size=(1, 2, 3)) + 1j * rng.normal(size=(1, 2, 3)),
+        rng.normal(size=(3, 2, 3)) + 1j * rng.normal(size=(3, 2, 3)),
+        rng.normal(size=(3, 2, 3)) + 1j * rng.normal(size=(3, 2, 3)),
+        rng.normal(size=(3, 2, 1)) + 1j * rng.normal(size=(3, 2, 1)),
+    ]
+    psi = MPS(factors, labels=["lv", "p", "rv"]).right_canonicalize()
+    local = np.array([[1.1, 0.2 - 0.1j], [0.2 + 0.1j, -0.7]], dtype=complex)
+    mpo = [local.reshape(1, 1, 2, 2) for _ in range(4)]
+    reference = tdvp_module.TDVPEngine(
+        mpo,
+        integrator="tdvp2",
+        max_bond=3,
+        krylov_dim=8,
+        dense_cpp_workspace="off",
+    )
+    cached = tdvp_module.TDVPEngine(
+        mpo,
+        integrator="tdvp2",
+        max_bond=3,
+        krylov_dim=8,
+        dense_cpp_workspace="on",
+    )
+    expected, _ = reference.step(psi, 0.02)
+    actual, info = cached.step(psi, 0.02)
+    np.testing.assert_allclose(
+        np.asarray(tt_to_tensor(actual.factors), dtype=complex),
+        np.asarray(tt_to_tensor(expected.factors), dtype=complex),
+        atol=1.0e-12,
+    )
+    assert info["dense_cpp_workspace_two_site_evolutions"] == 6, info["dense_cpp_workspace_last_error"]
+    assert info["dense_cpp_workspace_static_w_reuses"] >= 2
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="dense native environment updates use Accelerate",
+)
+def test_dense_tdvp_cpp_environment_updates_match_einsum():
+    _cpp_davidson_or_skip()
+    rng = np.random.default_rng(47)
+    left = rng.normal(size=(4, 2, 4)) + 1j * rng.normal(size=(4, 2, 4))
+    right = rng.normal(size=(5, 2, 5)) + 1j * rng.normal(size=(5, 2, 5))
+    site = rng.normal(size=(4, 3, 5)) + 1j * rng.normal(size=(4, 3, 5))
+    w = rng.normal(size=(2, 2, 3, 3)) + 1j * rng.normal(size=(2, 2, 3, 3))
+    np.testing.assert_allclose(
+        tdvp_module._update_left_env(left, site, w, dense_cpp=True),
+        tdvp_module._update_left_env(left, site, w),
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        tdvp_module._update_right_env(right, site, w, dense_cpp=True),
+        tdvp_module._update_right_env(right, site, w),
+        atol=1.0e-12,
+    )
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="native Abelian sector SVD currently uses Accelerate",
+)
+def test_block_sparse_two_site_tdvp_uses_cpp_moving_environment_sweep():
+    _cpp_davidson_or_skip()
+    model = Heisenberg(4)
+    engine = SymmetricTDVP(
+        model.build_H_mpo(),
+        local_sectors=[0, 1],
+        target_sector=2,
+        integrator="tdvp2",
+        projection_backend="block-sparse",
+        max_bond=4,
+    )
+    state = model.build_neel_state()
+    info = {}
+    for _ in range(2):
+        state, info = engine.step(state, 0.03, return_info=True)
+
+    assert info["cpp_two_site_engine"] is True
+    assert info["cpp_two_site_engine_native_kernels"] is True
+    assert info["cpp_two_site_engine_two_site_evolutions"] == 6
+    assert info["cpp_two_site_engine_splits"] == 6
+    assert info["cpp_two_site_engine_environment_advances"] == 10
+    assert info["cpp_two_site_tdvp_sweep_failures"] == 0
+    dense_engine = tdvp_module.TDVPEngine(
+        model.build_H_mpo(),
+        integrator="tdvp2",
+        max_bond=4,
+    )
+    dense_state = model.build_neel_state()
+    for _ in range(2):
+        dense_state, _ = dense_engine.step(dense_state, 0.03)
+    block_vector = np.asarray(
+        tt_to_tensor(tdvp_module.symmetric_to_dense(state).factors),
+        dtype=complex,
+    ).reshape(-1)
+    dense_vector = np.asarray(
+        tt_to_tensor(dense_state.factors),
+        dtype=complex,
+    ).reshape(-1)
+    np.testing.assert_allclose(block_vector, dense_vector, atol=1.0e-12)
+
+
+def test_block_sparse_two_site_tdvp_cutoff_reduces_bond_dimension():
+    model = Heisenberg(6)
+    h_mpo = model.build_H_mpo()
+
+    def run(cutoff):
+        state = model.build_neel_state()
+        engine = SymmetricTDVP(
+            h_mpo,
+            local_sectors=[0, 1],
+            target_sector=3,
+            integrator="tdvp2",
+            projection_backend="block-sparse",
+            max_bond=32,
+            cutoff=cutoff,
+            krylov_dim=10,
+        )
+        for _ in range(2):
+            state, info = engine.step(state, 0.05, return_info=True)
+        return state, info
+
+    full, _ = run(0.0)
+    adaptive, info = run(1.0e-5)
+
+    assert max(adaptive.bond_orders()) < max(full.bond_orders())
+    assert max(adaptive.bond_orders()) <= 32
+    assert info["max_kept_states"] < 8
+    np.testing.assert_allclose(adaptive.norm(), 1.0, atol=1.0e-12)
+
+
+def test_tdmps_routes_symmetric_tdvp2_to_block_sparse_engine():
+    model = Heisenberg(2)
+    driver = TDMPS(
+        model.build_H_mpo(),
+        D=2,
+        local_sectors=[0, 1],
+        target_sector=1,
+        projection="block-sparse",
+    ).run(
+        model.build_neel_state(),
+        dt=0.05,
+        steps=1,
+        integrator="tdvp2",
+        measure_observables=False,
+        track_energy=False,
+        progress=False,
+    )
+
+    assert hasattr(driver.final_state.factors[0], "qns")
+    assert driver.final_state.bond_orders()[0] == 2
+    assert driver.integrator_history.tolist() == ["tdvp2"]
 
 
 def test_symmetric_tdvp_block_sparse_accepts_spatial_sector_tuples():
@@ -730,7 +1239,7 @@ def test_symmetric_tdvp_block_sparse_reuses_native_mpo(monkeypatch):
     assert calls["count"] == 1
     assert info1["mpo_cached"] is True
     assert info2["mpo_cached"] is True
-    assert engine.canonicalize_first is False
+    assert engine.canonicalize_first is True
     assert hasattr(out.factors[0], "qns")
 
 
@@ -961,7 +1470,7 @@ def test_tdmps_block_sparse_observables_do_not_densify(monkeypatch):
         D=2,
         local_sectors=[0, 1],
         target_sector=1,
-        tdvp_projection_backend="block-sparse",
+        projection="block-sparse",
     )
     td.run(
         psi,

@@ -14,6 +14,7 @@ CPP_TDVP_AVAILABLE = False
 CPP_TDVP_BUILD_ERROR = None
 CPP_TDVP_HAS_BLAS = False
 site_lanczos = None
+two_site_lanczos = None
 bond_lanczos = None
 
 
@@ -161,6 +162,7 @@ def _initialize():
     global CPP_TDVP_AVAILABLE
     global CPP_TDVP_HAS_BLAS
     global site_lanczos
+    global two_site_lanczos
     global bond_lanczos
 
     if _disabled(os.environ.get("PYQED_MPS_DISABLE_CPP_TDVP", "0")):
@@ -175,9 +177,14 @@ def _initialize():
             return
 
     site_lanczos = getattr(module, "site_lanczos", None)
+    two_site_lanczos = getattr(module, "two_site_lanczos", None)
     bond_lanczos = getattr(module, "bond_lanczos", None)
     CPP_TDVP_HAS_BLAS = bool(getattr(module, "HAS_BLAS", False))
-    CPP_TDVP_AVAILABLE = site_lanczos is not None and bond_lanczos is not None
+    CPP_TDVP_AVAILABLE = (
+        site_lanczos is not None
+        and two_site_lanczos is not None
+        and bond_lanczos is not None
+    )
 
 
 _initialize()

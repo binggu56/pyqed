@@ -20,6 +20,14 @@ from scipy.optimize import minimize
 from scipy.sparse import csr_matrix, issparse
 from scipy.sparse.linalg import LinearOperator, eigsh, lobpcg
 
+from ._support_kernels import (
+    apply_support_hamiltonian as _support_kernel_apply,
+    assemble_support_hamiltonian as _support_kernel_assemble,
+    native_available as _support_kernel_native_available,
+)
+
+from .conditional_gauge import apply_conditional_gauges as _apply_conditional_gauges
+
 try:
     from opt_einsum import contract as _contract
 except (ModuleNotFoundError, ImportError):  # pragma: no cover
@@ -38,6 +46,7 @@ _DEFAULT_ABELIAN_SPARSE_SUPPORT_DIM = 1024
 _DEFAULT_DIRECT_REDUCED_HEFF_DIM = 2048
 _DEFAULT_ACTIVE_WARM_START_DIM = 256
 _DEFAULT_SUPPORT_BATCH_SIZE = 64
+_DEFAULT_MASKED_DENSE_SLICE_LOCAL_DIM = 256
 _SPARSE_MPO_DENSITY_LIMIT = 0.20
 _SPARSE_MPO_MIN_BOND_PRODUCT = 3000
 _SPARSE_MPO_SITE_CACHE_MAXSIZE = 128
@@ -48,6 +57,23 @@ _TWO_SITE_MPO_TRANSITION_CACHE_MAXSIZE = 32
 _TWO_SITE_MPO_TRANSITION_CACHE = {}
 _TWO_SITE_MPO_PHYSICAL_BLOCK_LIMIT = 262_144
 _TWO_SITE_MPO_TRANSITION_CHUNK = 128
+_EINSUM_PATH_CACHE_MAXSIZE = 256
+_EINSUM_PATH_CACHE = {}
+
+
+def _cached_einsum(subscripts, *operands):
+    """Contract with a shape-keyed NumPy path cache."""
+    key = (
+        str(subscripts),
+        tuple(tuple(int(size) for size in operand.shape) for operand in operands),
+    )
+    path = _EINSUM_PATH_CACHE.get(key)
+    if path is None:
+        path = np.einsum_path(subscripts, *operands, optimize=True)[0]
+        if len(_EINSUM_PATH_CACHE) >= _EINSUM_PATH_CACHE_MAXSIZE:
+            _EINSUM_PATH_CACHE.pop(next(iter(_EINSUM_PATH_CACHE)))
+        _EINSUM_PATH_CACHE[key] = path
+    return np.einsum(subscripts, *operands, optimize=path)
 
 
 if njit is not None:
@@ -620,9 +646,25 @@ def _apply_support_heff_by_transitions(
     coords = np.asarray(coords, dtype=np.int64)
     vector = np.asarray(vector)
     nallowed = coords.shape[0]
-    out = np.zeros(nallowed, dtype=np.result_type(dtype, vector.dtype))
+    output_shape = (nallowed,) if vector.ndim == 1 else (nallowed, vector.shape[1])
+    out = np.zeros(output_shape, dtype=np.result_type(dtype, vector.dtype))
     if nallowed == 0 or transitions is None or transitions.ntransitions == 0:
         return out
+    if _support_kernel_native_available() or vector.ndim == 2:
+        return _support_kernel_apply(
+            coords,
+            left,
+            right,
+            transitions.bra_i,
+            transitions.ket_i,
+            transitions.bra_j,
+            transitions.ket_j,
+            transitions.entry_starts,
+            transitions.entry_m,
+            transitions.entry_n,
+            transitions.entry_values,
+            vector,
+        ).astype(out.dtype, copy=False)
     if physical_groups is None:
         groups = _physical_groups_from_coords(coords)
     else:
@@ -865,12 +907,11 @@ def _advance_left_environment_sparse(env, tensor, package, right_mpo_dim):
                 env[:, :, :, bra_state, ket_state].reshape(bra_left * ket_left, left_mpo_dim)
                 @ left_block
             ).reshape(bra_left, ket_left, cols.size)
-            out[:, :, cols, :, :] += np.einsum(
+            out[:, :, cols, :, :] += _cached_einsum(
                 "bkn,buc,kvd->cdnuv",
                 q,
                 tensor_conj[:, bra_state, :, :],
                 tensor[:, ket_state, :, :],
-                optimize=True,
             )
     return out
 
@@ -895,12 +936,11 @@ def _advance_right_environment_sparse(env, tensor, package, left_mpo_dim):
                 env[:, :, :, bra_state, ket_state].reshape(bra_right * ket_right, right_mpo_dim)
                 @ right_block.T
             ).reshape(bra_right, ket_right, rows.size)
-            out[:, :, rows, :, :] += np.einsum(
+            out[:, :, rows, :, :] += _cached_einsum(
                 "cdm,bxc,kyd->bkmxy",
                 q,
                 tensor_conj[:, :, bra_state, :],
                 tensor[:, :, ket_state, :],
-                optimize=True,
             )
     return out
 
@@ -935,6 +975,15 @@ def _validate_gauge(gauge):
     return mode
 
 
+def _validate_gauge_mode(mode):
+    if mode is None:
+        return "symmetric"
+    mode = str(mode).lower().replace("-", "_")
+    if mode not in {"symmetric", "qr"}:
+        raise ValueError("mode must be 'symmetric' or 'qr'.")
+    return mode
+
+
 def _normalize_with_metric(vector, metric):
     norm2 = np.vdot(vector, metric @ vector)
     norm = np.sqrt(float(np.real(norm2)))
@@ -948,6 +997,11 @@ def _metric_basis(metric, *, metric_tol=1e-12, metric_threshold=None):
     if metric_threshold is None:
         metric_scale = float(np.linalg.norm(metric, ord=np.inf))
         metric_threshold = metric_tol * metric_scale
+    if metric.shape == (1, 1):
+        value = float(np.real(metric[0, 0]))
+        if value <= metric_threshold:
+            raise ValueError("Effective overlap metric is numerically singular.")
+        return np.asarray([[1.0 / np.sqrt(value)]], dtype=metric.dtype)
     try:
         metric_vals, metric_vecs = linalg.eigh(
             metric,
@@ -965,6 +1019,9 @@ def _metric_basis(metric, *, metric_tol=1e-12, metric_threshold=None):
 
 def _lowest_hermitian_eigenpair(matrix, *, iterative_threshold=256, tol=1e-10):
     matrix = 0.5 * (matrix + matrix.conj().T)
+    if matrix.shape == (1, 1):
+        vector = np.ones(1, dtype=matrix.dtype)
+        return float(np.real(matrix[0, 0])), vector
     if matrix.shape[0] > iterative_threshold:
         try:
             evals, evecs = eigsh(
@@ -1217,6 +1274,16 @@ def _active_projected_warm_start(
 def _hermitian_sqrt_pair(matrix, *, eps=1.0e-14, rcond=1.0e-12):
     matrix = np.asarray(matrix)
     matrix = 0.5 * (matrix + matrix.conj().T)
+    if matrix.shape == (1, 1):
+        value = float(np.real(matrix[0, 0]))
+        scale = max(abs(value), float(eps))
+        value = max(value, float(eps), float(rcond) * scale)
+        root = np.sqrt(value)
+        dtype = np.result_type(matrix.dtype, root)
+        return (
+            np.real_if_close(np.asarray([[root]], dtype=dtype), tol=1000),
+            np.real_if_close(np.asarray([[1.0 / root]], dtype=dtype), tol=1000),
+        )
     vals, vecs = linalg.eigh(matrix, check_finite=False)
     if vals.size == 0:
         return matrix.copy(), matrix.copy()
@@ -1292,7 +1359,6 @@ def _metric_blocks_from_abelian_plan(plan, mleft, mright, *, metric_tol=1e-12):
     if not blocks:
         raise ValueError("Effective overlap metric is numerically singular.")
     return blocks
-
 
 @dataclass
 class LETTAOperatorPackage:
@@ -1411,7 +1477,111 @@ class LETTA:
     This class is a small dense prototype for one-site LETTA optimization.  It
     is intended for validating the variational equations and for seeding from a
     NARG/MPS state before replacing dense projectors by cached environments.
+
+    Passing a :class:`~pyqed.letta.LocalHamiltonian` and ``parents`` uses
+    the graph/frontier implementation and infers ``dims`` from the
+    Hamiltonian.  In that form, ``symmetry="u1"`` keeps every LETTA tensor
+    unrestricted and applies an exact fixed-charge projector to the
+    represented state.
     """
+
+    def __new__(
+        cls,
+        hamiltonian,
+        dims=None,
+        parents=None,
+        *,
+        symmetry=None,
+        charges=None,
+        target=0,
+        **kwargs,
+    ):
+        if cls is not LETTA:
+            return super().__new__(cls)
+
+        from .local_terms import (
+            LocalHamiltonian,
+            local_charges_from_sites,
+        )
+
+        if isinstance(hamiltonian, LocalHamiltonian) and dims is None:
+            dims = hamiltonian.dims
+        graph_requested = parents is not None or isinstance(
+            hamiltonian, LocalHamiltonian
+        )
+        if not graph_requested:
+            return super().__new__(cls)
+        if parents is None:
+            raise TypeError("graph LETTA requires parents.")
+
+        options = dict(kwargs)
+        reduced_layout_options = tuple(
+            name
+            for name in ("layout", "symmetry_layout", "abelian_layout")
+            if options.pop(name, None) is not None
+        )
+        if reduced_layout_options:
+            names = ", ".join(reduced_layout_options)
+            raise TypeError(
+                f"{names} selected the removed locally masked U(1) ansatz; "
+                "use symmetry='u1' with charges for exact sector projection."
+            )
+
+        if symmetry is None:
+            normalized_symmetry = None
+        else:
+            normalized_symmetry = (
+                str(symmetry)
+                .strip()
+                .lower()
+                .replace("(", "")
+                .replace(")", "")
+            )
+            normalized_symmetry = normalized_symmetry.replace("_", "").replace(
+                "-", ""
+            )
+            if normalized_symmetry in {"none", "dense", "unrestricted"}:
+                normalized_symmetry = None
+            elif normalized_symmetry in {
+                "u1",
+                "abelian",
+                "projected",
+                "projectedu1",
+                "u1projected",
+                "exactu1",
+                "sectorprojected",
+            }:
+                normalized_symmetry = "projected_u1"
+            else:
+                raise ValueError("symmetry must be None or 'u1'.")
+
+        from .frontier_tying import FrontierTiedLETTA
+
+        if normalized_symmetry is None:
+            if charges is not None:
+                raise TypeError("charges require symmetry='u1'.")
+            return FrontierTiedLETTA(hamiltonian, dims, parents, **options)
+
+        if charges is None:
+            charges = local_charges_from_sites(
+                hamiltonian.sites,
+                require=True,
+            )
+        if "charge_assignment" in options:
+            raise TypeError(
+                "exact U(1) projection counts every unique physical site once "
+                "and does not use charge_assignment."
+            )
+        from .projected_frontier import SectorProjectedLETTA
+
+        return SectorProjectedLETTA(
+            hamiltonian,
+            dims,
+            parents,
+            local_charges=charges,
+            target=target,
+            **options,
+        )
 
     def __init__(
         self,
@@ -1423,8 +1593,14 @@ class LETTA:
         tensors=None,
         local_masks=None,
         abelian_layout=None,
+        symmetry=None,
         seed=None,
     ):
+        if symmetry is not None:
+            raise TypeError(
+                "symmetry= is available for graph LETTA with a LocalHamiltonian "
+                "and parent_sets; dense LETTA accepts abelian_layout instead."
+            )
         self.dims = _validate_dims(dims)
         if len(self.dims) < 2:
             raise ValueError("LETTA needs at least two physical sites.")
@@ -1530,7 +1706,7 @@ class LETTA:
 
         penultimate = factors[-2]
         final = factors[-1]
-        last = np.einsum("asb,btz->astz", penultimate, final, optimize=True)
+        last = _cached_einsum("asb,btz->astz", penultimate, final)
         letta_tensors.append(last)
 
         bond_dim = max(max(tensor.shape[0], tensor.shape[3]) for tensor in letta_tensors)
@@ -1754,10 +1930,13 @@ class LETTA:
             validated.append(mask.copy())
         return validated
 
-    def _apply_local_masks(self):
-        for i, mask in enumerate(self.local_masks):
+    def _apply_local_masks(self, tensor_indices=None):
+        if tensor_indices is None:
+            tensor_indices = range(self.nlocal_tensors)
+        for i in tensor_indices:
+            mask = self.local_masks[int(i)]
             if mask is not None:
-                self.tensors[i] = np.where(mask, self.tensors[i], 0)
+                self.tensors[int(i)] = np.where(mask, self.tensors[int(i)], 0)
 
     def local_support_sizes(self):
         """Return allowed/total entry counts for each symmetry/support mask."""
@@ -1789,11 +1968,17 @@ class LETTA:
             return None
         from .abelian import Layout
 
+        bond_qns = getattr(self.abelian_layout, "bond_qns", None)
+        if bond_qns is None:
+            raise NotImplementedError(
+                "bond expansion is not yet implemented for conditional "
+                "tied-frontier charge layouts."
+            )
         bond_dim = int(bond_dim)
-        target_sizes = [1] + [bond_dim] * (len(self.abelian_layout.bond_qns) - 1)
+        target_sizes = [1] + [bond_dim] * (len(bond_qns) - 1)
         bond_qns = [
             self._expand_repeated_labels(labels, target)
-            for labels, target in zip(self.abelian_layout.bond_qns, target_sizes)
+            for labels, target in zip(bond_qns, target_sizes)
         ]
         return Layout(
             local_qns=self.abelian_layout.local_qns,
@@ -2015,6 +2200,19 @@ class LETTA:
         self._support_plan_cache[key] = plan
         return plan
 
+    def _abelian_bond_labels(self, bond, shared_state=None):
+        """Return charge labels for one native LETTA virtual bond."""
+        layout = self.abelian_layout
+        if layout is None:
+            return None
+        frontier_labels = getattr(layout, "frontier_labels", None)
+        if frontier_labels is not None:
+            return tuple(frontier_labels(int(bond), shared_state=shared_state))
+        bond_qns = getattr(layout, "bond_qns", None)
+        if bond_qns is None or int(bond) + 1 >= len(bond_qns):
+            return None
+        return tuple(bond_qns[int(bond) + 1])
+
     def _virtual_bond_groups(self, bond):
         bond = int(bond)
         left = self.tensors[bond]
@@ -2027,9 +2225,9 @@ class LETTA:
         shared = min(left.shape[3], right.shape[right_axis])
         if shared < 1:
             return []
-        labels = None
-        if self.abelian_layout is not None and bond + 1 < len(self.abelian_layout.bond_qns):
-            labels = self.abelian_layout.bond_qns[bond + 1][:shared]
+        labels = self._abelian_bond_labels(bond)
+        if labels is not None:
+            labels = labels[:shared]
         if labels is None and self.local_masks[bond] is None and self.local_masks[bond + 1] is None:
             return [np.arange(shared, dtype=np.int64)]
         left_mask = self.local_masks[bond]
@@ -2058,13 +2256,25 @@ class LETTA:
         left = self.tensors[bond]
         right = self.tensors[bond + 1]
         shared = min(left.shape[3], right.shape[0] if right.ndim == 4 else right.shape[1])
-        labels = None
-        if self.abelian_layout is not None and bond + 1 < len(self.abelian_layout.bond_qns):
-            labels = self.abelian_layout.bond_qns[bond + 1][:shared]
+        labels = self._abelian_bond_labels(bond, shared_state=shared_state)
+        if labels is not None:
+            labels = labels[:shared]
         left_mask = self.local_masks[bond]
         right_mask = self.local_masks[bond + 1]
         if labels is None and left_mask is None and right_mask is None:
             return [np.arange(shared, dtype=np.int64)]
+        key = (
+            "conditional_bond_groups",
+            bond,
+            shared_state,
+            shared,
+            id(left_mask),
+            id(right_mask),
+            id(self.abelian_layout),
+        )
+        cached = self._support_plan_cache.get(key)
+        if cached is not None:
+            return cached
 
         groups = {}
         for index in range(shared):
@@ -2083,7 +2293,13 @@ class LETTA:
             else:
                 right_signature = bool(right_mask[shared_state, index])
             groups.setdefault((label, left_signature, right_signature), []).append(index)
-        return [np.asarray(indices, dtype=np.int64) for indices in groups.values() if indices]
+        result = tuple(
+            np.asarray(indices, dtype=np.int64)
+            for indices in groups.values()
+            if indices
+        )
+        self._support_plan_cache[key] = result
+        return result
 
     def compress_conditional_bond(
         self,
@@ -2108,6 +2324,14 @@ class LETTA:
         group channels and reports their local discarded singular-value
         weight.
         """
+        if (
+            self.abelian_layout is not None
+            and getattr(self.abelian_layout, "frontier_qns", None) is not None
+        ):
+            raise NotImplementedError(
+                "conditional compression does not yet update tied-frontier "
+                "charge labels."
+            )
         bond = int(bond)
         if bond < 0 or bond >= self.nlocal_tensors - 1:
             raise IndexError("bond index out of range.")
@@ -2206,8 +2430,13 @@ class LETTA:
         new_labels = []
         cursor = 0
         old_labels = None
-        if self.abelian_layout is not None and bond + 1 < len(self.abelian_layout.bond_qns):
-            old_labels = self.abelian_layout.bond_qns[bond + 1]
+        bond_qns = (
+            None
+            if self.abelian_layout is None
+            else getattr(self.abelian_layout, "bond_qns", None)
+        )
+        if bond_qns is not None and bond + 1 < len(bond_qns):
+            old_labels = bond_qns[bond + 1]
 
         for group_index, (group, group_records) in enumerate(zip(groups, records)):
             group = np.asarray(group, dtype=np.int64)
@@ -2273,7 +2502,7 @@ class LETTA:
         if old_labels is not None:
             from .abelian import Layout
 
-            bond_qns = [list(labels) for labels in self.abelian_layout.bond_qns]
+            bond_qns = [list(labels) for labels in bond_qns]
             bond_qns[bond + 1] = list(new_labels)
             self.abelian_layout = Layout(
                 local_qns=self.abelian_layout.local_qns,
@@ -2337,6 +2566,18 @@ class LETTA:
     def _apply_virtual_gauge(self, bond, group, gauge, gauge_inv):
         left = self.tensors[bond]
         right = self.tensors[bond + 1]
+        dtype = np.result_type(
+            left.dtype,
+            right.dtype,
+            np.asarray(gauge).dtype,
+            np.asarray(gauge_inv).dtype,
+        )
+        if left.dtype != dtype:
+            left = left.astype(dtype)
+            self.tensors[bond] = left
+        if right.dtype != dtype:
+            right = right.astype(dtype)
+            self.tensors[bond + 1] = right
         group = np.asarray(group, dtype=np.int64)
         left_block = left[:, :, :, group]
         left[:, :, :, group] = np.tensordot(left_block, gauge, axes=([3], [0]))
@@ -2376,6 +2617,18 @@ class LETTA:
         """Apply a state-preserving physical-conditioned bond gauge."""
         left = self.tensors[bond]
         right = self.tensors[bond + 1]
+        dtype = np.result_type(
+            left.dtype,
+            right.dtype,
+            np.asarray(gauge).dtype,
+            np.asarray(gauge_inv).dtype,
+        )
+        if left.dtype != dtype:
+            left = left.astype(dtype)
+            self.tensors[bond] = left
+        if right.dtype != dtype:
+            right = right.astype(dtype)
+            self.tensors[bond + 1] = right
         shared_state = int(shared_state)
         group = np.asarray(group, dtype=np.int64)
 
@@ -2402,6 +2655,7 @@ class LETTA:
         bond,
         *,
         direction="lr",
+        mode="symmetric",
         eps=1.0e-14,
         rcond=1.0e-12,
         normalize=False,
@@ -2419,6 +2673,7 @@ class LETTA:
         direction = str(direction).lower()
         if direction not in {"lr", "rl"}:
             raise ValueError("direction must be 'lr' or 'rl'.")
+        mode = _validate_gauge_mode(mode)
         left = self.tensors[bond]
         right = self.tensors[bond + 1]
         if left.ndim != 4:
@@ -2428,6 +2683,7 @@ class LETTA:
         if shared_dim != expected_shared_dim:
             raise ValueError("neighboring LETTA tensors have incompatible shared physical legs.")
 
+        transforms = []
         for shared_state in range(shared_dim):
             for group in self._conditional_virtual_bond_groups(bond, shared_state):
                 if group.size == 0:
@@ -2438,31 +2694,60 @@ class LETTA:
                     group,
                 )
                 if direction == "lr":
-                    gram = left_matrix.conj().T @ left_matrix
-                    sqrt, inv_sqrt = _hermitian_sqrt_pair(
-                        gram,
-                        eps=eps,
-                        rcond=rcond,
-                    )
-                    gauge = inv_sqrt
-                    gauge_inv = sqrt
+                    q = None
+                    if mode == "qr" and left_matrix.shape[0] >= left_matrix.shape[1]:
+                        q, r = np.linalg.qr(left_matrix, mode="reduced")
+                        try:
+                            gauge = np.linalg.inv(r)
+                        except linalg.LinAlgError:
+                            q = None
+                        else:
+                            gauge_inv = r
+                            left_matrix = q
+                            right_matrix = gauge_inv @ right_matrix
+                    if q is None:
+                        gram = left_matrix.conj().T @ left_matrix
+                        sqrt, inv_sqrt = _hermitian_sqrt_pair(
+                            gram,
+                            eps=eps,
+                            rcond=rcond,
+                        )
+                        gauge = inv_sqrt
+                        gauge_inv = sqrt
                 else:
-                    gram = right_matrix @ right_matrix.conj().T
-                    sqrt, inv_sqrt = _hermitian_sqrt_pair(
-                        gram,
-                        eps=eps,
-                        rcond=rcond,
+                    q = None
+                    if mode == "qr" and right_matrix.shape[1] >= right_matrix.shape[0]:
+                        q, r = np.linalg.qr(right_matrix.T, mode="reduced")
+                        r = r.T
+                        try:
+                            gauge_inv = np.linalg.inv(r)
+                        except linalg.LinAlgError:
+                            q = None
+                        else:
+                            gauge = r
+                            left_matrix = left_matrix @ gauge
+                            right_matrix = q.T
+                    if q is None:
+                        gram = right_matrix @ right_matrix.conj().T
+                        sqrt, inv_sqrt = _hermitian_sqrt_pair(
+                            gram,
+                            eps=eps,
+                            rcond=rcond,
+                        )
+                        gauge = sqrt
+                        gauge_inv = inv_sqrt
+                transforms.append(
+                    (
+                        shared_state,
+                        group,
+                        gauge,
+                        gauge_inv,
                     )
-                    gauge = sqrt
-                    gauge_inv = inv_sqrt
-                self._apply_conditional_virtual_gauge(
-                    bond,
-                    shared_state,
-                    group,
-                    gauge,
-                    gauge_inv,
                 )
-        self._apply_local_masks()
+        left, right = _apply_conditional_gauges(left, right, transforms)
+        self.tensors[bond] = left
+        self.tensors[bond + 1] = right
+        self._apply_local_masks((bond, bond + 1))
         if normalize:
             self.normalize()
         return self
@@ -2471,6 +2756,7 @@ class LETTA:
         self,
         *,
         direction="lr",
+        mode="symmetric",
         eps=1.0e-14,
         rcond=1.0e-12,
         normalize=True,
@@ -2479,6 +2765,7 @@ class LETTA:
         direction = str(direction).lower()
         if direction not in {"lr", "rl"}:
             raise ValueError("direction must be 'lr' or 'rl'.")
+        mode = _validate_gauge_mode(mode)
         bonds = range(self.nlocal_tensors - 1)
         if direction == "rl":
             bonds = reversed(list(bonds))
@@ -2486,6 +2773,7 @@ class LETTA:
             self.canonicalize_conditional_bond(
                 bond,
                 direction=direction,
+                mode=mode,
                 eps=eps,
                 rcond=rcond,
                 normalize=False,
@@ -2498,11 +2786,13 @@ class LETTA:
         self,
         tensor_index,
         *,
+        mode="symmetric",
         eps=1.0e-14,
         rcond=1.0e-12,
         normalize=True,
     ):
         """Build a physical-conditioned mixed gauge around one tensor."""
+        mode = _validate_gauge_mode(mode)
         tensor_index = int(tensor_index)
         if tensor_index < 0 or tensor_index >= self.nlocal_tensors:
             raise IndexError("tensor_index out of range.")
@@ -2510,6 +2800,7 @@ class LETTA:
             self.canonicalize_conditional_bond(
                 bond,
                 direction="lr",
+                mode=mode,
                 eps=eps,
                 rcond=rcond,
                 normalize=False,
@@ -2518,6 +2809,7 @@ class LETTA:
             self.canonicalize_conditional_bond(
                 bond,
                 direction="rl",
+                mode=mode,
                 eps=eps,
                 rcond=rcond,
                 normalize=False,
@@ -2531,6 +2823,7 @@ class LETTA:
         bond,
         *,
         direction="lr",
+        mode="symmetric",
         eps=1.0e-14,
         rcond=1.0e-12,
         normalize=False,
@@ -2542,6 +2835,7 @@ class LETTA:
         direction = str(direction).lower()
         if direction not in {"lr", "rl"}:
             raise ValueError("direction must be 'lr' or 'rl'.")
+        mode = _validate_gauge_mode(mode)
         left = self.tensors[bond]
         right = self.tensors[bond + 1]
         if left.ndim != 4:
@@ -2552,17 +2846,62 @@ class LETTA:
             left_matrix = left[:, :, :, group].reshape(-1, group.size)
             right_matrix = self._right_bond_matrix(right, group)
             if direction == "lr":
-                gram = left_matrix.conj().T @ left_matrix
-                sqrt, inv_sqrt = _hermitian_sqrt_pair(gram, eps=eps, rcond=rcond)
-                gauge = inv_sqrt
-                gauge_inv = sqrt
+                if mode == "qr" and left_matrix.shape[0] >= left_matrix.shape[1]:
+                    q, r = np.linalg.qr(left_matrix, mode="reduced")
+                    try:
+                        gauge = np.linalg.inv(r)
+                    except linalg.LinAlgError:
+                        gram = left_matrix.conj().T @ left_matrix
+                        sqrt, inv_sqrt = _hermitian_sqrt_pair(
+                            gram,
+                            eps=eps,
+                            rcond=rcond,
+                        )
+                        gauge = inv_sqrt
+                        gauge_inv = sqrt
+                    else:
+                        gauge_inv = r
+                        left_matrix = q
+                        right_matrix = gauge_inv @ right_matrix
+                else:
+                    gram = left_matrix.conj().T @ left_matrix
+                    sqrt, inv_sqrt = _hermitian_sqrt_pair(
+                        gram,
+                        eps=eps,
+                        rcond=rcond,
+                    )
+                    gauge = inv_sqrt
+                    gauge_inv = sqrt
             else:
-                gram = right_matrix @ right_matrix.conj().T
-                sqrt, inv_sqrt = _hermitian_sqrt_pair(gram, eps=eps, rcond=rcond)
-                gauge = sqrt
-                gauge_inv = inv_sqrt
+                if mode == "qr" and right_matrix.shape[1] >= right_matrix.shape[0]:
+                    q, r = np.linalg.qr(right_matrix.T, mode="reduced")
+                    r = r.T
+                    try:
+                        gauge_inv = np.linalg.inv(r)
+                    except linalg.LinAlgError:
+                        gram = right_matrix @ right_matrix.conj().T
+                        sqrt, inv_sqrt = _hermitian_sqrt_pair(
+                            gram,
+                            eps=eps,
+                            rcond=rcond,
+                        )
+                        gauge = sqrt
+                        gauge_inv = inv_sqrt
+                    else:
+                        gauge = r
+                        left_matrix = left_matrix @ gauge
+                        right_matrix = q.T
+                else:
+                    gram = right_matrix @ right_matrix.conj().T
+                    sqrt, inv_sqrt = _hermitian_sqrt_pair(
+                        gram,
+                        eps=eps,
+                        rcond=rcond,
+                    )
+                    gauge = sqrt
+                    gauge_inv = inv_sqrt
             self._apply_virtual_gauge(bond, group, gauge, gauge_inv)
-        self._apply_local_masks()
+        self._apply_local_masks((bond, bond + 1))
         if normalize:
             self.normalize()
         return self
@@ -2571,6 +2910,7 @@ class LETTA:
         self,
         *,
         direction="lr",
+        mode="symmetric",
         eps=1.0e-14,
         rcond=1.0e-12,
         normalize=True,
@@ -2579,6 +2919,7 @@ class LETTA:
         direction = str(direction).lower()
         if direction not in {"lr", "rl"}:
             raise ValueError("direction must be 'lr' or 'rl'.")
+        mode = _validate_gauge_mode(mode)
         bonds = range(self.nlocal_tensors - 1)
         if direction == "rl":
             bonds = reversed(list(bonds))
@@ -2586,6 +2927,7 @@ class LETTA:
             self.canonicalize_virtual_bond(
                 bond,
                 direction=direction,
+                mode=mode,
                 eps=eps,
                 rcond=rcond,
                 normalize=False,
@@ -2598,11 +2940,13 @@ class LETTA:
         self,
         tensor_index,
         *,
+        mode="symmetric",
         eps=1.0e-14,
         rcond=1.0e-12,
         normalize=True,
     ):
         """Move LETTA into a mixed gauge around one active tensor."""
+        mode = _validate_gauge_mode(mode)
         tensor_index = int(tensor_index)
         if tensor_index < 0 or tensor_index >= self.nlocal_tensors:
             raise IndexError("tensor_index out of range.")
@@ -2610,6 +2954,7 @@ class LETTA:
             self.canonicalize_virtual_bond(
                 bond,
                 direction="lr",
+                mode=mode,
                 eps=eps,
                 rcond=rcond,
                 normalize=False,
@@ -2618,6 +2963,7 @@ class LETTA:
             self.canonicalize_virtual_bond(
                 bond,
                 direction="rl",
+                mode=mode,
                 eps=eps,
                 rcond=rcond,
                 normalize=False,
@@ -2658,12 +3004,11 @@ class LETTA:
     @staticmethod
     def _advance_left_overlap_environment(env, bra_tensor, ket_tensor):
         diagonal = np.einsum("bkxx->bkx", env[:, :, 0], optimize=True)
-        advanced = np.einsum(
+        advanced = _cached_einsum(
             "bkx,bxuc,kxvd->cduv",
             diagonal,
             bra_tensor.conj(),
             ket_tensor,
-            optimize=True,
         )
         return advanced[:, :, None, :, :]
 
@@ -2684,17 +3029,16 @@ class LETTA:
         bra_terminal = self.tensors[-1] if self.has_terminal_tensor else None
         ket_terminal = other.tensors[-1] if other.has_terminal_tensor else None
         if bra_terminal is not None and ket_terminal is not None:
-            return np.einsum(
+            return _cached_einsum(
                 "bkxx,xb,xk->",
                 diagonal,
                 bra_terminal.conj(),
                 ket_terminal,
-                optimize=True,
             )
         if bra_terminal is not None:
-            return np.einsum("bkxx,xb->", diagonal, bra_terminal.conj(), optimize=True)
+            return _cached_einsum("bkxx,xb->", diagonal, bra_terminal.conj())
         if ket_terminal is not None:
-            return np.einsum("bkxx,xk->", diagonal, ket_terminal, optimize=True)
+            return _cached_einsum("bkxx,xk->", diagonal, ket_terminal)
         return np.einsum("bkxx->", diagonal, optimize=True)
 
     def fidelity(self, other):
@@ -2833,15 +3177,14 @@ class LETTA:
         for i, tensor in enumerate(self.tensors[:self.npairs]):
             env = self._advance_left_environment(env, mpo[i], tensor)
         if self.has_terminal_tensor:
-            return np.einsum(
+            return _cached_einsum(
                 "bkmxy,mnxy,xb,yk->",
                 env,
                 mpo[-1],
                 self.tensors[-1].conj(),
                 self.tensors[-1],
-                optimize=True,
             )
-        return np.einsum("bkmxy,mnxy->", env, mpo[-1], optimize=True)
+        return _cached_einsum("bkmxy,mnxy->", env, mpo[-1])
 
     def _mpo_matrix_element_direct(self, mpo):
         """
@@ -2930,38 +3273,35 @@ class LETTA:
         return np.ones((1, 1, self.dims[0], self.dims[0]), dtype=dtype)
 
     def _advance_product_environment(self, env, operator, tensor):
-        return np.einsum(
+        return _cached_einsum(
             "bkxy,xy,bxuc,kyvd->cduv",
             env,
             operator,
             tensor.conj(),
             tensor,
-            optimize=True,
         )
 
     def _final_product_closure(self, operator, dtype):
         operator = np.asarray(operator)
         if self.has_terminal_tensor:
             terminal = self.tensors[-1]
-            return np.einsum(
+            return _cached_einsum(
                 "xy,xb,yk->bkxy",
                 operator,
                 terminal.conj(),
                 terminal,
-                optimize=True,
             )
         closure = np.zeros((1, 1, operator.shape[0], operator.shape[1]), dtype=dtype)
         closure[0, 0] = operator
         return closure
 
     def _retreat_product_closure(self, closure, operator, tensor):
-        return np.einsum(
+        return _cached_einsum(
             "xy,bxuc,kyvd,cduv->bkxy",
             operator,
             tensor.conj(),
             tensor,
             closure,
-            optimize=True,
         )
 
     def _identity_product_environments(self, dtype):
@@ -2987,7 +3327,7 @@ class LETTA:
         return closures
 
     def _contract_product_environment(self, env, closure):
-        return np.einsum("bkxy,bkxy->", env, closure, optimize=True)
+        return _cached_einsum("bkxy,bkxy->", env, closure)
 
     def _identity_matrix_element(self):
         dtype = np.result_type(*[tensor.dtype for tensor in self.tensors])
@@ -2996,12 +3336,11 @@ class LETTA:
             env = self._advance_left_metric_environment(env, tensor)
         if self.has_terminal_tensor:
             terminal = self.tensors[-1]
-            return np.einsum(
+            return _cached_einsum(
                 "bkxx,xb,xk->",
                 env[:, :, 0],
                 terminal.conj(),
                 terminal,
-                optimize=True,
             )
         return np.einsum("bkxx->", env[:, :, 0], optimize=True)
 
@@ -3201,13 +3540,12 @@ class LETTA:
                 package,
                 np.asarray(mpo_site).shape[1],
             )
-        return np.einsum(
+        return _cached_einsum(
             "bkmxy,mnxy,bxuc,kyvd->cdnuv",
             env,
             mpo_site,
             tensor.conj(),
             tensor,
-            optimize=True,
         )
 
     def _right_local_environments(self, mpo, *, verbose=0):
@@ -3245,7 +3583,11 @@ class LETTA:
             (terminal.shape[1], terminal.shape[1], right_mpo_dim, self.dims[-1], self.dims[-1]),
             dtype=dtype,
         )
-        env[:, :, 0, :, :] = np.einsum("uc,vd->cduv", terminal.conj(), terminal, optimize=True)
+        env[:, :, 0, :, :] = _cached_einsum(
+            "uc,vd->cduv",
+            terminal.conj(),
+            terminal,
+        )
         return env
 
     def _advance_right_environment(self, env, mpo_site, tensor):
@@ -3257,13 +3599,12 @@ class LETTA:
                 package,
                 np.asarray(mpo_site).shape[0],
             )
-        return np.einsum(
+        return _cached_einsum(
             "cdnuv,mnuv,bxuc,kyvd->bkmxy",
             env,
             mpo_site,
             tensor.conj(),
             tensor,
-            optimize=True,
         )
 
     def _left_metric_environments(self, *, verbose=0):
@@ -3281,12 +3622,11 @@ class LETTA:
 
     def _advance_left_metric_environment(self, env, tensor):
         diagonal = np.einsum("bkxx->bkx", env[:, :, 0], optimize=True)
-        advanced = np.einsum(
+        advanced = _cached_einsum(
             "bkx,bxuc,kxvd->cduv",
             diagonal,
             tensor.conj(),
             tensor,
-            optimize=True,
         )
         return advanced[:, :, None, :, :]
 
@@ -3309,36 +3649,33 @@ class LETTA:
 
     def _advance_right_metric_environment(self, env, tensor):
         diagonal = np.einsum("cduu->cdu", env[:, :, 0], optimize=True)
-        advanced = np.einsum(
+        advanced = _cached_einsum(
             "cdu,bxuc,kyud->bkxy",
             diagonal,
             tensor.conj(),
             tensor,
-            optimize=True,
         )
         return advanced[:, :, None, :, :]
 
     def _local_effective_from_environments(self, mpo, tensor_index, left_envs, right_envs):
         tensor_index = int(tensor_index)
         shape = self.tensors[tensor_index].shape
-        heff = np.einsum(
+        heff = _cached_einsum(
             "bkmxy,mpxy,pnuv,cdnuv->bxuckyvd",
             left_envs[tensor_index],
             mpo[tensor_index],
             mpo[tensor_index + 1],
             right_envs[tensor_index],
-            optimize=True,
         )
         return heff.reshape(int(np.prod(shape)), int(np.prod(shape)))
 
     def _terminal_effective_from_environment(self, mpo, left_envs):
         terminal_index = self.npairs
         terminal = self.tensors[terminal_index]
-        heff = np.einsum(
+        heff = _cached_einsum(
             "cdmxy,mnxy->xcyd",
             left_envs[terminal_index],
             mpo[-1],
-            optimize=True,
         )
         return heff.reshape(terminal.size, terminal.size)
 
@@ -3356,14 +3693,13 @@ class LETTA:
     def _apply_local_effective_from_environments(self, mpo, tensor_index, left_envs, right_envs, vector):
         tensor_index = int(tensor_index)
         theta = np.asarray(vector).reshape(self.tensors[tensor_index].shape)
-        out = np.einsum(
+        out = _cached_einsum(
             "bkmxy,mpxy,pnuv,cdnuv,kyvd->bxuc",
             left_envs[tensor_index],
             mpo[tensor_index],
             mpo[tensor_index + 1],
             right_envs[tensor_index],
             theta,
-            optimize=True,
         )
         return out.reshape(-1)
 
@@ -3371,14 +3707,13 @@ class LETTA:
         tensor_index = int(tensor_index)
         vectors = np.asarray(vectors)
         theta = vectors.reshape((vectors.shape[0],) + self.tensors[tensor_index].shape)
-        out = np.einsum(
+        out = _cached_einsum(
             "bkmxy,mpxy,pnuv,cdnuv,qkyvd->qbxuc",
             left_envs[tensor_index],
             mpo[tensor_index],
             mpo[tensor_index + 1],
             right_envs[tensor_index],
             theta,
-            optimize=True,
         )
         return out.reshape(vectors.shape[0], -1)
 
@@ -3394,12 +3729,11 @@ class LETTA:
             return metric @ np.asarray(vector).reshape(-1)
         left_diag = np.einsum("bkxx->bkx", left[:, :, 0], optimize=True)
         right_diag = np.einsum("cduu->cdu", right[:, :, 0], optimize=True)
-        out = np.einsum(
+        out = _cached_einsum(
             "bkx,cdu,kxud->bxuc",
             left_diag,
             right_diag,
             theta,
-            optimize=True,
         )
         return out.reshape(-1)
 
@@ -3416,12 +3750,11 @@ class LETTA:
             return vectors @ metric.T
         left_diag = np.einsum("bkxx->bkx", left[:, :, 0], optimize=True)
         right_diag = np.einsum("cduu->cdu", right[:, :, 0], optimize=True)
-        out = np.einsum(
+        out = _cached_einsum(
             "bkx,cdu,qkxud->qbxuc",
             left_diag,
             right_diag,
             theta,
-            optimize=True,
         )
         return out.reshape(vectors.shape[0], -1)
 
@@ -3471,16 +3804,29 @@ class LETTA:
         w_right = mpo[tensor_index + 1]
 
         def build_heff():
+            if local_dim <= _DEFAULT_MASKED_DENSE_SLICE_LOCAL_DIM:
+                full_heff = self._local_effective_from_environments(
+                    mpo,
+                    tensor_index,
+                    left_envs,
+                    right_envs,
+                )
+                return full_heff[np.ix_(support_indices, support_indices)]
             transitions = _two_site_mpo_sparse_transitions(w_left, w_right)
             if transitions is not None and transitions.ntransitions:
-                return _support_heff_sparse_by_transitions(
+                return _support_kernel_assemble(
                     coords,
                     np.asarray(left),
                     np.asarray(right),
-                    transitions,
-                    dtype=dtype,
-                    physical_groups=physical_groups,
-                ).toarray()
+                    transitions.bra_i,
+                    transitions.ket_i,
+                    transitions.bra_j,
+                    transitions.ket_j,
+                    transitions.entry_starts,
+                    transitions.entry_m,
+                    transitions.entry_n,
+                    transitions.entry_values,
+                ).astype(dtype, copy=False)
             sparse_entries = _two_site_mpo_sparse_entries(w_left, w_right)
             if _support_heff_sparse_numba is not None and sparse_entries is not None:
                 entry_starts, entry_m, entry_n, entry_values = sparse_entries
@@ -3610,9 +3956,28 @@ class LETTA:
                         full_vector,
                     )[support_indices]
 
+                def matmat(vectors):
+                    vectors = np.asarray(vectors)
+                    if direct_transitions is not None:
+                        return _apply_support_heff_by_transitions(
+                            coords,
+                            np.asarray(left),
+                            np.asarray(right),
+                            direct_transitions,
+                            vectors,
+                            dtype=dtype,
+                            physical_groups=physical_groups,
+                        )
+                    if sparse_heff is not None:
+                        return sparse_heff @ vectors
+                    return np.column_stack(
+                        [matvec(vectors[:, column]) for column in range(vectors.shape[1])]
+                    )
+
                 operator = LinearOperator(
                     (support_size, support_size),
                     matvec=matvec,
+                    matmat=matmat,
                     dtype=dtype,
                 )
                 v0 = _active_projected_warm_start(
@@ -4422,13 +4787,53 @@ class LETTA:
             "identity_metric": bool(assume_identity_metric),
         }
 
-    def sweep(self, direction="lr", operator=None):
+    def sweep(
+        self,
+        direction="lr",
+        operator=None,
+        *,
+        local_solver="auto",
+        matrix_free_threshold=None,
+        matrix_free_memory_limit=_DEFAULT_MATRIX_FREE_MEMORY_LIMIT,
+        matrix_free_tol=1e-9,
+        matrix_free_maxiter=None,
+        matrix_free_fallback_dim=_DEFAULT_MATRIX_FREE_FALLBACK_DIM,
+        gauge=None,
+        canonicalize="symmetric",
+        identity_metric=None,
+        metric_tol=1.0e-10,
+        adapt_bonds=None,
+        compress_rtol=1.0e-12,
+        compress_atol=0.0,
+        max_bond_dim=None,
+        verbose=0,
+        _canonicalize_start=True,
+    ):
         """
         Perform one one-site variational sweep over tied tensors.
         """
         if operator is not None:
             if self._looks_like_mpo(operator):
-                return self.sweep_mpo(operator, direction=direction)
+                return self._sweep_mpo(
+                    operator,
+                    direction,
+                    local_solver=local_solver,
+                    matrix_free_threshold=matrix_free_threshold,
+                    matrix_free_memory_limit=matrix_free_memory_limit,
+                    matrix_free_tol=matrix_free_tol,
+                    matrix_free_maxiter=matrix_free_maxiter,
+                    matrix_free_fallback_dim=matrix_free_fallback_dim,
+                    gauge=gauge,
+                    canonicalize=canonicalize,
+                    identity_metric=identity_metric,
+                    metric_tol=metric_tol,
+                    adapt_bonds=adapt_bonds,
+                    compress_rtol=compress_rtol,
+                    compress_atol=compress_atol,
+                    max_bond_dim=max_bond_dim,
+                    verbose=verbose,
+                    _canonicalize_start=_canonicalize_start,
+                )
             old_hamiltonian = self.hamiltonian
             self.hamiltonian = self._validate_dense_operator(operator)
             try:
@@ -4444,7 +4849,7 @@ class LETTA:
             indices = reversed(list(indices))
         return [self.optimize_tensor(i) for i in indices]
 
-    def sweep_mpo(
+    def _sweep_mpo(
         self,
         mpo,
         direction="lr",
@@ -4456,6 +4861,7 @@ class LETTA:
         matrix_free_maxiter=None,
         matrix_free_fallback_dim=_DEFAULT_MATRIX_FREE_FALLBACK_DIM,
         gauge=None,
+        canonicalize="symmetric",
         identity_metric=None,
         metric_tol=1.0e-10,
         adapt_bonds=None,
@@ -4463,6 +4869,7 @@ class LETTA:
         compress_atol=0.0,
         max_bond_dim=None,
         verbose=0,
+        _canonicalize_start=True,
     ):
         """
         Perform one one-site sweep using MPO-contracted local Hamiltonians.
@@ -4484,6 +4891,7 @@ class LETTA:
         if direction not in {"lr", "rl"}:
             raise ValueError("direction must be 'lr' or 'rl'.")
         gauge_mode = _validate_gauge(gauge)
+        canonicalize_mode = _validate_gauge_mode(canonicalize)
         if identity_metric is None:
             identity_metric = gauge_mode == "conditional"
         identity_metric = bool(identity_metric)
@@ -4503,9 +4911,13 @@ class LETTA:
                 atol=compress_atol,
                 max_bond_dim=max_bond_dim,
             )
-        if identity_metric:
+        if identity_metric and bool(_canonicalize_start):
             start = 0 if direction == "lr" else self.nlocal_tensors - 1
-            self.canonicalize_conditional_center(start, normalize=False)
+            self.canonicalize_conditional_center(
+                start,
+                mode=canonicalize_mode,
+                normalize=False,
+            )
         updates = []
         package = LETTAOperatorPackage.for_sweep(self, mpo, direction, verbose=verbose)
 
@@ -4550,10 +4962,16 @@ class LETTA:
                         self.canonicalize_conditional_bond(
                             i,
                             direction="lr",
+                            mode=canonicalize_mode,
                             normalize=False,
                         )
                     else:
-                        self.canonicalize_virtual_bond(i, direction="lr", normalize=False)
+                        self.canonicalize_virtual_bond(
+                            i,
+                            direction="lr",
+                            mode=canonicalize_mode,
+                            normalize=False,
+                        )
                 package.advance_after_update(i)
         else:
             for i in reversed(range(self.nlocal_tensors)):
@@ -4596,12 +5014,14 @@ class LETTA:
                         self.canonicalize_conditional_bond(
                             i - 1,
                             direction="rl",
+                            mode=canonicalize_mode,
                             normalize=False,
                         )
                     else:
                         self.canonicalize_virtual_bond(
                             i - 1,
                             direction="rl",
+                            mode=canonicalize_mode,
                             normalize=False,
                         )
                 package.advance_after_update(i)
@@ -4623,6 +5043,7 @@ class LETTA:
         matrix_free_maxiter=None,
         matrix_free_fallback_dim=_DEFAULT_MATRIX_FREE_FALLBACK_DIM,
         gauge="conditional",
+        canonicalize="symmetric",
         identity_metric=None,
         metric_tol=1.0e-10,
         adapt_bonds=None,
@@ -4647,6 +5068,7 @@ class LETTA:
         ``max_bond_dim`` enables additional lossy truncation, with
         discarded weights recorded in each local update.
         """
+        canonicalize_mode = _validate_gauge_mode(canonicalize)
         mpo = None
         if operator is not None:
             if self._looks_like_mpo(operator):
@@ -4669,14 +5091,23 @@ class LETTA:
             raise ValueError("nsweeps must be positive.")
         direction = start_direction.lower()
         previous_energy = None
+        previous_sweep_direction = None
         self.history = []
         self.converged = False
 
         for sweep_idx in range(int(nsweeps)):
+            reuse_canonical_center = (
+                mpo is not None
+                and previous_sweep_direction is not None
+                and direction != previous_sweep_direction
+                and _validate_gauge(gauge) == "conditional"
+                and identity_metric is not False
+                and adapt_bonds is False
+            )
             if mpo is not None:
-                updates = self.sweep_mpo(
-                    mpo,
+                updates = self.sweep(
                     direction,
+                    mpo,
                     local_solver=local_solver,
                     matrix_free_threshold=matrix_free_threshold,
                     matrix_free_memory_limit=matrix_free_memory_limit,
@@ -4684,6 +5115,7 @@ class LETTA:
                     matrix_free_maxiter=matrix_free_maxiter,
                     matrix_free_fallback_dim=matrix_free_fallback_dim,
                     gauge=gauge,
+                    canonicalize=canonicalize_mode,
                     identity_metric=identity_metric,
                     metric_tol=metric_tol,
                     adapt_bonds=adapt_bonds,
@@ -4691,6 +5123,7 @@ class LETTA:
                     compress_atol=compress_atol,
                     max_bond_dim=max_bond_dim,
                     verbose=verbose,
+                    _canonicalize_start=not reuse_canonical_center,
                 )
                 energy = updates[-1]["local_energy"] if updates else self.expectation_mpo(mpo)
             else:
@@ -4703,6 +5136,8 @@ class LETTA:
                 "energy": energy,
                 "delta_energy": delta,
                 "gauge": _validate_gauge(gauge) if mpo is not None else None,
+                "canonicalize": canonicalize_mode if mpo is not None else None,
+                "reused_canonical_center": bool(reuse_canonical_center),
                 "updates": updates,
             }
             self.history.append(entry)
@@ -4716,6 +5151,7 @@ class LETTA:
                 self.converged = True
                 break
             previous_energy = energy
+            previous_sweep_direction = direction
             if alternate:
                 direction = "rl" if direction == "lr" else "lr"
 
@@ -4986,3 +5422,6 @@ class LETTA:
                     self.tensors[i] = vector.reshape(self.tensors[i].shape)
             self.normalize()
         return self
+
+# Backward-compatible alias for the chain-ordered dense workflow.
+SequentialLETTA = LETTA

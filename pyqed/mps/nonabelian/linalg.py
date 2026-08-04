@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .tensor import FusionPipe
+from .tensor import FusionPipe, IdentityBasisTransform
 
 
 def find_pipe_entry(pipe, fused_sector, child_sectors, selected_shape, slot):
@@ -93,6 +93,7 @@ class ReducedProjectedSVD:
     singular_values: np.ndarray
     U: np.ndarray
     Vh: np.ndarray
+    state_weight_override: int | None = None
 
     @property
     def sector(self):
@@ -134,6 +135,8 @@ class ReducedProjectedSVD:
 
     @property
     def state_weight(self):
+        if self.state_weight_override is not None:
+            return int(self.state_weight_override)
         return sector_state_weight(self.sector)
 
     def kept_indices(self, cutoff=1.0e-10):
@@ -325,7 +328,12 @@ def project_reduced_sector(entries, q_mid, left_pipe, right_pipe, left_basis_map
                 if col_key[0] != col_combo or col_key[1] != col_shape:
                     continue
                 right_basis = right_basis_map[(col_combo, col_shape, col_key[2])]
-                blocks[(row_key, col_key)] = left_basis.T @ block_matrix @ right_basis
+                projected = block_matrix
+                if not isinstance(left_basis, IdentityBasisTransform):
+                    projected = left_basis.T @ projected
+                if not isinstance(right_basis, IdentityBasisTransform):
+                    projected = projected @ right_basis
+                blocks[(row_key, col_key)] = projected
     return ReducedProjectedSector(
         sector=q_mid,
         left_pipe=left_pipe,
@@ -337,7 +345,14 @@ def project_reduced_sector(entries, q_mid, left_pipe, right_pipe, left_basis_map
     )
 
 
-def truncate_reduced_svds(sector_svds, *, cutoff=1.0e-10, max_bond=None, mode="reduced"):
+def truncate_reduced_svds(
+    sector_svds,
+    *,
+    cutoff=1.0e-10,
+    max_bond=None,
+    mode="reduced",
+    retain_sector_topology=False,
+):
     mode = normalize_max_bond_mode(mode, default="reduced")
     if hasattr(sector_svds, "items"):
         normalized = dict(sector_svds)
@@ -353,12 +368,91 @@ def truncate_reduced_svds(sector_svds, *, cutoff=1.0e-10, max_bond=None, mode="r
             )
         sv_list.extend(svd.singular_items(cutoff=cutoff))
 
-    if not sv_list:
+    if not sv_list and not retain_sector_topology:
         raise ValueError("All non-Abelian singular values were truncated.")
 
     sv_list.sort(reverse=True, key=lambda item: item[3] * item[0] ** 2)
     full_sq_norm = sum(weight * sval**2 for sval, _, _, weight in sv_list)
-    kept_items = select_kept_singular_values(sv_list, max_bond, mode=mode)
+    if retain_sector_topology:
+        topology_items = []
+        for sector in sorted(normalized):
+            values = np.asarray(normalized[sector].singular_values).reshape(-1)
+            if values.size:
+                idx = int(np.argmax(np.abs(values)))
+                topology_items.append(
+                    (
+                        float(values[idx]),
+                        sector,
+                        idx,
+                        normalized[sector].state_weight,
+                    )
+                )
+
+        if max_bond is None:
+            kept_items = list(topology_items)
+            seen = {(item[1], item[2]) for item in kept_items}
+            kept_items.extend(
+                item for item in sv_list
+                if (item[1], item[2]) not in seen
+            )
+        elif mode == "per_sector":
+            kept_items = select_kept_singular_values(
+                sv_list,
+                max_bond,
+                mode=mode,
+            )
+            seen = {(item[1], item[2]) for item in kept_items}
+            kept_items.extend(
+                item for item in topology_items
+                if (item[1], item[2]) not in seen
+            )
+        elif mode == "reduced":
+            budget = int(max_bond)
+            topology_items.sort(
+                reverse=True,
+                key=lambda item: item[3] * item[0] ** 2,
+            )
+            kept_items = topology_items[:budget]
+            seen = {(item[1], item[2]) for item in kept_items}
+            for item in sv_list:
+                key = (item[1], item[2])
+                if key in seen:
+                    continue
+                if len(kept_items) >= budget:
+                    break
+                kept_items.append(item)
+                seen.add(key)
+        else:
+            budget = int(max_bond)
+            topology_cost = sum(int(item[3]) for item in topology_items)
+            if topology_cost <= budget:
+                kept_items = list(topology_items)
+                seen = {(item[1], item[2]) for item in kept_items}
+                remaining = [
+                    item for item in sv_list
+                    if (item[1], item[2]) not in seen
+                ]
+                remaining_budget = budget - topology_cost
+                if remaining and remaining_budget > 0:
+                    selected = select_kept_singular_values(
+                        remaining,
+                        remaining_budget,
+                        mode=mode,
+                    )
+                    kept_items.extend(
+                        item for item in selected
+                        if int(item[3]) <= remaining_budget
+                    )
+            else:
+                kept_items = select_kept_singular_values(
+                    topology_items,
+                    max_bond,
+                    mode=mode,
+                )
+    else:
+        kept_items = select_kept_singular_values(sv_list, max_bond, mode=mode)
+    if not kept_items:
+        raise ValueError("All non-Abelian singular values were truncated.")
     kept_sq_norm = sum(weight * sval**2 for sval, _, _, weight in kept_items)
     trunc_err = 0.0 if full_sq_norm <= 1.0e-15 else 1.0 - kept_sq_norm / full_sq_norm
 

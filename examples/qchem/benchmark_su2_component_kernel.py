@@ -136,7 +136,7 @@ def run_case(mf, case, *, bond_dim, nsweeps, direct, recursive=False):
     :param mf: Mean-field reference object.
     :param case: Preset active-space metadata.
     :param bond_dim: Per-sector bond dimension.
-    :param nsweeps: Number of sweeps.
+    :param nsweeps: Number of complete left-to-right plus right-to-left sweeps.
     :param direct: Force the experimental component-direct projection path.
     :param recursive: Force the recursive matrix-free complementary matvec.
     :returns: Benchmark result dictionary.
@@ -164,6 +164,7 @@ def run_case(mf, case, *, bond_dim, nsweeps, direct, recursive=False):
         dmrg.run(
             nsweeps=nsweeps,
             conv_tol=-1.0,
+            require_convergence=False,
             local_basis_policy="block2_like",
             orthonormalized_operator_dim=512,
             max_bond_mode="per_sector",
@@ -233,7 +234,18 @@ def main():
 
     case = PRESETS[args.system]
     mol = Molecule(atom=case["atom"], unit="bohr", basis=args.basis)
-    mol.build(driver="gbasis")
+    mol.build(
+        driver="builtin",
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    build_info = mol._builtin_build_info
+    if (
+        build_info.get("eri_backend") != "cpp"
+        or not str(build_info.get("dense_builder", "")).startswith("cpp-")
+    ):
+        raise RuntimeError("The SU(2) component benchmark requires the compiled C++ ERI backend.")
     mf = RHF(mol).run()
 
     runs = [("default", False)]

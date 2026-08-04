@@ -11,12 +11,19 @@ native C-order flattening used by :class:`FrontierTiedLETTA`.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
+from scipy import linalg
 
 from .local_terms import LocalHamiltonian
 from .matrix_free import DavidsonDiagnostics, lowest_generalized_davidson
+
+try:  # Optional native kernel; the Python path below is the reference path.
+    from . import _physical_blocks_cpp
+except Exception:  # pragma: no cover - depends on optional build artifacts.
+    _physical_blocks_cpp = None
 
 
 @dataclass(frozen=True)
@@ -41,6 +48,8 @@ class PhysicalBlockSolveDiagnostics:
     metric_blocks: int
     hamiltonian_blocks: int
     stored_elements: int
+    component_dimensions: tuple[int, ...] = ()
+    dense_components: tuple[bool, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -231,7 +240,32 @@ class PhysicalBlockLinearOperator:
         self.blocks = {
             pair: np.asarray(block, dtype=self.dtype) for pair, block in copied.items()
         }
+        self._native_rows = np.asarray(
+            [pair[0] for pair in self.blocks],
+            dtype=np.intp,
+        )
+        self._native_columns = np.asarray(
+            [pair[1] for pair in self.blocks],
+            dtype=np.intp,
+        )
+        self._native_blocks = (
+            np.ascontiguousarray(np.stack(tuple(self.blocks.values())))
+            if self.blocks
+            else np.empty(
+                (0, layout.virtual_size, layout.virtual_size),
+                dtype=self.dtype,
+            )
+        )
         self.shape = (layout.size, layout.size)
+
+    @property
+    def _use_native_matvec(self) -> bool:
+        return bool(
+            _physical_blocks_cpp is not None
+            and self.layout.virtual_size <= 64
+            and self._native_blocks.dtype
+            in {np.dtype(np.float64), np.dtype(np.complex128)}
+        )
 
     @property
     def connected_pairs(self) -> tuple[tuple[int, int], ...]:
@@ -243,6 +277,16 @@ class PhysicalBlockLinearOperator:
 
     def matvec(self, vector) -> np.ndarray:
         inputs = self.layout.as_blocks(vector)
+        if self._use_native_matvec:
+            return self.layout.from_blocks(
+                _physical_blocks_cpp.block_matvec(
+                    self._native_blocks,
+                    self._native_rows,
+                    self._native_columns,
+                    np.ascontiguousarray(inputs),
+                    False,
+                )
+            )
         dtype = np.result_type(inputs.dtype, self.dtype)
         outputs = np.zeros(
             (self.layout.nblocks, self.layout.virtual_size), dtype=dtype
@@ -253,6 +297,16 @@ class PhysicalBlockLinearOperator:
 
     def rmatvec(self, vector) -> np.ndarray:
         inputs = self.layout.as_blocks(vector)
+        if self._use_native_matvec:
+            return self.layout.from_blocks(
+                _physical_blocks_cpp.block_matvec(
+                    self._native_blocks,
+                    self._native_rows,
+                    self._native_columns,
+                    np.ascontiguousarray(inputs),
+                    True,
+                )
+            )
         dtype = np.result_type(inputs.dtype, self.dtype)
         outputs = np.zeros(
             (self.layout.nblocks, self.layout.virtual_size), dtype=dtype
@@ -546,6 +600,21 @@ class PhysicalBlockGeneralizedProblem:
                 f"initial_vector must contain {self.layout.size} entries."
             )
         initial_vector = initial_vector.reshape(-1)
+        dense_component_max_size = davidson_options.pop(
+            "dense_component_max_size",
+            0,
+        )
+        parallel_components = bool(davidson_options.pop("parallel_components", False))
+        max_component_workers = davidson_options.pop("max_component_workers", None)
+        if max_component_workers is not None:
+            max_component_workers = int(max_component_workers)
+            if max_component_workers < 1:
+                raise ValueError("max_component_workers must be positive or None.")
+        if dense_component_max_size is None:
+            dense_component_max_size = 0
+        dense_component_max_size = int(dense_component_max_size)
+        if dense_component_max_size < 0:
+            raise ValueError("dense_component_max_size must be nonnegative.")
         tolerance = float(davidson_options.get("tol", 1.0e-10))
         absolute_tolerance = float(davidson_options.get("atol", 0.0))
         if not np.isfinite(tolerance) or tolerance < 0.0:
@@ -601,8 +670,11 @@ class PhysicalBlockGeneralizedProblem:
         total_metric_matvecs = 0
         total_restarts = 0
         total_subspace = 0
+        component_dimensions = []
+        dense_components = []
 
-        for component_index, component in enumerate(components):
+        def solve_component(component_item):
+            component_index, component = component_item
             active_blocks = component
             block_ranges = {}
             active_layout = []
@@ -660,7 +732,45 @@ class PhysicalBlockGeneralizedProblem:
                     dtype=np.result_type(initial_vector.dtype, self.metric.dtype),
                 )
 
-            if component_size == 1:
+            if component_size <= dense_component_max_size:
+                dense_hamiltonian = np.zeros(
+                    (component_size, component_size),
+                    dtype=np.result_type(
+                        initial_vector.dtype,
+                        self.hamiltonian.dtype,
+                    ),
+                )
+                for row_slice, column_slice, block in reduced_hamiltonian_blocks:
+                    dense_hamiltonian[row_slice, column_slice] += block
+                dense_hamiltonian = 0.5 * (
+                    dense_hamiltonian + dense_hamiltonian.T.conj()
+                )
+                eigenvalues, eigenvectors = linalg.eigh(
+                    dense_hamiltonian,
+                    subset_by_index=[0, 0],
+                    driver="evx",
+                    check_finite=False,
+                )
+                energy = float(np.real(eigenvalues[0]))
+                vector = eigenvectors[:, 0]
+                h_vector = hamiltonian_action(vector)
+                residual = h_vector - energy * vector
+                residual_norm = float(np.linalg.norm(residual))
+                diagnostics = DavidsonDiagnostics(
+                    converged=True,
+                    message="dense conditional component diagonalization",
+                    iterations=1,
+                    hamiltonian_matvecs=1,
+                    metric_matvecs=1,
+                    restarts=0,
+                    residual_norm=residual_norm,
+                    metric_norm=float(np.vdot(vector, vector).real),
+                    projected_rank=component_size,
+                    subspace_dimension=component_size,
+                    energy_history=(energy,),
+                    residual_history=(residual_norm,),
+                )
+            elif component_size == 1:
                 unit = np.ones(1, dtype=component_initial.dtype)
                 metric_value = float(np.real(metric_action(unit)[0]))
                 vector = unit / np.sqrt(metric_value)
@@ -699,20 +809,41 @@ class PhysicalBlockGeneralizedProblem:
                     f"physical-block component {component_index} failed: "
                     f"{diagnostics.message}"
                 )
+            return (
+                float(energy),
+                component_index,
+                tuple(active_layout),
+                vector,
+                diagnostics,
+                component_size,
+                component_size <= dense_component_max_size,
+            )
+
+        component_items = tuple(enumerate(components))
+        if parallel_components and len(component_items) > 1:
+            with ThreadPoolExecutor(max_workers=max_component_workers) as executor:
+                component_results = tuple(executor.map(solve_component, component_items))
+        else:
+            component_results = tuple(solve_component(item) for item in component_items)
+
+        for result in component_results:
+            (
+                energy,
+                component_index,
+                active_layout,
+                vector,
+                diagnostics,
+                component_size,
+                dense_component,
+            ) = result
             total_iterations += diagnostics.iterations
             total_hamiltonian_matvecs += diagnostics.hamiltonian_matvecs
             total_metric_matvecs += diagnostics.metric_matvecs
             total_restarts += diagnostics.restarts
             total_subspace += diagnostics.subspace_dimension
-            candidates.append(
-                (
-                    float(energy),
-                    component_index,
-                    tuple(active_layout),
-                    vector,
-                    diagnostics,
-                )
-            )
+            component_dimensions.append(component_size)
+            dense_components.append(dense_component)
+            candidates.append((energy, component_index, active_layout, vector, diagnostics))
 
         if not candidates:
             raise ValueError("local overlap metric is numerically singular.")
@@ -766,6 +897,8 @@ class PhysicalBlockGeneralizedProblem:
             metric_blocks=len(self.metric.blocks),
             hamiltonian_blocks=len(self.hamiltonian.blocks),
             stored_elements=self.stored_elements,
+            component_dimensions=tuple(component_dimensions),
+            dense_components=tuple(dense_components),
         )
         return energy, vector, diagnostics
 

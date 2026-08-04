@@ -113,10 +113,7 @@ class ModeDVR:
     dvr: SineDVR | HermiteDVR
 
     def t(self) -> np.ndarray:
-        if self.kind == "hermite":
-            t = self.dvr.t(mc2=self.mass)
-        else:
-            t = self.dvr.t()
+        t = self.dvr.t()
         return 0.5 * (t + t.conj().T)
 
 
@@ -126,7 +123,12 @@ def _make_mode_dvr(kind: str, npts: int, qmax: float, mode: int) -> ModeDVR:
         dvr = SineDVR(-qmax, qmax, npts, mass=mass)
         return ModeDVR(x=np.asarray(dvr.x), npts=dvr.npts, mass=mass, kind=kind, dvr=dvr)
     if kind == "hermite":
-        dvr = HermiteDVR(npts)
+        dvr = HermiteDVR(
+            npts=npts,
+            mass=mass,
+            omega=float(MODE_FREQ_AU[mode]),
+            center=0.0,
+        )
         return ModeDVR(x=np.asarray(dvr.x), npts=dvr.npts, mass=mass, kind=kind, dvr=dvr)
     raise ValueError(f"unknown DVR type {kind!r}")
 

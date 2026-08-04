@@ -11,7 +11,6 @@ from collections import Counter
 from pathlib import Path
 
 import numpy as np
-from pyblock2._pyscf.ao2mo import integrals as block2_integrals
 from pyblock2.driver.core import DMRGDriver, SymmetryTypes
 from pyscf import gto, mcscf, scf
 
@@ -35,7 +34,46 @@ PRESETS = {
         "ncas": 6,
         "nelecas": 6,
     },
+    "h8": {
+        "atom": "; ".join(f"H 0 0 {1.6 * i}" for i in range(8)),
+        "ncas": 8,
+        "nelecas": 8,
+    },
+    "h10": {
+        "atom": "; ".join(f"H 0 0 {1.6 * i}" for i in range(10)),
+        "ncas": 10,
+        "nelecas": 10,
+    },
+    "h12": {
+        "atom": "; ".join(f"H 0 0 {1.6 * i}" for i in range(12)),
+        "ncas": 12,
+        "nelecas": 12,
+    },
+    "h14": {
+        "atom": "; ".join(f"H 0 0 {1.6 * i}" for i in range(14)),
+        "ncas": 14,
+        "nelecas": 14,
+    },
 }
+
+
+def build_pyqed_cpp_molecule(case, basis):
+    """Build PyQED AO integrals with the compiled C++ backend."""
+
+    mol = Molecule(atom=case["atom"], basis=basis, unit="bohr")
+    mol.build(
+        driver="builtin",
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    build_info = mol._builtin_build_info
+    if (
+        build_info.get("eri_backend") != "cpp"
+        or not str(build_info.get("dense_builder", "")).startswith("cpp-")
+    ):
+        raise RuntimeError("The SU(2)/block2 benchmark requires the compiled C++ ERI backend.")
+    return mol
 
 
 def scalar_energy(value):
@@ -45,7 +83,7 @@ def scalar_energy(value):
 
 
 def run_pyscf_casci(case, basis):
-    """Build the PySCF reference molecule, RHF, and exact CASCI."""
+    """Build an independent PySCF reference molecule, RHF, and exact CASCI."""
 
     mol = gto.M(
         atom=case["atom"],
@@ -62,11 +100,53 @@ def run_pyscf_casci(case, basis):
     return mol, mf, mc, e_casci
 
 
+def build_pyqed_cpp_active_hamiltonian(case, basis):
+    """Return block2-ready active tensors derived from PyQED's C++ AO ERIs."""
+
+    mol = build_pyqed_cpp_molecule(case, basis)
+    mf = RHF(mol).run()
+    dmrg = DMRG(
+        mf,
+        ncas=case["ncas"],
+        nelecas=case["nelecas"],
+        D=1,
+        init_guess="cid",
+        verbose=0,
+        symmetry="su2",
+    )
+    dmrg.build()
+
+    h1e_spin = np.asarray(dmrg.h1e)
+    g2e_spin = np.asarray(dmrg.h2e)
+    if h1e_spin.shape != (2, dmrg.ncas, dmrg.ncas):
+        raise RuntimeError(f"Unexpected PyQED one-body tensor shape {h1e_spin.shape}.")
+    if g2e_spin.shape != (2, 2, dmrg.ncas, dmrg.ncas, dmrg.ncas, dmrg.ncas):
+        raise RuntimeError(f"Unexpected PyQED two-body tensor shape {g2e_spin.shape}.")
+    if not np.allclose(h1e_spin[0], h1e_spin[1]):
+        raise RuntimeError("The SU(2) benchmark requires spin-independent one-body integrals.")
+    if not all(
+        np.allclose(g2e_spin[a, b], g2e_spin[0, 0])
+        for a in range(2)
+        for b in range(2)
+    ):
+        raise RuntimeError("The SU(2) benchmark requires spin-independent two-body integrals.")
+
+    return {
+        "ncas": int(dmrg.ncas),
+        "n_elec": int(dmrg.nelecas),
+        "spin": int(dmrg.spin),
+        "ecore": float(dmrg.e_core),
+        "h1e": np.ascontiguousarray(h1e_spin[0]),
+        "g2e": np.ascontiguousarray(g2e_spin[0, 0]),
+        "orb_sym": [0] * int(dmrg.ncas),
+        "rhf_energy": scalar_energy(mf.e_tot),
+    }
+
+
 def run_pyqed(case, basis, *, symmetry, bond_dim, nsweeps, max_bond_mode):
     """Run a PyQED DMRG calculation and return diagnostics."""
 
-    mol = Molecule(atom=case["atom"], basis=basis, unit="bohr")
-    mol.build(driver="gbasis")
+    mol = build_pyqed_cpp_molecule(case, basis)
     mf = RHF(mol).run()
     dmrg = DMRG(
         mf,
@@ -77,8 +157,15 @@ def run_pyqed(case, basis, *, symmetry, bond_dim, nsweeps, max_bond_mode):
         verbose=0,
         symmetry=symmetry,
     )
+    # Match block2's timer, which starts after its Hamiltonian MPO is built.
+    dmrg.build()
     t0 = time.perf_counter()
-    dmrg.run(nsweeps=nsweeps, max_bond_mode=max_bond_mode)
+    dmrg.run(
+        nsweeps=nsweeps,
+        max_bond_mode=max_bond_mode,
+        conv_tol=-1.0,
+        require_convergence=False,
+    )
     elapsed = time.perf_counter() - t0
     history = getattr(getattr(dmrg, "dmrg", None), "history", []) or []
     objectives = [
@@ -92,7 +179,7 @@ def run_pyqed(case, basis, *, symmetry, bond_dim, nsweeps, max_bond_mode):
         "sweep_energies": [
             scalar_energy(entry["energy"])
             for entry in history
-            if entry.get("energy") is not None
+            if entry.get("energy") is not None and entry.get("sweep_complete")
         ],
         "local_problems": Counter(
             objective.get("effective_local_problem")
@@ -114,8 +201,7 @@ def run_pyqed(case, basis, *, symmetry, bond_dim, nsweeps, max_bond_mode):
 def run_pyqed_su2_strict(case, basis, *, bond_dim, nsweeps):
     """Run PyQED SU(2) with stricter local solves and no mixer noise."""
 
-    mol = Molecule(atom=case["atom"], basis=basis, unit="bohr")
-    mol.build(driver="gbasis")
+    mol = build_pyqed_cpp_molecule(case, basis)
     mf = RHF(mol).run()
     dmrg = DMRG(
         mf,
@@ -126,9 +212,12 @@ def run_pyqed_su2_strict(case, basis, *, bond_dim, nsweeps):
         verbose=0,
         symmetry="su2",
     )
+    dmrg.build()
     t0 = time.perf_counter()
     dmrg.run(
         nsweeps=nsweeps,
+        conv_tol=-1.0,
+        require_convergence=False,
         max_bond_mode="reduced",
         warm_start_bonds=True,
         mixer_zero_block_noise_scale=0.0,
@@ -156,7 +245,7 @@ def run_pyqed_su2_strict(case, basis, *, bond_dim, nsweeps):
         "sweep_energies": [
             scalar_energy(entry["energy"])
             for entry in history
-            if entry.get("energy") is not None
+            if entry.get("energy") is not None and entry.get("sweep_complete")
         ],
         "local_problems": Counter(
             objective.get("effective_local_problem")
@@ -180,28 +269,29 @@ def run_pyqed_su2_strict(case, basis, *, bond_dim, nsweeps):
     }
 
 
-def run_block2_su2(pyscf_mf, pyscf_mc, *, bond_dim, nsweeps):
-    """Run native pyblock2 SU(2) DMRG from the same PySCF active integrals."""
+def run_block2_su2(active, *, bond_dim, nsweeps, seed=1234):
+    """Run block2 SU(2) DMRG on PyQED's C++-integral Hamiltonian."""
 
-    ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = block2_integrals.get_rhf_integrals(
-        pyscf_mf,
-        pyscf_mc.ncore,
-        pyscf_mc.ncas,
-        g2e_symm=1,
-    )
+    half_sweeps = 2 * int(nsweeps)
     with tempfile.TemporaryDirectory(prefix="block2_su2_step_") as scratch:
         driver = DMRGDriver(
             scratch=scratch,
             symm_type=SymmetryTypes.SU2,
             n_threads=1,
         )
+        driver.bw.b.Random.rand_seed(int(seed))
         driver.initialize_system(
-            n_sites=ncas,
-            n_elec=n_elec,
-            spin=spin,
-            orb_sym=orb_sym,
+            n_sites=active["ncas"],
+            n_elec=active["n_elec"],
+            spin=active["spin"],
+            orb_sym=active["orb_sym"],
         )
-        mpo = driver.get_qc_mpo(h1e, g2e, ecore=ecore, iprint=0)
+        mpo = driver.get_qc_mpo(
+            active["h1e"],
+            active["g2e"],
+            ecore=active["ecore"],
+            iprint=0,
+        )
         ket = driver.get_random_mps(
             tag="KET",
             bond_dim=bond_dim,
@@ -211,9 +301,9 @@ def run_block2_su2(pyscf_mf, pyscf_mc, *, bond_dim, nsweeps):
         energy = driver.dmrg(
             mpo,
             ket,
-            n_sweeps=nsweeps,
-            bond_dims=[bond_dim] * nsweeps,
-            noises=[1.0e-6, 1.0e-7] + [0.0] * max(0, nsweeps - 2),
+            n_sweeps=half_sweeps,
+            bond_dims=[bond_dim] * half_sweeps,
+            noises=[1.0e-6, 1.0e-7] + [0.0] * max(0, half_sweeps - 2),
             tol=1.0e-9,
             iprint=0,
             dav_max_iter=100,
@@ -223,28 +313,28 @@ def run_block2_su2(pyscf_mf, pyscf_mc, *, bond_dim, nsweeps):
     return {"energy": float(energy), "time": elapsed}
 
 
-def run_block2_su2_stepwise(pyscf_mf, pyscf_mc, *, bond_dim, nsweeps):
-    """Run block2 one sweep at a time and report sweep-resolved energies."""
+def run_block2_su2_stepwise(active, *, bond_dim, nsweeps, seed=1234):
+    """Run block2 one sweep at a time on PyQED's C++-integral Hamiltonian."""
 
-    ncas, n_elec, spin, ecore, h1e, g2e, orb_sym = block2_integrals.get_rhf_integrals(
-        pyscf_mf,
-        pyscf_mc.ncore,
-        pyscf_mc.ncas,
-        g2e_symm=1,
-    )
     with tempfile.TemporaryDirectory(prefix="block2_su2_step_") as scratch:
         driver = DMRGDriver(
             scratch=scratch,
             symm_type=SymmetryTypes.SU2,
             n_threads=1,
         )
+        driver.bw.b.Random.rand_seed(int(seed))
         driver.initialize_system(
-            n_sites=ncas,
-            n_elec=n_elec,
-            spin=spin,
-            orb_sym=orb_sym,
+            n_sites=active["ncas"],
+            n_elec=active["n_elec"],
+            spin=active["spin"],
+            orb_sym=active["orb_sym"],
         )
-        mpo = driver.get_qc_mpo(h1e, g2e, ecore=ecore, iprint=0)
+        mpo = driver.get_qc_mpo(
+            active["h1e"],
+            active["g2e"],
+            ecore=active["ecore"],
+            iprint=0,
+        )
         ket = driver.get_random_mps(
             tag="KET",
             bond_dim=bond_dim,
@@ -257,9 +347,9 @@ def run_block2_su2_stepwise(pyscf_mf, pyscf_mc, *, bond_dim, nsweeps):
             energy = driver.dmrg(
                 mpo,
                 ket,
-                n_sweeps=1,
-                bond_dims=[bond_dim],
-                noises=[0.0],
+                n_sweeps=2,
+                bond_dims=[bond_dim, bond_dim],
+                noises=[0.0, 0.0],
                 tol=1.0e-9,
                 iprint=0,
                 dav_max_iter=100,
@@ -312,6 +402,8 @@ def main():
     )
     pyscf_mol, pyscf_mf, pyscf_mc, e_casci = run_pyscf_casci(case, args.basis)
     _ = pyscf_mol
+    active = build_pyqed_cpp_active_hamiltonian(case, args.basis)
+    print(f"PyQED C++ RHF          {active['rhf_energy']: .12f}")
     print(f"PySCF RHF              {float(pyscf_mf.e_tot): .12f}")
     print(f"PySCF CASCI            {e_casci: .12f}")
 
@@ -375,14 +467,13 @@ def main():
     )
     print_result(
         "block2 SU2",
-        run_block2_su2(pyscf_mf, pyscf_mc, bond_dim=args.D, nsweeps=args.nsweeps),
+        run_block2_su2(active, bond_dim=args.D, nsweeps=args.nsweeps),
         e_casci,
     )
     print_result(
         "block2 SU2 stepwise",
         run_block2_su2_stepwise(
-            pyscf_mf,
-            pyscf_mc,
+            active,
             bond_dim=args.D,
             nsweeps=args.nsweeps,
         ),

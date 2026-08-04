@@ -16,6 +16,148 @@ from pyqed.mps.symmetry import Sector
 from .coupling import clebsch_gordan, left_or_right_fusion, ordered_two_m_values
 
 
+class SparseVirtualBlock:
+    """
+    Sparse storage for the two virtual axes of an MPO block.
+
+    Physical payloads remain small dense arrays.  This avoids padding every
+    local operator across the full visible ``(D_left, D_right)`` carrier.
+    """
+
+    __slots__ = ("shape", "rows", "cols", "values")
+
+    def __init__(self, shape, rows, cols, values):
+        shape = tuple(int(dim) for dim in shape)
+        if len(shape) < 2 or any(dim < 0 for dim in shape):
+            raise ValueError(f"Invalid sparse virtual block shape {shape!r}.")
+        rows = np.ascontiguousarray(rows, dtype=np.int64).reshape(-1)
+        cols = np.ascontiguousarray(cols, dtype=np.int64).reshape(-1)
+        values = np.ascontiguousarray(values)
+        expected = (rows.size,) + shape[2:]
+        if cols.size != rows.size or values.shape != expected:
+            raise ValueError(
+                "Sparse virtual block routes and payloads have incompatible "
+                f"shapes: rows={rows.shape!r}, cols={cols.shape!r}, "
+                f"values={values.shape!r}, expected={expected!r}."
+            )
+        if np.any(rows < 0) or np.any(rows >= shape[0]):
+            raise ValueError("Sparse virtual block row index is out of bounds.")
+        if np.any(cols < 0) or np.any(cols >= shape[1]):
+            raise ValueError("Sparse virtual block column index is out of bounds.")
+        self.shape = shape
+        self.rows = rows
+        self.cols = cols
+        self.values = values
+
+    @classmethod
+    def from_dense(cls, block):
+        arr = np.asarray(block)
+        if arr.ndim < 2:
+            raise ValueError("SparseVirtualBlock requires at least two axes.")
+        if arr.ndim == 2:
+            active = arr != 0
+        else:
+            active = np.any(arr != 0, axis=tuple(range(2, arr.ndim)))
+        rows, cols = np.nonzero(active)
+        values = arr[rows, cols]
+        return cls(arr.shape, rows, cols, values)
+
+    @classmethod
+    def from_entries(cls, shape, entries, *, dtype=float):
+        items = [
+            ((int(row), int(col)), np.asarray(value, dtype=dtype))
+            for (row, col), value in entries.items()
+            if np.any(np.asarray(value) != 0)
+        ]
+        if items:
+            rows = np.fromiter((key[0] for key, _ in items), dtype=np.int64)
+            cols = np.fromiter((key[1] for key, _ in items), dtype=np.int64)
+            values = np.stack([value for _, value in items])
+        else:
+            rows = np.empty(0, dtype=np.int64)
+            cols = np.empty(0, dtype=np.int64)
+            values = np.empty((0,) + tuple(shape)[2:], dtype=dtype)
+        return cls(shape, rows, cols, values)
+
+    @property
+    def dtype(self):
+        return self.values.dtype
+
+    @property
+    def ndim(self):
+        return len(self.shape)
+
+    @property
+    def size(self):
+        return int(np.prod(self.shape, dtype=np.int64))
+
+    @property
+    def nnz(self):
+        return int(self.rows.size)
+
+    def iter_routes(self):
+        for index in range(self.rows.size):
+            yield int(self.rows[index]), int(self.cols[index]), self.values[index]
+
+    def with_offsets(self, shape, *, row_offset=0, col_offset=0, dtype=None):
+        values = self.values if dtype is None else self.values.astype(dtype, copy=False)
+        return type(self)(
+            shape,
+            self.rows + int(row_offset),
+            self.cols + int(col_offset),
+            values,
+        )
+
+    def to_dense(self, dtype=None):
+        dtype = self.dtype if dtype is None else np.dtype(dtype)
+        out = np.zeros(self.shape, dtype=dtype)
+        for row, col, value in self.iter_routes():
+            out[row, col] += np.asarray(value, dtype=dtype)
+        return out
+
+    def __array__(self, dtype=None, copy=None):
+        out = self.to_dense(dtype=dtype)
+        if copy is False:
+            return out
+        return np.array(out, copy=True)
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        if len(key) >= 2 and isinstance(key[0], (int, np.integer)) and isinstance(
+            key[1], (int, np.integer)
+        ):
+            row = int(key[0])
+            col = int(key[1])
+            matches = np.nonzero((self.rows == row) & (self.cols == col))[0]
+            value = np.zeros(self.shape[2:], dtype=self.dtype)
+            for index in matches:
+                value = value + self.values[int(index)]
+            return value[key[2:]] if len(key) > 2 else value
+        return self.to_dense()[key]
+
+
+def as_sparse_virtual_block(block):
+    if isinstance(block, SparseVirtualBlock):
+        return block
+    return SparseVirtualBlock.from_dense(block)
+
+
+def iter_virtual_routes(block):
+    if isinstance(block, SparseVirtualBlock):
+        return block.iter_routes()
+    arr = np.asarray(block)
+    if arr.ndim == 2:
+        active = arr != 0
+    else:
+        active = np.any(arr != 0, axis=tuple(range(2, arr.ndim)))
+    rows, cols = np.nonzero(active)
+    return (
+        (int(row), int(col), arr[int(row), int(col)])
+        for row, col in zip(rows, cols)
+    )
+
+
 @dataclass(frozen=True)
 class PhysicalLeg:
     """
@@ -680,8 +822,14 @@ class RankCoupledChannelTerm:
     """
 
     reduced_operator: object
-    visible_virtual_block: np.ndarray
+    visible_virtual_block: object
     use_cg_coupling: bool = False
+    left_component_orientation: int = 1
+    right_component_orientation: int = 1
+    orient_virtual_coupling: bool = False
+    dual_right_coupling: bool = False
+    phase_from_charged_scalar_source: bool = False
+    phase_to_charged_pair_target: bool = False
 
     def __post_init__(self):
         if not hasattr(self.reduced_operator, "component_block") or not hasattr(
@@ -690,13 +838,41 @@ class RankCoupledChannelTerm:
             raise TypeError(
                 "RankCoupledChannelTerm expects a reduced operator exposing component_block()."
             )
-        block = np.asarray(self.visible_virtual_block)
+        block = as_sparse_virtual_block(self.visible_virtual_block)
         if block.ndim != 2:
             raise ValueError(
                 f"RankCoupledChannelTerm visible_virtual_block must be rank-2, got {block.shape!r}."
             )
         object.__setattr__(self, "visible_virtual_block", block)
         object.__setattr__(self, "use_cg_coupling", bool(self.use_cg_coupling))
+        object.__setattr__(
+            self,
+            "orient_virtual_coupling",
+            bool(self.orient_virtual_coupling),
+        )
+        object.__setattr__(
+            self,
+            "dual_right_coupling",
+            bool(self.dual_right_coupling),
+        )
+        object.__setattr__(
+            self,
+            "phase_from_charged_scalar_source",
+            bool(self.phase_from_charged_scalar_source),
+        )
+        object.__setattr__(
+            self,
+            "phase_to_charged_pair_target",
+            bool(self.phase_to_charged_pair_target),
+        )
+        for name in (
+            "left_component_orientation",
+            "right_component_orientation",
+        ):
+            orientation = int(getattr(self, name))
+            if orientation not in (-1, 1):
+                raise ValueError(f"{name} must be -1 or 1.")
+            object.__setattr__(self, name, orientation)
 
     @property
     def dtype(self):
@@ -725,6 +901,31 @@ class RankCoupledMPO:
     right_channel_charges: tuple[int, ...] | None = None
     reduced_terms: tuple[RankCoupledChannelTerm, ...] = ()
     symbolic_transitions: tuple = ()
+    normal_complementary_site: int | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    normal_complementary_plan: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    normal_complementary_owner: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    normal_complementary_fully_reduced: bool = field(
+        default=False,
+        compare=False,
+        repr=False,
+    )
+    normal_complementary_right_dual: bool = field(
+        default=False,
+        compare=False,
+        repr=False,
+    )
     _reduced_block_cache: dict[tuple[Sector, Sector], dict[tuple[int, int], np.ndarray]] = field(
         default_factory=dict,
         init=False,
@@ -775,7 +976,7 @@ class RankCoupledMPO:
             raise ValueError("RankCoupledMPO channel charge counts must match channel irrep counts.")
 
         dense_blocks = {
-            key: np.asarray(block)
+            key: as_sparse_virtual_block(block)
             for key, block in dict(self.dense_blocks).items()
         }
         reduced_terms = tuple(self.reduced_terms)
@@ -825,6 +1026,22 @@ class RankCoupledMPO:
         object.__setattr__(self, "right_channel_charges", right_channel_charges)
         object.__setattr__(self, "reduced_terms", reduced_terms)
         object.__setattr__(self, "symbolic_transitions", tuple(self.symbolic_transitions))
+        if self.normal_complementary_site is not None:
+            object.__setattr__(
+                self,
+                "normal_complementary_site",
+                int(self.normal_complementary_site),
+            )
+        object.__setattr__(
+            self,
+            "normal_complementary_fully_reduced",
+            bool(self.normal_complementary_fully_reduced),
+        )
+        object.__setattr__(
+            self,
+            "normal_complementary_right_dual",
+            bool(self.normal_complementary_right_dual),
+        )
         dtypes = [block.dtype for block in dense_blocks.values()]
         dtypes.extend(term.dtype for term in reduced_terms)
         object.__setattr__(self, "_dtype_cache", np.dtype(np.result_type(*dtypes)))
@@ -867,9 +1084,36 @@ class RankCoupledMPO:
         if cached is not None:
             return cached
 
+        try:
+            from pyqed.mps import cpp_davidson
+
+            native_builder = getattr(
+                cpp_davidson,
+                "rank_coupled_reduced_actions",
+                None,
+            )
+            cached = (
+                None
+                if native_builder is None
+                or any(
+                    isinstance(term.visible_virtual_block, SparseVirtualBlock)
+                    for term in self.reduced_terms
+                )
+                else native_builder(
+                    self.reduced_terms,
+                    self.left_channel_irreps,
+                    self.right_channel_irreps,
+                )
+            )
+        except Exception:
+            cached = None
+        if cached is not None:
+            cached = tuple(cached)
+            object.__setattr__(self, "_reduced_action_cache", cached)
+            return cached
+
         actions = []
         for term in self.reduced_terms:
-            coeffs = term.visible_virtual_block
             rank_irrep = None
             if term.use_cg_coupling:
                 rank_irrep = (
@@ -877,37 +1121,67 @@ class RankCoupledMPO:
                     if hasattr(term.reduced_operator, "base_operator")
                     else term.reduced_operator.rank_irrep
                 )
-            for i, left_irrep in enumerate(self.left_channel_irreps):
+            for i, j, coeff in iter_virtual_routes(term.visible_virtual_block):
+                left_irrep = self.left_channel_irreps[i]
+                right_irrep = self.right_channel_irreps[j]
                 left_ms = ordered_two_m_values(left_irrep)
-                for j, right_irrep in enumerate(self.right_channel_irreps):
-                    coeff = coeffs[i, j]
-                    if coeff == 0:
-                        continue
-                    if term.use_cg_coupling and right_irrep not in left_or_right_fusion(left_irrep, rank_irrep):
-                        continue
-                    right_ms = ordered_two_m_values(right_irrep)
-                    for row, two_m_left in enumerate(left_ms):
-                        for col, two_m_right in enumerate(right_ms):
-                            cg_coeff = 1.0
-                            if term.use_cg_coupling:
-                                component = two_m_right - two_m_left
-                                cg_coeff = clebsch_gordan(
-                                    left_irrep,
-                                    rank_irrep,
-                                    right_irrep,
-                                    two_m_left,
-                                    component,
-                                    two_m_right,
-                                )
-                                if not cg_coeff:
-                                    continue
-                            elif left_irrep.two_j == 0 and right_irrep.two_j != 0:
-                                component = two_m_right
-                            elif right_irrep.two_j == 0 and left_irrep.two_j != 0:
-                                component = two_m_left
+                if term.use_cg_coupling and right_irrep not in left_or_right_fusion(left_irrep, rank_irrep):
+                    continue
+                right_ms = ordered_two_m_values(right_irrep)
+                for row, two_m_left in enumerate(left_ms):
+                    for col, two_m_right in enumerate(right_ms):
+                        cg_coeff = 1.0
+                        if term.use_cg_coupling:
+                            oriented_left = (
+                                term.left_component_orientation
+                                * two_m_left
+                            )
+                            oriented_right = (
+                                term.right_component_orientation
+                                * two_m_right
+                            )
+                            component = oriented_right - oriented_left
+                            if term.orient_virtual_coupling:
+                                coupling_left = oriented_left
+                                coupling_right = oriented_right
+                                coupling_component = component
                             else:
-                                component = two_m_right - two_m_left
-                            actions.append((term.reduced_operator, i, j, row, col, int(component), coeff * cg_coeff))
+                                coupling_left = two_m_left
+                                coupling_right = two_m_right
+                                coupling_component = (
+                                    two_m_right - two_m_left
+                                )
+                            cg_coeff = clebsch_gordan(
+                                left_irrep,
+                                rank_irrep,
+                                right_irrep,
+                                coupling_left,
+                                coupling_component,
+                                coupling_right,
+                            )
+                            if not cg_coeff:
+                                continue
+                            if term.phase_from_charged_scalar_source:
+                                cg_coeff *= -two_m_right
+                            if term.phase_to_charged_pair_target:
+                                cg_coeff *= -two_m_left
+                        elif left_irrep.two_j == 0 and right_irrep.two_j != 0:
+                            component = two_m_right
+                        elif right_irrep.two_j == 0 and left_irrep.two_j != 0:
+                            component = two_m_left
+                        else:
+                            component = two_m_right - two_m_left
+                        actions.append(
+                            (
+                                term.reduced_operator,
+                                i,
+                                j,
+                                row,
+                                col,
+                                int(component),
+                                coeff * cg_coeff,
+                            )
+                        )
         cached = tuple(actions)
         object.__setattr__(self, "_reduced_action_cache", cached)
         return cached
@@ -920,19 +1194,16 @@ class RankCoupledMPO:
         reduced = {}
         dense_block = self.dense_blocks.get(key)
         if dense_block is not None:
-            dense_block = np.asarray(dense_block)
-            nonzero_channels = np.any(dense_block != 0, axis=(2, 3))
-            for i, j in zip(*np.nonzero(nonzero_channels)):
-                left_irrep = self.left_channel_irreps[int(i)]
-                right_irrep = self.right_channel_irreps[int(j)]
+            for i, j, local_dense in iter_virtual_routes(dense_block):
+                left_irrep = self.left_channel_irreps[i]
+                right_irrep = self.right_channel_irreps[j]
                 if left_irrep != right_irrep:
                     raise ValueError(
                         f"RankCoupledMPO dense block {key!r} connects incompatible reduced channels {left_irrep!r} and {right_irrep!r}."
                     )
-                local = dense_block[int(i), int(j)]
-                reduced[(int(i), int(j))] = (
+                reduced[(i, j)] = (
                     np.eye(left_irrep.dim, dtype=self.dtype)[:, :, None, None]
-                    * local[None, None, :, :]
+                    * np.asarray(local_dense, dtype=self.dtype)[None, None, :, :]
                 )
 
         for operator, i, j, row, col, component, coeff in self._reduced_actions():
@@ -998,6 +1269,487 @@ class RankCoupledMPO:
         return dense
 
 
+def _rank_coupled_left_row_space(core, *, rtol, atol):
+    """Return sector-preserving left-channel row-space isometries."""
+
+    groups = {}
+    for index, (irrep, charge) in enumerate(
+        zip(core.left_channel_irreps, core.left_channel_charges)
+    ):
+        groups.setdefault((irrep, int(charge)), []).append(int(index))
+
+    dense_routes = tuple(
+        tuple(block.iter_routes())
+        for block in core.dense_blocks.values()
+    )
+    reduced_routes = tuple(
+        tuple(term.visible_virtual_block.iter_routes())
+        for term in core.reduced_terms
+    )
+    transforms = []
+    for key, indices in groups.items():
+        row_for_index = {
+            int(index): int(row)
+            for row, index in enumerate(indices)
+        }
+        feature_for_key = {}
+        entries = []
+
+        def add_feature(row, feature, value):
+            column = feature_for_key.get(feature)
+            if column is None:
+                column = len(feature_for_key)
+                feature_for_key[feature] = column
+            entries.append((int(row), int(column), value))
+
+        for block_index, routes in enumerate(dense_routes):
+            for left, right, payload in routes:
+                row = row_for_index.get(int(left))
+                if row is None:
+                    continue
+                flat = np.asarray(payload).reshape(-1)
+                for physical, value in enumerate(flat):
+                    if value != 0:
+                        add_feature(
+                            row,
+                            ("dense", int(block_index), int(right), int(physical)),
+                            value,
+                        )
+        for term_index, routes in enumerate(reduced_routes):
+            for left, right, payload in routes:
+                row = row_for_index.get(int(left))
+                if row is None:
+                    continue
+                value = np.asarray(payload).reshape(()).item()
+                if value != 0:
+                    add_feature(
+                        row,
+                        ("reduced", int(term_index), int(right)),
+                        value,
+                    )
+
+        if not feature_for_key:
+            continue
+        matrix = np.zeros(
+            (len(indices), len(feature_for_key)),
+            dtype=core.dtype,
+        )
+        for row, column, value in entries:
+            matrix[row, column] += value
+        if len(indices) == 1:
+            isometry = np.ones((1, 1), dtype=matrix.dtype)
+        else:
+            left_vectors, singular_values, _ = np.linalg.svd(
+                matrix,
+                full_matrices=False,
+            )
+            largest = (
+                0.0
+                if singular_values.size == 0
+                else float(np.max(np.abs(singular_values)))
+            )
+            threshold = max(float(atol), float(rtol) * largest)
+            rank = int(np.count_nonzero(np.abs(singular_values) > threshold))
+            if rank <= 0:
+                continue
+            if rank == len(indices):
+                isometry = np.eye(len(indices), dtype=matrix.dtype)
+            else:
+                isometry = np.ascontiguousarray(left_vectors[:, :rank])
+        transforms.append(
+            (
+                key,
+                np.asarray(indices, dtype=np.int64),
+                isometry,
+            )
+        )
+    return tuple(transforms)
+
+
+def _rank_coupled_left_row_skeleton(core, *, rtol, atol):
+    """Return sparse row selectors and exact interpolation gauges by sector."""
+
+    groups = {}
+    for index, (irrep, charge) in enumerate(
+        zip(core.left_channel_irreps, core.left_channel_charges)
+    ):
+        groups.setdefault((irrep, int(charge)), []).append(int(index))
+
+    dense_routes = tuple(
+        tuple(block.iter_routes())
+        for block in core.dense_blocks.values()
+    )
+    reduced_routes = tuple(
+        tuple(term.visible_virtual_block.iter_routes())
+        for term in core.reduced_terms
+    )
+    transforms = []
+    for key, indices in groups.items():
+        row_for_index = {
+            int(index): int(row)
+            for row, index in enumerate(indices)
+        }
+        feature_for_key = {}
+        entries = []
+
+        def add_feature(row, feature, value):
+            column = feature_for_key.get(feature)
+            if column is None:
+                column = len(feature_for_key)
+                feature_for_key[feature] = column
+            entries.append((int(row), int(column), value))
+
+        for block_index, routes in enumerate(dense_routes):
+            for left, right, payload in routes:
+                row = row_for_index.get(int(left))
+                if row is None:
+                    continue
+                flat = np.asarray(payload).reshape(-1)
+                for physical, value in enumerate(flat):
+                    if value != 0:
+                        add_feature(
+                            row,
+                            ("dense", int(block_index), int(right), int(physical)),
+                            value,
+                        )
+        for term_index, routes in enumerate(reduced_routes):
+            for left, right, payload in routes:
+                row = row_for_index.get(int(left))
+                if row is None:
+                    continue
+                value = np.asarray(payload).reshape(()).item()
+                if value != 0:
+                    add_feature(
+                        row,
+                        ("reduced", int(term_index), int(right)),
+                        value,
+                    )
+
+        if not feature_for_key:
+            continue
+        matrix = np.zeros(
+            (len(indices), len(feature_for_key)),
+            dtype=core.dtype,
+        )
+        for row, column, value in entries:
+            matrix[row, column] += value
+        if len(indices) == 1:
+            selector = np.ones((1, 1), dtype=matrix.dtype)
+            interpolation = selector
+        else:
+            from scipy.linalg import qr, solve_triangular
+
+            _, triangular, pivots = qr(
+                matrix.T,
+                mode="economic",
+                pivoting=True,
+                check_finite=False,
+            )
+            diagonal = np.abs(np.diag(triangular))
+            largest = 0.0 if diagonal.size == 0 else float(diagonal.max())
+            threshold = max(float(atol), float(rtol) * largest)
+            rank = int(np.count_nonzero(diagonal > threshold))
+            if rank <= 0:
+                continue
+            selected = np.asarray(pivots[:rank], dtype=np.int64)
+            selector = np.zeros((len(indices), rank), dtype=matrix.dtype)
+            selector[selected, np.arange(rank)] = 1
+            pivot_coordinates = solve_triangular(
+                triangular[:rank, :rank],
+                triangular[:rank, :],
+                lower=False,
+                check_finite=False,
+            )
+            interpolation = np.zeros(
+                (len(indices), rank),
+                dtype=matrix.dtype,
+            )
+            interpolation[np.asarray(pivots, dtype=np.int64), :] = (
+                pivot_coordinates.T
+            )
+        transforms.append(
+            (
+                key,
+                np.asarray(indices, dtype=np.int64),
+                np.ascontiguousarray(selector),
+                np.ascontiguousarray(interpolation),
+            )
+        )
+    return tuple(transforms)
+
+
+def _transform_sparse_virtual_axis(
+    block,
+    transforms,
+    *,
+    axis,
+    new_shape,
+    cutoff,
+):
+    """Apply block-diagonal virtual gauges to one sparse MPO payload."""
+
+    block = as_sparse_virtual_block(block)
+    payload_shape = tuple(block.shape[2:])
+    rows = []
+    cols = []
+    values = []
+    new_offset = 0
+    for _key, old_indices, transform in transforms:
+        old_indices = np.asarray(old_indices, dtype=np.int64)
+        transform = np.asarray(transform)
+        old_to_local = {
+            int(index): int(local)
+            for local, index in enumerate(old_indices)
+        }
+        if axis == 0:
+            sub = np.zeros(
+                (old_indices.size, block.shape[1]) + payload_shape,
+                dtype=np.result_type(block.dtype, transform.dtype),
+            )
+            for old_left, old_right, payload in block.iter_routes():
+                local = old_to_local.get(int(old_left))
+                if local is not None:
+                    sub[local, int(old_right)] += payload
+            result = np.tensordot(
+                transform.conj().T,
+                sub,
+                axes=(1, 0),
+            )
+            if payload_shape:
+                active = np.any(
+                    np.abs(result) > float(cutoff),
+                    axis=tuple(range(2, result.ndim)),
+                )
+            else:
+                active = np.abs(result) > float(cutoff)
+            new_rows, new_cols = np.nonzero(active)
+            for new_left, old_right in zip(new_rows, new_cols):
+                rows.append(int(new_offset + new_left))
+                cols.append(int(old_right))
+                values.append(np.asarray(result[new_left, old_right]))
+        elif axis == 1:
+            sub = np.zeros(
+                (block.shape[0], old_indices.size) + payload_shape,
+                dtype=np.result_type(block.dtype, transform.dtype),
+            )
+            for old_left, old_right, payload in block.iter_routes():
+                local = old_to_local.get(int(old_right))
+                if local is not None:
+                    sub[int(old_left), local] += payload
+            result = np.tensordot(sub, transform, axes=(1, 0))
+            result = np.moveaxis(result, -1, 1)
+            if payload_shape:
+                active = np.any(
+                    np.abs(result) > float(cutoff),
+                    axis=tuple(range(2, result.ndim)),
+                )
+            else:
+                active = np.abs(result) > float(cutoff)
+            old_rows, new_cols = np.nonzero(active)
+            for old_left, new_right in zip(old_rows, new_cols):
+                rows.append(int(old_left))
+                cols.append(int(new_offset + new_right))
+                values.append(np.asarray(result[old_left, new_right]))
+        else:
+            raise ValueError("Sparse virtual-axis transform expects axis 0 or 1.")
+        new_offset += int(transform.shape[1])
+
+    dtype = np.result_type(block.dtype, *(item[2].dtype for item in transforms))
+    if values:
+        value_array = np.ascontiguousarray(np.stack(values), dtype=dtype)
+    else:
+        value_array = np.empty((0,) + payload_shape, dtype=dtype)
+    return SparseVirtualBlock(
+        tuple(int(value) for value in new_shape) + payload_shape,
+        np.asarray(rows, dtype=np.int64),
+        np.asarray(cols, dtype=np.int64),
+        value_array,
+    )
+
+
+def _transform_rank_coupled_core_axis(
+    core,
+    transforms,
+    *,
+    axis,
+    cutoff,
+):
+    """Return a rank-coupled core after one sector-preserving virtual gauge."""
+
+    transforms = tuple(transforms)
+    if not transforms:
+        raise ValueError("Rank-coupled virtual compression removed every channel.")
+    new_irreps = tuple(
+        key[0]
+        for key, _indices, transform in transforms
+        for _ in range(int(transform.shape[1]))
+    )
+    new_charges = tuple(
+        int(key[1])
+        for key, _indices, transform in transforms
+        for _ in range(int(transform.shape[1]))
+    )
+    if axis == 0:
+        left_irreps = new_irreps
+        left_charges = new_charges
+        right_irreps = core.right_channel_irreps
+        right_charges = core.right_channel_charges
+    elif axis == 1:
+        left_irreps = core.left_channel_irreps
+        left_charges = core.left_channel_charges
+        right_irreps = new_irreps
+        right_charges = new_charges
+    else:
+        raise ValueError("Rank-coupled core transform expects axis 0 or 1.")
+    visible_shape = (len(left_irreps), len(right_irreps))
+    dense_blocks = {
+        key: _transform_sparse_virtual_axis(
+            block,
+            transforms,
+            axis=axis,
+            new_shape=visible_shape,
+            cutoff=cutoff,
+        )
+        for key, block in core.dense_blocks.items()
+    }
+    reduced_terms = tuple(
+        RankCoupledChannelTerm(
+            reduced_operator=term.reduced_operator,
+            visible_virtual_block=_transform_sparse_virtual_axis(
+                term.visible_virtual_block,
+                transforms,
+                axis=axis,
+                new_shape=visible_shape,
+                cutoff=cutoff,
+            ),
+            use_cg_coupling=term.use_cg_coupling,
+            left_component_orientation=term.left_component_orientation,
+            right_component_orientation=term.right_component_orientation,
+            orient_virtual_coupling=term.orient_virtual_coupling,
+            dual_right_coupling=term.dual_right_coupling,
+            phase_from_charged_scalar_source=(
+                term.phase_from_charged_scalar_source
+            ),
+            phase_to_charged_pair_target=(
+                term.phase_to_charged_pair_target
+            ),
+        )
+        for term in core.reduced_terms
+    )
+    return RankCoupledMPO(
+        dense_blocks=dense_blocks,
+        phys_out_leg=core.phys_out_leg,
+        phys_in_leg=core.phys_in_leg,
+        left_channel_irreps=left_irreps,
+        right_channel_irreps=right_irreps,
+        left_channel_charges=left_charges,
+        right_channel_charges=right_charges,
+        reduced_terms=reduced_terms,
+        symbolic_transitions=(),
+    )
+
+
+def compress_rank_coupled_mpo_chain(
+    factors,
+    *,
+    rtol=1.0e-12,
+    atol=1.0e-14,
+    cutoff=0.0,
+    gauge="skeleton",
+    return_info=False,
+):
+    """
+    Exactly compress a rank-coupled MPO from right to left.
+
+    Virtual channels are reduced only inside equal ``(SU(2) irrep, charge)``
+    sectors.  The default skeleton gauge keeps selected symbolic suffix rows
+    unchanged and places integral interpolation coefficients on the adjacent
+    core.  This preserves substantially more local sparsity than an
+    orthonormal SVD gauge.
+    """
+
+    factors = list(factors)
+    if not factors:
+        raise ValueError("Rank-coupled MPO compression requires a nonempty chain.")
+    if any(not isinstance(core, RankCoupledMPO) for core in factors):
+        raise TypeError("Rank-coupled MPO compression requires RankCoupledMPO cores.")
+    gauge = str(gauge).strip().lower()
+    if gauge not in {"skeleton", "orthonormal"}:
+        raise ValueError("gauge must be 'skeleton' or 'orthonormal'.")
+    before = tuple(int(len(core.right_channel_irreps)) for core in factors)
+    sector_ranks = []
+    for site in range(len(factors) - 1, 0, -1):
+        if gauge == "skeleton":
+            skeletons = _rank_coupled_left_row_skeleton(
+                factors[site],
+                rtol=rtol,
+                atol=atol,
+            )
+            right_transforms = tuple(
+                (key, indices, selector)
+                for key, indices, selector, _interpolation in skeletons
+            )
+            left_transforms = tuple(
+                (key, indices, interpolation)
+                for key, indices, _selector, interpolation in skeletons
+            )
+        else:
+            right_transforms = left_transforms = _rank_coupled_left_row_space(
+                factors[site],
+                rtol=rtol,
+                atol=atol,
+            )
+        old_dimension = int(len(factors[site].left_channel_irreps))
+        new_dimension = int(
+            sum(
+                transform.shape[1]
+                for _, _, transform in right_transforms
+            )
+        )
+        sector_ranks.append(
+            {
+                "bond": int(site - 1),
+                "old_visible_channels": old_dimension,
+                "new_visible_channels": new_dimension,
+            }
+        )
+        if new_dimension == old_dimension and all(
+            transform.shape[0] == transform.shape[1]
+            and np.array_equal(
+                transform,
+                np.eye(transform.shape[0], dtype=transform.dtype),
+            )
+            for _key, _indices, transform in right_transforms
+        ):
+            continue
+        factors[site] = _transform_rank_coupled_core_axis(
+            factors[site],
+            right_transforms,
+            axis=0,
+            cutoff=cutoff,
+        )
+        factors[site - 1] = _transform_rank_coupled_core_axis(
+            factors[site - 1],
+            left_transforms,
+            axis=1,
+            cutoff=cutoff,
+        )
+    after = tuple(int(len(core.right_channel_irreps)) for core in factors)
+    info = {
+        "source": "sector_preserving_operator_skeleton",
+        "gauge": gauge,
+        "rtol": float(rtol),
+        "atol": float(atol),
+        "cutoff": float(cutoff),
+        "visible_bond_channels_before": before,
+        "visible_bond_channels_after": after,
+        "max_visible_bond_channels_before": int(max(before)),
+        "max_visible_bond_channels_after": int(max(after)),
+        "sector_ranks": tuple(reversed(sector_ranks)),
+    }
+    return (factors, info) if return_info else factors
+
+
 def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):
     """
     Return ``core`` as a :class:`RankCoupledMPO`.
@@ -1037,13 +1789,12 @@ def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):
 
 
 def _pad_visible_virtual_block(block, shape, *, row_offset=0, col_offset=0, dtype):
-    out = np.zeros(shape, dtype=dtype)
-    arr = np.asarray(block, dtype=dtype)
-    out[
-        row_offset: row_offset + arr.shape[0],
-        col_offset: col_offset + arr.shape[1],
-    ] = arr
-    return out
+    return as_sparse_virtual_block(block).with_offsets(
+        shape,
+        row_offset=row_offset,
+        col_offset=col_offset,
+        dtype=dtype,
+    )
 
 
 def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg=None, cutoff=0.0):
@@ -1113,21 +1864,37 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
             left_core.phys_out_leg.dim(q_out),
             left_core.phys_in_leg.dim(q_in),
         )
-        block = np.zeros(shape, dtype=dtype)
+        pieces = []
         left_block = left_core.dense_blocks.get(key)
         if left_block is not None:
-            block[
-                left_row_offset: left_row_offset + left_block.shape[0],
-                left_col_offset: left_col_offset + left_block.shape[1],
-            ] += np.asarray(left_block, dtype=dtype)
+            pieces.append(
+                as_sparse_virtual_block(left_block).with_offsets(
+                    shape,
+                    row_offset=left_row_offset,
+                    col_offset=left_col_offset,
+                    dtype=dtype,
+                )
+            )
         right_block = right_core.dense_blocks.get(key)
         if right_block is not None:
-            block[
-                right_row_offset: right_row_offset + right_block.shape[0],
-                right_col_offset: right_col_offset + right_block.shape[1],
-            ] += np.asarray(right_block, dtype=dtype)
-        if np.linalg.norm(block.reshape(-1)) > cutoff:
-            dense_blocks[key] = block
+            pieces.append(
+                as_sparse_virtual_block(right_block).with_offsets(
+                    shape,
+                    row_offset=right_row_offset,
+                    col_offset=right_col_offset,
+                    dtype=dtype,
+                )
+            )
+        if not pieces:
+            continue
+        values = np.concatenate([piece.values for piece in pieces], axis=0)
+        if np.linalg.norm(values.reshape(-1)) > cutoff:
+            dense_blocks[key] = SparseVirtualBlock(
+                shape,
+                np.concatenate([piece.rows for piece in pieces]),
+                np.concatenate([piece.cols for piece in pieces]),
+                values,
+            )
 
     reduced_terms = []
     for term, row_offset, col_offset in (
@@ -1145,6 +1912,16 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
                     dtype=dtype,
                 ),
                 use_cg_coupling=term.use_cg_coupling,
+                left_component_orientation=term.left_component_orientation,
+                right_component_orientation=term.right_component_orientation,
+                orient_virtual_coupling=term.orient_virtual_coupling,
+                dual_right_coupling=term.dual_right_coupling,
+                phase_from_charged_scalar_source=(
+                    term.phase_from_charged_scalar_source
+                ),
+                phase_to_charged_pair_target=(
+                    term.phase_to_charged_pair_target
+                ),
             )
         )
 

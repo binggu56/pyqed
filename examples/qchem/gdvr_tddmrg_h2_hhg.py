@@ -91,12 +91,12 @@ def _field_z(field, times):
     return np.asarray([field(float(t))[2] for t in np.asarray(times, dtype=float)], dtype=float)
 
 
-def _tdvp_projection_backend(args):
-    backend = getattr(args, "tdvp_projection_backend", None)
-    if backend is None:
+def _projection(args):
+    projection = getattr(args, "projection", None)
+    if projection is None:
         return None
-    backend = str(backend).lower().replace("_", "-")
-    return None if backend == "none" else backend
+    projection = str(projection).lower().replace("_", "-")
+    return False if projection == "none" else projection
 
 
 def _cap_settings(args):
@@ -117,7 +117,7 @@ def _expect_initial(td, psi, mpo, args):
             D=args.td_bond or args.bond,
             local_sectors=sector_kwargs["local_sectors"],
             target_sector=sector_kwargs["target_sector"],
-            tdvp_projection_backend=_tdvp_projection_backend(args),
+            projection=_projection(args),
         )
         return helper._expectation(psi, mpo)
     factors = mpo.factors if hasattr(mpo, "factors") else mpo
@@ -125,12 +125,12 @@ def _expect_initial(td, psi, mpo, args):
 
 
 def _tddmrg_trace(td, psi0, pulse, args, acc_mpo=None):
-    projection_backend = _tdvp_projection_backend(args)
+    projection = _projection(args)
     td_bond = args.td_bond or args.bond
     if psi0 is None:
         psi0 = td.default_initial_condition(
             D=td_bond,
-            tdvp_projection_backend=projection_backend,
+            projection=projection,
         )
     mu_mpo = td.get_interaction_mpo(axis=2)
     mu0 = float(np.real(_expect_initial(td, psi0, mu_mpo, args)))
@@ -147,7 +147,7 @@ def _tddmrg_trace(td, psi0, pulse, args, acc_mpo=None):
         "field": pulse,
         "order": args.order,
         "integrator": args.integrator,
-        "tdvp_projection_backend": projection_backend,
+        "projection": projection,
         "krylov_dim": args.krylov_dim,
         "krylov_tol": args.krylov_tol,
         "diagonal_fast_path": args.diagonal_fast_path,
@@ -372,14 +372,14 @@ def run_case(args):
             davidson_tol=args.dmrg_tol,
         )
 
-    projection_backend = _tdvp_projection_backend(args)
+    projection = _projection(args)
     if args.skip_dmrg:
         psi0 = td._initial_state_for_run(
             None,
-            tdvp_projection_backend=projection_backend,
+            projection=projection,
         )
     else:
-        block_sparse = projection_backend in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
+        block_sparse = projection in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
         psi0 = td.export_ground_state(dense=not block_sparse)
     acc_mpo = None
     acceleration_source = "finite-difference"
@@ -551,7 +551,7 @@ def run_case(args):
             "run_D": int(args.td_bond or args.bond),
             "integrator": str(args.integrator),
             "tdvp_dynamic_mode": str(args.tdvp_dynamic_mode),
-            "tdvp_projection_backend": None if projection_backend is None else str(projection_backend),
+            "projection": None if projection is None else str(projection),
             "krylov_method": str(args.krylov_method or ("arnoldi" if bool(args.cap) else "lanczos")),
             "cap": None if not bool(args.cap) else _cap_settings(args),
             "skip_dmrg": bool(args.skip_dmrg),
@@ -723,7 +723,7 @@ def main(argv=None):
     parser.add_argument("--diagonal-fast-path", action="store_true")
     parser.add_argument("--tdvp-dynamic-mode", choices=("split", "midpoint"), default="split")
     parser.add_argument(
-        "--tdvp-projection-backend",
+        "--projection",
         choices=("none", "dense", "dense-sector", "block-sparse"),
         default="block-sparse",
     )

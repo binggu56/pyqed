@@ -64,6 +64,16 @@ def _optional_extensions():
     enabled = os.environ.get("PYQED_BUILD_EXTENSIONS", "0")
     if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
         return []
+    groups = {
+        item.strip().lower()
+        for item in os.environ.get("PYQED_EXTENSION_GROUPS", "all").split(",")
+        if item.strip()
+    }
+    valid_groups = {"all", "qchem", "heom", "mps", "letta"}
+    unknown_groups = groups.difference(valid_groups)
+    if unknown_groups:
+        names = ", ".join(sorted(unknown_groups))
+        raise ValueError(f"unknown PYQED_EXTENSION_GROUPS entries: {names}")
 
     extensions = []
     try:
@@ -78,6 +88,7 @@ def _optional_extensions():
             if sys.platform == "win32"
             else ["-std=c++17", "-O3"]
         )
+        c_compile_args = ["/O2"] if sys.platform == "win32" else ["-O3"]
         accelerate_link_args = (
             ["-framework", "Accelerate"] if sys.platform == "darwin" else []
         )
@@ -130,6 +141,7 @@ def _optional_extensions():
                 "pyqed.qchem._basis_cy",
                 ["pyqed/qchem/_basis_cy.c"],
                 include_dirs=[np.get_include()],
+                extra_compile_args=c_compile_args,
                 optional=True,
             )
         )
@@ -138,18 +150,79 @@ def _optional_extensions():
                 "pyqed.qchem._rys_cy",
                 ["pyqed/qchem/_rys_cy.c"],
                 include_dirs=[np.get_include()],
+                extra_compile_args=c_compile_args,
                 optional=True,
             )
         )
         extensions.append(
             Extension(
                 "pyqed.mps.nonabelian._su2_kernel",
-                ["pyqed/mps/nonabelian/_su2_kernel.c"],
-                include_dirs=[np.get_include()],
+                [
+                    "pyqed/mps/nonabelian/_su2_kernel.cpp",
+                    "pyqed/mps/nonabelian/su2_dmrg_engine.cpp",
+                ],
+                depends=[
+                    "pyqed/mps/nonabelian/su2_dmrg_engine.hpp",
+                    "pyqed/mps/nonabelian/su2_coupling_core.hpp",
+                    "pyqed/mps/dmrg_linalg_core.hpp",
+                ],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                extra_link_args=accelerate_link_args + (
+                    ["-ldl"] if sys.platform.startswith("linux") else []
+                ),
                 optional=True,
             )
         )
-    return extensions
+        extensions.append(
+            Extension(
+                "pyqed.letta._physical_blocks_cpp",
+                ["pyqed/letta/_physical_blocks_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.letta._support_kernels_cpp",
+                ["pyqed/letta/_support_kernels_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.letta._conditional_gauge_cpp",
+                ["pyqed/letta/_conditional_gauge_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.letta._copy_einsum_cpp",
+                ["pyqed/letta/_copy_einsum_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+    if "all" in groups:
+        return extensions
+    prefixes = tuple(f"pyqed.{group}." for group in sorted(groups))
+    return [
+        extension
+        for extension in extensions
+        if extension.name.startswith(prefixes)
+    ]
 
 
 # Project metadata lives in pyproject.toml.  This small compatibility hook is

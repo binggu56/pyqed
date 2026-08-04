@@ -1,725 +1,597 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Sat Sep 28 20:09:06 2019
+"""DVR matrix-product-state utilities for quadratic vibronic Hamiltonians.
 
-TEBD for quantum dynamics of vibronic model systems
-
-@author: Bing
+The electronic degree of freedom is the first tensor-network site and each
+nuclear coordinate is represented by one DVR site.  Potential Hamiltonians may
+contain constant, linear, quadratic, and bilinear coordinate terms.
 """
 
-""" Comparison of the entanglement growth S(t) following a global quench using
-the first order MPO based time evolution for the XX model with the TEBD algorithm.
+from __future__ import annotations
 
-The TEBD algorithm is also used to recompress the MPS after the MPO time evolution.
-This is simpler to code but less efficient than a variational optimization.
-See arXiv:1407.1832 for details and how to extend to higher orders.
-
-Frank Pollmann, frankp@pks.mpg.de
-"""
+from collections.abc import Callable, Mapping, Sequence
+from itertools import product
 
 import numpy as np
-import pylab as pl
-from scipy.linalg import expm, block_diag
-import logging
-import copy
-import warnings
 
-from scipy.fftpack import fft, ifft, fftfreq, fftn, ifftn
-
-from pyqed.mps.decompose import decompose, compress
-
-from pyqed import gwp, discretize, pauli, sigmaz
-
-from pyqed.mps.mps import Site
+from pyqed.mps.autompo.Operator import Op
+from pyqed.mps.autompo.light_automatic_mpo import Mpo as AutoMPO
+from pyqed.mps.autompo.model import Model
+from pyqed.mps.first_quantization import FiniteDimLocalBasis
+from pyqed.mps.mps import MPO, MPS, expmpo
+from pyqed.mps.tdvp import TDVPEngine
 
 
+Array = np.ndarray
+Hamiltonian = Callable[[Array], Array]
+ProductTerm = tuple[complex, Mapping[int, Array]]
 
 
+def _validated_dimensions(dimensions: Sequence[int]) -> tuple[int, ...]:
+    dims = tuple(int(dimension) for dimension in dimensions)
+    if not dims or any(dimension <= 0 for dimension in dims):
+        raise ValueError("dimensions must contain positive integers.")
+    return dims
 
-def make_block_from_site(site):
-    """Makes a brand new block using a single site.
 
-    You use this function at the beginning of the DMRG algorithm to
-    upgrade a single site to a block.
+def _zero_mpo(dimensions: Sequence[int]) -> MPO:
+    factors = []
+    for site, dimension in enumerate(dimensions):
+        matrix = np.eye(dimension, dtype=complex)
+        if site == 0:
+            matrix.fill(0.0)
+        factors.append(matrix.reshape(1, 1, dimension, dimension))
+    return MPO(factors)
 
-    Parameters
-    ----------
-    site : a Site object.
-        The site you want to upgrade.
 
-    Returns
-    -------
-    result: a Block object.
-        A brand new block with the same contents that the single site.
+def product_terms_mpo(
+    dimensions: Sequence[int],
+    terms: Sequence[ProductTerm],
+    tol: float = 1.0e-12,
+) -> MPO:
+    """Build an MPO from sums of local-operator products.
 
-    Postcond
-    --------
-    The list for the operators in the site and the block are copied,
-    meaning that the list are different and modifying the block won't
-    modify the site.
-
-    Examples
-    --------
-    >>> from dmrg101.core.block import Block
-    >>> from dmrg101.core.block import make_block_from_site
-    >>> from dmrg101.core.sites import SpinOneHalfSite
-    >>> spin_one_half_site = SpinOneHalfSite()
-    >>> brand_new_block = make_block_from_site(spin_one_half_site)
-    >>> # check all it's what you expected
-    >>> print brand_new_block.dim
-    2
-    >>> print brand_new_block.operators.keys()
-    ['s_p', 's_z', 's_m', 'id']
-    >>> print brand_new_block.operators['s_z']
-    [[-0.5  0. ]
-     [ 0.   0.5]]
-    >>> print brand_new_block.operators['s_p']
-    [[ 0.  0.]
-     [ 1.  0.]]
-    >>> print brand_new_block.operators['s_m']
-    [[ 0.  1.]
-     [ 0.  0.]]
-    >>> # operators for site and block are different objects
-    >>> print ( id(spin_one_half_site.operators['s_z']) ==
-    ...		id(brand_new_block.operators['s_z']) )
-    False
+    ``dimensions[0]`` is the electronic dimension.  Each term consists of a
+    scalar and a mapping from site index to its local matrix.  Missing sites
+    carry the identity.
     """
-    result = Block(site.dim)
-    result.operators = copy.deepcopy(site.operators)
-    return result
+    dimensions = _validated_dimensions(dimensions)
+    if tol < 0.0:
+        raise ValueError("tol must be non-negative.")
+
+    nel = dimensions[0]
+    eye_el = np.eye(nel, dtype=complex)
+    clean_terms: list[ProductTerm] = []
+    for coefficient, operators in terms:
+        cleaned = {}
+        for site, matrix in operators.items():
+            if not isinstance(site, (int, np.integer)):
+                raise TypeError("operator site indices must be integers.")
+            site = int(site)
+            if not 0 <= site < len(dimensions):
+                raise ValueError(f"Operator site {site} is out of range.")
+            matrix = np.ascontiguousarray(matrix, dtype=complex)
+            expected = (dimensions[site], dimensions[site])
+            if matrix.shape != expected:
+                raise ValueError(
+                    f"Invalid operator shape {matrix.shape} at site {site}; "
+                    f"expected {expected}."
+                )
+            cleaned[site] = matrix
+
+        coefficient = complex(coefficient)
+        electronic = cleaned.get(0, eye_el)
+        if abs(coefficient) > tol and np.max(np.abs(electronic)) > tol:
+            clean_terms.append((coefficient, cleaned))
+
+    if not clean_terms:
+        return _zero_mpo(dimensions)
+
+    electronic = np.stack(
+        [
+            operators.get(0, eye_el).reshape(-1)
+            for _, operators in clean_terms
+        ]
+    )
+    _, singular_values, vh = np.linalg.svd(electronic, full_matrices=False)
+    rank = int(np.count_nonzero(singular_values > tol * singular_values[0]))
+    electronic_basis = [
+        np.ascontiguousarray(vh[index].reshape(nel, nel))
+        for index in range(rank)
+    ]
+
+    operator_mats: list[dict[str, Array]] = [
+        {} for _ in dimensions
+    ]
+    for index, matrix in enumerate(electronic_basis):
+        operator_mats[0][f"E{index}"] = matrix
+
+    local_symbols: list[dict[bytes, str]] = [
+        {} for _ in dimensions
+    ]
+    for _, operators in clean_terms:
+        for site, matrix in operators.items():
+            if site == 0:
+                continue
+            key = matrix.tobytes()
+            if key not in local_symbols[site]:
+                symbol = f"L{site}_{len(local_symbols[site])}"
+                local_symbols[site][key] = symbol
+                operator_mats[site][symbol] = matrix
+
+    symbolic_terms = []
+    for scalar, operators in clean_terms:
+        electronic_matrix = operators.get(0, eye_el)
+        for index, basis_matrix in enumerate(electronic_basis):
+            coefficient = scalar * np.vdot(basis_matrix, electronic_matrix)
+            if abs(coefficient) <= tol:
+                continue
+            term = Op(f"E{index}", 0, complex(coefficient))
+            for site in sorted(operators):
+                if site:
+                    symbol = local_symbols[site][operators[site].tobytes()]
+                    term *= Op(symbol, site)
+            symbolic_terms.append(term)
+
+    if not symbolic_terms:
+        return _zero_mpo(dimensions)
+
+    basis = [
+        FiniteDimLocalBasis(
+            site,
+            dimension,
+            operator_mats=operator_mats[site],
+        )
+        for site, dimension in enumerate(dimensions)
+    ]
+    matrices = AutoMPO(
+        Model(basis=basis, ham_terms=symbolic_terms),
+        algo="Hopcroft-Karp",
+    ).matrices
+    return MPO(
+        [
+            np.asarray(core).transpose(0, 3, 1, 2)
+            for core in matrices
+        ]
+    )
 
 
+def _evaluate(hamiltonian: Hamiltonian, coordinates) -> Array:
+    """Evaluate a single-point or batch-oriented electronic Hamiltonian."""
+    coordinates = np.asarray(coordinates, dtype=float)
 
-# def make_updated_block_for_site(transformation_matrix,
-# 		                operators_to_add_to_block):
-#     """Make a new block for a list of operators.
+    def as_square_matrix(matrix) -> Array:
+        if hasattr(matrix, "detach"):
+            matrix = matrix.detach().cpu().numpy()
+        matrix = np.asarray(matrix, dtype=np.complex128)
+        if matrix.ndim == 3 and matrix.shape[0] == 1:
+            matrix = matrix[0]
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError("hamiltonian(q) must return a square matrix.")
+        return matrix
 
-#     Takes a dictionary of operator names and matrices and makes a new
-#     block inserting in the `operators` block dictionary the result of
-#     transforming the matrices in the original dictionary accoring to the
-#     transformation matrix.
-
-#     You use this function everytime you want to create a new block by
-#     transforming the current operators to a truncated basis.
-
-#     Parameters
-#     ----------
-#     transformation_matrix : a numpy array of ndim = 2.
-#         The transformation matrix coming from a (truncated) unitary
-# 	transformation.
-#     operators_to_add_to_block : a dict of strings and numpy arrays of ndim = 2.
-#         The list of operators to transform.
-
-#     Returns
-#     -------
-#     result : a Block.
-#         A block with the new transformed operators.
-#     """
-#     cols_of_transformation_matrix = transformation_matrix.shape[1]
-#     result = Block(cols_of_transformation_matrix)
-#     for key in operators_to_add_to_block.keys():
-#         ult.add_operator(key)
-#         ult.operators[key] = transform_matrix(operators_to_add_to_block[key],
-# 			                         transformation_matrix)
-#     return result
+    try:
+        return as_square_matrix(hamiltonian(coordinates))
+    except (IndexError, TypeError, ValueError) as single_point_error:
+        try:
+            return as_square_matrix(hamiltonian(coordinates[None, :]))
+        except Exception:
+            raise single_point_error
 
 
+def quadratic_dvr_terms(
+    hamiltonian: Hamiltonian,
+    grids: Sequence[Array],
+    step: float = 1.0,
+    tol: float = 0.0,
+) -> tuple[list[int], list[ProductTerm]]:
+    """Recover a quadratic matrix-valued potential as DVR product terms.
 
-
-def is_right_canonical(M):
-    N = len(M)
-    for l in range(N):
-        Mdag = M[l].conj().T #right-top-left
-        MMdag = np.einsum('ijk,kjl',M[l],Mdag) #top-bottom
-        I = np.eye(np.shape(M[l])[0]) #(leg order is indiferent)
-        print('l =', l, ': max(|M[l] · M[l]^† - I|) =', np.max(abs(MMdag-I)))
-
-# parameters
-N = 10
-d = 3
-D = 20
-
-# random MPS
-'''
-    Order of legs: left-bottom-right.
-    Note: this is the conventional order used for MPSs in the code.
-'''
-Mrand = []
-Mrand.append(np.random.rand(1,d,D))
-for l in range(1,N-1):
-    Mrand.append(np.random.rand(D,d,D))
-Mrand.append(np.random.rand(D,d,1))
-
-Mleft = LeftCanonical(Mrand)
-
-def is_left_canonical(M):
-    L = len(M)
-    for l in range(L):
-        Mdag = Mleft[l].conj().T #right-top-left
-        '''
-            Note: as a consequence of the conventional leg order chosen for the MPSs, the corresponding hermitian
-                conjugate versions are ordered as right-top-left.
-        '''
-        MdagM = np.einsum('ijk,kjl',Mdag,Mleft[l]) #bottom-top
-        I = np.eye(np.shape(Mleft[l])[2]) #(leg order is indiferent)
-        print('l =', l, ': max(|M[l]^† · M[l] - I|) =', np.max(abs(MdagM-I)))
-
-
-def mps_to_tensor(mps):
-    B0, B1, B2 = mps
-
-    # obs[k] = np.einsum('ib, jk, kb->', B0[:,0, :].conj(), sp@sm, B0[:, 0, :])
-    psi = np.einsum('ib, bjc, ck ->ijk', B0[0,:,:], B1, B2[:, :, 0])
-    return psi
-
-def tensor_to_vec(psi):
-    return psi.flatten()
-
-
-
-
-
-s0 = np.eye(2)
-sp = np.array([[0.,1.],[0.,0.]])
-sm = np.array([[0.,0.],[1.,0.]])
-
-# def initial_state(d, chi_max, L, dtype=complex):
-#     """
-#     Create an initial product state.
-#     input:
-#         L: number of sites
-#         chi_max: maximum bond dimension
-#         d: local dimension for each site
-
-#     return
-#     =======
-#     MPS in right canonical form S0-B0--B1-....B_L
-#     """
-#     B_list = []
-#     s_list = []
-#     for i in range(L):
-#         B = np.zeros((d,1,1),dtype=dtype)
-#         B[np.mod(i,2),0,0] = 1.
-#         s = np.zeros(1)
-#         s[0] = 1.
-#         B_list.append(B)
-#         s_list.append(s)
-#     s_list.append(s)
-#     return B_list,s_list
-
-
-
-
-
-def apply_mpo_svd(B_list, s_list, w_list, chi_max):
+    The interpolation is exact when every matrix element is a polynomial of
+    total degree at most two in the supplied coordinates.
     """
-    Apply the MPO to an MPS.
+    if step <= 0.0:
+        raise ValueError("step must be positive.")
+    if tol < 0.0:
+        raise ValueError("tol must be non-negative.")
+
+    grids = [np.asarray(grid, dtype=float) for grid in grids]
+    if any(grid.ndim != 1 or grid.size == 0 for grid in grids):
+        raise ValueError("Each DVR grid must be a non-empty one-dimensional array.")
+
+    nmodes = len(grids)
+    zero = np.zeros(nmodes)
+    h0 = _evaluate(hamiltonian, zero)
+    q_ops = [np.diag(grid) for grid in grids]
+    dimensions = [h0.shape[0], *[grid.size for grid in grids]]
+    terms: list[ProductTerm] = [(1.0, {0: h0})]
+
+    for mode in range(nmodes):
+        displacement = zero.copy()
+        displacement[mode] = step
+        hp = _evaluate(hamiltonian, displacement)
+        displacement[mode] = -step
+        hm = _evaluate(hamiltonian, displacement)
+
+        linear = (hp - hm) / (2.0 * step)
+        quadratic = (hp + hm - 2.0 * h0) / (2.0 * step**2)
+        if np.max(np.abs(linear)) > tol:
+            terms.append((1.0, {0: linear, mode + 1: q_ops[mode]}))
+        if np.max(np.abs(quadratic)) > tol:
+            terms.append(
+                (
+                    1.0,
+                    {
+                        0: quadratic,
+                        mode + 1: q_ops[mode] @ q_ops[mode],
+                    },
+                )
+            )
+
+    for left in range(nmodes):
+        for right in range(left + 1, nmodes):
+            values = {}
+            for left_sign, right_sign in product((-1.0, 1.0), repeat=2):
+                displacement = zero.copy()
+                displacement[left] = left_sign * step
+                displacement[right] = right_sign * step
+                values[left_sign, right_sign] = _evaluate(
+                    hamiltonian, displacement
+                )
+            cross = (
+                values[1.0, 1.0]
+                - values[1.0, -1.0]
+                - values[-1.0, 1.0]
+                + values[-1.0, -1.0]
+            ) / (4.0 * step**2)
+            if np.max(np.abs(cross)) > tol:
+                terms.append(
+                    (
+                        1.0,
+                        {
+                            0: cross,
+                            left + 1: q_ops[left],
+                            right + 1: q_ops[right],
+                        },
+                    )
+                )
+    return dimensions, terms
 
 
-    Parameters
-    ----------
-    B_list : TYPE
-        DESCRIPTION.
-    s_list : TYPE
-        DESCRIPTION.
-    w_list : TYPE
-        DESCRIPTION.
-    chi_max : TYPE
-        DESCRIPTION.
+def dvr_potential_mpo(
+    hamiltonian: Hamiltonian,
+    grids: Sequence[Array],
+    *,
+    step: float = 1.0,
+    tol: float = 0.0,
+    mpo_tol: float = 1.0e-12,
+) -> MPO:
+    """Build the potential-only DVR MPO for a quadratic Hamiltonian."""
+    dimensions, terms = quadratic_dvr_terms(
+        hamiltonian, grids, step=step, tol=tol
+    )
+    return product_terms_mpo(dimensions, terms, tol=mpo_tol)
 
-    Returns
-    -------
-    None.
 
+def fock_hamiltonian_mpo(
+    model,
+    nbas=10,
+    *,
+    include_harmonic=True,
+    tol=1.0e-12,
+) -> MPO:
+    r"""Build an LVC/QVC Hamiltonian MPO in a truncated Fock basis.
+
+    Normal coordinates are dimensionless,
+    :math:`Q_m=(a_m^\dagger+a_m)/\sqrt{2}`, and the common nuclear reference
+    Hamiltonian is :math:`\omega_m(a_m^\dagger a_m+1/2)`.
     """
-
-    d = B_list[0].shape[0] # size of local space
-    D = w_list[0].shape[0]
-
-    L = len(B_list) # nsites
-
-    chi1 = B_list[0].shape[1]
-    chi2 = B_list[0].shape[2] # left and right bond dims
-
-    B = np.tensordot(B_list[0],w_list[0][0,:,:,:],axes=(0,1))
-    B = np.reshape(np.transpose(B,(3,0,1,2)),(d,chi1,chi2*D))
-    B_list[0] = B
-
-    for i_site in range(1,L-1):
-        chi1 = B_list[i_site].shape[1]
-        chi2 = B_list[i_site].shape[2]
-        B = np.tensordot(B_list[i_site],w_list[i_site][:,:,:,:],axes=(0,2))
-        B = np.reshape(np.transpose(B,(4,0,2,1,3)),(d,chi1*D,chi2*D))
-        B_list[i_site] = B
-        s_list[i_site] = np.reshape(np.tensordot(s_list[i_site],np.ones(D),axes=0),D*chi1)
-
-    chi1 = B_list[L-1].shape[1]
-    chi2 = B_list[L-1].shape[2]
-
-    B = np.tensordot(B_list[L-1],w_list[L-1][:,0,:,:],axes=(0,1))
-    B = np.reshape(np.transpose(B,(3,0,2,1)),(d,D*chi1,chi2))
-    s_list[L-1] = np.reshape(np.tensordot(s_list[L-1],np.ones(D),axes=0),D*chi1)
-    B_list[L-1] = B
-
-    tebd(B_list,s_list,(L-1)*[np.reshape(np.eye(d**2),[d,d,d,d])],chi_max)
-    return
-
-
-def make_U_xx_bond(L,delta):
-    """
-    Create the bond evolution operator used by the TEBD algorithm.
-    ouput:
-        u_list: single-step evolution operator
-
-    """
-
-    d = 2
-    # Hamiltonian
-    H = np.real(np.kron(sp,sm) + np.kron(sm,sp))
-
-    u_list = (L-1)*[np.reshape(expm(-delta*H),(d,d,d,d))]
-    return u_list, d
-
-def make_U_xx_mpo(L,dt,dtype=float):
-    " Create the MPO of the time evolution operator.  "
-
-    w = np.zeros((3,3,2,2),dtype=type(dt))
-    w[0,:] = [s0,sp,sm]
-    w[1:,0] = [-dt*sm,-dt*sp]
-    w_list = [w]*L
-    return w_list
-
-
-# class TimeEvolvingBlockDecimation:
-
-class TEBD:
-    def __init__(self, D):
-        self.D = D
-
-
-
-
-def k_evolve_1d(k, psi):
-    """
-    propagate the state in grid basis a time step forward with H = K
-    :param dt: float, time step
-    :param kx: float, momentum corresponding to x
-    :param ky: float, momentum corresponding to y
-    :param psi_grid: list, the two-electronic-states vibrational states in
-                           grid basis
-    :return: psi_grid(update): list, the two-electronic-states vibrational
-                                     states in grid basis
-    """
-    psi_k = fft(psi)
-    psi_k = psi_k * np.exp(-0.5j * k**2 * dt)
-    psi = ifft(psi_k)
-
-    return psi
-
-# def kinetic(k, B_list):
-#     """
-#     kinetic energy (KE) component of the one-step evolution operator
-#     :math:`e^{-i T \delta t )` on the MPS
-
-#               where T is the total KE operator
-#     """
-#     L = len(B_list)
-
-#     for i in range(L):
-#         _, chi1, chi2 = np.shape(B_list[i])
-#         # for a in range(chi1):
-#         #     for b in range(chi2):
-#                 # B_list[i][:,a,b] = k_evolve_1d(k, B_list[i][:,a,b])
-#         B_list[i] = ifftn(np.einsum('i, iab -> iab', np.exp(-0.5j * k**2 * dt), \
-#                                     fftn(B_list[i], axes=(0))), axes=(0))
-
-#     return B_list
-
-def kinetic(k, B_list):
-    """
-    kinetic energy (KE) component of the one-step evolution operator
-    :math:`e^{-i T \delta t )` on the MPS
-
-              where T is the total KE operator
-
-    The factors are of shape [chi1, d, chi2]
-    Returns
-    -------
-
-    """
-    L = len(B_list)
-
-    for i in range(L):
-        _, chi1, chi2 = np.shape(B_list[i])
-        # for a in range(chi1):
-        #     for b in range(chi2):
-                # B_list[i][:,a,b] = k_evolve_1d(k, B_list[i][:,a,b])
-        B_list[i] = ifftn(np.einsum('i, aib -> aib', np.exp(-0.5j * k**2 * dt), \
-                                    fftn(B_list[i], axes=(1))), axes=(1))
-
-    return B_list
-
-def make_V_list(X, Y):
-    """
-    return:
-        V: 2d array e^{-1j * V * dt}
-    """
-    V = apes(X, Y)
-
-    return V
-
-def apes(x,y):
-    """
-    adiabatic PES
-    """
-    return x**2/2. + y**2/2. + x*y
-
-def potential(B_list, s_list, V, chi_max):
-    """
-    potential energy component of the evolution operator e^{-i * dt * V) on the MPS
-    input:
-        V: n-d array, PES
-        L: int
-            number of sites
-    """
-    U = np.exp(-1j * dt * V)
-
-    for i in range(L-1):
-
-            i1 = i; i2 = i+1
-
-            chi1 = B_list[i1].shape[1]
-            chi3 = B_list[i2].shape[2]
-
-            C = np.tensordot(B_list[i1], B_list[i2], axes=(2,1))
-            C = np.einsum('iajb, ij ->iajb', C, U)
-            #C = np.tensordot(C, U, axes=([0,2],[2,3]))
-
-            # ? Why not directly SVD the C tensor?
-
-            theta = np.reshape(np.transpose(np.transpose(C)*s_list[i1],(1,3,0,2)),(d*chi1,d*chi3))
-
-            C = np.reshape(np.transpose(C,(2,0,3,1)),(d*chi1,d*chi3))
-
-            # Schmidt decomposition #
-            X, Y, Z = np.linalg.svd(theta)
-            Z=Z.T
-
-            W = np.dot(C,Z.conj())
-            chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
-
-            # Obtain the new values for B and l #
-            invsq = np.sqrt(sum(Y[:chi2]**2))
-            s_list[i2] = Y[:chi2]/invsq
-            B_list[i1] = np.reshape(W[:,:chi2],(d,chi1,chi2))/invsq
-            B_list[i2] = np.transpose(np.reshape(Z[:,:chi2],(d,chi3,chi2)),(0,2,1))
-
-    return B_list, s_list
-
-
-def potential_svd(B_list, s_list, v_mps, chi_max):
-    """
-    potential energy component of the one-step evolution operator :math:`e^{-i V \delta t)` on the MPS
-    input:
-        V: n-d array, PES
-        L: int
-            number of sites
-    """
-    L = len(B_list)
-
-
-    # U = np.exp(-1j * dt * V)
-
-    # decompose the potential energy matrix
-
-    # vf, vs = decompose(U, rank=chi_max)
-
-    As = []
-    for i in range(L):
-
-        a1, d, a2 = v_mps[i].shape
-        chi1, d, chi2 = B_list[i].shape
-
-        A = np.einsum('aib, cid-> aci bd', v_mps[i], B_list[i])
-        A = np.reshape(A, (a1 * chi1, d, a2 * chi2))
-
-        As.append(A.copy())
-
-    As, Ss = compress(As, chi_max=chi_max)
-
-    # for i in range(L-1):
-
-    #         i1 = i; i2 = i+1
-
-    #         chi1 = B_list[i1].shape[1]
-    #         chi3 = B_list[i2].shape[2]
-
-    #         C = np.tensordot(B_list[i1], B_list[i2], axes=(2,1))
-    #         C = np.einsum('iajb, ij ->iajb', C, U)
-    #         #C = np.tensordot(C, U, axes=([0,2],[2,3]))
-
-    #         # ? Why not directly SVD the C tensor?
-
-    #         theta = np.reshape(np.transpose(np.transpose(C)*s_list[i1],(1,3,0,2)),(d*chi1,d*chi3))
-
-    #         C = np.reshape(np.transpose(C,(2,0,3,1)),(d*chi1,d*chi3))
-
-    #         # Schmidt decomposition #
-    #         X, Y, Z = np.linalg.svd(theta)
-    #         Z=Z.T
-
-    #         W = np.dot(C,Z.conj())
-    #         chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
-
-    #         # Obtain the new values for B and l #
-    #         invsq = np.sqrt(sum(Y[:chi2]**2))
-    #         s_list[i2] = Y[:chi2]/invsq
-    #         B_list[i1] = np.reshape(W[:,:chi2],(d,chi1,chi2))/invsq
-    #         B_list[i2] = np.transpose(np.reshape(Z[:,:chi2],(d,chi3,chi2)),(0,2,1))
-
-    return As, Ss
-
-
-
-
-
-class SPO:
-    """
-    MPS representation for adiabatic wave packet dynamics
-    """
-    def __init__(self, domains, levels, chi_max, dvr_type='sinc'):
-        """
-        Use TEBD to optmize the MPS and to project it back.
-
-        The first site is the electronic, while the rest represents the vibrational
-        modes. :math:`| \alpha n_1 n_2 \cdots n_d\rangle`
-
-        """
-        self.nsites = self.L = len(levels)
-        if dvr_type == 'sinc': # particle in a box eigenstates
-            self.x = []
-            for d in range(self.ndim):
-                a, b = domains[d]
-                self.x.append(discretize(a, b, levels[d]))
-
-        self.dims = [len(_x) for _x in self.x] # [B.shape[1] for B in B_list]
-
-        # self.nsites = self.L = self.ndim  # nuclear degrees of freedom
-
-        self.chi_max = chi_max
-        # make_V_list(X, Y)
-
-        self.v = None
-
-    def set_apes(self, v):
-
-
-        assert(v.shape == tuple(self.dims))
-
-        self.v = v
-
-
-
-
-    def run(self, B_list, s_list, dt=0.001, nt=10, nout=1):
-
-        chi_max = self.chi_max
-        v = self.v
-        V = np.exp(-1j * v * dt)
-
-        # decompose the potential propagator
-        vf, vs = decompose(V, chi_max)
-
-        X = np.diag(x)
-        Xs = []
-
-        for n in range(nt):
-            for k1 in range(nout):
-
-                B_list = kinetic(kx, B_list)
-                B_list, s_list = potential_svd(B_list, s_list, vf, chi_max)
-
-            Xs.append(self.expect_one_site(B_list, X))
-
-        return Xs
-
-
-    def expect_one_site(self, mps, a, n=-1):
-        """
-        compute single-site observable
-        """
-
-        return expect_one_site(mps, a=a, n=n)
-
-    def expect_two_sites(self, mps, e_ops, n):
-        pass
-
-
-def expect_one_site(mps, a, n=-1):
-    """
-    how to compute the observables
-    """
-    d = mps[n].shape[1]
-    assert(a.shape == (d,d))
-
-    if n == -1:
-        M = mps[n]
-        return np.einsum('aib, ij, ajb', M.conj(), a, M)
+    nmodes = int(model.nmodes)
+    counts = np.broadcast_to(nbas, (nmodes,)).astype(int)
+    if np.any(counts <= 0):
+        raise ValueError("Every Fock basis size must be positive.")
+
+    dimensions = [int(model.nstates), *counts.tolist()]
+    terms: list[ProductTerm] = [
+        (1.0, {0: np.diag(np.asarray(model.E, dtype=complex))})
+    ]
+    coordinates = []
+    coordinate_squares = []
+    for mode, count in enumerate(counts):
+        annihilation = np.diag(
+            np.sqrt(np.arange(1, count, dtype=float)), k=1
+        )
+        coordinate = (annihilation + annihilation.T) / np.sqrt(2.0)
+        coordinates.append(coordinate)
+        number = np.arange(count, dtype=float)
+        coordinate_square = np.diag(number + 0.5)
+        if count > 2:
+            second_off_diagonal = 0.5 * np.sqrt(
+                np.arange(1, count - 1, dtype=float)
+                * np.arange(2, count, dtype=float)
+            )
+            coordinate_square += np.diag(second_off_diagonal, k=2)
+            coordinate_square += np.diag(second_off_diagonal, k=-2)
+        coordinate_squares.append(coordinate_square)
+        if include_harmonic:
+            harmonic = model.omega[mode] * (
+                np.arange(count, dtype=float) + 0.5
+            )
+            terms.append((1.0, {mode + 1: np.diag(harmonic)}))
+
+        linear = np.asarray(
+            model.linear_couplings[:, :, mode], dtype=complex
+        )
+        if np.max(np.abs(linear)) > tol:
+            terms.append(
+                (1.0, {0: linear, mode + 1: coordinate})
+            )
+
+    quadratic = getattr(model, "quadratic_couplings", None)
+    if quadratic is not None:
+        quadratic = np.asarray(quadratic, dtype=complex)
+        for left in range(nmodes):
+            diagonal = 0.5 * quadratic[:, :, left, left]
+            if np.max(np.abs(diagonal)) > tol:
+                terms.append(
+                    (
+                        1.0,
+                        {
+                            0: diagonal,
+                            left + 1: coordinate_squares[left],
+                        },
+                    )
+                )
+            for right in range(left + 1, nmodes):
+                mixed = quadratic[:, :, left, right]
+                if np.max(np.abs(mixed)) > tol:
+                    terms.append(
+                        (
+                            1.0,
+                            {
+                                0: mixed,
+                                left + 1: coordinates[left],
+                                right + 1: coordinates[right],
+                            },
+                        )
+                    )
+    return product_terms_mpo(dimensions, terms, tol=tol)
+
+
+def kinetic_half_step_mpo(
+    dvrs: Sequence,
+    dt: float,
+    nstates: int = 2,
+) -> MPO:
+    """Return the rank-one MPO for ``exp(-i T dt / 2)``."""
+    operators = [
+        np.eye(nstates, dtype=complex),
+        *[np.asarray(dvr.expT(dt / 2), dtype=complex) for dvr in dvrs],
+    ]
+    return MPO(
+        [
+            operator.reshape(1, 1, *operator.shape)
+            for operator in operators
+        ]
+    )
+
+
+def kinetic_mpo(dvrs: Sequence, nstates: int = 2) -> MPO:
+    """Build ``I_el`` tensor the sum of all one-mode kinetic operators."""
+    if nstates <= 0:
+        raise ValueError("nstates must be positive.")
+    kinetic = [np.asarray(dvr.t(), dtype=complex) for dvr in dvrs]
+    if not kinetic:
+        return _zero_mpo([nstates])
+    dimensions = [nstates, *[matrix.shape[0] for matrix in kinetic]]
+    terms = [
+        (1.0, {mode + 1: matrix})
+        for mode, matrix in enumerate(kinetic)
+    ]
+    return product_terms_mpo(dimensions, terms)
+
+
+def full_hamiltonian_mpo(potential: MPO, dvrs: Sequence) -> MPO:
+    """Build ``H = T + V`` as one MPO."""
+    nstates = potential.factors[0].shape[2]
+    if len(dvrs) + 1 != potential.L:
+        raise ValueError("The DVR count does not match the potential MPO.")
+    return kinetic_mpo(dvrs, nstates=nstates) + potential
+
+
+def tdvp_evolution(
+    psi: MPS,
+    potential: MPO,
+    dvrs: Sequence,
+    dt: float,
+    nsteps: int,
+    chi_max: int,
+    switch_step: int | None = None,
+):
+    """Yield ``(time, state)`` from two-site then one-site TDVP."""
+    if nsteps < 0 or chi_max <= 0:
+        raise ValueError("nsteps must be non-negative and chi_max positive.")
+    if switch_step is None:
+        switch_step = nsteps // 3
+    if not 0 <= switch_step <= nsteps:
+        raise ValueError("switch_step must lie between zero and nsteps.")
+
+    hamiltonian = full_hamiltonian_mpo(potential, dvrs)
+    psi = psi.copy()
+    psi.right_canonicalize()
+    yield 0.0, psi
+
+    if switch_step:
+        engine = TDVPEngine(
+            hamiltonian, integrator="tdvp2", max_bond=chi_max
+        )
+        for step in range(1, switch_step + 1):
+            psi, _ = engine.step(psi, dt)
+            yield step * dt, psi
+
+    if switch_step < nsteps:
+        engine = TDVPEngine(
+            hamiltonian, integrator="tdvp1", max_bond=chi_max
+        )
+        for step in range(switch_step + 1, nsteps + 1):
+            psi, _ = engine.step(psi, dt)
+            yield step * dt, psi
+
+
+def strang_evolution(
+    psi: MPS,
+    potential: MPO,
+    dvrs: Sequence,
+    dt: float,
+    nsteps: int,
+    chi_max: int,
+    taylor_order: int = 6,
+    scale: int = 3,
+):
+    """Yield second-order split-operator evolution steps."""
+    if nsteps < 0 or chi_max <= 0:
+        raise ValueError("nsteps must be non-negative and chi_max positive.")
+    kinetic = kinetic_half_step_mpo(
+        dvrs, dt, potential.factors[0].shape[2]
+    )
+    potential_u = expmpo(
+        potential,
+        constant=-1j * dt,
+        D=chi_max,
+        method="taylor",
+        order=taylor_order,
+        scale=scale,
+    )
+    yield 0.0, psi
+    for step in range(1, nsteps + 1):
+        psi = kinetic.matmul(psi, chi_max=chi_max)
+        psi = potential_u.matmul(psi, chi_max=chi_max)
+        psi = kinetic.matmul(psi, chi_max=chi_max)
+        yield step * dt, psi
+
+
+def run_evolution(
+    psi: MPS,
+    potential: MPO,
+    dvrs: Sequence,
+    dt: float,
+    nsteps: int,
+    chi_max: int,
+    method: str = "strang",
+    *,
+    taylor_order: int = 6,
+    scale: int = 3,
+    switch_step: int | None = None,
+):
+    """Dispatch to Strang or TDVP time evolution."""
+    if method == "strang":
+        yield from strang_evolution(
+            psi,
+            potential,
+            dvrs,
+            dt,
+            nsteps,
+            chi_max,
+            taylor_order=taylor_order,
+            scale=scale,
+        )
+    elif method == "tdvp":
+        yield from tdvp_evolution(
+            psi,
+            potential,
+            dvrs,
+            dt,
+            nsteps,
+            chi_max,
+            switch_step=switch_step,
+        )
     else:
-        raise NotImplementedError
+        raise ValueError(
+            f"Unknown method {method!r}; choose 'strang' or 'tdvp'."
+        )
 
 
-def overlap(bra, ket):
-    """
-
-    Compute the overlap between two MPSs with the same sites
-
-    .. math::
-
-        S = \langle \phi | \chi \rangle
-
-    Note
-    ----
-    It does not work for two MPS with different basis sets.
-
-    Parameters
-    ----------
-    bra : TYPE
-        DESCRIPTION.
-    ket : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    TYPE
-        DESCRIPTION.
-
-    """
-    assert(ket.dims == bra.dims)
-
-    C = np.einsum('aib, aic -> bc', bra.factors[0].conj(), ket.factors[0])
-
-    for i in range(1, bra.L):
-        C = np.einsum('aib, ac, cid -> bd', bra.factors[i].conj(), C, ket.factors[i])
+def overlap(bra: MPS, ket: MPS) -> complex:
+    """Return ``<bra|ket>``."""
+    return bra._mps_dot(bra, ket)
 
 
-    return C[0, 0]
+def electronic_populations(psi: MPS) -> Array:
+    """Return the normalized diagonal of the reduced electronic density."""
+    environment = np.ones((1, 1), dtype=complex)
+    for core in reversed(psi.factors[1:]):
+        environment = np.einsum(
+            "asr,ru,bsu->ab", core, environment, core.conj()
+        )
+    electronic = psi.factors[0]
+    density = np.einsum(
+        "asr,ru,atu->st",
+        electronic,
+        environment,
+        electronic.conj(),
+    )
+    norm = float(np.real(np.trace(density)))
+    if not np.isfinite(norm) or norm <= 0.0:
+        raise ValueError("The MPS has a non-positive or non-finite norm.")
+    return np.real(np.diag(density)) / norm
 
 
+def dense_dvr_potential(
+    hamiltonian: Hamiltonian,
+    grids: Sequence[Array],
+) -> Array:
+    """Evaluate a small DVR potential densely for validation."""
+    grid_shape = tuple(map(len, grids))
+    nuclear_size = int(np.prod(grid_shape, dtype=int))
+    nstates = _evaluate(hamiltonian, np.zeros(len(grids))).shape[0]
+    values = np.empty(
+        (nstates, nstates, nuclear_size), dtype=np.complex128
+    )
+    for column, indices in enumerate(product(*map(range, grid_shape))):
+        coordinates = [
+            grids[mode][index]
+            for mode, index in enumerate(indices)
+        ]
+        values[:, :, column] = _evaluate(hamiltonian, coordinates)
 
-if __name__ == "__main__":
-
-    from pyqed import interval
-
-    def initial_state(d, chi_max, L, dtype=complex):
-        """
-        Create an initial product state.
-        input:
-            L: number of sites
-            chi_max: maximum bond dimension
-            d: local dimension for each site
-
-        return
-        =======
-        MPS in right canonical form S0-B0--B1-....B_L
-        """
-        B_list = []
-        s_list = []
-
-        g = gwp(x, x0=-1)
-
-        for i in range(L):
-            B = np.zeros((1,d,1),dtype=dtype)
-            B[0, :, 0] = g
-
-            s = np.zeros(1)
-            s[0] = 1.
-            B_list.append(B)
-            s_list.append(s)
-
-        s_list.append(s)
-
-        # return B_list,s_list
-        return MPS(B_list)
+    dense = np.zeros(
+        (nstates * nuclear_size,) * 2, dtype=np.complex128
+    )
+    for bra in range(nstates):
+        for ket in range(nstates):
+            rows = slice(bra * nuclear_size, (bra + 1) * nuclear_size)
+            columns = slice(ket * nuclear_size, (ket + 1) * nuclear_size)
+            dense[rows, columns] = np.diag(values[bra, ket])
+    return dense
 
 
-
-    # Define Pararemeter here
-    delta = dt = 0.02
-    L = 2
-    chi_max = 10
-    N_steps = 10
-
-    # # grid
-    d = 2**4 # local size of Hilbert space
-    # x = np.linspace(-2,2,d, endpoint=False)
-    # y = np.linspace(-2,2,d, endpoint=False)
-
-
-    # print(interval(x))
-
-    # X, Y = np.meshgrid(x,y)
-
-    # V = make_V_list(X,Y)
-    def pes(x):
-        dim = len(x)
-        v = 0
-        for d in range(dim):
-            v += 0.5 *d* x[d]**2
-        v += 0.3 * x[0] * x[2] #+ x[0]**2 * 0.2
-        return v
+def validate_structure(mpo: MPO, dimensions: Sequence[int]) -> None:
+    """Raise ``ValueError`` if physical or virtual MPO dimensions are invalid."""
+    dimensions = _validated_dimensions(dimensions)
+    if len(mpo.factors) != len(dimensions):
+        raise ValueError("The MPO site count does not match dimensions.")
+    if mpo.factors[0].shape[0] != 1 or mpo.factors[-1].shape[1] != 1:
+        raise ValueError("The MPO boundary bonds must have dimension one.")
+    for site, (core, dimension) in enumerate(
+        zip(mpo.factors, dimensions)
+    ):
+        if core.shape[2:] != (dimension, dimension):
+            raise ValueError(f"Invalid physical dimensions at site {site}.")
+        if site and mpo.factors[site - 1].shape[1] != core.shape[0]:
+            raise ValueError(f"Invalid virtual bond before site {site}.")
 
 
-    # a = np.random.randn(3, 3, 3)
-    level = 4
-    # n = 2**level - 1 # number of grid points for each dim
-    x = np.linspace(-6, 6, 2**level, endpoint=False)[1:]
-    n = len(x)
-
-    dx = interval(x)
-
-
-    v = np.zeros((n, n, n))
-    for i in range(n):
-        for j in range(n):
-            for k in range(n):
-                v[i, j, k] = pes([x[i], x[j], x[k]])
-    # frequency space
-    kx = 2. * np.pi * fftfreq(n, dx)
-
-
-
-    # TEBD algorithm
-    L = 3
-    # B_list,s_list
-
-    # initialize a vibronic state
-    # mps = initial_state(n, chi_max, L, dtype=complex)
-    mps = vibronic_state(x)
-
-
-
-    # spo = SPO(L, dims=[n, ] * 3, chi_max=6)
-    # spo.set_apes(v)
-
-    # Xs = spo.run(B_list, s_list, dt=0.04, nt=500)
-
-    # # print(len(B_list), len(s_list))
-    # import matplotlib.pyplot as plt
-    # fig, ax = plt.subplots()
-    # ax.plot(Xs)
-
-    # S = [0]
-    # for step in range(N_steps):
-
-    #     B_list = kinetic(k, B_list)
-    #     B_list, s_list = potential(B_list, s_list, V, chi_max)
-
-    #     s2 = np.array(s_list[L//2])**2
-    #     S.append(-np.sum(s2*np.log(s2)))
-
-    # pl.plot(delta*np.arange(N_steps+1),S)
-    # pl.xlabel('$t$')
-    # pl.ylabel('$S$')
-    # pl.legend(['MPO','TEBD'],loc='upper left')
-    # pl.show()
+__all__ = [
+    "dense_dvr_potential",
+    "dvr_potential_mpo",
+    "electronic_populations",
+    "fock_hamiltonian_mpo",
+    "full_hamiltonian_mpo",
+    "kinetic_half_step_mpo",
+    "kinetic_mpo",
+    "overlap",
+    "product_terms_mpo",
+    "quadratic_dvr_terms",
+    "run_evolution",
+    "strang_evolution",
+    "tdvp_evolution",
+    "validate_structure",
+]

@@ -21,6 +21,7 @@ from .mpo import (
     IrreducibleMPO,
     RankCoupledChannelTerm,
     RankCoupledMPO,
+    SparseVirtualBlock,
 )
 from .tensor import NonabelianTensor
 
@@ -112,11 +113,11 @@ def _validate_reduced_operator(reduced_operator, phys_leg, *, label):
 def _accumulate_site_operator(blocks, operator, row, col, *, coeff=1.0, d_left, d_right, dtype):
     coeff = np.asarray(coeff, dtype=dtype)
     for key, block in operator.blocks.items():
-        arr = blocks.get(key)
-        if arr is None:
-            arr = np.zeros((d_left, d_right) + block.shape, dtype=dtype)
-            blocks[key] = arr
-        arr[row, col] += coeff * np.asarray(block, dtype=dtype)
+        routes = blocks.setdefault(key, {})
+        route = (int(row), int(col))
+        value = coeff * np.asarray(block, dtype=dtype)
+        previous = routes.get(route)
+        routes[route] = value if previous is None else previous + value
 
 
 def _dense_signature(array, *, tol=1.0e-14):
@@ -1361,11 +1362,13 @@ class AutoMPO:
                         bool(record["use_cg_coupling"]),
                     )
                     item = reduced_blocks.get(key)
-                    block = None if item is None else item[0]
-                    if block is None:
-                        block = np.zeros((d_left, d_right), dtype=dtype)
-                        reduced_blocks[key] = (block, record["operator"])
-                    block[left, right] += np.asarray(record["coeff"], dtype=dtype)
+                    routes = None if item is None else item[0]
+                    if routes is None:
+                        routes = {}
+                        reduced_blocks[key] = (routes, record["operator"])
+                    route = (int(left), int(right))
+                    coeff = np.asarray(record["coeff"], dtype=dtype)
+                    routes[route] = routes.get(route, 0) + coeff
 
             symbolic_transitions = []
             for record in transition_records[site]:
@@ -1381,14 +1384,27 @@ class AutoMPO:
                 )
             symbolic_transitions = tuple(symbolic_transitions)
 
+            sparse_visible_blocks = {
+                key: SparseVirtualBlock.from_entries(
+                    (d_left, d_right) + tuple(next(iter(routes.values())).shape),
+                    routes,
+                    dtype=dtype,
+                )
+                for key, routes in visible_blocks.items()
+                if any(np.any(value != 0) for value in routes.values())
+            }
             rank_coupled_terms = [
                 RankCoupledChannelTerm(
                     reduced_operator=operator,
-                    visible_virtual_block=block,
+                    visible_virtual_block=SparseVirtualBlock.from_entries(
+                        (d_left, d_right),
+                        routes,
+                        dtype=dtype,
+                    ),
                     use_cg_coupling=use_cg_coupling,
                 )
-                for (_signature, use_cg_coupling), (block, operator) in reduced_blocks.items()
-                if np.any(block)
+                for (_signature, use_cg_coupling), (routes, operator) in reduced_blocks.items()
+                if any(value != 0 for value in routes.values())
             ]
 
             left_irreps = class_irreps[site]
@@ -1399,7 +1415,7 @@ class AutoMPO:
             if needs_rank_coupled_core:
                 mpo.append(
                     RankCoupledMPO(
-                        dense_blocks=visible_blocks,
+                        dense_blocks=sparse_visible_blocks,
                         left_channel_irreps=left_irreps,
                         right_channel_irreps=right_irreps,
                         left_channel_charges=class_charges[site],
@@ -1413,7 +1429,10 @@ class AutoMPO:
             else:
                 mpo.append(
                     MPO(
-                        blocks=visible_blocks,
+                        blocks={
+                            key: np.asarray(block)
+                            for key, block in sparse_visible_blocks.items()
+                        },
                         phys_out_leg=phys_leg,
                         phys_in_leg=phys_leg,
                         symbolic_transitions=symbolic_transitions,

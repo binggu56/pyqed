@@ -903,7 +903,11 @@ class TTMPOFrontier:
         return messages
 
     def scalar(self, tensors):
-        value = self.build_left(tensors)[-1].to_dense()
+        self.reset_diagnostics()
+        value = self.left_boundary()
+        for site in range(self.nsites):
+            value = self.advance_left(value, tensors, site)
+        value = value.to_dense()
         return np.asarray(value).reshape(()).item()
 
     @staticmethod
@@ -1215,7 +1219,74 @@ def _product_mpo(dims, local_operators):
     return LocalMPO(dims, tensors)
 
 
-def _term_product_mpos(dims, term):
+def _validated_local_qns(dims, local_qns):
+    if local_qns is None:
+        return None
+    local_qns = tuple(
+        tuple(tuple(int(value) for value in charge) for charge in site)
+        for site in local_qns
+    )
+    if len(local_qns) != len(dims):
+        raise ValueError("local_qns must contain one entry per physical site.")
+    if any(len(site) != dim for site, dim in zip(local_qns, dims)):
+        raise ValueError("local_qns dimensions do not match the local dimensions.")
+    ranks = {len(charge) for site in local_qns for charge in site}
+    if len(ranks) != 1:
+        raise ValueError("all local_qns charges must have the same rank.")
+    return local_qns
+
+
+def _charge_difference(left, right):
+    return tuple(int(a) - int(b) for a, b in zip(left, right))
+
+
+def _charge_resolved_two_site_schmidt(matrix, left_qns, right_qns):
+    """Split a two-site operator without mixing Abelian transfer sectors."""
+    left_dim = len(left_qns)
+    right_dim = len(right_qns)
+    row_groups = {}
+    column_groups = {}
+    for bra in range(left_dim):
+        for ket in range(left_dim):
+            transfer = _charge_difference(left_qns[bra], left_qns[ket])
+            row_groups.setdefault(transfer, []).append(bra * left_dim + ket)
+    for bra in range(right_dim):
+        for ket in range(right_dim):
+            transfer = _charge_difference(right_qns[bra], right_qns[ket])
+            column_groups.setdefault(transfer, []).append(bra * right_dim + ket)
+
+    scale = max(1.0, float(np.max(np.abs(matrix), initial=0.0)))
+    threshold = np.finfo(float).eps * max(matrix.shape) * scale
+    components = []
+    for left_transfer in sorted(row_groups):
+        rows = np.asarray(row_groups[left_transfer], dtype=np.intp)
+        for right_transfer in sorted(column_groups):
+            columns = np.asarray(column_groups[right_transfer], dtype=np.intp)
+            block = matrix[np.ix_(rows, columns)]
+            if not np.any(np.abs(block) > threshold):
+                continue
+            left, singular_values, right = np.linalg.svd(
+                block,
+                full_matrices=False,
+            )
+            rank = int(np.count_nonzero(singular_values > threshold))
+            for component in range(rank):
+                left_vector = np.zeros(matrix.shape[0], dtype=left.dtype)
+                right_vector = np.zeros(matrix.shape[1], dtype=right.dtype)
+                left_vector[rows] = left[:, component] * singular_values[component]
+                right_vector[columns] = right[component]
+                components.append(
+                    (
+                        left_vector.reshape(left_dim, left_dim),
+                        right_vector.reshape(right_dim, right_dim),
+                        left_transfer,
+                        right_transfer,
+                    )
+                )
+    return tuple(components)
+
+
+def _term_product_mpos(dims, term, *, local_qns=None):
     """Expand one finite-support term into bond-one product MPOs."""
 
     sites = tuple(term.sites)
@@ -1232,6 +1303,23 @@ def _term_product_mpos(dims, term):
             .transpose(0, 2, 1, 3)
             .reshape(left_dim * left_dim, right_dim * right_dim)
         )
+        if local_qns is not None:
+            components = _charge_resolved_two_site_schmidt(
+                matrix,
+                local_qns[left_site],
+                local_qns[right_site],
+            )
+            return tuple(
+                _product_mpo(
+                    dims,
+                    {
+                        left_site: left_operator,
+                        right_site: right_operator,
+                    },
+                )
+                for left_operator, right_operator, _left_transfer, _right_transfer
+                in components
+            )
         left, singular_values, right = np.linalg.svd(matrix, full_matrices=False)
         if singular_values.size:
             threshold = (
@@ -1287,7 +1375,11 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
     Hamiltonian channel and spuriously drive the numerator to zero.  This
     contractor expands each local term into bond-one operator-Schmidt product
     MPOs.  Every component has an independent TT frontier, so boundary
-    rounding cannot mix or remove Hamiltonian automaton sectors.
+    rounding cannot mix or remove Hamiltonian automaton sectors.  When
+    ``local_qns`` are supplied, the operator-Schmidt split is performed
+    independently in each Abelian charge-transfer block.  Local transfers
+    then remain exact and only the propagated boundary messages may be
+    rounded.
     """
 
     def __init__(
@@ -1304,6 +1396,7 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
         transfer_atol=0.0,
         absorption="structured",
         optimize="greedy",
+        local_qns=None,
     ):
         self.hamiltonian = hamiltonian
         self.dims = tuple(hamiltonian.dims)
@@ -1318,6 +1411,16 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
             transfer_rtol, transfer_atol
         )
         self.optimize = optimize
+        self.local_qns = _validated_local_qns(self.dims, local_qns)
+        if self.local_qns is not None and (
+            self.transfer_max_rank is not None
+            or self.transfer_rtol != 0.0
+            or self.transfer_atol != 0.0
+        ):
+            raise ValueError(
+                "charge-resolved termwise TT requires exact local transfers; "
+                "truncate only boundary messages with max_rank/rtol/atol."
+            )
         self._groups = []
         self._engines = []
         if hamiltonian.constant != 0.0:
@@ -1345,7 +1448,11 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
             self._groups.append(((0,), True))
         for term in hamiltonian.terms:
             group = []
-            for mpo in _term_product_mpos(self.dims, term):
+            for mpo in _term_product_mpos(
+                self.dims,
+                term,
+                local_qns=self.local_qns,
+            ):
                 engine = TTMPOFrontier(
                     self.dims,
                     self.physical_sites,

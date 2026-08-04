@@ -13,14 +13,16 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+import hashlib
 import time
+import weakref
 
 import numpy as np
 
 from .su2_kernel import (
     SU2LocalAction,
     build_component_parent_blocks as _su2_build_component_parent_blocks,
-    cython_available as _su2_cython_available,
+    cpp_available as _su2_cpp_available,
     project_component_orthonormal_blocks as _su2_project_component_orthonormal_blocks,
     resolve_backend as _resolve_su2_kernel_backend,
 )
@@ -34,12 +36,28 @@ _ORTHONORMAL_BLOCK_BATCH_MIN_ENTRIES = 4
 _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS = 16_000_000
 _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS = 16_000_000
 _SU2_QCHEM_DIRECT_PARENT_BLOCKS = False
+# H8 remains substantially faster with persistent parent blocks.  H10 exceeds
+# this cap (about 427 million complex elements) and stays on the factorized
+# family route instead of transiently allocating several gigabytes.
+_SU2_QCHEM_DIRECT_PARENT_BLOCK_MAX_ELEMENTS = 400_000_000
 _SU2_KERNEL_BACKEND = "auto"
 _SU2_KERNEL_DEBUG_CHECK = False
 _SU2_KERNEL_DEBUG_CHECK_TOL = 1.0e-10
 _UNSET = object()
 _SYMBOLIC_MPO_TRANSITION_CACHE = {}
 _SYMBOLIC_TRANSITION_SUMMARY_CACHE = {}
+
+
+def _stable_array_revision(*arrays):
+    """Return a deterministic 64-bit revision for array topology or values."""
+
+    digest = hashlib.blake2b(digest_size=8)
+    for value in arrays:
+        array = np.ascontiguousarray(value)
+        digest.update(array.dtype.str.encode())
+        digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+        digest.update(array.view(np.uint8).tobytes())
+    return int.from_bytes(digest.digest(), "little", signed=False)
 
 
 def get_su2_kernel_policy():
@@ -53,7 +71,7 @@ def get_su2_kernel_policy():
     return {
         "backend": requested,
         "actual": actual,
-        "cython_available": bool(_su2_cython_available()),
+        "cpp_available": bool(_su2_cpp_available()),
         "debug_check": bool(_SU2_KERNEL_DEBUG_CHECK),
         "debug_check_tol": float(_SU2_KERNEL_DEBUG_CHECK_TOL),
     }
@@ -63,7 +81,7 @@ def configure_su2_kernel_policy(*, backend=None, debug_check=None, debug_check_t
     """
     Configure the SU(2) local-action backend.
 
-    :param backend: ``"auto"``, ``"cython"``, or ``"python"``.
+    :param backend: ``"auto"``, ``"cpp"``, or ``"python"``.
     :returns: Previous policy dictionary, suitable for restoring later.
     """
 
@@ -76,9 +94,11 @@ def configure_su2_kernel_policy(*, backend=None, debug_check=None, debug_check_t
         normalized = str(backend).lower().replace("-", "_")
         if normalized == "default":
             normalized = "auto"
-        if normalized not in {"auto", "cython", "python"}:
-            raise ValueError("su2_kernel_backend must be 'auto', 'cython', or 'python'.")
         if normalized == "cython":
+            normalized = "cpp"
+        if normalized not in {"auto", "cpp", "python"}:
+            raise ValueError("su2_kernel_backend must be 'auto', 'cpp', or 'python'.")
+        if normalized == "cpp":
             _resolve_su2_kernel_backend(normalized)
         _SU2_KERNEL_BACKEND = normalized
     if debug_check is not None:
@@ -105,6 +125,9 @@ def get_direct_factorized_orthonormal_kernel_policy():
             _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS
         ),
         "su2_qchem_direct_parent_blocks": bool(_SU2_QCHEM_DIRECT_PARENT_BLOCKS),
+        "su2_qchem_direct_parent_block_max_elements": int(
+            _SU2_QCHEM_DIRECT_PARENT_BLOCK_MAX_ELEMENTS
+        ),
     }
 
 
@@ -113,6 +136,7 @@ def configure_direct_factorized_orthonormal_kernel_policy(
     orthonormal_block_max_elements=None,
     orthonormal_dense_max_elements=None,
     su2_qchem_direct_parent_blocks=None,
+    su2_qchem_direct_parent_block_max_elements=None,
 ):
     """
     Configure direct-factorized orthonormal local-kernel materialization.
@@ -127,6 +151,7 @@ def configure_direct_factorized_orthonormal_kernel_policy(
     global _DIRECT_FACTORIZED_ORTHONORMAL_BLOCK_MAX_ELEMENTS
     global _DIRECT_FACTORIZED_ORTHONORMAL_DENSE_MAX_ELEMENTS
     global _SU2_QCHEM_DIRECT_PARENT_BLOCKS
+    global _SU2_QCHEM_DIRECT_PARENT_BLOCK_MAX_ELEMENTS
 
     previous = get_direct_factorized_orthonormal_kernel_policy()
     if orthonormal_block_max_elements is not None:
@@ -139,6 +164,11 @@ def configure_direct_factorized_orthonormal_kernel_policy(
         )
     if su2_qchem_direct_parent_blocks is not None:
         _SU2_QCHEM_DIRECT_PARENT_BLOCKS = bool(su2_qchem_direct_parent_blocks)
+    if su2_qchem_direct_parent_block_max_elements is not None:
+        _SU2_QCHEM_DIRECT_PARENT_BLOCK_MAX_ELEMENTS = max(
+            0,
+            int(su2_qchem_direct_parent_block_max_elements),
+        )
     return previous
 
 
@@ -698,6 +728,11 @@ class SymbolicRenormalizedOperatorTable:
         """
 
         try:
+            ensure_packed = getattr(block_map, "ensure_packed", None)
+            if ensure_packed is not None:
+                packed = ensure_packed(side=side, bond=bond)
+                if packed is not None:
+                    return packed
             from .su2_qchem_plan import pack_rank_coupled_boundary_table_from_block_map
 
             return pack_rank_coupled_boundary_table_from_block_map(
@@ -2143,7 +2178,7 @@ class ComplementaryNativeExactPatternComponentTable:
 
 
 @dataclass(frozen=True)
-class FamilyNativeFactorKernel:
+class FamilyCppFactorKernel:
     """
     Family-owned factorized local contraction kernel.
 
@@ -2247,7 +2282,7 @@ class FamilyNativeFactorKernel:
         if bool(self.matmul_two_step):
             kin, bin_, cin, rin = (int(dim) for dim in block_in.shape)
             if self.left_matrix is None or self.right_matrix is None:
-                raise RuntimeError("FamilyNativeFactorKernel is missing BLAS matrices.")
+                raise RuntimeError("FamilyCppFactorKernel is missing BLAS matrices.")
             input_matrix = block_in.reshape(kin * bin_, cin * rin)
             tmp = (self.left_matrix @ input_matrix).reshape(tuple(self.tmp_shape))
             ldim, adim, ddim, qdim = (int(dim) for dim in self.output_shape)
@@ -2275,6 +2310,39 @@ class FamilyNativeFactorKernel:
         )
         return np.asarray(contrib).reshape(int(self.output_size))
 
+    def apply_blocks(self, block_inputs):
+        """Apply this factor kernel to a trailing block-vector dimension."""
+
+        block_inputs = np.asarray(block_inputs)
+        if block_inputs.ndim != 5:
+            raise ValueError("Factor-kernel block input must have rank five.")
+        nvec = int(block_inputs.shape[-1])
+        if nvec == 1:
+            return self.apply_block(block_inputs[..., 0]).reshape(-1, 1)
+        if not bool(self.matmul_two_step):
+            return np.column_stack(
+                [self.apply_block(block_inputs[..., idx]) for idx in range(nvec)]
+            )
+        kin, bin_, cin, rin, _ = (int(dim) for dim in block_inputs.shape)
+        if self.left_matrix is None or self.right_matrix is None:
+            raise RuntimeError("FamilyCppFactorKernel is missing BLAS matrices.")
+        input_matrix = block_inputs.reshape(kin * bin_, cin * rin * nvec)
+        tmp = (self.left_matrix @ input_matrix).reshape(
+            tuple(self.tmp_shape) + (nvec,)
+        )
+        ldim, adim, ddim, qdim = (int(dim) for dim in self.output_shape)
+        tmp_matrices = np.ascontiguousarray(
+            tmp.transpose(6, 1, 3, 0, 2, 5, 4).reshape(
+                nvec,
+                ldim * adim,
+                -1,
+            )
+        )
+        contrib = np.matmul(tmp_matrices, self.right_matrix)
+        return np.ascontiguousarray(
+            contrib.transpose(1, 2, 0).reshape(int(self.output_size), nvec)
+        )
+
 
 @dataclass(frozen=True)
 class ComplementaryFamilyApplyEntry:
@@ -2294,7 +2362,7 @@ class ComplementaryFamilyApplyEntry:
     family_names: tuple
     source_tables: tuple = ()
     backend: str = "compiled_factorized_term"
-    factor_kernel: FamilyNativeFactorKernel | None = None
+    factor_kernel: FamilyCppFactorKernel | None = None
     native_kernel: np.ndarray | None = None
 
     @classmethod
@@ -2336,7 +2404,7 @@ class ComplementaryFamilyApplyEntry:
             family_names=self.family_names,
             source_tables=self.source_tables,
             backend="family_table_factor_kernel",
-            factor_kernel=FamilyNativeFactorKernel.from_compiled_term(
+            factor_kernel=FamilyCppFactorKernel.from_compiled_term(
                 self.compiled_term
             ),
             native_kernel=self.native_kernel,
@@ -2404,6 +2472,19 @@ class ComplementaryFamilyApplyEntry:
             return self.factor_kernel.apply_block(block_in)
         return self.compiled_term.apply_block(block_in)
 
+    def apply_blocks(self, block_inputs):
+        """Apply the current backend to a trailing block-vector dimension."""
+
+        block_inputs = np.asarray(block_inputs)
+        nvec = int(block_inputs.shape[-1])
+        if self.native_kernel is not None:
+            return self.native_kernel @ block_inputs.reshape(-1, nvec)
+        if self.factor_kernel is not None:
+            return self.factor_kernel.apply_blocks(block_inputs)
+        return np.column_stack(
+            [self.compiled_term.apply_block(block_inputs[..., idx]) for idx in range(nvec)]
+        )
+
     @property
     def stats(self):
         """Return compact diagnostics for this local application entry."""
@@ -2424,7 +2505,12 @@ class ComplementaryFamilyApplyEntry:
 def _active_boundary_channels(block):
     channels = set()
     for value in block.values():
-        if isinstance(value, (tuple, list)):
+        if hasattr(value, "items"):
+            for index, item in value.items():
+                arr = np.asarray(item)
+                if arr.size and np.any(arr != 0):
+                    channels.add(int(index))
+        elif isinstance(value, (tuple, list)):
             for index, item in enumerate(value):
                 arr = np.asarray(item)
                 if arr.size and np.any(arr != 0):
@@ -2444,7 +2530,12 @@ def _active_boundary_channels(block):
 def _nonzero_rank_coupled_blocks_for_channels(blocks, active_channels, *, tol=0.0):
     out = []
     active_channels = set(int(channel) for channel in active_channels)
-    for idx, block in enumerate(blocks):
+    block_items = (
+        blocks.items()
+        if hasattr(blocks, "items")
+        else enumerate(tuple(blocks or ()))
+    )
+    for idx, block in block_items:
         if idx not in active_channels:
             continue
         arr = np.asarray(block)
@@ -2460,7 +2551,7 @@ def _symbolic_numeric_payloads_from_block_map(block_map, active_channels):
     active_channels = set(int(channel) for channel in active_channels)
     rank_coupled = bool(getattr(block_map, "rank_coupled", False))
     for (q_out, q_in), value in block_map.items():
-        if isinstance(value, (tuple, list)):
+        if hasattr(value, "items") or isinstance(value, (tuple, list)):
             rank_coupled = True
             for channel, block in _nonzero_rank_coupled_blocks_for_channels(
                 value,
@@ -2473,6 +2564,11 @@ def _symbolic_numeric_payloads_from_block_map(block_map, active_channels):
 
 
 def _active_virtual_pairs_from_block(block):
+    if hasattr(block, "iter_routes"):
+        return tuple(
+            (int(left), int(right))
+            for left, right, _payload in block.iter_routes()
+        )
     arr = np.asarray(block)
     if arr.ndim < 2:
         return ()
@@ -2741,6 +2837,12 @@ class RenormalizedOperatorStack:
         self.entries[key] = value
         self.prune()
         return value
+
+    def prepare_miss(self, key):
+        """Release the sole stale numeric problem before building its replacement."""
+
+        if int(self.max_size) == 1 and key not in self.entries:
+            self.entries.clear()
 
     def prune(self):
         """Prune least-recently-used entries beyond ``max_size``."""
@@ -3191,7 +3293,7 @@ class RenormalizedLocalOperatorTable:
 
         for compiled in (self.compiled_transitions, self.compiled_factorized_terms):
             if compiled is not None:
-                setattr(compiled, "local_operator_table", self)
+                setattr(compiled, "local_operator_table", weakref.proxy(self))
         return self
 
     def mark_hit(self):
@@ -3300,7 +3402,16 @@ class RenormalizedBlockEntry:
 
         object.__setattr__(self, "symbolic_operator_table", table)
         complementary_entry = getattr(self, "complementary_operator_entry", None)
-        if complementary_entry is not None:
+        if (
+            complementary_entry is not None
+            and bool(
+                getattr(
+                    complementary_entry,
+                    "materialize_family_operator_table",
+                    True,
+                )
+            )
+        ):
             object.__setattr__(
                 complementary_entry,
                 "family_operator_table",
@@ -3543,17 +3654,19 @@ class ComplementaryFamilyBoundaryPayload:
     contractions can consume without rewalking the chemistry integral tensor.
 
     :param family_name: Complementary family label.
-    :param entries: Tuple of ``(index_tuple, coefficient)`` entries.
+    :param entries: Shared read-only mapping of index tuples to coefficients.
     :param internal_terms: Number of entries fully inside the boundary block.
     :param cross_terms: Number of entries connecting the block and exterior.
     :param external_terms: Number of entries fully outside the boundary block.
     """
 
     family_name: str
-    entries: tuple
+    entries: object
     internal_terms: int
     cross_terms: int
     external_terms: int
+    coefficient_norm_value: float | None = None
+    max_abs_coefficient_value: float | None = None
 
     @property
     def n_terms(self):
@@ -3565,10 +3678,12 @@ class ComplementaryFamilyBoundaryPayload:
     def coefficient_norm(self):
         """Return the Euclidean norm of stored numeric coefficients."""
 
+        if self.coefficient_norm_value is not None:
+            return float(self.coefficient_norm_value)
         if not self.entries:
             return 0.0
         values = np.asarray(
-            [complex(value) for _key, value in self.entries],
+            [complex(value) for _key, value in self.entries.items()],
             dtype=complex,
         )
         return float(np.linalg.norm(values))
@@ -3577,8 +3692,16 @@ class ComplementaryFamilyBoundaryPayload:
     def max_abs_coefficient(self):
         """Return the largest absolute coefficient in this payload."""
 
+        if self.max_abs_coefficient_value is not None:
+            return float(self.max_abs_coefficient_value)
         return float(
-            max((abs(complex(value)) for _key, value in self.entries), default=0.0)
+            max(
+                (
+                    abs(complex(value))
+                    for _key, value in self.entries.items()
+                ),
+                default=0.0,
+            )
         )
 
     @property
@@ -3622,6 +3745,7 @@ class ComplementaryRenormalizedOperatorEntry:
     signature: object | None = None
     family_payloads: dict = field(default_factory=dict)
     family_operator_table: ComplementaryFamilyRenormalizedOperatorTable | None = None
+    materialize_family_operator_table: bool = True
 
     @property
     def key(self):
@@ -3676,9 +3800,25 @@ class ComplementaryRenormalizedOperatorStack:
     """
 
     families: object
+    materialize_family_operator_tables: bool = True
     entries: dict = field(default_factory=dict)
     puts: int = 0
     advances: int = 0
+    _family_payload_sources: dict = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    _family_payload_norms: dict = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
+    _family_payload_max_abs: dict = field(
+        default_factory=dict,
+        compare=False,
+        repr=False,
+    )
 
     @property
     def n_sites(self):
@@ -3720,42 +3860,82 @@ class ComplementaryRenormalizedOperatorStack:
     def _family_payloads_for_boundary(self, side, bond):
         """Build numeric sparse family payloads for one boundary."""
 
-        owned_sites = self._owned_sites(side, bond)
+        side = str(side).lower()
+        bond = int(bond)
         payloads = {}
         families = getattr(self.families, "families", {}) or {}
         for name in self.family_names:
             family = families.get(name)
             entries = getattr(family, "entries", {}) if family is not None else {}
-            ordered_entries = tuple(
-                (
-                    tuple(int(index) for index in key),
-                    complex(value),
+            if name not in self._family_payload_sources:
+                self._family_payload_sources[name] = entries
+                values = np.asarray(
+                    [complex(value) for _key, value in entries.items()],
+                    dtype=complex,
                 )
-                for key, value in sorted(
-                    entries.items(),
-                    key=lambda item: tuple(int(index) for index in item[0]),
+                self._family_payload_norms[name] = float(np.linalg.norm(values))
+                self._family_payload_max_abs[name] = float(
+                    np.max(np.abs(values)) if values.size else 0.0
                 )
+            entries = self._family_payload_sources[name]
+            partition_counts = getattr(entries, "partition_counts", None)
+            native_counts = (
+                None
+                if partition_counts is None
+                else partition_counts(side, bond)
             )
-            internal_terms = 0
-            cross_terms = 0
-            external_terms = 0
-            for key, _value in ordered_entries:
-                if not key:
-                    external_terms += 1
-                    continue
-                flags = tuple(int(index) in owned_sites for index in key)
-                if all(flags):
-                    internal_terms += 1
-                elif any(flags):
-                    cross_terms += 1
+            native_indices = getattr(entries, "indices", None)
+            if native_counts is not None:
+                internal_terms, cross_terms, external_terms = (
+                    int(value) for value in native_counts
+                )
+            elif native_indices is not None:
+                native_indices = np.asarray(native_indices)
+                if native_indices.size:
+                    minimum = np.min(native_indices, axis=1)
+                    maximum = np.max(native_indices, axis=1)
+                    if side == "left":
+                        internal_terms = int(np.count_nonzero(maximum < bond))
+                        external_terms = int(np.count_nonzero(minimum >= bond))
+                    elif side == "right":
+                        internal_terms = int(np.count_nonzero(minimum > bond))
+                        external_terms = int(np.count_nonzero(maximum <= bond))
+                    else:
+                        raise ValueError(
+                            f"Unknown complementary boundary side {side!r}."
+                        )
+                    cross_terms = int(
+                        len(entries) - internal_terms - external_terms
+                    )
                 else:
-                    external_terms += 1
+                    internal_terms = 0
+                    cross_terms = 0
+                    external_terms = int(len(entries))
+            else:
+                owned_sites = self._owned_sites(side, bond)
+                internal_terms = 0
+                cross_terms = 0
+                external_terms = 0
+                for key in entries:
+                    key = tuple(int(index) for index in key)
+                    if not key:
+                        external_terms += 1
+                        continue
+                    flags = tuple(index in owned_sites for index in key)
+                    if all(flags):
+                        internal_terms += 1
+                    elif any(flags):
+                        cross_terms += 1
+                    else:
+                        external_terms += 1
             payloads[str(name)] = ComplementaryFamilyBoundaryPayload(
                 family_name=str(name),
-                entries=ordered_entries,
+                entries=entries,
                 internal_terms=int(internal_terms),
                 cross_terms=int(cross_terms),
                 external_terms=int(external_terms),
+                coefficient_norm_value=self._family_payload_norms[name],
+                max_abs_coefficient_value=self._family_payload_max_abs[name],
             )
         return payloads
 
@@ -3779,6 +3959,9 @@ class ComplementaryRenormalizedOperatorStack:
             source=str(source),
             signature=signature,
             family_payloads=self._family_payloads_for_boundary(side, bond),
+            materialize_family_operator_table=bool(
+                self.materialize_family_operator_tables
+            ),
         )
         self.entries[entry.key] = entry
         self.puts += 1
@@ -3804,6 +3987,13 @@ class ComplementaryRenormalizedOperatorStack:
             if hasattr(self.families, "as_metadata")
             else {"enabled": True, "type": type(self.families).__name__}
         )
+        native_storage_bytes = int(
+            sum(
+                int(getattr(getattr(entries, "indices", None), "nbytes", 0))
+                + int(getattr(getattr(entries, "values", None), "nbytes", 0))
+                for entries in self._family_payload_sources.values()
+            )
+        )
         return {
             "enabled": True,
             "family_names": self.family_names,
@@ -3817,6 +4007,16 @@ class ComplementaryRenormalizedOperatorStack:
                     for payload in entry.family_payloads.values()
                 )
             ),
+            "unique_numeric_payload_terms": int(
+                sum(
+                    len(entries)
+                    for entries in self._family_payload_sources.values()
+                )
+            ),
+            "shared_numeric_payload_sources": int(
+                len(self._family_payload_sources)
+            ),
+            "native_numeric_payload_storage_bytes": native_storage_bytes,
             "numeric_payload_cross_terms": int(
                 sum(
                     payload.cross_terms
@@ -3904,10 +4104,25 @@ class RenormalizedBlockStack:
     misses: int = 0
     puts: int = 0
     complementary_operator_families: object | None = None
+    materialize_complementary_family_operator_tables: bool = True
     complementary_operator_stack: ComplementaryRenormalizedOperatorStack | None = None
     moving_environment_cache: MovingEnvironmentContractionCache = field(
         default_factory=MovingEnvironmentContractionCache
     )
+    su2_operator_engine: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    su2_moving_environment: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    cpp_boundary_syncs: int = 0
+    cpp_boundary_sync_failures: int = 0
+    released_consumed_numeric_tables: int = 0
+    released_consumed_boundaries: int = 0
 
     def __post_init__(self):
         if (
@@ -3915,7 +4130,20 @@ class RenormalizedBlockStack:
             and self.complementary_operator_stack is None
         ):
             self.complementary_operator_stack = ComplementaryRenormalizedOperatorStack(
-                families=self.complementary_operator_families
+                families=self.complementary_operator_families,
+                materialize_family_operator_tables=bool(
+                    self.materialize_complementary_family_operator_tables
+                ),
+            )
+        if (
+            self.complementary_operator_families is not None
+            and self.su2_operator_engine is None
+        ):
+            from .su2_qchem_plan import SU2OperatorEngine
+
+            self.su2_operator_engine = SU2OperatorEngine(
+                max_factor_tables=2,
+                max_plans=1,
             )
 
     def set_complementary_operator_families(self, families):
@@ -3930,6 +4158,7 @@ class RenormalizedBlockStack:
         if families is None:
             self.complementary_operator_families = None
             self.complementary_operator_stack = None
+            self.su2_operator_engine = None
             return self
         if (
             self.complementary_operator_stack is not None
@@ -3938,8 +4167,18 @@ class RenormalizedBlockStack:
             return self
         self.complementary_operator_families = families
         self.complementary_operator_stack = ComplementaryRenormalizedOperatorStack(
-            families=families
+            families=families,
+            materialize_family_operator_tables=bool(
+                self.materialize_complementary_family_operator_tables
+            ),
         )
+        if self.su2_operator_engine is None:
+            from .su2_qchem_plan import SU2OperatorEngine
+
+            self.su2_operator_engine = SU2OperatorEngine(
+                max_factor_tables=2,
+                max_plans=1,
+            )
         return self
 
     @property
@@ -4035,16 +4274,105 @@ class RenormalizedBlockStack:
         """
 
         entry = self.put(side, bond, block, signature=signature, source="initialized")
-        entry.put_symbolic_operator_table(
-            SymbolicRenormalizedOperatorTable.initialize(
+        if str(self.namespace) != "norm":
+            entry.put_symbolic_operator_table(
+                SymbolicRenormalizedOperatorTable.initialize(
+                    entry.side,
+                    entry.bond,
+                    entry.block,
+                    source=entry.source,
+                )
+            )
+        self.prepopulate_side_operator_tables(entry, side_table_builders)
+        self._sync_cpp_boundary(entry)
+        return entry
+
+    def _sync_cpp_boundary(self, entry):
+        """Copy one reduced boundary arena into the persistent C++ owner."""
+
+        owner = self.su2_moving_environment
+        namespace = str(self.namespace)
+        if (
+            owner is None
+            or namespace not in {"hamiltonian", "norm"}
+            or entry is None
+            or not bool(getattr(entry.block, "rank_coupled", False))
+        ):
+            return False
+        try:
+            ensure_packed = getattr(entry.block, "ensure_packed", None)
+            packed = (
+                ensure_packed(side=entry.side, bond=entry.bond)
+                if ensure_packed is not None
+                else None
+            )
+            if packed is None:
+                from .su2_qchem_plan import (
+                    pack_rank_coupled_boundary_table_from_block_map,
+                )
+
+                packed = pack_rank_coupled_boundary_table_from_block_map(
+                    entry.block,
+                    side=entry.side,
+                    bond=entry.bond,
+                    representation="rank_coupled_by_ket",
+                )
+            if packed is None or np.iscomplexobj(packed.block_pool.data):
+                return False
+            topology_arrays = (
+                np.asarray(packed.ket_sector_ids, dtype=np.int64),
+                np.asarray(packed.entry_offsets, dtype=np.int64),
+                np.asarray(packed.out_sector_ids, dtype=np.int64),
+                np.asarray(packed.channel_offsets, dtype=np.int64),
+                np.asarray(packed.channel_ids, dtype=np.int64),
+                np.asarray(packed.block_pool.shape_offsets, dtype=np.int64),
+                np.asarray(packed.block_pool.shapes, dtype=np.int64),
+            )
+            header = np.asarray(
+                [array.size for array in topology_arrays],
+                dtype=np.int64,
+            )
+            labels = np.concatenate((header, *topology_arrays))
+            digest = hashlib.blake2b(labels.tobytes(), digest_size=8).digest()
+            topology_revision = int.from_bytes(digest, "little") or 1
+            installed = (
+                owner.metric_boundary_installed
+                if namespace == "norm"
+                else owner.boundary_installed
+            )
+            install = (
+                owner.install_metric_boundary
+                if namespace == "norm"
+                else owner.install_boundary
+            )
+            if (
+                bool(getattr(entry.block, "cpp_owned_boundary", False))
+                and int(
+                    getattr(entry.block, "cpp_topology_revision", 0)
+                ) == int(topology_revision)
+                and installed(
+                    entry.side,
+                    entry.bond,
+                    int(topology_revision),
+                    int(getattr(entry.block, "cpp_numeric_revision", 0)),
+                )
+            ):
+                self.cpp_boundary_syncs += 1
+                return True
+            install(
                 entry.side,
                 entry.bond,
-                entry.block,
-                source=entry.source,
+                np.asarray(packed.block_pool.data, dtype=float),
+                np.asarray(packed.block_pool.offsets, dtype=np.int64),
+                labels,
+                topology_revision,
+                int(self.puts),
             )
-        )
-        self.prepopulate_side_operator_tables(entry, side_table_builders)
-        return entry
+            self.cpp_boundary_syncs += 1
+            return True
+        except Exception:
+            self.cpp_boundary_sync_failures += 1
+            return False
 
     def prepopulate_side_operator_tables(
         self,
@@ -4127,6 +4455,20 @@ class RenormalizedBlockStack:
                     pack_rank_coupled_boundary_table_from_payloads,
                 )
 
+                # A C++ boundary advance already produced the canonical packed
+                # arena.  Repacking its symbolic payloads below promotes the
+                # otherwise-real arena to complex128 and breaks raw compiled
+                # factor routes on every interior bond.  Keep the boundary
+                # owner's arena as the single numerical source of truth.
+                packed_table = getattr(entry.block, "packed_table", None)
+                if (
+                    packed_table is not None
+                    and str(getattr(packed_table, "side", "")) == str(entry.side)
+                    and int(getattr(packed_table, "bond", -1)) == int(entry.bond)
+                    and str(getattr(packed_table, "representation", ""))
+                    == str(representation)
+                ):
+                    return None, symbolic_table is not None, packed_table
                 if symbolic_table is not None and getattr(
                     symbolic_table,
                     "numeric_payloads",
@@ -4203,7 +4545,20 @@ class RenormalizedBlockStack:
             "side_table_prepopulate": 0.0,
         }
         t0 = time.perf_counter()
-        block = entry.block.advance(W, site, site, phys_slices=phys_slices)
+        block = entry.block.advance(
+            W,
+            site,
+            site,
+            phys_slices=phys_slices,
+            moving_environment=(
+                self.su2_moving_environment
+                if str(self.namespace) in {"hamiltonian", "norm"}
+                else None
+            ),
+            parent_bond=entry.bond,
+            child_bond=bond,
+            numeric_revision=int(self.puts + 1),
+        )
         timing["block_contract"] = time.perf_counter() - t0
         if signature is None and signature_fn is not None:
             t0 = time.perf_counter()
@@ -4237,6 +4592,7 @@ class RenormalizedBlockStack:
             parent_entry=entry,
             advance_direction="left",
         )
+        self._sync_cpp_boundary(advanced)
         timing["side_table_prepopulate"] = time.perf_counter() - t0
         advanced.advance_timing.update(timing)
         return advanced
@@ -4279,7 +4635,20 @@ class RenormalizedBlockStack:
             "side_table_prepopulate": 0.0,
         }
         t0 = time.perf_counter()
-        block = entry.block.advance(W, site, site, phys_slices=phys_slices)
+        block = entry.block.advance(
+            W,
+            site,
+            site,
+            phys_slices=phys_slices,
+            moving_environment=(
+                self.su2_moving_environment
+                if str(self.namespace) in {"hamiltonian", "norm"}
+                else None
+            ),
+            parent_bond=entry.bond,
+            child_bond=bond,
+            numeric_revision=int(self.puts + 1),
+        )
         timing["block_contract"] = time.perf_counter() - t0
         if signature is None and signature_fn is not None:
             t0 = time.perf_counter()
@@ -4313,6 +4682,7 @@ class RenormalizedBlockStack:
             parent_entry=entry,
             advance_direction="right",
         )
+        self._sync_cpp_boundary(advanced)
         timing["side_table_prepopulate"] = time.perf_counter() - t0
         advanced.advance_timing.update(timing)
         return advanced
@@ -4348,6 +4718,64 @@ class RenormalizedBlockStack:
             return default
         return entry.block
 
+    def release_consumed_numeric_tables(self, side, bond):
+        """Release bond-local plans after a boundary is consumed."""
+
+        entry = self.entries.get(self.key(side, bond))
+        if entry is None:
+            return 0
+        released = int(len(entry.local_operator_tables))
+        entry.local_operator_tables.clear()
+        for table in tuple(entry.side_operator_tables.values()):
+            released += int(len(table.qchem_sweep_plan_cache))
+            table.qchem_sweep_plan_cache.clear()
+        self.released_consumed_numeric_tables += int(released)
+        return int(released)
+
+    def release_consumed_boundary(self, side, bond):
+        """Drop an obsolete prebuilt boundary after its bond was advanced."""
+
+        if self.su2_moving_environment is None:
+            return False
+        normalized_side = str(side).lower()
+        normalized_bond = int(bond)
+        system_stats = getattr(
+            self.su2_moving_environment,
+            "system_stats",
+            {},
+        )
+        n_sites = int(system_stats.get("n_sites", 0))
+        if (
+            (normalized_side == "left" and normalized_bond == 0)
+            or (
+                normalized_side == "right"
+                and normalized_bond == n_sites - 1
+            )
+        ):
+            # These two scalar edge boundaries seed the opposite half sweep.
+            # Their NumPy arenas are borrowed by the persistent C++ owner, so
+            # retain the stack entries that keep those buffers alive.
+            return False
+        key = self.key(normalized_side, normalized_bond)
+        entry = self.entries.pop(key, None)
+        if entry is None:
+            return False
+        if self.complementary_operator_stack is not None:
+            self.complementary_operator_stack.entries.pop(
+                (normalized_side, int(bond)),
+                None,
+            )
+        if str(self.namespace) != "norm":
+            release = getattr(
+                self.su2_moving_environment,
+                "release_boundary",
+                None,
+            )
+            if release is not None:
+                release(normalized_side, normalized_bond)
+        self.released_consumed_boundaries += 1
+        return True
+
     def __len__(self):
         """Return the number of persisted boundary entries."""
 
@@ -4382,6 +4810,12 @@ class RenormalizedBlockStack:
             "hits": int(self.hits),
             "misses": int(self.misses),
             "puts": int(self.puts),
+            "released_consumed_numeric_tables": int(
+                self.released_consumed_numeric_tables
+            ),
+            "released_consumed_boundaries": int(
+                self.released_consumed_boundaries
+            ),
             "initialized_entries": int(
                 sum(entry.source == "initialized" for entry in self.entries.values())
             ),
@@ -4510,6 +4944,20 @@ class RenormalizedBlockStack:
                 else self.complementary_operator_stack.stats
             ),
             "moving_environment_cache": self.moving_environment_cache.stats,
+            "su2_operator_engine": (
+                None
+                if self.su2_operator_engine is None
+                else self.su2_operator_engine.stats
+            ),
+            "su2_moving_environment": (
+                None
+                if self.su2_moving_environment is None
+                else self.su2_moving_environment.stats
+            ),
+            "cpp_boundary_syncs": int(self.cpp_boundary_syncs),
+            "cpp_boundary_sync_failures": int(
+                self.cpp_boundary_sync_failures
+            ),
         }
 
 
@@ -4644,6 +5092,25 @@ class CompiledOrthonormalBlockTable:
         out = np.zeros_like(vector, dtype=complex)
         for term in self.terms:
             term.apply(vector, out)
+        return out
+
+    def matmat(self, vectors):
+        """Apply the compiled table to a block of Davidson vectors."""
+
+        vectors = np.asarray(vectors, dtype=complex)
+        if vectors.ndim != 2 or int(vectors.shape[0]) != self.dim:
+            raise ValueError(
+                f"Expected a ({self.dim}, nvec) block, got {vectors.shape}."
+            )
+        if int(vectors.shape[1]) == 1:
+            return self.matvec(vectors[:, 0]).reshape(self.dim, 1)
+        if self.dense_matrix is not None:
+            return self.dense_matrix @ vectors
+        out = np.zeros_like(vectors, dtype=complex)
+        for term in self.terms:
+            out[term.output_slice, :] += (
+                term.kernel @ vectors[term.input_slice, :]
+            )
         return out
 
     def dense_operator_matrix(self):
@@ -5083,6 +5550,128 @@ def _component_block_residual(blocks, reference_blocks):
 
 
 @dataclass(frozen=True)
+class MovingEnvironmentFactorRouteTable:
+    """Thin Python handle for a projected route owned entirely by C++."""
+
+    owner: object
+    projection_key: str
+    dim: int
+    active_complementary: bool = False
+
+    def matvec(self, vector):
+        return self.owner.factor_route_projected_matvec(
+            self.projection_key,
+            np.asarray(vector),
+        )
+
+    def matmat(self, vectors):
+        vectors = np.asarray(vectors, dtype=complex)
+        return np.column_stack(
+            [self.matvec(vectors[:, index]) for index in range(vectors.shape[1])]
+        )
+
+    def diagonal(self):
+        return None
+
+    def davidson(
+        self,
+        diagonal,
+        guess,
+        tolerance,
+        max_iterations,
+        restart_dimension,
+        accept_unconverged=False,
+    ):
+        if self.active_complementary and hasattr(
+            self.owner,
+            "active_bond_complementary_davidson",
+        ) and hasattr(
+            self.owner,
+            "active_bond_complementary_action_ready",
+        ) and self.owner.active_bond_complementary_action_ready(
+            self.projection_key,
+            int(self.dim),
+        ):
+            return self.owner.active_bond_complementary_davidson(
+                self.projection_key,
+                guess,
+                float(tolerance),
+                int(max_iterations),
+                int(restart_dimension),
+                bool(accept_unconverged),
+            )
+        return self.owner.factor_route_projected_davidson(
+            self.projection_key,
+            diagonal,
+            guess,
+            float(tolerance),
+            int(max_iterations),
+            int(restart_dimension),
+            bool(accept_unconverged),
+        )
+
+    @property
+    def stats(self):
+        owner_stats = self.owner.stats
+        projected_matvec_calls = int(
+            owner_stats.get("factor_route_projected_matvec_calls", 0)
+        )
+        projected_davidson_calls = int(
+            owner_stats.get("factor_route_projected_davidson_calls", 0)
+        )
+        return {
+            "kind": "cpp_su2_moving_environment_factor_routes",
+            "projection_key": str(self.projection_key),
+            "dimension": int(self.dim),
+            "raw_factor_routes": bool(owner_stats.get("raw_factor_routes", False)),
+            "factor_route_count": int(owner_stats.get("factor_route_count", 0)),
+            "raw_factor_cache_bytes": int(
+                owner_stats.get("raw_factor_cache_bytes", 0)
+            ),
+            "raw_factor_gemm_calls": int(
+                owner_stats.get("raw_factor_gemm_calls", 0)
+            ),
+            "raw_route_group_count": int(
+                owner_stats.get("raw_route_group_count", 0)
+            ),
+            "fused_raw_route_group_count": int(
+                owner_stats.get("fused_raw_route_group_count", 0)
+            ),
+            "fused_raw_route_count": int(
+                owner_stats.get("fused_raw_route_count", 0)
+            ),
+            "dense_pair_kernel_count": int(
+                owner_stats.get("dense_pair_kernel_count", 0)
+            ),
+            "dense_pair_execution_count": int(
+                owner_stats.get("dense_pair_execution_count", 0)
+            ),
+            "dense_pair_kernel_elements": int(
+                owner_stats.get("dense_pair_kernel_elements", 0)
+            ),
+            "dense_pair_route_count": int(
+                owner_stats.get("dense_pair_route_count", 0)
+            ),
+            "raw_execution_group_count": int(
+                owner_stats.get("raw_execution_group_count", 0)
+            ),
+            "raw_execution_action_count": int(
+                owner_stats.get("raw_execution_action_count", 0)
+            ),
+            "raw_input_superchannel_count": int(
+                owner_stats.get("raw_input_superchannel_count", 0)
+            ),
+            "raw_input_superchannel_tile_count": int(
+                owner_stats.get("raw_input_superchannel_tile_count", 0)
+            ),
+            "matvec_calls": projected_matvec_calls,
+            "davidson_calls": projected_davidson_calls,
+            "factor_route_projected_matvec_calls": projected_matvec_calls,
+            "factor_route_projected_davidson_calls": projected_davidson_calls,
+        }
+
+
+@dataclass(frozen=True)
 class DirectOrthonormalFactorizedTable:
     """
     Matrix-free transformed Hamiltonian table for factorized local operators.
@@ -5106,21 +5695,88 @@ class DirectOrthonormalFactorizedTable:
     source: str = "direct_factorized"
     compiled_factorized_terms: object | None = None
     components: tuple | None = None
+    su2_moving_environment: object | None = None
+    local_operator_key: object | None = None
 
     def __post_init__(self):
+        compiled_owner = getattr(
+            self.compiled_factorized_terms,
+            "su2_moving_environment",
+            None,
+        )
+        if self.su2_moving_environment is None and compiled_owner is not None:
+            object.__setattr__(
+                self,
+                "su2_moving_environment",
+                compiled_owner,
+            )
         timing = {}
         t0 = time.perf_counter()
+        estimated_parent_block_elements = (
+            self._estimate_qchem_component_parent_block_elements()
+            if _SU2_QCHEM_DIRECT_PARENT_BLOCKS
+            else None
+        )
+        oversized_parent_blocks = bool(
+            estimated_parent_block_elements is not None
+            and int(estimated_parent_block_elements)
+            > int(_SU2_QCHEM_DIRECT_PARENT_BLOCK_MAX_ELEMENTS)
+        )
+        force_family_tensor = bool(
+            self.uses_complementary_payload_tensor_kernel
+        )
+        force_component_direct = bool(
+            getattr(
+                self.compiled_factorized_terms,
+                "explicit_direct_orthonormal_projection",
+                False,
+            )
+        )
+        packed_oversized_family_route = bool(
+            not force_family_tensor
+            and
+            not force_component_direct
+            and
+            _resolve_su2_kernel_backend(_SU2_KERNEL_BACKEND) == "cpp"
+            and getattr(
+                self.compiled_factorized_terms,
+                "qchem_packed_entry_kernel_provider",
+                False,
+            )
+        )
         qchem_parent_blocks = (
             self._build_qchem_component_parent_blocks()
-            if _SU2_QCHEM_DIRECT_PARENT_BLOCKS
+            if (
+                _SU2_QCHEM_DIRECT_PARENT_BLOCKS
+                and not oversized_parent_blocks
+                and not force_family_tensor
+                and not force_component_direct
+                and not packed_oversized_family_route
+            )
             else None
         )
         timing["direct_table_qchem_parent_blocks"] = time.perf_counter() - t0
         t0 = time.perf_counter()
+        factorized_fallback_terms = None
+        if (
+            oversized_parent_blocks or force_component_direct
+        ) and not packed_oversized_family_route:
+            factorized_provider = getattr(
+                self.compiled_factorized_terms,
+                "factorized_terms",
+                None,
+            )
+            if factorized_provider is not None:
+                factorized_fallback_terms = factorized_provider()
         component_direct_plan = (
             None
-            if qchem_parent_blocks is not None
-            else self._build_component_direct_plan()
+            if (
+                qchem_parent_blocks is not None
+                or packed_oversized_family_route
+            )
+            else self._build_component_direct_plan(
+                compiled=factorized_fallback_terms,
+            )
         )
         timing["direct_table_component_plan"] = time.perf_counter() - t0
         object.__setattr__(
@@ -5128,7 +5784,41 @@ class DirectOrthonormalFactorizedTable:
             "_component_direct_plan",
             component_direct_plan,
         )
-        use_family_tensor = self.uses_complementary_payload_tensor_kernel
+        compiled = self.compiled_factorized_terms
+        cpp_owner_factor_route = bool(
+            packed_oversized_family_route
+            and self.su2_moving_environment is not None
+            and getattr(compiled, "_cpp_factor_routes_installed", False)
+            and getattr(compiled, "su2_moving_environment", None)
+            is self.su2_moving_environment
+        )
+        object.__setattr__(
+            self,
+            "_cpp_owner_factor_route_status",
+            {
+                "eligible": bool(cpp_owner_factor_route),
+                "packed_route_requested": bool(packed_oversized_family_route),
+                "moving_environment": bool(
+                    self.su2_moving_environment is not None
+                ),
+                "compiled_route_installed": bool(
+                    getattr(compiled, "_cpp_factor_routes_installed", False)
+                ),
+                "shared_owner": bool(
+                    compiled is not None
+                    and getattr(compiled, "su2_moving_environment", None)
+                    is self.su2_moving_environment
+                ),
+            },
+        )
+        oversized_family_fallback = bool(
+            oversized_parent_blocks
+            and component_direct_plan is not None
+        )
+        use_family_tensor = bool(
+            force_family_tensor
+            or oversized_family_fallback
+        )
         t0 = time.perf_counter()
         family_table = (
             self._build_complementary_family_tensor_table(
@@ -5147,7 +5837,12 @@ class DirectOrthonormalFactorizedTable:
         component_parent_blocks = (
             None if use_family_tensor else qchem_parent_blocks
         )
-        if component_parent_blocks is None and not use_family_tensor:
+        if (
+            component_parent_blocks is None
+            and not use_family_tensor
+            and not oversized_parent_blocks
+            and not packed_oversized_family_route
+        ):
             component_parent_blocks = self._build_component_parent_blocks(
                 component_direct_plan
             )
@@ -5160,6 +5855,11 @@ class DirectOrthonormalFactorizedTable:
             component_parent_blocks,
         )
         timing["direct_table_orthonormal_blocks"] = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        cpp_davidson_table = self._build_cpp_davidson_table(
+            component_orthonormal_blocks,
+        )
+        timing["direct_table_cpp_davidson"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         component_orthonormal_dense_matrix = self._build_component_orthonormal_dense_matrix(
             component_orthonormal_blocks,
@@ -5175,7 +5875,12 @@ class DirectOrthonormalFactorizedTable:
         )
         timing["direct_table_orthonormal_block_batches"] = time.perf_counter() - t0
         t0 = time.perf_counter()
-        if family_table is not None:
+        if cpp_owner_factor_route:
+            cpp_davidson_table = self._install_cpp_factor_route_projection(
+                compiled
+            )
+            su2_action = None
+        elif family_table is not None:
             su2_action = SU2LocalAction.from_family_table(
                 self.component_basis,
                 family_table,
@@ -5189,20 +5894,51 @@ class DirectOrthonormalFactorizedTable:
             )
         else:
             su2_action = None
+        if (
+            su2_action is None
+            and packed_oversized_family_route
+            and not cpp_owner_factor_route
+        ):
+            su2_action = SU2LocalAction.from_packed_family_terms(
+                self.component_basis,
+                self.compiled_factorized_terms,
+                backend=_SU2_KERNEL_BACKEND,
+            )
         timing["direct_table_su2_action"] = time.perf_counter() - t0
+        if (
+            cpp_davidson_table is None
+            and su2_action is not None
+            and getattr(su2_action, "_cpp_family_table", None) is not None
+        ):
+            cpp_davidson_table = su2_action._cpp_family_table
         su2_residual = None
         if su2_action is not None and _SU2_KERNEL_DEBUG_CHECK:
             t0 = time.perf_counter()
             rng = np.random.default_rng(1234)
             probe = rng.normal(size=self.dim) + 1j * rng.normal(size=self.dim)
-            reference = (
-                family_table.matvec(probe, self.component_basis)
-                if family_table is not None
-                else self._component_parent_block_matvec(
+            if family_table is not None:
+                reference = family_table.matvec(probe, self.component_basis)
+            elif component_parent_blocks is not None:
+                reference = self._component_parent_block_matvec(
                     probe,
                     component_parent_blocks,
                 )
-            )
+            else:
+                parent = self.component_basis.from_orthonormal(probe)
+                parent_out = np.asarray(
+                    self.packed_matvec(parent),
+                    dtype=complex,
+                ).reshape(self.component_basis.parent_dim)
+                reference = np.zeros(self.dim, dtype=complex)
+                for idx, indices in enumerate(
+                    self.component_basis.component_indices
+                ):
+                    transform = self.component_basis.component_transforms[idx]
+                    start = int(self.component_basis.orth_offsets[idx])
+                    stop = start + int(transform.shape[1])
+                    reference[start:stop] = (
+                        transform.conj().T @ parent_out[indices]
+                    )
             candidate = su2_action.matvec(probe)
             scale = max(float(np.linalg.norm(reference)), 1.0)
             su2_residual = float(np.linalg.norm(candidate - reference) / scale)
@@ -5212,6 +5948,86 @@ class DirectOrthonormalFactorizedTable:
                     f"residual={su2_residual:.3e}"
                 )
             timing["direct_table_su2_debug_check"] = time.perf_counter() - t0
+        cpp_family_table = (
+            None
+            if su2_action is None
+            else getattr(su2_action, "_cpp_family_table", None)
+        )
+        cpp_family_source_stats = (
+            None if family_table is None else dict(family_table.stats)
+        ) if cpp_family_table is not None else None
+        if (
+            (cpp_family_table is not None or cpp_owner_factor_route)
+            and cpp_family_source_stats is None
+        ):
+            source_families = getattr(
+                self.compiled_factorized_terms,
+                "complementary_operator_families",
+                None,
+            )
+            source_family_metadata = (
+                source_families.as_metadata()
+                if hasattr(source_families, "as_metadata")
+                else None
+            )
+            source_payloads = getattr(
+                self.compiled_factorized_terms,
+                "complementary_boundary_payloads",
+                None,
+            )
+            cpp_family_source_stats = {
+                "kind": "packed_qchem_factor_routes",
+                "source": "packed_su2_qchem_factor_pools",
+                "family_names": tuple(
+                    getattr(self.compiled_factorized_terms, "family_names", ())
+                ),
+                "family_term_counts": dict(
+                    getattr(
+                        self.compiled_factorized_terms,
+                        "family_term_counts",
+                        {},
+                    )
+                    or {}
+                ),
+                "complementary_operator_families": source_family_metadata,
+                "complementary_payload_backed": bool(
+                    source_payloads is not None
+                    and source_payloads.get("payload_backed", False)
+                ),
+                "complementary_payload_terms": int(
+                    0
+                    if source_payloads is None
+                    else source_payloads.get("numeric_payload_terms", 0)
+                ),
+                "su2_qchem_sweep_plan": getattr(
+                    self.compiled_factorized_terms,
+                    "su2_qchem_sweep_plan",
+                    None,
+                ),
+                "su2_qchem_factor_match_backend": getattr(
+                    self.compiled_factorized_terms,
+                    "su2_qchem_factor_match_backend",
+                    None,
+                ),
+                "su2_qchem_factor_match_count": getattr(
+                    self.compiled_factorized_terms,
+                    "su2_qchem_factor_match_count",
+                    None,
+                ),
+                "cpp_table": dict(cpp_davidson_table.stats),
+            }
+        packed_cpp_owner = bool(
+            cpp_owner_factor_route
+            or (
+                cpp_family_table is not None
+                and str(cpp_family_table.stats.get("kind", ""))
+                == "cpp_su2_packed_factorized_family_table"
+            )
+        )
+        if cpp_family_table is not None or cpp_owner_factor_route:
+            family_table = None
+            component_direct_plan = None
+            factorized_fallback_terms = None
         object.__setattr__(self, "_build_timing", timing)
         object.__setattr__(self, "_su2_action", su2_action)
         object.__setattr__(
@@ -5221,13 +6037,57 @@ class DirectOrthonormalFactorizedTable:
         )
         object.__setattr__(
             self,
+            "_cpp_family_source_stats",
+            cpp_family_source_stats,
+        )
+        object.__setattr__(
+            self,
+            "_packed_cpp_exclusive_owner",
+            packed_cpp_owner,
+        )
+        if packed_cpp_owner:
+            object.__setattr__(self, "compiled_factorized_terms", None)
+            object.__setattr__(self, "packed_matvec", None)
+            object.__setattr__(self, "components", None)
+        object.__setattr__(
+            self,
             "_component_parent_blocks",
             component_parent_blocks,
         )
         object.__setattr__(
             self,
+            "_estimated_parent_block_elements",
+            estimated_parent_block_elements,
+        )
+        object.__setattr__(
+            self,
+            "_oversized_parent_block_fallback",
+            oversized_parent_blocks,
+        )
+        object.__setattr__(
+            self,
+            "_oversized_parent_block_family_fallback",
+            oversized_family_fallback,
+        )
+        object.__setattr__(
+            self,
+            "_factorized_fallback_terms",
+            factorized_fallback_terms,
+        )
+        object.__setattr__(
+            self,
             "_component_orthonormal_blocks",
             component_orthonormal_blocks,
+        )
+        object.__setattr__(
+            self,
+            "_cpp_davidson_table",
+            cpp_davidson_table,
+        )
+        object.__setattr__(
+            self,
+            "_cpp_factor_route_projection",
+            cpp_owner_factor_route,
         )
         object.__setattr__(
             self,
@@ -5257,10 +6117,14 @@ class DirectOrthonormalFactorizedTable:
         vector = np.asarray(vector, dtype=complex).reshape(self.dim)
         family_table = getattr(self, "_complementary_family_tensor_table", None)
         su2_action = getattr(self, "_su2_action", None)
+        cpp_davidson_table = getattr(self, "_cpp_davidson_table", None)
         if family_table is not None:
             if su2_action is not None:
                 return su2_action.matvec(vector)
             return family_table.matvec(vector, self.component_basis)
+        cpp_table = getattr(self, "_cpp_davidson_table", None)
+        if cpp_table is not None:
+            return cpp_table.matvec(vector)
         orthonormal_dense = getattr(self, "_component_orthonormal_dense_matrix", None)
         if orthonormal_dense is not None:
             return orthonormal_dense @ vector
@@ -5297,10 +6161,182 @@ class DirectOrthonormalFactorizedTable:
             )
         return out
 
+    def matmat(self, vectors):
+        """Apply ``X^H H X`` to a block of Davidson vectors."""
+
+        vectors = np.asarray(vectors, dtype=complex)
+        if vectors.ndim != 2 or int(vectors.shape[0]) != self.dim:
+            raise ValueError(
+                f"Expected a ({self.dim}, nvec) block, got {vectors.shape}."
+            )
+        if int(vectors.shape[1]) == 1:
+            return self.matvec(vectors[:, 0]).reshape(self.dim, 1)
+        family_table = getattr(self, "_complementary_family_tensor_table", None)
+        su2_action = getattr(self, "_su2_action", None)
+        if family_table is not None and su2_action is not None:
+            return su2_action.matmat(vectors)
+        cpp_table = getattr(self, "_cpp_davidson_table", None)
+        cpp_matmat = getattr(cpp_table, "matmat", None)
+        if callable(cpp_matmat):
+            return np.asarray(cpp_matmat(vectors))
+        orthonormal_dense = getattr(self, "_component_orthonormal_dense_matrix", None)
+        if orthonormal_dense is not None:
+            return orthonormal_dense @ vectors
+        return np.column_stack(
+            [self.matvec(vectors[:, idx]) for idx in range(vectors.shape[1])]
+        )
+
     def dense_operator_matrix(self):
         """Return the materialized orthonormal matrix when already owned."""
 
         return getattr(self, "_component_orthonormal_dense_matrix", None)
+
+    def cpp_davidson(
+        self,
+        diag,
+        guess,
+        *,
+        tol,
+        max_iter,
+        restart_dim,
+        accept_unconverged=False,
+        block_size=1,
+    ):
+        """Solve this transformed block table without Python matvec callbacks."""
+
+        table = getattr(self, "_cpp_davidson_table", None)
+        if table is None:
+            return None
+        cpp_diag = np.ascontiguousarray(diag, dtype=complex)
+        table_diagonal = getattr(table, "diagonal", None)
+        table_diagonal_used = False
+        if callable(table_diagonal):
+            candidate = table_diagonal()
+            if candidate is not None:
+                candidate = np.asarray(candidate, dtype=float).reshape(-1)
+                if candidate.size == cpp_diag.size:
+                    cpp_diag = np.ascontiguousarray(
+                        candidate,
+                        dtype=complex,
+                    )
+                    table_diagonal_used = True
+        block_solver = getattr(table, "davidson_block", None)
+        if int(block_size) > 1 and callable(block_solver):
+            result = block_solver(
+                cpp_diag,
+                np.ascontiguousarray(guess, dtype=complex),
+                float(tol),
+                int(max_iter),
+                int(restart_dim),
+                bool(accept_unconverged),
+                int(block_size),
+            )
+        else:
+            result = table.davidson(
+                cpp_diag,
+                np.ascontiguousarray(guess, dtype=complex),
+                float(tol),
+                int(max_iter),
+                int(restart_dim),
+                bool(accept_unconverged),
+            )
+        result["table_diagonal_used"] = bool(table_diagonal_used)
+        return result
+
+    def _install_cpp_factor_route_projection(self, compiled):
+        """Install the orthonormal transform beside the owner's raw routes."""
+
+        owner = self.su2_moving_environment
+        factor_route_key = getattr(compiled, "_cpp_factor_route_key", None)
+        if owner is None or factor_route_key is None:
+            raise RuntimeError(
+                "The C++ SU(2) factor route is unavailable for projection."
+            )
+        indices = tuple(
+            np.ascontiguousarray(value, dtype=np.int64)
+            for value in self.component_basis.component_indices
+        )
+        transforms = tuple(
+            np.ascontiguousarray(value)
+            for value in self.component_basis.component_transforms
+        )
+        offsets = tuple(int(value) for value in self.component_basis.orth_offsets)
+        topology_arrays = [
+            np.asarray(
+                [
+                    int(self.component_basis.parent_dim),
+                    int(self.component_basis.orthonormal_dim),
+                    len(indices),
+                ],
+                dtype=np.int64,
+            ),
+            np.asarray(offsets, dtype=np.int64),
+        ]
+        for index, transform in zip(indices, transforms):
+            topology_arrays.extend(
+                (
+                    index,
+                    np.asarray(transform.shape, dtype=np.int64),
+                )
+            )
+        topology_revision = _stable_array_revision(*topology_arrays)
+        numeric_revision = _stable_array_revision(*transforms)
+        projection_key = (
+            f"projection:{factor_route_key}:{int(topology_revision)}"
+        )
+        owner.install_factor_route_projection(
+            projection_key,
+            factor_route_key,
+            indices,
+            transforms,
+            offsets,
+            int(self.component_basis.parent_dim),
+            int(self.component_basis.orthonormal_dim),
+            int(topology_revision),
+            int(numeric_revision),
+        )
+        return MovingEnvironmentFactorRouteTable(
+            owner=owner,
+            projection_key=projection_key,
+            dim=int(self.component_basis.orthonormal_dim),
+            active_complementary=bool(
+                getattr(compiled, "cpp_owned_basis_topology", False)
+            ),
+        )
+
+    def _build_cpp_davidson_table(self, orthonormal_blocks):
+        """Build one persistent C++ block table for matvec and Davidson."""
+
+        if (
+            orthonormal_blocks is None
+            or str(_SU2_KERNEL_BACKEND).lower().replace("-", "_") == "python"
+        ):
+            return None
+        try:
+            from pyqed.mps import cpp_davidson
+
+            table_cls = getattr(cpp_davidson, "BlockTable", None)
+            if table_cls is None:
+                return None
+            blocks = []
+            in_starts = []
+            out_starts = []
+            for in_comp, out_comp, block in orthonormal_blocks:
+                in_slice = self.component_basis._orth_slice(int(in_comp))
+                out_slice = self.component_basis._orth_slice(int(out_comp))
+                blocks.append(np.ascontiguousarray(block, dtype=complex))
+                in_starts.append(int(in_slice.start))
+                out_starts.append(int(out_slice.start))
+            if not blocks:
+                return None
+            return table_cls(
+                tuple(blocks),
+                np.asarray(in_starts, dtype=np.int64),
+                np.asarray(out_starts, dtype=np.int64),
+                int(self.dim),
+            )
+        except Exception:
+            return None
 
     @property
     def uses_component_direct_kernel(self):
@@ -5366,7 +6402,10 @@ class DirectOrthonormalFactorizedTable:
             and applied through :class:`ComplementaryFamilyTensorTable`.
         """
 
-        return getattr(self, "_complementary_family_tensor_table", None) is not None
+        return bool(
+            getattr(self, "_complementary_family_tensor_table", None) is not None
+            or getattr(self, "_cpp_family_source_stats", None) is not None
+        )
 
     def _build_complementary_family_tensor_table(self, plan):
         """
@@ -5416,14 +6455,15 @@ class DirectOrthonormalFactorizedTable:
         )
 
 
-    def _build_component_direct_plan(self):
+    def _build_component_direct_plan(self, *, compiled=None):
         """
         Build a component-local factorized block application plan.
 
         :returns: Tuple of plan entries or ``None`` when metadata is missing.
         """
 
-        compiled = self.compiled_factorized_terms
+        if compiled is None:
+            compiled = self.compiled_factorized_terms
         components = self.components
         basis = getattr(self.component_basis, "parent_basis", None)
         if compiled is None or components is None or basis is None:
@@ -5459,6 +6499,49 @@ class DirectOrthonormalFactorizedTable:
         if not plan:
             return None
         return tuple(plan)
+
+    def _estimate_qchem_component_parent_block_elements(self):
+        """
+        Estimate dense parent-block storage without materializing any blocks.
+
+        The packed qchem schedule already owns input/output entry indices.
+        Mapping those indices to metric components gives the unique dense
+        component-pair shapes that a parent-block action would allocate.
+        """
+
+        compiled = self.compiled_factorized_terms
+        components = self.components
+        if compiled is None or components is None:
+            return None
+        in_indices = getattr(compiled, "in_indices", None)
+        out_indices = getattr(compiled, "out_indices", None)
+        if in_indices is None or out_indices is None:
+            return None
+        in_indices = np.asarray(in_indices, dtype=np.int64).reshape(-1)
+        out_indices = np.asarray(out_indices, dtype=np.int64).reshape(-1)
+        if in_indices.size != out_indices.size:
+            return None
+        entry_to_component = {}
+        for comp_idx, component in enumerate(components):
+            for entry_idx in component:
+                entry_to_component[int(entry_idx)] = int(comp_idx)
+        pairs = set()
+        for in_idx, out_idx in zip(in_indices, out_indices):
+            in_comp = entry_to_component.get(int(in_idx))
+            out_comp = entry_to_component.get(int(out_idx))
+            if in_comp is None or out_comp is None:
+                return None
+            pairs.add((in_comp, out_comp))
+        component_dims = tuple(
+            int(np.asarray(indices).size)
+            for indices in self.component_basis.component_indices
+        )
+        return int(
+            sum(
+                component_dims[out_comp] * component_dims[in_comp]
+                for in_comp, out_comp in pairs
+            )
+        )
 
     def _build_qchem_component_parent_blocks(self):
         """
@@ -5860,6 +6943,9 @@ class DirectOrthonormalFactorizedTable:
         :returns: Dictionary describing the direct factorized matvec table.
         """
 
+        cpp_source_stats = dict(
+            getattr(self, "_cpp_family_source_stats", None) or {}
+        )
         complementary_families = getattr(
             self.compiled_factorized_terms,
             "complementary_operator_families",
@@ -5868,7 +6954,7 @@ class DirectOrthonormalFactorizedTable:
         complementary_metadata = (
             complementary_families.as_metadata()
             if hasattr(complementary_families, "as_metadata")
-            else None
+            else cpp_source_stats.get("complementary_operator_families")
         )
         complementary_payloads = getattr(
             self.compiled_factorized_terms,
@@ -5881,33 +6967,38 @@ class DirectOrthonormalFactorizedTable:
             None,
         )
         complementary_payload_terms = int(
-            0
+            cpp_source_stats.get("complementary_payload_terms", 0)
             if complementary_payloads is None
             else complementary_payloads.get("numeric_payload_terms", 0)
         )
         family_names = tuple(
-            getattr(self.compiled_factorized_terms, "family_names", ()) or ()
+            getattr(self.compiled_factorized_terms, "family_names", ())
+            or cpp_source_stats.get("family_names", ())
+            or ()
         )
         family_term_counts = dict(
-            getattr(self.compiled_factorized_terms, "family_term_counts", {}) or {}
+            getattr(self.compiled_factorized_terms, "family_term_counts", {})
+            or cpp_source_stats.get("family_term_counts", {})
+            or {}
         )
         su2_qchem_sweep_plan = getattr(
             self.compiled_factorized_terms,
             "su2_qchem_sweep_plan",
-            None,
+            cpp_source_stats.get("su2_qchem_sweep_plan"),
         )
         su2_qchem_factor_match_backend = getattr(
             self.compiled_factorized_terms,
             "su2_qchem_factor_match_backend",
-            None,
+            cpp_source_stats.get("su2_qchem_factor_match_backend"),
         )
         su2_qchem_factor_match_count = getattr(
             self.compiled_factorized_terms,
             "su2_qchem_factor_match_count",
-            None,
+            cpp_source_stats.get("su2_qchem_factor_match_count"),
         )
         family_table = getattr(self, "_complementary_family_tensor_table", None)
         su2_action = getattr(self, "_su2_action", None)
+        cpp_davidson_table = getattr(self, "_cpp_davidson_table", None)
         orthonormal_block_batches = getattr(
             self,
             "_component_orthonormal_block_batches",
@@ -5973,6 +7064,12 @@ class DirectOrthonormalFactorizedTable:
             "component_orthonormal_dense_kernel": bool(
                 self.uses_component_orthonormal_dense_kernel
             ),
+            "cpp_block_table": bool(cpp_davidson_table is not None),
+            "cpp_block_table_stats": (
+                None
+                if cpp_davidson_table is None
+                else cpp_davidson_table.stats
+            ),
             "component_orthonormal_block_batch_kernel": bool(
                 orthonormal_block_batches
             ),
@@ -6002,7 +7099,11 @@ class DirectOrthonormalFactorizedTable:
                 self.uses_complementary_family_table_kernel
             ),
             "complementary_family_table": (
-                None if family_table is None else family_table.stats
+                (
+                    getattr(self, "_cpp_family_source_stats", None)
+                    if family_table is None
+                    else family_table.stats
+                )
             ),
             "su2_local_action": (
                 None if su2_action is None else su2_action.stats
@@ -6013,10 +7114,24 @@ class DirectOrthonormalFactorizedTable:
                 None,
             ),
             "su2_kernel_backend_actual": (
-                "python" if su2_action is None else str(su2_action.backend)
+                "cpp"
+                if cpp_davidson_table is not None
+                else ("python" if su2_action is None else str(su2_action.backend))
+            ),
+            "packed_cpp_exclusive_owner": bool(
+                getattr(self, "_packed_cpp_exclusive_owner", False)
+            ),
+            "cpp_owner_factor_route_status": dict(
+                getattr(self, "_cpp_owner_factor_route_status", {}) or {}
             ),
             "complementary_family_table_source": (
-                None if family_table is None else str(family_table.source)
+                (
+                    (getattr(self, "_cpp_family_source_stats", None) or {}).get(
+                        "source"
+                    )
+                    if family_table is None
+                    else str(family_table.source)
+                )
             ),
             "complementary_family_operator_table_source": bool(
                 self.uses_complementary_family_operator_table_source
@@ -6027,8 +7142,11 @@ class DirectOrthonormalFactorizedTable:
             "complementary_direct_matvec": bool(complementary_metadata is not None),
             "complementary_operator_families": complementary_metadata,
             "complementary_payload_backed": bool(
-                complementary_payloads is not None
-                and complementary_payloads.get("payload_backed", False)
+                (
+                    complementary_payloads is not None
+                    and complementary_payloads.get("payload_backed", False)
+                )
+                or cpp_source_stats.get("complementary_payload_backed", False)
             ),
             "complementary_boundary_payloads": complementary_payloads,
             "complementary_payload_terms": int(complementary_payload_terms),
@@ -6042,6 +7160,23 @@ class DirectOrthonormalFactorizedTable:
                 if su2_qchem_factor_match_count is None
                 else int(su2_qchem_factor_match_count)
             ),
+            "su2_qchem_cpp_factor_route_calls": int(
+                getattr(
+                    self.compiled_factorized_terms,
+                    "cpp_factor_route_calls",
+                    0,
+                )
+            ),
+            "su2_qchem_cpp_factor_diagonal_calls": int(
+                getattr(
+                    self.compiled_factorized_terms,
+                    "cpp_factor_diagonal_calls",
+                    0,
+                )
+            ),
+            "cpp_factor_route_projection": bool(
+                getattr(self, "_cpp_factor_route_projection", False)
+            ),
             "component_parent_block_elements": int(
                 sum(
                     np.asarray(block).size
@@ -6050,6 +7185,17 @@ class DirectOrthonormalFactorizedTable:
                     )
                 )
             ),
+            "estimated_component_parent_block_elements": (
+                None
+                if getattr(self, "_estimated_parent_block_elements", None) is None
+                else int(self._estimated_parent_block_elements)
+            ),
+            "oversized_parent_block_fallback": bool(
+                getattr(self, "_oversized_parent_block_fallback", False)
+            ),
+            "oversized_parent_block_family_fallback": bool(
+                getattr(self, "_oversized_parent_block_family_fallback", False)
+            ),
             "component_orthonormal_block_elements": orthonormal_block_elements,
             "component_orthonormal_dense_elements": orthonormal_dense_elements,
             "build_timing": {
@@ -6057,6 +7203,469 @@ class DirectOrthonormalFactorizedTable:
                 for key, value in (getattr(self, "_build_timing", None) or {}).items()
             },
         }
+
+
+@dataclass(frozen=True)
+class DiagonalMetricBlock:
+    """Compact diagonal local metric block."""
+
+    diagonal: np.ndarray
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "diagonal",
+            np.ascontiguousarray(self.diagonal, dtype=complex).reshape(-1),
+        )
+
+    @property
+    def shape(self):
+        dim = int(self.diagonal.size)
+        return (dim, dim)
+
+    @property
+    def dtype(self):
+        return self.diagonal.dtype
+
+    @property
+    def stored_elements(self):
+        return int(self.diagonal.size)
+
+    def __matmul__(self, value):
+        array = np.asarray(value)
+        scale = self.diagonal if array.ndim == 1 else self.diagonal[:, None]
+        return scale * array
+
+    def __array__(self, dtype=None, copy=None):
+        out = np.diag(self.diagonal)
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return np.array(out, copy=True) if copy is not False else out
+
+
+class _DiagonalMetricTransformTranspose:
+    __slots__ = ("transform",)
+
+    def __init__(self, transform):
+        self.transform = transform
+
+    @property
+    def shape(self):
+        rows, cols = self.transform.shape
+        return (cols, rows)
+
+    def __matmul__(self, value):
+        array = np.asarray(value)
+        selected = array[self.transform.rows]
+        scale = (
+            self.transform.values
+            if selected.ndim == 1
+            else self.transform.values[:, None]
+        )
+        return scale * selected
+
+    def __array__(self, dtype=None, copy=None):
+        out = np.asarray(self.transform).T
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return np.array(out, copy=True) if copy is not False else out
+
+
+@dataclass(frozen=True)
+class DiagonalMetricTransform:
+    """Compact selected diagonal map from orthonormal to parent coordinates."""
+
+    parent_dim: int
+    rows: np.ndarray
+    values: np.ndarray
+
+    def __post_init__(self):
+        rows = np.ascontiguousarray(self.rows, dtype=np.int64).reshape(-1)
+        values = np.ascontiguousarray(self.values, dtype=complex).reshape(-1)
+        if rows.size != values.size:
+            raise ValueError("Diagonal metric transform rows and values must align.")
+        if np.any(rows < 0) or np.any(rows >= int(self.parent_dim)):
+            raise ValueError("Diagonal metric transform row is out of bounds.")
+        object.__setattr__(self, "parent_dim", int(self.parent_dim))
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "values", values)
+
+    @classmethod
+    def from_metric_diagonal(cls, diagonal, *, tol):
+        diagonal = np.ascontiguousarray(diagonal, dtype=complex).reshape(-1)
+        scale = max(1.0, float(np.max(np.abs(diagonal))) if diagonal.size else 0.0)
+        if np.max(np.abs(np.imag(diagonal)), initial=0.0) > float(tol) * scale:
+            return None
+        real = np.real(diagonal)
+        keep = real > max(float(tol), 1.0e-14)
+        if not np.any(keep):
+            return None
+        rows = np.flatnonzero(keep)
+        return cls(
+            parent_dim=int(diagonal.size),
+            rows=rows,
+            values=1.0 / np.sqrt(real[keep]),
+        )
+
+    @property
+    def shape(self):
+        return (int(self.parent_dim), int(self.rows.size))
+
+    @property
+    def dtype(self):
+        return self.values.dtype
+
+    @property
+    def stored_elements(self):
+        return int(self.rows.size + self.values.size)
+
+    @property
+    def T(self):
+        return _DiagonalMetricTransformTranspose(self)
+
+    def conj(self):
+        return type(self)(
+            parent_dim=self.parent_dim,
+            rows=self.rows,
+            values=self.values.conj(),
+        )
+
+    def __matmul__(self, value):
+        array = np.asarray(value)
+        shape = (self.parent_dim,) + tuple(array.shape[1:])
+        out = np.zeros(shape, dtype=np.result_type(self.dtype, array.dtype))
+        scale = self.values if array.ndim == 1 else self.values[:, None]
+        out[self.rows] = scale * array
+        return out
+
+    def project_diagonal(self, parent_diagonal):
+        parent_diagonal = np.asarray(parent_diagonal)
+        return np.abs(self.values) ** 2 * parent_diagonal[self.rows]
+
+    def __array__(self, dtype=None, copy=None):
+        dtype = self.dtype if dtype is None else np.dtype(dtype)
+        out = np.zeros(self.shape, dtype=dtype)
+        out[self.rows, np.arange(self.rows.size)] = self.values
+        return np.array(out, copy=True) if copy is not False else out
+
+
+@dataclass(frozen=True)
+class KroneckerMetricBlock:
+    """Compact ``left ⊗ I ⊗ I ⊗ right`` metric block."""
+
+    left: np.ndarray
+    right: np.ndarray
+    phys_dims: tuple[int, int]
+
+    def __post_init__(self):
+        left = np.ascontiguousarray(self.left, dtype=complex)
+        right = np.ascontiguousarray(self.right, dtype=complex)
+        phys_dims = tuple(int(dim) for dim in self.phys_dims)
+        if left.ndim != 2 or left.shape[0] != left.shape[1]:
+            raise ValueError("Kronecker metric left factor must be square.")
+        if right.ndim != 2 or right.shape[0] != right.shape[1]:
+            raise ValueError("Kronecker metric right factor must be square.")
+        if len(phys_dims) != 2 or any(dim <= 0 for dim in phys_dims):
+            raise ValueError("Kronecker metric physical dimensions must be positive.")
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "right", right)
+        object.__setattr__(self, "phys_dims", phys_dims)
+
+    @property
+    def tensor_shape(self):
+        return (
+            int(self.left.shape[0]),
+            int(self.phys_dims[0]),
+            int(self.phys_dims[1]),
+            int(self.right.shape[0]),
+        )
+
+    @property
+    def shape(self):
+        dim = int(np.prod(self.tensor_shape, dtype=np.int64))
+        return (dim, dim)
+
+    @property
+    def dtype(self):
+        return np.result_type(self.left.dtype, self.right.dtype)
+
+    @property
+    def stored_elements(self):
+        return int(self.left.size + self.right.size)
+
+    def __matmul__(self, value):
+        array = np.asarray(value)
+        trailing = tuple(array.shape[1:])
+        tensor = array.reshape(self.tensor_shape + trailing)
+        if trailing:
+            result = np.einsum(
+                "lk,kbcr...,qr->lbcq...",
+                self.left,
+                tensor,
+                self.right,
+                optimize=True,
+            )
+        else:
+            result = np.einsum(
+                "lk,kbcr,qr->lbcq",
+                self.left,
+                tensor,
+                self.right,
+                optimize=True,
+            )
+        return result.reshape((self.shape[0],) + trailing)
+
+    def __array__(self, dtype=None, copy=None):
+        out = np.kron(
+            np.kron(
+                np.kron(self.left, np.eye(self.phys_dims[0])),
+                np.eye(self.phys_dims[1]),
+            ),
+            self.right,
+        )
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return np.array(out, copy=True) if copy is not False else out
+
+
+class _KroneckerMetricTransformTranspose:
+    __slots__ = ("transform",)
+
+    def __init__(self, transform):
+        self.transform = transform
+
+    @property
+    def shape(self):
+        rows, cols = self.transform.shape
+        return (cols, rows)
+
+    def __matmul__(self, value):
+        return self.transform.transpose_apply(value)
+
+    def __array__(self, dtype=None, copy=None):
+        out = np.asarray(self.transform).T
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return np.array(out, copy=True) if copy is not False else out
+
+
+@dataclass(frozen=True)
+class KroneckerMetricTransform:
+    """Compact tensor-product orthonormalization map for one basis entry."""
+
+    left: np.ndarray
+    right: np.ndarray
+    phys_dims: tuple[int, int]
+
+    def __post_init__(self):
+        left = np.ascontiguousarray(self.left, dtype=complex)
+        right = np.ascontiguousarray(self.right, dtype=complex)
+        phys_dims = tuple(int(dim) for dim in self.phys_dims)
+        if left.ndim != 2 or right.ndim != 2:
+            raise ValueError("Kronecker metric transform factors must be matrices.")
+        if len(phys_dims) != 2 or any(dim <= 0 for dim in phys_dims):
+            raise ValueError("Kronecker metric physical dimensions must be positive.")
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "right", right)
+        object.__setattr__(self, "phys_dims", phys_dims)
+
+    @property
+    def parent_shape(self):
+        return (
+            int(self.left.shape[0]),
+            int(self.phys_dims[0]),
+            int(self.phys_dims[1]),
+            int(self.right.shape[0]),
+        )
+
+    @property
+    def orth_shape(self):
+        return (
+            int(self.left.shape[1]),
+            int(self.phys_dims[0]),
+            int(self.phys_dims[1]),
+            int(self.right.shape[1]),
+        )
+
+    @property
+    def shape(self):
+        return (
+            int(np.prod(self.parent_shape, dtype=np.int64)),
+            int(np.prod(self.orth_shape, dtype=np.int64)),
+        )
+
+    @property
+    def dtype(self):
+        return np.result_type(self.left.dtype, self.right.dtype)
+
+    @property
+    def stored_elements(self):
+        return int(self.left.size + self.right.size)
+
+    @property
+    def T(self):
+        return _KroneckerMetricTransformTranspose(self)
+
+    def conj(self):
+        return type(self)(
+            left=self.left.conj(),
+            right=self.right.conj(),
+            phys_dims=self.phys_dims,
+        )
+
+    def __matmul__(self, value):
+        array = np.asarray(value)
+        trailing = tuple(array.shape[1:])
+        tensor = array.reshape(self.orth_shape + trailing)
+        if trailing:
+            result = np.einsum(
+                "lk,kbcr...,qr->lbcq...",
+                self.left,
+                tensor,
+                self.right,
+                optimize=True,
+            )
+        else:
+            result = np.einsum(
+                "lk,kbcr,qr->lbcq",
+                self.left,
+                tensor,
+                self.right,
+                optimize=True,
+            )
+        return result.reshape((self.shape[0],) + trailing)
+
+    def transpose_apply(self, value):
+        array = np.asarray(value)
+        trailing = tuple(array.shape[1:])
+        tensor = array.reshape(self.parent_shape + trailing)
+        if trailing:
+            result = np.einsum(
+                "kl,lbcq...,rq->kbcr...",
+                self.left.T,
+                tensor,
+                self.right.T,
+                optimize=True,
+            )
+        else:
+            result = np.einsum(
+                "kl,lbcq,rq->kbcr",
+                self.left.T,
+                tensor,
+                self.right.T,
+                optimize=True,
+            )
+        return result.reshape((self.shape[1],) + trailing)
+
+    def project_diagonal(self, parent_diagonal):
+        parent = np.asarray(parent_diagonal).reshape(self.parent_shape)
+        projected = np.einsum(
+            "lk,lbcq,qr->kbcr",
+            np.abs(self.left) ** 2,
+            parent,
+            np.abs(self.right) ** 2,
+            optimize=True,
+        )
+        return projected.reshape(self.shape[1])
+
+    def __array__(self, dtype=None, copy=None):
+        out = np.kron(
+            np.kron(
+                np.kron(self.left, np.eye(self.phys_dims[0])),
+                np.eye(self.phys_dims[1]),
+            ),
+            self.right,
+        )
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        return np.array(out, copy=True) if copy is not False else out
+
+
+@dataclass(frozen=True)
+class FactorizedRouteMetricBlock:
+    """Sparse sum of boundary-factor Kronecker routes for one component."""
+
+    dim: int
+    routes: tuple
+
+    @property
+    def shape(self):
+        return (int(self.dim), int(self.dim))
+
+    @property
+    def dtype(self):
+        return np.result_type(
+            *(
+                np.result_type(
+                    np.asarray(route[4]).dtype,
+                    np.asarray(route[5]).dtype,
+                )
+                for route in self.routes
+            ),
+            float,
+        )
+
+    @property
+    def stored_elements(self):
+        return int(
+            sum(
+                np.asarray(route[4]).size + np.asarray(route[5]).size
+                for route in self.routes
+            )
+        )
+
+    def __matmul__(self, value):
+        array = np.asarray(value)
+        trailing = tuple(array.shape[1:])
+        out = np.zeros(
+            (int(self.dim),) + trailing,
+            dtype=np.result_type(self.dtype, array.dtype),
+        )
+        for in_slice, out_slice, in_shape, out_shape, left, right in self.routes:
+            tensor = array[in_slice].reshape(tuple(in_shape) + trailing)
+            if trailing:
+                contribution = np.einsum(
+                    "lk,kbcr...,qr->lbcq...",
+                    left,
+                    tensor,
+                    right,
+                    optimize=True,
+                )
+            else:
+                contribution = np.einsum(
+                    "lk,kbcr,qr->lbcq",
+                    left,
+                    tensor,
+                    right,
+                    optimize=True,
+                )
+            out[out_slice] += contribution.reshape(
+                (int(np.prod(out_shape, dtype=np.int64)),) + trailing
+            )
+        return out
+
+    def to_dense(self, *, dtype=None, order="C"):
+        """Materialize the route metric in the requested memory order."""
+
+        dtype = self.dtype if dtype is None else np.dtype(dtype)
+        out = np.zeros(self.shape, dtype=dtype, order=str(order))
+        for in_slice, out_slice, in_shape, out_shape, left, right in self.routes:
+            kernel = np.kron(
+                np.kron(
+                    np.kron(left, np.eye(int(in_shape[1]), dtype=dtype)),
+                    np.eye(int(in_shape[2]), dtype=dtype),
+                ),
+                right,
+            )
+            out[out_slice, in_slice] += kernel.reshape(
+                int(np.prod(out_shape, dtype=np.int64)),
+                int(np.prod(in_shape, dtype=np.int64)),
+            )
+        return out
+
+    def __array__(self, dtype=None, copy=None):
+        out = self.to_dense(dtype=dtype)
+        return np.array(out, copy=True) if copy is not False else out
 
 
 @dataclass(frozen=True)
@@ -6164,6 +7773,21 @@ class BlockSparseOrthonormalizedLocalProblem:
         vector = np.asarray(vector, dtype=complex).reshape(self.orthonormal_dim)
         return self.block_table.matvec(vector)
 
+    def matmat(self, vectors):
+        """Apply the transformed Hamiltonian to several column vectors."""
+
+        vectors = np.asarray(vectors, dtype=complex)
+        if vectors.ndim != 2 or int(vectors.shape[0]) != self.orthonormal_dim:
+            raise ValueError(
+                f"Expected a ({self.orthonormal_dim}, nvec) block, got {vectors.shape}."
+            )
+        matmat = getattr(self.block_table, "matmat", None)
+        if callable(matmat):
+            return np.asarray(matmat(vectors))
+        return np.column_stack(
+            [self.block_table.matvec(vectors[:, idx]) for idx in range(vectors.shape[1])]
+        )
+
     def metric_matvec(self, vector):
         """
         Apply the parent-basis block-diagonal local metric.
@@ -6234,12 +7858,52 @@ class RenormalizedComponentBasis:
         :returns: Dictionary describing component counts and dimensions.
         """
 
+        metric_storage = int(
+            sum(
+                (
+                    int(block.stored_elements)
+                    if hasattr(block, "stored_elements")
+                    else int(np.asarray(block).size)
+                )
+                for block in self.metric_blocks
+            )
+        )
+        transform_storage = int(
+            sum(
+                (
+                    int(transform.stored_elements)
+                    if hasattr(transform, "stored_elements")
+                    else int(np.asarray(transform).size)
+                )
+                for transform in self.component_transforms
+            )
+        )
         return {
             "basis_kind": "metric_connected_components",
             "parent_dim": int(self.parent_dim),
             "orthonormal_dim": int(self.orthonormal_dim),
             "n_components": int(self.n_components),
             "max_component_parent_dim": int(self.max_component_parent_dim),
+            "metric_storage_elements": metric_storage,
+            "transform_storage_elements": transform_storage,
+            "compact_diagonal_metric": bool(
+                any(
+                    isinstance(block, DiagonalMetricBlock)
+                    for block in self.metric_blocks
+                )
+            ),
+            "compact_factorized_metric": bool(
+                any(
+                    isinstance(block, KroneckerMetricBlock)
+                    for block in self.metric_blocks
+                )
+            ),
+            "compact_route_metric": bool(
+                any(
+                    isinstance(block, FactorizedRouteMetricBlock)
+                    for block in self.metric_blocks
+                )
+            ),
         }
 
     def _orth_slice(self, index):
@@ -6347,6 +8011,8 @@ class ComponentOrthonormalizedLocalProblem:
     source: str = "component_sparse_operator_table"
     cache_hit: bool = False
     metadata: dict | None = None
+    metric_factor_blocks: dict | None = None
+    metric_factor_routes: tuple | None = None
 
     @property
     def basis(self):
@@ -6443,6 +8109,21 @@ class ComponentOrthonormalizedLocalProblem:
 
         vector = np.asarray(vector, dtype=complex).reshape(self.orthonormal_dim)
         return self.block_table.matvec(vector)
+
+    def matmat(self, vectors):
+        """Apply the transformed Hamiltonian to several column vectors."""
+
+        vectors = np.asarray(vectors, dtype=complex)
+        if vectors.ndim != 2 or int(vectors.shape[0]) != self.orthonormal_dim:
+            raise ValueError(
+                f"Expected a ({self.orthonormal_dim}, nvec) block, got {vectors.shape}."
+            )
+        matmat = getattr(self.block_table, "matmat", None)
+        if callable(matmat):
+            return np.asarray(matmat(vectors))
+        return np.column_stack(
+            [self.block_table.matvec(vectors[:, idx]) for idx in range(vectors.shape[1])]
+        )
 
     def dense_operator_matrix(self):
         """Return the materialized orthonormal matrix when already owned."""

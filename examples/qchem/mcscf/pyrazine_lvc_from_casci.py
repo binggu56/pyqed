@@ -18,7 +18,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from pyqed.models.pyrazine import pyrazine_2mode_lvc
+from pyqed.models.pyrazine import lvc as literature_lvc
 from pyqed.qchem import Molecule
 from pyqed.qchem.mcscf.casci import CASCI
 from pyqed.units import amu_to_au, au2wavenumber, wavenumber2hartree
@@ -285,7 +285,7 @@ def build_lvc_from_reference(mc, modes, frequencies_au, args):
     return LVC.from_casci(
         mc,
         modes=modes,
-        frequencies=frequencies_au,
+        omega=frequencies_au,
         state_ids=range(args.nstates),
         mode_ids=np.array([10, 6]),
         return_quadratic=True,
@@ -300,7 +300,7 @@ def stationarize_s0(coords, modes, frequencies_au, args):
     for _iteration in range(max(0, args.stationary_iterations)):
         mol, _mf, mc = run_reference(coords, args)
         lvc, quadratic = build_lvc_from_reference(mc, modes, frequencies_au, args)
-        slope = np.asarray(lvc.vibronic_couplings()[0, 0], dtype=float)
+        slope = np.asarray(lvc.linear_couplings[0, 0], dtype=float)
 
         if args.stationary_hessian == "fd":
             hess = np.zeros((modes.shape[0], modes.shape[0]), dtype=float)
@@ -313,7 +313,9 @@ def stationarize_s0(coords, modes, frequencies_au, args):
                     frequencies_au,
                     args,
                 )
-                trial_slope = np.asarray(trial_lvc.vibronic_couplings()[0, 0], dtype=float)
+                trial_slope = np.asarray(
+                    trial_lvc.linear_couplings[0, 0], dtype=float
+                )
                 hess[:, mode_id] = (trial_slope - slope) / args.stationary_fd_step
         else:
             hess = np.asarray(quadratic[0, 0], dtype=float)
@@ -331,7 +333,7 @@ def stationarize_s0(coords, modes, frequencies_au, args):
                 "step": step.copy(),
                 "step_norm": float(np.linalg.norm(step)),
                 "hessian_source": args.stationary_hessian,
-                "energy": float(lvc.reference_energies[0]),
+                "energy": float(lvc.E[0]),
                 "mol": mol,
                 "mc": mc,
             }
@@ -380,16 +382,16 @@ def main():
 
     print("Building LVC from analytic CASCI BO-Hamiltonian derivatives...", flush=True)
     lvc, quadratic = build_lvc_from_reference(mc, modes, frequencies_au, args)
-    literature = pyrazine_2mode_lvc(units="cm^-1")
+    literature = literature_lvc(units="cm^-1")
 
-    energies_cm1 = (lvc.reference_energies - lvc.reference_energies[0]) * au2wavenumber
-    raw_couplings_cm1 = lvc.vibronic_couplings() * au2wavenumber
+    energies_cm1 = (lvc.E - lvc.E[0]) * au2wavenumber
+    raw_couplings_cm1 = lvc.linear_couplings * au2wavenumber
     couplings_cm1 = raw_couplings_cm1.copy()
     if args.subtract_common_s0_slope:
         diag_idx = np.diag_indices(lvc.nstates)
         for mode in range(lvc.nmodes):
             couplings_cm1[diag_idx[0], diag_idx[1], mode] -= raw_couplings_cm1[0, 0, mode]
-    literature_couplings = literature.vibronic_couplings()
+    literature_couplings = literature.linear_couplings
 
     print()
     print("Pyrazine two-mode LVC.from_casci benchmark")
@@ -440,7 +442,7 @@ def main():
         "Vertical energies relative to S0 (cm^-1)",
         [f"S{i}" for i in range(args.nstates)],
         energies_cm1,
-        literature.reference_energies[: args.nstates],
+        literature.E[: args.nstates],
     )
 
     print(

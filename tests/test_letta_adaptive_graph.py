@@ -2,8 +2,6 @@ import numpy as np
 import pytest
 
 from pyqed.letta import (
-    AbelianFrontierTiedLETTA,
-    FrontierAbelianLayout,
     FrontierTiedLETTA,
     LocalHamiltonian,
     LocalTerm,
@@ -202,66 +200,5 @@ def test_graph_migration_rejects_subclasses_instead_of_dropping_structure():
         _signal_batch(),
         cost_weight=0.0,
     )[0]
-    with pytest.raises(TypeError, match="another subclass"):
+    with pytest.raises(TypeError, match="projected subclass"):
         state_with_tie_graph_proposal(state, proposal)
-
-
-def test_u1_add_tie_migration_preserves_state_sector_and_variable_bonds():
-    state = AbelianFrontierTiedLETTA(
-        _two_site_state().hamiltonian,
-        (2, 2),
-        ((), ()),
-        abelian_layout=FrontierAbelianLayout.spin_half(
-            2,
-            target_two_sz=0,
-            bond_dims=(1, 2, 1),
-        ),
-        seed=17,
-        frontier_backend="identity_block",
-    )
-    proposal = rank_tie_graph_proposals(
-        state,
-        _signal_batch(),
-        cost_weight=0.0,
-    )[0]
-    vector = state.state_vector().copy()
-    candidate = state_with_tie_graph_proposal(state, proposal)
-
-    assert isinstance(candidate, AbelianFrontierTiedLETTA)
-    assert candidate.parent_sets == ((1,), ())
-    assert candidate.bond_dims == state.bond_dims
-    assert candidate.abelian_layout == state.abelian_layout
-    np.testing.assert_allclose(candidate.state_vector(), vector, atol=2.0e-13)
-    for configuration, amplitude in zip(
-        np.ndindex(*candidate.dims), candidate.state_vector()
-    ):
-        if sum(1 if local == 0 else -1 for local in configuration) != 0:
-            np.testing.assert_allclose(amplitude, 0.0, atol=1.0e-14)
-
-
-def test_u1_adaptive_graph_relaxation_stays_in_the_target_sector():
-    state = AbelianFrontierTiedLETTA(
-        _two_site_state(seed=19).hamiltonian,
-        (2, 2),
-        ((), ()),
-        abelian_layout=FrontierAbelianLayout.spin_half(
-            2,
-            target_two_sz=0,
-            bond_dims=(1, 2, 1),
-        ),
-        seed=19,
-        frontier_backend="identity_block",
-    )
-    result = adaptive_tie_graph_step(
-        state,
-        signal_batch=_signal_batch(),
-        shortlist=1,
-        cost_weight=0.0,
-        relaxation_sweeps=1,
-        run_options={"solver": "whitened", "tol": 0.0},
-    )
-
-    assert result.selected is not None
-    assert isinstance(result.state, AbelianFrontierTiedLETTA)
-    for tensor, mask in zip(result.state.tensors, result.state.local_masks):
-        np.testing.assert_array_equal(tensor[~mask], 0.0)

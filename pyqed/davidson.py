@@ -96,6 +96,24 @@ def _resolve_matvec(A):
     return lambda x: A_arr @ x
 
 
+def _apply_columns(matvec, vectors):
+    """Apply a matrix-free operator to one or more column vectors."""
+
+    vectors = np.asarray(vectors)
+    if vectors.ndim != 2:
+        raise ValueError("Davidson block input must be a rank-2 array.")
+    matmat = getattr(matvec, "matmat", None)
+    if callable(matmat):
+        result = np.asarray(matmat(vectors))
+        if result.shape != vectors.shape:
+            raise ValueError(
+                "Matrix-free block action returned shape "
+                f"{result.shape}, expected {vectors.shape}."
+            )
+        return result
+    return np.column_stack([matvec(vectors[:, i]) for i in range(vectors.shape[1])])
+
+
 def _resolve_diag(A, diag, n):
     if diag is not None:
         diag_arr = np.asarray(diag, dtype=float).reshape(n)
@@ -252,7 +270,7 @@ def davidson(
     tol_res = np.sqrt(tol) if tol_residual is None else tol_residual
 
     V = _build_guess(diag_arr, neigen, guess=guess)
-    AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+    AV = _apply_columns(matvec, V)
     T = _build_projected_matrix(V, AV)
     precondition = _resolve_preconditioner(A, diag_arr, jacobi=jacobi, precond=precond)
 
@@ -332,11 +350,11 @@ def davidson(
             restart_cols = [V @ alpha_all[:, order[i]] for i in range(keep)]
             restart_cols.extend(new_block[:, i] for i in range(new_block.shape[1]))
             V = _orthonormalize_columns(np.column_stack(restart_cols))
-            AV = np.column_stack([matvec(V[:, i]) for i in range(V.shape[1])])
+            AV = _apply_columns(matvec, V)
             T = _build_projected_matrix(V, AV)
             info["restarts"] += 1
         else:
-            AV_new = np.column_stack([matvec(new_block[:, i]) for i in range(new_block.shape[1])])
+            AV_new = _apply_columns(matvec, new_block)
             T = _expand_projected_matrix(T, V, AV, new_block, AV_new)
             V = np.column_stack((V, new_block))
             AV = np.column_stack((AV, AV_new))

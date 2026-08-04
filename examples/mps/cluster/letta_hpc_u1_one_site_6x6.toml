@@ -1,0 +1,56 @@
+[cluster]
+host = "gubing@10.28.1.66"
+port = 10002
+remote_source_root = "/share/home/gubingLab/gubing/letta_scan_20260726/pyqed_letta_cluster_20260726"
+remote_sources_root = "/share/home/gubingLab/gubing/letta_scan_20260726/sources"
+remote_runs_root = "/share/home/gubingLab/gubing/letta_scan_20260726/hpc_runs"
+python = "/share/home/gubingLab/gubing/letta_scan_20260726/env/bin/python"
+partition = "gubing"
+qos = "huge"
+slurm_bin = "/soft/slurm/bin"
+cpus_per_task = 1
+memory = "16G"
+time_limit = "06:00:00"
+concurrency = 13
+slurm_directives = [
+  "--account=gubing",
+  "--nodelist=xnode[102-103]",
+]
+
+[scan]
+name = "j1j2-6x6-u1-one-site-tol1e6"
+values = [
+  0.00,
+  0.10,
+  0.20,
+  0.30,
+  0.40,
+  0.45,
+  0.50,
+  0.55,
+  0.60,
+  0.70,
+  0.80,
+  0.90,
+  1.00,
+]
+gain_tolerance = 1.0e-6
+gain_tolerance_units = "energy_per_site"
+maximum_directional_passes = 200
+pair_workers = 1
+frontier_workers = 1
+source_run_root = "/share/home/gubingLab/gubing/letta_scan_20260726/runs"
+worker = "examples/mps/cluster/run_sector_projected_letta_one_site_j2_task_6x6.sh"
+
+[local]
+runs_root = "hpc_runs"
+source_root = "."
+sync_source = false
+build_command = "bash \"$PYQED_ROOT/examples/mps/cluster/build_letta_native.sh\""
+source_paths = [
+  "pyqed",
+  "examples/mps",
+  "pyproject.toml",
+  "setup.py",
+  "MANIFEST.in",
+]

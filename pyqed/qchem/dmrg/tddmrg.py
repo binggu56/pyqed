@@ -109,10 +109,21 @@ def _mpo_site_to_dense_factor(site):
     return out
 
 
-def _is_block_sparse_tdvp_backend(backend):
-    if backend is None:
+def _dense_mpo_for_taylor(mpo):
+    """Return a dense-core MPO suitable for global Taylor construction."""
+    factors = mpo.factors if hasattr(mpo, "factors") else list(mpo)
+    if not any(hasattr(site, "qns") for site in factors):
+        return mpo
+    return TensorMPO(
+        [_mpo_site_to_dense_factor(site) for site in factors],
+        homogenous=False,
+    )
+
+
+def _is_block_sparse_projection(projection):
+    if projection is None:
         return False
-    key = str(backend).lower().replace("_", "-")
+    key = str(projection).lower().replace("_", "-")
     return key in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
 
 
@@ -367,19 +378,19 @@ class TDDMRG(DMRG):
         except TypeError:
             return True
 
-    def _auto_ground_state_kwargs(self, *, tdvp_projection_backend=None):
-        del tdvp_projection_backend
+    def _auto_ground_state_kwargs(self, *, projection=None):
+        del projection
         return {
             "D": self._set_bond_dim(),
             "symmetry_list": ["charge", "sz"],
             "compute_s2": False,
         }
 
-    def _ensure_ground_state_for_run(self, *, tdvp_projection_backend=None):
+    def _ensure_ground_state_for_run(self, *, projection=None):
         if self._has_ground_state():
             return
         kwargs = self._auto_ground_state_kwargs(
-            tdvp_projection_backend=tdvp_projection_backend,
+            projection=projection,
         )
         kwargs.setdefault("D", self._set_bond_dim())
         self.optimize_ground_state(**kwargs)
@@ -427,23 +438,23 @@ class TDDMRG(DMRG):
             return guess.copy()
         return self._default_initial_state()
 
-    def default_initial_condition(self, D=None, *, tdvp_projection_backend=None):
+    def default_initial_condition(self, D=None, *, projection=None):
         """Return the default real-time initial condition for ``run(psi0=...)``."""
         if D is not None:
             self._set_bond_dim(D)
         return self._initial_state_for_run(
             None,
-            tdvp_projection_backend=tdvp_projection_backend,
+            projection=projection,
         )
 
-    def _initial_state_for_run(self, psi0, *, tdvp_projection_backend=None):
+    def _initial_state_for_run(self, psi0, *, projection=None):
         block_sparse = (
-            _is_block_sparse_tdvp_backend(tdvp_projection_backend)
+            _is_block_sparse_projection(projection)
             and hasattr(self, "_tdvp_sector_settings")
         )
         if psi0 is None:
             self._ensure_ground_state_for_run(
-                tdvp_projection_backend=tdvp_projection_backend,
+                projection=projection,
             )
             if block_sparse:
                 return self._default_block_sparse_initial_state()
@@ -456,6 +467,11 @@ class TDDMRG(DMRG):
         ):
             return psi0.copy()
         return self._ensure_dense_mps(psi0)
+
+    def _resolve_projection(self, integrator, projection):
+        """Resolve an optional TDVP projection selection for this driver."""
+        del integrator
+        return None if projection is False else projection
 
     def _normalize_observables(self, e_ops):
         if e_ops is None:
@@ -691,8 +707,11 @@ class TDDMRG(DMRG):
             self.build(mo_coeff=mo_coeff)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
+        hamiltonian = _dense_mpo_for_taylor(
+            self._get_td_hamiltonian(mo_coeff=mo_coeff)
+        )
         self.tdmps = TDMPS(
-            self._get_td_hamiltonian(mo_coeff=mo_coeff),
+            hamiltonian,
             D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
@@ -723,7 +742,7 @@ class TDDMRG(DMRG):
         sparse_vectorized=True,
         reuse_tdvp_engine=True,
         canonicalize_each_step=False,
-        tdvp_projection_backend=None,
+        projection=None,
         tdvp_split_dynamic_block_sparse=False,
         measure_observables=True,
         track_energy=True,
@@ -739,10 +758,8 @@ class TDDMRG(DMRG):
         if D is not None:
             self._set_bond_dim(D)
 
-        psi = self._initial_state_for_run(
-            psi0,
-            tdvp_projection_backend=tdvp_projection_backend,
-        )
+        projection = self._resolve_projection(integrator, projection)
+        psi = self._initial_state_for_run(psi0, projection=projection)
         bond_dim = self._set_bond_dim(D, psi=psi)
         observables = self._normalize_observables(e_ops)
         if interaction_mpo is None and field is not None:
@@ -759,16 +776,21 @@ class TDDMRG(DMRG):
             )
 
         sector_kwargs = {}
-        if tdvp_projection_backend is not None and hasattr(self, "_tdvp_sector_settings"):
+        if projection is not None and hasattr(self, "_tdvp_sector_settings"):
             sector_kwargs = dict(self._tdvp_sector_settings())
 
+        hamiltonian = self._get_td_hamiltonian(mo_coeff=mo_coeff)
+        integrator_key = str(integrator).lower().replace("_", "-")
+        if integrator_key in {"taylor", "mpo", "mpo-taylor"}:
+            hamiltonian = _dense_mpo_for_taylor(hamiltonian)
+
         self.tdmps = TDMPS(
-            self._get_td_hamiltonian(mo_coeff=mo_coeff),
+            hamiltonian,
             D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
-            tdvp_projection_backend=tdvp_projection_backend,
+            projection=projection,
             tdvp_split_dynamic_block_sparse=tdvp_split_dynamic_block_sparse,
             **sector_kwargs,
         )
@@ -830,7 +852,7 @@ class TDDMRG(DMRG):
         sparse_vectorized=True,
         reuse_tdvp_engine=True,
         canonicalize_each_step=False,
-        tdvp_projection_backend=None,
+        projection=None,
         D=None,
     ):
         if dt is None:
@@ -844,10 +866,8 @@ class TDDMRG(DMRG):
         if D is not None:
             self._set_bond_dim(D)
 
-        psi = self._initial_state_for_run(
-            psi0,
-            tdvp_projection_backend=tdvp_projection_backend,
-        )
+        projection = self._resolve_projection(integrator, projection)
+        psi = self._initial_state_for_run(psi0, projection=projection)
         bond_dim = self._set_bond_dim(D, psi=psi)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
@@ -886,7 +906,7 @@ class TDDMRG(DMRG):
             return diagnostic
 
         sector_kwargs = {}
-        if tdvp_projection_backend is not None and hasattr(self, "_tdvp_sector_settings"):
+        if projection is not None and hasattr(self, "_tdvp_sector_settings"):
             sector_kwargs = dict(self._tdvp_sector_settings())
 
         solver = TDMPS(
@@ -895,7 +915,7 @@ class TDDMRG(DMRG):
             interaction_mpo=interaction_mpo,
             field=field,
             interaction_propagator_builder=self.build_interaction_unitary_mpo,
-            tdvp_projection_backend=tdvp_projection_backend,
+            projection=projection,
             **sector_kwargs,
         )
         diagnostic = solver.time_reversal_error(

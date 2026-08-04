@@ -1103,6 +1103,92 @@ def test_abelian_one_site_conditional_cc_projects_later_growth_operators():
     assert solver.tensors is None
 
 
+def test_abelian_detached_frames_improve_same_dimension_hubbard_chain():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6, t=0.7, u=2.0)
+    exact = float(_sector_ground_energy(h1e, eri, DummyMol.nelec)[0])
+    abelian_narg.mol = DummyMol()
+
+    plain = abelian_narg.kernel(
+        h1e,
+        eri,
+        D=3,
+        n0=2,
+        nstates=1,
+        growth_sites=1,
+    )[0][0]
+    solver = abelian_narg.NARG(
+        object(),
+        mol=DummyMol(),
+        D=2,
+        chi=12,
+        n0=2,
+        nstates=1,
+        growth_sites=1,
+        dressing="detached_frames",
+    )
+    detached = solver.run(h1e=h1e, eri=eri)[0][0]
+
+    assert exact <= detached + 1.0e-10
+    assert detached < plain - 0.2
+    assert len(solver.detached_history) == 3
+    assert all(item["branch_ranks"] == (2, 2, 2, 2) for item in solver.detached_history)
+    assert all(item["detached_dim"] == 32 for item in solver.detached_history)
+    assert all(item["retained_dim"] <= 12 for item in solver.detached_history)
+    assert all(item["orthogonality_error"] < 1.0e-12 for item in solver.detached_history)
+    assert solver.tensors is None
+
+
+def test_abelian_detached_frames_adapt_rank_from_projected_residual():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6, t=0.7, u=2.0)
+    abelian_narg.mol = DummyMol()
+    common = dict(
+        mol=DummyMol(),
+        D=2,
+        chi=12,
+        n0=2,
+        nstates=1,
+        growth_sites=1,
+        dressing="detached_frames",
+    )
+    fixed = abelian_narg.NARG(object(), **common)
+    fixed_energy = fixed.run(h1e=h1e, eri=eri)[0][0]
+    adaptive = abelian_narg.NARG(
+        object(),
+        **common,
+        frame_adapt_tol=0.1,
+        frame_max_dim=12,
+        frame_expand_dim=1,
+    )
+    adaptive_energy = adaptive.run(h1e=h1e, eri=eri)[0][0]
+
+    assert adaptive_energy < fixed_energy - 0.01
+    assert any(item["adapted_rank"] > 0 for item in adaptive.detached_history)
+    assert all(
+        item["frame_residual_norm"] <= 0.1 + 1.0e-12
+        or item["frame_rank"] == 12
+        for item in adaptive.detached_history
+    )
+    assert all(
+        item["frame_residual_history"][-1]
+        <= item["frame_residual_history"][0] + 1.0e-12
+        for item in adaptive.detached_history
+    )
+
+
 def test_abelian_narg_supersite_hubbard_uses_literal_d16_sites():
     class DummyMol:
         nelec = (2, 2)

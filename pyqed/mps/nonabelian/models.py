@@ -826,13 +826,13 @@ def _we_basis_dense_for_spinfree_order(site_order, middle_irrep):
     return _dense_matrix_from_local_mpo(builder.build())
 
 
-def _spinfree_we_recoupling_coefficients(site_order, *, cutoff=1.0e-12):
+def _reference_spinfree_we_recoupling_coefficients(site_order, *, cutoff=1.0e-12):
     """
-    Return coefficients for the K=0 and K=1 four-spinor WE channels.
+    Dense reference coefficients for the K=0 and K=1 WE channels.
 
     The coefficients are the SU(2) recoupling from pair-coupled
     ``E_pq E_rs`` to the left-associated chain order used by ``AutoMPO``.
-    They are computed once from the local Wigner-Eckart basis and then cached.
+    This determinant-space projection is retained only for validation tests.
     """
     site_order = tuple(int(index) for index in site_order)
     cached = _SPINFREE_WE_RECOUPLING_CACHE.get(site_order)
@@ -857,6 +857,44 @@ def _spinfree_we_recoupling_coefficients(site_order, *, cutoff=1.0e-12):
     )
     _SPINFREE_WE_RECOUPLING_CACHE[site_order] = coeffs
     return coeffs
+
+
+_SPINFREE_WE_CHANNELS = {
+    (0, 1, 2, 3): (2.0, 0.0),
+    (0, 1, 3, 2): (2.0, 0.0),
+    (1, 0, 2, 3): (2.0, 0.0),
+    (1, 0, 3, 2): (2.0, 0.0),
+    (2, 3, 0, 1): (2.0, 0.0),
+    (2, 3, 1, 0): (2.0, 0.0),
+    (3, 2, 0, 1): (2.0, 0.0),
+    (3, 2, 1, 0): (2.0, 0.0),
+    (0, 2, 1, 3): (-1.0, -_SQRT3),
+    (0, 3, 1, 2): (-1.0, -_SQRT3),
+    (1, 2, 0, 3): (-1.0, -_SQRT3),
+    (1, 3, 0, 2): (-1.0, -_SQRT3),
+    (2, 0, 3, 1): (-1.0, -_SQRT3),
+    (2, 1, 3, 0): (-1.0, -_SQRT3),
+    (3, 0, 2, 1): (-1.0, -_SQRT3),
+    (3, 1, 2, 0): (-1.0, -_SQRT3),
+    (0, 2, 3, 1): (-1.0, _SQRT3),
+    (0, 3, 2, 1): (-1.0, _SQRT3),
+    (1, 2, 3, 0): (-1.0, _SQRT3),
+    (1, 3, 2, 0): (-1.0, _SQRT3),
+    (2, 0, 1, 3): (-1.0, _SQRT3),
+    (2, 1, 0, 3): (-1.0, _SQRT3),
+    (3, 0, 1, 2): (-1.0, _SQRT3),
+    (3, 1, 0, 2): (-1.0, _SQRT3),
+}
+
+
+def _spinfree_we_recoupling_coefficients(site_order, *, cutoff=1.0e-12):
+    """Analytic SU(2) recoupling coefficients for four distinct sites."""
+    del cutoff
+    key = tuple(int(index) for index in site_order)
+    try:
+        return _SPINFREE_WE_CHANNELS[key]
+    except KeyError as exc:
+        raise ValueError(f"Expected a permutation of four operator positions, got {key!r}.") from exc
 
 
 def _middle_parity_operators_for_four_sites(sorted_sites, *, phys_leg, dtype):
@@ -1143,9 +1181,11 @@ def _fully_reduced_exchange_order_phase(original_sites):
     return 1.0
 
 
-def _spinfree_exchange_recoupling_coefficients(original_sites, *, cutoff=1.0e-12):
+def _reference_spinfree_exchange_recoupling_coefficients(original_sites, *, cutoff=1.0e-12):
     """
-    Return cached recoupling coefficients for exchange repeated-site products.
+    Dense reference recoupling for exchange repeated-site products.
+
+    This determinant-space projection is retained only for validation tests.
     """
     key = _exchange_recoupling_key(original_sites)
     cached = _SPINFREE_EXCHANGE_RECOUPLING_CACHE.get(key)
@@ -1179,6 +1219,40 @@ def _spinfree_exchange_recoupling_coefficients(original_sites, *, cutoff=1.0e-12
     cached = tuple((coeff, specs[index][3]) for index, coeff in enumerate(coeffs) if abs(coeff) > cutoff)
     _SPINFREE_EXCHANGE_RECOUPLING_CACHE[key] = cached
     return cached
+
+
+_SPINFREE_EXCHANGE_CHANNELS = {
+    (0, 1, 1, 0): ((-1.0, (0, 0)), (-_SQRT3, (2, 2))),
+    (0, 1, 1, 2): ((-1.0, (1, 0, 1)), (_SQRT3, (1, 2, 1))),
+    (0, 1, 2, 0): ((-1.0, (0, 1, 1)), (-_SQRT3, (2, 1, 1))),
+    (0, 2, 1, 0): ((-1.0, (0, 1, 1)), (_SQRT3, (2, 1, 1))),
+    (0, 2, 2, 1): ((-1.0, (1, 1, 0)), (-_SQRT3, (1, 1, 2))),
+    (1, 0, 0, 1): ((-1.0, (0, 0)), (-_SQRT3, (2, 2))),
+    (1, 0, 0, 2): ((-1.0, (0, 1, 1)), (-_SQRT3, (2, 1, 1))),
+    (1, 0, 2, 1): ((-1.0, (1, 0, 1)), (_SQRT3, (1, 2, 1))),
+    (1, 2, 0, 1): ((-1.0, (1, 0, 1)), (-_SQRT3, (1, 2, 1))),
+    (1, 2, 2, 0): ((-1.0, (1, 1, 0)), (_SQRT3, (1, 1, 2))),
+    (2, 0, 0, 1): ((-1.0, (0, 1, 1)), (_SQRT3, (2, 1, 1))),
+    (2, 0, 1, 2): ((-1.0, (1, 1, 0)), (-_SQRT3, (1, 1, 2))),
+    (2, 1, 0, 2): ((-1.0, (1, 1, 0)), (_SQRT3, (1, 1, 2))),
+    (2, 1, 1, 0): ((-1.0, (1, 0, 1)), (-_SQRT3, (1, 2, 1))),
+}
+
+
+def _spinfree_exchange_recoupling_coefficients(original_sites, *, cutoff=1.0e-12):
+    """Analytic SU(2) recoupling for repeated-site exchange strings."""
+    key = _exchange_recoupling_key(original_sites)
+    try:
+        channels = _SPINFREE_EXCHANGE_CHANNELS[key]
+    except KeyError as exc:
+        raise NotImplementedError(
+            f"No scalar reduced exchange recoupling channels for pattern {key!r}."
+        ) from exc
+    return tuple(
+        (coeff, tuple(SU2Irrep(rank) for rank in ranks))
+        for coeff, ranks in channels
+        if abs(coeff) > cutoff
+    )
 
 
 def _site_operator_signature(site_operator, *, cutoff):
@@ -1558,6 +1632,19 @@ class SpatialSpinFreeERIBuilder:
         phys_leg = self.site_legs[0]
         canonical_leg = physical_leg_from_spatial_orbital()
         fully_reduced = phys_leg != canonical_leg
+        if fully_reduced:
+            four_distinct = [
+                tuple(int(index) for index in entry)
+                for entry in np.argwhere(np.abs(values) > cutoff)
+                if len({int(index) for index in entry}) == 4
+            ]
+            if four_distinct:
+                raise NotImplementedError(
+                    "Fully reduced spin-free ERI growth does not yet carry the four-site "
+                    "recoupling data required for four-distinct index strings. Use the "
+                    "canonical spatial SU(2) site basis; determinant-space projection is "
+                    "reserved for validation and is not substituted into the active solver."
+                )
         we_product_terms = 0
         scalar_product_terms = 0
         fully_reduced_density_terms = 0
@@ -1752,6 +1839,120 @@ class SpatialSpinFreeERIBuilder:
         if return_info:
             return factors, info
         return factors
+
+
+def add_cpp_spatial_spinfree_family_terms(
+    autompo,
+    families,
+    *,
+    cutoff=1.0e-12,
+    return_info=False,
+):
+    """
+    Add the canonical spin-free ERI carrier from C++ ``P/Q`` families.
+
+    The compiled SU(2) system has already screened the active-space ERIs,
+    applied the conventional one-half prefactor, and accumulated the
+    ``-delta_qr E_ps`` correction into ``Q``.  This function only converts
+    those C++ family records into the reference rank-coupled carrier used
+    by the current environment implementation; it never revisits the raw
+    four-index integral tensor.
+    """
+
+    if not isinstance(autompo, AutoMPO):
+        raise TypeError(
+            "add_cpp_spatial_spinfree_family_terms expects an AutoMPO."
+        )
+    phys_leg = autompo.site_legs[0]
+    if any(leg != phys_leg for leg in autompo.site_legs):
+        raise ValueError("C++ spin-free family terms require uniform site legs.")
+    if phys_leg != physical_leg_from_spatial_orbital():
+        raise NotImplementedError(
+            "C++ P/Q carrier construction currently requires canonical "
+            "spatial SU(2) sites."
+        )
+
+    p_family = families["P"]
+    q_family = families["Q"]
+    p_entries = getattr(p_family, "entries", p_family)
+    q_entries = getattr(q_family, "entries", q_family)
+    cutoff = float(cutoff)
+    pending_we = {}
+    pending_scalar = {}
+    dtype = np.dtype(float)
+
+    for key, coefficient in p_entries.items():
+        p, q, r, s = (int(index) for index in key)
+        coefficient = float(np.real(coefficient))
+        if abs(coefficient) <= cutoff:
+            continue
+        if len({p, q, r, s}) == 4:
+            _accumulate_four_distinct_spinfree_we_product(
+                pending_we,
+                p,
+                q,
+                r,
+                s,
+                coefficient,
+                cutoff=cutoff,
+            )
+        else:
+            _accumulate_spinfree_component_product_terms(
+                pending_scalar,
+                p,
+                q,
+                r,
+                s,
+                coefficient,
+                dtype=dtype,
+                cutoff=cutoff,
+            )
+
+    we_product_terms = _emit_shared_spinfree_we_terms(
+        autompo,
+        pending_we,
+        phys_leg=phys_leg,
+        dtype=dtype,
+        cutoff=cutoff,
+        family="P",
+    )
+    scalar_product_terms = _emit_shared_scalar_product_terms(
+        autompo,
+        pending_scalar,
+        cutoff=cutoff,
+        family="P",
+    )
+
+    correction = np.zeros(
+        (len(autompo.site_legs), len(autompo.site_legs)),
+        dtype=float,
+    )
+    for key, coefficient in q_entries.items():
+        p, s, _q = (int(index) for index in key)
+        correction[p, s] += float(np.real(coefficient))
+    correction_terms = int(np.count_nonzero(np.abs(correction) > cutoff))
+    if correction_terms:
+        add_spatial_one_body_terms(
+            autompo,
+            correction,
+            cutoff=cutoff,
+            family="Q",
+            split_fully_reduced=False,
+        )
+
+    info = {
+        "total_terms": int(
+            we_product_terms + scalar_product_terms + correction_terms
+        ),
+        "we_product_terms": int(we_product_terms),
+        "scalar_product_terms": int(scalar_product_terms),
+        "fully_reduced_density_terms": 0,
+        "fully_reduced_density_bilinear_terms": 0,
+        "fully_reduced_pair_terms": 0,
+        "fully_reduced_exchange_terms": 0,
+        "one_body_correction_terms": int(correction_terms),
+    }
+    return info if return_info else info["total_terms"]
 
 
 def add_spatial_spinfree_eri_terms(

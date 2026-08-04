@@ -23,7 +23,7 @@ from numpy.polynomial.legendre import leggauss
 from scipy.integrate import quad
 from scipy.linalg import eig, expm, expm_frechet
 from scipy.optimize import brentq, minimize
-from scipy.special import i0e
+from scipy.special import i0e, j0
 
 from .cletta import cletta_memory_matrices
 
@@ -288,6 +288,34 @@ class GaussianPotentialBoseGas2D:
             -0.5 * (self.interaction_range * momentum) ** 2
         )
         return _scalar_if_scalar(values, momentum)
+
+    def interaction_real_space(self, distance):
+        r"""Return the real-space Gaussian potential.
+
+        The Fourier convention is
+
+        $$
+        V(k)=\int d^2r\,e^{-i\mathbf k\cdot\mathbf r}V(r),
+        $$
+
+        so that
+
+        $$
+        V(r)=\frac{g}{2\pi\sigma^2}
+        \exp\left(-\frac{r^2}{2\sigma^2}\right).
+        $$
+        """
+        distance_array = np.asarray(distance, dtype=float)
+        if np.any(distance_array < 0.0):
+            raise ValueError("radial distance must be non-negative.")
+        values = (
+            self.interaction_strength
+            / (2.0 * np.pi * self.interaction_range**2)
+            * np.exp(
+                -0.5 * (distance_array / self.interaction_range) ** 2
+            )
+        )
+        return _scalar_if_scalar(values, distance_array)
 
     def density_transfer_profile(self, momentum):
         r"""Return the single radial channel ``u(q)`` with ``V(q)=|u(q)|^2``."""
@@ -780,6 +808,2089 @@ class GaussianPotentialBoseGas2D:
         return self.squeezing_amplitude * self.squeezing(
             self.squeezing_momentum_scale * np.asarray(momentum, dtype=float)
         )
+
+
+@dataclass
+class JastrowHNC2D:
+    r"""Thermodynamic-limit HNC/0 contraction of a scalar 2D Jastrow state.
+
+    The wavefunction is
+
+    $$
+    \Psi(X)=\exp\left[-\sum_{i<j}u(r_{ij})\right]\Phi_0(X),
+    $$
+
+    where ``Phi_0`` is the uniform condensate.  For the probability density
+    ``|Psi|**2``, the HNC/0 closure and the Ornstein--Zernike equation are
+
+    $$
+    g(r)=\exp[-2u(r)+\gamma(r)],\qquad
+    c(r)=g(r)-1-\gamma(r),
+    $$
+
+    $$
+    \widetilde\gamma(k)
+    =\frac{n\widetilde c(k)^2}{1-n\widetilde c(k)}.
+    $$
+
+    All transforms are direct radial continuum quadratures,
+
+    $$
+    \widetilde f(k)=2\pi\int_0^\infty r\,dr\,J_0(kr)f(r).
+    $$
+
+    Finite radial and momentum cutoffs are numerical quadrature controls, not
+    a finite physical box.  The solver works directly at fixed density in the
+    thermodynamic limit.
+    """
+
+    density: float
+    jastrow_exponent: object
+    jastrow_laplacian: object
+    potential: object
+    kinetic_prefactor: float = 1.0
+    radial_cutoff: float = 12.0
+    momentum_cutoff: float = 12.0
+    quadrature_points: int = 192
+    mixing: float = 0.25
+    tolerance: float = 1.0e-9
+    maxiter: int = 2000
+
+    def __post_init__(self):
+        self.density = float(self.density)
+        self.kinetic_prefactor = float(self.kinetic_prefactor)
+        self.radial_cutoff = float(self.radial_cutoff)
+        self.momentum_cutoff = float(self.momentum_cutoff)
+        self.quadrature_points = int(self.quadrature_points)
+        self.mixing = float(self.mixing)
+        self.tolerance = float(self.tolerance)
+        self.maxiter = int(self.maxiter)
+        if self.density <= 0.0:
+            raise ValueError("density must be positive.")
+        if self.kinetic_prefactor <= 0.0:
+            raise ValueError("kinetic_prefactor must be positive.")
+        if self.radial_cutoff <= 0.0 or self.momentum_cutoff <= 0.0:
+            raise ValueError("HNC quadrature cutoffs must be positive.")
+        if self.quadrature_points < 32:
+            raise ValueError("quadrature_points must be at least 32.")
+        if not (0.0 < self.mixing <= 1.0):
+            raise ValueError("mixing must lie in (0, 1].")
+        if self.tolerance <= 0.0:
+            raise ValueError("tolerance must be positive.")
+        if self.maxiter < 1:
+            raise ValueError("maxiter must be positive.")
+        for name in ("jastrow_exponent", "jastrow_laplacian", "potential"):
+            if not callable(getattr(self, name)):
+                raise TypeError(f"{name} must be callable.")
+
+    @classmethod
+    def gaussian(
+        cls,
+        model,
+        *,
+        jastrow_amplitude,
+        jastrow_range,
+        radial_cutoff=None,
+        momentum_cutoff=None,
+        quadrature_points=192,
+        mixing=0.25,
+        tolerance=1.0e-9,
+        maxiter=2000,
+    ):
+        r"""Construct ``u(r)=a exp[-r**2/(2 xi**2)]`` for a Gaussian model."""
+        if not isinstance(model, GaussianPotentialBoseGas2D):
+            raise TypeError("model must be GaussianPotentialBoseGas2D.")
+        amplitude = float(jastrow_amplitude)
+        correlation_range = float(jastrow_range)
+        if amplitude < 0.0 or not np.isfinite(amplitude):
+            raise ValueError("jastrow_amplitude must be finite and non-negative.")
+        if correlation_range <= 0.0 or not np.isfinite(correlation_range):
+            raise ValueError("jastrow_range must be finite and positive.")
+        shortest_range = min(model.interaction_range, correlation_range)
+        longest_range = max(model.interaction_range, correlation_range)
+        mean_spacing = 1.0 / np.sqrt(model.density)
+        if radial_cutoff is None:
+            radial_cutoff = max(10.0 * longest_range, 8.0 * mean_spacing)
+        if momentum_cutoff is None:
+            momentum_cutoff = max(
+                12.0 / shortest_range,
+                8.0 / mean_spacing,
+            )
+
+        def exponent(distance):
+            distance_array = np.asarray(distance, dtype=float)
+            return amplitude * np.exp(
+                -0.5 * (distance_array / correlation_range) ** 2
+            )
+
+        def laplacian(distance):
+            distance_array = np.asarray(distance, dtype=float)
+            gaussian = np.exp(
+                -0.5 * (distance_array / correlation_range) ** 2
+            )
+            return (
+                amplitude
+                * (
+                    distance_array**2 / correlation_range**4
+                    - 2.0 / correlation_range**2
+                )
+                * gaussian
+            )
+
+        solver = cls(
+            density=model.density,
+            jastrow_exponent=exponent,
+            jastrow_laplacian=laplacian,
+            potential=model.interaction_real_space,
+            kinetic_prefactor=model.kinetic_prefactor,
+            radial_cutoff=radial_cutoff,
+            momentum_cutoff=momentum_cutoff,
+            quadrature_points=quadrature_points,
+            mixing=mixing,
+            tolerance=tolerance,
+            maxiter=maxiter,
+        )
+        solver.model = model
+        solver.jastrow_amplitude = amplitude
+        solver.jastrow_range = correlation_range
+        return solver
+
+    def _build_quadrature(self):
+        nodes, weights = leggauss(self.quadrature_points)
+        self.radii = 0.5 * self.radial_cutoff * (nodes + 1.0)
+        self.radial_weights = 0.5 * self.radial_cutoff * weights
+        self.momenta = 0.5 * self.momentum_cutoff * (nodes + 1.0)
+        self.momentum_weights = 0.5 * self.momentum_cutoff * weights
+        bessel = j0(self.momenta[:, None] * self.radii[None, :])
+        self._forward_hankel = (
+            2.0
+            * np.pi
+            * bessel
+            * (self.radial_weights * self.radii)[None, :]
+        )
+        self._inverse_hankel = (
+            bessel.T
+            * (self.momentum_weights * self.momenta)[None, :]
+            / (2.0 * np.pi)
+        )
+
+    def forward_hankel(self, radial_values):
+        """Apply the finite-cutoff 2D radial Fourier transform."""
+        radial_values = np.asarray(radial_values, dtype=float)
+        if radial_values.shape != self.radii.shape:
+            raise ValueError("radial_values must match the HNC radial grid.")
+        return self._forward_hankel @ radial_values
+
+    def inverse_hankel(self, momentum_values):
+        """Apply the inverse finite-cutoff 2D radial Fourier transform."""
+        momentum_values = np.asarray(momentum_values, dtype=float)
+        if momentum_values.shape != self.momenta.shape:
+            raise ValueError("momentum_values must match the HNC momentum grid.")
+        return self._inverse_hankel @ momentum_values
+
+    def solve(self):
+        """Iterate the HNC/0 equations and populate intensive observables."""
+        self._build_quadrature()
+        exponent = np.asarray(self.jastrow_exponent(self.radii), dtype=float)
+        laplacian = np.asarray(self.jastrow_laplacian(self.radii), dtype=float)
+        potential = np.asarray(self.potential(self.radii), dtype=float)
+        for name, values in (
+            ("jastrow_exponent", exponent),
+            ("jastrow_laplacian", laplacian),
+            ("potential", potential),
+        ):
+            if values.shape != self.radii.shape:
+                try:
+                    values = np.broadcast_to(values, self.radii.shape)
+                except ValueError as error:
+                    raise ValueError(
+                        f"{name} must return values compatible with the radial grid."
+                    ) from error
+            if np.any(~np.isfinite(values)):
+                raise ValueError(f"{name} returned non-finite values.")
+            if name == "jastrow_exponent":
+                exponent = np.asarray(values)
+            elif name == "jastrow_laplacian":
+                laplacian = np.asarray(values)
+            else:
+                potential = np.asarray(values)
+
+        gamma = np.zeros_like(self.radii)
+        converged = False
+        residual = np.inf
+        minimum_oz_denominator = np.inf
+        for iteration in range(1, self.maxiter + 1):
+            closure_argument = np.clip(-2.0 * exponent + gamma, -700.0, 80.0)
+            pair_distribution = np.exp(closure_argument)
+            direct_correlation = pair_distribution - 1.0 - gamma
+            direct_momentum = self.forward_hankel(direct_correlation)
+            denominator = 1.0 - self.density * direct_momentum
+            minimum_oz_denominator = float(np.min(denominator))
+            if minimum_oz_denominator <= 0.0:
+                self.success = False
+                self.message = (
+                    "the HNC Ornstein-Zernike denominator became non-positive"
+                )
+                self.iterations = iteration
+                self.residual = float(np.inf)
+                self.minimum_oz_denominator = minimum_oz_denominator
+                return self
+            gamma_momentum = (
+                self.density
+                * direct_momentum**2
+                / denominator
+            )
+            updated_gamma = self.inverse_hankel(gamma_momentum)
+            residual = float(
+                np.max(np.abs(updated_gamma - gamma))
+                / max(1.0, float(np.max(np.abs(updated_gamma))))
+            )
+            gamma = (
+                (1.0 - self.mixing) * gamma
+                + self.mixing * updated_gamma
+            )
+            if residual < self.tolerance:
+                converged = True
+                break
+
+        closure_argument = np.clip(-2.0 * exponent + gamma, -700.0, 80.0)
+        pair_distribution = np.exp(closure_argument)
+        total_correlation = pair_distribution - 1.0
+        direct_correlation = total_correlation - gamma
+        direct_momentum = self.forward_hankel(direct_correlation)
+        denominator = 1.0 - self.density * direct_momentum
+        total_momentum = direct_momentum / denominator
+        gamma_momentum = total_momentum - direct_momentum
+        updated_gamma = self.inverse_hankel(gamma_momentum)
+
+        area_weights = 2.0 * np.pi * self.radial_weights * self.radii
+        kinetic_density = (
+            0.5
+            * self.kinetic_prefactor
+            * self.density**2
+            * float(area_weights @ (pair_distribution * laplacian))
+        )
+        potential_density = (
+            0.5
+            * self.density**2
+            * float(area_weights @ (pair_distribution * potential))
+        )
+
+        self.jastrow_exponent_values = exponent
+        self.jastrow_laplacian_values = laplacian
+        self.potential_values = potential
+        self.nodal_correlation = gamma
+        self.direct_correlation = direct_correlation
+        self.total_correlation = total_correlation
+        self.pair_distribution = pair_distribution
+        self.direct_correlation_momentum = direct_momentum
+        self.total_correlation_momentum = total_momentum
+        self.structure_factor = 1.0 + self.density * total_momentum
+        self.iterations = iteration
+        self.residual = residual
+        self.fixed_point_residual = float(
+            np.max(np.abs(updated_gamma - gamma))
+            / max(1.0, float(np.max(np.abs(updated_gamma))))
+        )
+        self.minimum_oz_denominator = float(np.min(denominator))
+        self.kinetic_energy_density = float(kinetic_density)
+        self.potential_energy_density = float(potential_density)
+        self.energy_density = float(kinetic_density + potential_density)
+        self.energy_per_particle = self.energy_density / self.density
+        self.success = bool(
+            converged
+            and np.all(np.isfinite(self.structure_factor))
+            and np.min(self.structure_factor) > 0.0
+            and np.isfinite(self.energy_density)
+        )
+        self.message = (
+            "HNC/0 converged"
+            if self.success
+            else "HNC/0 did not converge within maxiter"
+        )
+        return self
+
+
+@dataclass
+class HNCELBoseGas2D:
+    r"""Functionally optimized scalar HNC-EL/0 state in two dimensions.
+
+    The Euler equation is solved in its particle-hole form,
+
+    $$
+    S(k)=\left[1+\frac{2V_{\rm ph}(k)}{\epsilon_k}\right]^{-1/2},
+    $$
+
+    with
+
+    $$
+    \begin{aligned}
+    V_{\rm ph}(r)={}&g(r)V(r)
+    +2\lambda|\nabla\sqrt{g(r)}|^2\\
+    &+[g(r)-1]w_I(r),
+    \end{aligned}
+    $$
+
+    $$
+    w_I(k)=-\epsilon_k
+    \left(1-\frac1{S(k)}\right)^2
+    \left(S(k)+\frac12\right).
+    $$
+
+    No functional form or infrared coefficient is prescribed for the Jastrow
+    correlation.  After convergence it is reconstructed from the HNC closure.
+    """
+
+    model: object
+    radial_cutoff: float | None = None
+    momentum_cutoff: float | None = None
+    quadrature_points: int = 192
+    mixing: float = 0.05
+    tolerance: float = 1.0e-9
+    maxiter: int = 4000
+
+    def __post_init__(self):
+        if not isinstance(self.model, GaussianPotentialBoseGas2D):
+            raise TypeError("model must be GaussianPotentialBoseGas2D.")
+        mean_spacing = 1.0 / np.sqrt(self.model.density)
+        if self.radial_cutoff is None:
+            self.radial_cutoff = max(
+                25.0 * self.model.interaction_range,
+                25.0 * mean_spacing,
+            )
+        if self.momentum_cutoff is None:
+            self.momentum_cutoff = max(
+                24.0 / self.model.interaction_range,
+                20.0 / mean_spacing,
+            )
+        self.radial_cutoff = float(self.radial_cutoff)
+        self.momentum_cutoff = float(self.momentum_cutoff)
+        self.quadrature_points = int(self.quadrature_points)
+        self.mixing = float(self.mixing)
+        self.tolerance = float(self.tolerance)
+        self.maxiter = int(self.maxiter)
+        if self.radial_cutoff <= 0.0 or self.momentum_cutoff <= 0.0:
+            raise ValueError("HNC-EL quadrature cutoffs must be positive.")
+        if self.quadrature_points < 64:
+            raise ValueError("quadrature_points must be at least 64.")
+        if not (0.0 < self.mixing <= 1.0):
+            raise ValueError("mixing must lie in (0, 1].")
+        if self.tolerance <= 0.0 or self.maxiter < 1:
+            raise ValueError("invalid HNC-EL convergence controls.")
+
+    def _build_quadrature(self):
+        nodes, weights = leggauss(self.quadrature_points)
+        self.radii = 0.5 * self.radial_cutoff * (nodes + 1.0)
+        self.radial_weights = 0.5 * self.radial_cutoff * weights
+        self.momenta = 0.5 * self.momentum_cutoff * (nodes + 1.0)
+        self.momentum_weights = 0.5 * self.momentum_cutoff * weights
+        bessel = j0(self.momenta[:, None] * self.radii[None, :])
+        self._forward_hankel = (
+            2.0
+            * np.pi
+            * bessel
+            * (self.radial_weights * self.radii)[None, :]
+        )
+        self._inverse_hankel = (
+            bessel.T
+            * (self.momentum_weights * self.momenta)[None, :]
+            / (2.0 * np.pi)
+        )
+        self._area_weights = (
+            2.0 * np.pi * self.radial_weights * self.radii
+        )
+
+    def solve(self):
+        """Solve the unrestricted HNC-EL/0 Euler equation."""
+        self._build_quadrature()
+        density = self.model.density
+        kinetic_prefactor = self.model.kinetic_prefactor
+        dispersion = kinetic_prefactor * self.momenta**2
+        potential = np.asarray(
+            self.model.interaction_real_space(self.radii),
+            dtype=float,
+        )
+        structure = np.asarray(
+            self.model.static_structure_factor(self.momenta),
+            dtype=float,
+        )
+        converged = False
+        residual = np.inf
+
+        for iteration in range(1, self.maxiter + 1):
+            total_correlation = self._inverse_hankel @ (
+                (structure - 1.0) / density
+            )
+            pair_distribution = 1.0 + total_correlation
+            if np.min(pair_distribution) <= 0.0:
+                self.success = False
+                self.message = "HNC-EL produced a non-positive pair distribution"
+                self.iterations = iteration
+                return self
+            pair_amplitude = np.sqrt(pair_distribution)
+            pair_amplitude_derivative = np.gradient(
+                pair_amplitude,
+                self.radii,
+                edge_order=2,
+            )
+            induced_momentum = (
+                -dispersion
+                * (1.0 - 1.0 / structure) ** 2
+                * (structure + 0.5)
+            )
+            induced_real = self._inverse_hankel @ induced_momentum
+            particle_hole_real = (
+                pair_distribution * potential
+                + 2.0
+                * kinetic_prefactor
+                * pair_amplitude_derivative**2
+                + total_correlation * induced_real
+            )
+            particle_hole_momentum = (
+                self._forward_hankel @ particle_hole_real
+            )
+            euler_argument = (
+                1.0 + 2.0 * particle_hole_momentum / dispersion
+            )
+            if np.min(euler_argument) <= 0.0:
+                self.success = False
+                self.message = "the HNC-EL particle-hole spectrum became unstable"
+                self.iterations = iteration
+                return self
+            updated_structure = 1.0 / np.sqrt(euler_argument)
+            residual = float(
+                np.max(
+                    np.abs(updated_structure - structure)
+                    / np.maximum(updated_structure, 5.0e-2)
+                )
+            )
+            structure = (
+                (1.0 - self.mixing) * structure
+                + self.mixing * updated_structure
+            )
+            if residual < self.tolerance:
+                converged = True
+                break
+
+        total_correlation = self._inverse_hankel @ (
+            (structure - 1.0) / density
+        )
+        pair_distribution = 1.0 + total_correlation
+        nodal_correlation = self._inverse_hankel @ (
+            (structure - 1.0) ** 2 / (density * structure)
+        )
+        jastrow_exponent = 0.5 * (
+            nodal_correlation - np.log(pair_distribution)
+        )
+        pair_derivative = np.gradient(
+            pair_distribution,
+            self.radii,
+            edge_order=2,
+        )
+        jastrow_derivative = np.gradient(
+            jastrow_exponent,
+            self.radii,
+            edge_order=2,
+        )
+        kinetic_density = (
+            -0.5
+            * kinetic_prefactor
+            * density**2
+            * float(
+                self._area_weights
+                @ (pair_derivative * jastrow_derivative)
+            )
+        )
+        potential_density = (
+            0.5
+            * density**2
+            * float(self._area_weights @ (pair_distribution * potential))
+        )
+        tail_slice = slice(
+            int(0.55 * self.radii.size),
+            int(0.9 * self.radii.size),
+        )
+        tail_amplitudes = (
+            self.radii[tail_slice] * jastrow_exponent[tail_slice]
+        )
+        low_points = min(8, self.momenta.size)
+        infrared_fit = np.polyfit(
+            np.log(self.momenta[:low_points]),
+            np.log(structure[:low_points]),
+            1,
+        )
+        infrared_ratios = (
+            structure[:low_points] / self.momenta[:low_points]
+        )
+
+        self.structure_factor = structure
+        self.total_correlation = total_correlation
+        self.pair_distribution = pair_distribution
+        self.nodal_correlation = nodal_correlation
+        self.jastrow_exponent = jastrow_exponent
+        self.induced_interaction_momentum = induced_momentum
+        self.induced_interaction = induced_real
+        self.particle_hole_interaction_momentum = particle_hole_momentum
+        self.particle_hole_interaction = particle_hole_real
+        self.kinetic_energy_density = float(kinetic_density)
+        self.potential_energy_density = float(potential_density)
+        self.energy_density = float(kinetic_density + potential_density)
+        self.energy_per_particle = self.energy_density / density
+        self.iterations = iteration
+        self.euler_residual = residual
+        self.infrared_exponent = float(infrared_fit[0])
+        self.infrared_slope = float(np.mean(infrared_ratios))
+        self.infrared_slope_relative_spread = float(
+            np.std(infrared_ratios) / np.mean(infrared_ratios)
+        )
+        self.jastrow_tail_amplitude = float(np.median(tail_amplitudes))
+        self.success = bool(
+            converged
+            and np.min(pair_distribution) > 0.0
+            and np.isfinite(self.energy_density)
+        )
+        self.message = (
+            "HNC-EL/0 converged"
+            if self.success
+            else "HNC-EL/0 did not converge within maxiter"
+        )
+        return self
+
+
+@dataclass
+class D2TripletHNC2D(JastrowHNC2D):
+    r"""Leading connected ``D=2`` virtual-cumulant extension of HNC/0.
+
+    With the virtual boundary functional
+
+    $$
+    \omega(A)=\langle\uparrow|A|\uparrow\rangle
+    $$
+
+    and
+
+    $$
+    K(r)=u(r)\sigma_z+x(r)\tau_x,
+    \qquad \tau_x^2=sI,
+    $$
+
+    the first two symmetrized virtual cumulants are
+
+    $$
+    \kappa_1[K(r)]=u(r),\qquad
+    \kappa_2[K(r),K(s)]=s\,x(r)x(s).
+    $$
+
+    Here ``s=+1`` corresponds to ``tau_x=sigma_x`` and ``s=-1`` to
+    ``tau_x=i sigma_x``.  Keeping only spatially connected pairs of edges
+    gives the triplet kernel
+
+    $$
+    w_3(1,2,3)=s[x_{12}x_{13}+x_{12}x_{23}+x_{13}x_{23}].
+    $$
+
+    The pair distribution is contracted with the HNC/3 closure
+
+    $$
+    g_{12}=\exp\left[
+    -2u_{12}+\gamma_{12}
+    +2n\int d^2r_3\,w_3(1,2,3)g_{13}g_{23}
+    \right].
+    $$
+
+    This is a Kirkwood-triplet closure: it works directly in the
+    thermodynamic continuum and resums the pair HNC chains, but it is not an
+    exact contraction of all triplet and elementary diagrams.
+    """
+
+    transverse_profile: object = None
+    transverse_derivative: object = None
+    transverse_laplacian: object = None
+    virtual_metric: float = -1.0
+    angular_points: int = 24
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.virtual_metric = float(self.virtual_metric)
+        self.angular_points = int(self.angular_points)
+        if self.virtual_metric not in (-1.0, 1.0):
+            raise ValueError("virtual_metric must be either -1 or +1.")
+        if self.angular_points < 8:
+            raise ValueError("angular_points must be at least eight.")
+        for name in (
+            "transverse_profile",
+            "transverse_derivative",
+            "transverse_laplacian",
+        ):
+            if not callable(getattr(self, name)):
+                raise TypeError(f"{name} must be callable.")
+
+    @classmethod
+    def gaussian(
+        cls,
+        model,
+        *,
+        jastrow_amplitude,
+        jastrow_range,
+        transverse_amplitude,
+        transverse_range,
+        virtual_metric=-1.0,
+        radial_cutoff=None,
+        momentum_cutoff=None,
+        quadrature_points=128,
+        angular_points=24,
+        mixing=0.15,
+        tolerance=1.0e-8,
+        maxiter=2000,
+    ):
+        """Construct Gaussian pair and transverse virtual profiles."""
+        if not isinstance(model, GaussianPotentialBoseGas2D):
+            raise TypeError("model must be GaussianPotentialBoseGas2D.")
+        pair_amplitude = float(jastrow_amplitude)
+        pair_range = float(jastrow_range)
+        transverse_amplitude = float(transverse_amplitude)
+        transverse_range = float(transverse_range)
+        if pair_amplitude < 0.0 or not np.isfinite(pair_amplitude):
+            raise ValueError("jastrow_amplitude must be finite and non-negative.")
+        if pair_range <= 0.0 or not np.isfinite(pair_range):
+            raise ValueError("jastrow_range must be finite and positive.")
+        if transverse_amplitude < 0.0 or not np.isfinite(transverse_amplitude):
+            raise ValueError(
+                "transverse_amplitude must be finite and non-negative."
+            )
+        if transverse_range <= 0.0 or not np.isfinite(transverse_range):
+            raise ValueError("transverse_range must be finite and positive.")
+        active_ranges = [model.interaction_range, pair_range]
+        if transverse_amplitude > 0.0:
+            active_ranges.append(transverse_range)
+        shortest_range = min(active_ranges)
+        longest_range = max(active_ranges)
+        mean_spacing = 1.0 / np.sqrt(model.density)
+        if radial_cutoff is None:
+            radial_cutoff = max(10.0 * longest_range, 8.0 * mean_spacing)
+        if momentum_cutoff is None:
+            momentum_cutoff = max(
+                12.0 / shortest_range,
+                8.0 / mean_spacing,
+            )
+
+        def gaussian_profile(distance, amplitude, correlation_range):
+            distance_array = np.asarray(distance, dtype=float)
+            return amplitude * np.exp(
+                -0.5 * (distance_array / correlation_range) ** 2
+            )
+
+        def pair_exponent(distance):
+            return gaussian_profile(distance, pair_amplitude, pair_range)
+
+        def pair_laplacian(distance):
+            distance_array = np.asarray(distance, dtype=float)
+            values = gaussian_profile(distance_array, pair_amplitude, pair_range)
+            return (
+                distance_array**2 / pair_range**4
+                - 2.0 / pair_range**2
+            ) * values
+
+        def transverse(distance):
+            return gaussian_profile(
+                distance,
+                transverse_amplitude,
+                transverse_range,
+            )
+
+        def transverse_derivative(distance):
+            distance_array = np.asarray(distance, dtype=float)
+            return (
+                -distance_array
+                / transverse_range**2
+                * transverse(distance_array)
+            )
+
+        def transverse_laplacian(distance):
+            distance_array = np.asarray(distance, dtype=float)
+            return (
+                distance_array**2 / transverse_range**4
+                - 2.0 / transverse_range**2
+            ) * transverse(distance_array)
+
+        solver = cls(
+            density=model.density,
+            jastrow_exponent=pair_exponent,
+            jastrow_laplacian=pair_laplacian,
+            potential=model.interaction_real_space,
+            kinetic_prefactor=model.kinetic_prefactor,
+            radial_cutoff=radial_cutoff,
+            momentum_cutoff=momentum_cutoff,
+            quadrature_points=quadrature_points,
+            mixing=mixing,
+            tolerance=tolerance,
+            maxiter=maxiter,
+            transverse_profile=transverse,
+            transverse_derivative=transverse_derivative,
+            transverse_laplacian=transverse_laplacian,
+            virtual_metric=virtual_metric,
+            angular_points=angular_points,
+        )
+        solver.model = model
+        solver.jastrow_amplitude = pair_amplitude
+        solver.jastrow_range = pair_range
+        solver.transverse_amplitude = transverse_amplitude
+        solver.transverse_range = transverse_range
+        return solver
+
+    def virtual_kernel(self, distance):
+        """Return the explicit ``2 x 2`` virtual generator ``K(r)``."""
+        distance_array = np.asarray(distance, dtype=float)
+        pair = np.asarray(self.jastrow_exponent(distance_array), dtype=float)
+        transverse = np.asarray(
+            self.transverse_profile(distance_array),
+            dtype=float,
+        )
+        output = np.zeros(distance_array.shape + (2, 2), dtype=np.complex128)
+        output[..., 0, 0] = pair
+        output[..., 1, 1] = -pair
+        off_diagonal = (
+            transverse
+            if self.virtual_metric > 0.0
+            else 1.0j * transverse
+        )
+        output[..., 0, 1] = off_diagonal
+        output[..., 1, 0] = off_diagonal
+        return output
+
+    def connected_virtual_cumulant(self, first_distance, second_distance):
+        """Return the symmetrized second virtual cumulant."""
+        first = np.asarray(self.transverse_profile(first_distance), dtype=float)
+        second = np.asarray(
+            self.transverse_profile(second_distance),
+            dtype=float,
+        )
+        return self.virtual_metric * first * second
+
+    def triplet_kernel(self, first, second, third):
+        """Return the connected scalar kernel ``w_3`` for three distances."""
+        first_value = np.asarray(self.transverse_profile(first), dtype=float)
+        second_value = np.asarray(self.transverse_profile(second), dtype=float)
+        third_value = np.asarray(self.transverse_profile(third), dtype=float)
+        return self.virtual_metric * (
+            first_value * second_value
+            + first_value * third_value
+            + second_value * third_value
+        )
+
+    def triplet_total_laplacian(self, first, second, third):
+        r"""Return ``(nabla_1^2+nabla_2^2+nabla_3^2) w_3``."""
+        first, second, third = np.broadcast_arrays(
+            np.asarray(first, dtype=float),
+            np.asarray(second, dtype=float),
+            np.asarray(third, dtype=float),
+        )
+        first_profile = np.asarray(self.transverse_profile(first), dtype=float)
+        second_profile = np.asarray(self.transverse_profile(second), dtype=float)
+        third_profile = np.asarray(self.transverse_profile(third), dtype=float)
+        first_derivative = np.asarray(
+            self.transverse_derivative(first),
+            dtype=float,
+        )
+        second_derivative = np.asarray(
+            self.transverse_derivative(second),
+            dtype=float,
+        )
+        third_derivative = np.asarray(
+            self.transverse_derivative(third),
+            dtype=float,
+        )
+        first_laplacian = np.asarray(
+            self.transverse_laplacian(first),
+            dtype=float,
+        )
+        second_laplacian = np.asarray(
+            self.transverse_laplacian(second),
+            dtype=float,
+        )
+        third_laplacian = np.asarray(
+            self.transverse_laplacian(third),
+            dtype=float,
+        )
+
+        def triangle_cosine(side_a, side_b, opposite):
+            denominator = 2.0 * side_a * side_b
+            return np.clip(
+                np.divide(
+                    side_a**2 + side_b**2 - opposite**2,
+                    denominator,
+                    out=np.zeros_like(denominator),
+                    where=denominator > 1.0e-14,
+                ),
+                -1.0,
+                1.0,
+            )
+
+        cosine_one = triangle_cosine(first, second, third)
+        cosine_two = triangle_cosine(first, third, second)
+        cosine_three = triangle_cosine(second, third, first)
+
+        def edge_pair_laplacian(
+            profile_a,
+            profile_b,
+            derivative_a,
+            derivative_b,
+            laplacian_a,
+            laplacian_b,
+            cosine,
+        ):
+            return 2.0 * (
+                laplacian_a * profile_b
+                + profile_a * laplacian_b
+                + derivative_a * derivative_b * cosine
+            )
+
+        values = (
+            edge_pair_laplacian(
+                first_profile,
+                second_profile,
+                first_derivative,
+                second_derivative,
+                first_laplacian,
+                second_laplacian,
+                cosine_one,
+            )
+            + edge_pair_laplacian(
+                first_profile,
+                third_profile,
+                first_derivative,
+                third_derivative,
+                first_laplacian,
+                third_laplacian,
+                cosine_two,
+            )
+            + edge_pair_laplacian(
+                second_profile,
+                third_profile,
+                second_derivative,
+                third_derivative,
+                second_laplacian,
+                third_laplacian,
+                cosine_three,
+            )
+        )
+        return _scalar_if_scalar(self.virtual_metric * values, first)
+
+    def _build_triplet_geometry(self):
+        angular_nodes, angular_weights = leggauss(self.angular_points)
+        angles = np.pi * (angular_nodes + 1.0)
+        angular_weights = np.pi * angular_weights
+        cosines = np.cos(angles)
+        first = self.radii[:, None, None]
+        second = self.radii[None, :, None]
+        cosine = cosines[None, None, :]
+        third = np.sqrt(
+            np.maximum(
+                first**2 + second**2 - 2.0 * first * second * cosine,
+                0.0,
+            )
+        )
+
+        first_profile = np.asarray(self.transverse_profile(first), dtype=float)
+        second_profile = np.asarray(self.transverse_profile(second), dtype=float)
+        third_profile = np.asarray(self.transverse_profile(third), dtype=float)
+        triplet_kernel = self.virtual_metric * (
+            first_profile * second_profile
+            + first_profile * third_profile
+            + second_profile * third_profile
+        )
+
+        self.triplet_angles = angles
+        self.triplet_angular_weights = angular_weights
+        self._triplet_third_distance = third
+        self._triplet_kernel_values = triplet_kernel
+        self._triplet_laplacian_values = self.triplet_total_laplacian(
+            first,
+            second,
+            third,
+        )
+        self._triplet_inner_weights = (
+            (self.radial_weights * self.radii)[None, :, None]
+            * angular_weights[None, None, :]
+        )
+        self._triplet_full_weights = (
+            (2.0 * np.pi * self.radial_weights * self.radii)[:, None, None]
+            * self._triplet_inner_weights
+        )
+
+    def _pair_at_triplet_distance(self, pair_distribution):
+        return np.interp(
+            self._triplet_third_distance.ravel(),
+            self.radii,
+            pair_distribution,
+            left=float(pair_distribution[0]),
+            right=1.0,
+        ).reshape(self._triplet_third_distance.shape)
+
+    def _triplet_closure(self, pair_distribution):
+        pair_second = pair_distribution[None, :, None]
+        pair_third = self._pair_at_triplet_distance(pair_distribution)
+        integral = np.sum(
+            self._triplet_inner_weights
+            * self._triplet_kernel_values
+            * pair_second
+            * pair_third,
+            axis=(1, 2),
+        )
+        return 2.0 * self.density * integral
+
+    def _triplet_laplacian_integral(self, pair_distribution):
+        pair_first = pair_distribution[:, None, None]
+        pair_second = pair_distribution[None, :, None]
+        pair_third = self._pair_at_triplet_distance(pair_distribution)
+        return float(
+            np.sum(
+                self._triplet_full_weights
+                * pair_first
+                * pair_second
+                * pair_third
+                * self._triplet_laplacian_values
+            )
+        )
+
+    def solve(self):
+        """Solve the self-consistent thermodynamic HNC/3 equations."""
+        if getattr(self, "transverse_amplitude", None) == 0.0:
+            super().solve()
+            self.triplet_closure = np.zeros_like(self.radii)
+            self.triplet_kinetic_energy_density = 0.0
+            self.pair_kinetic_energy_density = self.kinetic_energy_density
+            self.message = self.message.replace("HNC/0", "HNC/3")
+            return self
+
+        self._build_quadrature()
+        self._build_triplet_geometry()
+        exponent = np.asarray(self.jastrow_exponent(self.radii), dtype=float)
+        laplacian = np.asarray(self.jastrow_laplacian(self.radii), dtype=float)
+        potential = np.asarray(self.potential(self.radii), dtype=float)
+        pair_distribution = np.exp(np.clip(-2.0 * exponent, -700.0, 80.0))
+        gamma = np.zeros_like(self.radii)
+        converged = False
+        residual = np.inf
+        minimum_oz_denominator = np.inf
+
+        for iteration in range(1, self.maxiter + 1):
+            triplet_closure = self._triplet_closure(pair_distribution)
+            closure_argument = np.clip(
+                -2.0 * exponent + gamma + triplet_closure,
+                -700.0,
+                80.0,
+            )
+            updated_pair = np.exp(closure_argument)
+            direct_correlation = updated_pair - 1.0 - gamma
+            direct_momentum = self.forward_hankel(direct_correlation)
+            denominator = 1.0 - self.density * direct_momentum
+            minimum_oz_denominator = float(np.min(denominator))
+            if minimum_oz_denominator <= 0.0:
+                self.success = False
+                self.message = (
+                    "the HNC/3 Ornstein-Zernike denominator became non-positive"
+                )
+                self.iterations = iteration
+                self.residual = float(np.inf)
+                self.minimum_oz_denominator = minimum_oz_denominator
+                return self
+            gamma_momentum = (
+                self.density
+                * direct_momentum**2
+                / denominator
+            )
+            updated_gamma = self.inverse_hankel(gamma_momentum)
+            gamma_residual = np.max(np.abs(updated_gamma - gamma)) / max(
+                1.0,
+                float(np.max(np.abs(updated_gamma))),
+            )
+            pair_residual = np.max(
+                np.abs(updated_pair - pair_distribution)
+            ) / max(1.0, float(np.max(np.abs(updated_pair))))
+            residual = float(max(gamma_residual, pair_residual))
+            gamma = (
+                (1.0 - self.mixing) * gamma
+                + self.mixing * updated_gamma
+            )
+            pair_distribution = (
+                (1.0 - self.mixing) * pair_distribution
+                + self.mixing * updated_pair
+            )
+            if residual < self.tolerance:
+                converged = True
+                break
+
+        triplet_closure = self._triplet_closure(pair_distribution)
+        closure_argument = np.clip(
+            -2.0 * exponent + gamma + triplet_closure,
+            -700.0,
+            80.0,
+        )
+        updated_pair = np.exp(closure_argument)
+        total_correlation = updated_pair - 1.0
+        direct_correlation = total_correlation - gamma
+        direct_momentum = self.forward_hankel(direct_correlation)
+        denominator = 1.0 - self.density * direct_momentum
+        total_momentum = direct_momentum / denominator
+        updated_gamma = self.inverse_hankel(
+            total_momentum - direct_momentum
+        )
+
+        area_weights = 2.0 * np.pi * self.radial_weights * self.radii
+        pair_kinetic_density = (
+            0.5
+            * self.kinetic_prefactor
+            * self.density**2
+            * float(area_weights @ (updated_pair * laplacian))
+        )
+        triplet_laplacian_integral = self._triplet_laplacian_integral(
+            updated_pair
+        )
+        triplet_kinetic_density = (
+            -self.kinetic_prefactor
+            * self.density**3
+            * triplet_laplacian_integral
+            / 12.0
+        )
+        potential_density = (
+            0.5
+            * self.density**2
+            * float(area_weights @ (updated_pair * potential))
+        )
+
+        self.jastrow_exponent_values = exponent
+        self.jastrow_laplacian_values = laplacian
+        self.potential_values = potential
+        self.nodal_correlation = gamma
+        self.triplet_closure = triplet_closure
+        self.direct_correlation = direct_correlation
+        self.total_correlation = total_correlation
+        self.pair_distribution = updated_pair
+        self.direct_correlation_momentum = direct_momentum
+        self.total_correlation_momentum = total_momentum
+        self.structure_factor = 1.0 + self.density * total_momentum
+        self.iterations = iteration
+        self.residual = residual
+        self.fixed_point_residual = float(
+            max(
+                np.max(np.abs(updated_gamma - gamma)),
+                np.max(np.abs(updated_pair - pair_distribution)),
+            )
+        )
+        self.minimum_oz_denominator = float(np.min(denominator))
+        self.pair_kinetic_energy_density = float(pair_kinetic_density)
+        self.triplet_kinetic_energy_density = float(triplet_kinetic_density)
+        self.kinetic_energy_density = float(
+            pair_kinetic_density + triplet_kinetic_density
+        )
+        self.potential_energy_density = float(potential_density)
+        self.energy_density = float(
+            self.kinetic_energy_density + potential_density
+        )
+        self.energy_per_particle = self.energy_density / self.density
+        self.success = bool(
+            converged
+            and np.all(np.isfinite(self.structure_factor))
+            and np.min(self.structure_factor) > 0.0
+            and np.isfinite(self.energy_density)
+        )
+        self.message = (
+            "HNC/3 converged"
+            if self.success
+            else "HNC/3 did not converge within maxiter"
+        )
+        return self
+
+
+def optimize_gaussian_jastrow_hnc(
+    model,
+    *,
+    initial_amplitude=0.05,
+    initial_range=None,
+    amplitude_bounds=(1.0e-6, 2.0),
+    range_bounds=None,
+    radial_cutoff=None,
+    momentum_cutoff=None,
+    optimization_quadrature_points=128,
+    quadrature_points=192,
+    mixing=0.25,
+    tolerance=1.0e-9,
+    hnc_maxiter=2000,
+    maxiter=80,
+):
+    r"""Optimize a Gaussian Jastrow factor with an HNC/0 contraction.
+
+    Both Jastrow parameters are varied logarithmically.  Every objective
+    evaluation is already in the infinite-area, fixed-density continuum; the
+    two quadrature cutoffs control only the radial Hankel transforms.
+    """
+    if not isinstance(model, GaussianPotentialBoseGas2D):
+        raise TypeError("model must be GaussianPotentialBoseGas2D.")
+    amplitude_bounds = tuple(float(value) for value in amplitude_bounds)
+    if (
+        len(amplitude_bounds) != 2
+        or amplitude_bounds[0] <= 0.0
+        or amplitude_bounds[1] <= amplitude_bounds[0]
+    ):
+        raise ValueError("amplitude_bounds must be two increasing positive values.")
+    mean_spacing = 1.0 / np.sqrt(model.density)
+    if range_bounds is None:
+        range_bounds = (
+            0.5 * model.interaction_range,
+            max(3.0 * model.interaction_range, 2.0 * mean_spacing),
+        )
+    range_bounds = tuple(float(value) for value in range_bounds)
+    if (
+        len(range_bounds) != 2
+        or range_bounds[0] <= 0.0
+        or range_bounds[1] <= range_bounds[0]
+    ):
+        raise ValueError("range_bounds must be two increasing positive values.")
+    initial_amplitude = float(initial_amplitude)
+    if initial_range is None:
+        initial_range = max(model.interaction_range, mean_spacing)
+    initial_range = float(initial_range)
+    initial_amplitude = float(
+        np.clip(initial_amplitude, amplitude_bounds[0], amplitude_bounds[1])
+    )
+    initial_range = float(
+        np.clip(initial_range, range_bounds[0], range_bounds[1])
+    )
+    if radial_cutoff is None:
+        radial_cutoff = max(
+            10.0 * max(model.interaction_range, range_bounds[1]),
+            8.0 * mean_spacing,
+        )
+    if momentum_cutoff is None:
+        momentum_cutoff = max(
+            12.0 / min(model.interaction_range, range_bounds[0]),
+            8.0 / mean_spacing,
+        )
+    radial_cutoff = float(radial_cutoff)
+    momentum_cutoff = float(momentum_cutoff)
+
+    def objective(log_parameters):
+        amplitude, correlation_range = np.exp(np.asarray(log_parameters))
+        state = JastrowHNC2D.gaussian(
+            model,
+            jastrow_amplitude=amplitude,
+            jastrow_range=correlation_range,
+            radial_cutoff=radial_cutoff,
+            momentum_cutoff=momentum_cutoff,
+            quadrature_points=optimization_quadrature_points,
+            mixing=mixing,
+            tolerance=max(float(tolerance), 1.0e-8),
+            maxiter=hnc_maxiter,
+        ).solve()
+        if not state.success:
+            return 1.0e100
+        return state.energy_density
+
+    result = minimize(
+        objective,
+        np.log([initial_amplitude, initial_range]),
+        method="L-BFGS-B",
+        bounds=[
+            tuple(np.log(amplitude_bounds)),
+            tuple(np.log(range_bounds)),
+        ],
+        options={
+            "maxiter": int(maxiter),
+            "ftol": 1.0e-12,
+            "gtol": 1.0e-7,
+        },
+    )
+    amplitude, correlation_range = np.exp(result.x)
+    state = JastrowHNC2D.gaussian(
+        model,
+        jastrow_amplitude=amplitude,
+        jastrow_range=correlation_range,
+        radial_cutoff=radial_cutoff,
+        momentum_cutoff=momentum_cutoff,
+        quadrature_points=quadrature_points,
+        mixing=mixing,
+        tolerance=tolerance,
+        maxiter=hnc_maxiter,
+    ).solve()
+    state.optimization_success = bool(result.success)
+    state.optimization_message = str(result.message)
+    state.optimization_evaluations = int(result.nfev)
+    state.optimized_parameters = {
+        "jastrow_amplitude": float(amplitude),
+        "jastrow_range": float(correlation_range),
+    }
+    state.success = bool(state.success and result.success)
+    if not result.success:
+        state.message = f"{state.message}; {result.message}"
+    return state
+
+
+def optimize_d2_triplet_hnc(
+    model,
+    *,
+    pair_state=None,
+    initial_transverse_amplitude=0.04,
+    initial_transverse_range=None,
+    transverse_amplitude_bounds=(1.0e-6, 0.3),
+    transverse_range_bounds=None,
+    virtual_metric=-1.0,
+    radial_cutoff=None,
+    momentum_cutoff=None,
+    optimization_quadrature_points=96,
+    optimization_angular_points=16,
+    quadrature_points=160,
+    angular_points=24,
+    mixing=0.15,
+    tolerance=1.0e-9,
+    hnc_maxiter=2000,
+    maxiter=50,
+):
+    r"""Optimize the leading connected ``D=2`` triplet channel.
+
+    The optimized scalar HNC/0 pair factor is held fixed.  This isolates the
+    first new virtual cumulant rather than allowing the pair channel to absorb
+    it.  ``virtual_metric=-1`` uses ``tau_x=i sigma_x`` and produces a
+    suppressing connected triplet factor.
+    """
+    if not isinstance(model, GaussianPotentialBoseGas2D):
+        raise TypeError("model must be GaussianPotentialBoseGas2D.")
+    if pair_state is None:
+        pair_state = optimize_gaussian_jastrow_hnc(model)
+    if not isinstance(pair_state, JastrowHNC2D):
+        raise TypeError("pair_state must be a solved JastrowHNC2D.")
+    if not pair_state.success:
+        raise ValueError("pair_state must be converged.")
+    if not hasattr(pair_state, "jastrow_amplitude"):
+        raise ValueError("pair_state must use a Gaussian Jastrow profile.")
+
+    pair_amplitude = float(pair_state.jastrow_amplitude)
+    pair_range = float(pair_state.jastrow_range)
+    amplitude_bounds = tuple(
+        float(value) for value in transverse_amplitude_bounds
+    )
+    if (
+        len(amplitude_bounds) != 2
+        or amplitude_bounds[0] <= 0.0
+        or amplitude_bounds[1] <= amplitude_bounds[0]
+    ):
+        raise ValueError(
+            "transverse_amplitude_bounds must be increasing and positive."
+        )
+    if transverse_range_bounds is None:
+        transverse_range_bounds = (
+            0.5 * model.interaction_range,
+            2.0 * model.interaction_range,
+        )
+    range_bounds = tuple(float(value) for value in transverse_range_bounds)
+    if (
+        len(range_bounds) != 2
+        or range_bounds[0] <= 0.0
+        or range_bounds[1] <= range_bounds[0]
+    ):
+        raise ValueError(
+            "transverse_range_bounds must be increasing and positive."
+        )
+    initial_amplitude = float(
+        np.clip(
+            initial_transverse_amplitude,
+            amplitude_bounds[0],
+            amplitude_bounds[1],
+        )
+    )
+    if initial_transverse_range is None:
+        initial_transverse_range = 0.75 * model.interaction_range
+    initial_range = float(
+        np.clip(
+            initial_transverse_range,
+            range_bounds[0],
+            range_bounds[1],
+        )
+    )
+    mean_spacing = 1.0 / np.sqrt(model.density)
+    if radial_cutoff is None:
+        radial_cutoff = max(
+            10.0
+            * max(
+                model.interaction_range,
+                pair_range,
+                range_bounds[1],
+            ),
+            8.0 * mean_spacing,
+        )
+    if momentum_cutoff is None:
+        momentum_cutoff = max(
+            12.0
+            / min(
+                model.interaction_range,
+                pair_range,
+                range_bounds[0],
+            ),
+            8.0 / mean_spacing,
+        )
+    radial_cutoff = float(radial_cutoff)
+    momentum_cutoff = float(momentum_cutoff)
+
+    def objective(log_parameters):
+        amplitude, correlation_range = np.exp(np.asarray(log_parameters))
+        state = D2TripletHNC2D.gaussian(
+            model,
+            jastrow_amplitude=pair_amplitude,
+            jastrow_range=pair_range,
+            transverse_amplitude=amplitude,
+            transverse_range=correlation_range,
+            virtual_metric=virtual_metric,
+            radial_cutoff=radial_cutoff,
+            momentum_cutoff=momentum_cutoff,
+            quadrature_points=optimization_quadrature_points,
+            angular_points=optimization_angular_points,
+            mixing=mixing,
+            tolerance=max(float(tolerance), 2.0e-7),
+            maxiter=hnc_maxiter,
+        ).solve()
+        if not state.success:
+            return 1.0e100
+        return state.energy_density
+
+    result = minimize(
+        objective,
+        np.log([initial_amplitude, initial_range]),
+        method="L-BFGS-B",
+        bounds=[
+            tuple(np.log(amplitude_bounds)),
+            tuple(np.log(range_bounds)),
+        ],
+        options={
+            "maxiter": int(maxiter),
+            "ftol": 1.0e-11,
+            "gtol": 2.0e-6,
+            "maxls": 12,
+        },
+    )
+    transverse_amplitude, transverse_range = np.exp(result.x)
+    state = D2TripletHNC2D.gaussian(
+        model,
+        jastrow_amplitude=pair_amplitude,
+        jastrow_range=pair_range,
+        transverse_amplitude=transverse_amplitude,
+        transverse_range=transverse_range,
+        virtual_metric=virtual_metric,
+        radial_cutoff=radial_cutoff,
+        momentum_cutoff=momentum_cutoff,
+        quadrature_points=quadrature_points,
+        angular_points=angular_points,
+        mixing=mixing,
+        tolerance=tolerance,
+        maxiter=hnc_maxiter,
+    ).solve()
+    state.pair_state = pair_state
+    state.pair_baseline_energy_density = float(pair_state.energy_density)
+    state.d2_energy_gain_density = float(
+        pair_state.energy_density - state.energy_density
+    )
+    state.optimization_success = bool(result.success)
+    state.optimization_message = str(result.message)
+    state.optimization_evaluations = int(result.nfev)
+    state.optimized_parameters = {
+        "jastrow_amplitude": pair_amplitude,
+        "jastrow_range": pair_range,
+        "transverse_amplitude": float(transverse_amplitude),
+        "transverse_range": float(transverse_range),
+        "virtual_metric": float(virtual_metric),
+    }
+    state.success = bool(state.success and result.success)
+    if not result.success:
+        state.message = f"{state.message}; {result.message}"
+    return state
+
+
+@dataclass
+class FunctionalD2HNC2D:
+    r"""Functional stability test of the ``D=2`` HNC/3 channel.
+
+    ``S(k)`` is represented by freely varied values of ``log(S)`` on a
+    logarithmic momentum mesh.  The HNC/3 relation then determines the full
+    scalar Jastrow function,
+
+    $$
+    u(r)=\frac{\gamma(r)+C_x(r)-\log g(r)}{2}.
+    $$
+
+    By default the scalar structure factor is held at the unrestricted
+    HNC-EL/0 solution while the transverse entry of
+
+    $$
+    K(r)=u(r)\sigma_z+i x(r)\sigma_x
+    $$
+
+    is expanded in a multiscale radial basis and optimized.  This cleanly
+    tests whether the leading ``D=2`` cumulant has an interior stationary
+    point.  Setting ``freeze_scalar_to_hncel=False`` also releases the scalar
+    structure coefficients, but the truncated HNC/3 functional need not be
+    bounded under such unrestricted variations.
+
+    The virtual matrix dimension is exactly two regardless of the number of
+    continuum basis functions.
+
+    Gradients are evaluated through the complete discretized HNC functional,
+    including the triplet closure.  JAX is imported lazily by :meth:`optimize`
+    so importing :mod:`pyqed.mps` does not require it.
+    """
+
+    model: object
+    radial_cutoff: float | None = None
+    momentum_cutoff: float | None = None
+    quadrature_points: int = 128
+    angular_points: int = 12
+    structure_basis_size: int = 28
+    transverse_basis_size: int = 6
+    transverse_min_scale: float | None = None
+    transverse_max_scale: float | None = None
+    initial_transverse_amplitude: float = 0.04
+    initial_transverse_range: float | None = None
+    transverse_coefficient_bound: float = 0.3
+    virtual_metric: float = -1.0
+    freeze_scalar_to_hncel: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.model, GaussianPotentialBoseGas2D):
+            raise TypeError("model must be GaussianPotentialBoseGas2D.")
+        mean_spacing = 1.0 / np.sqrt(self.model.density)
+        if self.radial_cutoff is None:
+            self.radial_cutoff = max(
+                25.0 * self.model.interaction_range,
+                25.0 * mean_spacing,
+            )
+        if self.momentum_cutoff is None:
+            self.momentum_cutoff = max(
+                24.0 / self.model.interaction_range,
+                20.0 / mean_spacing,
+            )
+        if self.transverse_min_scale is None:
+            self.transverse_min_scale = 0.3 * self.model.interaction_range
+        if self.transverse_max_scale is None:
+            self.transverse_max_scale = max(
+                2.0 * self.model.interaction_range,
+                mean_spacing,
+            )
+        if self.initial_transverse_range is None:
+            self.initial_transverse_range = 0.75 * self.model.interaction_range
+
+        self.radial_cutoff = float(self.radial_cutoff)
+        self.momentum_cutoff = float(self.momentum_cutoff)
+        self.quadrature_points = int(self.quadrature_points)
+        self.angular_points = int(self.angular_points)
+        self.structure_basis_size = int(self.structure_basis_size)
+        self.transverse_basis_size = int(self.transverse_basis_size)
+        self.transverse_min_scale = float(self.transverse_min_scale)
+        self.transverse_max_scale = float(self.transverse_max_scale)
+        self.initial_transverse_amplitude = float(
+            self.initial_transverse_amplitude
+        )
+        self.initial_transverse_range = float(self.initial_transverse_range)
+        self.transverse_coefficient_bound = float(
+            self.transverse_coefficient_bound
+        )
+        self.virtual_metric = float(self.virtual_metric)
+        if self.radial_cutoff <= 0.0 or self.momentum_cutoff <= 0.0:
+            raise ValueError("functional quadrature cutoffs must be positive.")
+        if self.quadrature_points < 64:
+            raise ValueError("quadrature_points must be at least 64.")
+        if self.angular_points < 8:
+            raise ValueError("angular_points must be at least eight.")
+        if self.structure_basis_size < 8:
+            raise ValueError("structure_basis_size must be at least eight.")
+        if self.transverse_basis_size < 2:
+            raise ValueError("transverse_basis_size must be at least two.")
+        if not (
+            0.0 < self.transverse_min_scale < self.transverse_max_scale
+        ):
+            raise ValueError("transverse basis scales must be increasing.")
+        if self.initial_transverse_amplitude < 0.0:
+            raise ValueError("initial_transverse_amplitude must be non-negative.")
+        if self.transverse_coefficient_bound < 0.0:
+            raise ValueError("transverse_coefficient_bound must be non-negative.")
+        if self.initial_transverse_range <= 0.0:
+            raise ValueError("initial_transverse_range must be positive.")
+        if self.virtual_metric not in (-1.0, 1.0):
+            raise ValueError("virtual_metric must be either -1 or +1.")
+        self._build_functional_geometry()
+        if self.freeze_scalar_to_hncel:
+            self.scalar_reference = HNCELBoseGas2D(
+                self.model,
+                radial_cutoff=self.radial_cutoff,
+                momentum_cutoff=self.momentum_cutoff,
+                quadrature_points=self.quadrature_points,
+            ).solve()
+            if not self.scalar_reference.success:
+                raise RuntimeError(
+                    "the scalar HNC-EL reference did not converge."
+                )
+
+    @staticmethod
+    def _linear_design(points, knots):
+        points = np.asarray(points, dtype=float)
+        knots = np.asarray(knots, dtype=float)
+        design = np.zeros((points.size, knots.size), dtype=float)
+        indices = np.searchsorted(knots, points, side="right") - 1
+        indices = np.clip(indices, 0, knots.size - 2)
+        right_weight = (
+            (points - knots[indices])
+            / (knots[indices + 1] - knots[indices])
+        )
+        rows = np.arange(points.size)
+        design[rows, indices] = 1.0 - right_weight
+        design[rows, indices + 1] = right_weight
+        design[points <= knots[0], :] = 0.0
+        design[points <= knots[0], 0] = 1.0
+        design[points >= knots[-1], :] = 0.0
+        design[points >= knots[-1], -1] = 1.0
+        return design
+
+    @staticmethod
+    def _derivative_matrix(grid):
+        grid = np.asarray(grid, dtype=float)
+        identity = np.eye(grid.size)
+        return np.gradient(identity, grid, axis=0, edge_order=2)
+
+    def _build_functional_geometry(self):
+        nodes, weights = leggauss(self.quadrature_points)
+        self.radii = 0.5 * self.radial_cutoff * (nodes + 1.0)
+        self.radial_weights = 0.5 * self.radial_cutoff * weights
+        self.momenta = 0.5 * self.momentum_cutoff * (nodes + 1.0)
+        self.momentum_weights = 0.5 * self.momentum_cutoff * weights
+        bessel = j0(self.momenta[:, None] * self.radii[None, :])
+        self.forward_hankel_matrix = (
+            2.0
+            * np.pi
+            * bessel
+            * (self.radial_weights * self.radii)[None, :]
+        )
+        self.inverse_hankel_matrix = (
+            bessel.T
+            * (self.momentum_weights * self.momenta)[None, :]
+            / (2.0 * np.pi)
+        )
+        self.radial_derivative_matrix = self._derivative_matrix(self.radii)
+        self.area_weights = (
+            2.0 * np.pi * self.radial_weights * self.radii
+        )
+
+        self.structure_knots = np.geomspace(
+            self.momenta[0],
+            self.momenta[-1],
+            self.structure_basis_size,
+        )
+        self.structure_design = self._linear_design(
+            np.log(self.momenta),
+            np.log(self.structure_knots),
+        )
+        self.transverse_scales = np.geomspace(
+            self.transverse_min_scale,
+            self.transverse_max_scale,
+            self.transverse_basis_size,
+        )
+        radius_ratio = (
+            self.radii[:, None] / self.transverse_scales[None, :]
+        )
+        self.transverse_design = np.exp(-0.5 * radius_ratio**2)
+        self.transverse_derivative_design = (
+            -self.radii[:, None]
+            / self.transverse_scales[None, :] ** 2
+            * self.transverse_design
+        )
+        self.transverse_laplacian_design = (
+            (
+                self.radii[:, None] ** 2
+                / self.transverse_scales[None, :] ** 4
+                - 2.0 / self.transverse_scales[None, :] ** 2
+            )
+            * self.transverse_design
+        )
+
+        angular_nodes, angular_weights = leggauss(self.angular_points)
+        self.triplet_angles = np.pi * (angular_nodes + 1.0)
+        self.triplet_angular_weights = np.pi * angular_weights
+        cosine = np.cos(self.triplet_angles)[None, None, :]
+        first = self.radii[:, None, None]
+        second = self.radii[None, :, None]
+        third = np.sqrt(
+            np.maximum(
+                first**2 + second**2 - 2.0 * first * second * cosine,
+                0.0,
+            )
+        )
+        self.triplet_third_distance = third
+        self.triplet_cosine_one = np.broadcast_to(cosine, third.shape)
+
+        def triangle_cosine(side_a, side_b, opposite):
+            denominator = 2.0 * side_a * side_b
+            return np.clip(
+                np.divide(
+                    side_a**2 + side_b**2 - opposite**2,
+                    denominator,
+                    out=np.zeros_like(third),
+                    where=denominator > 1.0e-14,
+                ),
+                -1.0,
+                1.0,
+            )
+
+        self.triplet_cosine_two = triangle_cosine(first, third, second)
+        self.triplet_cosine_three = triangle_cosine(second, third, first)
+        third_ratio = (
+            third[..., None] / self.transverse_scales[None, None, None, :]
+        )
+        self.triplet_transverse_design = np.exp(-0.5 * third_ratio**2)
+        self.triplet_transverse_derivative_design = (
+            -third[..., None]
+            / self.transverse_scales[None, None, None, :] ** 2
+            * self.triplet_transverse_design
+        )
+        self.triplet_transverse_laplacian_design = (
+            (
+                third[..., None] ** 2
+                / self.transverse_scales[None, None, None, :] ** 4
+                - 2.0
+                / self.transverse_scales[None, None, None, :] ** 2
+            )
+            * self.triplet_transverse_design
+        )
+
+        flat_third = third.ravel()
+        interpolation_indices = (
+            np.searchsorted(self.radii, flat_third, side="right") - 1
+        )
+        interpolation_indices = np.clip(
+            interpolation_indices,
+            0,
+            self.radii.size - 2,
+        )
+        interpolation_weights = (
+            flat_third - self.radii[interpolation_indices]
+        ) / (
+            self.radii[interpolation_indices + 1]
+            - self.radii[interpolation_indices]
+        )
+        self.triplet_interpolation_indices = interpolation_indices.reshape(
+            third.shape
+        )
+        self.triplet_interpolation_weights = interpolation_weights.reshape(
+            third.shape
+        )
+        self.triplet_interpolation_left = third < self.radii[0]
+        self.triplet_interpolation_right = third > self.radii[-1]
+        self.triplet_inner_weights = (
+            (self.radial_weights * self.radii)[None, :, None]
+            * self.triplet_angular_weights[None, None, :]
+        )
+        self.triplet_full_weights = (
+            self.area_weights[:, None, None] * self.triplet_inner_weights
+        )
+
+    def _initial_parameters(self):
+        if self.freeze_scalar_to_hncel:
+            structure = np.exp(
+                np.interp(
+                    np.log(self.structure_knots),
+                    np.log(self.scalar_reference.momenta),
+                    np.log(self.scalar_reference.structure_factor),
+                )
+            )
+        else:
+            structure = np.asarray(
+                self.model.static_structure_factor(self.structure_knots),
+                dtype=float,
+            )
+        log_structure = np.log(np.maximum(structure, 1.0e-12))
+        transverse_coefficients = np.zeros(self.transverse_basis_size)
+        if self.transverse_coefficient_bound > 0.0:
+            closest = int(
+                np.argmin(
+                    np.abs(
+                        np.log(self.transverse_scales)
+                        - np.log(self.initial_transverse_range)
+                    )
+                )
+            )
+            transverse_coefficients[closest] = min(
+                self.initial_transverse_amplitude,
+                self.transverse_coefficient_bound,
+            )
+        return np.concatenate(
+            [log_structure[:-1], transverse_coefficients]
+        )
+
+    def optimize(self, *, maxiter=250, gtol=2.0e-7):
+        """Jointly optimize the continuum functions and populate this object."""
+        try:
+            import jax
+            import jax.numpy as jnp
+        except ImportError as error:  # pragma: no cover
+            raise ImportError(
+                "FunctionalD2HNC2D.optimize requires the optional jax package."
+            ) from error
+
+        jax.config.update("jax_enable_x64", True)
+        density = self.model.density
+        kinetic_prefactor = self.model.kinetic_prefactor
+        split = self.structure_basis_size - 1
+
+        structure_design = jnp.asarray(self.structure_design)
+        inverse_hankel = jnp.asarray(self.inverse_hankel_matrix)
+        derivative = jnp.asarray(self.radial_derivative_matrix)
+        area_weights = jnp.asarray(self.area_weights)
+        potential = jnp.asarray(
+            self.model.interaction_real_space(self.radii)
+        )
+        transverse_design = jnp.asarray(self.transverse_design)
+        transverse_derivative_design = jnp.asarray(
+            self.transverse_derivative_design
+        )
+        transverse_laplacian_design = jnp.asarray(
+            self.transverse_laplacian_design
+        )
+        third_transverse_design = jnp.asarray(
+            self.triplet_transverse_design
+        )
+        third_transverse_derivative_design = jnp.asarray(
+            self.triplet_transverse_derivative_design
+        )
+        third_transverse_laplacian_design = jnp.asarray(
+            self.triplet_transverse_laplacian_design
+        )
+        cosine_one = jnp.asarray(self.triplet_cosine_one)
+        cosine_two = jnp.asarray(self.triplet_cosine_two)
+        cosine_three = jnp.asarray(self.triplet_cosine_three)
+        interpolation_indices = jnp.asarray(
+            self.triplet_interpolation_indices
+        )
+        interpolation_weights = jnp.asarray(
+            self.triplet_interpolation_weights
+        )
+        interpolation_left = jnp.asarray(self.triplet_interpolation_left)
+        interpolation_right = jnp.asarray(self.triplet_interpolation_right)
+        triplet_inner_weights = jnp.asarray(self.triplet_inner_weights)
+        triplet_full_weights = jnp.asarray(self.triplet_full_weights)
+        metric = self.virtual_metric
+
+        def functional(parameters):
+            log_structure_coefficients = jnp.concatenate(
+                [parameters[:split], jnp.zeros(1)]
+            )
+            transverse_coefficients = parameters[split:]
+            structure = jnp.exp(
+                structure_design @ log_structure_coefficients
+            )
+            total_correlation = inverse_hankel @ (
+                (structure - 1.0) / density
+            )
+            pair_distribution_raw = 1.0 + total_correlation
+            pair_distribution = jnp.maximum(
+                pair_distribution_raw,
+                1.0e-10,
+            )
+            nodal_correlation = inverse_hankel @ (
+                (structure - 1.0) ** 2 / (density * structure)
+            )
+
+            transverse = transverse_design @ transverse_coefficients
+            transverse_derivative = (
+                transverse_derivative_design @ transverse_coefficients
+            )
+            transverse_laplacian = (
+                transverse_laplacian_design @ transverse_coefficients
+            )
+            third_transverse = jnp.tensordot(
+                third_transverse_design,
+                transverse_coefficients,
+                axes=([-1], [0]),
+            )
+            third_transverse_derivative = jnp.tensordot(
+                third_transverse_derivative_design,
+                transverse_coefficients,
+                axes=([-1], [0]),
+            )
+            third_transverse_laplacian = jnp.tensordot(
+                third_transverse_laplacian_design,
+                transverse_coefficients,
+                axes=([-1], [0]),
+            )
+            pair_third = (
+                (1.0 - interpolation_weights)
+                * pair_distribution[interpolation_indices]
+                + interpolation_weights
+                * pair_distribution[interpolation_indices + 1]
+            )
+            pair_third = jnp.where(
+                interpolation_left,
+                pair_distribution[0],
+                pair_third,
+            )
+            pair_third = jnp.where(interpolation_right, 1.0, pair_third)
+
+            first_transverse = transverse[:, None, None]
+            second_transverse = transverse[None, :, None]
+            triplet_kernel = metric * (
+                first_transverse * second_transverse
+                + first_transverse * third_transverse
+                + second_transverse * third_transverse
+            )
+            triplet_closure = 2.0 * density * jnp.sum(
+                triplet_inner_weights
+                * triplet_kernel
+                * pair_distribution[None, :, None]
+                * pair_third,
+                axis=(1, 2),
+            )
+            jastrow_exponent = 0.5 * (
+                nodal_correlation
+                + triplet_closure
+                - jnp.log(pair_distribution)
+            )
+
+            derivative_pair = derivative @ pair_distribution
+            derivative_jastrow = derivative @ jastrow_exponent
+            pair_kinetic = (
+                -0.5
+                * kinetic_prefactor
+                * density**2
+                * jnp.dot(
+                    area_weights,
+                    derivative_pair * derivative_jastrow,
+                )
+            )
+            potential_energy = (
+                0.5
+                * density**2
+                * jnp.dot(
+                    area_weights,
+                    pair_distribution * potential,
+                )
+            )
+
+            first_derivative = transverse_derivative[:, None, None]
+            second_derivative = transverse_derivative[None, :, None]
+            first_laplacian = transverse_laplacian[:, None, None]
+            second_laplacian = transverse_laplacian[None, :, None]
+
+            def pair_laplacian(
+                first_profile,
+                second_profile,
+                first_gradient,
+                second_gradient,
+                first_lap,
+                second_lap,
+                cosine,
+            ):
+                return 2.0 * (
+                    first_lap * second_profile
+                    + first_profile * second_lap
+                    + first_gradient * second_gradient * cosine
+                )
+
+            triplet_laplacian = metric * (
+                pair_laplacian(
+                    first_transverse,
+                    second_transverse,
+                    first_derivative,
+                    second_derivative,
+                    first_laplacian,
+                    second_laplacian,
+                    cosine_one,
+                )
+                + pair_laplacian(
+                    first_transverse,
+                    third_transverse,
+                    first_derivative,
+                    third_transverse_derivative,
+                    first_laplacian,
+                    third_transverse_laplacian,
+                    cosine_two,
+                )
+                + pair_laplacian(
+                    second_transverse,
+                    third_transverse,
+                    second_derivative,
+                    third_transverse_derivative,
+                    second_laplacian,
+                    third_transverse_laplacian,
+                    cosine_three,
+                )
+            )
+            triplet_kinetic = (
+                -kinetic_prefactor
+                * density**3
+                / 12.0
+                * jnp.sum(
+                    triplet_full_weights
+                    * pair_distribution[:, None, None]
+                    * pair_distribution[None, :, None]
+                    * pair_third
+                    * triplet_laplacian
+                )
+            )
+            positivity_penalty = 1.0e10 * jnp.mean(
+                jnp.minimum(pair_distribution_raw - 1.0e-6, 0.0) ** 2
+            )
+            energy = (
+                pair_kinetic
+                + triplet_kinetic
+                + potential_energy
+                + positivity_penalty
+            )
+            auxiliary = (
+                structure,
+                pair_distribution,
+                nodal_correlation,
+                jastrow_exponent,
+                transverse,
+                triplet_closure,
+                pair_kinetic,
+                triplet_kinetic,
+                potential_energy,
+                positivity_penalty,
+            )
+            return energy, auxiliary
+
+        value_and_gradient = jax.jit(
+            jax.value_and_grad(lambda parameters: functional(parameters)[0])
+        )
+
+        def scipy_objective(parameters):
+            value, gradient = value_and_gradient(jnp.asarray(parameters))
+            return float(value), np.asarray(gradient, dtype=float)
+
+        initial = self._initial_parameters()
+        if self.freeze_scalar_to_hncel:
+            structure_bounds = [
+                (float(value), float(value)) for value in initial[:split]
+            ]
+        else:
+            structure_bounds = [(-20.0, 0.2)] * split
+        bounds = (
+            structure_bounds
+            + [
+                (
+                    -self.transverse_coefficient_bound,
+                    self.transverse_coefficient_bound,
+                )
+            ]
+            * self.transverse_basis_size
+        )
+        result = minimize(
+            scipy_objective,
+            initial,
+            jac=True,
+            method="L-BFGS-B",
+            bounds=bounds,
+            options={
+                "maxiter": int(maxiter),
+                "ftol": 1.0e-13,
+                "gtol": float(gtol),
+                "maxls": 30,
+                "maxcor": 20,
+            },
+        )
+        energy, auxiliary = functional(jnp.asarray(result.x))
+        auxiliary = [np.asarray(value) for value in auxiliary]
+        (
+            structure,
+            pair_distribution,
+            nodal_correlation,
+            jastrow_exponent,
+            transverse,
+            triplet_closure,
+            pair_kinetic,
+            triplet_kinetic,
+            potential_energy,
+            positivity_penalty,
+        ) = auxiliary
+        _, final_gradient = scipy_objective(result.x)
+
+        lower = np.asarray([bound[0] for bound in bounds])
+        upper = np.asarray([bound[1] for bound in bounds])
+        projected_gradient = final_gradient.copy()
+        at_lower = result.x <= lower + 1.0e-8
+        at_upper = result.x >= upper - 1.0e-8
+        projected_gradient[at_lower & (projected_gradient > 0.0)] = 0.0
+        projected_gradient[at_upper & (projected_gradient < 0.0)] = 0.0
+
+        low_points = min(6, self.momenta.size)
+        infrared_fit = np.polyfit(
+            np.log(self.momenta[:low_points]),
+            np.log(structure[:low_points]),
+            1,
+        )
+        infrared_ratios = structure[:low_points] / self.momenta[:low_points]
+
+        self.structure_factor = structure
+        self.pair_distribution = pair_distribution
+        self.nodal_correlation = nodal_correlation
+        self.jastrow_exponent = jastrow_exponent
+        self.transverse_profile = transverse
+        self.triplet_closure = triplet_closure
+        self.pair_kinetic_energy_density = float(pair_kinetic)
+        self.triplet_kinetic_energy_density = float(triplet_kinetic)
+        self.kinetic_energy_density = float(pair_kinetic + triplet_kinetic)
+        self.potential_energy_density = float(potential_energy)
+        self.energy_density = float(
+            pair_kinetic + triplet_kinetic + potential_energy
+        )
+        self.energy_per_particle = self.energy_density / self.model.density
+        self.scalar_reference_energy_density = float(
+            self.scalar_reference.energy_density
+            if self.freeze_scalar_to_hncel
+            else np.nan
+        )
+        self.positivity_penalty = float(positivity_penalty)
+        self.parameters = np.asarray(result.x)
+        self.structure_log_coefficients = np.concatenate(
+            [result.x[:split], np.zeros(1)]
+        )
+        self.transverse_coefficients = np.asarray(result.x[split:])
+        self.functional_gradient = final_gradient
+        self.projected_functional_gradient = projected_gradient
+        self.scalar_el_residual = float(
+            np.max(np.abs(projected_gradient[:split]))
+        )
+        self.transverse_el_residual = float(
+            np.max(np.abs(projected_gradient[split:]))
+        )
+        self.transverse_boundary_limited = bool(
+            self.transverse_coefficient_bound > 0.0
+            and np.any(
+                np.abs(self.transverse_coefficients)
+                >= 0.999
+                * self.transverse_coefficient_bound
+            )
+        )
+        self.controlled_d2_stationary_point = bool(
+            not self.transverse_boundary_limited
+            and self.transverse_el_residual <= max(10.0 * float(gtol), 1.0e-6)
+        )
+        self.infrared_exponent = float(infrared_fit[0])
+        self.infrared_slope = float(np.mean(infrared_ratios))
+        self.infrared_slope_relative_spread = float(
+            np.std(infrared_ratios) / np.mean(infrared_ratios)
+        )
+        self.optimization_evaluations = int(getattr(result, "nfev", 1))
+        self.iterations = int(getattr(result, "nit", 0))
+        numerical_success = bool(
+            result.success
+            and self.positivity_penalty < 1.0e-10
+            and np.min(self.pair_distribution) > 0.0
+            and np.isfinite(self.energy_density)
+        )
+        self.success = bool(
+            numerical_success and self.controlled_d2_stationary_point
+        )
+        self.message = str(result.message)
+        if numerical_success and self.transverse_boundary_limited:
+            self.message += (
+                "; transverse functional ran into its coefficient bound"
+            )
+        return self
 
 
 @dataclass
@@ -3729,12 +5840,18 @@ __all__ = [
     "DiluteBoseGas2D",
     "D2M1HierarchicalCLETTA2D",
     "D2M1NestedCLETTA2D",
+    "D2TripletHNC2D",
+    "FunctionalD2HNC2D",
     "GaussianPotentialBoseGas2D",
+    "HNCELBoseGas2D",
     "HierarchicalShellContraction",
+    "JastrowHNC2D",
     "RankOneDensityTransferChannel2D",
     "fixed_density_gns_nested_hletta_state",
     "fixed_density_nested_hletta_state",
     "optimize_condensate_gns_hletta_fixed_density",
     "optimize_condensate_nested_hletta_fixed_density",
+    "optimize_d2_triplet_hnc",
+    "optimize_gaussian_jastrow_hnc",
     "optimize_nested_hletta_fixed_density",
 ]

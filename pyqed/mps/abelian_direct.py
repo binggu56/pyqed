@@ -1498,7 +1498,7 @@ def _decode_adjacent_site_merge_layout_integer_sector_ids(layout, id_to_sector):
     )
 
 
-def abelian_two_site_svd_from_permuted_data(data, *, m_max=None):
+def abelian_two_site_svd_from_permuted_data(data, *, m_max=None, cutoff=0.0):
     """Split permuted two-site block data ``(L, pL, R, pR)`` by SVD."""
 
     global _ABELIAN_SVD_KERNEL_LAST_ERROR
@@ -1506,7 +1506,7 @@ def abelian_two_site_svd_from_permuted_data(data, *, m_max=None):
     if native_split is not None:
         try:
             packed_data, id_to_sector = _pack_two_site_svd_integer_sector_ids(data)
-            result = native_split(packed_data, m_max)
+            result = native_split(packed_data, m_max, float(cutoff))
             (
                 u_data,
                 v_data,
@@ -1539,10 +1539,14 @@ def abelian_two_site_svd_from_permuted_data(data, *, m_max=None):
         except Exception as exc:
             _ABELIAN_SVD_KERNEL_STATS["cpp_full_split_failures"] += 1
             _ABELIAN_SVD_KERNEL_LAST_ERROR = repr(exc)
-    return _abelian_two_site_svd_from_permuted_data_python(data, m_max=m_max)
+    return _abelian_two_site_svd_from_permuted_data_python(
+        data,
+        m_max=m_max,
+        cutoff=cutoff,
+    )
 
 
-def _abelian_two_site_svd_from_permuted_data_python(data, *, m_max=None):
+def _abelian_two_site_svd_from_permuted_data_python(data, *, m_max=None, cutoff=0.0):
     """Split permuted two-site block data ``(L, pL, R, pR)`` by SVD."""
 
     blocks_by_q_mid = {}
@@ -1621,6 +1625,9 @@ def _abelian_two_site_svd_from_permuted_data_python(data, *, m_max=None):
 
     sv_list = _abelian_sort_singular_entries(sv_list)
     full_sq_norm = sum(float(np.real(s)) ** 2 for s, _q_mid, _i in sv_list)
+    if cutoff and cutoff > 0.0 and sv_list:
+        above_cutoff = [entry for entry in sv_list if float(np.real(entry[0])) > cutoff]
+        sv_list = above_cutoff or sv_list[:1]
     if m_max is not None:
         sv_list = sv_list[: int(m_max)]
     kept = {}
@@ -1693,7 +1700,10 @@ def abelian_state_averaged_two_site_svd_from_permuted_data(
     data_list = tuple(data_list or ())
     if not data_list:
         return AbelianTwoSiteSVDResult({}, {}, {}, [], 0.0, 0)
-    weights = tuple(float(weight) for weight in tuple(weights or ()))
+    weights = tuple(
+        float(weight)
+        for weight in (() if weights is None else tuple(weights))
+    )
     if len(weights) != len(data_list):
         raise ValueError("state-averaged SVD weights must match state count")
     direction = str(direction)
@@ -2490,6 +2500,7 @@ def abelian_split_two_site_svd_data(
     dirs=None,
     direction="right",
     m_max=None,
+    cutoff=0.0,
 ):
     """Split two-site data ``(L, R, pL, pR)`` into MPS tensors."""
 
@@ -2498,7 +2509,12 @@ def abelian_split_two_site_svd_data(
     if native_split is not None:
         try:
             packed_data, id_to_sector = _pack_two_site_split_integer_sector_ids(data)
-            result = native_split(packed_data, str(direction), m_max)
+            result = native_split(
+                packed_data,
+                str(direction),
+                m_max,
+                float(cutoff),
+            )
             (
                 a_data,
                 b_data,
@@ -2547,6 +2563,7 @@ def abelian_split_two_site_svd_data(
         dirs=dirs,
         direction=direction,
         m_max=m_max,
+        cutoff=cutoff,
     )
 
 
@@ -2557,6 +2574,7 @@ def _abelian_split_two_site_svd_data_python(
     dirs=None,
     direction="right",
     m_max=None,
+    cutoff=0.0,
 ):
     """Split two-site data ``(L, R, pL, pR)`` into MPS tensors."""
 
@@ -2571,7 +2589,11 @@ def _abelian_split_two_site_svd_data_python(
             1,
             3,
         )
-    svd = _abelian_two_site_svd_from_permuted_data_python(permuted, m_max=m_max)
+    svd = _abelian_two_site_svd_from_permuted_data_python(
+        permuted,
+        m_max=m_max,
+        cutoff=cutoff,
+    )
     direction = str(direction)
     if direction == "right":
         a_source = svd.u_data
@@ -3526,8 +3548,91 @@ class AbelianRenormalizedActionDataTable:
                 diag[out_start + row0 + idx] += block[row0 + idx, col0 + idx]
             self._diagonal_cache = diag
             return diag
-        self._diagonal_cache = None
-        return None
+        groups = self.collected.get("matvec_groups")
+        if groups:
+            iterator = (
+                (
+                    group["left"],
+                    group["right"],
+                    group["dims"],
+                    group["in_start"],
+                    group["out_start"],
+                    group.get("scales"),
+                )
+                for group in groups
+            )
+        else:
+            scales = self.collected.get("scales_array")
+            if scales is None:
+                scales = (None,) * len(self.collected.get("left", ()))
+            iterator = zip(
+                self.collected.get("left", ()),
+                self.collected.get("right", ()),
+                self.collected.get("dims_array", ()),
+                self.collected.get("in_starts_array", ()),
+                self.collected.get("out_starts_array", ()),
+                scales,
+            )
+        for left_stack, right_stack, dims, in_start, out_start, scales in iterator:
+            ni, nl, nu, nv, nj, nx, nk, ny = (int(value) for value in dims)
+            in_start = int(in_start)
+            out_start = int(out_start)
+            first = max(in_start, out_start)
+            last = min(
+                in_start + nj * nx * nk * ny,
+                out_start + ni * nl * nu * nv,
+            )
+            if last <= first:
+                continue
+            global_indices = np.arange(first, last, dtype=np.int64)
+
+            out_indices = global_indices - out_start
+            out_v = out_indices % nv
+            out_indices = out_indices // nv
+            out_u = out_indices % nu
+            out_indices = out_indices // nu
+            out_l = out_indices % nl
+            out_i = out_indices // nl
+
+            in_indices = global_indices - in_start
+            in_y = in_indices % ny
+            in_indices = in_indices // ny
+            in_x = in_indices % nx
+            in_indices = in_indices // nx
+            in_k = in_indices % nk
+            in_j = in_indices // nk
+
+            left = np.asarray(left_stack, dtype=np.complex128)
+            right = np.asarray(right_stack, dtype=np.complex128)
+            if left.ndim == 2:
+                left = left[None, ...]
+            if right.ndim == 2:
+                right = right[None, ...]
+            channels = min(int(left.shape[0]), int(right.shape[0]))
+            if channels <= 0:
+                continue
+            channel_indices = np.arange(channels, dtype=np.int64)[:, None]
+            channel_values = (
+                left[
+                    channel_indices,
+                    (out_i * nu + out_u)[None, :],
+                    (in_j * nx + in_x)[None, :],
+                ]
+                * right[
+                    channel_indices,
+                    (in_k * ny + in_y)[None, :],
+                    (out_l * nv + out_v)[None, :],
+                ]
+            )
+            if scales is not None:
+                scale_values = np.asarray(scales, dtype=np.complex128)
+                if scale_values.ndim == 0:
+                    channel_values *= scale_values
+                else:
+                    channel_values *= scale_values.reshape(-1)[:channels, None]
+            diag[global_indices] += np.sum(channel_values, axis=0)
+        self._diagonal_cache = diag
+        return diag
 
     def apply_data(self, data):
         return self.unflatten_data(self.matvec(self.flatten_data(data)))
@@ -6991,9 +7096,9 @@ class AbelianPlannedPackedDirectFamilyEntries:
                 tuple(int(value) for value in right_table_ids),
             )
         return cls(
-            route_plan.coeffs,
-            route_plan.left_ids,
-            route_plan.right_ids,
+            route_plan.pair_coeffs,
+            route_plan.pair_left_ids,
+            route_plan.pair_right_ids,
             ()
             if table_backed
             else tuple(getattr(boundary_batch, "left_values", ()) or ()),
@@ -11660,7 +11765,18 @@ class AbelianContextualDirectFamilyBuilder:
                 + int(len(planned_entries))
             )
             snapshot_stats["last_entries"] = int(len(planned_entries))
-            return snapshot()
+            try:
+                return snapshot()
+            except ValueError as exc:
+                if "table payload is missing" not in str(exc):
+                    raise
+                _increment_counter(snapshot_stats, "missing_payloads")
+                _increment_counter(
+                    snapshot_stats,
+                    "kept_entries",
+                    int(len(planned_entries)),
+                )
+                return planned_entries
 
         if route_plan is not None:
             left_keys = route_plan.left_keys

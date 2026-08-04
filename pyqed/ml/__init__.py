@@ -7,6 +7,7 @@ from .autoregressive import (
 )
 from .nn import EquivariantMLP, H3PES, MLP, MPNN, PESFitResult, fit_pes, grid_to_samples
 from .rbm import RBM, RestrictedBoltzmannState
+from .tqs import TQS
 
 __all__ = [
     "ARNN",
@@ -17,6 +18,7 @@ __all__ = [
     "PESFitResult",
     "RBM",
     "RestrictedBoltzmannState",
+    "TQS",
     "fit_pes",
     "grid_to_samples",
     "heisenberg_connections",

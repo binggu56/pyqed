@@ -914,6 +914,38 @@ def test_leg_tied_letta_conditional_center_has_identity_local_metric():
     np.testing.assert_allclose(metric, np.eye(metric.shape[0]), atol=2.0e-10)
 
 
+def test_leg_tied_letta_conditional_qr_mode_preserves_state():
+    dims = (2, 2, 2, 2, 2)
+    letta = LETTA(None, dims, bond_dim=4, seed=17)
+    tensors = [np.array(tensor, copy=True) for tensor in letta.tensors]
+
+    before = letta.state_vector()
+    letta.canonicalize_conditional_bond(1, direction="lr", mode="qr", normalize=False)
+    np.testing.assert_allclose(letta.state_vector(), before, atol=1.0e-12)
+
+    # The same tensors should be recovered on every shared state slice up to local gauge
+    # application, so state values remain invariant.
+    letta.tensors = tensors
+    before = letta.state_vector()
+    letta.canonicalize_conditional_bond(2, direction="rl", mode="qr", normalize=False)
+    np.testing.assert_allclose(letta.state_vector(), before, atol=1.0e-12)
+
+
+def test_letta_virtual_qr_mode_preserves_state():
+    dims = (2, 2, 2, 2, 2)
+    letta = LETTA(None, dims, bond_dim=5, seed=11)
+    tensors = [np.array(tensor, copy=True) for tensor in letta.tensors]
+
+    before = letta.state_vector()
+    letta.canonicalize_virtual_bond(1, direction="lr", mode="qr", normalize=False)
+    np.testing.assert_allclose(letta.state_vector(), before, atol=1.0e-12)
+
+    letta.tensors = tensors
+    before = letta.state_vector()
+    letta.canonicalize_virtual_bond(1, direction="rl", mode="qr", normalize=False)
+    np.testing.assert_allclose(letta.state_vector(), before, atol=1.0e-12)
+
+
 def test_abelian_letta_conditional_gauge_preserves_state_and_masks():
     layout = Layout(
         local_qns=[[(0,), (1,)] for _ in range(4)],

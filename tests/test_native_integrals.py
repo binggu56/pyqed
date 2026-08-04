@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.basis import (
@@ -136,9 +137,9 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_sp_basis():
     np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-11, rtol=1e-11)
     if _integrals_cpp is not None:
         assert mol_default._builtin_build_info['dense_builder'] == 'cpp-cartesian-lmax6'
-    elif _rys_cy is not None:
-        assert mol_default._builtin_build_info['dense_builder'] == 'rys-cython-blocked-auto'
-    expected_builder = 'rys-cython-blocked' if _rys_cy is not None else 'rys-screened-mixed'
+    else:
+        assert mol_default._builtin_build_info['dense_builder'] == 'python-shellblocked'
+    expected_builder = 'rys-cython-blocked' if _rys_cy is not None else 'rys-python-shellblocked'
     assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
 
     e_default = mol_default.RHF().run(max_cycle=80).e_tot
@@ -146,7 +147,7 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_sp_basis():
     np.testing.assert_allclose(e_rys, e_default, atol=1e-10, rtol=1e-10)
 
 
-def test_builtin_parallel_option_keeps_compiled_rys_for_sp_basis():
+def test_builtin_parallel_option_keeps_selected_dense_backend():
     atom = 'O 0 0 0; H 0 0 1.8; H 0 1.7 0'
     basis = 'sto-3g'
 
@@ -166,34 +167,57 @@ def test_builtin_parallel_option_keeps_compiled_rys_for_sp_basis():
 
     if _integrals_cpp is not None:
         assert mol_parallel._builtin_build_info['dense_builder'] == 'cpp-cartesian-lmax6'
-    elif _rys_cy is not None:
-        assert mol_parallel._builtin_build_info['dense_builder'] == 'rys-cython-blocked-auto'
+    else:
+        assert mol_parallel._builtin_build_info['dense_builder'] == 'python-shellblocked'
     np.testing.assert_allclose(mol_parallel.eri, mol_serial.eri, atol=1e-11, rtol=1e-11)
 
 
-def test_builtin_rys_backend_matches_default_dense_builder_for_d_basis():
-    atom = 'H 0 0 0; F 0 0 0.9'
-    basis = '6-31g(d,p)'
-
-    mol_default = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol_default.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
-
-    mol_rys = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol_rys.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1', 'eri_backend': 'rys'})
-
-    np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
-    np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
-    np.testing.assert_allclose(mol_rys.eri, mol_default.eri, atol=1e-9, rtol=1e-9)
-    expected_builder = (
-        'cython-shell-os-blocked-mixed-d-fallback'
-        if _basis_cy is not None
-        else 'python-serial-mixed-d-fallback'
+def test_builtin_rys_backend_rejects_d_basis_before_building_eris():
+    mol = Molecule(
+        atom='H 0 0 0; F 0 0 0.9',
+        unit='angstrom',
+        basis='6-31g(d,p)',
     )
-    assert mol_rys._builtin_build_info['dense_builder'] == expected_builder
+    with pytest.raises(RuntimeError, match='only Cartesian s/p bases'):
+        mol.build(
+            driver='builtin',
+            options={'eri_representation': 'dense', 'aosym': 's1', 'eri_backend': 'rys'},
+        )
 
-    e_default = mol_default.RHF().run(max_cycle=80).e_tot
-    e_rys = mol_rys.RHF().run(max_cycle=80).e_tot
-    np.testing.assert_allclose(e_rys, e_default, atol=1e-9, rtol=1e-9)
+
+def test_builtin_python_backend_is_an_explicit_reference_path():
+    atom = 'H 0 0 0; H 0 0 1.4'
+    mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    mol.build(
+        driver='builtin',
+        eri='dense',
+        aosym='s1',
+        options={'eri_backend': 'python'},
+    )
+
+    ref = Molecule(atom=atom, unit='bohr', basis='sto-3g')
+    ref.build(driver='builtin', eri='dense', aosym='s1')
+
+    info = mol._builtin_build_info
+    assert info['eri_backend_requested'] == 'python'
+    assert info['eri_backend_selected'] == 'python'
+    assert info['dense_builder'] == 'python-shellblocked'
+    np.testing.assert_allclose(mol.eri, ref.eri, atol=1e-12, rtol=1e-12)
+
+
+def test_builtin_rys_factor_only_honors_s8_pair_storage():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol.build(
+        driver='builtin',
+        eri='factors',
+        aosym='s8',
+        options={'eri_backend': 'rys', 'low_rank_tol': 1e-12},
+    )
+
+    info = mol._builtin_build_info
+    assert isinstance(mol.eri_factors, PackedRIFactors)
+    assert info['factor_storage'] == 'packed-pair'
+    assert info['factor_builder'] == 'rys-s8-pair-pivoted-cholesky'
 
 
 def test_cpp_ssss_dense_helper_matches_existing_dense_builder():
@@ -526,6 +550,8 @@ def test_builtin_dense_defaults_to_cpp_s8_storage():
     assert mol.eri is None
     assert mol.eri_s8 is not None
     if _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_eri_s8_cartesian"):
+        assert info['eri_backend_requested'] == 'auto'
+        assert info['eri_backend_selected'] == 'cpp'
         assert info['dense_builder'] == 'cpp-cartesian-s8-lmax6'
 
 
@@ -622,7 +648,7 @@ def test_builtin_aosym_s8_matches_legacy_eri_alias():
     expected_builder = (
         'cpp-cartesian-s8-lmax6'
         if _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_eri_s8_cartesian")
-        else ('cpp-cartesian-lmax6' if _integrals_cpp is not None else 'cython-s8-packed')
+        else ('cpp-cartesian-lmax6' if _integrals_cpp is not None else 'python-shellblocked')
     )
     assert mol_aosym._builtin_build_info['dense_builder'] == expected_builder
     np.testing.assert_allclose(mol_aosym.eri_s8, mol_legacy.eri_s8, atol=1e-12)

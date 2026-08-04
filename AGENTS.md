@@ -5,7 +5,8 @@
 - Prefer project-local patterns and focused changes over broad refactors.
 - The worktree may contain user changes. Do not revert or overwrite unrelated edits.
 
-## Compatibility
+## Compatibility (No compatibility)
+- No compatibility: don't preserve old APIs/behavior unless the user explicitly asks.
 - Don't worry about compatibility unless the user explicitly asks for it.
 - Prefer clean current behavior over preserving legacy APIs, old Python versions, or historical package metadata.
 
@@ -28,6 +29,7 @@
 
 ## Code Style
 - Keep changes readable and direct. Add abstractions only when they reduce real duplication or complexity.
+- When adding new code, make it compact.
 - Do not casually create separate `Result` classes for solver/driver workflows. Prefer populating the solver/driver object with fields such as `energy`, `state`, `history`, `success`, and `message`; add a result object only when it clearly improves ownership, immutability, or composition.
 - When optimizing code, prioritize architecture and data flow first; leave micro-optimization until the very end.
 - Use structured numerical APIs and existing helper functions instead of ad hoc parsing or manual array manipulation.

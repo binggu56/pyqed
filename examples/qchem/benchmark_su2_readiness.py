@@ -172,7 +172,12 @@ def _family_kernel_diagnostics(history):
             family_table = stats.get("complementary_family_table") or {}
             if not family_table:
                 continue
-            backend = str(family_table.get("backend", "unknown"))
+            backend = family_table.get("backend")
+            if backend is None:
+                # Packed C++ factor routes expose their source metadata here,
+                # but they are not a ComplementaryFamilyTensorTable backend.
+                continue
+            backend = str(backend)
             backend_counts[backend] = backend_counts.get(backend, 0) + 1
             native_elements += int(family_table.get("native_kernel_elements", 0))
             factor_elements += int(family_table.get("factor_kernel_elements", 0))
@@ -218,7 +223,7 @@ def run_case(
     system,
     *,
     basis="sto-3g",
-    driver="gbasis",
+    driver="builtin",
     bond_dim=16,
     nsweeps=4,
     energy_tol=1.0e-7,
@@ -229,14 +234,28 @@ def run_case(
     family_dense_threshold=None,
     family_dense_max_total_elements=None,
     conv_tol=-1.0,
+    require_convergence=False,
 ):
     """Run one SU(2) readiness case and return a structured result."""
 
     if system not in PRESETS:
         raise ValueError(f"Unknown readiness preset {system!r}; choose one of {sorted(PRESETS)}.")
     case = PRESETS[system]
+    if str(driver).lower() not in {"builtin", "native"}:
+        raise ValueError("SU(2) readiness benchmarks require the compiled builtin C++ integral backend.")
     mol = Molecule(atom=case["atom"], unit=case["unit"], basis=basis, spin=case["spin"])
-    mol.build(driver=driver)
+    mol.build(
+        driver="builtin",
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    build_info = mol._builtin_build_info
+    if (
+        build_info.get("eri_backend") != "cpp"
+        or not str(build_info.get("dense_builder", "")).startswith("cpp-")
+    ):
+        raise RuntimeError("The SU(2) readiness benchmark requires the compiled C++ ERI backend.")
     mf = RHF(mol).run()
 
     qcdmrg = DMRG(
@@ -255,6 +274,7 @@ def run_case(
     run_kwargs = {
         "nsweeps": int(nsweeps),
         "conv_tol": float(conv_tol),
+        "require_convergence": bool(require_convergence),
         "local_basis_policy": local_basis_policy,
         "orthonormalized_operator_dim": int(orthonormalized_operator_dim),
         "max_bond_mode": "per_sector",
@@ -375,7 +395,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", choices=sorted(PRESETS), action="append")
     parser.add_argument("--basis", default="sto-3g")
-    parser.add_argument("--driver", default="gbasis")
+    parser.add_argument("--driver", choices=["builtin", "native"], default="builtin")
     parser.add_argument("--D", type=int, default=16)
     parser.add_argument("--nsweeps", type=int, default=4)
     parser.add_argument("--energy-tol", type=float, default=1.0e-7)

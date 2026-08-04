@@ -146,7 +146,8 @@ class RHFHessian:
             amat[row, col] += e_occ[j] - e_vir[bpos]
         return amat
 
-    def _solve_cphf(self, f1, s1):
+    def _cphf_orbital_columns(self, f1, s1):
+        """Solve occupied MO response columns for arbitrary perturbations."""
         mo_coeff = np.asarray(self.base.mo_coeff, dtype=float)
         mo_energy = np.asarray(self.base.mo_energy, dtype=float)
         mo_occ = np.asarray(self.base.mo_occ)
@@ -156,22 +157,29 @@ class RHFHessian:
         nmo = mo_coeff.shape[1]
         nocc = occidx.size
         nvir = viridx.size
-        npert = self._npert
         e_occ = mo_energy[occidx]
         e_vir = mo_energy[viridx]
 
-        f1f = f1.reshape(npert, *f1.shape[2:])
-        s1f = s1.reshape(npert, *s1.shape[2:])
+        f1 = np.asarray(f1, dtype=float)
+        s1 = np.asarray(s1, dtype=float)
+        if f1.shape != s1.shape or f1.shape[-2:] != (self.mol.nao, self.mol.nao):
+            raise ValueError(
+                "fock and overlap derivatives must have matching shape "
+                "(..., nao, nao)"
+            )
+        perturbation_shape = f1.shape[:-2]
+        npert = int(np.prod(perturbation_shape))
+        f1f = f1.reshape(npert, self.mol.nao, self.mol.nao)
+        s1f = s1.reshape(npert, self.mol.nao, self.mol.nao)
 
         u_all = np.zeros((npert, nmo, nocc), dtype=float)
-        e1_all = np.zeros((npert, nocc, nocc), dtype=float)
-        dm1_all = np.zeros((npert, self.mol.nao, self.mol.nao), dtype=float)
-        w1_all = np.zeros_like(dm1_all)
-
-        amat = self._build_cphf_matrix(mo_coeff, cocc, occidx, viridx, e_occ, e_vir)
+        h_vo_all = np.zeros_like(u_all)
+        s1_mo_all = np.empty((npert, nmo, nmo), dtype=float)
         rhs_all = np.zeros((npert, nvir, nocc), dtype=float)
-        u_fixed_all = np.zeros((npert, nmo, nocc), dtype=float)
-        h_vo_all = np.zeros((npert, nmo, nocc), dtype=float)
+        u_fixed_all = np.zeros_like(u_all)
+        amat = self._build_cphf_matrix(
+            mo_coeff, cocc, occidx, viridx, e_occ, e_vir
+        )
 
         for x in range(npert):
             f1_mo = mo_coeff.T @ f1f[x] @ mo_coeff
@@ -180,18 +188,384 @@ class RHFHessian:
 
             u_fixed = np.zeros((nmo, nocc), dtype=float)
             u_fixed[occidx, :] = -0.5 * s1_mo[np.ix_(occidx, occidx)]
-            v_fixed, _dm_fixed, _ = self._response_veff_mo(u_fixed, mo_coeff, cocc)
+            v_fixed, _dm_fixed, _ = self._response_veff_mo(
+                u_fixed, mo_coeff, cocc
+            )
             rhs_all[x] = h_vo[viridx] + v_fixed[viridx]
             u_fixed_all[x] = u_fixed
             h_vo_all[x] = h_vo
+            s1_mo_all[x] = s1_mo
 
-        u_vo_all = np.linalg.solve(amat, rhs_all.reshape(npert, -1).T).T.reshape(npert, nvir, nocc)
+        if nvir:
+            u_vo_all = np.linalg.solve(
+                amat, rhs_all.reshape(npert, -1).T
+            ).T.reshape(npert, nvir, nocc)
+        else:
+            u_vo_all = np.empty((npert, 0, nocc), dtype=float)
+        u_all[:] = u_fixed_all
+        u_all[:, viridx, :] = u_vo_all
+        return {
+            "amplitudes": u_all,
+            "h_vo": h_vo_all,
+            "overlap_mo": s1_mo_all,
+            "perturbation_shape": perturbation_shape,
+            "mo_coeff": mo_coeff,
+            "mo_energy": mo_energy,
+            "cocc": cocc,
+            "occidx": occidx,
+            "viridx": viridx,
+            "e_occ": e_occ,
+        }
+
+    def solve_mo_response(self, fock_derivatives, overlap_derivatives):
+        """Return full RHF MO coefficient derivatives in canonical MO gauge.
+
+        CPHF first determines the occupied response and therefore the relaxed
+        first-order Fock matrix. The response of every canonical MO then follows
+        from the differentiated generalized Fock eigenproblem. This includes
+        occupied-occupied and virtual-virtual rotations needed by truncated
+        active spaces.
+        """
+        response = self._first_order_mo_response_data(
+            fock_derivatives,
+            overlap_derivatives,
+        )
+        full = response["full_response"]
+        return full.reshape(
+            *response["perturbation_shape"],
+            full.shape[-2],
+            full.shape[-1],
+        )
+
+    def _first_order_mo_response_data(self, fock_derivatives, overlap_derivatives):
+        self._require_scf()
+        response = self._cphf_orbital_columns(
+            fock_derivatives, overlap_derivatives
+        )
+        amplitudes = response["amplitudes"]
+        overlap_mo = response["overlap_mo"]
+        mo_coeff = response["mo_coeff"]
+        mo_energy = response["mo_energy"]
+        cocc = response["cocc"]
+        occidx = response["occidx"]
+        e_occ = response["e_occ"]
+        f1 = np.asarray(fock_derivatives, dtype=float).reshape(
+            len(amplitudes), self.mol.nao, self.mol.nao
+        )
+        full = -0.5 * overlap_mo
+        dm1_all = np.empty(
+            (len(amplitudes), self.mol.nao, self.mol.nao),
+            dtype=float,
+        )
+        f1_total_ao = np.empty_like(dm1_all)
+        f1_total_mo = np.empty_like(full)
+        e1_occ = np.empty((len(amplitudes), len(e_occ), len(e_occ)))
+        e1 = np.empty((len(amplitudes), len(mo_energy)))
+        for perturbation in range(len(full)):
+            v_occ, dm1, v1_ao = self._response_veff_mo(
+                amplitudes[perturbation], mo_coeff, cocc
+            )
+            total_ao = f1[perturbation] + v1_ao
+            relaxed_fock = mo_coeff.T @ total_ao @ mo_coeff
+            h_vo = response["h_vo"][perturbation]
+            e1_occ[perturbation] = (
+                h_vo[occidx]
+                + v_occ[occidx]
+                + amplitudes[perturbation, occidx]
+                * (e_occ[:, None] - e_occ[None, :])
+            )
+            e1[perturbation] = (
+                np.diag(relaxed_fock)
+                - np.diag(overlap_mo[perturbation]) * mo_energy
+            )
+            dm1_all[perturbation] = dm1
+            f1_total_ao[perturbation] = total_ao
+            f1_total_mo[perturbation] = relaxed_fock
+            for column in range(len(mo_energy)):
+                for row in range(len(mo_energy)):
+                    if row == column:
+                        continue
+                    denominator = mo_energy[column] - mo_energy[row]
+                    if abs(denominator) < 1.0e-10:
+                        continue
+                    full[perturbation, row, column] = (
+                        relaxed_fock[row, column]
+                        - overlap_mo[perturbation, row, column]
+                        * mo_energy[column]
+                    ) / denominator
+        response.update({
+            "full_response": full,
+            "density_response": dm1_all,
+            "fock_total_ao": f1_total_ao,
+            "fock_total_mo": f1_total_mo,
+            "orbital_energy_response": e1,
+            "occupied_energy_response": e1_occ,
+        })
+        return response
+
+    @staticmethod
+    def _second_normalization(ux, uy, sx, sy, sxy, columns=None):
+        if columns is None:
+            left_x = ux.T
+            left_y = uy.T
+            sx_right = sx
+            sy_right = sy
+            sxy_block = sxy
+        else:
+            columns = np.asarray(columns, dtype=int)
+            left_x = ux.T
+            left_y = uy.T
+            sx_right = sx[:, columns]
+            sy_right = sy[:, columns]
+            sxy_block = sxy[np.ix_(columns, columns)]
+        return (
+            sxy_block
+            + left_x @ sy_right
+            + left_x @ uy
+            + left_y @ sx_right
+            + left_y @ ux
+            + sx_right.T @ uy
+            + sy_right.T @ ux
+        )
+
+    def _second_order_mo_response_data(
+        self,
+        first,
+        fock_second_explicit,
+        overlap_second,
+    ):
+        mo_coeff = first["mo_coeff"]
+        mo_energy = first["mo_energy"]
+        occidx = first["occidx"]
+        viridx = first["viridx"]
+        cocc = first["cocc"]
+        e_occ = first["e_occ"]
+        u_occ = first["amplitudes"]
+        u_full = first["full_response"]
+        s1_mo = first["overlap_mo"]
+        f1_mo = first["fock_total_mo"]
+        e1_occ = first["occupied_energy_response"]
+        e1 = first["orbital_energy_response"]
+        ncoord, nmo, nocc = u_occ.shape
+        nvir = len(viridx)
+        f2_explicit = np.asarray(fock_second_explicit, dtype=float).reshape(
+            ncoord, ncoord, self.mol.nao, self.mol.nao
+        )
+        s2 = np.asarray(overlap_second, dtype=float).reshape(
+            ncoord, ncoord, self.mol.nao, self.mol.nao
+        )
+        s2_mo = np.einsum(
+            "pi,xypq,qj->xyij",
+            mo_coeff,
+            s2,
+            mo_coeff,
+            optimize=True,
+        )
+        e0_occ = np.diag(e_occ)
+        fixed = np.zeros((ncoord, ncoord, nmo, nocc), dtype=float)
+        rhs = np.zeros((ncoord, ncoord, nvir, nocc), dtype=float)
+
+        for x in range(ncoord):
+            for y in range(ncoord):
+                normalization = self._second_normalization(
+                    u_occ[x],
+                    u_occ[y],
+                    s1_mo[x],
+                    s1_mo[y],
+                    s2_mo[x, y],
+                    columns=occidx,
+                )
+                fixed[x, y, occidx] = -0.5 * normalization
+                c1x = mo_coeff @ u_occ[x]
+                c1y = mo_coeff @ u_occ[y]
+                c2_fixed = mo_coeff @ fixed[x, y]
+                dm2_fixed = 2.0 * (
+                    c2_fixed @ cocc.T
+                    + cocc @ c2_fixed.T
+                    + c1x @ c1y.T
+                    + c1y @ c1x.T
+                )
+                f2_known = f2_explicit[x, y] + self.base.get_veff(dm2_fixed)
+                f2_known_mo = mo_coeff.T @ f2_known @ mo_coeff
+                known = (
+                    f2_known_mo[:, occidx]
+                    + f1_mo[x] @ u_occ[y]
+                    + f1_mo[y] @ u_occ[x]
+                    - s2_mo[x, y][:, occidx] @ e0_occ
+                    - s1_mo[x] @ u_occ[y] @ e0_occ
+                    - s1_mo[x][:, occidx] @ e1_occ[y]
+                    - s1_mo[y] @ u_occ[x] @ e0_occ
+                    - u_occ[x] @ e1_occ[y]
+                    - s1_mo[y][:, occidx] @ e1_occ[x]
+                    - u_occ[y] @ e1_occ[x]
+                )
+                rhs[x, y] = known[viridx]
+
+        if nvir:
+            amat = self._build_cphf_matrix(
+                mo_coeff,
+                cocc,
+                occidx,
+                viridx,
+                e_occ,
+                mo_energy[viridx],
+            )
+            solved = np.linalg.solve(
+                amat,
+                rhs.reshape(ncoord * ncoord, -1).T,
+            ).T.reshape(ncoord, ncoord, nvir, nocc)
+        else:
+            solved = np.empty((ncoord, ncoord, 0, nocc), dtype=float)
+
+        u2_occ = fixed
+        u2_occ[:, :, viridx] = solved
+        dm2 = np.empty(
+            (ncoord, ncoord, self.mol.nao, self.mol.nao),
+            dtype=float,
+        )
+        f2_total_mo = np.empty((ncoord, ncoord, nmo, nmo), dtype=float)
+        for x in range(ncoord):
+            for y in range(ncoord):
+                c1x = mo_coeff @ u_occ[x]
+                c1y = mo_coeff @ u_occ[y]
+                c2 = mo_coeff @ u2_occ[x, y]
+                dm2[x, y] = 2.0 * (
+                    c2 @ cocc.T
+                    + cocc @ c2.T
+                    + c1x @ c1y.T
+                    + c1y @ c1x.T
+                )
+                f2_total = f2_explicit[x, y] + self.base.get_veff(dm2[x, y])
+                f2_total_mo[x, y] = mo_coeff.T @ f2_total @ mo_coeff
+
+        e0 = np.diag(mo_energy)
+        u2_full = np.empty((ncoord, ncoord, nmo, nmo), dtype=float)
+        for x in range(ncoord):
+            for y in range(ncoord):
+                normalization = self._second_normalization(
+                    u_full[x],
+                    u_full[y],
+                    s1_mo[x],
+                    s1_mo[y],
+                    s2_mo[x, y],
+                )
+                response = -0.5 * normalization
+                known = (
+                    f2_total_mo[x, y]
+                    + f1_mo[x] @ u_full[y]
+                    + f1_mo[y] @ u_full[x]
+                    - s2_mo[x, y] @ e0
+                    - s1_mo[x] @ u_full[y] @ e0
+                    - s1_mo[x] @ np.diag(e1[y])
+                    - s1_mo[y] @ u_full[x] @ e0
+                    - u_full[x] @ np.diag(e1[y])
+                    - s1_mo[y] @ np.diag(e1[x])
+                    - u_full[y] @ np.diag(e1[x])
+                )
+                for column in range(nmo):
+                    for row in range(nmo):
+                        if row == column:
+                            continue
+                        denominator = mo_energy[column] - mo_energy[row]
+                        if abs(denominator) < 1.0e-10:
+                            continue
+                        response[row, column] = known[row, column] / denominator
+                u2_full[x, y] = response
+
+        u2_full = 0.5 * (u2_full + u2_full.swapaxes(0, 1))
+        return {
+            "full_response": u2_full,
+            "occupied_response": u2_occ,
+            "density_response": dm2,
+            "fock_total_mo": f2_total_mo,
+            "overlap_mo": s2_mo,
+        }
+
+    def orbital_second_response(
+        self,
+        hcore_first,
+        eri_first,
+        overlap_first,
+        hcore_second,
+        eri_second,
+        overlap_second,
+    ):
+        """Return first and second canonical RHF MO coefficient responses."""
+        self._require_scf()
+        h1 = np.asarray(hcore_first, dtype=float)
+        eri1 = np.asarray(eri_first, dtype=float)
+        s1 = np.asarray(overlap_first, dtype=float)
+        h2 = np.asarray(hcore_second, dtype=float)
+        eri2 = np.asarray(eri_second, dtype=float)
+        s2 = np.asarray(overlap_second, dtype=float)
+        ncoord = h1.shape[0]
+        one_shape = (ncoord, self.mol.nao, self.mol.nao)
+        two_shape = (ncoord, ncoord, self.mol.nao, self.mol.nao)
+        if h1.shape != one_shape or s1.shape != one_shape:
+            raise ValueError(f"first one-electron derivatives must have shape {one_shape}")
+        if h2.shape != two_shape or s2.shape != two_shape:
+            raise ValueError(f"second one-electron derivatives must have shape {two_shape}")
+        if eri1.shape != (ncoord,) + (self.mol.nao,) * 4:
+            raise ValueError("first ERI derivative shape is inconsistent")
+        if eri2.shape != (ncoord, ncoord) + (self.mol.nao,) * 4:
+            raise ValueError("second ERI derivative shape is inconsistent")
+
+        dm0 = np.asarray(self.base.make_rdm1(), dtype=float)
+        f1 = np.empty_like(h1)
+        for x in range(ncoord):
+            f1[x] = h1[x] + _veff_from_eri(eri1[x], dm0)
+        first = self._first_order_mo_response_data(f1, s1)
+        dm1 = first["density_response"]
+        f2_explicit = np.empty_like(h2)
+        for x in range(ncoord):
+            for y in range(ncoord):
+                f2_explicit[x, y] = (
+                    h2[x, y]
+                    + _veff_from_eri(eri2[x, y], dm0)
+                    + _veff_from_eri(eri1[x], dm1[y])
+                    + _veff_from_eri(eri1[y], dm1[x])
+                )
+        second = self._second_order_mo_response_data(first, f2_explicit, s2)
+        return first["full_response"], second["full_response"]
+
+    def orbital_response(self, hcore_derivatives, eri_derivatives, overlap_derivatives):
+        """Solve RHF MO response from explicit AO integral derivatives."""
+        self._require_scf()
+        h1 = np.asarray(hcore_derivatives, dtype=float)
+        eri1 = np.asarray(eri_derivatives, dtype=float)
+        s1 = np.asarray(overlap_derivatives, dtype=float)
+        if h1.shape != s1.shape or h1.shape[-2:] != (self.mol.nao, self.mol.nao):
+            raise ValueError(
+                "hcore and overlap derivatives must have matching shape "
+                "(..., nao, nao)"
+            )
+        expected_eri = (*h1.shape[:-2],) + (self.mol.nao,) * 4
+        if eri1.shape != expected_eri:
+            raise ValueError(
+                f"eri_derivatives shape {eri1.shape} != {expected_eri}"
+            )
+        dm0 = np.asarray(self.base.make_rdm1(), dtype=float)
+        f1 = np.empty_like(h1)
+        for index in np.ndindex(h1.shape[:-2]):
+            f1[index] = h1[index] + _veff_from_eri(eri1[index], dm0)
+        return self.solve_mo_response(f1, s1)
+
+    def _solve_cphf(self, f1, s1):
+        response = self._cphf_orbital_columns(f1, s1)
+        mo_coeff = response["mo_coeff"]
+        cocc = response["cocc"]
+        occidx = response["occidx"]
+        e_occ = response["e_occ"]
+        u_all = response["amplitudes"]
+        h_vo_all = response["h_vo"]
+        npert, nmo, nocc = u_all.shape
+        e1_all = np.zeros((npert, nocc, nocc), dtype=float)
+        dm1_all = np.zeros((npert, self.mol.nao, self.mol.nao), dtype=float)
+        w1_all = np.zeros_like(dm1_all)
 
         for x in range(npert):
             h_vo = h_vo_all[x]
-            u_vo = u_vo_all[x]
-            u = u_fixed_all[x].copy()
-            u[viridx] = u_vo
+            u = u_all[x]
 
             v_total, dm1, _ = self._response_veff_mo(u, mo_coeff, cocc)
             hs = h_vo + v_total

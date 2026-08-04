@@ -3,7 +3,9 @@
 This module keeps the next-nearest-neighbor tied ansatz separate from the
 production nearest-neighbor :class:`pyqed.letta.LETTA` implementation.  The
 local eigensolves use range-2 MPO prefix/suffix environments that carry the two
-open shared physical legs required by the ansatz.
+open shared physical legs required by the ansatz.  Physical-pair-conditioned
+gauges and adaptive bond compression expose an identity norm metric on the
+active local support.
 """
 
 from __future__ import annotations
@@ -14,7 +16,11 @@ from pathlib import Path
 import numpy as np
 from scipy.sparse.linalg import LinearOperator, eigsh
 
-from .core import _lowest_generalized_eigenpair, _metric_basis
+from .core import (
+    _lowest_generalized_eigenpair,
+    _lowest_hermitian_eigenpair,
+    _metric_basis,
+)
 
 
 def _validate_dims(dims) -> tuple[int, ...]:
@@ -36,8 +42,8 @@ class NNNLETTA:
     $$
 
     Adjacent tensors share two physical legs.  This experimental class supports
-    one-tensor MPO sweeps and a conditional QR gauge over the shared physical
-    pair on each virtual bond.
+    one-tensor MPO sweeps, adaptive conditional ranks, and a conditional
+    canonical gauge over the shared physical pair on each virtual bond.
     """
 
     tie_range = 2
@@ -481,20 +487,35 @@ class NNNLETTA:
         full[support] = vector
         return full
 
-    def _solve_tensor_mpo_dense(self, mpo, tensor_index: int, left, right, metric_left, metric_right):
+    def _solve_tensor_mpo_dense(
+        self,
+        mpo,
+        tensor_index: int,
+        left,
+        right,
+        metric_left,
+        metric_right,
+        *,
+        assume_identity_metric=False,
+    ):
         heff = self._local_effective_from_environments(mpo, tensor_index, left, right)
-        metric = self._local_effective_from_environments(
-            self.identity_mpo(),
-            tensor_index,
-            metric_left,
-            metric_right,
-        )
         support = self._support_indices(tensor_index)
         local_dim = heff.shape[0]
-        energy, vector = _lowest_generalized_eigenpair(
-            self._restrict_matrix(heff, support),
-            self._restrict_matrix(metric, support),
-        )
+        heff = self._restrict_matrix(heff, support)
+        heff = 0.5 * (heff + heff.T.conj())
+        if assume_identity_metric:
+            energy, vector = _lowest_hermitian_eigenpair(heff)
+        else:
+            metric = self._local_effective_from_environments(
+                self.identity_mpo(),
+                tensor_index,
+                metric_left,
+                metric_right,
+            )
+            energy, vector = _lowest_generalized_eigenpair(
+                heff,
+                self._restrict_matrix(metric, support),
+            )
         return energy, self._expand_supported_vector(vector, support, local_dim)
 
     def _solve_tensor_mpo_matrix_free(
@@ -508,6 +529,7 @@ class NNNLETTA:
         *,
         tol=1.0e-9,
         maxiter=None,
+        assume_identity_metric=False,
     ):
         shape = self.tensors[tensor_index].shape
         local_dim = int(np.prod(shape))
@@ -529,25 +551,32 @@ class NNNLETTA:
                 full_vector,
             ).reshape(-1)[slice(None) if support is None else support].astype(dtype, copy=False)
 
-        metric = self._local_effective_from_environments(
-            self.identity_mpo(),
-            tensor_index,
-            metric_left,
-            metric_right,
-        )
-        metric = self._restrict_matrix(metric, support)
-        metric = 0.5 * (metric + metric.T.conj())
-        basis = _metric_basis(metric)
-        reduced_dim = basis.shape[1]
+        if assume_identity_metric:
+            metric = None
+            basis = None
+            reduced_dim = active_dim
+        else:
+            metric = self._local_effective_from_environments(
+                self.identity_mpo(),
+                tensor_index,
+                metric_left,
+                metric_right,
+            )
+            metric = self._restrict_matrix(metric, support)
+            metric = 0.5 * (metric + metric.T.conj())
+            basis = _metric_basis(metric)
+            reduced_dim = basis.shape[1]
 
         def reduced_matvec(vector):
+            if basis is None:
+                return matvec(vector)
             full_vector = basis @ np.asarray(vector)
             return basis.conj().T @ matvec(full_vector)
 
         v0 = np.asarray(self.tensors[tensor_index]).reshape(-1)
         if support is not None:
             v0 = v0[support]
-        reduced_v0 = basis.conj().T @ (metric @ v0)
+        reduced_v0 = v0 if basis is None else basis.conj().T @ (metric @ v0)
         try:
             if reduced_dim <= 2:
                 reduced_matrix = np.column_stack(
@@ -555,12 +584,12 @@ class NNNLETTA:
                 )
                 reduced_matrix = 0.5 * (reduced_matrix + reduced_matrix.T.conj())
                 evals, evecs = np.linalg.eigh(reduced_matrix)
-                vector = basis @ evecs[:, 0]
+                vector = evecs[:, 0] if basis is None else basis @ evecs[:, 0]
                 return float(np.real(evals[0])), self._expand_supported_vector(vector, support, local_dim)
             reduced_operator = LinearOperator(
                 (reduced_dim, reduced_dim),
                 matvec=reduced_matvec,
-                dtype=np.result_type(dtype, basis.dtype),
+                dtype=dtype if basis is None else np.result_type(dtype, basis.dtype),
             )
             if np.linalg.norm(reduced_v0) < 1.0e-14:
                 reduced_v0 = None
@@ -572,11 +601,71 @@ class NNNLETTA:
                 maxiter=maxiter,
                 v0=reduced_v0,
             )
-            return float(np.real(evals[0])), self._expand_supported_vector(basis @ evecs[:, 0], support, local_dim)
+            vector = evecs[:, 0] if basis is None else basis @ evecs[:, 0]
+            return float(np.real(evals[0])), self._expand_supported_vector(vector, support, local_dim)
         except Exception:
             heff = self._local_effective_from_environments(mpo, tensor_index, left, right)
-            energy, vector = _lowest_generalized_eigenpair(self._restrict_matrix(heff, support), metric)
+            heff = self._restrict_matrix(heff, support)
+            heff = 0.5 * (heff + heff.T.conj())
+            if assume_identity_metric:
+                energy, vector = _lowest_hermitian_eigenpair(heff)
+            else:
+                energy, vector = _lowest_generalized_eigenpair(heff, metric)
             return energy, self._expand_supported_vector(vector, support, local_dim)
+
+    def _local_metric_is_identity(
+        self,
+        tensor_index: int,
+        metric_left,
+        metric_right,
+        *,
+        atol=1.0e-10,
+    ) -> bool:
+        """Check the active range-2 norm blocks without building the full metric."""
+        tensor_index = int(tensor_index)
+        left = metric_left[tensor_index]
+        right = metric_right[tensor_index]
+        if left.shape[2] != 1 or right.shape[2] != 1:
+            return False
+        mask = None if self.local_masks is None else self.local_masks[tensor_index]
+        for s0 in range(self.dims[tensor_index]):
+            for s1 in range(self.dims[tensor_index + 1]):
+                left_block = left[:, :, 0, s0, s0, s1, s1]
+                for s2 in range(self.dims[tensor_index + 2]):
+                    right_block = right[:, :, 0, s1, s1, s2, s2]
+                    if mask is None:
+                        if not np.allclose(
+                            left_block,
+                            np.eye(left_block.shape[0], dtype=left_block.dtype),
+                            rtol=0.0,
+                            atol=float(atol),
+                        ):
+                            return False
+                        if not np.allclose(
+                            right_block,
+                            np.eye(right_block.shape[0], dtype=right_block.dtype),
+                            rtol=0.0,
+                            atol=float(atol),
+                        ):
+                            return False
+                        continue
+                    coords = np.argwhere(mask[:, s0, s1, s2, :])
+                    if not coords.size:
+                        continue
+                    left_indices = coords[:, 0]
+                    right_indices = coords[:, 1]
+                    block = (
+                        left_block[left_indices[:, None], left_indices[None, :]]
+                        * right_block[right_indices[:, None], right_indices[None, :]]
+                    )
+                    if not np.allclose(
+                        block,
+                        np.eye(coords.shape[0], dtype=block.dtype),
+                        rtol=0.0,
+                        atol=float(atol),
+                    ):
+                        return False
+        return True
 
     def optimize_tensor_mpo(
         self,
@@ -587,6 +676,8 @@ class NNNLETTA:
         matrix_free_threshold=4096,
         matrix_free_tol=1.0e-9,
         matrix_free_maxiter=None,
+        identity_metric=False,
+        metric_tol=1.0e-10,
     ) -> dict:
         """Optimize one local tensor using range-2 MPO environments."""
         mpo = self._validate_mpo(mpo)
@@ -599,6 +690,12 @@ class NNNLETTA:
         identity = self.identity_mpo()
         metric_left = self._left_local_environments(identity)
         metric_right = self._right_local_environments(identity)
+        use_identity_metric = bool(identity_metric) and self._local_metric_is_identity(
+            tensor_index,
+            metric_left,
+            metric_right,
+            atol=metric_tol,
+        )
         local_dim = int(np.prod(self.tensors[tensor_index].shape))
         solver = str(local_solver).lower()
         if solver not in {"auto", "dense", "matrix_free"}:
@@ -618,6 +715,7 @@ class NNNLETTA:
                 metric_right,
                 tol=matrix_free_tol,
                 maxiter=matrix_free_maxiter,
+                assume_identity_metric=use_identity_metric,
             )
         else:
             energy, vector = self._solve_tensor_mpo_dense(
@@ -627,12 +725,239 @@ class NNNLETTA:
                 right,
                 metric_left,
                 metric_right,
+                assume_identity_metric=use_identity_metric,
             )
         tensor = vector.reshape(self.tensors[tensor_index].shape)
         if self.local_masks is not None:
             tensor = np.where(self.local_masks[tensor_index], tensor, 0.0)
         self.tensors[tensor_index] = tensor
-        return {"tensor": tensor_index, "local_energy": float(np.real(energy))}
+        return {
+            "tensor": tensor_index,
+            "local_energy": float(np.real(energy)),
+            "identity_metric": bool(use_identity_metric),
+        }
+
+    def _virtual_bond_groups(self, bond: int) -> list[np.ndarray]:
+        """Return virtual channels with compatible mask support."""
+        bond = int(bond)
+        left = self.tensors[bond]
+        right = self.tensors[bond + 1]
+        shared = min(left.shape[-1], right.shape[0])
+        if self.local_masks is None:
+            return [np.arange(shared, dtype=np.int64)]
+        left_mask = self.local_masks[bond]
+        right_mask = self.local_masks[bond + 1]
+        groups = {}
+        for index in range(shared):
+            left_signature = np.ascontiguousarray(left_mask[..., index]).tobytes()
+            right_signature = np.ascontiguousarray(right_mask[index, ...]).tobytes()
+            groups.setdefault((left_signature, right_signature), []).append(index)
+        return [np.asarray(indices, dtype=np.int64) for indices in groups.values() if indices]
+
+    def _conditional_bond_matrices(self, bond, s1, s2, group):
+        left = self.tensors[int(bond)]
+        right = self.tensors[int(bond) + 1]
+        group = np.asarray(group, dtype=np.int64)
+        left_block = left[:, :, int(s1), int(s2), :][:, :, group]
+        right_block = right[:, int(s1), int(s2), :, :][group, :, :]
+        return (
+            left_block.reshape(-1, group.size),
+            right_block.reshape(group.size, -1),
+        )
+
+    def compress_conditional_bond(
+        self,
+        bond: int,
+        *,
+        direction="lr",
+        rtol=1.0e-12,
+        atol=0.0,
+        max_bond_dim=None,
+    ) -> dict:
+        """Compress a bond independently for every shared physical pair."""
+        bond = int(bond)
+        if bond < 0 or bond + 1 >= self.nlocal_tensors:
+            raise IndexError("bond out of range.")
+        direction = str(direction).lower()
+        if direction not in {"lr", "rl", "balanced"}:
+            raise ValueError("direction must be 'lr', 'rl', or 'balanced'.")
+        rtol = float(rtol)
+        atol = float(atol)
+        if rtol < 0.0 or atol < 0.0:
+            raise ValueError("rtol and atol must be nonnegative.")
+        if max_bond_dim is not None:
+            max_bond_dim = int(max_bond_dim)
+            if max_bond_dim < 1:
+                raise ValueError("max_bond_dim must be positive when provided.")
+
+        left = self.tensors[bond]
+        right = self.tensors[bond + 1]
+        old_dim = int(left.shape[-1])
+        if right.shape[0] != old_dim:
+            raise ValueError("neighboring tensors have incompatible virtual bond dimensions.")
+        shared_dims = (self.dims[bond + 1], self.dims[bond + 2])
+        pairs = tuple(np.ndindex(*shared_dims))
+        groups = self._virtual_bond_groups(bond)
+        records = []
+        numeric_ranks = []
+        total_weight = 0.0
+        for group in groups:
+            group_records = []
+            group_ranks = []
+            for s1, s2 in pairs:
+                left_matrix, right_matrix = self._conditional_bond_matrices(
+                    bond,
+                    s1,
+                    s2,
+                    group,
+                )
+                u, values, vh = np.linalg.svd(left_matrix @ right_matrix, full_matrices=False)
+                scale = float(values[0]) if values.size else 0.0
+                rank = int(np.count_nonzero(values > max(atol, rtol * scale)))
+                group_records.append((u, values, vh, rank))
+                group_ranks.append(rank)
+                total_weight += float(np.sum(np.abs(values) ** 2))
+            records.append(group_records)
+            numeric_ranks.append(group_ranks)
+
+        capacities = [max(ranks, default=0) for ranks in numeric_ranks]
+        exact_dim = int(sum(capacities))
+        if max_bond_dim is not None and exact_dim > max_bond_dim:
+            capacities = [0] * len(records)
+            for _ in range(max_bond_dim):
+                gains = []
+                for group_index, group_records in enumerate(records):
+                    channel = capacities[group_index]
+                    gains.append(
+                        sum(
+                            float(abs(values[channel]) ** 2)
+                            for _u, values, _vh, rank in group_records
+                            if channel < rank
+                        )
+                    )
+                selected = int(np.argmax(gains)) if gains else 0
+                if not gains or gains[selected] <= 0.0:
+                    break
+                capacities[selected] += 1
+        new_dim = int(sum(capacities))
+        if new_dim < 1:
+            raise ValueError("conditional compression removed every virtual channel.")
+
+        dtype = np.result_type(left.dtype, right.dtype)
+        new_left = np.zeros(left.shape[:-1] + (new_dim,), dtype=dtype)
+        new_right = np.zeros((new_dim,) + right.shape[1:], dtype=dtype)
+        new_left_mask = np.zeros(new_left.shape, dtype=bool)
+        new_right_mask = np.zeros(new_right.shape, dtype=bool)
+        old_left_mask = None if self.local_masks is None else self.local_masks[bond]
+        old_right_mask = None if self.local_masks is None else self.local_masks[bond + 1]
+        retained_ranks = np.zeros(shared_dims, dtype=np.int64)
+        discarded_weight = 0.0
+        cursor = 0
+        for group, group_records, capacity in zip(groups, records, capacities):
+            group = np.asarray(group, dtype=np.int64)
+            capacity = int(capacity)
+            if capacity == 0:
+                for _u, values, _vh, _rank in group_records:
+                    discarded_weight += float(np.sum(np.abs(values) ** 2))
+                continue
+            left_allowed = (
+                np.ones(left.shape[:-1], dtype=bool)
+                if old_left_mask is None
+                else np.any(old_left_mask[..., group], axis=-1)
+            )
+            right_allowed = (
+                np.ones(right.shape[1:], dtype=bool)
+                if old_right_mask is None
+                else np.any(old_right_mask[group, ...], axis=0)
+            )
+            for (s1, s2), (u, values, vh, numeric_rank) in zip(pairs, group_records):
+                rank = min(int(numeric_rank), capacity)
+                retained_ranks[s1, s2] += rank
+                discarded_weight += float(np.sum(np.abs(values[rank:]) ** 2))
+                if rank == 0:
+                    continue
+                if direction == "lr":
+                    left_factor = u[:, :rank]
+                    right_factor = values[:rank, None] * vh[:rank, :]
+                elif direction == "rl":
+                    left_factor = u[:, :rank] * values[None, :rank]
+                    right_factor = vh[:rank, :]
+                else:
+                    roots = np.sqrt(values[:rank])
+                    left_factor = u[:, :rank] * roots[None, :]
+                    right_factor = roots[:, None] * vh[:rank, :]
+                new_left[:, :, s1, s2, cursor : cursor + rank] = left_factor.reshape(
+                    left.shape[0],
+                    left.shape[1],
+                    rank,
+                )
+                new_right[cursor : cursor + rank, s1, s2, :, :] = right_factor.reshape(
+                    rank,
+                    right.shape[3],
+                    right.shape[4],
+                )
+                new_left_mask[:, :, s1, s2, cursor : cursor + rank] = left_allowed[
+                    :, :, s1, s2, None
+                ]
+                new_right_mask[cursor : cursor + rank, s1, s2, :, :] = right_allowed[
+                    s1, s2, :, :
+                ]
+            cursor += capacity
+
+        masks = (
+            [np.ones(tensor.shape, dtype=bool) for tensor in self.tensors]
+            if self.local_masks is None
+            else [mask.copy() for mask in self.local_masks]
+        )
+        self.tensors[bond] = new_left
+        self.tensors[bond + 1] = new_right
+        masks[bond] = new_left_mask
+        masks[bond + 1] = new_right_mask
+        self.local_masks = None if all(np.all(mask) for mask in masks) else masks
+        self._apply_local_masks()
+        self.bond_dim = max(
+            [1]
+            + [int(tensor.shape[-1]) for tensor in self.tensors[:-1]]
+            + [int(tensor.shape[0]) for tensor in self.tensors[1:]]
+        )
+        self.converged = False
+        relative_discarded = 0.0 if total_weight <= 0.0 else discarded_weight / total_weight
+        return {
+            "bond": bond,
+            "old_dim": old_dim,
+            "new_dim": new_dim,
+            "exact_dim": exact_dim,
+            "sector_ranks": tuple(int(rank) for rank in retained_ranks.reshape(-1)),
+            "discarded_weight": float(discarded_weight),
+            "relative_discarded_weight": float(relative_discarded),
+            "truncated": bool(discarded_weight > max(atol * atol, 1.0e-30)),
+        }
+
+    def compress_conditional_bonds(
+        self,
+        *,
+        direction="lr",
+        rtol=1.0e-12,
+        atol=0.0,
+        max_bond_dim=None,
+    ) -> list[dict]:
+        """Compress all range-2 bonds in sweep order."""
+        direction = str(direction).lower()
+        if direction not in {"lr", "rl"}:
+            raise ValueError("direction must be 'lr' or 'rl'.")
+        bonds = list(range(self.nlocal_tensors - 1))
+        if direction == "rl":
+            bonds.reverse()
+        return [
+            self.compress_conditional_bond(
+                bond,
+                direction=direction,
+                rtol=rtol,
+                atol=atol,
+                max_bond_dim=max_bond_dim,
+            )
+            for bond in bonds
+        ]
 
     def canonicalize_conditional_bond(self, bond: int, *, direction="lr", normalize=False):
         """QR-gauge one virtual bond for each shared physical pair.
@@ -721,6 +1046,59 @@ class NNNLETTA:
             self.normalize()
         return self
 
+    def canonicalize_conditional_center(self, tensor_index: int, *, normalize=True):
+        """Build a physical-pair-conditioned mixed gauge around one tensor."""
+        tensor_index = int(tensor_index)
+        if tensor_index < 0 or tensor_index >= self.nlocal_tensors:
+            raise IndexError("tensor_index out of range.")
+        for bond in range(tensor_index):
+            self.canonicalize_conditional_bond(bond, direction="lr", normalize=False)
+        for bond in reversed(range(tensor_index, self.nlocal_tensors - 1)):
+            self.canonicalize_conditional_bond(bond, direction="rl", normalize=False)
+        if normalize:
+            self.normalize()
+        return self
+
+    def sweep(
+        self,
+        direction="lr",
+        operator=None,
+        *,
+        gauge="conditional",
+        local_solver="auto",
+        matrix_free_threshold=4096,
+        matrix_free_tol=1.0e-9,
+        matrix_free_maxiter=None,
+        identity_metric=None,
+        metric_tol=1.0e-10,
+        adapt_bonds=None,
+        compress_rtol=1.0e-12,
+        compress_atol=0.0,
+        max_bond_dim=None,
+    ) -> list[dict]:
+        """Run one local variational sweep.
+
+        If ``operator`` is provided, it is treated as an MPO and optimized via
+        MPO environments.
+        """
+        if operator is None:
+            raise ValueError("NNNLETTA sweep currently supports MPO operators only; pass operator=mpo.")
+        return self.sweep_mpo(
+            operator,
+            direction,
+            gauge=gauge,
+            local_solver=local_solver,
+            matrix_free_threshold=matrix_free_threshold,
+            matrix_free_tol=matrix_free_tol,
+            matrix_free_maxiter=matrix_free_maxiter,
+            identity_metric=identity_metric,
+            metric_tol=metric_tol,
+            adapt_bonds=adapt_bonds,
+            compress_rtol=compress_rtol,
+            compress_atol=compress_atol,
+            max_bond_dim=max_bond_dim,
+        )
+
     def sweep_mpo(
         self,
         mpo,
@@ -731,13 +1109,48 @@ class NNNLETTA:
         matrix_free_threshold=4096,
         matrix_free_tol=1.0e-9,
         matrix_free_maxiter=None,
+        identity_metric=None,
+        metric_tol=1.0e-10,
+        adapt_bonds=None,
+        compress_rtol=1.0e-12,
+        compress_atol=0.0,
+        max_bond_dim=None,
     ) -> list[dict]:
+        """Compatibility entrypoint for MPO sweeps.
+
+        Prefer calling ``sweep(..., operator=mpo)``.
+        """
         mpo = self._validate_mpo(mpo)
         direction = str(direction).lower()
         if direction not in {"lr", "rl"}:
             raise ValueError("direction must be 'lr' or 'rl'.")
         if gauge not in {None, "conditional"}:
             raise ValueError("NNNLETTA currently supports only gauge='conditional' or None.")
+        if identity_metric is None:
+            identity_metric = gauge == "conditional"
+        identity_metric = bool(identity_metric)
+        if identity_metric and gauge != "conditional":
+            raise ValueError("identity_metric requires gauge='conditional'.")
+        if adapt_bonds is None:
+            adapt_bonds = identity_metric
+        adapt_bonds = bool(adapt_bonds)
+        if adapt_bonds and gauge != "conditional":
+            raise ValueError("adapt_bonds requires gauge='conditional'.")
+        precompression = []
+        if adapt_bonds:
+            precompression = self.compress_conditional_bonds(
+                direction="rl" if direction == "lr" else "lr",
+                rtol=compress_rtol,
+                atol=compress_atol,
+                max_bond_dim=max_bond_dim,
+            )
+        if identity_metric:
+            start = 0 if direction == "lr" else self.nlocal_tensors - 1
+            try:
+                self.canonicalize_conditional_center(start, normalize=False)
+            except ValueError:
+                if adapt_bonds:
+                    raise
         indices = range(self.nlocal_tensors)
         if direction == "rl":
             indices = reversed(list(indices))
@@ -750,13 +1163,41 @@ class NNNLETTA:
                 matrix_free_threshold=matrix_free_threshold,
                 matrix_free_tol=matrix_free_tol,
                 matrix_free_maxiter=matrix_free_maxiter,
+                identity_metric=identity_metric,
+                metric_tol=metric_tol,
             )
+            if not updates and precompression:
+                update["precompression"] = precompression
             updates.append(update)
             if gauge == "conditional":
                 if direction == "lr" and tensor_index + 1 < self.nlocal_tensors:
-                    self.canonicalize_conditional_bond(tensor_index, direction="lr")
+                    if adapt_bonds:
+                        update["compression"] = self.compress_conditional_bond(
+                            tensor_index,
+                            direction="lr",
+                            rtol=compress_rtol,
+                            atol=compress_atol,
+                            max_bond_dim=max_bond_dim,
+                        )
+                    try:
+                        self.canonicalize_conditional_bond(tensor_index, direction="lr")
+                    except ValueError:
+                        if adapt_bonds:
+                            raise
                 elif direction == "rl" and tensor_index > 0:
-                    self.canonicalize_conditional_bond(tensor_index - 1, direction="rl")
+                    if adapt_bonds:
+                        update["compression"] = self.compress_conditional_bond(
+                            tensor_index - 1,
+                            direction="rl",
+                            rtol=compress_rtol,
+                            atol=compress_atol,
+                            max_bond_dim=max_bond_dim,
+                        )
+                    try:
+                        self.canonicalize_conditional_bond(tensor_index - 1, direction="rl")
+                    except ValueError:
+                        if adapt_bonds:
+                            raise
         self.normalize()
         return updates
 
@@ -773,6 +1214,12 @@ class NNNLETTA:
         matrix_free_threshold=4096,
         matrix_free_tol=1.0e-9,
         matrix_free_maxiter=None,
+        identity_metric=None,
+        metric_tol=1.0e-10,
+        adapt_bonds=None,
+        compress_rtol=1.0e-12,
+        compress_atol=0.0,
+        max_bond_dim=None,
         verbose=0,
     ):
         if int(nsweeps) < 1:
@@ -782,14 +1229,20 @@ class NNNLETTA:
         self.history = []
         self.converged = False
         for sweep in range(int(nsweeps)):
-            updates = self.sweep_mpo(
+            updates = self.sweep(
+                direction,
                 mpo,
-                direction=direction,
                 gauge=gauge,
                 local_solver=local_solver,
                 matrix_free_threshold=matrix_free_threshold,
                 matrix_free_tol=matrix_free_tol,
                 matrix_free_maxiter=matrix_free_maxiter,
+                identity_metric=identity_metric,
+                metric_tol=metric_tol,
+                adapt_bonds=adapt_bonds,
+                compress_rtol=compress_rtol,
+                compress_atol=compress_atol,
+                max_bond_dim=max_bond_dim,
             )
             energy = self.expectation_mpo(mpo)
             delta = None if previous is None else abs(energy - previous)

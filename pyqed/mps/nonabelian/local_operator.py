@@ -42,6 +42,7 @@ _IDENTITY_TWO_SITE_KERNEL_PATH = _cached_einsum_path(
     (2, 2),
     (2, 2),
 )
+_FACTORIZED_IDENTITY_ROUTE_MIN_DIM = 2048
 
 
 def _factorized_block_two_step_matrices(left_stack, right_stack):
@@ -870,7 +871,14 @@ class CompiledFactorizedBlock:
             np.asarray(self.left_stack),
             np.asarray(self.right_stack),
             optimize=False,
-        ).reshape(output_size, input_size)
+        )
+        if int(kernel.size) != output_size * input_size:
+            # Some reduced physical bases remove magnetic-state dimensions
+            # which are still present in the generic factor stack shape.  In
+            # that case this dense block-kernel shortcut is not applicable;
+            # let the caller use the packed factor contraction instead.
+            return None
+        kernel = kernel.reshape(output_size, input_size)
         self._kernel_matrix_cache = (cache_key, np.ascontiguousarray(kernel))
         return self._kernel_matrix_cache[1]
 
@@ -921,6 +929,13 @@ class CompiledFactorizedBlock:
                 right_stack,
                 optimize=False,
             )
+            if int(np.asarray(contrib).size) != self._output_size:
+                raise ValueError(
+                    "Factorized local term produced an incompatible reduced block: "
+                    f"input={block_in.shape}, left={left_stack.shape}, "
+                    f"right={right_stack.shape}, output_key={self.output_entry.key!r}, "
+                    f"output_shape={self.output_entry.shape}, contribution={contrib.shape}."
+                )
             out[self._output_slice] += np.asarray(contrib).reshape(self._output_size)
             return out
         contrib = _apply_factorized_block_two_step(
@@ -929,6 +944,13 @@ class CompiledFactorizedBlock:
             right_stack,
             matrices=self._two_step_matrices(),
         )
+        if int(np.asarray(contrib).size) != self._output_size:
+            raise ValueError(
+                "Factorized local term produced an incompatible reduced block: "
+                f"input={block_in.shape}, left={left_stack.shape}, "
+                f"right={right_stack.shape}, output_key={self.output_entry.key!r}, "
+                f"output_shape={self.output_entry.shape}, contribution={contrib.shape}."
+            )
         out[self._output_slice] += np.asarray(contrib).reshape(self._output_size)
         return out
 
@@ -1319,7 +1341,11 @@ def identity_mpo_transitions(E_map, F_map, basis, *, base_dtype):
     kernel_cache = {}
 
     for in_entry in basis:
-        q_lk, q_p1k, q_p2k, q_rk = in_entry.key
+        if len(in_entry.key) == 5:
+            q_lk, q_p1k, q_mid, q_p2k, q_rk = in_entry.key
+        else:
+            q_lk, q_p1k, q_p2k, q_rk = in_entry.key
+            q_mid = None
         in_transitions = []
         eye_p1 = np.eye(int(in_entry.shape[1]), dtype=base_dtype)
         eye_p2 = np.eye(int(in_entry.shape[2]), dtype=base_dtype)
@@ -1330,7 +1356,11 @@ def identity_mpo_transitions(E_map, F_map, basis, *, base_dtype):
             for q_rb, q_rk_again in F_map:
                 if q_rk_again != q_rk:
                     continue
-                out_key = (q_lb, q_p1k, q_p2k, q_rb)
+                out_key = (
+                    (q_lb, q_p1k, q_mid, q_p2k, q_rb)
+                    if q_mid is not None
+                    else (q_lb, q_p1k, q_p2k, q_rb)
+                )
                 out_idx = out_index.get(out_key)
                 if out_idx is None:
                     continue
@@ -1373,6 +1403,274 @@ def build_identity_mpo_local_actions(E_map, F_map, basis, *, base_dtype):
         identity_like)``.
     """
 
+    diagonal_metric = True
+    factorized_metric = True
+    cross_sector_blocks = 0
+    cross_sector_elements = 0
+    cross_sector_max_abs = 0.0
+    for (q_out, q_in), block in tuple(E_map.items()) + tuple(F_map.items()):
+        matrix = identity_env_to_matrix(block, dtype=base_dtype)
+        if q_out != q_in:
+            block_max = float(np.max(np.abs(matrix), initial=0.0))
+            if block_max > 1.0e-12:
+                cross_sector_blocks += 1
+                cross_sector_elements += int(matrix.size)
+                cross_sector_max_abs = max(cross_sector_max_abs, block_max)
+                diagonal_metric = False
+                factorized_metric = False
+            continue
+        diagonal = np.diag(matrix)
+        if not np.allclose(
+            matrix,
+            np.diag(diagonal),
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        ):
+            diagonal_metric = False
+    diagonal_values = np.zeros(basis.size, dtype=np.result_type(base_dtype, float))
+    for entry in basis:
+        q_l, q_r = entry.key[0], entry.key[-1]
+        E_block = E_map.get((q_l, q_l))
+        F_block = F_map.get((q_r, q_r))
+        if E_block is None or F_block is None:
+            diagonal_metric = False
+            continue
+        diag_left = np.diag(identity_env_to_matrix(E_block, dtype=base_dtype))
+        diag_right = np.diag(identity_env_to_matrix(F_block, dtype=base_dtype))
+        diag_block = np.einsum(
+            "l,p,q,r->lpqr",
+            diag_left,
+            np.ones(int(entry.shape[1]), dtype=diagonal_values.dtype),
+            np.ones(int(entry.shape[2]), dtype=diagonal_values.dtype),
+            diag_right,
+            optimize=True,
+        )
+        diagonal_values[entry.offset:entry.offset + entry.size] = diag_block.reshape(
+            entry.size
+        )
+
+    if factorized_metric:
+        factor_blocks = {}
+        identity_like = True
+        for entry in basis:
+            q_l, q_r = entry.key[0], entry.key[-1]
+            E_block = E_map.get((q_l, q_l))
+            F_block = F_map.get((q_r, q_r))
+            if E_block is None or F_block is None:
+                factorized_metric = False
+                break
+            left = np.ascontiguousarray(
+                identity_env_to_matrix(E_block, dtype=base_dtype)
+            )
+            right = np.ascontiguousarray(
+                identity_env_to_matrix(F_block, dtype=base_dtype)
+            )
+            factor_blocks[entry.key] = (left, right)
+            identity_like = bool(
+                identity_like
+                and np.allclose(
+                    left,
+                    np.eye(left.shape[0], dtype=left.dtype),
+                    rtol=1.0e-12,
+                    atol=1.0e-12,
+                )
+                and np.allclose(
+                    right,
+                    np.eye(right.shape[0], dtype=right.dtype),
+                    rtol=1.0e-12,
+                    atol=1.0e-12,
+                )
+            )
+
+    if factorized_metric:
+        def apply_entry(entry, block):
+            left, right = factor_blocks[entry.key]
+            return np.einsum(
+                "lk,kbcr,qr->lbcq",
+                left,
+                np.asarray(block).reshape(entry.shape),
+                right,
+                optimize=True,
+            )
+
+        def tensor_apply(two_site):
+            input_blocks = basis.blocks_from_two_site_tensor(
+                two_site,
+                drop_zeros=False,
+                copy=False,
+            )
+            out_blocks = {}
+            for entry in basis:
+                block = input_blocks.get(entry.key)
+                if block is not None:
+                    out_blocks[entry.key] = apply_entry(entry, block)
+            return basis.tensor_from_blocks(out_blocks, two_site)
+
+        def reduced_apply(state):
+            blocks = {}
+            for entry in basis:
+                block = state.blocks.get(entry.key)
+                if block is not None:
+                    blocks[entry.key] = apply_entry(entry, block)
+            return ReducedStateVector(layout=state.layout, blocks=blocks)
+
+        def packed_apply(vector):
+            vector = np.asarray(vector)
+            out = np.zeros(
+                int(basis.size),
+                dtype=np.result_type(vector.dtype, diagonal_values.dtype),
+            )
+            for entry in basis:
+                out[entry.slice] = apply_entry(
+                    entry,
+                    vector[entry.slice],
+                ).reshape(entry.size)
+            return out
+
+        packed_apply.basis = basis
+        packed_apply.out_entries = basis.out_entries
+        packed_apply.block_matrices = None
+        packed_apply.dense_matrix = None
+        packed_apply.diagonal_values = np.ascontiguousarray(diagonal_values)
+        packed_apply.diagonal_operator = bool(diagonal_metric)
+        packed_apply.factorized_metric_blocks = factor_blocks
+        packed_apply.factorized_metric_operator = True
+        packed_apply.factorized_metric_cross_sector_blocks = 0
+        packed_apply.factorized_metric_cross_sector_elements = 0
+        packed_apply.factorized_metric_cross_sector_max_abs = 0.0
+        diag = np.real(diagonal_values)
+        return tensor_apply, reduced_apply, packed_apply, diag, identity_like
+
+    entries_by_physical = {}
+    for out_idx, out_entry in enumerate(basis):
+        physical_key = (
+            (out_entry.key[1], out_entry.key[2], out_entry.key[3])
+            if len(out_entry.key) == 5
+            else (out_entry.key[1], out_entry.key[2])
+        )
+        entries_by_physical.setdefault(
+            physical_key,
+            [],
+        ).append((int(out_idx), out_entry))
+    factor_routes = []
+    for in_idx, in_entry in enumerate(basis):
+        q_l_in, q_r_in = in_entry.key[0], in_entry.key[-1]
+        physical_key = (
+            (in_entry.key[1], in_entry.key[2], in_entry.key[3])
+            if len(in_entry.key) == 5
+            else (in_entry.key[1], in_entry.key[2])
+        )
+        for out_idx, out_entry in entries_by_physical.get(physical_key, ()):
+            q_l_out, q_r_out = out_entry.key[0], out_entry.key[-1]
+            E_block = E_map.get((q_l_out, q_l_in))
+            F_block = F_map.get((q_r_out, q_r_in))
+            if E_block is None or F_block is None:
+                continue
+            left = np.ascontiguousarray(
+                identity_env_to_matrix(E_block, dtype=base_dtype)
+            )
+            right = np.ascontiguousarray(
+                identity_env_to_matrix(F_block, dtype=base_dtype)
+            )
+            if (
+                left.shape != (int(out_entry.shape[0]), int(in_entry.shape[0]))
+                or right.shape
+                != (int(out_entry.shape[3]), int(in_entry.shape[3]))
+            ):
+                continue
+            factor_routes.append(
+                (int(in_idx), int(out_idx), in_entry, out_entry, left, right)
+            )
+    if factor_routes and int(basis.size) > _FACTORIZED_IDENTITY_ROUTE_MIN_DIM:
+        def apply_route(in_entry, out_entry, left, right, block):
+            return np.einsum(
+                "lk,kbcr,qr->lbcq",
+                left,
+                np.asarray(block).reshape(in_entry.shape),
+                right,
+                optimize=True,
+            ).reshape(out_entry.shape)
+
+        def tensor_apply(two_site):
+            out_data = {}
+            for _in_idx, _out_idx, in_entry, out_entry, left, right in factor_routes:
+                block = two_site.data.get(in_entry.key)
+                if block is None:
+                    continue
+                contribution = apply_route(
+                    in_entry,
+                    out_entry,
+                    left,
+                    right,
+                    block,
+                )
+                if out_entry.key in out_data:
+                    out_data[out_entry.key] += contribution
+                else:
+                    out_data[out_entry.key] = contribution
+            return NonabelianTensor(
+                out_data,
+                [leg[:] for leg in two_site.qns],
+                two_site.dirs[:],
+                fusion_legs=two_site.fusion_legs[:],
+                metadata=two_site.metadata.copy(),
+            )
+
+        def reduced_apply(state):
+            blocks = {}
+            for _in_idx, _out_idx, in_entry, out_entry, left, right in factor_routes:
+                block = state.blocks.get(in_entry.key)
+                if block is None:
+                    continue
+                contribution = apply_route(
+                    in_entry,
+                    out_entry,
+                    left,
+                    right,
+                    block,
+                )
+                if out_entry.key in blocks:
+                    blocks[out_entry.key] += contribution
+                else:
+                    blocks[out_entry.key] = contribution
+            return ReducedStateVector(layout=state.layout, blocks=blocks)
+
+        def packed_apply(vector):
+            vector = np.asarray(vector)
+            out = np.zeros(
+                int(basis.size),
+                dtype=np.result_type(vector.dtype, diagonal_values.dtype),
+            )
+            for _in_idx, _out_idx, in_entry, out_entry, left, right in factor_routes:
+                out[out_entry.slice] += apply_route(
+                    in_entry,
+                    out_entry,
+                    left,
+                    right,
+                    vector[in_entry.slice],
+                ).reshape(out_entry.size)
+            return out
+
+        packed_apply.basis = basis
+        packed_apply.out_entries = basis.out_entries
+        packed_apply.block_matrices = None
+        packed_apply.dense_matrix = None
+        packed_apply.diagonal_values = np.ascontiguousarray(diagonal_values)
+        packed_apply.diagonal_operator = False
+        packed_apply.factorized_metric_operator = True
+        packed_apply.factorized_metric_routes = tuple(factor_routes)
+        packed_apply.factorized_metric_cross_sector_blocks = int(
+            cross_sector_blocks
+        )
+        packed_apply.factorized_metric_cross_sector_elements = int(
+            cross_sector_elements
+        )
+        packed_apply.factorized_metric_cross_sector_max_abs = float(
+            cross_sector_max_abs
+        )
+        diag = np.real(diagonal_values)
+        return tensor_apply, reduced_apply, packed_apply, diag, False
+
     out_entries, transitions = identity_mpo_transitions(
         E_map,
         F_map,
@@ -1388,27 +1686,16 @@ def build_identity_mpo_local_actions(E_map, F_map, basis, *, base_dtype):
         return compiled_transitions.apply_reduced(state, base_dtype=base_dtype)
 
     packed_apply = compiled_transitions.packed_matvec(base_dtype=base_dtype)
-
-    diag = np.zeros(basis.size, dtype=float)
-    for entry in basis:
-        q_l, _q_p1, _q_p2, q_r = entry.key
-        E_block = E_map.get((q_l, q_l))
-        F_block = F_map.get((q_r, q_r))
-        if E_block is None or F_block is None:
-            continue
-        diag_left = np.real(np.diag(identity_env_to_matrix(E_block, dtype=base_dtype)))
-        diag_right = np.real(np.diag(identity_env_to_matrix(F_block, dtype=base_dtype)))
-        diag_block = np.einsum(
-            "l,p,q,r->lpqr",
-            diag_left,
-            np.ones(int(entry.shape[1]), dtype=float),
-            np.ones(int(entry.shape[2]), dtype=float),
-            diag_right,
-            optimize=True,
-        )
-        diag[entry.offset:entry.offset + entry.size] = diag_block.reshape(entry.size)
+    packed_apply.factorized_metric_cross_sector_blocks = int(cross_sector_blocks)
+    packed_apply.factorized_metric_cross_sector_elements = int(
+        cross_sector_elements
+    )
+    packed_apply.factorized_metric_cross_sector_max_abs = float(
+        cross_sector_max_abs
+    )
 
     identity_like = transitions_are_identity_operator(basis, transitions)
+    diag = np.real(diagonal_values)
     return tensor_apply, reduced_apply, packed_apply, diag, identity_like
 
 

@@ -2646,9 +2646,9 @@ class TDDMRG(BaseTDDMRG):
             kwargs["abelian_matvec_options"] = options
         return super().optimize_ground_state(*args, **kwargs)
 
-    def _auto_ground_state_kwargs(self, *, tdvp_projection_backend=None):
+    def _auto_ground_state_kwargs(self, *, projection=None):
         kwargs = super()._auto_ground_state_kwargs(
-            tdvp_projection_backend=tdvp_projection_backend,
+            projection=projection,
         )
         kwargs.setdefault("symmetry_list", ["charge", "sz"])
         kwargs.setdefault("compute_s2", False)
@@ -2675,12 +2675,22 @@ class TDDMRG(BaseTDDMRG):
             preserve_quantum_numbers=True,
         )
 
-    def default_initial_condition(self, D=None, *, tdvp_projection_backend=None):
+    def default_initial_condition(self, D=None, *, projection=None):
         """Return the default real-time initial condition for ``run(psi0=...)``."""
         return super().default_initial_condition(
             D=D,
-            tdvp_projection_backend=tdvp_projection_backend,
+            projection=projection,
         )
+
+    def _resolve_projection(self, integrator, projection):
+        if projection is False:
+            return None
+        if projection is not None or self._use_exact_dense_td():
+            return projection
+        key = str(integrator).lower().replace("_", "-")
+        if key in {"tdvp", "tdvp1", "1tdvp", "one-site-tdvp", "1site-tdvp"}:
+            return "block-sparse"
+        return None
 
     def _tdvp_sector_settings(self):
         labels = ("charge", "sz")

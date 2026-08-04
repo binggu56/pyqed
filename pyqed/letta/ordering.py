@@ -109,10 +109,16 @@ def _heisenberg_block_cut_diagnostic(
     )
     crossing = 0
     crossing_on_frontier = 0
+    has_left = False
+    has_right = False
     for left, right in interactions:
         left_in_prefix = bool(mask & (1 << left))
         right_in_prefix = bool(mask & (1 << right))
-        if left_in_prefix == right_in_prefix:
+        if left_in_prefix and right_in_prefix:
+            has_left = True
+            continue
+        if not left_in_prefix and not right_in_prefix:
+            has_right = True
             continue
         crossing += 1
         future_site = right if left_in_prefix else left
@@ -121,8 +127,8 @@ def _heisenberg_block_cut_diagnostic(
     frontier_width = len(frontier)
     base = float(local_dim**frontier_width)
     block_factor = (
-        1
-        + local_dim ** len(idle_paired)
+        int(has_left)
+        + int(has_right) * local_dim ** len(idle_paired)
         + 3 * crossing
         + 2 * (local_dim - 1) * crossing_on_frontier
     )
@@ -130,6 +136,7 @@ def _heisenberg_block_cut_diagnostic(
         "frontier_sites": frontier,
         "frontier_width": frontier_width,
         "mpo_channels": 2 + 3 * crossing,
+        "active_mpo_channels": int(has_left) + int(has_right) + 3 * crossing,
         "idle_paired_sites": idle_paired,
         "crossing_bonds": crossing,
         "crossing_bonds_on_tied_frontier": crossing_on_frontier,
@@ -235,10 +242,16 @@ def _heisenberg_block_cut_tables(
         )
         crossing = 0
         crossing_on_frontier = 0
+        has_left = False
+        has_right = False
         for left, right in interactions:
             left_in_prefix = bool(mask & (1 << left))
             right_in_prefix = bool(mask & (1 << right))
-            if left_in_prefix == right_in_prefix:
+            if left_in_prefix and right_in_prefix:
+                has_left = True
+                continue
+            if not left_in_prefix and not right_in_prefix:
+                has_right = True
                 continue
             crossing += 1
             future_site = right if left_in_prefix else left
@@ -247,11 +260,13 @@ def _heisenberg_block_cut_tables(
         frontier_width = len(frontier)
         base = float(local_dim**frontier_width)
         # The raw Heisenberg automaton has idle/done channels and three
-        # channels per crossing bond.  In each spin-vector triplet, exactly
-        # two suffix operators are off-diagonal in the computational basis.
+        # channels per crossing bond.  Reachability pruning keeps idle only
+        # while a term remains wholly on the right and done only after a term
+        # has completed on the left.  In each spin-vector triplet, exactly two
+        # suffix operators are off-diagonal in the computational basis.
         block_factor = (
-            1
-            + local_dim ** len(idle_paired)
+            int(has_left)
+            + int(has_right) * local_dim ** len(idle_paired)
             + 3 * crossing
             + 2 * (local_dim - 1) * crossing_on_frontier
         )
@@ -260,6 +275,7 @@ def _heisenberg_block_cut_tables(
             "frontier_sites": frontier,
             "frontier_width": frontier_width,
             "mpo_channels": 2 + 3 * crossing,
+            "active_mpo_channels": int(has_left) + int(has_right) + 3 * crossing,
             "idle_paired_sites": idle_paired,
             "crossing_bonds": crossing,
             "crossing_bonds_on_tied_frontier": crossing_on_frontier,
@@ -437,16 +453,11 @@ def _heuristic_heisenberg_order(
                     interaction_neighbors,
                     local_dim=local_dim,
                 )
-                width = diagnostic["frontier_width"]
-                factor = (
-                    1
-                    + local_dim ** len(diagnostic["idle_paired_sites"])
-                    + 3 * diagnostic["crossing_bonds"]
-                    + 2
-                    * (local_dim - 1)
-                    * diagnostic["crossing_bonds_on_tied_frontier"]
+                log_score = (
+                    -np.inf
+                    if diagnostic["score"] == 0.0
+                    else float(np.log(diagnostic["score"]))
                 )
-                log_score = width * log_local_dim + float(np.log(factor))
             else:
                 diagnostic = _heisenberg_cut_diagnostic(
                     nsites,

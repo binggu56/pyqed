@@ -120,4 +120,10 @@ namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--strict-config --strict-markers"
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--ignore-glob=*MacBook Pro*.py",
+    "--ignore-glob=*Mac Pro*.py",
+    "--ignore-glob=*Mac Studio*.py",
+]

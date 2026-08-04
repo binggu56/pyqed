@@ -5,6 +5,7 @@ from pyqed.qchem.hf import RHF
 from pyqed.qchem.mcscf.casci import CASCI
 from pyqed.qchem.vibronic import (
     LVC,
+    QVC,
     build_lvc,
     compare_lvc_to_sharc,
     lvc_from_sharc_template,
@@ -40,7 +41,7 @@ def test_build_lvc_collects_terms_in_vibronic_couplings():
         derivative_couplings=derivative_couplings,
     )
 
-    couplings = model.vibronic_couplings()
+    couplings = model.linear_couplings
     np.testing.assert_allclose(couplings[0, 0], [0.3, -0.4])
     np.testing.assert_allclose(couplings[1, 1], [-0.1, 0.8])
     np.testing.assert_allclose(couplings[0, 1], [0.1, -0.1])
@@ -89,10 +90,77 @@ def test_overlap_finite_difference_produces_mode_derivative_couplings():
 def test_lvc_rejects_coupling_shape_mistakes():
     with np.testing.assert_raises(ValueError):
         LVC(
-            reference_energies=[0.0, 0.1],
-            mode_frequencies=[0.01],
-            couplings=np.zeros((2, 1, 1)),
+            E=[0.0, 0.1],
+            omega=[0.01],
+            linear_couplings=np.zeros((2, 1, 1)),
         )
+
+
+def test_lvc_is_callable_without_common_harmonic_term():
+    model = LVC(
+        E=[0.1, 0.4],
+        omega=[0.01],
+        linear_couplings=np.array([[[0.2], [0.3]], [[0.3], [-0.1]]]),
+    )
+    np.testing.assert_allclose(
+        model([0.5]),
+        model.electronic_hamiltonian([0.5], include_harmonic=False),
+    )
+    np.testing.assert_array_equal(model.E, [0.1, 0.4])
+    np.testing.assert_array_equal(model.omega, [0.01])
+    harmonic = model.electronic_hamiltonian(
+        [0.5], include_harmonic=True
+    )
+    np.testing.assert_allclose(
+        harmonic - model([0.5]), 0.5 * 0.01 * 0.5**2 * np.eye(2)
+    )
+
+
+def test_qvc_evaluates_electronic_hessian_with_half_convention():
+    linear = np.zeros((2, 2, 2))
+    linear[:, :, 0] = [[0.2, 0.3], [0.3, -0.1]]
+
+    quadratic = np.zeros((2, 2, 2, 2))
+    quadratic[:, :, 0, 0] = [[2.0, 0.4], [0.4, -1.0]]
+    quadratic[:, :, 1, 1] = [[0.5, 0.0], [0.0, 0.8]]
+    quadratic[:, :, 0, 1] = [[0.7, -0.2], [-0.2, 0.3]]
+    quadratic[:, :, 1, 0] = quadratic[:, :, 0, 1]
+
+    model = QVC(
+        E=[0.1, 0.4],
+        omega=[0.01, 0.02],
+        linear_couplings=linear,
+        quadratic_couplings=quadratic,
+    )
+    q = np.array([0.5, -0.25])
+    expected = np.diag([0.1, 0.4])
+    expected += np.einsum("abm,m->ab", linear, q)
+    expected += 0.5 * np.einsum("abmn,m,n->ab", quadratic, q, q)
+
+    np.testing.assert_allclose(model(q), expected)
+    np.testing.assert_allclose(model.linear_couplings, linear)
+    np.testing.assert_allclose(model.quadratic_couplings, quadratic)
+    assert model.nstates == 2
+    assert model.nmodes == 2
+
+
+def test_qvc_from_lvc_and_symmetry_validation():
+    lvc = LVC(
+        E=[0.0, 0.2],
+        omega=[0.01, 0.02],
+        linear_couplings=np.zeros((2, 2, 2)),
+        mode_ids=[3, 7],
+    )
+    quadratic = np.zeros((2, 2, 2, 2))
+    qvc = QVC.from_lvc(lvc, quadratic)
+    np.testing.assert_array_equal(qvc.mode_ids, [3, 7])
+
+    asymmetric = quadratic.copy()
+    asymmetric[0, 1, 0, 1] = 1.0
+    with np.testing.assert_raises_regex(
+        ValueError, "symmetric in the state indices"
+    ):
+        QVC.from_lvc(lvc, asymmetric)
 
 
 def test_sharc_lvc_template_maps_to_pyqed_coupling_tensor():
@@ -115,20 +183,20 @@ def test_sharc_lvc_template_maps_to_pyqed_coupling_tensor():
     1 1 2 2 -0.100000
     """
 
-    sharc = lvc_from_sharc_template(template, mode_frequencies=[0.01, 0.02])
-    np.testing.assert_allclose(sharc.reference_energies, [0.0, 0.2])
+    sharc = lvc_from_sharc_template(template, omega=[0.01, 0.02])
+    np.testing.assert_allclose(sharc.E, [0.0, 0.2])
     np.testing.assert_array_equal(sharc.mode_ids, [1, 2])
 
-    couplings = sharc.vibronic_couplings()
+    couplings = sharc.linear_couplings
     np.testing.assert_allclose(couplings[0, 0], [0.3, -0.4])
     np.testing.assert_allclose(couplings[1, 1], [-0.1, 0.8])
     np.testing.assert_allclose(couplings[0, 1], [0.1, -0.1])
     np.testing.assert_allclose(couplings[1, 0], [0.1, -0.1])
 
     pyqed = LVC(
-        reference_energies=[0.0, 0.2],
-        mode_frequencies=[0.01, 0.02],
-        couplings=couplings,
+        E=[0.0, 0.2],
+        omega=[0.01, 0.02],
+        linear_couplings=couplings,
         mode_ids=[1, 2],
     )
     comparison = compare_lvc_to_sharc(pyqed, template)
@@ -139,7 +207,7 @@ def test_sharc_lvc_template_maps_to_pyqed_coupling_tensor():
 
 def test_lvc_from_casci_uses_vibronic_couplings():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build(driver="builtin", eri="dense")
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -152,7 +220,7 @@ def test_lvc_from_casci_uses_vibronic_couplings():
     model, quadratic = LVC.from_casci(
         mc,
         modes=modes,
-        frequencies=frequencies,
+        omega=frequencies,
         state_ids=[0, 1],
         return_quadratic=True,
     )
@@ -160,8 +228,32 @@ def test_lvc_from_casci_uses_vibronic_couplings():
 
     assert model.nstates == 2
     assert model.nmodes == 1
-    np.testing.assert_allclose(model.reference_energies, mc.e_tot[:2])
-    np.testing.assert_allclose(model.mode_frequencies, frequencies)
+    np.testing.assert_allclose(model.E, mc.e_tot[:2])
+    np.testing.assert_allclose(model.omega, frequencies)
     np.testing.assert_allclose(model.normal_modes, modes)
-    np.testing.assert_allclose(model.vibronic_couplings(), f_ref)
+    np.testing.assert_allclose(model.linear_couplings, f_ref)
     np.testing.assert_allclose(quadratic, g_ref)
+
+
+def test_qvc_from_casci_uses_first_and_second_derivatives():
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    mol.build(driver="builtin", eri="dense")
+
+    mf = RHF(mol).run()
+    mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
+    modes = np.zeros((1, mol.natom, 3))
+    modes[0, 0, 2] = -1.0
+    modes[0, 1, 2] = 1.0
+
+    model = QVC.from_casci(
+        mc,
+        modes=modes,
+        omega=[0.01],
+        state_ids=[0, 1],
+    )
+    linear, quadratic = mc.vibronic_couplings(
+        state_ids=[0, 1], modes=modes
+    )
+
+    np.testing.assert_allclose(model.linear_couplings, linear)
+    np.testing.assert_allclose(model.quadratic_couplings, quadratic)

@@ -27,6 +27,26 @@ def _is_nonabelian_sector(sector):
 
 
 @dataclass(frozen=True)
+class IdentityBasisTransform:
+    """Compact marker for a square identity change of reduced basis."""
+
+    dim: int
+
+    def __post_init__(self):
+        if int(self.dim) < 0:
+            raise ValueError("IdentityBasisTransform dimension must be nonnegative.")
+        object.__setattr__(self, "dim", int(self.dim))
+
+    @property
+    def shape(self):
+        return (self.dim, self.dim)
+
+    @property
+    def T(self):
+        return self
+
+
+@dataclass(frozen=True)
 class FusionPipeEntry:
     """
     Packed-layout entry for one child-sector tuple inside a fused sector block.
@@ -548,12 +568,17 @@ class NonabelianTensor:
         return any(_is_nonabelian_sector(sector) for leg_qns in self.qns for sector in leg_qns)
 
     def copy(self):
+        metadata = self.metadata.copy()
+        # This stamp certifies that the exact numerical tensor is already
+        # installed in one persistent C++ sweep owner. A deep copy has distinct
+        # numerical storage and must be refreshed before compiled reuse.
+        metadata.pop("_cpp_split_site", None)
         return NonabelianTensor(
             {key: block.copy() for key, block in self.data.items()},
             [leg_qns[:] for leg_qns in self.qns],
             self.dirs[:],
             fusion_legs=self.fusion_legs[:],
-            metadata=self.metadata.copy(),
+            metadata=metadata,
         )
 
     def _check_compatible(self, other):

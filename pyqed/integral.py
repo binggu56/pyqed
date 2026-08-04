@@ -465,12 +465,12 @@ def electron_nuclear_attraction():
 
 
 
-from pyqed.dvr.dvr_2d import DVR2
+from pyqed.dvr import DVR
 
 nx=15
 ny=15
 
-dvr = DVR2([-6, 6], [-6, 6], nx, ny)
+dvr = DVR(([-6, 6], [-6, 6]), (nx, ny))
 
 # kinetic energy matrix elements
 t = dvr.t()
@@ -478,7 +478,7 @@ t = np.reshape(t, (nx, ny, nx, ny))
 
 
 zbasis = []
-for grid in DVR2.grid:
+for grid in dvr.points:
     # for each grid point, there is CGF
 
 

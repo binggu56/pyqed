@@ -91,6 +91,11 @@ class Sector(tuple):
         obj.components = tuple(components)
         return obj
 
+    @property
+    def is_abelian(self):
+        """Whether every labelled factor has Abelian fusion rules."""
+        return "su2" not in self.labels
+
     def fuse(self, other):
         if not isinstance(other, Sector) or self.labels != other.labels:
             return NotImplemented

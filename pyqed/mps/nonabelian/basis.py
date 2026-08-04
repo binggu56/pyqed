@@ -202,6 +202,13 @@ class TwoSiteBasis:
     phys2: SiteBasis
     right: BondBasis
     entries: tuple[LocalLayoutEntry, ...]
+    intermediate: BondBasis | None = None
+
+    @property
+    def channel_resolved(self):
+        """Whether entries retain the intermediate SU(2) fusion sector."""
+
+        return self.intermediate is not None
 
     def __len__(self):
         """
@@ -237,7 +244,15 @@ class TwoSiteBasis:
 
     @property
     def bases(self):
-        return self.left, self.phys1, self.phys2, self.right
+        if self.intermediate is None:
+            return self.left, self.phys1, self.phys2, self.right
+        return (
+            self.left,
+            self.phys1,
+            self.intermediate,
+            self.phys2,
+            self.right,
+        )
 
     @property
     def out_entries(self):
@@ -416,6 +431,39 @@ class TwoSiteBasis:
             blocks[entry.key] = np.array(block, copy=copy)
         return blocks
 
+    def blocks_from_two_site_tensor(self, tensor, *, drop_zeros=True, copy=True):
+        """Extract ordinary or intermediate-channel blocks from a tensor."""
+
+        if not self.channel_resolved:
+            return self.blocks_from_tensor_data(
+                tensor.data,
+                drop_zeros=drop_zeros,
+                copy=copy,
+            )
+        if not bool(
+            tensor.metadata.get("contracted_channel_blocks_current", False)
+        ):
+            raise ValueError(
+                "Channel-resolved basis requires current intermediate-channel "
+                "blocks on the two-site tensor."
+            )
+        channel_blocks = tensor.metadata.get("contracted_channel_blocks", {})
+        blocks = {}
+        for entry in self.entries:
+            block = channel_blocks.get(entry.key)
+            if block is None:
+                continue
+            block = np.asarray(block)
+            if block.shape != entry.shape:
+                raise ValueError(
+                    f"Channel block {entry.key!r} has shape {block.shape!r}, "
+                    f"expected {entry.shape!r}."
+                )
+            if drop_zeros and np.linalg.norm(block.reshape(-1)) <= 0.0:
+                continue
+            blocks[entry.key] = np.array(block, copy=copy)
+        return blocks
+
     def tensor_data_from_blocks(self, blocks, *, template_data=None, default_dtype=float):
         """
         Expand state blocks into full tensor data for this basis.
@@ -441,6 +489,57 @@ class TwoSiteBasis:
             else:
                 data[entry.key] = np.zeros(entry.shape, dtype=default_dtype)
         return data
+
+    def tensor_from_blocks(self, blocks, template):
+        """Rebuild a two-site tensor while preserving fusion-path amplitudes."""
+
+        from .tensor import NonabelianTensor
+
+        if not self.channel_resolved:
+            data = self.tensor_data_from_blocks(
+                blocks,
+                template_data=template.data,
+            )
+            metadata = template.metadata.copy()
+            metadata["contracted_channel_blocks_current"] = False
+            return NonabelianTensor(
+                data,
+                [leg[:] for leg in template.qns],
+                template.dirs[:],
+                fusion_legs=template.fusion_legs[:],
+                metadata=metadata,
+            )
+
+        channel_blocks = {}
+        data = {}
+        for entry in self.entries:
+            block = np.asarray(
+                blocks.get(
+                    entry.key,
+                    np.zeros(entry.shape, dtype=float),
+                )
+            ).reshape(entry.shape)
+            channel_blocks[entry.key] = np.array(block, copy=True)
+            outer_key = (
+                entry.key[0],
+                entry.key[1],
+                entry.key[3],
+                entry.key[4],
+            )
+            if outer_key in data:
+                data[outer_key] = data[outer_key] + block
+            else:
+                data[outer_key] = np.array(block, copy=True)
+        metadata = template.metadata.copy()
+        metadata["contracted_channel_blocks"] = channel_blocks
+        metadata["contracted_channel_blocks_current"] = True
+        return NonabelianTensor(
+            data,
+            [leg[:] for leg in template.qns],
+            template.dirs[:],
+            fusion_legs=template.fusion_legs[:],
+            metadata=metadata,
+        )
 
     def entry_index(self, key):
         """
@@ -493,6 +592,52 @@ class TwoSiteBasis:
             phys2=SiteBasis.from_tensor_axis(two_site, 2, name="phys2"),
             right=BondBasis.from_tensor_axis(two_site, 3, name="right"),
             entries=entries,
+        )
+
+    @classmethod
+    def from_channel_tensor(cls, two_site):
+        """Build a packed basis that keeps each intermediate fusion path."""
+
+        if two_site.rank != 4:
+            raise ValueError(
+                "Channel-resolved TwoSiteBasis expects a rank-4 tensor."
+            )
+        if not bool(
+            two_site.metadata.get("contracted_channel_blocks_current", False)
+        ):
+            raise ValueError(
+                "Two-site tensor has no current intermediate-channel blocks."
+            )
+        channel_blocks = two_site.metadata.get("contracted_channel_blocks", {})
+        if not channel_blocks:
+            raise ValueError("Two-site tensor has no intermediate-channel blocks.")
+        entries = []
+        offset = 0
+        for key in sorted(channel_blocks):
+            block = np.asarray(channel_blocks[key])
+            size = int(block.size)
+            entries.append(
+                LocalLayoutEntry(
+                    tuple(key),
+                    tuple(int(dim) for dim in block.shape),
+                    offset,
+                    size,
+                )
+            )
+            offset += size
+        middle_sectors = _ordered_unique(entry.key[2] for entry in entries)
+        return cls(
+            left=BondBasis.from_tensor_axis(two_site, 0, name="left"),
+            phys1=SiteBasis.from_tensor_axis(two_site, 1, name="phys1"),
+            phys2=SiteBasis.from_tensor_axis(two_site, 2, name="phys2"),
+            right=BondBasis.from_tensor_axis(two_site, 3, name="right"),
+            entries=tuple(entries),
+            intermediate=BondBasis.from_qns(
+                middle_sectors,
+                dims={sector: 1 for sector in middle_sectors},
+                direction=1,
+                name="intermediate",
+            ),
         )
 
     def metric_is_identity(self, metric, *, tol=1.0e-10):
