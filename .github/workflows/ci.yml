@@ -63,12 +63,39 @@ jobs:
           python -m pip install -e ".[test]"
       - name: Verify native imports and public quickstart
         run: |
-          python -c 'from pyqed.qchem import _basis_cy, _integrals_cpp, _rys_cy; from pyqed.heom import _heom_cpp; from pyqed.mps.nonabelian import _su2_kernel; assert all(module is not None for module in (_basis_cy, _integrals_cpp, _rys_cy, _heom_cpp, _su2_kernel))'
+          python -c 'from pyqed.qchem import _basis_cy, _casscf_cpp, _integrals_cpp, _rys_cy; from pyqed.heom import _heom_cpp; from pyqed.mps.nonabelian import _su2_kernel; assert all(module is not None for module in (_basis_cy, _casscf_cpp, _integrals_cpp, _rys_cy, _heom_cpp, _su2_kernel))'
           python examples/quickstart.py
+
+  cas-native:
+    name: Native CAS / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    env:
+      PYQED_BUILD_EXTENSIONS: "1"
+      PYQED_EXTENSION_GROUPS: qchem
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Compile and test native CAS
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[test]"
+          python -c 'from pyqed.qchem import _casscf_cpp; assert _casscf_cpp is not None'
+          python -m pytest -q tests/test_casci.py -k native_rhf_davidson
 
   distribution:
     name: Wheel and source distribution
     runs-on: ubuntu-latest
+    env:
+      PYQED_BUILD_EXTENSIONS: "1"
+      PYQED_EXTENSION_GROUPS: qchem
 
     steps:
       - uses: actions/checkout@v7
@@ -89,7 +116,7 @@ jobs:
           /tmp/pyqed-wheel/bin/python -m pip install dist/*.whl
           cd /tmp
           /tmp/pyqed-wheel/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
-          /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from pathlib import Path; import pyqed; from pyqed.qchem.basis import _basis_path; assert pyqed.__version__ == version("pyqed") == "0.2.0"; assert Path(_basis_path("sto-3g")).is_file()'
+          /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from pathlib import Path; import pyqed; from pyqed.qchem import _casscf_cpp; from pyqed.qchem.basis import _basis_path; assert pyqed.__version__ == version("pyqed") == "0.2.0"; assert _casscf_cpp is not None; assert Path(_basis_path("sto-3g")).is_file()'
       - name: Install and test the source distribution in isolation
         run: |
           python -m venv /tmp/pyqed-sdist

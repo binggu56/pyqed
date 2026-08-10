@@ -22,6 +22,7 @@ from pyqed.qchem.mcscf.casci import (
     _string_overlap_matrix,
     _string_singular_weights,
     _string_transform_matrix,
+    mo_overlap,
     transform_spatial_eri_to_mo,
 )
 from pyqed.qchem.mcscf import direct_ci
@@ -61,6 +62,57 @@ def test_casci_is_exported_from_pyqed_qchem():
     from pyqed.qchem import CASCI as ExportedCASCI
 
     assert ExportedCASCI is CASCI
+
+
+def test_molecule_casci_owns_scan_configuration():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    electronic = mol.casci(
+        ncas=2,
+        nelecas=2,
+        nstates=2,
+        method='ci',
+        run_options={'use_cholesky': False},
+    )
+
+    assert isinstance(electronic, CASCI)
+    assert electronic.ncas == 2
+    assert electronic.nelecas == 2
+    assert electronic.nstates == 2
+    scanner = electronic.as_scanner()
+    assert scanner.nstates == 2
+    assert scanner.method == 'ci'
+    assert scanner.run_kwargs == {'use_cholesky': False}
+
+
+def test_casci_scanner_root_homing_tracks_and_phase_aligns_states():
+    atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(4))
+    mol = Molecule(atom=atom, unit='bohr', basis='sto-6g')
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+
+    template = CASCI(mf, ncas=4, nelecas=4)
+    template.direct_ci_dense_fallback_ndets = 1
+    template.run(nstates=2, method='direct_ci')
+    scanner = template.as_scanner(
+        nstates=2,
+        method='direct_ci',
+        reuse_ci=True,
+        root_homing=True,
+        root_homing_cushion=2,
+    )
+
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    scanner(coords)
+    displaced = coords.copy()
+    displaced[-1, 2] += 0.02
+    tracked = scanner(displaced)
+
+    assert tracked.nstates == 2
+    assert tracked.root_tracking_permutation.shape == (2,)
+    assert len(np.unique(tracked.root_tracking_permutation)) == 2
+    assert np.all(tracked.root_tracking_overlaps > 0.8)
+    if tracked.direct_ci_native_diagnostics.get('used'):
+        assert tracked.direct_ci_native_diagnostics['used_initial_guess'] is True
 
 
 def test_casci_ms2_multiplicity_selects_triplet_m0_root():
@@ -273,12 +325,17 @@ def test_direct_ci_casci_accepts_open_shell_uhf_reference():
     mol.build(driver='gbasis')
 
     mf = UHF(mol).run()
-    mc = direct_ci.CASCI(mf, ncas=2, nelecas=(2, 1)).run(nstates=1, method='direct_ci')
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=(2, 1))
+    mc.direct_ci_dense_fallback_ndets = 1
+    mc.run(nstates=1, method='direct_ci')
 
     dm1a, dm1b = mc.make_rdm1s(0)
     np.testing.assert_allclose(dm1a + dm1b, mc.make_rdm1(0), atol=1e-8)
     assert np.isfinite(mc.e_tot[0])
     assert str(mc.solver_backend).startswith('direct_ci')
+    assert mc.direct_ci_native_diagnostics['used'] is False
+    assert 'restricted spin strings' in mc.direct_ci_fallback_reason
+    assert mc.direct_ci_diagnostics['backend'] == 'python_davidson'
 
 
 def test_direct_ci_casci_uhf_supports_factor_backend():
@@ -286,15 +343,23 @@ def test_direct_ci_casci_uhf_supports_factor_backend():
     mol.build(driver='gbasis')
 
     mf = UHF(mol).run()
-    mc_dense = direct_ci.CASCI(mf, ncas=2, nelecas=(2, 1)).run(nstates=1, method='direct_ci')
-    mc_factor = direct_ci.CASCI(mf, ncas=2, nelecas=(2, 1)).run(
-        nstates=1,
+    mc_dense = direct_ci.CASCI(mf, ncas=4, nelecas=(2, 1)).run(nstates=2, method='ci')
+    mc_factor = direct_ci.CASCI(mf, ncas=4, nelecas=(2, 1)).run(
+        nstates=2,
         method='direct_ci',
         use_cholesky=True,
     )
 
     np.testing.assert_allclose(mc_factor.e_tot[0], mc_dense.e_tot[0], atol=1e-8)
-    assert str(mc_factor.solver_backend).startswith('direct_ci_factor_conn')
+    assert mc_factor.solver_backend == 'direct_ci_spin_string_uhf'
+    assert mc_factor.direct_connectivity is None
+    sigma = mc_factor.ci_sigma(mc_factor.ci[0])
+    assert mc_factor.direct_connectivity is None
+    np.testing.assert_allclose(
+        np.vdot(mc_factor.ci[0], sigma),
+        mc_factor.e_tot[0] - mc_factor.e_core,
+        atol=1.0e-8,
+    )
 
 
 def test_casci_make_tdm1s_sum_to_spin_traced_tdm():
@@ -480,6 +545,58 @@ def test_spin_string_direct_connectivity_matches_slow_builder_records():
         fast_order = np.lexsort(tuple(fast_records[:, col] for col in range(fast_records.shape[1] - 1, -1, -1)))
         slow_order = np.lexsort(tuple(slow_records[:, col] for col in range(slow_records.shape[1] - 1, -1, -1)))
         np.testing.assert_array_equal(fast_records[fast_order], slow_records[slow_order])
+
+
+def test_fci_string_basis_matches_expanded_determinant_ordering():
+    mo_occ = np.zeros((2, 5), dtype=np.int8)
+    mo_occ[0, :2] = 1
+    mo_occ[1, :1] = 1
+    basis = direct_ci.get_fci_string_basis(mo_occ)
+    expanded = direct_ci.get_fci_combos(mo_occ=mo_occ)
+
+    assert isinstance(basis, direct_ci.FCIStringBasis)
+    assert basis.shape == expanded.shape
+    assert basis.nbytes < expanded.nbytes
+    np.testing.assert_array_equal(np.asarray(basis), expanded)
+    np.testing.assert_array_equal(basis[7], expanded[7])
+    np.testing.assert_array_equal(basis[[1, 5, 8], 1, :], expanded[[1, 5, 8], 1, :])
+
+    rng = np.random.default_rng(73)
+    h1 = rng.normal(size=(5, 5))
+    eri_same = rng.normal(size=(5, 5, 5, 5))
+    eri_cross = rng.normal(size=(5, 5, 5, 5))
+    np.testing.assert_allclose(
+        direct_ci._compute_diag_compact(h1, eri_same, eri_cross, basis),
+        direct_ci._compute_diag_compact(h1, eri_same, eri_cross, expanded),
+        atol=1.0e-13,
+    )
+
+
+def test_large_direct_ci_retains_compact_string_basis_through_common_operations():
+    atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(6))
+    mol = Molecule(atom=atom, unit='bohr', basis='sto-6g', spin=0)
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+
+    mc = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    mc.direct_ci_dense_fallback_ndets = 1
+    mc.run(nstates=1, method='direct_ci')
+    basis = mc.binary
+
+    assert isinstance(basis, direct_ci.FCIStringBasis)
+    assert basis.nbytes < basis.shape[0] * basis.shape[1] * basis.shape[2]
+    sigma = mc.ci_sigma(mc.ci[0])
+    np.testing.assert_allclose(
+        sigma,
+        (mc.e_tot[0] - mc.e_core) * mc.ci[0],
+        atol=2.0e-5,
+    )
+    assert abs(mc.spin_square(0)) < 1.0e-6
+    dm1 = mc.make_rdm1(0)
+    assert np.isclose(np.trace(dm1), 6.0)
+    dm2 = mc.make_rdm2(0)
+    assert dm2.shape == (6, 6, 6, 6)
+    assert mc.binary is basis
 
 
 def test_reduced_ci_full_subspace_reproduces_dense_casci():
@@ -973,7 +1090,6 @@ def test_public_casci_defaults_to_direct_ci():
         'ci_dense_fallback',
         'direct_ci_spin_string',
         'direct_ci_compact_conn',
-        'direct_ci_factor_conn',
     }
 
 
@@ -1004,6 +1120,16 @@ def test_direct_ci_on_the_fly_matches_dense_solver():
 
     assert mc_direct.solver_backend == 'direct_ci_spin_string'
     np.testing.assert_allclose(mc_direct.e_tot, mc_dense.e_tot, atol=1e-10)
+    workspace = mc_direct._direct_rhf_blas_matvec
+    if workspace is not None:
+        vector = np.random.default_rng(42).normal(size=mc_direct.binary.shape[0])
+        fast_sigma = mc_direct.ci_sigma(vector)
+        mc_direct._direct_rhf_blas_matvec = None
+        try:
+            reference_sigma = mc_direct.ci_sigma(vector)
+        finally:
+            mc_direct._direct_rhf_blas_matvec = workspace
+        np.testing.assert_allclose(fast_sigma, reference_sigma, atol=1.0e-12)
 
 
 def test_direct_ci_davidson_matches_eigsh():
@@ -1023,6 +1149,121 @@ def test_direct_ci_davidson_matches_eigsh():
     mc_eigsh.run(nstates=2, method='direct_ci')
 
     np.testing.assert_allclose(mc_davidson.e_tot, mc_eigsh.e_tot, atol=1e-10)
+
+
+def test_python_davidson_supports_complex_hermitian_hamiltonians():
+    rng = np.random.default_rng(2026)
+    raw = rng.normal(size=(24, 24)) + 1j * rng.normal(size=(24, 24))
+    hamiltonian = 0.03 * (raw + raw.conj().T)
+    hamiltonian += np.diag(np.linspace(-2.0, 3.0, 24))
+    reference, _ = np.linalg.eigh(hamiltonian)
+    guess = rng.normal(size=(24, 4)) + 1j * rng.normal(size=(24, 4))
+
+    energies, vectors, diagnostics = direct_ci.davidson_lowest(
+        lambda vector: hamiltonian @ vector,
+        np.real(np.diag(hamiltonian)),
+        nroots=4,
+        tol=1.0e-10,
+        energy_tol=1.0e-11,
+        max_cycle=100,
+        max_subspace=24,
+        guess=guess,
+        return_info=True,
+    )
+
+    np.testing.assert_allclose(energies, reference[:4], atol=1.0e-10)
+    np.testing.assert_allclose(
+        vectors.conj().T @ vectors,
+        np.eye(4),
+        atol=1.0e-10,
+    )
+    assert diagnostics['converged'] is True
+    assert np.max(diagnostics['residual_norms']) < 1.0e-10
+
+
+def test_native_rhf_davidson_matches_python_multiroot_and_supports_restart():
+    atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(6))
+    mol = Molecule(atom=atom, unit='bohr', basis='sto-6g', spin=0)
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+
+    python_solver = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    python_solver.direct_ci_dense_fallback_ndets = 1
+    python_solver.direct_ci_root_cushion = 0
+    python_solver.direct_ci_native_davidson = False
+    python_solver.run(nstates=1, method='direct_ci')
+    assert python_solver.direct_ci_fallback_reason == 'native Davidson disabled by solver setting'
+    assert python_solver.direct_ci_diagnostics['backend'] == 'python_davidson'
+
+    native_solver = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    native_solver.direct_ci_dense_fallback_ndets = 1
+    native_solver.direct_ci_root_cushion = 0
+    native_solver.run(nstates=1, method='direct_ci')
+
+    np.testing.assert_allclose(native_solver.e_tot, python_solver.e_tot, atol=2.0e-9)
+    if native_solver._direct_ci_used_native_davidson:
+        assert direct_ci._cpp_attr('davidson_rhf_workspace') is not None
+        capabilities = direct_ci.direct_ci_capabilities()
+        assert capabilities['native_extension'] is True
+        assert capabilities['cblas'] is True
+        assert capabilities['rhf_multiroot'] is True
+        diagnostics = native_solver.direct_ci_native_diagnostics
+        assert diagnostics['converged'] is True
+        assert diagnostics['iterations'] >= 1
+        assert diagnostics['fallback_reason'] is None
+        assert len(diagnostics['residual_norms']) == 1
+
+    python_multiroot = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    python_multiroot.direct_ci_dense_fallback_ndets = 1
+    python_multiroot.direct_ci_root_cushion = 0
+    python_multiroot.direct_ci_native_davidson = False
+    python_multiroot.run(nstates=2, method='direct_ci')
+
+    native_multiroot = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    native_multiroot.direct_ci_dense_fallback_ndets = 1
+    native_multiroot.direct_ci_root_cushion = 0
+    native_multiroot.run(nstates=2, method='direct_ci')
+
+    np.testing.assert_allclose(
+        native_multiroot.e_tot,
+        python_multiroot.e_tot,
+        atol=5.0e-9,
+    )
+    if native_solver._direct_ci_used_native_davidson:
+        assert native_multiroot._direct_ci_used_native_davidson is True
+
+    eigsh_four = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    eigsh_four.direct_ci_dense_fallback_ndets = 1
+    eigsh_four.direct_ci_eigensolver = 'eigsh'
+    eigsh_four.run(nstates=4, method='direct_ci')
+
+    native_four = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    native_four.direct_ci_dense_fallback_ndets = 1
+    native_four.run(nstates=4, method='direct_ci')
+
+    np.testing.assert_allclose(native_four.e_tot, eigsh_four.e_tot, atol=2.0e-8)
+    if native_solver._direct_ci_used_native_davidson:
+        assert native_four._direct_ci_used_native_davidson is True
+
+    restarted = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    restarted.direct_ci_dense_fallback_ndets = 1
+    restarted.direct_ci_root_cushion = 0
+    restarted.run(nstates=2, method='direct_ci', ci0=python_multiroot.ci)
+    if native_solver._direct_ci_used_native_davidson:
+        assert restarted._direct_ci_used_native_davidson is True
+        assert restarted.direct_ci_native_diagnostics['used_initial_guess'] is True
+
+    complex_restart = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
+    complex_restart.direct_ci_dense_fallback_ndets = 1
+    complex_restart.direct_ci_root_cushion = 0
+    complex_restart.run(
+        nstates=2,
+        method='direct_ci',
+        ci0=[1j * state for state in python_multiroot.ci],
+    )
+    assert complex_restart._direct_ci_used_native_davidson is False
+    assert 'complex CI guess' in complex_restart.direct_ci_fallback_reason
+    np.testing.assert_allclose(complex_restart.e_tot, python_multiroot.e_tot, atol=5.0e-9)
 
 
 def test_direct_spin0_symm_davidson_matches_dense_spin0():
@@ -1059,6 +1300,18 @@ def test_direct_spin0_symm_davidson_matches_dense_spin0():
     assert mc_native_davidson.solver_backend == 'direct_spin0_symm_davidson_spin0_pair'
     np.testing.assert_allclose(mc_native_davidson.e_tot, mc_dense.e_tot[:1], atol=1e-10)
 
+    mc_python_davidson = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_python_davidson.direct_spin0_symm_dense_fallback_nconfigs = 0
+    mc_python_davidson.direct_spin0_native_davidson = False
+    mc_python_davidson.direct_ci_workers = 4
+    mc_python_davidson.run(nstates=2, method='direct_spin0_symm')
+
+    np.testing.assert_allclose(
+        mc_python_davidson.e_tot,
+        mc_dense.e_tot[:2],
+        atol=1e-10,
+    )
+
     mc_public = CASCI(mf, ncas=4, nelecas=4)
     mc_public.direct_spin0_symm_dense_fallback_nconfigs = 0
     mc_public.run(nstates=2, method='direct_spin0_symm')
@@ -1076,6 +1329,17 @@ def test_direct_ci_defaults_to_davidson():
 
     assert mc.direct_ci_eigensolver == 'davidson'
     assert mc.direct_ci_root_cushion == 2
+
+
+def test_direct_ci_residual_tolerance_defaults_to_sqrt_energy_tolerance():
+    solver = SimpleNamespace(tol=1.0e-10, direct_ci_residual_tol=None)
+    energy_tol, residual_tol = direct_ci._resolve_direct_ci_tolerances(solver)
+
+    assert energy_tol == 1.0e-10
+    assert residual_tol == 1.0e-5
+
+    solver.direct_ci_residual_tol = 2.0e-7
+    assert direct_ci._resolve_direct_ci_tolerances(solver) == (1.0e-10, 2.0e-7)
 
 
 def test_direct_ci_auto_eigensolver_uses_eigsh_for_medium_spaces():
@@ -1210,7 +1474,69 @@ def test_direct_ci_use_cholesky_matches_dense_energy():
 
     mc_dense = CASCI(mf, ncas=4, nelecas=4).run(nstates=2, method='ci')
 
+    assert mc_direct.solver_backend == 'direct_ci_spin_string'
+    assert mc_direct.direct_connectivity is None
+    assert mc_direct._direct_factor_H_diag is None
+    assert mc_direct.h2e_cas is not None
+    sigma = mc_direct.ci_sigma(mc_direct.ci[0])
+    assert mc_direct.direct_connectivity is None
+    np.testing.assert_allclose(
+        np.vdot(mc_direct.ci[0], sigma),
+        mc_direct.e_tot[0] - mc_direct.e_core,
+        atol=1.0e-8,
+    )
     np.testing.assert_allclose(mc_direct.e_tot, mc_dense.e_tot, atol=1e-8)
+
+
+def test_public_casci_retains_direct_solver_and_restart_state():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+
+    mc = CASCI(mf, ncas=4, nelecas=4)
+    mc.direct_ci_dense_fallback_ndets = 1
+    mc.run(nstates=1)
+    solver = mc._direct_solver
+    connectivity = solver.spin_string_connectivity
+    previous_ci = solver.ci[0].copy()
+
+    mc.run(nstates=1)
+
+    assert mc._direct_solver is solver
+    assert solver.spin_string_connectivity is connectivity
+    assert abs(np.vdot(previous_ci, solver.ci[0])) > 1.0 - 1.0e-10
+
+
+def test_retained_direct_integrals_detect_in_place_mo_changes():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+    mo = np.array(mf.mo_coeff, copy=True)
+
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2)
+    mc.direct_ci_dense_fallback_ndets = 1
+    mc.run(nstates=1, mo_coeff=mo)
+    initial_hcore = np.array(mc.hcore, copy=True)
+
+    mo[:, [mc.ncore, mc.ncore + mc.ncas]] = mo[:, [mc.ncore + mc.ncas, mc.ncore]]
+    mc.run(nstates=1, mo_coeff=mo)
+
+    assert not np.allclose(mc.hcore, initial_hcore)
+    np.testing.assert_array_equal(mc._direct_integrals_mo_snapshot, mo)
+
+
+def test_explicit_singlet_direct_ci_auto_uses_spin0_solver():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(driver='gbasis')
+    mf = RHF(mol).run()
+
+    auto = CASCI(mf, ncas=4, nelecas=4, multiplicity=1).run(nstates=1)
+    explicit = direct_ci.CASCI(
+        mf, ncas=4, nelecas=4, multiplicity=1
+    ).run(nstates=1, method='direct_spin0_symm')
+
+    assert auto.solver_backend.startswith('direct_spin0_symm')
+    np.testing.assert_allclose(auto.e_tot, explicit.e_tot, atol=1.0e-10)
 
 
 def test_public_casci_direct_ci_method_dispatches_to_direct_backend():
@@ -1447,6 +1773,22 @@ def test_public_overlap_matches_slow_reference_for_displaced_casci_pair():
     np.testing.assert_allclose(fast, exact, atol=1e-10)
 
 
+def test_compact_casci_frames_preserve_displaced_overlap():
+    mol1 = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    mol1.build(driver='builtin', eri='dense')
+    mc1 = CASCI(RHF(mol1).run(), ncas=2, nelecas=2).run(nstates=2)
+
+    mol2 = Molecule(atom='H 0 0 0; H 0 0 1.5', unit='bohr', basis='sto-3g')
+    mol2.build(driver='builtin', eri='dense')
+    mc2 = CASCI(RHF(mol2).run(), ncas=2, nelecas=2).run(nstates=2)
+
+    np.testing.assert_allclose(
+        mc1.frame().overlap(mc2.frame()),
+        mc1.overlap(mc2),
+        atol=1e-10,
+    )
+
+
 def test_builtin_casci_overlap_self_is_identity_with_p_orbitals():
     mol = Molecule(
         atom='O 0 0 0; H 0 -1.4 1.1; H 0 1.4 1.1',
@@ -1457,4 +1799,9 @@ def test_builtin_casci_overlap_self_is_identity_with_p_orbitals():
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
 
+    np.testing.assert_allclose(
+        mo_overlap(mc, mc),
+        np.eye(mc.mo_coeff.shape[1]),
+        atol=1e-10,
+    )
     np.testing.assert_allclose(mc.overlap(mc), np.eye(2), atol=1e-10)

@@ -5,6 +5,54 @@ PyQED provides native active-space methods for multireference quantum
 chemistry. CASCI optimizes CI coefficients in a fixed active orbital space.
 CASSCF additionally optimizes the orbitals.
 
+Direct CASCI Diagnostics
+------------------------
+
+The restricted real direct-CASCI solver uses a native single- or multiroot
+Davidson implementation when the compiled backend and CBLAS are available.
+Linux builds use the system BLAS and macOS builds use Accelerate. Other
+Hamiltonian types use the tested Python Davidson fallback.
+
+Every completed solve exposes structured status instead of silently changing
+backends:
+
+.. code-block:: python
+
+   from pyqed.qchem import CASCI
+   from pyqed.qchem.mcscf.direct_ci import direct_ci_capabilities
+
+   print(direct_ci_capabilities())
+
+   mc = CASCI(mf, ncas=6, nelecas=6).run(nstates=3, method="direct_ci")
+   print(mc.converged)
+   print(mc.direct_ci_diagnostics)
+   print(mc.direct_ci_fallback_reason)
+
+Native diagnostics include the iteration count, final residual norms, energy
+changes, subspace dimension, root count, and whether a restart guess was used.
+If native execution is unavailable or fails to converge,
+``direct_ci_fallback_reason`` records the exact reason before the Python solver
+is used.
+
+For geometry scans, request coefficient reuse and overlap-based root homing:
+
+.. code-block:: python
+
+   scanner = mc.as_scanner(
+       nstates=3,
+       method="direct_ci",
+       reuse_ci=True,
+       root_homing=True,
+       root_homing_cushion=2,
+   )
+   result = scanner(new_geometry)
+   print(result.root_tracking_overlaps)
+
+Root homing evaluates the biorthogonal electronic overlap between adjacent
+geometries, performs a one-to-one maximum-overlap assignment, and phase-aligns
+the selected CI vectors. Keep the default two-state Davidson root cushion near
+dense manifolds and avoided crossings.
+
 Basic CASSCF
 ------------
 

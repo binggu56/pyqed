@@ -92,6 +92,12 @@ def _optional_extensions():
         accelerate_link_args = (
             ["-framework", "Accelerate"] if sys.platform == "darwin" else []
         )
+        casscf_libraries = ["blas"] if sys.platform.startswith("linux") else []
+        casscf_macros = (
+            [("PYQED_USE_CBLAS", "1")]
+            if sys.platform.startswith("linux")
+            else []
+        )
         extensions.append(
             Extension(
                 "pyqed.qchem._integrals_cpp",
@@ -110,6 +116,8 @@ def _optional_extensions():
                 language="c++",
                 extra_compile_args=cpp_compile_args,
                 extra_link_args=accelerate_link_args,
+                libraries=casscf_libraries,
+                define_macros=casscf_macros,
                 optional=True,
             )
         )

@@ -9,10 +9,12 @@ complete active space configuration interaction
 """
 
 import logging
+import copy
 from functools import lru_cache, reduce
 import importlib
 import numpy as np
 from scipy.linalg import eigh
+from scipy.optimize import linear_sum_assignment
 from scipy.sparse.linalg import eigsh
 
 import sys
@@ -25,7 +27,15 @@ import warnings
 from dataclasses import dataclass
 from numba import njit
 
-from pyqed.qchem.ci.fci import givenΛgetB, SpinOuterProduct, get_fci_combos, SlaterCondon, CI_H
+from pyqed.qchem.ci.fci import (
+    FCIStringBasis,
+    givenΛgetB,
+    SpinOuterProduct,
+    get_fci_combos,
+    get_fci_string_basis,
+    SlaterCondon,
+    CI_H,
+)
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
             create, Is #, jordan_wigner_two_body
 
@@ -43,6 +53,79 @@ from pyqed.qchem.soc import (
 
 _CASSCF_CPP_UNINITIALIZED = object()
 _casscf_cpp = _CASSCF_CPP_UNINITIALIZED
+
+_DIRECT_SOLVER_SETTING_NAMES = (
+    'direct_ci_dense_fallback_ndets',
+    'direct_spin0_symm_dense_fallback_nconfigs',
+    'direct_ci_eigensolver',
+    'direct_ci_auto_eigsh_ndets',
+    'direct_ci_root_cushion',
+    'direct_ci_max_cycle',
+    'direct_ci_max_subspace',
+    'direct_ci_residual_tol',
+    'direct_ci_factor_davidson_block_size',
+    'direct_ci_reuse_guess',
+    'direct_ci_auto_spin0',
+    'direct_ci_workers',
+    'direct_ci_parallel_min_ndet',
+    'direct_ci_spin_string_backend',
+    'direct_ci_native_davidson',
+    'direct_spin0_native_pair',
+    'direct_spin0_native_davidson',
+)
+
+
+@dataclass(frozen=True)
+class _AOBasisFrame:
+    """Minimal molecule data required for cross-geometry AO overlaps."""
+
+    _bas: object
+    _bas_cart: object
+    _ao_cart2sph: object
+
+
+@dataclass(frozen=True)
+class CASCIFrame:
+    """Compact CASCI state used for electronic overlaps between geometries."""
+
+    mol: _AOBasisFrame
+    mo_coeff: np.ndarray
+    ci: tuple
+    binary: np.ndarray | FCIStringBasis
+    ncore: int
+    ncas: int
+
+    @classmethod
+    def from_casci(cls, mc):
+        mol = mc.mol
+        basis = _AOBasisFrame(
+            _bas=(None if getattr(mol, "_bas", None) is None else copy.deepcopy(mol._bas)),
+            _bas_cart=(
+                None
+                if getattr(mol, "_bas_cart", None) is None
+                else copy.deepcopy(mol._bas_cart)
+            ),
+            _ao_cart2sph=(
+                None
+                if getattr(mol, "_ao_cart2sph", None) is None
+                else np.array(mol._ao_cart2sph, copy=True)
+            ),
+        )
+        return cls(
+            mol=basis,
+            mo_coeff=np.array(mc.mo_coeff, copy=True),
+            ci=tuple(np.array(state, copy=True) for state in mc.ci),
+            binary=(
+                mc.binary.copy()
+                if isinstance(mc.binary, FCIStringBasis)
+                else np.array(mc.binary, copy=True)
+            ),
+            ncore=int(mc.ncore),
+            ncas=int(mc.ncas),
+        )
+
+    def overlap(self, other):
+        return overlap(self, other)
 
 
 def _cpp_attr(*names):
@@ -471,7 +554,7 @@ def _binary_to_grouped_spin_orbital_occ(binary):
 
 
 def make_tdm1_spin_orbital(cibra, ciket, binary_bra, binary_ket, order='grouped'):
-    """
+    r"""
     One-particle transition density matrix in a full spin-orbital basis.
 
     The returned matrix follows the convention
@@ -676,7 +759,7 @@ class CASCI:
         multiplicity=None,
         verbose=0,
     ):
-        """
+        r"""
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
 
@@ -743,6 +826,30 @@ class CASCI:
             warnings.warn('Active space with {} orbitals is probably too big.'.format(ncas))
 
         self.nstates = None
+        self.scan_method = 'direct_ci'
+        self.scan_run_kwargs = {}
+        self._direct_solver = None
+        self.direct_ci_dense_fallback_ndets = 256
+        self.direct_spin0_symm_dense_fallback_nconfigs = 256
+        self.direct_ci_eigensolver = 'davidson'
+        self.direct_ci_auto_eigsh_ndets = 10000
+        self.direct_ci_root_cushion = 2
+        self.direct_ci_max_cycle = 100
+        self.direct_ci_max_subspace = None
+        self.direct_ci_residual_tol = None
+        self.direct_ci_factor_davidson_block_size = 1
+        self.direct_ci_reuse_guess = True
+        self.direct_ci_auto_spin0 = True
+        self.direct_ci_workers = None
+        self.direct_ci_parallel_min_ndet = 4096
+        self.direct_ci_spin_string_backend = True
+        self.direct_ci_native_davidson = True
+        self.direct_spin0_native_pair = True
+        self.direct_spin0_native_davidson = True
+        self.direct_ci_native_diagnostics = {}
+        self.direct_ci_diagnostics = {}
+        self.direct_ci_fallback_reason = None
+        self.converged = False
         # if nelecas is None:
         #     nelecas = mf.mol.nelec
 
@@ -788,6 +895,7 @@ class CASCI:
         self.det_irrep_filter_indices = None
         self.spin0_symm_transform = None
         self.spin0_pair_indices = None
+        self.spin_string_connectivity = None
 
 
         # effective CAS Hamiltonian
@@ -960,10 +1068,12 @@ class CASCI:
     def as_scanner(
         self,
         nstates=None,
-        method='direct_ci',
+        method=None,
         build_driver=None,
         run_kwargs=None,
         reuse_ci=False,
+        root_homing=False,
+        root_homing_cushion=2,
         **kwargs,
     ):
         """Return a stateful CASCI scanner for nearby geometries.
@@ -973,8 +1083,10 @@ class CASCI:
         so downstream LDR code can use energies, overlaps, and density matrices
         from the same electronic calculation.
         """
-        options = dict(run_kwargs or {})
+        options = dict(self.scan_run_kwargs)
+        options.update(run_kwargs or {})
         options.update(kwargs)
+        method = self.scan_method if method is None else method
         return CASCIScanner(
             self,
             nstates=nstates,
@@ -982,6 +1094,8 @@ class CASCI:
             build_driver=build_driver,
             run_kwargs=options,
             reuse_ci=reuse_ci,
+            root_homing=root_homing,
+            root_homing_cushion=root_homing_cushion,
         )
 
 
@@ -1387,7 +1501,7 @@ class CASCI:
         return H
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
-        """
+        r"""
         fix the spin by energy penalty
 
         .. math::
@@ -1525,7 +1639,7 @@ class CASCI:
 
         if self.binary is None:
             mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
-            binary = get_fci_combos(mo_occ = mo_occ)
+            binary = get_fci_string_basis(mo_occ=mo_occ)
             self.binary = binary
         else:
             binary = self.binary
@@ -1541,29 +1655,47 @@ class CASCI:
         )):
             from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
 
-            direct_solver = DirectCASCI(
-                self.mf,
-                ncas=self.ncas,
-                nelecas=self.nelecas,
-                ncore=self.ncore,
-                ms2=self.ms2,
-                multiplicity=self.multiplicity,
-                tol=getattr(self, 'tol', 0),
-                verbose=self.verbose,
+            direct_solver = self._direct_solver
+            solver_matches = (
+                isinstance(direct_solver, DirectCASCI)
+                and direct_solver.mf is self.mf
+                and direct_solver.ncas == self.ncas
+                and direct_solver.ncore == self.ncore
+                and direct_solver.nelecas_spin == self.nelecas_spin
+                and direct_solver.ms2 == self.ms2
+                and direct_solver.multiplicity == self.multiplicity
             )
+            if not solver_matches:
+                direct_solver = DirectCASCI(
+                    self.mf,
+                    ncas=self.ncas,
+                    nelecas=self.nelecas,
+                    ncore=self.ncore,
+                    ms2=self.ms2,
+                    multiplicity=self.multiplicity,
+                    tol=getattr(self, 'tol', 0),
+                    verbose=self.verbose,
+                )
+                if self.spin_string_connectivity is not None:
+                    direct_solver.spin_string_connectivity = self.spin_string_connectivity
+                self._direct_solver = direct_solver
+
             direct_solver.spin_root_cushion = self.spin_root_cushion
             direct_solver.spin_selection_tol = self.spin_selection_tol
-            if hasattr(self, 'direct_spin0_symm_dense_fallback_nconfigs'):
-                direct_solver.direct_spin0_symm_dense_fallback_nconfigs = (
-                    self.direct_spin0_symm_dense_fallback_nconfigs
-                )
-            if hasattr(self, 'direct_spin0_native_pair'):
-                direct_solver.direct_spin0_native_pair = self.direct_spin0_native_pair
-            if hasattr(self, 'direct_spin0_native_davidson'):
-                direct_solver.direct_spin0_native_davidson = self.direct_spin0_native_davidson
-            if hasattr(self, 'direct_ci_workers'):
-                direct_solver.direct_ci_workers = self.direct_ci_workers
-            direct_solver.binary = binary
+            direct_solver.tol = getattr(self, 'tol', direct_solver.tol)
+            direct_solver.verbose = self.verbose
+            for name in _DIRECT_SOLVER_SETTING_NAMES:
+                if hasattr(self, name):
+                    setattr(direct_solver, name, getattr(self, name))
+
+            if direct_solver.binary is not binary:
+                if direct_solver.binary is not None:
+                    self.spin_string_connectivity = None
+                direct_solver.binary = binary
+                direct_solver.direct_connectivity = None
+                direct_solver.SC1 = None
+                direct_solver.SC2 = None
+                direct_solver.spin_string_connectivity = self.spin_string_connectivity
             direct_solver.run(
                 nstates=nstates,
                 mo_coeff=self.mo_coeff,
@@ -1609,8 +1741,23 @@ class CASCI:
             self.spin0_pair_indices = getattr(
                 direct_solver, 'spin0_pair_indices', self.spin0_pair_indices
             )
-            self.solver_backend = getattr(direct_solver, 'solver_backend', 'direct_ci_factor_conn')
+            self.spin_string_connectivity = getattr(
+                direct_solver, 'spin_string_connectivity', self.spin_string_connectivity
+            )
+            self.solver_backend = getattr(direct_solver, 'solver_backend', 'direct_ci_spin_string')
+            self.direct_ci_native_diagnostics = getattr(
+                direct_solver, 'direct_ci_native_diagnostics', {}
+            )
+            self.direct_ci_diagnostics = getattr(direct_solver, 'direct_ci_diagnostics', {})
+            self.direct_ci_fallback_reason = getattr(
+                direct_solver, 'direct_ci_fallback_reason', None
+            )
+            self.converged = getattr(direct_solver, 'converged', True)
             return self
+
+        if isinstance(binary, FCIStringBasis):
+            binary = binary.materialize()
+            self.binary = binary
 
         # print('Number of determinants', binary.shape[0])
 
@@ -1711,7 +1858,7 @@ class CASCI:
         return E, X
 
     def make_rdm1_contract(self, state_id, h1e=None, representation='ao'):
-        """
+        r"""
         spin-traced 1e reduced density matrix
         .. math::
 
@@ -1757,7 +1904,7 @@ class CASCI:
         representation='mo',
         repr=None,
     ):
-        """
+        r"""
         spin-traced 1e reduced density matrix
         .. math::
 
@@ -1829,7 +1976,7 @@ class CASCI:
 
 
     def make_rdm1s(self, state_id):
-        """
+        r"""
         spin-polarized 1e reduced density matrix
         .. math::
 
@@ -1846,7 +1993,7 @@ class CASCI:
         return make_rdm1s(ci, self.binary, self.SC1)
 
     def make_rdm2(self, state_id=0, with_core=False, with_vir=False):
-        """
+        r"""
         2-e reduced density matrix
 
         The definition follows the PySCF convention.
@@ -1931,8 +2078,12 @@ class CASCI:
     def overlap(self, other):
         return overlap(self, other)
 
+    def frame(self):
+        """Return a compact state retaining only electronic-overlap data."""
+        return CASCIFrame.from_casci(self)
+
     def contract_with_tdm1(self, bra_id, ket_id=0, h1e=None, representation='mo'):
-        """
+        r"""
         spin-traced 1e transition density matrix
 
         .. math::
@@ -2369,7 +2520,7 @@ class CASCI:
         )
 
     def make_tdm2(self, bra_id, ket_id=0):
-        """
+        r"""
         Spin-traced two-particle transition density matrix in MO basis.
 
         .. math::
@@ -2483,7 +2634,7 @@ def size_of_cas(norb, nelec, basis='sd', S=0):
         return (2*S+1)/(norb + 1) * comb(norb+1, N//2 - S) * comb(norb+1, N//2+S+1)
 
 def spin_square(dm1, dm2):
-    """
+    r"""
 
     Compute the total spin S^2, require 2e RDM
 
@@ -2522,7 +2673,7 @@ def spin_square(dm1, dm2):
 #     ss = CI_H(binary, H1, H2, SC1, SC2)
 
 def contract_with_tdm1(cibra, ciket, binary, SC1, h1e):
-    """
+    r"""
 
     1e transition DM contracted with 1e operators
 
@@ -2566,7 +2717,7 @@ def contract_with_tdm1(cibra, ciket, binary, SC1, h1e):
     return np.einsum('I, IJ, J -> ', cibra.conj(), H, ciket)
 
 def contract_with_rdm1(ci, binary, SC1, h1e):
-    """
+    r"""
 
     make 1e RDM contracted with 1e operators without returning RDM
 
@@ -2635,7 +2786,7 @@ def make_rdm1s(ci, binary, SC1):
 
 
 def make_rdm1(ci, binary, SC1):
-    """
+    r"""
 
     make spin-traced 1e RDM E_{pq}
 
@@ -2673,7 +2824,7 @@ def make_tdm1s(cibra, ciket, binary, SC1):
     return _make_tdm1s_link_contractions(cibra, ciket, binary)
 
 def make_tdm1(cibra, ciket, binary, SC1):
-    """
+    r"""
 
     make spin-traced 1e TDM E_{pq}
 
@@ -2811,6 +2962,9 @@ def _cached_spin_string_basis(shape, data):
 
 
 def _ci_to_spin_string_matrix(ci, binary):
+    if isinstance(binary, FCIStringBasis):
+        coeff = np.asarray(ci).reshape(binary.nalpha, binary.nbeta)
+        return binary.alpha_occ, binary.beta_occ, coeff
     alpha, beta, alpha_det, beta_det = _cached_spin_string_basis(
         tuple(binary.shape),
         np.ascontiguousarray(binary, dtype=np.int8).tobytes(),
@@ -3158,7 +3312,7 @@ def _make_tdm2_explicit(cibra, ciket, binary):
 
 
 def make_rdm2(ci, Binary, SC1, SC2):
-    """
+    r"""
     build the spin-traced 2-particle operator with the 2e RDM
 
     .. math::
@@ -3189,7 +3343,13 @@ def make_tdm2(cibra, ciket, Binary, SC1, SC2):
     return _make_tdm2_link_contractions(cibra, ciket, Binary)
 
 
-def _compute_ci_mo_overlap(cibra, ciket, s=None):
+def mo_overlap(cibra, ciket, s=None):
+    """Return the bra-ket molecular-orbital overlap.
+
+    When ``s`` is supplied, it is returned as the already transformed MO
+    overlap. Otherwise the cross-geometry AO overlap is transformed with the
+    orbital coefficients stored by the two calculation objects.
+    """
     if s is not None:
         return s
 
@@ -3202,8 +3362,12 @@ def _compute_ci_mo_overlap(cibra, ciket, s=None):
         mol_bra.build()
         mol_ket.build()
         s = gto.intor_cross('int1e_ovlp', mol_bra, mol_ket)
-    bra_mo = getattr(cibra, "mo_coeff", cibra.mf.mo_coeff)
-    ket_mo = getattr(ciket, "mo_coeff", ciket.mf.mo_coeff)
+    bra_mo = getattr(cibra, "mo_coeff", None)
+    ket_mo = getattr(ciket, "mo_coeff", None)
+    if bra_mo is None:
+        bra_mo = cibra.mf.mo_coeff
+    if ket_mo is None:
+        ket_mo = ciket.mf.mo_coeff
     return reduce(np.dot, (bra_mo.T.conj(), s, ket_mo))
 
 
@@ -3224,6 +3388,15 @@ def _unique_rows_first(rows):
         return rows
     _, first_idx = np.unique(rows, axis=0, return_index=True)
     return rows[np.sort(first_idx)]
+
+
+def _basis_spin_strings(binary):
+    if isinstance(binary, FCIStringBasis):
+        return binary.alpha_occ, binary.beta_occ
+    return (
+        _unique_rows_first(binary[:, 0, :]),
+        _unique_rows_first(binary[:, 1, :]),
+    )
 
 
 def _occupation_lists(strings):
@@ -3401,7 +3574,7 @@ def _overlap_slow_from_mo_overlap(
     ciket,
     s,
 ):
-    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+    s = mo_overlap(cibra, ciket, s=s)
     nsd_bra = cibra.binary.shape[0]
     nsd_ket = ciket.binary.shape[0]
     dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
@@ -3448,7 +3621,7 @@ def _factorized_ci_overlap(
     ciket,
     s=None,
 ):
-    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+    s = mo_overlap(cibra, ciket, s=s)
 
     nsd_bra = cibra.binary.shape[0]
     nsd_ket = ciket.binary.shape[0]
@@ -3465,10 +3638,8 @@ def _factorized_ci_overlap(
         dtype,
     )
 
-    bra_alpha = _unique_rows_first(cibra.binary[:, 0, :])
-    bra_beta = _unique_rows_first(cibra.binary[:, 1, :])
-    ket_alpha = _unique_rows_first(ciket.binary[:, 0, :])
-    ket_beta = _unique_rows_first(ciket.binary[:, 1, :])
+    bra_alpha, bra_beta = _basis_spin_strings(cibra.binary)
+    ket_alpha, ket_beta = _basis_spin_strings(ciket.binary)
 
     nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
     nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
@@ -3522,10 +3693,8 @@ def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
     """Biorthogonal CI overlap from precomputed active-space overlap prep."""
     nsd_bra = cibra.binary.shape[0]
     nsd_ket = ciket.binary.shape[0]
-    bra_alpha = _unique_rows_first(cibra.binary[:, 0, :])
-    bra_beta = _unique_rows_first(cibra.binary[:, 1, :])
-    ket_alpha = _unique_rows_first(ciket.binary[:, 0, :])
-    ket_beta = _unique_rows_first(ciket.binary[:, 1, :])
+    bra_alpha, bra_beta = _basis_spin_strings(cibra.binary)
+    ket_alpha, ket_beta = _basis_spin_strings(ciket.binary)
 
     nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
     nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
@@ -3551,7 +3720,7 @@ def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
 
 def _biorthogonal_ci_overlap_candidate(cibra, ciket, s=None):
     """Private candidate overlap using active-space biorthogonal CI transforms."""
-    s = _compute_ci_mo_overlap(cibra, ciket, s=s)
+    s = mo_overlap(cibra, ciket, s=s)
 
     dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
 
@@ -3593,8 +3762,9 @@ def overlap(cibra, ciket, s=None):
         DESCRIPTION.
     binary2 : TYPE
         DESCRIPTION.
-    s : TYPE
-        AO overlap.
+    s : ndarray, optional
+        MO overlap. If omitted, it is built from the cross-geometry AO
+        overlap and the orbitals stored by ``cibra`` and ``ciket``.
 
     Returns
     -------
@@ -3624,6 +3794,8 @@ class CASCIScanner:
         build_driver=None,
         run_kwargs=None,
         reuse_ci=False,
+        root_homing=False,
+        root_homing_cushion=2,
     ):
         self.template = mc
         self.mf = mc.mf
@@ -3632,7 +3804,12 @@ class CASCIScanner:
         self.method = method
         self.run_kwargs = dict(run_kwargs or {})
         self.reuse_ci = bool(reuse_ci)
+        self.root_homing = bool(root_homing)
+        self.root_homing_cushion = max(0, int(root_homing_cushion))
         self.last_result = None
+        self.last_frame = None
+        self.root_tracking_overlaps = None
+        self.root_tracking_permutation = None
         self._mf_scanner = (
             self.mf.as_scanner(build_driver=build_driver)
             if hasattr(self.mf, "as_scanner")
@@ -3658,7 +3835,8 @@ class CASCIScanner:
             mf,
             ncas=self.template.ncas,
             nelecas=self.template.nelecas,
-            spin=self.template.spin,
+            ms2=self.template.ms2,
+            multiplicity=self.template.multiplicity,
             verbose=self.template.verbose,
         )
         scanner_mc.binary = self.template.binary
@@ -3666,22 +3844,69 @@ class CASCIScanner:
         scanner_mc.ss = self.template.ss
         scanner_mc.shift = self.template.shift
         scanner_mc.use_cholesky_integrals = self.template.use_cholesky_integrals
+        scanner_mc.spin_string_connectivity = self.template.spin_string_connectivity
+        for name in _DIRECT_SOLVER_SETTING_NAMES:
+            if hasattr(self.template, name):
+                setattr(scanner_mc, name, getattr(self.template, name))
 
         options = dict(self.run_kwargs)
         method = options.pop("method", self.method)
         ci0 = options.pop("ci0", None)
         if ci0 is None and self.reuse_ci and self.last_result is not None:
             ci0 = getattr(self.last_result, "ci", None)
+        solve_nstates = self.nstates
+        if self.root_homing and self.last_frame is not None:
+            basis = scanner_mc.binary
+            ndet = (
+                basis.shape[0]
+                if isinstance(basis, FCIStringBasis)
+                else size_of_cas(scanner_mc.ncas, scanner_mc.nelecas_spin)
+                if basis is None
+                else np.asarray(basis).shape[0]
+            )
+            solve_nstates = min(ndet, self.nstates + self.root_homing_cushion)
         scanner_mc.run(
-            nstates=self.nstates,
+            nstates=solve_nstates,
             method=method,
             ci0=ci0,
             **options,
         )
 
+        if self.root_homing and self.last_frame is not None:
+            current_frame = CASCIFrame.from_casci(scanner_mc)
+            state_overlap = np.asarray(overlap(self.last_frame, current_frame))
+            ntrack = min(self.nstates, state_overlap.shape[0], state_overlap.shape[1])
+            rows, cols = linear_sum_assignment(-np.abs(state_overlap[:ntrack]))
+            assigned = {int(row): int(col) for row, col in zip(rows, cols)}
+            order = [assigned[row] for row in range(ntrack) if row in assigned]
+            order.extend(
+                int(idx)
+                for idx in np.argsort(np.real(scanner_mc.e_tot))
+                if int(idx) not in order
+            )
+            order = order[:self.nstates]
+            tracked_ci = []
+            tracked_overlap = []
+            for row, col in enumerate(order):
+                state = np.array(scanner_mc.ci[col], copy=True)
+                value = state_overlap[row, col] if row < state_overlap.shape[0] else 0.0
+                if abs(value) > 0.0:
+                    state = state * np.exp(-1j * np.angle(value))
+                    state = np.real_if_close(state, tol=1000)
+                tracked_ci.append(state)
+                tracked_overlap.append(abs(value))
+            scanner_mc.e_tot = np.asarray(scanner_mc.e_tot)[order]
+            scanner_mc.ci = tracked_ci
+            scanner_mc.nstates = self.nstates
+            scanner_mc.root_tracking_overlaps = np.asarray(tracked_overlap)
+            scanner_mc.root_tracking_permutation = np.asarray(order, dtype=int)
+            self.root_tracking_overlaps = scanner_mc.root_tracking_overlaps
+            self.root_tracking_permutation = scanner_mc.root_tracking_permutation
+
         self.mf = mf
         self.mol = mf.mol
         self.last_result = scanner_mc
+        self.last_frame = CASCIFrame.from_casci(scanner_mc)
         return scanner_mc
 
     def overlap(self, left, right):
