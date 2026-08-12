@@ -572,6 +572,24 @@ def test_fci_string_basis_matches_expanded_determinant_ordering():
     )
 
 
+def test_spin_orbital_diagonal_accepts_fci_string_basis():
+    mo_occ = np.zeros((2, 5), dtype=np.int8)
+    mo_occ[0, :2] = 1
+    mo_occ[1, :1] = 1
+    basis = direct_ci.get_fci_string_basis(mo_occ)
+    expanded = basis.materialize()
+
+    rng = np.random.default_rng(79)
+    h1 = rng.normal(size=(2, 5, 5))
+    h2 = rng.normal(size=(2, 2, 5, 5, 5, 5))
+
+    np.testing.assert_allclose(
+        direct_ci._compute_diag(h1, h2, basis),
+        direct_ci._compute_diag(h1, h2, expanded),
+        atol=1.0e-13,
+    )
+
+
 def test_large_direct_ci_retains_compact_string_basis_through_common_operations():
     atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(6))
     mol = Molecule(atom=atom, unit='bohr', basis='sto-6g', spin=0)

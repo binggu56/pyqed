@@ -1248,7 +1248,7 @@ def build_direct_connectivity(Binary):
 
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
-def _compute_diag(H1, H2, Binary):
+def _compute_diag_expanded(H1, H2, Binary):
 
     n_dets, _, n_mo = Binary.shape
 
@@ -1300,6 +1300,16 @@ def _compute_diag(H1, H2, Binary):
 
 
     return H_diag
+
+
+def _compute_diag(H1, H2, Binary):
+    if isinstance(Binary, FCIStringBasis):
+        return _compute_diag_compact_uhf(
+            H1[0], H1[1],
+            H2[0, 0], H2[0, 1], H2[1, 0], H2[1, 1],
+            Binary,
+        )
+    return _compute_diag_expanded(H1, H2, Binary)
 
 @njit(nogil=True, parallel=True, cache=True, fastmath=True)
 def _compute_single_excitation(H1_spin, H2_same, H2_cross, a_t, a, ca, binary_complement):
