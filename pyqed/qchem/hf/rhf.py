@@ -62,33 +62,34 @@ def _cross_ao_overlap_matrix(mol_bra, mol_ket):
     if basis_bra is None or basis_ket is None:
         raise ValueError("Build both molecules before requesting cross AO overlaps.")
 
-    try:
-        from pyqed.qchem.basis import S as native_overlap
-
+    from pyqed.qchem.basis import ContractedGaussian, S as native_overlap
+    native_bra = all(isinstance(fn, ContractedGaussian) for fn in basis_bra)
+    native_ket = all(isinstance(fn, ContractedGaussian) for fn in basis_ket)
+    if native_bra and native_ket:
         s12 = np.empty((len(basis_bra), len(basis_ket)), dtype=float)
         for i, bra_ao in enumerate(basis_bra):
             for j, ket_ao in enumerate(basis_ket):
                 s12[i, j] = float(native_overlap(bra_ao, ket_ao))
-    except Exception:
-        s12 = None
+        transform_bra = getattr(mol_bra, "_ao_cart2sph", None)
+        transform_ket = getattr(mol_ket, "_ao_cart2sph", None)
+        if transform_bra is not None:
+            s12 = np.einsum('pi,pq->iq', transform_bra, s12, optimize=True)
+        if transform_ket is not None:
+            s12 = np.einsum('pq,qj->pj', s12, transform_ket, optimize=True)
+        return s12
 
-    if s12 is None:
-        try:
-            from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
-            s12 = np.asarray(overlap_integral_asymmetric(basis_bra, basis_ket), dtype=float)
-        except Exception as err:
-            raise ValueError(
-                "Cross-AO overlap requires PyQED builtin AO objects or gbasis shells."
-            ) from err
-
-    transform_bra = getattr(mol_bra, "_ao_cart2sph", None)
-    transform_ket = getattr(mol_ket, "_ao_cart2sph", None)
-    if transform_bra is not None:
-        s12 = np.einsum('pi,pq->iq', transform_bra, s12, optimize=True)
-    if transform_ket is not None:
-        s12 = np.einsum('pq,qj->pj', s12, transform_ket, optimize=True)
-    return s12
+    try:
+        from pyscf import gto
+    except ImportError as exc:
+        raise ValueError(
+            "Cross-AO overlap requires builtin AO objects or PySCF."
+        ) from exc
+    pyscf_bra = mol_bra.topyscf().build()
+    pyscf_ket = mol_ket.topyscf().build()
+    if bool(pyscf_bra.cart) != bool(pyscf_ket.cart):
+        raise ValueError("Cross-AO overlap requires matching Cartesian/spherical conventions.")
+    intor = "int1e_ovlp_cart" if pyscf_bra.cart else "int1e_ovlp_sph"
+    return np.asarray(gto.intor_cross(intor, pyscf_bra, pyscf_ket), dtype=float)
 
 
 def _lowdin_sqrt_overlap(overlap, thresh=1e-12):
@@ -404,7 +405,7 @@ def _ibo_localize(
 
 
 class RHF:
-    def __init__(self, mol, init_guess='h1e', verbose=0):
+    def __init__(self, mol, init_guess='minao', verbose=0):
         self.mol = mol
         self.max_cycle = 100
         self.init_guess = init_guess
@@ -472,6 +473,9 @@ class RHF:
         self.diis_switch_tol = 1e-3
         self.diis_start_cycle = 2
         self.diis_space = 6
+        self.direct_scf_tol = float(
+            getattr(mol, "builtin_direct_scf_tol", 1.0e-13)
+        )
         self.symmetry = bool(getattr(mol, 'symmetry', False))
         self.groupname = getattr(mol, 'groupname', None)
         self.irrep_names = getattr(mol, 'irrep_names', None)
@@ -499,6 +503,7 @@ class RHF:
         x2c_kw = bool(x2c_kw)
         density_fit = bool(kwargs.pop('density_fit', False))
         auxbasis = kwargs.pop('auxbasis', None)
+        init_guess = kwargs.pop('init_guess', self.init_guess)
         with_solvent = kwargs.pop('with_solvent', kwargs.pop('solvent', getattr(self, 'with_solvent', None)))
         cholesky_jk_kw = kwargs.pop('cholesky_jk', None)
         low_rank_jk_kw = kwargs.pop('low_rank_jk', None)
@@ -552,6 +557,9 @@ class RHF:
         self.conv_tol_grad = kwargs.get('conv_tol_grad', None)
         if self.conv_tol_grad is not None:
             self.conv_tol_grad = float(self.conv_tol_grad)
+        direct_scf_tol_kw = kwargs.get('direct_scf_tol', self.direct_scf_tol)
+        if direct_scf_tol_kw is not None:
+            self.direct_scf_tol = float(direct_scf_tol_kw)
         self.damping = float(kwargs.get('damping', 0.0))
         self.damping_mode = str(kwargs.get('damping_mode', 'density')).lower()
         self.damping_decay = float(kwargs.get('damping_decay', 1.0))
@@ -590,7 +598,7 @@ class RHF:
                     self.vhf, self.dm, self._pyscf_mf = pyscf_density_fit_rhf(
                         self.mol,
                         dm0=kwargs.pop('dm0', None),
-                        init_guess=kwargs.pop('init_guess', self.init_guess),
+                        init_guess=init_guess,
                         max_cycle=kwargs.pop('max_cycle', 50),
                         tol=kwargs.pop('tol', 1e-8),
                         auxbasis=auxbasis,
@@ -614,6 +622,7 @@ class RHF:
                         low_rank_tol=cholesky_tol,
                         low_rank_max_rank=cholesky_max_rank,
                         with_solvent=with_solvent,
+                        init_guess=init_guess,
                         return_info=True,
                         verbose=verbose,
                         **kwargs,
@@ -669,12 +678,12 @@ class RHF:
             self.orb_irrep_weights = weights
         return self
 
-    def as_scanner(self, build_driver=None):
+    def as_scanner(self):
         """
         Return a lightweight scanner that reuses the previous density matrix and,
         when enabled, low-rank ERI factors across nearby geometries.
         """
-        return RHFScanner(self, build_driver=build_driver)
+        return RHFScanner(self)
     
 
     def get_eri(self, representation='mo'):
@@ -693,15 +702,33 @@ class RHF:
         # eri = ao2mo.general(self.mol, (C,C,C,C),
         #               compact=False).reshape(nmo,nmo,nmo,nmo, order='C')
 
-        if representation == 'ao':
-            return self.eri 
-        
-        elif representation == 'mo':
-            
-            C = self.mo_coeff            
-            eri = contract('abcd, ap, br, cs, dq -> pqrs', self.eri, C.conj(), C, C.conj(), C)
-                                    
+        key = str(representation).lower()
+        if key == 'mo':
+            return self.get_eri_mo()
+        if key != 'ao':
+            raise ValueError("representation must be 'ao' or 'mo'.")
+
+        eri = self.eri
+        if eri is not None:
             return eri
+        eri_s4 = getattr(self, 'eri_s4', None)
+        if eri_s4 is None:
+            eri_s4 = getattr(self.mol, 'eri_s4', None)
+        if eri_s4 is not None:
+            from pyqed.qchem.basis import unpack_eri_s4
+            return unpack_eri_s4(eri_s4, self.mol.nao)
+        eri_s8 = getattr(self, 'eri_s8', None)
+        if eri_s8 is None:
+            eri_s8 = getattr(self.mol, 'eri_s8', None)
+        if eri_s8 is not None:
+            from pyqed.qchem.basis import unpack_eri_s8
+            return unpack_eri_s8(eri_s8, self.mol.nao)
+        factors = getattr(self, 'eri_factors', None)
+        if factors is None:
+            factors = getattr(self.mol, 'eri_factors', None)
+        if factors is not None:
+            return contract('Ppq,Prs->pqrs', factors, factors)
+        raise ValueError("No materialized AO ERI representation is available.")
 
     def dipole(self, center=None, basis='ao'):
         """
@@ -1779,9 +1806,9 @@ class ROHF(RHF):
 
     kernel = run
 
-    def as_scanner(self, build_driver=None):
+    def as_scanner(self):
         """Return a geometry scanner that reuses the previous ROHF density."""
-        return ROHFScanner(self, build_driver=build_driver)
+        return ROHFScanner(self)
 
     def make_rdm1(self, spin_resolved=False):
         if spin_resolved:
@@ -1856,35 +1883,79 @@ def _record_direct_jk_stats(direct_jk_data, mode, computed, skipped):
     direct_jk_data["last_mode"] = mode
     direct_jk_data["last_computed"] = int(computed)
     direct_jk_data["last_skipped"] = int(skipped)
+    direct_jk_data["calls"] = int(direct_jk_data.get("calls", 0)) + 1
+    if computed >= 0:
+        direct_jk_data["total_computed"] = (
+            int(direct_jk_data.get("total_computed", 0)) + int(computed)
+        )
+    if skipped >= 0:
+        direct_jk_data["total_skipped"] = (
+            int(direct_jk_data.get("total_skipped", 0)) + int(skipped)
+        )
 
 
-def _direct_veff_from_builtin_data(mol, dm, direct_jk_data):
+def _direct_veff_from_builtin_data(mol, dm, direct_jk_data, screen_tol=None):
     transform = getattr(mol, '_ao_cart2sph', None)
+    kernel = str(direct_jk_data.get("kernel", "")).lower()
+    spherical_kernel = kernel.endswith("spherical-direct-jk")
+    if screen_tol is None:
+        screen_tol = direct_jk_data.get("screen_tol", 0.0)
+    screen_tol = float(screen_tol)
+    if screen_tol < 0.0:
+        raise ValueError("direct_scf_tol must be non-negative.")
     dm_work = np.asarray(dm)
-    if transform is not None:
+    if transform is not None and not spherical_kernel:
         dm_work = np.einsum('pa,ab,qb->pq', transform, dm_work, transform, optimize=True)
 
-    kernel = str(direct_jk_data.get("kernel", "")).lower()
-    if kernel.startswith("cpp"):
-        from pyqed.qchem.basis import _builtin_worker_count, direct_veff_cartesian_cpp
+    if "cpp" in kernel:
+        from pyqed.qchem.basis import (
+            _builtin_worker_count,
+            direct_veff_cartesian_cpp,
+            direct_veff_spherical_cpp,
+        )
 
-        direct = direct_veff_cartesian_cpp(
+        common = (
             direct_jk_data["shells"],
             direct_jk_data["origins"],
             direct_jk_data["exps"],
             direct_jk_data["weights"],
             direct_jk_data["nprim"],
             direct_jk_data["pair_bounds"],
-            np.ascontiguousarray(dm_work, dtype=np.float64),
-            float(direct_jk_data.get("screen_tol", 0.0)),
-            workers=_builtin_worker_count(mol, mol.nao),
         )
+        if spherical_kernel:
+            direct = direct_veff_spherical_cpp(
+                *common,
+                direct_jk_data["transform"],
+                np.ascontiguousarray(dm_work, dtype=np.float64),
+                screen_tol,
+                workers=_builtin_worker_count(mol, mol.nao),
+                rys_max_rank=direct_jk_data.get("rys_max_rank", -1),
+                native_plan=direct_jk_data.get("native_plan"),
+                symmetric_density=True,
+            )
+        else:
+            direct = direct_veff_cartesian_cpp(
+                *common,
+                np.ascontiguousarray(dm_work, dtype=np.float64),
+                screen_tol,
+                workers=_builtin_worker_count(mol, mol.nao),
+            )
         if direct is not None:
             veff, computed, skipped = direct
-            _record_direct_jk_stats(direct_jk_data, "veff-cpp", computed, skipped)
-            if transform is not None:
+            mode = (
+                "veff-rys-cpp-spherical"
+                if kernel.startswith("rys-")
+                else "veff-cpp-spherical"
+                if spherical_kernel
+                else "veff-cpp-cartesian"
+            )
+            _record_direct_jk_stats(direct_jk_data, mode, computed, skipped)
+            if transform is not None and not spherical_kernel:
                 veff = np.einsum('pa,pq,qb->ab', transform, veff, transform, optimize=True)
             return veff
+
+    if transform is not None and spherical_kernel:
+        dm_work = np.einsum('pa,ab,qb->pq', transform, dm_work, transform, optimize=True)
 
     from pyqed.qchem.basis import _basis_cy
 
@@ -1898,7 +1969,7 @@ def _direct_veff_from_builtin_data(mol, dm, direct_jk_data):
         direct_jk_data["nprim"],
         direct_jk_data["pair_bounds"],
         np.ascontiguousarray(dm_work, dtype=np.float64),
-        float(direct_jk_data.get("screen_tol", 0.0)),
+        screen_tol,
     )
     _record_direct_jk_stats(direct_jk_data, "veff-cython-jk-fallback", -1, -1)
     veff = vj - 0.5 * vk
@@ -1908,7 +1979,7 @@ def _direct_veff_from_builtin_data(mol, dm, direct_jk_data):
 
 
 def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
-             eri_factors=None):
+             eri_factors=None, direct_scf_tol=None):
     '''Unrestricted Hartree-Fock potential matrix for the given density matrix
 
     .. math::
@@ -1990,9 +2061,13 @@ def get_veff(mol, dm, dm_last=None, vhf_last=None, hermi=1, vhfopt=None,
     direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
     if direct_jk_data is not None:
         if dm_last is None:
-            return _direct_veff_from_builtin_data(mol, np.asarray(dm), direct_jk_data)
+            return _direct_veff_from_builtin_data(
+                mol, np.asarray(dm), direct_jk_data, screen_tol=direct_scf_tol
+            )
         ddm = np.asarray(dm) - np.asarray(dm_last)
-        return _direct_veff_from_builtin_data(mol, ddm, direct_jk_data) + np.asarray(vhf_last)
+        return _direct_veff_from_builtin_data(
+            mol, ddm, direct_jk_data, screen_tol=direct_scf_tol
+        ) + np.asarray(vhf_last)
 
     if dm_last is None:
         vj, vk = get_jk(mol, np.asarray(dm), eri_factors=eri_factors)
@@ -2193,7 +2268,6 @@ def _low_rank_cache_family_key(mol):
         repr(mol.basis),
         int(mol.charge),
         int(mol.spin),
-        getattr(mol, '_build_driver', None),
         int(mol.nao),
     )
 
@@ -2330,51 +2404,61 @@ def get_jk(mol, dm, eri_factors=None):
     direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
     if direct_jk_data is not None:
         transform = getattr(mol, '_ao_cart2sph', None)
-        if transform is None and direct_jk_data.get("cache_aosym") == "s8":
-            from pyqed.qchem.basis import _basis_cy
-
-            from pyqed.qchem.basis import _builtin_worker_count, contract_jk_s8
-
-            if _basis_cy is not None and hasattr(_basis_cy, "compute_eri_s8"):
-                eri_s8, _computed, _skipped = _basis_cy.compute_eri_s8(
-                    direct_jk_data["shells"],
-                    direct_jk_data["origins"],
-                    direct_jk_data["exps"],
-                    direct_jk_data["weights"],
-                    direct_jk_data["nprim"],
-                    direct_jk_data["pair_bounds"],
-                    float(direct_jk_data.get("screen_tol", 0.0)),
-                )
-                mol.eri_s8 = eri_s8
-                mol._builtin_direct_jk_data = None
-                return contract_jk_s8(eri_s8, dm, mol.nao, workers=_builtin_worker_count(mol, mol.nao))
-
+        kernel = str(direct_jk_data.get("kernel", "")).lower()
+        spherical_kernel = kernel.endswith("spherical-direct-jk")
         dm_work = dm
-        if transform is not None:
+        if transform is not None and not spherical_kernel:
             dm_work = np.einsum('pa,ab,qb->pq', transform, dm, transform, optimize=True)
 
-        kernel = str(direct_jk_data.get("kernel", "")).lower()
-        if kernel.startswith("cpp"):
-            from pyqed.qchem.basis import _builtin_worker_count, direct_jk_cartesian_cpp
+        if "cpp" in kernel:
+            from pyqed.qchem.basis import (
+                _builtin_worker_count,
+                direct_jk_cartesian_cpp,
+                direct_jk_spherical_cpp,
+            )
 
-            direct = direct_jk_cartesian_cpp(
+            common = (
                 direct_jk_data["shells"],
                 direct_jk_data["origins"],
                 direct_jk_data["exps"],
                 direct_jk_data["weights"],
                 direct_jk_data["nprim"],
                 direct_jk_data["pair_bounds"],
-                np.ascontiguousarray(dm_work, dtype=np.float64),
-                float(direct_jk_data.get("screen_tol", 0.0)),
-                workers=_builtin_worker_count(mol, mol.nao),
             )
+            if spherical_kernel:
+                direct = direct_jk_spherical_cpp(
+                    *common,
+                    direct_jk_data["transform"],
+                    np.ascontiguousarray(dm_work, dtype=np.float64),
+                    float(direct_jk_data.get("screen_tol", 0.0)),
+                    workers=_builtin_worker_count(mol, mol.nao),
+                    rys_max_rank=direct_jk_data.get("rys_max_rank", -1),
+                    native_plan=direct_jk_data.get("native_plan"),
+                )
+            else:
+                direct = direct_jk_cartesian_cpp(
+                    *common,
+                    np.ascontiguousarray(dm_work, dtype=np.float64),
+                    float(direct_jk_data.get("screen_tol", 0.0)),
+                    workers=_builtin_worker_count(mol, mol.nao),
+                )
             if direct is not None:
                 vj, vk, _computed, _skipped = direct
-                _record_direct_jk_stats(direct_jk_data, "jk-cpp", _computed, _skipped)
-                if transform is not None:
+                mode = (
+                    "jk-rys-cpp-spherical"
+                    if kernel.startswith("rys-")
+                    else "jk-cpp-spherical"
+                    if spherical_kernel
+                    else "jk-cpp-cartesian"
+                )
+                _record_direct_jk_stats(direct_jk_data, mode, _computed, _skipped)
+                if transform is not None and not spherical_kernel:
                     vj = np.einsum('pa,pq,qb->ab', transform, vj, transform, optimize=True)
                     vk = np.einsum('pa,pq,qb->ab', transform, vk, transform, optimize=True)
                 return vj, vk
+
+        if transform is not None and spherical_kernel:
+            dm_work = np.einsum('pa,ab,qb->pq', transform, dm, transform, optimize=True)
 
         from pyqed.qchem.basis import _basis_cy
 
@@ -2482,6 +2566,11 @@ def _generalized_eigh(fock, overlap):
     eig, c_orth = eigh(0.5 * (f_orth + dagger(f_orth)))
     coeff = x @ c_orth
     return np.real_if_close(eig), np.real_if_close(coeff)
+
+
+def _rhf_hcore_initial_density(hcore, overlap, mo_occ):
+    _, coeff = _generalized_eigh(hcore, overlap)
+    return make_rdm1(coeff, mo_occ)
 
 
 def _orbitals_from_density(dm, overlap, fallback_fock):
@@ -3105,10 +3194,138 @@ def rohf(
     return e_tot, nuclear_energy, mo_energy, mo_coeff, mo_occ, hcore, vhf, \
         dm_total, dm_alpha, dm_beta, conv
 
+def _occupied_virtual_rotation(mo_coeff, occupied, virtual, angle):
+    rotated = np.array(mo_coeff, copy=True)
+    co = rotated[:, occupied].copy()
+    cv = rotated[:, virtual].copy()
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    rotated[:, occupied] = cosine * co + sine * cv
+    rotated[:, virtual] = -sine * co + cosine * cv
+    return rotated
 
 
+def _rhf_determinant_energy(
+    mol,
+    coefficients,
+    mo_occ,
+    hcore,
+    nuclear_energy,
+    eri_factors,
+):
+    trial_dm = make_rdm1(coefficients, mo_occ)
+    trial_vhf = get_veff_mo(
+        mol,
+        coefficients,
+        mo_occ,
+        eri_factors=eri_factors,
+    )
+    return float(energy_elec(trial_dm, hcore, trial_vhf) + nuclear_energy)
 
-def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
+
+def _frontier_stability_directions(
+    mol,
+    mo_energy,
+    mo_coeff,
+    mo_occ,
+    nocc,
+    hcore,
+    nuclear_energy,
+    reference_energy,
+    eri_factors,
+    gap_tol,
+    curvature_step,
+    curvature_tol,
+):
+    frontier_pairs = []
+    for occupied in range(nocc):
+        for virtual in range(nocc, len(mo_energy)):
+            gap = float(mo_energy[virtual] - mo_energy[occupied])
+            if gap <= gap_tol:
+                frontier_pairs.append((gap, occupied, virtual))
+    frontier_pairs.sort()
+
+    records = []
+    unstable = []
+    for gap, occupied, virtual in frontier_pairs:
+        plus = _rhf_determinant_energy(
+            mol,
+            _occupied_virtual_rotation(
+                mo_coeff, occupied, virtual, curvature_step
+            ),
+            mo_occ,
+            hcore,
+            nuclear_energy,
+            eri_factors,
+        )
+        minus = _rhf_determinant_energy(
+            mol,
+            _occupied_virtual_rotation(
+                mo_coeff, occupied, virtual, -curvature_step
+            ),
+            mo_occ,
+            hcore,
+            nuclear_energy,
+            eri_factors,
+        )
+        curvature = (
+            plus + minus - 2.0 * reference_energy
+        ) / curvature_step ** 2
+        record = {
+            "occupied": int(occupied),
+            "virtual": int(virtual),
+            "gap": float(gap),
+            "curvature": float(curvature),
+        }
+        records.append(record)
+        if curvature < -curvature_tol:
+            direction = 1.0 if plus <= minus else -1.0
+            unstable.append((curvature, direction, occupied, virtual, record))
+    unstable.sort(key=lambda item: item[0])
+    return records, unstable
+
+
+def _run_rhf_stability_restarts(
+    mol,
+    mo_coeff,
+    mo_occ,
+    unstable,
+    rotation,
+    max_restarts,
+    restart_options,
+):
+    best = None
+    attempts = 0
+    for _curvature, direction, occupied, virtual, record in unstable:
+        for sign in (direction, -direction):
+            if attempts >= max_restarts:
+                return best
+            attempts += 1
+            trial_coeff = _occupied_virtual_rotation(
+                mo_coeff,
+                occupied,
+                virtual,
+                sign * rotation,
+            )
+            trial = hartree_fock(
+                mol,
+                dm0=make_rdm1(trial_coeff, mo_occ),
+                init_guess='dm',
+                stability_analysis=False,
+                verbose=0,
+                return_info=True,
+                **restart_options,
+            )
+            trial_energy = float(trial[0])
+            record.setdefault("restart_energies", []).append(trial_energy)
+            if trial[-1]["converged"] and (
+                best is None or trial_energy < float(best[0])
+            ):
+                best = trial
+    return best
+
+
+def hartree_fock(mol, dm0=None, init_guess='minao', max_cycle=50, tol=1e-8,
                  conv_tol_dm=1e-6, damping=0.0, level_shift=0.0,
                  damping_mode='density', damping_decay=1.0,
                  damping_decay_start=0, damping_min=0.0,
@@ -3116,9 +3333,12 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
                  level_shift_min=0.0,
                  diis=True, diis_start_cycle=2, diis_space=6,
                  scf_diis='cdiis', diis_switch_tol=1e-3,
-                 conv_tol_grad=None,
+                 conv_tol_grad=None, direct_scf_tol=None,
                  low_rank_jk=False, low_rank_tol=1e-8, low_rank_max_rank=None,
                  with_solvent=None,
+                 stability_analysis=True, stability_gap_tol=0.15,
+                 stability_rotation=0.25, stability_curvature_step=1e-3,
+                 stability_curvature_tol=1e-5, stability_max_restarts=4,
                  verbose=0, return_info=False):
     verbose = int(verbose)
 
@@ -3213,19 +3433,13 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
 
     init_key = str(init_guess).lower()
 
-    # dm = init_guess_by_hcore(hcore)
-    def init_guess_by_h1e(h):
-        h = dag(X) @ h @ X
-        mo_energy, C = eigh(h)
-        return make_rdm1(C, mo_occ)
-
     if dm0 is None:
         if init_key in ('hcore', 'h1e', '1e'):
-            dm = init_guess_by_h1e(hcore)
+            dm = _rhf_hcore_initial_density(hcore, S, mo_occ)
         elif init_key in ('minao', 'atom', 'huckel', 'mod_huckel', 'charged_atom', 'charged_minao'):
             dm = _rhf_initial_density(mol, init_key)
             if dm is None:
-                dm = init_guess_by_h1e(hcore)
+                dm = _rhf_hcore_initial_density(hcore, S, mo_occ)
         else:
             raise ValueError("Invalid RHF init_guess.")
     elif init_key in (
@@ -3485,6 +3699,16 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
     conv_tol_grad = math.sqrt(float(tol)) if conv_tol_grad is None else float(conv_tol_grad)
     if conv_tol_grad <= 0.0:
         raise ValueError("conv_tol_grad must be positive.")
+    direct_jk_data = getattr(mol, '_builtin_direct_jk_data', None)
+    if direct_scf_tol is None:
+        direct_scf_tol = (
+            direct_jk_data.get("screen_tol", 0.0)
+            if direct_jk_data is not None
+            else getattr(mol, "builtin_direct_scf_tol", 0.0)
+        )
+    direct_scf_tol = float(direct_scf_tol)
+    if direct_scf_tol < 0.0:
+        raise ValueError("direct_scf_tol must be non-negative.")
 
     def current_damping(iteration):
         if damping <= 0.0:
@@ -3532,7 +3756,18 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
         and getattr(mol, '_builtin_direct_jk_data', None) is not None
         and getattr(mol, 'eri_s8', None) is None
     )
-    vhf = get_veff(mol, dm, eri_factors=eri_factors)
+    direct_stats_start = None
+    if direct_jk_data is not None:
+        direct_stats_start = {
+            key: int(direct_jk_data.get(key, 0))
+            for key in ("calls", "total_computed", "total_skipped")
+        }
+    vhf = get_veff(
+        mol,
+        dm,
+        eri_factors=eri_factors,
+        direct_scf_tol=direct_scf_tol,
+    )
     solvent_energy, v_solvent = solvent_kernel(dm)
     electronic_energy = energy_elec(dm, hcore, vhf)
     total_energy = electronic_energy + solvent_energy + nuclear_energy
@@ -3589,6 +3824,7 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
                 dm_last=dm,
                 vhf_last=vhf,
                 eri_factors=eri_factors,
+                direct_scf_tol=direct_scf_tol,
             )
         else:
             vhf_pure = get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
@@ -3660,6 +3896,7 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
             dm_last=scf_density,
             vhf_last=scf_vhf,
             eri_factors=eri_factors,
+            direct_scf_tol=direct_scf_tol,
         )
     else:
         extra_vhf = get_veff_mo(mol, mo_coeff, mo_occ, eri_factors=eri_factors)
@@ -3695,6 +3932,7 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
     scf_info = {
         "converged": bool(conv),
         "iterations": int(scf_iter + 1),
+        "init_guess": init_key,
         "last_energy_change": float(de),
         "last_density_change": float(ddm),
         "last_diis_error": float(diis_error),
@@ -3745,7 +3983,17 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
         ),
         "diis_start_cycle": int(diis_start_cycle),
         "diis_space": int(diis_space),
+        "direct_scf_tol": direct_scf_tol,
     }
+    if direct_stats_start is not None:
+        scf_info.update({
+            "direct_scf_calls": int(direct_jk_data.get("calls", 0))
+            - direct_stats_start["calls"],
+            "direct_scf_computed": int(direct_jk_data.get("total_computed", 0))
+            - direct_stats_start["total_computed"],
+            "direct_scf_skipped": int(direct_jk_data.get("total_skipped", 0))
+            - direct_stats_start["total_skipped"],
+        })
     if with_solvent is not None:
         surface = getattr(with_solvent, "surface", None) or {}
         intermediates = getattr(with_solvent, "_intermediates", None) or {}
@@ -3757,6 +4005,115 @@ def hartree_fock(mol, dm0=None, init_guess='hcore', max_cycle=50, tol=1e-8,
             "solvent_integral_backend": intermediates.get("integral_backend"),
             "solvent_ngrids": None if grid_coords is None else int(len(grid_coords)),
         })
+
+    stability_analysis = bool(stability_analysis)
+    stability_gap_tol = float(stability_gap_tol)
+    stability_rotation = float(stability_rotation)
+    stability_curvature_step = float(stability_curvature_step)
+    stability_curvature_tol = float(stability_curvature_tol)
+    stability_max_restarts = int(stability_max_restarts)
+    if stability_gap_tol < 0.0:
+        raise ValueError("stability_gap_tol must be non-negative.")
+    if stability_rotation <= 0.0 or stability_rotation >= 0.5 * np.pi:
+        raise ValueError("stability_rotation must lie between 0 and pi/2.")
+    if stability_curvature_step <= 0.0:
+        raise ValueError("stability_curvature_step must be positive.")
+    if stability_curvature_tol < 0.0:
+        raise ValueError("stability_curvature_tol must be non-negative.")
+    if stability_max_restarts < 0:
+        raise ValueError("stability_max_restarts must be non-negative.")
+
+    stability_parent_energy = float(total_energy)
+    stability_records = []
+    accepted_restart = False
+    can_test_stability = (
+        stability_analysis
+        and conv
+        and with_solvent is None
+        and stability_max_restarts > 0
+        and 0 < nocc < len(mo_energy)
+    )
+    if can_test_stability:
+        stability_records, unstable = _frontier_stability_directions(
+            mol,
+            mo_energy,
+            mo_coeff,
+            mo_occ,
+            nocc,
+            hcore,
+            nuclear_energy,
+            stability_parent_energy,
+            eri_factors,
+            stability_gap_tol,
+            stability_curvature_step,
+            stability_curvature_tol,
+        )
+        best = _run_rhf_stability_restarts(
+            mol,
+            mo_coeff,
+            mo_occ,
+            unstable,
+            stability_rotation,
+            stability_max_restarts,
+            {
+                "max_cycle": max_cycle,
+                "tol": tol,
+                "conv_tol_dm": conv_tol_dm,
+                "damping": damping,
+                "level_shift": level_shift,
+                "damping_mode": damping_mode,
+                "damping_decay": damping_decay,
+                "damping_decay_start": damping_decay_start,
+                "damping_min": damping_min,
+                "level_shift_decay": level_shift_decay,
+                "level_shift_decay_start": level_shift_decay_start,
+                "level_shift_min": level_shift_min,
+                "diis": diis,
+                "diis_start_cycle": diis_start_cycle,
+                "diis_space": diis_space,
+                "scf_diis": scf_diis,
+                "diis_switch_tol": diis_switch_tol,
+                "conv_tol_grad": conv_tol_grad,
+                "direct_scf_tol": direct_scf_tol,
+                "low_rank_jk": low_rank_jk,
+                "low_rank_tol": low_rank_tol,
+                "low_rank_max_rank": low_rank_max_rank,
+                "with_solvent": None,
+            },
+        )
+
+        if best is not None and float(best[0]) < stability_parent_energy - max(tol, 1e-10):
+            (
+                total_energy,
+                nuclear_energy,
+                mo_energy,
+                mo_coeff,
+                mo_occ,
+                hcore,
+                vhf,
+                dm,
+                scf_info,
+            ) = best
+            conv = bool(scf_info["converged"])
+            electronic_energy = float(scf_info["electronic_energy"])
+            accepted_restart = True
+
+    scf_info.update({
+        "stability_analysis": stability_analysis,
+        "stability_gap_tol": stability_gap_tol,
+        "stability_rotation": stability_rotation,
+        "stability_curvature_step": stability_curvature_step,
+        "stability_curvature_tol": stability_curvature_tol,
+        "stability_max_restarts": stability_max_restarts,
+        "stability_parent_energy": stability_parent_energy,
+        "stability_directions": stability_records,
+        "stability_restarts_attempted": int(
+            sum(len(item.get("restart_energies", ())) for item in stability_records)
+        ),
+        "stability_restart_accepted": accepted_restart,
+        "stability_energy_lowering": float(stability_parent_energy - total_energy),
+        "total_energy": float(total_energy),
+    })
     if not conv and not return_info:
         sys.exit('SCF not converged.')
 
@@ -3789,34 +4146,32 @@ def pyscf_density_fit_rhf(mol, dm0=None, init_guess='hcore', max_cycle=50,
     mf.max_cycle = max_cycle
     mf.conv_tol = tol
     mf.verbose = int(verbose)
+    permutation = mol.pyscf_ao_permutation(pmol)
+    inverse = np.argsort(permutation)
 
     if dm0 is None:
         key = {'hcore': '1e', 'h1e': '1e'}.get(str(init_guess).lower(), init_guess)
         dm0 = mf.get_init_guess(key=key)
+    else:
+        dm0 = np.asarray(dm0)[np.ix_(inverse, inverse)]
 
     total_energy = mf.kernel(dm0=dm0)
     if not mf.converged:
         raise RuntimeError("PySCF density-fitted RHF did not converge.")
 
-    dm = mf.make_rdm1()
-    hcore = mf.get_hcore()
-    vhf = mf.get_veff(dm=dm)
-
-    mol.nao = pmol.nao
-    mol.nmo = pmol.nao
-    mol.nbas = pmol.nbas
-    mol.hcore = hcore
-    mol.overlap = mf.get_ovlp()
-    mol.cart = pmol.cart
-    mol._atm = pmol._atm
-    mol._bas = pmol._bas
-    mol._env = pmol._env
+    dm_pyscf = mf.make_rdm1()
+    hcore_pyscf = mf.get_hcore()
+    vhf_pyscf = mf.get_veff(dm=dm_pyscf)
+    dm = dm_pyscf[np.ix_(permutation, permutation)]
+    hcore = hcore_pyscf[np.ix_(permutation, permutation)]
+    vhf = vhf_pyscf[np.ix_(permutation, permutation)]
+    mo_coeff = mf.mo_coeff[permutation]
 
     return (
         total_energy,
         pmol.energy_nuc(),
         mf.mo_energy,
-        mf.mo_coeff,
+        mo_coeff,
         mf.mo_occ,
         hcore,
         vhf,
@@ -3830,21 +4185,19 @@ class RHFScanner:
     Minimal scanner wrapper for repeated RHF evaluations on nearby geometries.
     """
 
-    def __init__(self, mf, build_driver=None):
+    def __init__(self, mf):
         self.mf = mf
         self.mol = mf.mol
-        self.build_driver = build_driver or getattr(self.mol, '_build_driver', None) or 'gbasis'
 
     def __call__(self, mol_or_geom):
         if isinstance(mol_or_geom, np.ndarray):
             mol = self.mol
             mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
-            mol.build(driver=self.build_driver)
+            mol.build()
         else:
             mol = mol_or_geom
             if getattr(mol, 'eri', None) is None or getattr(mol, 'hcore', None) is None:
-                driver = getattr(mol, '_build_driver', None) or self.build_driver
-                mol.build(driver=driver)
+                mol.build()
 
         run_kwargs = {
             'dm0': None if self.mf.dm is None else np.array(self.mf.dm, copy=True),
@@ -3895,10 +4248,9 @@ class ROHFScanner:
     from the one-electron Hamiltonian.
     """
 
-    def __init__(self, mf, build_driver=None):
+    def __init__(self, mf):
         self.mf = mf
         self.mol = mf.mol
-        self.build_driver = build_driver or getattr(self.mol, '_build_driver', None) or 'builtin'
         self._guess_mf = mf
 
     def __getattr__(self, name):
@@ -3908,13 +4260,12 @@ class ROHFScanner:
         if isinstance(mol_or_geom, np.ndarray):
             mol = self.mol
             mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
-            mol.build(driver=self.build_driver)
+            mol.build()
             return mol
 
         mol = mol_or_geom
         if getattr(mol, 'eri', None) is None or getattr(mol, 'hcore', None) is None:
-            driver = getattr(mol, '_build_driver', None) or self.build_driver
-            mol.build(driver=driver)
+            mol.build()
         return mol
 
     def _initial_density(self, mol):

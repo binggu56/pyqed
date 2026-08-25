@@ -777,7 +777,11 @@ def _resolve_eri_backend(requested, signatures, operation="dense"):
         return "cpp"
 
     if operation == "direct":
-        raise ValueError("Direct JK supports only eri_backend='auto' or 'cpp'.")
+        if requested == "rys":
+            if _rys_cy is None or not hasattr(_rys_cy, "direct_jk_spherical_sp_rys"):
+                raise RuntimeError("The compiled Rys direct-J/K kernel is unavailable.")
+            return "rys"
+        raise ValueError("Direct JK supports eri_backend='auto', 'cpp', or 'rys'.")
     if requested == "rys" and not _signatures_are_sp_only(signatures):
         raise RuntimeError("The production Rys ERI backend currently supports only Cartesian s/p bases.")
     return requested
@@ -1072,6 +1076,84 @@ def direct_jk_cartesian_cpp(
         int(computed),
         int(skipped),
     )
+
+
+def direct_jk_spherical_cpp(
+    shells,
+    origins,
+    exps,
+    weights,
+    nprim,
+    pair_bounds,
+    transform,
+    dm,
+    screen_tol=0.0,
+    workers=1,
+    max_l=_CPP_CARTESIAN_MAX_L,
+    rys_max_rank=-1,
+    native_plan=None,
+    symmetric_density=None,
+):
+    if (
+        _integrals_cpp is None
+        or not hasattr(_integrals_cpp, "direct_jk_spherical")
+        or np.iscomplexobj(dm)
+    ):
+        return None
+    use_rys = int(rys_max_rank) >= 0
+    dm_c = np.ascontiguousarray(dm, dtype=np.float64)
+    try:
+        if (
+            native_plan is not None
+            and hasattr(_integrals_cpp, "direct_jk_spherical_plan")
+        ):
+            symmetric_hint = -1 if symmetric_density is None else int(bool(symmetric_density))
+            vj, vk, computed, skipped = _integrals_cpp.direct_jk_spherical_plan(
+                native_plan,
+                dm_c,
+                float(screen_tol),
+                int(max(1, workers)),
+                int(rys_max_rank) if use_rys else -1,
+                symmetric_hint,
+            )
+        else:
+            shells_c = np.ascontiguousarray(shells, dtype=np.int64)
+            origins_c = np.ascontiguousarray(origins, dtype=np.float64)
+            exps_c = np.ascontiguousarray(exps, dtype=np.float64)
+            weights_c = np.ascontiguousarray(weights, dtype=np.float64)
+            nprim_c = np.ascontiguousarray(nprim, dtype=np.int64)
+            pair_bounds_c = np.ascontiguousarray(pair_bounds, dtype=np.float64)
+            transform_c = np.ascontiguousarray(transform, dtype=np.float64)
+            vj, vk, computed, skipped = _integrals_cpp.direct_jk_spherical(
+                shells_c,
+                origins_c,
+                exps_c,
+                weights_c,
+                nprim_c,
+                pair_bounds_c,
+                transform_c,
+                dm_c,
+                float(screen_tol),
+                int(max_l),
+                int(max(1, workers)),
+                int(rys_max_rank) if use_rys else -1,
+            )
+    except Exception:
+        return None
+    return (
+        np.asarray(vj, dtype=np.float64),
+        np.asarray(vk, dtype=np.float64),
+        int(computed),
+        int(skipped),
+    )
+
+
+def direct_veff_spherical_cpp(*args, **kwargs):
+    direct = direct_jk_spherical_cpp(*args, **kwargs)
+    if direct is None:
+        return None
+    vj, vk, computed, skipped = direct
+    return vj - 0.5 * vk, computed, skipped
 
 
 def direct_veff_cartesian_cpp(
@@ -1895,6 +1977,511 @@ def _compute_dense_eri_serial_shellblocked_rys(signatures, pair_bounds, screen_t
     return eri, computed, skipped
 
 
+def _compute_dense_eri_spherical_shellblocked(
+    signatures,
+    pair_bounds,
+    screen_tol,
+    *,
+    backend="auto",
+    workers=1,
+):
+    """Build dense spherical ERIs without allocating a Cartesian AO tensor."""
+    backend = _resolve_eri_backend(backend, signatures, operation="dense")
+    shell_ranges = _contiguous_shell_blocks_from_signatures(signatures)
+    shell_transforms = []
+    spherical_ranges = []
+    spherical_stop = 0
+    for cart_start, cart_stop in shell_ranges:
+        angular_momentum = int(sum(signatures[cart_start][0]))
+        transform = _cart2sph_unit_block(angular_momentum)
+        if transform.shape[0] != cart_stop - cart_start:
+            raise ValueError("Cartesian shell size does not match its spherical transform.")
+        shell_transforms.append(transform)
+        spherical_start = spherical_stop
+        spherical_stop += transform.shape[1]
+        spherical_ranges.append((spherical_start, spherical_stop))
+
+    global_transform = np.zeros((len(signatures), spherical_stop), dtype=float)
+    for (cart_start, cart_stop), (sph_start, sph_stop), transform in zip(
+        shell_ranges,
+        spherical_ranges,
+        shell_transforms,
+    ):
+        global_transform[cart_start:cart_stop, sph_start:sph_stop] = transform
+
+    if (
+        backend == "cpp"
+        and _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "compute_dense_eri_spherical")
+    ):
+        shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        eri, computed, skipped = _integrals_cpp.compute_dense_eri_spherical(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(pair_bounds, dtype=np.float64),
+            np.ascontiguousarray(global_transform, dtype=np.float64),
+            float(screen_tol),
+            int(_CPP_CARTESIAN_MAX_L),
+            int(max(1, workers)),
+            12,
+        )
+        return (
+            (np.asarray(eri, dtype=np.float64), int(computed), int(skipped)),
+            f"cpp-rys-spherical-shellblocked-generated-hrr-sparse-transform-lmax{_CPP_CARTESIAN_MAX_L}",
+        )
+
+    eri = np.zeros((spherical_stop,) * 4, dtype=float)
+    nshell = len(shell_ranges)
+    shell_transform_l1 = [
+        float(np.max(np.sum(np.abs(transform), axis=0)))
+        for transform in shell_transforms
+    ]
+    shell_pair_bounds = np.zeros((nshell, nshell), dtype=float)
+    for ish, (p0, p1) in enumerate(shell_ranges):
+        for jsh, (q0, q1) in enumerate(shell_ranges):
+            shell_pair_bounds[ish, jsh] = (
+                float(np.max(pair_bounds[p0:p1, q0:q1]))
+                * shell_transform_l1[ish]
+                * shell_transform_l1[jsh]
+            )
+
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    shells = np.ascontiguousarray(shells, dtype=np.int64)
+    origins = np.ascontiguousarray(origins, dtype=np.float64)
+    exps = np.ascontiguousarray(exps, dtype=np.float64)
+    weights = np.ascontiguousarray(weights, dtype=np.float64)
+    nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+    computed = 0
+    skipped = 0
+
+    for ish, (p0, p1) in enumerate(shell_ranges):
+        np_ = p1 - p0
+        for jsh in range(ish + 1):
+            q0, q1 = shell_ranges[jsh]
+            nq_ = q1 - q0
+            bound_pq = shell_pair_bounds[ish, jsh]
+            for ksh in range(ish + 1):
+                r0, r1 = shell_ranges[ksh]
+                nr_ = r1 - r0
+                lsh_max = jsh if ksh == ish else ksh
+                for lsh in range(lsh_max + 1):
+                    s0, s1 = shell_ranges[lsh]
+                    ns_ = s1 - s0
+                    bound_rs = shell_pair_bounds[ksh, lsh]
+                    nsp_p = shell_transforms[ish].shape[1]
+                    nsp_q = shell_transforms[jsh].shape[1]
+                    nsp_r = shell_transforms[ksh].shape[1]
+                    nsp_s = shell_transforms[lsh].shape[1]
+                    npair_pq = (
+                        (nsp_p * (nsp_p + 1)) // 2
+                        if ish == jsh
+                        else nsp_p * nsp_q
+                    )
+                    npair_rs = (
+                        (nsp_r * (nsp_r + 1)) // 2
+                        if ksh == lsh
+                        else nsp_r * nsp_s
+                    )
+                    unique_count = (
+                        (npair_pq * (npair_pq + 1)) // 2
+                        if ish == ksh and jsh == lsh
+                        else npair_pq * npair_rs
+                    )
+                    if screen_tol > 0.0 and bound_pq * bound_rs < screen_tol:
+                        skipped += unique_count
+                        continue
+
+                    block = None
+                    if backend == "rys" and _rys_cy is not None:
+                        from .rys import supports_signature_quartet_rys
+
+                        representatives = (
+                            signatures[p0], signatures[q0], signatures[r0], signatures[s0]
+                        )
+                        if (
+                            _signatures_are_sp_only(representatives)
+                            and supports_signature_quartet_rys(*representatives)
+                        ):
+                            block = _rys_cy.compute_cartesian_shell_quartet_block_rys(
+                                shells,
+                                origins,
+                                exps,
+                                weights,
+                                nprim,
+                                p0,
+                                p1,
+                                q0,
+                                q1,
+                                r0,
+                                r1,
+                                s0,
+                                s1,
+                            )
+                    if block is None and _basis_cy is not None:
+                        block = _basis_cy.compute_cartesian_shell_quartet_block(
+                            shells,
+                            origins,
+                            exps,
+                            weights,
+                            nprim,
+                            p0,
+                            p1,
+                            q0,
+                            q1,
+                            r0,
+                            r1,
+                            s0,
+                            s1,
+                            False,
+                        )
+                    if block is None:
+                        block = np.empty((np_, nq_, nr_, ns_), dtype=float)
+                        for ip, p in enumerate(range(p0, p1)):
+                            for iq, q in enumerate(range(q0, q1)):
+                                for ir, r in enumerate(range(r0, r1)):
+                                    for is_, s in enumerate(range(s0, s1)):
+                                        block[ip, iq, ir, is_] = float(
+                                            _contracted_eri_from_signatures(
+                                                signatures[p],
+                                                signatures[q],
+                                                signatures[r],
+                                                signatures[s],
+                                            )
+                                        )
+                    block = np.asarray(block, dtype=float)
+                    if block.shape != (np_, nq_, nr_, ns_):
+                        raise ValueError("Native Cartesian shell-quartet kernel returned an invalid shape.")
+                    transformed = np.einsum(
+                        "pa,qb,rc,sd,pqrs->abcd",
+                        shell_transforms[ish],
+                        shell_transforms[jsh],
+                        shell_transforms[ksh],
+                        shell_transforms[lsh],
+                        block,
+                        optimize=True,
+                    )
+                    if screen_tol > 0.0:
+                        transformed = np.where(
+                            np.abs(transformed) < screen_tol,
+                            0.0,
+                            transformed,
+                        )
+                    a0, a1 = spherical_ranges[ish]
+                    b0, b1 = spherical_ranges[jsh]
+                    c0, c1 = spherical_ranges[ksh]
+                    d0, d1 = spherical_ranges[lsh]
+                    eri[a0:a1, b0:b1, c0:c1, d0:d1] = transformed
+                    eri[b0:b1, a0:a1, c0:c1, d0:d1] = transformed.transpose(1, 0, 2, 3)
+                    eri[a0:a1, b0:b1, d0:d1, c0:c1] = transformed.transpose(0, 1, 3, 2)
+                    eri[b0:b1, a0:a1, d0:d1, c0:c1] = transformed.transpose(1, 0, 3, 2)
+                    eri[c0:c1, d0:d1, a0:a1, b0:b1] = transformed.transpose(2, 3, 0, 1)
+                    eri[d0:d1, c0:c1, a0:a1, b0:b1] = transformed.transpose(3, 2, 0, 1)
+                    eri[c0:c1, d0:d1, b0:b1, a0:a1] = transformed.transpose(2, 3, 1, 0)
+                    eri[d0:d1, c0:c1, b0:b1, a0:a1] = transformed.transpose(3, 2, 1, 0)
+                    computed += unique_count
+
+    source = "rys" if backend == "rys" else "cython"
+    return (eri, computed, skipped), f"{source}-spherical-shellblocked"
+
+
+def _global_cartesian_to_spherical_transform(signatures):
+    shell_ranges = _contiguous_shell_blocks_from_signatures(signatures)
+    blocks = []
+    nsph = 0
+    for cart_start, cart_stop in shell_ranges:
+        angular_momentum = int(sum(signatures[cart_start][0]))
+        block = _cart2sph_unit_block(angular_momentum)
+        if block.shape[0] != cart_stop - cart_start:
+            raise ValueError("Cartesian shell size does not match its spherical transform.")
+        blocks.append((cart_start, cart_stop, nsph, nsph + block.shape[1], block))
+        nsph += block.shape[1]
+    transform = np.zeros((len(signatures), nsph), dtype=np.float64)
+    for cart_start, cart_stop, sph_start, sph_stop, block in blocks:
+        transform[cart_start:cart_stop, sph_start:sph_stop] = block
+    return np.ascontiguousarray(transform), blocks
+
+
+def _transform_pair_factors_to_spherical(pair_factors, primary_transform):
+    pair_factors = np.asarray(pair_factors, dtype=np.float64)
+    primary_transform = np.asarray(primary_transform, dtype=np.float64)
+    ncart, nsph = primary_transform.shape
+    cart_rows, cart_cols = np.tril_indices(ncart)
+    sph_rows, sph_cols = np.tril_indices(nsph)
+    if pair_factors.ndim != 2 or pair_factors.shape[1] != cart_rows.size:
+        raise ValueError("Cartesian CD factors have an inconsistent pair shape.")
+
+    transformed_pairs = np.empty(
+        (pair_factors.shape[0], sph_rows.size), dtype=np.float64
+    )
+    bytes_per_factor = max(1, ncart * ncart * np.dtype(np.float64).itemsize)
+    block_size = max(1, min(pair_factors.shape[0], (32 << 20) // bytes_per_factor))
+    for start in range(0, pair_factors.shape[0], block_size):
+        stop = min(start + block_size, pair_factors.shape[0])
+        dense = np.zeros((stop - start, ncart, ncart), dtype=np.float64)
+        dense[:, cart_rows, cart_cols] = pair_factors[start:stop]
+        dense[:, cart_cols, cart_rows] = pair_factors[start:stop]
+        spherical = np.einsum(
+            "pa,xpq,qb->xab",
+            primary_transform,
+            dense,
+            primary_transform,
+            optimize=True,
+        )
+        transformed_pairs[start:stop] = spherical[:, sph_rows, sph_cols]
+    return np.ascontiguousarray(transformed_pairs)
+
+
+def _matrix_free_spherical_cd_factors(
+    signatures,
+    pair_bounds,
+    primary_transform,
+    tol=1e-8,
+    max_rank=None,
+    screen_tol=0.0,
+    workers=1,
+    rys_cache_mib=64,
+):
+    tol = float(tol)
+    if tol <= 0.0:
+        raise ValueError("low_rank_tol must be positive for CD builds.")
+    nsph = int(primary_transform.shape[1])
+    npair = nsph * (nsph + 1) // 2
+    rank_limit = npair if max_rank is None else min(int(max_rank), npair)
+    if rank_limit < 0:
+        raise ValueError("low_rank_max_rank must be nonnegative.")
+
+    native_methods = (
+        "build_spherical_direct_jk_plan",
+        "spherical_direct_jk_plan_diagonal",
+        "spherical_direct_jk_plan_stats",
+        "direct_j_spherical_plan",
+    )
+    if _integrals_cpp is not None and all(
+        hasattr(_integrals_cpp, method) for method in native_methods
+    ):
+        effective_screen_tol = float(screen_tol or 0.0)
+        if effective_screen_tol > 0.0:
+            effective_screen_tol = min(effective_screen_tol, 0.1 * tol)
+        shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        shells = np.ascontiguousarray(shells, dtype=np.int64)
+        origins = np.ascontiguousarray(origins, dtype=np.float64)
+        exps = np.ascontiguousarray(exps, dtype=np.float64)
+        weights = np.ascontiguousarray(weights, dtype=np.float64)
+        nprim = np.ascontiguousarray(nprim, dtype=np.int64)
+        pair_bounds = np.ascontiguousarray(pair_bounds, dtype=np.float64)
+        primary_transform = np.ascontiguousarray(primary_transform, dtype=np.float64)
+        plan_started = time.perf_counter()
+        try:
+            native_plan = _integrals_cpp.build_spherical_direct_jk_plan(
+                shells,
+                origins,
+                exps,
+                weights,
+                nprim,
+                pair_bounds,
+                primary_transform,
+                effective_screen_tol,
+                int(_CPP_CARTESIAN_MAX_L),
+                12,
+                max(1, int(rys_cache_mib)) * 1024**2,
+                max(1, int(workers)),
+                0,
+            )
+        except Exception:
+            native_plan = None
+        if native_plan is not None:
+            plan_seconds = time.perf_counter() - plan_started
+            diagonal = np.asarray(
+                _integrals_cpp.spherical_direct_jk_plan_diagonal(native_plan),
+                dtype=np.float64,
+            ).copy()
+            if diagonal.shape != (npair,) or not np.all(np.isfinite(diagonal)):
+                raise RuntimeError("Native spherical CD returned an invalid ERI diagonal.")
+            np.maximum(diagonal, 0.0, out=diagonal)
+            rows, cols = np.tril_indices(nsph)
+            capacity = min(rank_limit, 64)
+            chol = np.empty((capacity, npair), dtype=np.float64)
+            dm = np.zeros((nsph, nsph), dtype=np.float64)
+            rank = 0
+            computed_total = 0
+            skipped_total = 0
+            columns_started = time.perf_counter()
+            for _ in range(rank_limit):
+                pivot = int(np.argmax(diagonal))
+                if float(diagonal[pivot]) <= tol:
+                    break
+                p = int(rows[pivot])
+                q = int(cols[pivot])
+                dm.fill(0.0)
+                if p == q:
+                    dm[p, p] = 1.0
+                else:
+                    dm[p, q] = 0.5
+                    dm[q, p] = 0.5
+                vj, computed, skipped = _integrals_cpp.direct_j_spherical_plan(
+                    native_plan,
+                    dm,
+                    effective_screen_tol,
+                    max(1, int(workers)),
+                    12,
+                    1,
+                )
+                computed_total += int(computed)
+                skipped_total += int(skipped)
+                column = np.asarray(vj, dtype=np.float64)[rows, cols].copy()
+                if rank:
+                    column -= chol[:rank].T @ chol[:rank, pivot]
+                delta = float(column[pivot])
+                if delta <= tol:
+                    diagonal[pivot] = 0.0
+                    continue
+                if rank == capacity:
+                    new_capacity = min(rank_limit, max(1, 2 * capacity))
+                    grown = np.empty((new_capacity, npair), dtype=np.float64)
+                    grown[:rank] = chol[:rank]
+                    chol = grown
+                    capacity = new_capacity
+                vector = column / math.sqrt(delta)
+                chol[rank] = vector
+                rank += 1
+                diagonal -= vector * vector
+                np.maximum(diagonal, 0.0, out=diagonal)
+
+            columns_seconds = time.perf_counter() - columns_started
+            peak_factor_bytes = int(chol.nbytes)
+            if rank:
+                chol.resize((rank, npair), refcheck=False)
+                spherical_pairs = chol
+            else:
+                spherical_pairs = np.empty((0, npair), dtype=np.float64)
+            factors = PackedRIFactors(spherical_pairs, nsph)
+            plan_stats = _integrals_cpp.spherical_direct_jk_plan_stats(native_plan)
+            info = {
+                "algorithm": "matrix-free-pivoted-cholesky",
+                "builder": "cpp-rys-matrix-free-spherical-pair",
+                "working_basis": "spherical",
+                "source_basis": "spherical",
+                "tol": tol,
+                "screen_tol": float(effective_screen_tol),
+                "cartesian_nao": int(primary_transform.shape[0]),
+                "spherical_nao": nsph,
+                "rank": int(rank),
+                "factor_bytes": int(factors.pair_factors.nbytes),
+                "peak_factor_bytes": peak_factor_bytes,
+                "plan_bytes": int(plan_stats.get("task_bytes", 0))
+                + int(plan_stats.get("recurrence_cache_bytes", 0))
+                + int(plan_stats.get("spherical_plan_cache_bytes", 0))
+                + int(plan_stats.get("coulomb_task_index_bytes", 0)),
+                "plan_build_seconds": float(plan_seconds),
+                "column_build_seconds": float(columns_seconds),
+                "computed_shell_quartets": int(computed_total),
+                "skipped_shell_quartets": int(skipped_total),
+                "allocated_dense_eri": False,
+            }
+            return factors, info
+
+    max_column_l1 = float(np.max(np.sum(np.abs(primary_transform), axis=0)))
+    residual_amplification = max(1.0, max_column_l1 ** 4)
+    cartesian_tol = tol / residual_amplification
+    effective_screen_tol = float(screen_tol or 0.0)
+    if effective_screen_tol > 0.0:
+        effective_screen_tol = min(effective_screen_tol, 0.1 * cartesian_tol)
+
+    shell_blocks = _contiguous_shell_blocks_from_signatures(signatures)
+    shell_starts = np.asarray([start for start, _stop in shell_blocks], dtype=np.int64)
+    shell_stops = np.asarray([stop for _start, stop in shell_blocks], dtype=np.int64)
+    cartesian = _pivoted_cholesky_from_integral_oracle_cython_blocked(
+        signatures,
+        pair_bounds,
+        shell_starts,
+        shell_stops,
+        tol=cartesian_tol,
+        max_rank=max_rank,
+        screen_tol=effective_screen_tol,
+        packed=True,
+    )
+    builder = "cython-matrix-free-blocked"
+    if cartesian is None:
+        cartesian = _pivoted_cholesky_from_integral_oracle(
+            signatures,
+            pair_bounds,
+            tol=cartesian_tol,
+            max_rank=max_rank,
+            screen_tol=effective_screen_tol,
+            packed=True,
+        )
+        builder = "python-matrix-free"
+
+    cartesian_pairs = _as_ri_pair_factors(cartesian, len(signatures))
+    spherical_pairs = _transform_pair_factors_to_spherical(
+        cartesian_pairs, primary_transform
+    )
+    if spherical_pairs.size:
+        nonzero = np.any(spherical_pairs != 0.0, axis=1)
+        spherical_pairs = np.ascontiguousarray(spherical_pairs[nonzero])
+    factors = PackedRIFactors(spherical_pairs, primary_transform.shape[1])
+    info = {
+        "algorithm": "matrix-free-pivoted-cholesky",
+        "builder": f"{builder}-cartesian-to-spherical-pair",
+        "working_basis": "spherical",
+        "source_basis": "cartesian",
+        "tol": tol,
+        "cartesian_tol": float(cartesian_tol),
+        "screen_tol": float(effective_screen_tol),
+        "residual_amplification_bound": float(residual_amplification),
+        "cartesian_nao": int(primary_transform.shape[0]),
+        "spherical_nao": int(primary_transform.shape[1]),
+        "rank": int(factors.shape[0]),
+        "factor_bytes": int(factors.pair_factors.nbytes),
+        "allocated_dense_eri": False,
+    }
+    return factors, info
+
+
+def _transform_ri_tensors_to_spherical(metric, j3_pair, primary_transform, aux_transform):
+    metric = np.asarray(metric, dtype=np.float64)
+    j3_pair = np.asarray(j3_pair, dtype=np.float64)
+    primary_transform = np.asarray(primary_transform, dtype=np.float64)
+    aux_transform = np.asarray(aux_transform, dtype=np.float64)
+    naux_cart = aux_transform.shape[0]
+    nao_cart, nao_sph = primary_transform.shape
+    cart_rows, cart_cols = np.tril_indices(nao_cart)
+    sph_rows, sph_cols = np.tril_indices(nao_sph)
+    if metric.shape != (naux_cart, naux_cart):
+        raise ValueError("Cartesian RI metric shape is inconsistent with the auxiliary transform.")
+    if j3_pair.shape != (naux_cart, cart_rows.size):
+        raise ValueError("Cartesian RI three-center tensor has an inconsistent pair shape.")
+
+    bytes_per_aux = max(1, nao_cart * nao_cart * np.dtype(np.float64).itemsize)
+    block_size = max(1, min(naux_cart, (32 << 20) // bytes_per_aux))
+    primary_spherical = np.empty((naux_cart, sph_rows.size), dtype=np.float64)
+    for start in range(0, naux_cart, block_size):
+        stop = min(start + block_size, naux_cart)
+        dense = np.zeros((stop - start, nao_cart, nao_cart), dtype=np.float64)
+        dense[:, cart_rows, cart_cols] = j3_pair[start:stop]
+        dense[:, cart_cols, cart_rows] = j3_pair[start:stop]
+        transformed = np.einsum(
+            "pa,xpq,qb->xab",
+            primary_transform,
+            dense,
+            primary_transform,
+            optimize=True,
+        )
+        primary_spherical[start:stop] = transformed[:, sph_rows, sph_cols]
+
+    metric_spherical = np.linalg.multi_dot(
+        (aux_transform.T, metric, aux_transform)
+    )
+    j3_spherical = aux_transform.T @ primary_spherical
+    return (
+        np.ascontiguousarray(metric_spherical, dtype=np.float64),
+        np.ascontiguousarray(j3_spherical, dtype=np.float64),
+    )
+
+
 def _compute_dense_eri_with_backend(
     signatures,
     pair_bounds,
@@ -2090,8 +2677,7 @@ def _pivoted_cholesky_from_integral_oracle(signatures, pair_bounds, tol=1e-8, ma
         [max(float(np.real(pair_bounds[i, j] * pair_bounds[i, j])), 0.0) for i, j in pairs],
         dtype=float,
     )
-    chol = np.zeros((npair, max_rank), dtype=float)
-    rank = 0
+    columns = []
     pair_blocks = _shell_pair_blocks_from_signatures(signatures, pair_bounds)
 
     for _ in range(max_rank):
@@ -2124,20 +2710,25 @@ def _pivoted_cholesky_from_integral_oracle(signatures, pair_bounds, tol=1e-8, ma
                 )
             col[pair_indices] = values
 
-        if rank > 0:
-            col -= chol[:, :rank] @ chol[pivot, :rank].conj()
+        if columns:
+            chol = np.asarray(columns)
+            col -= chol.T @ chol[:, pivot].conj()
 
         delta = float(np.real(col[pivot]))
         if delta <= tol:
             diag[pivot] = 0.0
             continue
 
-        chol[:, rank] = col / math.sqrt(delta)
-        diag -= np.real(chol[:, rank] * chol[:, rank].conj())
+        vector = col / math.sqrt(delta)
+        columns.append(vector)
+        diag -= np.real(vector * vector.conj())
         diag = np.maximum(diag, 0.0)
-        rank += 1
 
-    factors_packed = chol[:, :rank].T
+    factors_packed = (
+        np.asarray(columns, dtype=float)
+        if columns
+        else np.empty((0, npair), dtype=float)
+    )
     if packed:
         return PackedRIFactors(factors_packed, nao)
     return _unpack_packed_pair_factors(factors_packed, pairs, nao)
@@ -2152,6 +2743,14 @@ ALIAS = {
     '6311g'      : "6-311g.0.gbs",
     '631g++'     : "/6-31g++.gbs",
     '631g*'      : "6-31g_st_.0.gbs",
+    '631+g*'     : "6-31+g_st_.0.gbs",
+    '631+g(d)'   : "6-31+g_st_.0.gbs",
+    '631+g**'    : "6-31+g_st__st_.0.gbs",
+    '631+g(d,p)' : "6-31+g_st__st_.0.gbs",
+    '631++g*'    : "6-31++g_st_.0.gbs",
+    '631++g(d)'  : "6-31++g_st_.0.gbs",
+    '631++g**'   : "6-31++g_st__st_.0.gbs",
+    '631++g(d,p)': "6-31++g_st__st_.0.gbs",
     'ccpvdz'     : 'cc-pvdz.0.gbs'    ,
     'ccpvtz'     : 'cc-pvtz.0.gbs'    ,
     'ccpvqz'     : 'cc-pvqz.0.gbs'    ,
@@ -2175,6 +2774,58 @@ ALIAS = {
 
 def _normalize_basis_lookup_name(name):
     return str(name).replace('-', '').replace(' ', '').lower()
+
+
+def _basis_dict_from_pyscf_data(data_by_symbol):
+    basis_dict = {}
+    for symbol, shells in data_by_symbol.items():
+        converted = []
+        for shell in shells:
+            angular_momentum = shell[0]
+            if not isinstance(angular_momentum, (int, np.integer)):
+                raise NotImplementedError(
+                    "Spinor/kappa-resolved PySCF basis data are not supported."
+                )
+            rows = np.asarray(shell[1:], dtype=float)
+            if rows.ndim != 2 or rows.shape[1] < 2:
+                raise ValueError(f"Invalid basis shell for element {symbol!r}.")
+            converted.append((
+                int(angular_momentum),
+                np.asarray(rows[:, 0], dtype=float),
+                np.asarray(rows[:, 1:], dtype=float),
+            ))
+        basis_dict[str(symbol)] = converted
+    return basis_dict
+
+
+def load_basis_dict(basis, atoms):
+    """Load native basis data, accepting explicit or PySCF-named tables."""
+    if hasattr(basis, "items"):
+        raw = dict(basis)
+        if all(
+            isinstance(shell, tuple) and len(shell) == 3
+            for shells in raw.values()
+            for shell in shells
+        ):
+            return raw
+        return _basis_dict_from_pyscf_data(raw)
+
+    try:
+        return parse_gbs(_basis_path(basis))
+    except ValueError as native_error:
+        try:
+            from pyscf import gto as pyscf_gto
+        except ImportError:  # pragma: no cover - optional dependency
+            raise native_error
+        symbols = tuple(dict.fromkeys(str(symbol) for symbol in atoms))
+        try:
+            data = {
+                symbol: pyscf_gto.basis.load(str(basis), symbol)
+                for symbol in symbols
+            }
+        except Exception:
+            raise native_error from None
+        return _basis_dict_from_pyscf_data(data)
 
 
 @lru_cache(maxsize=256)
@@ -3276,7 +3927,7 @@ def _native_ri_cache_key(
     tensor_backend,
 ):
     payload = (
-        "pyqed-native-ri-v5",
+        "pyqed-native-ri-v6",
         getattr(pyqed, "__version__", None),
         tuple(getattr(mol, "atom_symbols", lambda: [])()),
         tuple(np.round(np.asarray(getattr(mol, "atom_coords", lambda: np.zeros((0, 3)))()), 12).reshape(-1).tolist()),
@@ -3289,6 +3940,7 @@ def _native_ri_cache_key(
         float(metric_tol),
         str(metric_solver),
         str(tensor_backend),
+        str(getattr(mol, "builtin_coord_type", getattr(mol, "native_coord_type", "spherical"))),
         signatures,
         aux_signatures,
     )
@@ -3312,7 +3964,7 @@ def _native_ri_fast_cache_key(
     tensor_backend,
 ):
     payload = (
-        "pyqed-native-ri-fast-v1",
+        "pyqed-native-ri-fast-v2",
         getattr(pyqed, "__version__", None),
         tuple(getattr(mol, "atom_symbols", lambda: [])()),
         tuple(np.round(np.asarray(getattr(mol, "atom_coords", lambda: np.zeros((0, 3)))()), 12).reshape(-1).tolist()),
@@ -3327,6 +3979,7 @@ def _native_ri_fast_cache_key(
         float(metric_tol),
         str(metric_solver),
         str(tensor_backend),
+        str(getattr(mol, "builtin_coord_type", getattr(mol, "native_coord_type", "spherical"))),
         signatures,
     )
     return hashlib.sha1(repr(payload).encode("utf-8")).hexdigest()
@@ -3483,6 +4136,15 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         auxbasis = _default_auxbasis_name(mol.basis, purpose=purpose, required_symbols=atoms)
 
     signatures = tuple(_basis_signature(fn) for fn in basis_cart)
+    coord_type = str(
+        getattr(mol, "builtin_coord_type", getattr(mol, "native_coord_type", "spherical"))
+    ).lower()
+    spherical = coord_type in {"p", "spherical"}
+    primary_transform = None
+    primary_nao = len(signatures)
+    if spherical:
+        primary_transform, _ = _global_cartesian_to_spherical_transform(signatures)
+        primary_nao = primary_transform.shape[1]
     ri_screen_tol = getattr(mol, "builtin_ri_screen_tol", getattr(mol, "native_ri_screen_tol", None))
     if ri_screen_tol is None:
         ri_screen_tol = getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-12))
@@ -3511,7 +4173,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         factors_pair, info = cached
         info["storage"] = storage
         info["timings"] = {key: float(value) for key, value in ri_timings.items()}
-        factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
+        factors = PackedRIFactors(factors_pair, primary_nao) if storage == "packed" else _pair_factors_to_full(factors_pair, primary_nao)
         return factors, info
 
     t0 = time.perf_counter()
@@ -3523,6 +4185,9 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             f"Auxiliary basis {auxbasis!r} does not define element {exc.args[0]!r} "
             "needed by this molecule."
         ) from exc
+    aux_transform = None
+    if spherical:
+        aux_transform, _ = _global_cartesian_to_spherical_transform(aux_signatures)
     pair_bounds = _compute_pair_bounds(signatures)
     ri_timings["auxbasis_setup"] = time.perf_counter() - t0
 
@@ -3548,7 +4213,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             info["legacy_cache_key"] = legacy_cache_key
             info["timings"] = {**dict(info.get("timings", {}) or {}), **ri_timings}
             _write_native_ri_factor_cache(mol, cache_key, factors_pair, info)
-            factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
+            factors = PackedRIFactors(factors_pair, primary_nao) if storage == "packed" else _pair_factors_to_full(factors_pair, primary_nao)
             return factors, info
 
     tensors = None
@@ -3606,6 +4271,16 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         if tensor_builder != "cython-kernel-packed-parallel":
             workers = 1
     ri_timings["tensor_build"] = time.perf_counter() - t0
+    if spherical:
+        t0 = time.perf_counter()
+        metric, j3_pair = _transform_ri_tensors_to_spherical(
+            metric,
+            j3_pair,
+            primary_transform,
+            aux_transform,
+        )
+        ri_timings["spherical_transform"] = time.perf_counter() - t0
+        tensor_builder = f"{tensor_builder}-spherical-pair-blocked"
     kernel_info = dict(_NATIVE_RI_LAST_KERNEL_INFO or {})
     evals, evecs = np.linalg.eigh(metric)
     keep = evals > tol
@@ -3623,7 +4298,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
     )
     ri_timings["metric_factorize"] = time.perf_counter() - t0
-    factors = PackedRIFactors(factors_pair, len(basis_cart)) if storage == "packed" else _pair_factors_to_full(factors_pair, len(basis_cart))
+    factors = PackedRIFactors(factors_pair, primary_nao) if storage == "packed" else _pair_factors_to_full(factors_pair, primary_nao)
     info = {
         "auxbasis": auxbasis,
         "purpose": purpose,
@@ -3642,6 +4317,11 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         "effective_tensor_backend": effective_tensor_backend,
         "storage": storage,
         "pair_shape": tuple(int(x) for x in factors_pair.shape),
+        "working_basis": "spherical" if spherical else "cartesian",
+        "primary_nao": int(primary_nao),
+        "auxiliary_nao": int(metric.shape[0]),
+        "primary_nao_cartesian": int(len(signatures)),
+        "auxiliary_nao_cartesian": int(len(aux_signatures)),
         "screen_tol": float(ri_screen_tol),
         "three_center_computed": int(ri_computed),
         "three_center_screened": int(ri_skipped),
@@ -4376,6 +5056,31 @@ def mo_pair_factors(eri_factors, mo_left, mo_right=None):
     mo_right = np.asarray(mo_right)
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, mo_left.shape[0])
+        transform_work = (
+            pair_factors.shape[0]
+            * mo_left.shape[0]
+            * mo_left.shape[1]
+            * mo_right.shape[1]
+        )
+        if transform_work >= 1_000_000:
+            nao = mo_left.shape[0]
+            dtype = np.result_type(pair_factors, mo_left, mo_right)
+            itemsize = np.dtype(dtype).itemsize
+            bytes_per_aux = itemsize * nao * (nao + mo_right.shape[1])
+            block_size = max(1, min(pair_factors.shape[0], (64 << 20) // bytes_per_aux))
+            rows, cols = np.tril_indices(nao)
+            out = np.empty(
+                (pair_factors.shape[0], mo_left.shape[1], mo_right.shape[1]),
+                dtype=dtype,
+            )
+            left = mo_left.conj().T[None, :, :]
+            for start in range(0, pair_factors.shape[0], block_size):
+                stop = min(start + block_size, pair_factors.shape[0])
+                dense = np.zeros((stop - start, nao, nao), dtype=dtype)
+                dense[:, rows, cols] = pair_factors[start:stop]
+                dense[:, cols, rows] = pair_factors[start:stop]
+                out[start:stop] = np.matmul(left, np.matmul(dense, mo_right))
+            return out
         if (
             _env_flag("PYQED_QCHEM_CPP_RI_AO2MO", default=True)
             and _integrals_cpp is not None
@@ -4436,7 +5141,7 @@ def build_builtin(mol):
     atnums = np.asarray(mol.atom_charges(), dtype=float)
 
     t0 = time.perf_counter()
-    basis_dict = parse_gbs(_basis_path(mol.basis))
+    basis_dict = load_basis_dict(mol.basis, atoms)
     basis_cart = make_contractions(basis_dict, atoms, atcoords, coord_types='c')
     timings["basis_setup"] = time.perf_counter() - t0
     nao_cart = len(basis_cart)
@@ -4470,9 +5175,19 @@ def build_builtin(mol):
         _write_native_one_electron_cache(mol, one_electron_cache_key, overlap_mat, kinetic_mat, vnuc_mat)
         timings["one_electron_cache_write"] = time.perf_counter() - t0
 
-    screen_tol = float(
+    eri_screen_tol = float(
         getattr(mol, "builtin_eri_screen_tol", getattr(mol, "native_eri_screen_tol", 1.0e-10)) or 0.0
     )
+    direct_scf_tol = float(
+        getattr(
+            mol,
+            "builtin_direct_scf_tol",
+            getattr(mol, "native_direct_scf_tol", 1.0e-13),
+        )
+        or 0.0
+    )
+    if eri_screen_tol < 0.0 or direct_scf_tol < 0.0:
+        raise ValueError("eri_screen_tol and direct_scf_tol must be non-negative.")
     requested_eri_backend = _normalize_eri_backend(
         getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
     )
@@ -4497,6 +5212,8 @@ def build_builtin(mol):
         eri_representation = _select_builtin_auto_eri_representation(mol, nao_cart)
         if eri_representation == "dense" and aosym == "s1":
             aosym = "s8"
+
+    screen_tol = direct_scf_tol if eri_representation == "direct" else eri_screen_tol
 
     if eri_representation not in {"dense", "dense+factors", "factors", "ri", "dense+ri", "direct"}:
         raise ValueError(
@@ -4536,6 +5253,10 @@ def build_builtin(mol):
     dense_builder = None
     factor_builder = None
     ri_info = None
+    cd_info = None
+    eri_is_spherical = False
+    factors_are_spherical = False
+    dense_eri_working_basis = None
     pack_s4 = aosym == "s4" and eri_representation in {"dense", "dense+factors"}
     pack_s8 = aosym == "s8" and eri_representation in {"dense", "dense+factors"}
 
@@ -4567,22 +5288,36 @@ def build_builtin(mol):
             eri_s8, computed, skipped = cpp_s8
             timings["dense_eri"] = time.perf_counter() - t0
             dense_builder = f"cpp-cartesian-s8-lmax{_CPP_CARTESIAN_MAX_L}"
+            dense_eri_working_basis = "cartesian"
             pack_s8 = False
 
     if eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is None:
         t0 = time.perf_counter()
-        (eri, computed, skipped), dense_builder = _compute_dense_eri_with_backend(
-            signatures,
-            pair_bounds,
-            screen_tol,
-            backend=eri_backend,
-            workers=workers,
-        )
+        if coord_type == "spherical":
+            (eri, computed, skipped), dense_builder = _compute_dense_eri_spherical_shellblocked(
+                signatures,
+                pair_bounds,
+                screen_tol,
+                backend=eri_backend,
+                workers=workers,
+            )
+            eri_is_spherical = True
+            dense_eri_working_basis = "spherical"
+        else:
+            (eri, computed, skipped), dense_builder = _compute_dense_eri_with_backend(
+                signatures,
+                pair_bounds,
+                screen_tol,
+                backend=eri_backend,
+                workers=workers,
+            )
+            dense_eri_working_basis = "cartesian"
         timings["dense_eri"] = time.perf_counter() - t0
 
         if eri_representation == "dense+ri":
             t0 = time.perf_counter()
             factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
+            factors_are_spherical = coord_type == "spherical"
             timings["ri_factors"] = time.perf_counter() - t0
             factor_builder = "native-ri"
         elif eri_representation == "dense+factors" or bool(
@@ -4602,6 +5337,7 @@ def build_builtin(mol):
                     getattr(mol, "native_low_rank_max_rank", None),
                 ),
             )
+            factors_are_spherical = eri_is_spherical
             timings["low_rank_factors"] = time.perf_counter() - t0
             factor_builder = (
                 "cpp-dense-pivoted-cholesky"
@@ -4614,16 +5350,29 @@ def build_builtin(mol):
     elif eri_representation == "ri":
         t0 = time.perf_counter()
         factors, ri_info = _build_native_ri_factors(mol, atoms, atcoords, basis_cart)
+        factors_are_spherical = coord_type == "spherical"
         timings["ri_factors"] = time.perf_counter() - t0
         factor_builder = "native-ri"
     elif eri_representation == "direct":
         aosym = "s8"
+        if eri_backend == "rys" and coord_type != "spherical":
+            raise ValueError("The Rys direct-J/K backend currently requires spherical AOs.")
         shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
-        direct_kernel = "cpp-cartesian-direct-jk"
+        direct_kernel = (
+            "rys-cpp-spherical-direct-jk"
+            if coord_type == "spherical" and eri_backend == "rys"
+            else "cpp-spherical-direct-jk"
+            if coord_type == "spherical" and hasattr(_integrals_cpp, "direct_jk_spherical")
+            else "cpp-cartesian-direct-jk"
+        )
 
         shell_blocks = _cart_shell_blocks(basis_cart)
         shell_starts = np.asarray([start for start, _stop, _l in shell_blocks], dtype=np.int64)
         shell_stops = np.asarray([stop for _start, stop, _l in shell_blocks], dtype=np.int64)
+        spherical_starts = np.asarray(
+            np.cumsum([0] + [2 * l + 1 for _start, _stop, l in shell_blocks[:-1]]),
+            dtype=np.int64,
+        )
         direct_jk_data = {
             "shells": np.ascontiguousarray(shells, dtype=np.int64),
             "origins": np.ascontiguousarray(origins, dtype=np.float64),
@@ -4633,18 +5382,37 @@ def build_builtin(mol):
             "pair_bounds": np.ascontiguousarray(pair_bounds, dtype=np.float64),
             "shell_starts": shell_starts,
             "shell_stops": shell_stops,
+            "spherical_starts": spherical_starts,
+            "rys_max_rank": (
+                12 if eri_backend == "rys"
+                else 3 if coord_type == "spherical" and requested_eri_backend == "auto"
+                else -1
+            ),
+            "rys_cache_mib": int(
+                getattr(
+                    mol,
+                    "builtin_rys_cache_mib",
+                    getattr(mol, "native_rys_cache_mib", 256),
+                )
+            ),
+            "rys_spherical_cache_mib": int(
+                getattr(
+                    mol,
+                    "builtin_rys_spherical_cache_mib",
+                    getattr(mol, "native_rys_spherical_cache_mib", 0),
+                )
+            ),
+            "workers": int(workers),
             "screen_tol": float(screen_tol),
             "kernel": direct_kernel,
-            "cache_aosym": None,
+            "aosym": aosym,
             "screening": "schwarz+density",
-            "task_cache": (
-                "cpp-shell-pair-geometry+quartet-tasks"
-                if str(direct_kernel).startswith("cpp-")
-                else None
-            ),
             "last_mode": None,
             "last_computed": None,
             "last_skipped": None,
+            "calls": 0,
+            "total_computed": 0,
+            "total_skipped": 0,
         }
         dense_builder = direct_kernel
     else:
@@ -4659,8 +5427,33 @@ def build_builtin(mol):
             "builtin_low_rank_max_rank",
             getattr(mol, "native_low_rank_max_rank", None),
         )
-        if eri_backend == "cpp":
-            if aosym == "s8" and _cpp_s8_eri_supported(signatures):
+        if coord_type == "spherical":
+            primary_transform, _ = _global_cartesian_to_spherical_transform(signatures)
+            t0 = time.perf_counter()
+            factors, cd_info = _matrix_free_spherical_cd_factors(
+                signatures,
+                pair_bounds,
+                primary_transform,
+                tol=low_rank_tol,
+                max_rank=low_rank_max_rank,
+                screen_tol=screen_tol,
+                workers=workers,
+                rys_cache_mib=min(
+                    64,
+                    int(
+                        getattr(
+                            mol,
+                            "builtin_rys_cache_mib",
+                            getattr(mol, "native_rys_cache_mib", 256),
+                        )
+                    ),
+                ),
+            )
+            timings["low_rank_factors"] = time.perf_counter() - t0
+            factors_are_spherical = True
+            factor_builder = cd_info["builder"]
+        elif eri_backend == "cpp":
+            if coord_type == "cartesian" and aosym == "s8" and _cpp_s8_eri_supported(signatures):
                 t0 = time.perf_counter()
                 cpp_s8 = _compute_eri_s8_cpp_cartesian(
                     signatures,
@@ -4672,6 +5465,7 @@ def build_builtin(mol):
                 if cpp_s8 is not None:
                     eri_s8_source, computed, skipped = cpp_s8
                     dense_builder = f"cpp-cartesian-s8-lmax{_CPP_CARTESIAN_MAX_L}-factor-source"
+                    dense_eri_working_basis = "cartesian"
                     t0 = time.perf_counter()
                     factors_pair = pivoted_cholesky_eri_s8(
                         eri_s8_source,
@@ -4685,24 +5479,39 @@ def build_builtin(mol):
 
             if factors is None:
                 t0 = time.perf_counter()
-                (cpp_eri, computed, skipped), source_builder = _compute_dense_eri_with_backend(
-                    signatures,
-                    pair_bounds,
-                    screen_tol,
-                    backend="cpp",
-                    workers=workers,
-                )
+                if coord_type == "spherical":
+                    (cpp_eri, computed, skipped), source_builder = (
+                        _compute_dense_eri_spherical_shellblocked(
+                            signatures,
+                            pair_bounds,
+                            screen_tol,
+                            backend="cpp",
+                            workers=workers,
+                        )
+                    )
+                    factors_are_spherical = True
+                    dense_eri_working_basis = "spherical"
+                else:
+                    (cpp_eri, computed, skipped), source_builder = _compute_dense_eri_with_backend(
+                        signatures,
+                        pair_bounds,
+                        screen_tol,
+                        backend="cpp",
+                        workers=workers,
+                    )
+                    dense_eri_working_basis = "cartesian"
                 timings["dense_eri"] = time.perf_counter() - t0
                 dense_builder = f"{source_builder}-factor-source"
                 t0 = time.perf_counter()
+                factor_nao = cpp_eri.shape[0]
                 if aosym == "s8":
                     factors_pair = pivoted_cholesky_eri_s8(
                         pack_eri_s8(cpp_eri),
-                        len(signatures),
+                        factor_nao,
                         tol=low_rank_tol,
                         max_rank=low_rank_max_rank,
                     )
-                    factors = PackedRIFactors(factors_pair, len(signatures))
+                    factors = PackedRIFactors(factors_pair, factor_nao)
                     factor_builder = "cpp-s8-pair-pivoted-cholesky"
                 else:
                     from pyqed.qchem.hf.rhf import pivoted_cholesky_eri
@@ -4731,24 +5540,39 @@ def build_builtin(mol):
 
         else:
             t0 = time.perf_counter()
-            (eri_source, computed, skipped), source_builder = _compute_dense_eri_with_backend(
-                signatures,
-                pair_bounds,
-                screen_tol,
-                backend=eri_backend,
-                workers=workers,
-            )
+            if coord_type == "spherical":
+                (eri_source, computed, skipped), source_builder = (
+                    _compute_dense_eri_spherical_shellblocked(
+                        signatures,
+                        pair_bounds,
+                        screen_tol,
+                        backend=eri_backend,
+                        workers=workers,
+                    )
+                )
+                factors_are_spherical = True
+                dense_eri_working_basis = "spherical"
+            else:
+                (eri_source, computed, skipped), source_builder = _compute_dense_eri_with_backend(
+                    signatures,
+                    pair_bounds,
+                    screen_tol,
+                    backend=eri_backend,
+                    workers=workers,
+                )
+                dense_eri_working_basis = "cartesian"
             timings["dense_eri"] = time.perf_counter() - t0
             dense_builder = f"{source_builder}-factor-source"
             t0 = time.perf_counter()
+            factor_nao = eri_source.shape[0]
             if aosym == "s8":
                 factors_pair = pivoted_cholesky_eri_s8(
                     pack_eri_s8(eri_source),
-                    len(signatures),
+                    factor_nao,
                     tol=low_rank_tol,
                     max_rank=low_rank_max_rank,
                 )
-                factors = PackedRIFactors(factors_pair, len(signatures))
+                factors = PackedRIFactors(factors_pair, factor_nao)
                 factor_builder = f"{eri_backend}-s8-pair-pivoted-cholesky"
             else:
                 from pyqed.qchem.hf.rhf import pivoted_cholesky_eri
@@ -4763,9 +5587,13 @@ def build_builtin(mol):
 
     t0 = time.perf_counter()
     transform = None
+    max_cartesian_shell_quartet_elements = None
     basis_out = basis_cart
     if coord_type == "spherical":
         blocks = _cart_shell_blocks(basis_cart)
+        max_cartesian_shell_quartet_elements = max(
+            (stop - start) ** 4 for start, stop, _l in blocks
+        )
         nsph = sum(2 * l + 1 for _, _, l in blocks)
         transform = np.zeros((nao_cart, nsph), dtype=float)
         col = 0
@@ -4775,11 +5603,43 @@ def build_builtin(mol):
             transform[start:stop, col:col + ncols] = blk
             col += ncols
 
+        if (
+            direct_jk_data is not None
+            and str(direct_jk_data["kernel"]).endswith("spherical-direct-jk")
+        ):
+            if direct_jk_data["rys_cache_mib"] < 1:
+                raise ValueError("rys_cache_mib must be a positive integer.")
+            if direct_jk_data["rys_spherical_cache_mib"] < 0:
+                raise ValueError("rys_spherical_cache_mib must be nonnegative.")
+            direct_jk_data["transform"] = np.ascontiguousarray(transform, dtype=np.float64)
+            if (
+                _integrals_cpp is not None
+                and hasattr(_integrals_cpp, "build_spherical_direct_jk_plan")
+            ):
+                try:
+                    direct_jk_data["native_plan"] = _integrals_cpp.build_spherical_direct_jk_plan(
+                        direct_jk_data["shells"],
+                        direct_jk_data["origins"],
+                        direct_jk_data["exps"],
+                        direct_jk_data["weights"],
+                        direct_jk_data["nprim"],
+                        direct_jk_data["pair_bounds"],
+                        direct_jk_data["transform"],
+                        float(direct_jk_data["screen_tol"]),
+                        int(_CPP_CARTESIAN_MAX_L),
+                        int(direct_jk_data.get("rys_max_rank", -1)),
+                        int(direct_jk_data["rys_cache_mib"]) * 1024**2,
+                        int(direct_jk_data["workers"]),
+                        int(direct_jk_data["rys_spherical_cache_mib"]) * 1024**2,
+                    )
+                except Exception:
+                    direct_jk_data["native_plan"] = None
+
         overlap_mat = np.einsum('pi,pq,qj->ij', transform, overlap_mat, transform, optimize=True)
         hcore_mat = np.einsum('pi,pq,qj->ij', transform, kinetic_mat + vnuc_mat, transform, optimize=True)
-        if eri is not None:
+        if eri is not None and not eri_is_spherical:
             eri = np.einsum('pa,qb,rc,sd,pqrs->abcd', transform, transform, transform, transform, eri, optimize=True)
-        if factors is not None:
+        if factors is not None and not factors_are_spherical:
             factors = np.einsum('pa,rpq,qb->rab', transform, factors, transform, optimize=True)
         basis_out = basis_cart
         mol.cart = False
@@ -4817,7 +5677,7 @@ def build_builtin(mol):
             setattr(fn, "coord_type", coord_type)
     mol.nbas = mol.nao
     mol._builtin_build_info = {
-        "driver": "builtin",
+        "integral_engine": "native",
         "basis": str(mol.basis),
         "input_unit": str(getattr(mol, "unit", "bohr")),
         "coordinate_unit": "bohr",
@@ -4839,6 +5699,14 @@ def build_builtin(mol):
         "cpp_cartesian_max_l": _CPP_CARTESIAN_MAX_L,
         "workers": workers,
         "screen_tol": screen_tol,
+        "rys_cache_mib": (
+            None if direct_jk_data is None else direct_jk_data.get("rys_cache_mib")
+        ),
+        "rys_spherical_cache_mib": (
+            None
+            if direct_jk_data is None
+            else direct_jk_data.get("rys_spherical_cache_mib")
+        ),
         "quartets_computed": int(computed),
         "quartets_screened": int(skipped),
         "factor_rank": None if factors is None else int(factors.shape[0]),
@@ -4853,13 +5721,19 @@ def build_builtin(mol):
             else None
         ),
         "dense_builder": dense_builder,
+        "dense_eri_working_basis": dense_eri_working_basis,
+        "allocated_cartesian_dense_eri": dense_eri_working_basis == "cartesian",
+        "cartesian_dense_eri_elements": (
+            int(nao_cart ** 4) if dense_eri_working_basis is not None else None
+        ),
+        "max_cartesian_shell_quartet_elements": max_cartesian_shell_quartet_elements,
         "factor_builder": factor_builder,
+        "cd": cd_info,
         "ri": ri_info,
         "direct_jk": None if direct_jk_data is None else {
             "kernel": direct_jk_data.get("kernel"),
+            "aosym": direct_jk_data.get("aosym"),
             "screening": direct_jk_data.get("screening"),
-            "task_cache": direct_jk_data.get("task_cache"),
-            "cache_aosym": direct_jk_data.get("cache_aosym"),
         },
         "timings": {key: float(value) for key, value in timings.items()},
         "build_time": float(time.perf_counter() - total_start),
@@ -4873,45 +5747,6 @@ def build_native(mol):
     Backward-compatible alias for the builtin AO integral builder.
     """
     return build_builtin(mol)
-
-
-def build(mol, pyscf=False):
-    """
-    Build AO integrals in the gbasis backend.
-    """
-    atoms = mol.atom_symbols()
-    atcoords = mol.atom_coords()
-    atnums = mol.atom_charges()
-
-    try:
-        from gbasis.integrals.electron_repulsion import electron_repulsion_integral
-        from gbasis.integrals.kinetic_energy import kinetic_energy_integral
-        from gbasis.integrals.nuclear_electron_attraction import \
-            nuclear_electron_attraction_integral
-        from gbasis.integrals.overlap import overlap_integral
-        from gbasis.parsers import make_contractions as gbasis_make_contractions
-        from gbasis.parsers import parse_gbs as gbasis_parse_gbs
-    except ImportError as exc:
-        raise ImportError(
-            "gbasis is required for driver='gbasis'. Use driver='builtin' to avoid gbasis."
-        ) from exc
-
-    if not pyscf:
-        basis_dict = gbasis_parse_gbs(_basis_path(mol.basis))
-        basis = gbasis_make_contractions(basis_dict, atoms, atcoords, coord_types="p")
-    else:
-        from gbasis.wrappers import from_pyscf
-        basis = from_pyscf(mol.topyscf())
-
-    mol.overlap = overlap_integral(basis)
-    mol.nao = mol.overlap.shape[0]
-    k_int1e = kinetic_energy_integral(basis)
-    nuc_int1e = nuclear_electron_attraction_integral(basis, atcoords, atnums)
-    mol.hcore = k_int1e + nuc_int1e
-    mol.eri = electron_repulsion_integral(basis, notation='chemist')
-    mol._bas = basis
-    mol.nbas = mol.nao
-    return
 
 
 @lru_cache(maxsize=None)
@@ -5015,7 +5850,7 @@ def make_contractions(basis_dict, atoms, coords, coord_types):
     Parameters
     ----------
     basis_dict : dict of str to list of 3-tuple of (int, np.ndarray, np.ndarray)
-        Output of the parsers from gbasis.parsers.
+        Parsed basis dictionary consumed by :func:`make_contractions`.
     atoms : N-list/tuple of str
         Atoms at which the contractions are centered.
     coords : np.ndarray(N, 3)
@@ -5198,6 +6033,75 @@ def _cart_shell_blocks(basis_cart):
     return blocks
 
 
+def _odd_double_factorial(value):
+    result = 1
+    for factor in range(value, 0, -2):
+        result *= factor
+    return result
+
+
+def _generated_cart2sph_unit_block(l):
+    cartesian = _shell(l)
+    ncart = len(cartesian)
+    overlap = np.zeros((ncart, ncart), dtype=float)
+    for row, left in enumerate(cartesian):
+        for column, right in enumerate(cartesian):
+            value = 1.0
+            for left_power, right_power in zip(left, right):
+                total = left_power + right_power
+                if total % 2:
+                    value = 0.0
+                    break
+                value *= _odd_double_factorial(total - 1) / math.sqrt(
+                    _odd_double_factorial(2 * left_power - 1) *
+                    _odd_double_factorial(2 * right_power - 1)
+                )
+            overlap[row, column] = value
+
+    transform = np.zeros((ncart, 2 * l + 1), dtype=float)
+    factorial = math.factorial
+    for column, signed_m in enumerate(range(-l, l + 1)):
+        m = abs(signed_m)
+        polynomial = {}
+        for radial_power in range((l - m) // 2 + 1):
+            legendre = (
+                (-1) ** radial_power * factorial(2 * l - 2 * radial_power) /
+                (
+                    2 ** l * factorial(radial_power) * factorial(l - radial_power) *
+                    factorial(l - 2 * radial_power - m)
+                )
+            )
+            for y_power in range(m + 1):
+                xy_coefficient = math.comb(m, y_power) * (1j ** y_power)
+                for radial_x in range(radial_power + 1):
+                    for radial_y in range(radial_power - radial_x + 1):
+                        radial_z = radial_power - radial_x - radial_y
+                        multinomial = factorial(radial_power) / (
+                            factorial(radial_x) * factorial(radial_y) * factorial(radial_z)
+                        )
+                        powers = (
+                            m - y_power + 2 * radial_x,
+                            y_power + 2 * radial_y,
+                            l - 2 * radial_power - m + 2 * radial_z,
+                        )
+                        polynomial[powers] = polynomial.get(powers, 0.0j) + (
+                            legendre * xy_coefficient * multinomial
+                        )
+        for row, powers in enumerate(cartesian):
+            coefficient = polynomial.get(powers, 0.0j)
+            real_coefficient = coefficient.imag if signed_m < 0 else coefficient.real
+            transform[row, column] = real_coefficient * math.sqrt(
+                _odd_double_factorial(2 * powers[0] - 1) *
+                _odd_double_factorial(2 * powers[1] - 1) *
+                _odd_double_factorial(2 * powers[2] - 1)
+            )
+        norm = math.sqrt(transform[:, column] @ overlap @ transform[:, column])
+        transform[:, column] /= norm
+    transform.setflags(write=False)
+    return transform
+
+
+@lru_cache(maxsize=None)
 def _cart2sph_unit_block(l):
     """
     Cartesian -> real-spherical transform for the builtin unit-normalized
@@ -5243,26 +6147,29 @@ def _cart2sph_unit_block(l):
     if l == 4:
         return np.array(
             [
-                [0.0, 0.0, 0.0, 0.0, 0.39467353541831303197, 0.0, -0.58834840541455207145, 0.0, 0.79056941504209483299],
-                [1.0606601717798212866, 0.0, -0.40824829046386301637, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0, -0.89442719099991587856, 0.0, 0.79056941504209483299, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.18257418583505537115, 0.0, 0.0, 0.0, -1.0606601717798212866],
-                [0.0, 1.1180339887498948482, 0.0, -0.40824829046386301637, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, -0.73029674334022148461, 0.0, 0.81649658092772603273, 0.0, 0.0],
-                [-1.0606601717798212866, 0.0, -0.40824829046386301637, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.0, -0.40824829046386301637, 0.0, -1.1180339887498948482, 0.0],
-                [0.0, 0.0, 1.154700538379251529, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.1180339887498948482, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, 0.39467353541831303197, 0.0, 0.58834840541455207145, 0.0, 0.79056941504209483299],
-                [0.0, -0.79056941504209483299, 0.0, -0.89442719099991587856, 0.0, 0.0, 0.0, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 0.0, -0.73029674334022148461, 0.0, -0.81649658092772603273, 0.0, 0.0],
-                [0.0, 0.0, 0.0, 1.1180339887498948482, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.375, 0.0, -0.55901699437494742410, 0.0, 0.73950997288745200532],
+                [1.1180339887498948482, 0.0, -0.42257712736425828875, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -0.89642145700079522998, 0.0, 0.79056941504209483299, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.21957751641341996535, 0.0, 0.0, 0.0, -1.2990381056766579701],
+                [0.0, 1.0606601717798212866, 0.0, -0.40089186286863657703, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, -0.87831006565367986142, 0.0, 0.98198050606196571570, 0.0, 0.0],
+                [-1.1180339887498948482, 0.0, -0.42257712736425828875, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, -0.40089186286863657703, 0.0, -1.0606601717798212866, 0.0],
+                [0.0, 0.0, 1.1338934190276816816, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.0, 1.19522860933439363997, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 0.375, 0.0, 0.55901699437494742410, 0.0, 0.73950997288745200532],
+                [0.0, -0.79056941504209483299, 0.0, -0.89642145700079522998, 0.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, -0.87831006565367986142, 0.0, -0.98198050606196571570, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 1.19522860933439363997, 0.0, 0.0, 0.0, 0.0, 0.0],
                 [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
             ],
             dtype=float,
         )
+    if 5 <= l <= _CPP_CARTESIAN_MAX_L:
+        return _generated_cart2sph_unit_block(l)
     raise NotImplementedError(
-        f"Builtin spherical AO transform is implemented only for l <= 4, got l={l}."
+        "Builtin spherical AO transform supports angular momenta "
+        f"0 <= l <= {_CPP_CARTESIAN_MAX_L}, got l={l}."
     )
 
 

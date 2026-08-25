@@ -1,8 +1,14 @@
 import math
 
 import numpy as np
+import pytest
 
 from pyqed.qchem import Molecule
+from pyqed.qchem import basis as basis_module
+try:
+    from pyqed.qchem import _rys_cy
+except ImportError:  # pragma: no cover - optional accelerator
+    _rys_cy = None
 from pyqed.qchem.basis import (
     ContractedGaussian,
     ERI,
@@ -36,6 +42,180 @@ def test_rys_single_root_weight_reproduces_boys_f0():
         assert weights.shape == (1,)
         assert 0.0 <= roots[0] <= 1.0
         np.testing.assert_allclose(np.sum(weights), boys(0, T), atol=1e-14, rtol=1e-14)
+
+
+def test_compiled_low_order_rys_rule_reproduces_required_moments():
+    if _rys_cy is None:
+        pytest.skip("compiled Rys kernels are unavailable")
+
+    def stable_boys(order, T):
+        return sum(
+            (-T) ** k / (math.factorial(k) * (2 * order + 2 * k + 1))
+            for k in range(80)
+        ) if T < 1.0 else boys(order, T)
+
+    for nroots in (1, 2, 3):
+        for T in (0.0, 1.0e-10, 1.0e-4, 0.1, 1.0, 10.0, 100.0):
+            roots, weights = _rys_cy.rys_roots_weights_low(nroots, T)
+            nodes = roots / (1.0 + roots)
+            assert np.all(nodes >= 0.0)
+            assert np.all(nodes < 1.0)
+            assert np.all(weights > 0.0)
+            for order in range(2 * nroots):
+                moment = np.dot(weights, nodes**order)
+                np.testing.assert_allclose(moment, stable_boys(order, T), atol=2.0e-14, rtol=2.0e-12)
+
+
+def test_native_cpp_low_root_fast_rules_reproduce_required_moments():
+    native = basis_module._integrals_cpp
+    if native is None or not hasattr(native, "compute_rys_roots_weights"):
+        pytest.skip("native C++ integral kernels are unavailable")
+
+    points = np.concatenate(
+        (
+            np.linspace(0.0, 40.0, 161),
+            np.array([1.0, 3.0, 5.0, 10.0, 20.0, 40.0, 60.0, 100.0]),
+        )
+    )
+    for nroots in (2, 3):
+        for T in points:
+            roots, weights = native.compute_rys_roots_weights(nroots, float(T))
+            roots = np.asarray(roots)
+            weights = np.asarray(weights)
+            nodes = roots / (1.0 + roots)
+            assert np.all(nodes >= 0.0)
+            assert np.all(nodes < 1.0)
+            assert np.all(weights > 0.0)
+            for order in range(2 * nroots):
+                reference = boys(order, float(T))
+                np.testing.assert_allclose(
+                    np.dot(weights, nodes**order),
+                    reference,
+                    atol=2.0e-14,
+                    rtol=6.0e-11,
+                )
+
+
+def test_compiled_rys_recurrence_covers_every_sp_shell_pattern():
+    if _rys_cy is None:
+        pytest.skip("compiled Rys kernels are unavailable")
+
+    centers = np.asarray(
+        ((0.1, -0.2, 0.3), (0.0, 0.2, 1.1), (0.3, -0.1, -0.2), (-0.4, 0.3, 0.2)),
+        dtype=float,
+    )
+    primitive_exponents = (0.5, 0.3, 0.4, 0.2)
+    p_shells = ((1, 0, 0), (0, 1, 0), (0, 0, 1))
+
+    for mask in range(16):
+        shells = []
+        origins = []
+        exponents = []
+        weights = []
+        nprim = []
+        ranges = []
+        for center in range(4):
+            start = len(shells)
+            components = p_shells if mask & (1 << center) else ((0, 0, 0),)
+            for component in components:
+                shells.append(component)
+                origins.append(centers[center])
+                exponents.append((primitive_exponents[center],))
+                weights.append((1.0,))
+                nprim.append(1)
+            ranges.append((start, len(shells)))
+
+        args = [item for bounds in ranges for item in bounds]
+        shells_array = np.ascontiguousarray(shells, dtype=np.int64)
+        origins_array = np.ascontiguousarray(origins, dtype=float)
+        exponents_array = np.ascontiguousarray(exponents, dtype=float)
+        weights_array = np.ascontiguousarray(weights, dtype=float)
+        nprim_array = np.ascontiguousarray(nprim, dtype=np.int64)
+        block = np.asarray(
+            _rys_cy.compute_cartesian_shell_quartet_block_rys(
+                shells_array, origins_array, exponents_array, weights_array, nprim_array, *args,
+            )
+        )
+        derivative_reference = np.asarray(
+            _rys_cy.compute_cartesian_shell_quartet_block_rys_derivative_reference(
+                shells_array, origins_array, exponents_array, weights_array, nprim_array, *args,
+            )
+        )
+        reference = np.empty_like(block)
+        for index in np.ndindex(block.shape):
+            ao_indices = tuple(ranges[center][0] + index[center] for center in range(4))
+            reference[index] = electron_repulsion(
+                primitive_exponents[0], shells[ao_indices[0]], centers[0],
+                primitive_exponents[1], shells[ao_indices[1]], centers[1],
+                primitive_exponents[2], shells[ao_indices[2]], centers[2],
+                primitive_exponents[3], shells[ao_indices[3]], centers[3],
+            )
+        np.testing.assert_allclose(block, derivative_reference, atol=2.0e-12, rtol=2.0e-11)
+        np.testing.assert_allclose(block, reference, atol=2.0e-12, rtol=2.0e-11)
+
+
+def test_native_rys_shell_blocks_cover_d_and_f_through_seven_roots():
+    try:
+        from pyqed.qchem import _integrals_cpp
+    except ImportError:
+        pytest.skip("native integral kernels are unavailable")
+    if not hasattr(_integrals_cpp, "compute_shell_quartet_rys_l3"):
+        pytest.skip("native d/f Rys shell-block validation helper is unavailable")
+
+    def components(l):
+        return [
+            (lx, ly, l - lx - ly)
+            for lx in range(l, -1, -1)
+            for ly in range(l - lx, -1, -1)
+        ]
+
+    centers = np.asarray(
+        ((0.1, -0.2, 0.3), (0.0, 0.2, 1.1), (0.3, -0.1, -0.2), (-0.4, 0.3, 0.2)),
+        dtype=float,
+    )
+    primitive_exponents = (0.5, 0.3, 0.4, 0.2)
+    for angular_momenta in ((3, 3, 2, 0), (3, 3, 3, 0), (3, 3, 3, 3)):
+        shells = []
+        origins = []
+        exponents = []
+        weights = []
+        nprim = []
+        ranges = []
+        for center, l in enumerate(angular_momenta):
+            start = len(shells)
+            for angular in components(l):
+                shells.append(angular)
+                origins.append(centers[center])
+                exponents.append((primitive_exponents[center],))
+                weights.append((1.0,))
+                nprim.append(1)
+            ranges.append((start, len(shells)))
+        args = [item for bounds in ranges for item in bounds]
+        block = np.asarray(
+            _integrals_cpp.compute_shell_quartet_rys_l3(
+                np.ascontiguousarray(shells, dtype=np.int64),
+                np.ascontiguousarray(origins, dtype=float),
+                np.ascontiguousarray(exponents, dtype=float),
+                np.ascontiguousarray(weights, dtype=float),
+                np.ascontiguousarray(nprim, dtype=np.int64),
+                *args,
+            )
+        )
+        sample_indices = {
+            (0, 0, 0, 0),
+            tuple(size - 1 for size in block.shape),
+            tuple(size // 2 for size in block.shape),
+            tuple((3 * axis + 1) % size for axis, size in enumerate(block.shape)),
+        }
+        for index in sample_indices:
+            ao_indices = tuple(ranges[center][0] + index[center] for center in range(4))
+            reference = electron_repulsion(
+                primitive_exponents[0], shells[ao_indices[0]], centers[0],
+                primitive_exponents[1], shells[ao_indices[1]], centers[1],
+                primitive_exponents[2], shells[ao_indices[2]], centers[2],
+                primitive_exponents[3], shells[ao_indices[3]], centers[3],
+            )
+            np.testing.assert_allclose(block[index], reference, atol=3.0e-11, rtol=3.0e-11)
 
 
 def test_primitive_ssss_rys_matches_existing_primitive_eri():

@@ -16,18 +16,11 @@ from __future__ import division
 import os
 import sys
 import hashlib
+import math
 import numpy
 from numpy import pi
 from numpy.linalg import norm
 import numpy as np
-
-# from gbasis.parsers import parse_gbs, make_contractions
-# from gbasis.integrals.overlap import overlap_integral
-# from gbasis.integrals.kinetic_energy import kinetic_energy_integral
-# from gbasis.integrals.nuclear_electron_attraction import \
-# nuclear_electron_attraction_integral
-# from gbasis.integrals.electron_repulsion import electron_repulsion_integral
-
 
 from pyqed import dag, au2angstrom
 from pyqed.qchem.hf import RHF, ROHF, UHF
@@ -48,7 +41,7 @@ except ImportError:
 # import pyscf.ao2mo
 # import pyscf
 # from functools import reduce
-from pyqed.qchem.basis import ContractedGaussian, build as build_gbasis
+from pyqed.qchem.basis import ContractedGaussian
 from pyqed.qchem.basis import build_builtin, overlap
 
 
@@ -81,12 +74,21 @@ BAS_SLOTS  = 8
 
 
 _BUILTIN_OPTION_SPECS = (
-    ("coord_type", "builtin_coord_type", "native_coord_type", str, "cartesian"),
+    ("coord_type", "builtin_coord_type", "native_coord_type", str, "spherical"),
     ("parallel", "builtin_parallel", "native_parallel", bool, False),
-    ("eri_workers", "builtin_eri_workers", "native_eri_workers", lambda v: None if v is None else int(v), None),
+    (
+        "eri_workers", "builtin_eri_workers", "native_eri_workers",
+        lambda v: None if v is None else int(v), None,
+    ),
     ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
     ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 1.0e-10),
+    ("direct_scf_tol", "builtin_direct_scf_tol", "native_direct_scf_tol", float, 1.0e-13),
     ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
+    ("rys_cache_mib", "builtin_rys_cache_mib", "native_rys_cache_mib", int, 256),
+    (
+        "rys_spherical_cache_mib", "builtin_rys_spherical_cache_mib",
+        "native_rys_spherical_cache_mib", int, 0,
+    ),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "auto"),
     ("aosym", "builtin_aosym", "native_aosym", lambda v: None if v is None else str(v), "s8"),
     ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: None if v is None else str(v), None),
@@ -286,6 +288,7 @@ def _basis_contracted_shell_signature(basis_fn):
         sum(shell),
         tuple(float(x) for x in np.asarray(getattr(basis_fn, "origin"), dtype=float)),
         tuple(float(x) for x in getattr(basis_fn, "exps")),
+        tuple(round(float(x), 14) for x in getattr(basis_fn, "coefs")),
     )
 
 
@@ -1217,7 +1220,6 @@ class Molecule:
         self._bas = None
         self._bas_cart = None
         self._ao_cart2sph = None
-        self._build_driver = None
         builtin_options = _pop_builtin_options(kwargs)
         self._set_builtin_options(builtin_options)
         self._builtin_build_info = None
@@ -1276,7 +1278,12 @@ class Molecule:
         self.builtin_eri_workers = self.builtin_options["eri_workers"]
         self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
+        self.builtin_direct_scf_tol = self.builtin_options["direct_scf_tol"]
         self.builtin_eri_backend = self.builtin_options["eri_backend"]
+        self.builtin_rys_cache_mib = self.builtin_options["rys_cache_mib"]
+        self.builtin_rys_spherical_cache_mib = self.builtin_options[
+            "rys_spherical_cache_mib"
+        ]
         self.builtin_eri_representation = self.builtin_options["eri_representation"]
         self.builtin_aosym = self.builtin_options["aosym"]
         self.builtin_auxbasis = self.builtin_options["auxbasis"]
@@ -1302,7 +1309,10 @@ class Molecule:
         self.native_eri_workers = self.builtin_eri_workers
         self.native_parallel_min_nao = self.builtin_parallel_min_nao
         self.native_eri_screen_tol = self.builtin_eri_screen_tol
+        self.native_direct_scf_tol = self.builtin_direct_scf_tol
         self.native_eri_backend = self.builtin_eri_backend
+        self.native_rys_cache_mib = self.builtin_rys_cache_mib
+        self.native_rys_spherical_cache_mib = self.builtin_rys_spherical_cache_mib
         self.native_eri_representation = self.builtin_eri_representation
         self.native_aosym = self.builtin_aosym
         self.native_auxbasis = self.builtin_auxbasis
@@ -1338,7 +1348,6 @@ class Molecule:
 
     def build(
         self,
-        driver='builtin',
         options=None,
         eri=None,
         aosym=None,
@@ -1352,28 +1361,22 @@ class Molecule:
 
         Parameters
         ----------
-        driver : str
-            AO integral backend. Supported are:
-            - 'builtin' (default): pyqed in-house integral engine;
-            - 'native' (alias for 'builtin');
-            - 'gbasis';
-            - 'gbasis-pyscf';
-            - 'pyscf'.
         options : dict, optional
-            Backend-specific build options. For ``driver='builtin'``, use short
-            keys such as ``eri_representation``, ``aosym``, ``low_rank_tol``,
-            ``eri_screen_tol``, ``parallel``, and ``eri_workers``.
+            Native integral-build options. Use short keys such as
+            ``eri_representation``, ``aosym``, ``low_rank_tol``,
+            ``eri_screen_tol``, ``direct_scf_tol``, ``parallel``, ``eri_workers``,
+            ``rys_cache_mib``, and ``rys_spherical_cache_mib``.
         eri : {'auto', 'dense', 's4', 's8', 'direct', 'factors', 'cd', 'ri'}, optional
-            Short alias for the builtin ``eri_representation`` option.
+            Short alias for the native ``eri_representation`` option.
         aosym : {'s1', 's4', 's8'}, optional
-            AO ERI permutation symmetry for dense-like builtin storage. The
-            default builtin build uses ``eri='auto'``: compact exact ``s8``
+            AO ERI permutation symmetry for dense-like native storage. The
+            default build uses ``eri='auto'``: compact exact ``s8``
             storage for small systems, native RI factors for medium systems
             when an auxiliary basis is available, and Cholesky/CD factors as a
             fallback. Explicit dense shortcuts such as ``eri='dense'`` default
             to ``aosym='s8'`` when no symmetry is supplied.
         auxbasis : str, optional
-            Short alias for the builtin ``auxbasis`` option used by
+            Short alias for the native ``auxbasis`` option used by
             ``eri='ri'`` and ``eri='dense+ri'``.
         symmetry : bool or str, optional
             Build native Abelian point-group metadata after the AO integrals are
@@ -1391,25 +1394,11 @@ class Molecule:
         None.
 
         """
-        if driver is None:
-            driver = 'builtin'
-        driver = driver.lower()
-        if driver in ('native', 'own', 'pyqed'):
-            driver = 'builtin'
-
         if eri is not None:
-            if driver != 'builtin':
-                raise ValueError(
-                    "build(eri=...) is only supported for driver='builtin' or its 'native' alias."
-                )
             options = {} if options is None else dict(options)
             options["eri_representation"] = _normalize_eri_representation(eri)
 
         if aosym is not None:
-            if driver != 'builtin':
-                raise ValueError(
-                    "build(aosym=...) is only supported for driver='builtin' or its 'native' alias."
-                )
             options = {} if options is None else dict(options)
             requested_aosym = _normalize_aosym(aosym)
             existing_aosym = _normalize_aosym(options.get("aosym", "s1"))
@@ -1418,21 +1407,12 @@ class Molecule:
             options["aosym"] = requested_aosym
 
         if auxbasis is not None:
-            if driver != 'builtin':
-                raise ValueError(
-                    "build(auxbasis=...) is only supported for driver='builtin' or its 'native' alias."
-                )
             options = {} if options is None else dict(options)
             options["auxbasis"] = auxbasis
 
         if options is not None:
-            if driver != 'builtin':
-                raise ValueError(
-                    "build(options=...) is only supported for driver='builtin' or its 'native' alias."
-                )
             self._set_builtin_options(_normalize_builtin_options(options, strict=True))
 
-        self._build_driver = driver
         self.eri_s4 = None
         self.eri_s8 = None
         self.eri_factors = None
@@ -1453,50 +1433,7 @@ class Molecule:
         self.symmetry_axis = None
         self.symmetry_tol = None
 
-        if driver == 'builtin':
-            build_builtin(self)
-        elif driver == 'gbasis':
-            build_gbasis(self)
-
-        elif driver == 'gbasis-pyscf':
-            build_gbasis(self, pyscf=True)
-
-        elif driver == 'pyscf':
-            # extract AO integrals from PySCF
-            if gto is None:
-                raise ImportError(
-                    "PySCF is not available but driver='pyscf' was requested."
-                )
-
-            mol = self.topyscf()
-            mol.build()
-
-            self.nao = mol.nao
-            self.nbas = mol.nbas
-
-            kin = mol.intor('int1e_kin')
-            vnuc = mol.intor('int1e_nuc')
-            self.hcore =  kin + vnuc
-
-            self.overlap = mol.intor('int1e_ovlp')
-            self.eri = mol.intor('int2e')
-
-            self.ao_moment = 1j * mol.intor('int1e_ipovlp', comp=3)
-
-            mol.set_common_orig(coord = self.nuc_charge_center())
-            self.ao_dip = -mol.intor('int1e_r', comp=3)
-            self.ao_magnetic_dip = mol.intor('int1e_cg_irxp', comp=3)
-
-            self.cart = mol.cart
-
-            self._atm = mol._atm
-            self._bas = mol._bas
-            self._env = mol._env
-        else:
-            raise ValueError(
-                f"Unsupported integral driver '{driver}'. "
-                "Use 'builtin', 'native', 'gbasis', 'gbasis-pyscf', or 'pyscf'."
-            )
+        build_builtin(self)
 
         if symmetry:
             from pyqed.qchem.symmetry import build_molecular_symmetry
@@ -1528,7 +1465,6 @@ class Molecule:
             repr(self.basis),
             int(self.charge),
             int(self.spin),
-            getattr(self, '_build_driver', None),
             coords.shape,
             tuple(rounded.tolist()),
         )
@@ -1544,42 +1480,47 @@ class Molecule:
         return mol._add_suffix(intor, cart) 
     
     def moment_integral(self, orders=None, center=np.array([0,0,0])):
-        """
-
-        Parameters
-        ----------
-        orders : np.ndarray(D, 3)
-            Orders of the moment for each dimension (x, y, z).
-            Note that a two dimensional array must be given, even if there is
-            only one set of orders of the moment. The default is None.
-        center : TYPE, optional
-            . The default is np.array([0,0,0]).
-
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-
-        """
-
-        from gbasis.integrals.moment import moment_integral
-
-        # set the orders of the moment integrals
+        """Native Cartesian moments ``<(r-center)^orders>`` in the AO basis."""
+        first_moments = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
         if orders is None:
-            orders = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-
-        basis = self._bas_cart if self._bas_cart is not None else self._bas
-        try:
-            ints = moment_integral(basis, moment_coord=center, moment_orders=orders)
-        except Exception:
-            default_orders = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
-            if not np.array_equal(np.asarray(orders, dtype=int), default_orders):
-                raise
-            return self.position_integral(center=center)
-        transform = getattr(self, "_ao_cart2sph", None)
-        if transform is not None:
-            ints = np.einsum('pi,xpq,qj->xij', transform, ints, transform, optimize=True)
-        return ints
+            orders = first_moments
+        orders = np.asarray(orders, dtype=int)
+        center = np.asarray(center, dtype=float)
+        if orders.ndim != 2 or orders.shape[1] != 3 or np.any(orders < 0):
+            raise ValueError("orders must have shape (ncomponent, 3) and be nonnegative.")
+        if center.shape != (3,):
+            raise ValueError("center must be a length-3 Cartesian vector.")
+        basis, transform = self._cart_basis()
+        output = np.zeros((orders.shape[0], len(basis), len(basis)), dtype=float)
+        for i, bra in enumerate(basis):
+            for j, ket in enumerate(basis):
+                for component, powers in enumerate(orders):
+                    value = 0.0
+                    for ia, wa in enumerate(bra.prim_weights):
+                        for ib, wb in enumerate(ket.prim_weights):
+                            primitive = 0.0
+                            for kx in range(int(powers[0]) + 1):
+                                for ky in range(int(powers[1]) + 1):
+                                    for kz in range(int(powers[2]) + 1):
+                                        raised = (
+                                            int(ket.shell[0]) + kx,
+                                            int(ket.shell[1]) + ky,
+                                            int(ket.shell[2]) + kz,
+                                        )
+                                        coefficient = (
+                                            math.comb(int(powers[0]), kx)
+                                            * math.comb(int(powers[1]), ky)
+                                            * math.comb(int(powers[2]), kz)
+                                            * (float(ket.origin[0]) - center[0]) ** (int(powers[0]) - kx)
+                                            * (float(ket.origin[1]) - center[1]) ** (int(powers[1]) - ky)
+                                            * (float(ket.origin[2]) - center[2]) ** (int(powers[2]) - kz)
+                                        )
+                                        primitive += coefficient * self._primitive_overlap(
+                                            bra, ket, ia, ib, ket_shell=raised
+                                        )
+                            value += float(wa) * float(wb) * primitive
+                    output[component, i, j] = value
+        return self._apply_ao_transform(output, transform)
 
     def _cart_basis(self):
         basis = self._bas_cart if self._bas_cart is not None else self._bas
@@ -1644,6 +1585,26 @@ class Molecule:
                 value += wa * wb * term
         return value
 
+    def _gradient_integral_pair(self, bra, ket, axis):
+        value = 0.0
+        ket_shell = tuple(ket.shell)
+        power = ket_shell[axis]
+        for ia, wa in enumerate(bra.prim_weights):
+            for ib, wb in enumerate(ket.prim_weights):
+                beta = float(ket.exps[ib])
+                term = 0.0
+                lowered = self._raise_axis(ket_shell, axis, -1)
+                if power > 0 and lowered is not None:
+                    term += power * self._primitive_overlap(
+                        bra, ket, ia, ib, ket_shell=lowered
+                    )
+                raised = self._raise_axis(ket_shell, axis, 1)
+                term -= 2.0 * beta * self._primitive_overlap(
+                    bra, ket, ia, ib, ket_shell=raised
+                )
+                value += wa * wb * term
+        return value
+
     @staticmethod
     def _apply_ao_transform(op, transform):
         if transform is None:
@@ -1662,21 +1623,6 @@ class Molecule:
         center = np.asarray(center, dtype=float)
         if center.shape != (3,):
             raise ValueError("center must be a length-3 Cartesian vector.")
-        if getattr(self, "_build_driver", None) == "pyscf":
-            mol = self.topyscf()
-            mol.build()
-            mol.set_common_orig(coord=center)
-            return mol.intor("int1e_r", comp=3)
-        if self._bas is not None and not all(isinstance(fn, ContractedGaussian) for fn in self._bas):
-            from gbasis.integrals.moment import moment_integral
-            ints = moment_integral(
-                self._bas,
-                moment_coord=center,
-                moment_orders=np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]]),
-            )
-            if ints.shape[-1] == 3:
-                ints = np.moveaxis(ints, -1, 0)
-            return ints
         basis, transform = self._cart_basis()
         nao = len(basis)
         op = np.zeros((3, nao, nao), dtype=float)
@@ -1693,11 +1639,6 @@ class Molecule:
         center = np.asarray(center, dtype=float)
         if center.shape != (3,):
             raise ValueError("center must be a length-3 Cartesian vector.")
-        if getattr(self, "_build_driver", None) == "pyscf":
-            mol = self.topyscf()
-            mol.build()
-            mol.set_common_orig(coord=center)
-            return mol.intor("int1e_cg_irxp", comp=3)
         basis, transform = self._cart_basis()
         nao = len(basis)
         op = np.zeros((3, nao, nao), dtype=float)
@@ -1742,11 +1683,17 @@ class Molecule:
             return 0.5j * rxgrad
         raise ValueError("convention must be 'cd', 'operator', or 'raw'.")
 
-    def momentum_integral(self, orders=(1,0,0), center=(0,0,0)):
-
-        from gbasis.integrals.momentum import momentum_integral
-
-        return momentum_integral(self.basis)
+    def momentum_integral(self):
+        """Native momentum integrals ``<chi_mu|-i grad|chi_nu>``."""
+        basis, transform = self._cart_basis()
+        operator = np.zeros((3, len(basis), len(basis)), dtype=complex)
+        for i, bra in enumerate(basis):
+            for j, ket in enumerate(basis):
+                for axis in range(3):
+                    operator[axis, i, j] = -1j * self._gradient_integral_pair(
+                        bra, ket, axis
+                    )
+        return self._apply_ao_transform(operator, transform)
 
     def ao_labels(self):
         """
@@ -1764,30 +1711,6 @@ class Molecule:
         atom_coords = np.asarray(self.atom_coords(), dtype=float)
         atom_symbols = self.atom_symbols()
         labels = []
-
-        if basis and hasattr(basis[0], "angmom") and not hasattr(basis[0], "shell"):
-            shell_counts = {}
-            for shell in basis:
-                l = int(shell.angmom)
-                atom_idx = int(shell.icenter) if hasattr(shell, "icenter") else _match_atom_index_from_origin(
-                    atom_coords, np.asarray(shell.coord, dtype=float)
-                )
-                coord_type = str(getattr(shell, "coord_type", "spherical")).lower()
-                if coord_type == "cartesian":
-                    components = [_cartesian_component_label(c) for c in shell.angmom_components_cart]
-                elif coord_type == "spherical":
-                    components = _spherical_component_labels(l)
-                else:
-                    raise ValueError(f"Unsupported gbasis coordinate type {coord_type!r}.")
-                nseg = int(getattr(shell, "num_seg_cont", 1))
-                for _seg in range(nseg):
-                    shell_counts[(atom_idx, l)] = shell_counts.get((atom_idx, l), 0) + 1
-                    shell_name = _angular_shell_name(l, shell_counts[(atom_idx, l)])
-                    for component in components:
-                        labels.append(f"{atom_idx} {atom_symbols[atom_idx]} {shell_name}{component}")
-            if len(labels) != self.nao:
-                raise ValueError("AO label count does not match mol.nao.")
-            return labels
 
         if self.cart or self._ao_cart2sph is None or len(basis) == self.nao:
             shell_counts = {}
@@ -1815,12 +1738,15 @@ class Molecule:
         nao_cart = len(basis)
         while start < nao_cart:
             basis_fn = basis[start]
-            sig = _basis_shell_signature(basis_fn)
+            sig = _basis_contracted_shell_signature(basis_fn)
             shell = tuple(int(x) for x in basis_fn.shell)
             l = sum(shell)
             ncart = (l + 1) * (l + 2) // 2
             stop = start + ncart
-            if stop > nao_cart or any(_basis_shell_signature(basis[k]) != sig for k in range(start, stop)):
+            if stop > nao_cart or any(
+                _basis_contracted_shell_signature(basis[k]) != sig
+                for k in range(start, stop)
+            ):
                 raise ValueError("Invalid Cartesian shell ordering while building AO labels.")
 
             atom_idx = _match_atom_index_from_origin(
@@ -1861,6 +1787,39 @@ class Molecule:
             spin=self.spin,
             cart=bool(getattr(self, "cart", False)),
         )
+
+    @staticmethod
+    def _canonical_ao_label(label):
+        text = " ".join(str(label).replace("^", "").split())
+        for angular in "fghi":
+            text = text.replace(f"{angular}m+", f"{angular}+")
+            text = text.replace(f"{angular}m-", f"{angular}-")
+            text = text.replace(f"{angular}m0", f"{angular}0")
+            text = text.replace(f"{angular}+0", f"{angular}0")
+        return text
+
+    def pyscf_ao_permutation(self, pyscf_mol=None):
+        """Map native AO indices to the corresponding PySCF AO indices."""
+        if self.nao is None:
+            raise ValueError("Build the molecule before aligning PySCF AO order.")
+        pmol = self.topyscf() if pyscf_mol is None else pyscf_mol
+        native_labels = [self._canonical_ao_label(label) for label in self.ao_labels()]
+        pyscf_labels = [self._canonical_ao_label(label) for label in pmol.ao_labels()]
+        positions = {}
+        for index, label in enumerate(pyscf_labels):
+            positions.setdefault(label, []).append(index)
+        try:
+            permutation = np.asarray(
+                [positions[label].pop(0) for label in native_labels],
+                dtype=int,
+            )
+        except (KeyError, IndexError) as exc:
+            raise ValueError(
+                "Cannot align native and PySCF AO labels for this molecule."
+            ) from exc
+        if len(permutation) != len(pyscf_labels) or any(positions.values()):
+            raise ValueError("Native and PySCF AO label sets do not match.")
+        return permutation
 
     def atom_mass_list(self):
         '''
@@ -2157,6 +2116,44 @@ class Molecule:
 
     def RHF(self, verbose=0):
         return RHF(self, verbose=verbose)
+
+    def casci(
+        self,
+        ncas,
+        nelecas,
+        *,
+        nstates=None,
+        method="direct_ci",
+        mf=None,
+        scf_options=None,
+        run_options=None,
+        verbose=0,
+    ):
+        """Return a CASCI electronic driver configured for geometry scans."""
+
+        if nstates is None:
+            nstates = getattr(self, "nstates", 1)
+        nstates = int(nstates)
+        if nstates <= 0:
+            raise ValueError("nstates must be positive")
+
+        if mf is None:
+            if self.nao is None:
+                self.build()
+            mf = self.RHF(verbose=verbose).run(**dict(scf_options or {}))
+
+        from pyqed.qchem.mcscf.casci import CASCI
+
+        electronic = CASCI(
+            mf,
+            ncas=int(ncas),
+            nelecas=nelecas,
+            verbose=verbose,
+        )
+        electronic.nstates = nstates
+        electronic.scan_method = str(method)
+        electronic.scan_run_kwargs = dict(run_options or {})
+        return electronic
 
     def ROHF(self, verbose=0):
         return ROHF(self, verbose=verbose)
@@ -2721,7 +2718,7 @@ if __name__ == '__main__':
     start = time.time()
 
     mol.basis = '631g*'
-    mol.build(driver='pyscf')
+    mol.build()
 
     print("time building AO integrals = ", time.time()-start)
     mol.RHF().run()

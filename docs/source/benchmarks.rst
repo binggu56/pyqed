@@ -53,6 +53,10 @@ output a release claim until a completed manifest and artifacts are reviewed.
    * - Integral-representation comparison
      - ``examples/qchem/casscf_factor_vs_dense.py``
      - Dense versus factorized CASSCF on one small H4 case
+   * - Native spherical integral consumers
+     - ``examples/qchem/spherical_consumer_validation.py``
+     - Dense-reference accuracy, direct-J/K timing against PySCF, Cartesian
+       round-trip timing, RI storage, screening, and native worker scaling
    * - Relativistic mean-field validation
      - ``examples/qchem/benchmark_x2c_rhf_vs_pyscf.py``
      - Selected X2C/RHF cases against PySCF
@@ -68,6 +72,11 @@ output a release claim until a completed manifest and artifacts are reviewed.
    * - Non-Abelian readiness diagnostics
      - ``examples/qchem/benchmark_su2_readiness.py``
      - Component/reduced-path diagnostics; not a general solver claim
+   * - Fully contracted CASPT2 validation
+     - ``benchmarks/caspt2_openmolcas.py``
+     - Matched CASSCF/zero-IPEA comparison with OpenMolcas when available;
+       explicitly correlates all inactive orbitals and always writes JSON
+       diagnostics and a contraction figure
 
 Run locally
 -----------

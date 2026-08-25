@@ -43,6 +43,17 @@ Current development-branch matrix
      - :doc:`mp2_comp2`, :doc:`guide/guide_qchem_mcscf`
      - ``tests/test_mp2.py``, ``tests/test_casci.py``,
        ``tests/test_casscf.py``
+   * - Fully internally contracted zero-IPEA SS-CASPT2 energies
+     - Beta
+     - :doc:`caspt2`
+     - ``tests/test_caspt2.py``, ``benchmarks/caspt2_openmolcas.py``;
+       matched LiH and H2O zero-IPEA OpenMolcas energies, including a
+       915-dimensional LiH/cc-pVDZ contracted-space gate
+   * - Zero-IPEA MS-CASPT2 and XMS-CASPT2 energies
+     - Beta
+     - :doc:`caspt2`
+     - algebraic/invariance checks and matched LiH OpenMolcas effective
+       Hamiltonians in ``tests/test_caspt2.py``
    * - DVR and small grid-dynamics paths
      - Beta
      - :doc:`dvr`
@@ -66,6 +77,10 @@ Current development-branch matrix
      - :doc:`gw_bse`, :doc:`periodic_gw_bse`
      - ``tests/test_gw_smoke.py``, ``tests/test_pbc_gw.py`` and comparison
        scripts
+   * - Periodic finite-displacement phonons
+     - Experimental
+     - :doc:`periodic_phonons`
+     - ``tests/test_pbc_phonon.py`` and ``examples/pbc_phonon.py``
    * - Real-time TDHF/TDDFT and coupled dynamics
      - Experimental
      - :doc:`tddft_ehrenfest`
