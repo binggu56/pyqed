@@ -199,7 +199,6 @@ class DMRGSCF(QCDMRG):
         integral_backend=None,
         **kwargs,
     ):
-       
         super().__init__(
             mf,
             ncas,
@@ -209,12 +208,11 @@ class DMRGSCF(QCDMRG):
             **kwargs,
         )
 
-        self.max_cycles = max_cycles # macroiterations
-        self.tol = float(macro_tol) # macro energy tol
+        self.max_cycles = max_cycles
+        self.tol = float(macro_tol)
         self.dmrg_conv_tol = float(dmrg_conv_tol)
-        self.mo_coeff = None # opt orb
+        self.mo_coeff = None
         self.use_cholesky_integrals = False
-
 
         self.weights = None
         self.nstates = 1
@@ -222,8 +220,6 @@ class DMRGSCF(QCDMRG):
         self.macro_converged = False
         self.solver_converged = False
         self.macro_iterations = 0
-
-
     def run(self, nstates=1, weights=None, require_conv=True, mo_coeff=None, **kwargs):
         mf = self.mf
         orbital_driver = str(kwargs.pop("orbital_driver", "constrained")).lower().replace(
