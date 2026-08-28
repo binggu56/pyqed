@@ -9,6 +9,7 @@ __all__ = [
     "CGLDR",
     "CGLDRElectronicData",
     "ElectronicPartition",
+    "LDR",
     "LDRN",
     "OverlapBasis",
     "SeparableHamiltonian",
@@ -40,6 +41,11 @@ def __getattr__(name):
 
         globals()[name] = LDRN
         return LDRN
+    if name == "LDR":
+        from .core import LDR
+
+        globals()[name] = LDR
+        return LDR
     if name in {"mps_to_array", "nuclear_density_distance", "nuclear_observables"}:
         from . import observables
 

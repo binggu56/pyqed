@@ -31,7 +31,7 @@ def _basis_and_transform(mol):
         basis = getattr(mol, "_bas", None)
         transform = None
     if basis is None:
-        raise ValueError("Build the molecule with driver='builtin' before requesting derivative integrals.")
+        raise ValueError("Build the molecule before requesting derivative integrals.")
     return tuple(basis), transform
 
 
@@ -854,7 +854,8 @@ def _directional_hcore_derivatives_pyscf(mol, directions, order):
                 generator(atom),
                 optimize=True,
             )
-        return out
+        permutation = mol.pyscf_ao_permutation(pmol)
+        return out[:, permutation][:, :, permutation]
 
     generator = pmf.Hessian().hcore_generator(pmol)
     out = np.zeros((nmodes, nmodes, nao, nao), dtype=float)
@@ -867,7 +868,9 @@ def _directional_hcore_derivatives_pyscf(mol, directions, order):
                 generator(atom_a, atom_b),
                 optimize=True,
             )
-    return 0.5 * (out + out.swapaxes(0, 1))
+    out = 0.5 * (out + out.swapaxes(0, 1))
+    permutation = mol.pyscf_ao_permutation(pmol)
+    return out[:, :, permutation][:, :, :, permutation]
 
 
 def _directional_one_electron_derivatives_python(
@@ -1370,7 +1373,58 @@ def _eri_derivatives_compact(mol, order=1):
     return CompactERIDerivatives(data, pairs, nao_cart, nao, transform=transform)
 
 
-def eri_derivative_veff_scalar(mol, dm_left, dm_right, order=2):
+def _directional_eri_derivative_scalar_cpp(
+    mol,
+    directions,
+    dm_left,
+    dm_right,
+    order=2,
+    workers=None,
+):
+    if _integrals_cpp is None or not hasattr(
+        _integrals_cpp,
+        "compute_directional_eri_derivative_scalar",
+    ):
+        raise ImportError("The C++ derivative-contraction kernel is unavailable.")
+    basis, transform = _basis_and_transform(mol)
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    atom_ids = _atom_ids_for_basis(basis, coords)
+    directions = _as_direction_matrix(directions, len(coords)).reshape(
+        -1, len(coords), 3
+    )
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    if workers is None:
+        workers = _builtin_worker_count(mol, len(basis))
+    return np.asarray(
+        _integrals_cpp.compute_directional_eri_derivative_scalar(
+            np.ascontiguousarray(shells, dtype=np.int64),
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(exps, dtype=np.float64),
+            np.ascontiguousarray(weights, dtype=np.float64),
+            np.ascontiguousarray(nprim, dtype=np.int64),
+            np.ascontiguousarray(atom_ids, dtype=np.int64),
+            np.ascontiguousarray(directions, dtype=np.float64),
+            np.ascontiguousarray(
+                _transform_dm_to_cart(dm_left, transform), dtype=np.float64
+            ),
+            np.ascontiguousarray(
+                _transform_dm_to_cart(dm_right, transform), dtype=np.float64
+            ),
+            int(order),
+            int(workers),
+        ),
+        dtype=float,
+    )
+
+
+def eri_derivative_veff_scalar(
+    mol,
+    dm_left,
+    dm_right,
+    order=2,
+    workers=None,
+):
     """
     Direct scalar contractions of derivative ERIs with two densities.
 
@@ -1390,6 +1444,23 @@ def eri_derivative_veff_scalar(mol, dm_left, dm_right, order=2):
     npert = natm * 3
     dm_l = _transform_dm_to_cart(dm_left, transform)
     dm_r = _transform_dm_to_cart(dm_right, transform)
+
+    if _integrals_cpp is not None and hasattr(
+        _integrals_cpp,
+        "compute_directional_eri_derivative_scalar",
+    ):
+        try:
+            directions = np.eye(npert, dtype=float).reshape(npert, natm, 3)
+            return _directional_eri_derivative_scalar_cpp(
+                mol,
+                directions,
+                dm_left,
+                dm_right,
+                order=order,
+                workers=workers,
+            )
+        except (AttributeError, ImportError, NotImplementedError, RuntimeError):
+            pass
 
     if order == 1:
         out = np.zeros(npert, dtype=float)
@@ -1610,6 +1681,9 @@ def _directional_eri_derivatives_pyscf(mol, directions, order):
                 kernel,
                 optimize=True,
             )
+        permutation = mol.pyscf_ao_permutation(pmol)
+        for axis in range(out.ndim - 4, out.ndim):
+            out = np.take(out, permutation, axis=axis)
         return out
 
     out = np.zeros((nmodes, nmodes, nao, nao, nao, nao), dtype=float)
@@ -1652,7 +1726,11 @@ def _directional_eri_derivatives_pyscf(mol, directions, order):
                 optimize=True,
             )
         del kernel, base
-    return 0.5 * (out + out.swapaxes(0, 1))
+    out = 0.5 * (out + out.swapaxes(0, 1))
+    permutation = mol.pyscf_ao_permutation(pmol)
+    for axis in range(out.ndim - 4, out.ndim):
+        out = np.take(out, permutation, axis=axis)
+    return out
 
 
 def _directional_eri_derivatives_cpp(mol, directions, order):

@@ -5,6 +5,7 @@ Native RHF analytic Hessian from builtin derivative integrals.
 """
 
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 from pyqed.qchem.basis_derivatives import (
     compact_eri_veff,
@@ -14,6 +15,7 @@ from pyqed.qchem.basis_derivatives import (
     one_electron_derivatives,
     position_derivatives,
 )
+from pyqed.units import amu_to_au
 
 
 def _nuclear_hessian(mol):
@@ -106,13 +108,24 @@ class RHFHessian:
         npert = self._npert
         return int(npert * npert * npair * npair * np.dtype(float).itemsize)
 
-    def _second_derivative_veff_scalar(self, dm0, max_compact_bytes):
+    def _second_derivative_veff_scalar(
+        self,
+        dm0,
+        max_compact_bytes,
+        workers=None,
+    ):
         estimated_bytes = self._estimate_compact_eri2_bytes()
         if estimated_bytes <= int(max_compact_bytes):
             g2 = eri_derivatives(self.mol, order=2, compact=True)
             g2_veff = compact_eri_veff_many(g2, dm0)
             return np.einsum("pq,xypq->xy", dm0, g2_veff, optimize=True)
-        return eri_derivative_veff_scalar(self.mol, dm0, dm0, order=2)
+        return eri_derivative_veff_scalar(
+            self.mol,
+            dm0,
+            dm0,
+            order=2,
+            workers=workers,
+        )
 
     def _explicit_fock_derivatives(self, h1, eri1, dm0):
         npert = self._npert
@@ -591,7 +604,12 @@ class RHFHessian:
         self.first_order_orbital_energy = e1_all.reshape(self.mol.natom, 3, nocc, nocc)
         return dm1_all, w1_all
 
-    def run(self, symmetrize=True, max_compact_eri2_bytes=512 * 1024**2):
+    def run(
+        self,
+        symmetrize=True,
+        max_compact_eri2_bytes=512 * 1024**2,
+        workers=None,
+    ):
         self._require_scf()
 
         dm0 = np.asarray(self.base.make_rdm1(), dtype=float)
@@ -612,7 +630,11 @@ class RHFHessian:
         g1 = eri_derivatives(self.mol, order=1, compact=True)
         s2 = one_electron_derivatives(self.mol, "overlap", order=2)
         h2 = one_electron_derivatives(self.mol, "hcore", order=2)
-        g2_scalar = self._second_derivative_veff_scalar(dm0, max_compact_eri2_bytes)
+        g2_scalar = self._second_derivative_veff_scalar(
+            dm0,
+            max_compact_eri2_bytes,
+            workers=workers,
+        )
 
         f1 = self._explicit_fock_derivatives(h1, g1, dm0)
         dm1, w1 = self._solve_cphf(f1, s1)
@@ -713,7 +735,12 @@ class RHFHessian:
     ):
         if self.hess is None:
             raise ValueError("Run the Hessian calculation before requesting vibrational analysis.")
-        from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+        try:
+            from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+        except ModuleNotFoundError as error:
+            if error.name != "pyqed.qchem.dft":
+                raise
+            from pyqed.qchem.DFT.hessian import analyze_cartesian_hessian
 
         return analyze_cartesian_hessian(
             self.hess,
@@ -732,3 +759,62 @@ class RHFHessian:
         if unit in ("au", "a.u.", "hartree"):
             return data["freq_au"]
         raise ValueError("unit must be 'cm^-1' or 'au'.")
+
+    def normal_modes(
+        self,
+        targets=None,
+        *,
+        target_unit="cm^-1",
+        dimensionless=False,
+        **kwargs,
+    ):
+        """Return positive-frequency modes, optionally matched to targets.
+
+        Parameters
+        ----------
+        targets : array_like, optional
+            Frequencies used to select distinct nearest modes. By default all
+            positive-frequency vibrational modes are returned.
+        target_unit : {'cm^-1', 'au'}, optional
+            Unit of ``targets``.
+        dimensionless : bool, optional
+            Scale Cartesian modes for displacements by dimensionless normal
+            coordinates.
+
+        Returns
+        -------
+        omega, modes : ndarray
+            Selected frequencies in atomic units and Cartesian mode vectors.
+        """
+
+        data = self.vibrational_analysis(**kwargs)
+        omega = np.asarray(data["freq_au"], dtype=float)
+        modes = np.asarray(data["modes"], dtype=float)
+        valid = np.flatnonzero(np.isfinite(omega) & (omega > 0.0))
+
+        if targets is not None:
+            targets = np.atleast_1d(np.asarray(targets, dtype=float))
+            if targets.ndim != 1 or not np.all(np.isfinite(targets)):
+                raise ValueError("targets must be a finite one-dimensional array")
+            if targets.size > valid.size:
+                raise ValueError("more target frequencies than positive normal modes")
+            unit = str(target_unit).lower()
+            if unit in ("cm^-1", "cm-1", "wavenumber", "wavenumbers"):
+                values = np.asarray(data["freq_cm1"], dtype=float)[valid]
+            elif unit in ("au", "a.u.", "hartree"):
+                values = omega[valid]
+            else:
+                raise ValueError("target_unit must be 'cm^-1' or 'au'")
+            rows, columns = linear_sum_assignment(
+                abs(values[:, None] - targets[None, :])
+            )
+            selected = np.empty(targets.size, dtype=int)
+            selected[columns] = valid[rows]
+        else:
+            selected = valid
+
+        omega = omega[selected]
+        modes = np.array(modes[selected], copy=True)
+        if dimensionless:
+            modes /= np.sqrt(amu_to_au * omega)[:, None, None]
+        return omega, modes

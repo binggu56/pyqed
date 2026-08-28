@@ -449,44 +449,61 @@ class ExponentialDVR(SincDVR):
         M.H. Beck et al. Physics Reports 324 (2000) 1-105, P94
 
     """
-    def __init__(self, n, L=1 ,x0=0, *v, **kw):
+    def __init__(self, n=None, L=1, x0=0, mass=1.0, *, npts=None):
         # Small shift here for consistent abscissa
         # SincDVR.__init__(self, *v, **kw)
         # self.x -= self.a/2.
-        self.npts = self.N = 2*n + 1
+        if npts is None:
+            if n is None:
+                raise TypeError("provide n or npts")
+            npts = 2 * int(n) + 1
+        elif n is not None:
+            raise TypeError("provide either n or npts, not both")
+        if int(npts) < 2:
+            raise ValueError("npts must be at least two")
+        self.npts = self.N = int(npts)
         self.L = L
         self.n = np.arange(self.npts)
         self.x0 = x0
+        self.mass = float(mass)
+        if not np.isfinite(self.mass) or self.mass <= 0.0:
+            raise ValueError("mass must be positive and finite")
         self.a = self.L/self.npts
         self.x = self.x0 + self.n * self.a - self.L / 2.
+        self.dx = self.a
+        self.w = np.full(self.npts, self.a)
 
-        self.kx = (self.n - n) * 2 * np.pi/self.L
+        self.kx = 2.0 * np.pi * np.fft.fftfreq(self.npts, d=self.a)
         # scipy.fftpack.fftfreq
 
-    def t(self, hc=1., mc2=1.):
-        """Return the kinetic energy matrix.
-        Usage:
-            T = self.t(V)
-
-        @returns T kinetic energy matrix
-        """
-        _m = self.n[:, np.newaxis]
-        _n = self.n[np.newaxis, :]
-        _arg = np.pi*(_m-_n)/self.npts
+    def kinetic_toeplitz(self, hc=1., mc2=None):
+        """Return the first column and row of the periodic kinetic matrix."""
+        offset = self.n
+        angle = np.pi * offset / self.npts
         if (0 == self.npts % 2):
-            T = 2.*(-1.)**(_m-_n)/np.sin(_arg)**2.
-            T[self.n, self.n] = (self.npts**2. + 2.)/3.
-        else:
-
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
-                T = 2.*(-1.)**(_m-_n)*np.cos(_arg)/np.sin(_arg)**2.
+                column = 2.0 * (-1.0) ** offset / np.sin(angle) ** 2
+            column[0] = (self.npts**2. + 2.0) / 3.0
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                column = (
+                    2.0
+                    * (-1.0) ** offset
+                    * np.cos(angle)
+                    / np.sin(angle) ** 2
+                )
+            column[0] = (self.npts**2. - 1.0) / 3.0
+        column *= (np.pi / self.L) ** 2
+        mass = self.mass if mc2 is None else float(mc2)
+        column *= 0.5 * hc**2 / mass
+        return column, column.copy()
 
-            T[self.n, self.n] = (self.npts**2. - 1.)/3.
-
-        T *= (np.pi/self.L)**2.
-        T *= 0.5 * hc**2. / mc2   # (pc)^2 / (2 mc^2)
-        return T
+    def t(self, hc=1., mc2=None):
+        """Return the periodic kinetic energy matrix."""
+        column, row = self.kinetic_toeplitz(hc=hc, mc2=mc2)
+        return scipy.linalg.toeplitz(column, row)
 
     def derivative(self):
         """
@@ -504,9 +521,18 @@ class ExponentialDVR(SincDVR):
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            D = np.pi/self.L * (-1.)**(_m-_n)/np.sin(np.pi * (_m - _n)/self.npts)
+            angle = np.pi * (_m - _n) / self.npts
+            if self.npts % 2:
+                D = np.pi / self.L * (-1.)**(_m-_n) / np.sin(angle)
+            else:
+                D = np.pi / self.L * (-1.)**(_m-_n) / np.tan(angle)
 
+        D[self.n, self.n] = 0.0
         return D
+
+    def momentum(self, hbar=1.0):
+        """Return the Hermitian periodic momentum operator."""
+        return -1j * hbar * self.derivative()
 
 
     def f(self, x=None):
@@ -625,7 +651,37 @@ class SineDVR(_DVR1D):
 
         return (0.5 / m) * (np.pi / l)**2 * np.arange(1, self.npts + 1)**2
 
-    def t(self, hc=1., mc2=1.):
+    def kinetic_descriptor(self, hc=1.0, mc2=None):
+        """Return the exact Toeplitz-plus-Hankel sine-DVR KEO descriptor."""
+        npts = self.npts
+        m = npts + 1
+        offset = np.arange(npts)
+        angle = np.pi * offset / (2.0 * m)
+        toeplitz = np.empty(npts, dtype=float)
+        toeplitz[0] = (2.0 * m**2 + 1.0) / 3.0
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            toeplitz[1:] = (
+                (-1.0) ** offset[1:] / np.sin(angle[1:]) ** 2
+            )
+
+        hankel_offset = np.arange(2 * npts - 1)
+        hankel_angle = np.pi * (hankel_offset + 2) / (2.0 * m)
+        hankel = -(
+            (-1.0) ** hankel_offset / np.sin(hankel_angle) ** 2
+        )
+        mass = self.mass if mc2 is None else float(mc2)
+        scale = np.pi**2 * hc**2 / (4.0 * mass * self.L**2)
+        toeplitz *= scale
+        hankel *= scale
+        return {
+            "kind": "sine-toeplitz-hankel",
+            "column": toeplitz,
+            "row": toeplitz.copy(),
+            "hankel": hankel,
+        }
+
+    def t(self, hc=1.0, mc2=None):
         """Return the kinetic energy matrix.
         Usage:
             T = self.t(V)
@@ -648,7 +704,8 @@ class SineDVR(_DVR1D):
                      - 1./np.square(np.sin(np.pi * self.n / m)))
 
         T *= np.pi**2. / 2. / self.L**2 #prefactor common to all of T
-        T *= 0.5 * hc**2. / self.mass   # (pc)^2 / (2 mc^2)
+        mass = self.mass if mc2 is None else float(mc2)
+        T *= 0.5 * hc**2 / mass   # (pc)^2 / (2 mc^2)
 
         self.T = T
         return T

@@ -9626,6 +9626,52 @@ inline double primitive_center_second_derivative_target(
     return value;
 }
 
+inline double eri_scalar_weight_unique(
+    npy_intp nao,
+    npy_intp p,
+    npy_intp q,
+    npy_intp r,
+    npy_intp s,
+    const double* dm_left,
+    const double* dm_right
+) {
+    const std::array<std::array<npy_intp, 4>, 8> permutations = {{
+        {{p, q, r, s}},
+        {{q, p, r, s}},
+        {{p, q, s, r}},
+        {{q, p, s, r}},
+        {{r, s, p, q}},
+        {{s, r, p, q}},
+        {{r, s, q, p}},
+        {{s, r, q, p}},
+    }};
+    std::array<npy_intp, 8> seen{};
+    int nseen = 0;
+    double coulomb = 0.0;
+    double exchange = 0.0;
+    for (const auto& index : permutations) {
+        const npy_intp dense = dense_index(
+            nao, index[0], index[1], index[2], index[3]
+        );
+        bool duplicate = false;
+        for (int previous = 0; previous < nseen; ++previous) {
+            if (seen[previous] == dense) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            continue;
+        }
+        seen[nseen++] = dense;
+        coulomb += dm_left[index[0] * nao + index[1]]
+            * dm_right[index[2] * nao + index[3]];
+        exchange += dm_left[index[0] * nao + index[2]]
+            * dm_right[index[1] * nao + index[3]];
+    }
+    return coulomb - 0.5 * exchange;
+}
+
 bool compute_directional_shell_quartet_derivatives(
     const std::int64_t* shells,
     const double* origins,
@@ -9666,7 +9712,9 @@ bool compute_directional_shell_quartet_derivatives(
     std::vector<double>& mode_coeffs,
     HrrExpansionCache& hrr_cache,
     std::vector<HrrFirstDerivativeRecipe>& first_recipes,
-    std::vector<HrrSecondDerivativeRecipe>& second_recipes
+    std::vector<HrrSecondDerivativeRecipe>& second_recipes,
+    const double* dm_left,
+    const double* dm_right
 ) {
     const int max_a_l = pblk.l + qblk.l + order;
     const int max_c_l = rblk.l + sblk.l + order;
@@ -9976,6 +10024,18 @@ bool compute_directional_shell_quartet_derivatives(
         static_cast<std::size_t>(nao) * nao * nao * nao;
     for (std::size_t it = 0; it < targets.size(); ++it) {
         const ShellQuartetTarget& target = targets[it];
+        const bool contract_scalar = dm_left != nullptr && dm_right != nullptr;
+        const double scalar_weight = contract_scalar
+            ? eri_scalar_weight_unique(
+                nao,
+                target.ao_p,
+                target.ao_q,
+                target.ao_r,
+                target.ao_s,
+                dm_left,
+                dm_right
+            )
+            : 0.0;
         if (order == 1) {
             for (npy_intp mode = 0; mode < nmodes; ++mode) {
                 double value = 0.0;
@@ -9984,15 +10044,19 @@ bool compute_directional_shell_quartet_derivatives(
                         mode_coeffs[static_cast<std::size_t>(mode) * ncenter_derivatives + derivative] *
                         derivative_block[it * ncenter_derivatives + derivative];
                 }
-                add_eri_symmetries_unique(
-                    out + static_cast<std::size_t>(mode) * eri_size,
-                    nao,
-                    target.ao_p,
-                    target.ao_q,
-                    target.ao_r,
-                    target.ao_s,
-                    value
-                );
+                if (contract_scalar) {
+                    out[mode] += scalar_weight * value;
+                } else {
+                    add_eri_symmetries_unique(
+                        out + static_cast<std::size_t>(mode) * eri_size,
+                        nao,
+                        target.ao_p,
+                        target.ao_q,
+                        target.ao_r,
+                        target.ao_s,
+                        value
+                    );
+                }
             }
         } else {
             for (npy_intp mode_a = 0; mode_a < nmodes; ++mode_a) {
@@ -10013,15 +10077,20 @@ bool compute_directional_shell_quartet_derivatives(
                             ];
                         }
                     }
-                    add_eri_symmetries_unique(
-                        out + (static_cast<std::size_t>(mode_a) * nmodes + mode_b) * eri_size,
-                        nao,
-                        target.ao_p,
-                        target.ao_q,
-                        target.ao_r,
-                        target.ao_s,
-                        value
-                    );
+                    if (contract_scalar) {
+                        out[static_cast<std::size_t>(mode_a) * nmodes + mode_b] +=
+                            scalar_weight * value;
+                    } else {
+                        add_eri_symmetries_unique(
+                            out + (static_cast<std::size_t>(mode_a) * nmodes + mode_b) * eri_size,
+                            nao,
+                            target.ao_p,
+                            target.ao_q,
+                            target.ao_r,
+                            target.ao_s,
+                            value
+                        );
+                    }
                 }
             }
         }
@@ -10044,7 +10113,9 @@ bool compute_directional_eri_derivatives_blocked(
     int order,
     int workers,
     double* out,
-    const std::vector<ShellBlock>& shell_blocks
+    const std::vector<ShellBlock>& shell_blocks,
+    const double* dm_left,
+    const double* dm_right
 ) {
     try {
         const int nshell = static_cast<int>(shell_blocks.size());
@@ -10078,6 +10149,11 @@ bool compute_directional_eri_derivatives_blocked(
         );
         std::atomic<std::size_t> next_task{0};
         std::atomic<bool> failed{false};
+        std::mutex output_mutex;
+        const bool contract_scalar = dm_left != nullptr && dm_right != nullptr;
+        const std::size_t scalar_size = order == 1
+            ? static_cast<std::size_t>(nmodes)
+            : static_cast<std::size_t>(nmodes) * nmodes;
 
         auto run_worker = [&]() {
             std::vector<double> vrr_table(vrr_table_cap, 0.0);
@@ -10087,6 +10163,11 @@ bool compute_directional_eri_derivatives_blocked(
             HrrExpansionCache hrr_cache;
             std::vector<HrrFirstDerivativeRecipe> first_recipes;
             std::vector<HrrSecondDerivativeRecipe> second_recipes;
+            std::vector<double> scalar_output(
+                contract_scalar ? scalar_size : 0,
+                0.0
+            );
+            double* worker_output = contract_scalar ? scalar_output.data() : out;
             try {
                 while (!failed.load(std::memory_order_relaxed)) {
                     const std::size_t task_index = next_task.fetch_add(1, std::memory_order_relaxed);
@@ -10131,17 +10212,25 @@ bool compute_directional_eri_derivatives_blocked(
                             pair_geom.k.data() + rs_offset,
                             pair_geom.n[rs_pair_idx],
                             order,
-                            out,
+                            worker_output,
                             vrr_table,
                             targets,
                             derivative_block,
                             mode_coeffs,
                             hrr_cache,
                             first_recipes,
-                            second_recipes
+                            second_recipes,
+                            dm_left,
+                            dm_right
                         )) {
                         failed.store(true, std::memory_order_relaxed);
                         break;
+                    }
+                }
+                if (contract_scalar && !failed.load(std::memory_order_relaxed)) {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    for (std::size_t index = 0; index < scalar_size; ++index) {
+                        out[index] += scalar_output[index];
                     }
                 }
             } catch (...) {
@@ -11580,12 +11669,163 @@ PyObject* compute_directional_eri_derivatives(PyObject*, PyObject* args) {
         order,
         std::max(1, workers),
         out,
-        shell_blocks
+        shell_blocks,
+        nullptr,
+        nullptr
     );
     Py_END_ALLOW_THREADS
     if (!ok) {
         Py_DECREF(out_obj);
         PyErr_SetString(PyExc_RuntimeError, "C++ directional ERI derivative evaluation failed.");
+        return nullptr;
+    }
+    return out_obj;
+}
+
+PyObject* compute_directional_eri_derivative_scalar(PyObject*, PyObject* args) {
+    PyObject* shells_obj = nullptr;
+    PyObject* origins_obj = nullptr;
+    PyObject* exps_obj = nullptr;
+    PyObject* weights_obj = nullptr;
+    PyObject* nprim_obj = nullptr;
+    PyObject* atom_ids_obj = nullptr;
+    PyObject* directions_obj = nullptr;
+    PyObject* dm_left_obj = nullptr;
+    PyObject* dm_right_obj = nullptr;
+    int order = 2;
+    int workers = 1;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOOOOOOii",
+            &shells_obj,
+            &origins_obj,
+            &exps_obj,
+            &weights_obj,
+            &nprim_obj,
+            &atom_ids_obj,
+            &directions_obj,
+            &dm_left_obj,
+            &dm_right_obj,
+            &order,
+            &workers
+        )) {
+        return nullptr;
+    }
+    if (order != 1 && order != 2) {
+        PyErr_SetString(PyExc_ValueError, "order must be 1 or 2.");
+        return nullptr;
+    }
+
+    ArrayRef shells(shells_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef origins(origins_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef exps(exps_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef weights(weights_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef nprim(nprim_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef atom_ids(atom_ids_obj, NPY_INT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef directions(directions_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef dm_left(dm_left_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef dm_right(dm_right_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (
+        !shells || !origins || !exps || !weights || !nprim || !atom_ids
+        || !directions || !dm_left || !dm_right
+    ) {
+        return nullptr;
+    }
+    if (!validate_directional_eri_inputs(
+            shells.obj,
+            origins.obj,
+            exps.obj,
+            weights.obj,
+            nprim.obj,
+            atom_ids.obj,
+            directions.obj
+        )) {
+        return nullptr;
+    }
+
+    const npy_intp nao = PyArray_DIM(shells.obj, 0);
+    if (
+        PyArray_NDIM(dm_left.obj) != 2
+        || PyArray_NDIM(dm_right.obj) != 2
+        || PyArray_DIM(dm_left.obj, 0) != nao
+        || PyArray_DIM(dm_left.obj, 1) != nao
+        || PyArray_DIM(dm_right.obj, 0) != nao
+        || PyArray_DIM(dm_right.obj, 1) != nao
+    ) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "density matrices must both have shape (nao_cart, nao_cart)."
+        );
+        return nullptr;
+    }
+
+    const npy_intp max_prim = PyArray_DIM(exps.obj, 1);
+    const npy_intp nmodes = PyArray_DIM(directions.obj, 0);
+    const npy_intp natm = PyArray_DIM(directions.obj, 1);
+    const auto* shells_data = static_cast<const std::int64_t*>(PyArray_DATA(shells.obj));
+    const auto* origins_data = static_cast<const double*>(PyArray_DATA(origins.obj));
+    const auto* exps_data = static_cast<const double*>(PyArray_DATA(exps.obj));
+    const auto* weights_data = static_cast<const double*>(PyArray_DATA(weights.obj));
+    const auto* nprim_data = static_cast<const std::int64_t*>(PyArray_DATA(nprim.obj));
+    const auto* atom_ids_data = static_cast<const std::int64_t*>(PyArray_DATA(atom_ids.obj));
+    const auto* directions_data = static_cast<const double*>(PyArray_DATA(directions.obj));
+    const auto* dm_left_data = static_cast<const double*>(PyArray_DATA(dm_left.obj));
+    const auto* dm_right_data = static_cast<const double*>(PyArray_DATA(dm_right.obj));
+
+    std::vector<ShellBlock> shell_blocks;
+    if (!try_build_shell_blocks(
+            shells_data,
+            origins_data,
+            exps_data,
+            nprim_data,
+            nao,
+            max_prim,
+            shell_blocks
+        )) {
+        PyErr_SetString(
+            PyExc_NotImplementedError,
+            "C++ derivative contractions require contiguous complete Cartesian shell blocks."
+        );
+        return nullptr;
+    }
+
+    npy_intp dims1[1] = {nmodes};
+    npy_intp dims2[2] = {nmodes, nmodes};
+    PyObject* out_obj = PyArray_ZEROS(
+        order == 1 ? 1 : 2,
+        order == 1 ? dims1 : dims2,
+        NPY_DOUBLE,
+        0
+    );
+    if (out_obj == nullptr) {
+        return nullptr;
+    }
+    auto* out = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(out_obj)));
+    bool ok = false;
+    Py_BEGIN_ALLOW_THREADS
+    ok = compute_directional_eri_derivatives_blocked(
+        shells_data,
+        origins_data,
+        exps_data,
+        weights_data,
+        nprim_data,
+        atom_ids_data,
+        directions_data,
+        natm,
+        nmodes,
+        nao,
+        max_prim,
+        order,
+        std::max(1, workers),
+        out,
+        shell_blocks,
+        dm_left_data,
+        dm_right_data
+    );
+    Py_END_ALLOW_THREADS
+    if (!ok) {
+        Py_DECREF(out_obj);
+        PyErr_SetString(PyExc_RuntimeError, "C++ derivative contraction failed.");
         return nullptr;
     }
     return out_obj;
@@ -13943,6 +14183,7 @@ PyMethodDef methods[] = {
     {"direct_jk_spherical", direct_jk_spherical, METH_VARARGS, "Compute direct real-spherical J/K from fused shell-quartet blocks."},
     {"compute_eri_s8_cartesian", compute_eri_s8_cartesian, METH_VARARGS, "Compute eight-fold packed Cartesian ERIs through max_l."},
     {"compute_directional_eri_derivatives", compute_directional_eri_derivatives, METH_VARARGS, "Compute first or second directional Cartesian ERI derivatives."},
+    {"compute_directional_eri_derivative_scalar", compute_directional_eri_derivative_scalar, METH_VARARGS, "Contract directional ERI derivatives directly with two density matrices."},
     {"compute_directional_one_electron_derivatives", compute_directional_one_electron_derivatives, METH_VARARGS, "Compute first or second directional Cartesian one-electron derivatives."},
     {"compute_one_index_one_electron_derivatives", compute_one_index_one_electron_derivatives, METH_VARARGS, "Compute first or second one-index Cartesian overlap or kinetic derivatives."},
     {"direct_jk_cartesian", direct_jk_cartesian, METH_VARARGS, "Compute direct Cartesian J/K from AO shell data and a density matrix."},
