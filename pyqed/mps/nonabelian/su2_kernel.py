@@ -3,15 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
-
 import numpy as np
 
 
 _USE_CYTHON_PARENT_BLOCK_BATCH = False
 
 
-@lru_cache(maxsize=1)
 def _cpp_module():
     try:
         from pyqed.mps.nonabelian import _su2_kernel as module

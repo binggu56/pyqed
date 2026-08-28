@@ -22,6 +22,8 @@ from pyqed.mps.mps import (
     svd_symmetric,
     symmetric_to_dense,
     two_site_dmrg,
+    MPS,
+    MPO,
 )
 from pyqed.mps.dmrg import (
     DMRG,
@@ -64,6 +66,21 @@ from pyqed.mps.su2 import (
     fuse_irreps,
     fuse_charge_spin_sectors,
 )
+
+
+def _typed_abelian_dmrg_inputs(mpo_factors, state_factors):
+    hamiltonian = MPO(mpo_factors)
+    labels = (
+        ["lv", "rv", "p"]
+        if hasattr(state_factors[0], "qns")
+        else ["lv", "p", "rv"]
+    )
+    state = MPS(
+        state_factors,
+        labels=labels,
+        sites=hamiltonian.input_sites,
+    )
+    return hamiltonian, state
 
 
 def test_abelian_sector_pickle_roundtrip():
@@ -998,10 +1015,11 @@ def test_abelian_dmrg_uses_davidson_not_dense_local_matrix(monkeypatch):
     monkeypatch.setattr(HamiltonianMultiplyU1, "dense_matrix", fail_dense_matrix)
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -1052,10 +1070,11 @@ def test_abelian_dmrg_packed_local_davidson_matches_two_site_hopping(monkeypatch
     monkeypatch.setattr(HamiltonianMultiplyU1, "solve_packed_davidson", wrapped)
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -1065,6 +1084,7 @@ def test_abelian_dmrg_packed_local_davidson_matches_two_site_hopping(monkeypatch
         davidson_max_iter=20,
         noise=0.0,
         site_qn_maps=site_qn_maps,
+        performance="packed-compiled-fast",
         abelian_matvec_options={
             "packed_local_davidson": True,
             "packed_local_davidson_restart_dim": 8,
@@ -1077,10 +1097,6 @@ def test_abelian_dmrg_packed_local_davidson_matches_two_site_hopping(monkeypatch
     assert calls["n"] > 0
     assert getattr(optimize_two_sites, "last_AA_flat", None) is not None
     assert getattr(optimize_two_sites, "last_AA_layout", None) is not None
-    assert isinstance(
-        getattr(optimize_two_sites, "last_split_result", None),
-        AbelianTwoSiteSplitResult,
-    )
     assert isinstance(
         getattr(optimize_two_sites, "last_native_site_tensors", None),
         AbelianTwoSiteUpdateData,
@@ -1120,10 +1136,11 @@ def test_abelian_dmrg_native_site_storage_keeps_native_factors():
     )
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -1197,20 +1214,24 @@ def test_abelian_dmrg_native_dense_guess_reaches_solver_without_blocktensor(monk
     monkeypatch.setattr(mps_module, "optimize_two_sites", fake_optimize)
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian = MPO(mpo)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=[
-            np.array([0.0, 1.0]).reshape(1, 2, 1),
-            np.array([1.0, 0.0]).reshape(1, 2, 1),
-        ],
+        init_guess=MPS(
+            [
+                np.array([0.0, 1.0]).reshape(1, 2, 1),
+                np.array([1.0, 0.0]).reshape(1, 2, 1),
+            ],
+            sites=hamiltonian.input_sites,
+        ),
         nsweeps=1,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
         sym_mgr=sym_mgr,
         not_conv_err=False,
         site_qn_maps=site_qn_maps,
-        performance="block2-like",
+        performance="symmetric",
         final_expectation=False,
     ).run()
 
@@ -1267,10 +1288,11 @@ def test_abelian_dmrg_native_site_storage_checkpoint_keeps_native_factors(tmp_pa
 
     checkpoint = tmp_path / "native_dmrg.pkl"
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -1376,10 +1398,11 @@ def test_abelian_packed_policy_defaults_to_native_site_storage(monkeypatch):
 
     monkeypatch.setattr(mps_module, "optimize_two_sites", wrapped_optimize)
 
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -1455,10 +1478,11 @@ def test_abelian_fast_policy_uses_native_site_storage(monkeypatch):
     monkeypatch.setattr(mps_module, "optimize_two_sites", wrapped_optimize)
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -1848,10 +1872,11 @@ def test_abelian_dmrg_native_site_storage_multibond_moving_environment():
     ]
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, native_init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=native_init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -2432,20 +2457,20 @@ def test_hubbard_ladder_compiled_policy_uses_full_safe_layout():
     assert projected["native_site_storage"] is True
     assert projected["packed_local_project_current_support"] is True
 
-    cpp = dmrg_matvec_options("packed-cpp-fast")
-    assert dmrg_matvec_options("auto") == cpp
-    assert dmrg_matvec_options("default") == cpp
-    assert dmrg_matvec_options("safe") == cpp
-    assert dmrg_matvec_options("block2-like") == cpp
-    assert cpp["native_site_storage"] is True
-    assert cpp["moving_environment_cpp_davidson"] is True
-    assert cpp["moving_environment_cpp_accept_unconverged"] is False
-    assert cpp["moving_environment_cpp_validate_solution"] is True
-    assert cpp["moving_environment_cpp_solution_residual_tol_factor"] >= 1.0
-    assert cpp["moving_environment_cpp_solution_residual_abs_tol"] <= 1.0e-8
-    assert cpp["moving_environment_cpp_validate_matvec"] is False
-    assert cpp["generator_table_packed_boundary_tensors"] is True
-    assert cpp["generator_table_allow_legacy_blocktensor_boundary_tables"] is False
+    symmetric = dmrg_matvec_options("symmetric")
+    cpp = symmetric
+    assert dmrg_matvec_options("auto") == symmetric
+    assert dmrg_matvec_options("default") == symmetric
+    assert dmrg_matvec_options("safe") == symmetric
+    assert symmetric["native_site_storage"] is True
+    assert symmetric["moving_environment_cpp_davidson"] is True
+    assert symmetric["moving_environment_cpp_accept_unconverged"] is True
+    assert symmetric["moving_environment_cpp_validate_solution"] is True
+    assert symmetric["moving_environment_cpp_solution_residual_tol_factor"] >= 1.0
+    assert symmetric["moving_environment_cpp_solution_residual_abs_tol"] <= 1.0e-8
+    assert symmetric["moving_environment_cpp_validate_matvec"] is False
+    assert symmetric["generator_table_packed_boundary_tensors"] is True
+    assert symmetric["generator_table_allow_legacy_blocktensor_boundary_tables"] is False
     assert cpp["generator_table_allow_unpacked_boundary_tensor_fallback"] is False
     assert cpp["generator_table_prebuild_same_side_native_p"] is True
     assert cpp["generator_table_incremental_same_side_pair_prebuild"] is True
@@ -2473,8 +2498,7 @@ def test_hubbard_ladder_compiled_policy_uses_full_safe_layout():
     assert cpp["moving_environment_cpp_owner_half_sweep_step_records"] is True
     assert cpp["moving_environment_cpp_owner_half_sweep_typed_records"] is True
     assert cpp["moving_environment_operatorless_local_problem"] is True
-    assert cpp["generator_table_packed_direct_family_entries"] is False
-    assert "mixed packed P" in cpp["generator_table_packed_direct_family_entries_reason"]
+    assert cpp["generator_table_packed_direct_family_entries"] is True
     assert cpp["generator_table_precompute_contextual_boundaries"] is True
     assert cpp["generator_table_precompute_contextual_boundaries_min_records"] == 0
     assert cpp["generator_table_planned_contextual_without_precompute_table_lookup"] is True
@@ -2518,7 +2542,10 @@ def test_hubbard_ladder_compiled_policy_uses_full_safe_layout():
     without_cpp.pop("generator_table_planned_contextual_without_precompute")
     without_cpp.pop("generator_table_planned_contextual_without_precompute_table_lookup")
     without_cpp.pop("generator_table_packed_direct_family_entries")
-    without_cpp.pop("generator_table_packed_direct_family_entries_reason")
+    without_cpp.pop("generator_table_allow_planned_packed_contextual_entries")
+    without_cpp.pop("generator_table_allow_table_backed_planned_contextual_entries")
+    without_cpp.pop("generator_table_snapshot_table_backed_planned_entries")
+    without_cpp.pop("generator_table_validate_cpp_boundary_p_raw_table")
     without_cpp.pop("generator_table_packed_boundary_tensors")
     without_cpp.pop("generator_table_allow_legacy_blocktensor_boundary_tables")
     without_cpp.pop("generator_table_allow_unpacked_boundary_tensor_fallback")
@@ -2529,12 +2556,16 @@ def test_hubbard_ladder_compiled_policy_uses_full_safe_layout():
     without_cpp.pop("generator_table_use_true_packed_identity_entries")
     without_cpp.pop("generator_table_planned_native_p_identity_entries")
     without_cpp["generator_table_precompute_contextual_boundaries"] = False
+    without_cpp["generator_table_packed_route_table"] = opts[
+        "generator_table_packed_route_table"
+    ]
     without_cpp.pop("moving_environment_cpp_grouped_bond_slots")
     without_cpp.pop("moving_environment_cpp_environment_update")
     without_cpp.pop("packed_local_family_flat_group_identity_csr")
     without_cpp.pop("packed_local_family_flat_group_local_generator_csr")
     assert without_cpp == opts
-    assert dmrg_matvec_options("block2-cpp") == cpp
+    with pytest.raises(ValueError, match="Unknown DMRG performance policy"):
+        dmrg_matvec_options("block2-cpp")
 
 
 def test_cpp_direct_family_payload_accepts_packed_boundary_tensors():
@@ -2584,7 +2615,7 @@ def test_cpp_direct_family_payload_accepts_packed_boundary_tensors():
     assert stats["direct_layout_pair_misses"] == 0
 
 
-def test_packed_cpp_fast_full_sweep_matches_compiled_policy_for_tiny_chain():
+def test_symmetric_full_sweep_matches_compiled_policy_for_tiny_chain():
     if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
         pytest.skip("optional C++ Davidson backend is not available")
 
@@ -2622,10 +2653,15 @@ def test_packed_cpp_fast_full_sweep_matches_compiled_policy_for_tiny_chain():
     sym_mgr = SymmetryManager(["charge"])
 
     def run(policy):
+        hamiltonian = MPO(mpo)
         return DMRG(
-            mpo,
+            hamiltonian,
             D=4,
-            init_guess=[tensor.copy() for tensor in init],
+            init_guess=MPS(
+                [tensor.copy() for tensor in init],
+                labels=["lv", "rv", "p"],
+                sites=hamiltonian.input_sites,
+            ),
             nsweeps=3,
             symmetry=True,
             target_qn=sym_mgr.get_target_qn(1),
@@ -2640,7 +2676,7 @@ def test_packed_cpp_fast_full_sweep_matches_compiled_policy_for_tiny_chain():
         ).run()
 
     compiled = run("packed-compiled-fast")
-    cpp = run("packed-cpp-fast")
+    cpp = run("symmetric")
 
     assert cpp.e_tot == pytest.approx(compiled.e_tot, abs=1.0e-10)
     moving = cpp.environment_profile["moving_environment"]
@@ -2685,10 +2721,11 @@ def test_abelian_dmrg_records_environment_profile():
     )
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -8789,10 +8826,11 @@ def test_abelian_dmrg_accepts_entangled_dense_initial_guess():
     A1[1, 0, 0] = inv_sqrt2
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, [A0, A1])
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=4,
-        init_guess=[A0, A1],
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),
@@ -8831,10 +8869,11 @@ def test_abelian_dmrg_reports_post_truncation_state_energy():
     init = dense_to_symmetric(psi0, phys_qns=[q0, q1])
 
     sym_mgr = SymmetryManager(["charge"])
+    hamiltonian, state = _typed_abelian_dmrg_inputs(mpo, init)
     dmrg = DMRG(
-        mpo,
+        hamiltonian,
         D=1,
-        init_guess=init,
+        init_guess=state,
         nsweeps=2,
         symmetry=True,
         target_qn=sym_mgr.get_target_qn(1),

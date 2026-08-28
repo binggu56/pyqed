@@ -155,6 +155,42 @@ def orbital_hessian_action_from_integrals(h1_mo, eri_mo, dm1, dm2, kappa):
     return orbital_gradient(dfock)
 
 
+def create_factor_hessian_workspace(
+    h1_mo,
+    pair_factors,
+    dm1_occ,
+    dm2_occ,
+    pair_matrix,
+    contracted_dm2,
+):
+    """Create the optional persistent C++ factor-Hessian workspace."""
+    arrays = (h1_mo, pair_factors, dm1_occ, dm2_occ, pair_matrix, contracted_dm2)
+    if any(np.iscomplexobj(array) for array in arrays):
+        return None
+    create = _cpp_attr("create_factor_hessian_workspace")
+    if create is None:
+        return None
+    try:
+        return create(
+            *(np.ascontiguousarray(array, dtype=np.float64) for array in arrays)
+        )
+    except Exception:
+        return None
+
+
+def apply_factor_hessian_workspace(workspace, kappas):
+    """Apply a persistent C++ factor-Hessian workspace, or return ``None``."""
+    if workspace is None or np.iscomplexobj(kappas):
+        return None
+    apply = _cpp_attr("apply_factor_hessian_workspace")
+    if apply is None:
+        return None
+    try:
+        return apply(workspace, np.ascontiguousarray(kappas, dtype=np.float64))
+    except Exception:
+        return None
+
+
 def orbital_gradient(fock):
     """
     Anti-Hermitian orbital gradient from the generalized Fock matrix.
@@ -466,38 +502,39 @@ def augmented_hessian_direction(
         return np.zeros(0, dtype=float)
 
     hess_model = np.maximum(np.abs(hess_diag), float(regularization))
-    ah = np.zeros((grad_vec.size + 1, grad_vec.size + 1), dtype=float)
-    ah[0, 1:] = grad_vec
-    ah[1:, 0] = grad_vec
-    ah[1:, 1:] = np.diag(hess_model)
+    if not np.any(grad_vec):
+        return np.zeros_like(grad_vec)
 
-    eigvals, eigvecs = np.linalg.eigh(ah)
-    candidates = []
+    # For diagonal H the lowest augmented-Hessian eigenvalue is the unique
+    # negative root of lambda + sum(g_i^2 / (H_i - lambda)) = 0.  Solving this
+    # secular equation avoids materializing and diagonalizing an
+    # (n_orbital_rotations + 1)^2 dense arrowhead matrix.
+    grad_sq = grad_vec * grad_vec
 
-    for root in range(eigvecs.shape[1]):
-        vec = eigvecs[:, root]
-        alpha = float(vec[0])
-        if alpha < 0.0:
-            vec = -vec
-            alpha = -alpha
-        if abs(alpha) < 1.0e-10:
-            continue
+    def secular(value):
+        return float(value + np.sum(grad_sq / (hess_model - value)))
 
-        step = np.asarray(vec[1:] / alpha, dtype=float)
-        if max_step is not None:
-            step = limit_step_norm(step, max_step)
-
-        directional_derivative = float(np.dot(step, grad_vec))
-        if directional_derivative >= -1.0e-12:
-            continue
-
-        candidates.append(
-            (
-                quadratic_model_change(step, grad_vec, hess_model),
-                np.linalg.norm(step),
-                step,
-            )
+    lower = -max(1.0, float(np.max(hess_model)), float(np.linalg.norm(grad_vec)))
+    while secular(lower) > 0.0:
+        lower *= 2.0
+    upper = 0.0
+    for _ in range(80):
+        midpoint = 0.5 * (lower + upper)
+        if secular(midpoint) > 0.0:
+            upper = midpoint
+        else:
+            lower = midpoint
+    eigenvalue = 0.5 * (lower + upper)
+    step = -grad_vec / (hess_model - eigenvalue)
+    if max_step is not None:
+        step = limit_step_norm(step, max_step)
+    candidates = [
+        (
+            quadratic_model_change(step, grad_vec, hess_model),
+            np.linalg.norm(step),
+            step,
         )
+    ]
 
     if fallback_step is not None:
         fallback_step = np.asarray(fallback_step, dtype=float)
@@ -534,6 +571,7 @@ def davidson_augmented_hessian_direction(
     guess=None,
     fallback_step=None,
     return_info=False,
+    matvec_block=None,
 ):
     """
     Solve the orbital augmented-Hessian eigenproblem with a Davidson microiteration.
@@ -546,6 +584,9 @@ def davidson_augmented_hessian_direction(
         Diagonal Hessian approximation used for preconditioning.
     matvec : callable
         Returns the Hessian action ``H @ x`` for a packed step ``x``.
+    matvec_block : callable, optional
+        Applies the Hessian to a column block. Used to batch expensive
+        factorized integral contractions for the initial/restart subspaces.
     """
     grad_vec = np.asarray(grad_vec, dtype=float)
     hess_diag = np.asarray(hess_diag, dtype=float)
@@ -595,7 +636,18 @@ def davidson_augmented_hessian_direction(
         seed_cols = seed_cols[: int(max_subspace)]
 
     V = _orthonormalize_columns(np.column_stack(seed_cols))
-    W = np.column_stack([np.asarray(matvec(V[:, i]), dtype=float) for i in range(V.shape[1])])
+    def apply_block(block):
+        block = np.asarray(block, dtype=float)
+        if matvec_block is None:
+            return np.column_stack(
+                [np.asarray(matvec(block[:, i]), dtype=float) for i in range(block.shape[1])]
+            )
+        result = np.asarray(matvec_block(block), dtype=float)
+        if result.shape != block.shape:
+            raise ValueError("augmented-Hessian block matvec returned the wrong shape.")
+        return result
+
+    W = apply_block(V)
 
     best = None
     info = {
@@ -709,7 +761,7 @@ def davidson_augmented_hessian_direction(
             if max_subspace is not None and int(max_subspace) > 0:
                 keep = keep[: int(max_subspace)]
             V = _orthonormalize_columns(np.column_stack(keep))
-            W = np.column_stack([np.asarray(matvec(V[:, i]), dtype=float) for i in range(V.shape[1])])
+            W = apply_block(V)
             continue
 
         corr_block = correction.reshape(-1, 1)

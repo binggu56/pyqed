@@ -6,7 +6,7 @@ import numpy as np
 from tensorly.decomposition import tensor_train_matrix
 
 from pyqed.mps.decompose import tt_to_tensor, compress as compress_mps_factors
-from pyqed.mps.mps import MPO, product_MPO, symmetric_to_dense
+from pyqed.mps.mps import MPO, symmetric_to_dense
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
@@ -124,13 +124,13 @@ def _normalize_state_ids(state_ids, nstates):
 
 
 def _state_to_dense_tensor(state):
-    dense_state = symmetric_to_dense(state) if hasattr(state.Bs[0], "qns") else state
+    dense_state = symmetric_to_dense(state) if hasattr(state.factors[0], "qns") else state
     std_state = dense_state if dense_state.labels == ["lv", "p", "rv"] else dense_state.to_order(["lv", "p", "rv"])
     return np.asarray(tt_to_tensor(std_state.factors))
 
 
 def _state_to_dense_mps(state):
-    dense_state = symmetric_to_dense(state) if hasattr(state.Bs[0], "qns") else state
+    dense_state = symmetric_to_dense(state) if hasattr(state.factors[0], "qns") else state
     return dense_state if dense_state.labels == ["lv", "p", "rv"] else dense_state.to_order(["lv", "p", "rv"])
 
 
@@ -228,18 +228,9 @@ def _as_overlap_state(obj, state_ids):
 
 
 def _compute_ao_overlap_matrix(bra, ket):
-    try:
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+    from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 
-        return overlap_integral_asymmetric(bra.mol._bas, ket.mol._bas)
-    except (ImportError, AttributeError, TypeError):
-        from pyscf import gto
-
-        mol_bra = bra.mol.topyscf()
-        mol_ket = ket.mol.topyscf()
-        mol_bra.build()
-        mol_ket.build()
-        return gto.intor_cross("int1e_ovlp", mol_bra, mol_ket)
+    return _cross_ao_overlap_matrix(bra.mol, ket.mol)
 
 
 def _compute_full_mo_overlap(bra, ket, s=None):
@@ -542,32 +533,18 @@ def _phase_align_transformed_states(reference_states, transformed_states, tol=1e
 
 def _compress_mps_preserve_norm(state, chi_max):
     compressed = compress_mps_factors([factor.copy() for factor in state.factors], chi_max, renormalize=False)
-    return state.__class__(compressed, labels=["lv", "p", "rv"])
+    return state.__class__(
+        compressed, labels=["lv", "p", "rv"], sites=state.sites
+    )
 
 
 def _mpo_product_preserve_operator(left, right, chi_max=None):
-    raw_factors = product_MPO(left.factors, right.factors)
+    product = left @ right
     if chi_max is None:
-        return MPO(raw_factors)
-    if max(w.shape[1] for w in raw_factors) <= chi_max:
-        return MPO(raw_factors)
-
-    mps_factors = []
-    phys_dims = []
-    for w in raw_factors:
-        phys_dims.append((w.shape[2], w.shape[3]))
-        mps_factors.append(w.reshape(w.shape[0], w.shape[1], w.shape[2] * w.shape[3]).transpose(0, 2, 1))
-
-    compressed_factors = compress_mps_factors(mps_factors, chi_max, renormalize=False)
-
-    final_factors = []
-    for i, b in enumerate(compressed_factors):
-        d_up, d_down = phys_dims[i]
-        b_transposed = b.transpose(0, 2, 1)
-        final_factors.append(
-            b_transposed.reshape(b_transposed.shape[0], b_transposed.shape[1], d_up, d_down)
-        )
-    return MPO(final_factors)
+        return product
+    if max(product.bond_orders()) <= chi_max:
+        return product
+    return product.compress(chi_max)
 
 
 def _finalize_transformed_states(reference_states, transformed_states, *, method, chi_max, phase_align_tol):

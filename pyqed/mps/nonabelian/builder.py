@@ -14,7 +14,7 @@ from pyqed.mps.su2 import SU2Irrep
 
 from .contraction import normalize_site_tensor_layout
 from .mpo import (
-    PhysicalLeg,
+    Leg,
     SiteOperator,
     MPO,
     IrreducibleChannelTerm,
@@ -30,11 +30,11 @@ def identity_operator(phys_leg, *, dtype=float):
     """
     Build the identity operator in the sector basis of one site.
     """
-    if not isinstance(phys_leg, PhysicalLeg):
-        raise TypeError("identity_operator expects a PhysicalLeg.")
+    if not isinstance(phys_leg, Leg):
+        raise TypeError("identity_operator expects a Leg.")
     blocks = {}
     for sector in phys_leg.sectors:
-        dim = phys_leg.dim(sector)
+        dim = phys_leg.sector_dim(sector)
         blocks[(sector, sector)] = np.eye(dim, dtype=dtype)
     return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
 
@@ -68,12 +68,12 @@ def _parity_operator(phys_leg, *, dtype=float):
         charge = getattr(sector, "charge", None)
         if charge is None:
             raise ValueError(
-                "Cannot infer fermionic parity for a PhysicalLeg whose sectors have no charge."
+                "Cannot infer fermionic parity for a Leg whose sectors have no charge."
             )
         weights[sector] = float((-1) ** int(charge))
     blocks = {}
     for sector in phys_leg.sectors:
-        dim = phys_leg.dim(sector)
+        dim = phys_leg.sector_dim(sector)
         blocks[(sector, sector)] = np.asarray(weights[sector], dtype=dtype) * np.eye(
             dim, dtype=dtype
         )
@@ -87,7 +87,7 @@ def _site_physical_leg_from_tensor(site):
     dims = {}
     for key, block in site.data.items():
         dims.setdefault(key[1], int(block.shape[1]))
-    return PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+    return Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
 
 
 def _validate_site_operator(site_operator, phys_leg, *, label):
@@ -130,7 +130,7 @@ def _dense_signature(array, *, tol=1.0e-14):
 def _leg_signature(leg):
     return (
         tuple(leg.sectors),
-        tuple((sector, int(leg.dim(sector))) for sector in leg.sectors),
+        tuple((sector, int(leg.sector_dim(sector))) for sector in leg.sectors),
     )
 
 
@@ -289,8 +289,8 @@ class AutoMPO:
         site_legs = tuple(site_legs)
         if len(site_legs) < 2:
             raise ValueError("AutoMPO requires at least two sites.")
-        if any(not isinstance(leg, PhysicalLeg) for leg in site_legs):
-            raise TypeError("AutoMPO expects PhysicalLeg entries.")
+        if any(not isinstance(leg, Leg) for leg in site_legs):
+            raise TypeError("AutoMPO expects Leg entries.")
         self.site_legs = site_legs
         self.nsites = len(site_legs)
         self._terms = []

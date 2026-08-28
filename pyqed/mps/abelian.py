@@ -6,7 +6,7 @@ Created on Mon Jun 23 10:47:12 2025
 @author: Bing Gu (gubing@westlake.edu.cn)
 """
 
-from pyqed.mps.mps import Site
+from pyqed.lattice.site import Leg, Site
 # from pyqed import
 
 from itertools import product
@@ -44,7 +44,7 @@ class ConservedSite(Site):
         else:
             self.d = sum(self.degeneracy) # total size
 
-        # super().__init__(self.d)
+        super().__init__(Leg(dim=self.d), operators=operators)
 
         self.dims = [self.d] # for composite sites
 
@@ -340,7 +340,7 @@ if __name__=='__main__':
 
 
     # from pyqed.dmrg.dmrg import SpinHalfFermionChain
-    from pyqed.mps import SpinHalfFermionChain
+    from pyqed.mps.fermion import SpinHalfFermionChain
     from pyqed.qchem.mol import atomic_chain
     from pyqed.phys import eigh
 

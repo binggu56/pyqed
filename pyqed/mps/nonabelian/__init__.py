@@ -39,7 +39,7 @@ from .coupling import (
     recoupling_matrix,
 )
 from .mpo import (
-    PhysicalLeg,
+    Leg,
     SiteOperator,
     MPO,
     IrreducibleChannelTerm,
@@ -49,6 +49,7 @@ from .mpo import (
     as_rank_coupled_mpo,
     compress_rank_coupled_mpo_chain,
     direct_sum_rank_coupled_mpo,
+    scale_mpo_chain,
     sum_mpo_chains,
 )
 from .builder import AutoMPO, identity_operator

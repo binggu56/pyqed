@@ -4119,6 +4119,11 @@ class RenormalizedBlockStack:
         compare=False,
         repr=False,
     )
+    su2_boundary_environment: object | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
     cpp_boundary_syncs: int = 0
     cpp_boundary_sync_failures: int = 0
     released_consumed_numeric_tables: int = 0
@@ -4290,7 +4295,7 @@ class RenormalizedBlockStack:
     def _sync_cpp_boundary(self, entry):
         """Copy one reduced boundary arena into the persistent C++ owner."""
 
-        owner = self.su2_moving_environment
+        owner = self.su2_boundary_environment or self.su2_moving_environment
         namespace = str(self.namespace)
         if (
             owner is None
@@ -4551,7 +4556,7 @@ class RenormalizedBlockStack:
             site,
             phys_slices=phys_slices,
             moving_environment=(
-                self.su2_moving_environment
+                self.su2_boundary_environment or self.su2_moving_environment
                 if str(self.namespace) in {"hamiltonian", "norm"}
                 else None
             ),
@@ -4641,7 +4646,7 @@ class RenormalizedBlockStack:
             site,
             phys_slices=phys_slices,
             moving_environment=(
-                self.su2_moving_environment
+                self.su2_boundary_environment or self.su2_moving_environment
                 if str(self.namespace) in {"hamiltonian", "norm"}
                 else None
             ),
@@ -4735,12 +4740,13 @@ class RenormalizedBlockStack:
     def release_consumed_boundary(self, side, bond):
         """Drop an obsolete prebuilt boundary after its bond was advanced."""
 
-        if self.su2_moving_environment is None:
+        owner = self.su2_boundary_environment or self.su2_moving_environment
+        if owner is None:
             return False
         normalized_side = str(side).lower()
         normalized_bond = int(bond)
         system_stats = getattr(
-            self.su2_moving_environment,
+            owner,
             "system_stats",
             {},
         )
@@ -4767,7 +4773,7 @@ class RenormalizedBlockStack:
             )
         if str(self.namespace) != "norm":
             release = getattr(
-                self.su2_moving_environment,
+                owner,
                 "release_boundary",
                 None,
             )
@@ -6242,6 +6248,82 @@ class DirectOrthonormalFactorizedTable:
             )
         result["table_diagonal_used"] = bool(table_diagonal_used)
         return result
+
+    def cpp_lanczos_expm_apply(self, vector, dt, *, krylov_dim, tol):
+        """Propagate with the complex Lanczos loop owned by the C++ local table."""
+        table = getattr(self, "_cpp_davidson_table", None)
+        apply = getattr(table, "lanczos_expm_apply", None)
+        if not callable(apply):
+            dense = getattr(self, "_component_orthonormal_dense_matrix", None)
+            blocks = getattr(self, "_component_orthonormal_blocks", None)
+            table = getattr(self, "_cpp_tdvp_lanczos_table", None)
+            if (dense is not None or blocks is not None) and table is None:
+                try:
+                    from pyqed.mps import cpp_davidson
+
+                    table_cls = getattr(
+                        cpp_davidson,
+                        "SU2FactorizedFamilyTable",
+                        None,
+                    )
+                    if table_cls is not None and hasattr(
+                        table_cls,
+                        "lanczos_expm_apply",
+                    ):
+                        dim = int(self.dim)
+                        transform = (
+                            "diagonal",
+                            0,
+                            dim,
+                            np.arange(dim, dtype=np.int64),
+                            np.ones(dim, dtype=complex),
+                        )
+                        if dense is not None:
+                            kernels = ((0, dim, 0, dim, dense),)
+                        else:
+                            kernels = tuple(
+                                (
+                                    int(self.component_basis._orth_slice(in_comp).start),
+                                    int(block.shape[1]),
+                                    int(self.component_basis._orth_slice(out_comp).start),
+                                    int(block.shape[0]),
+                                    block,
+                                )
+                                for in_comp, out_comp, block in blocks
+                            )
+                        entries = tuple(
+                            (
+                                0,
+                                0,
+                                in_start,
+                                in_size,
+                                out_start,
+                                out_size,
+                                np.ascontiguousarray(kernel, dtype=complex),
+                                np.ones((1, 1), dtype=complex),
+                                (1, out_size, 1, 1, 1, 1),
+                                (out_size, 1, 1, 1),
+                                (in_size, 1, 1, 1),
+                                out_size,
+                            )
+                            for in_start, in_size, out_start, out_size, kernel in kernels
+                        )
+                        table = table_cls((transform,), entries, dim)
+                        object.__setattr__(self, "_cpp_tdvp_lanczos_table", table)
+                except (ImportError, AttributeError, TypeError, ValueError, RuntimeError):
+                    table = None
+            apply = getattr(table, "lanczos_expm_apply", None)
+        if not callable(apply):
+            return None
+        try:
+            return apply(
+                np.ascontiguousarray(vector, dtype=complex),
+                float(dt),
+                int(krylov_dim),
+                float(tol),
+            )
+        except RuntimeError:
+            return None
 
     def _install_cpp_factor_route_projection(self, compiled):
         """Install the orthonormal transform beside the owner's raw routes."""
@@ -7787,6 +7869,71 @@ class BlockSparseOrthonormalizedLocalProblem:
         return np.column_stack(
             [self.block_table.matvec(vectors[:, idx]) for idx in range(vectors.shape[1])]
         )
+
+    def cpp_lanczos_expm_apply(self, vector, dt, *, krylov_dim, tol):
+        """Apply the compiled complex Lanczos propagator to this block table."""
+        table = getattr(self, "_cpp_tdvp_lanczos_table", None)
+        if table is None:
+            try:
+                from pyqed.mps import cpp_davidson
+
+                table_cls = getattr(cpp_davidson, "SU2FactorizedFamilyTable", None)
+                if table_cls is None or not hasattr(table_cls, "lanczos_expm_apply"):
+                    return None
+                dim = int(self.orthonormal_dim)
+                transform = (
+                    "diagonal",
+                    0,
+                    dim,
+                    np.arange(dim, dtype=np.int64),
+                    np.ones(dim, dtype=complex),
+                )
+                if self.block_table.dense_matrix is not None:
+                    kernels = (
+                        (slice(0, dim), slice(0, dim), self.block_table.dense_matrix),
+                    )
+                else:
+                    kernels = tuple(
+                        (term.input_slice, term.output_slice, term.kernel)
+                        for term in self.block_table.terms
+                    )
+                entries = tuple(
+                    (
+                        0,
+                        0,
+                        int(input_slice.start),
+                        int(input_slice.stop - input_slice.start),
+                        int(output_slice.start),
+                        int(output_slice.stop - output_slice.start),
+                        np.ascontiguousarray(kernel, dtype=complex),
+                        np.ones((1, 1), dtype=complex),
+                        (
+                            1,
+                            int(output_slice.stop - output_slice.start),
+                            1,
+                            1,
+                            1,
+                            1,
+                        ),
+                        (int(output_slice.stop - output_slice.start), 1, 1, 1),
+                        (int(input_slice.stop - input_slice.start), 1, 1, 1),
+                        int(output_slice.stop - output_slice.start),
+                    )
+                    for input_slice, output_slice, kernel in kernels
+                )
+                table = table_cls((transform,), entries, dim)
+                object.__setattr__(self, "_cpp_tdvp_lanczos_table", table)
+            except (ImportError, AttributeError, TypeError, ValueError, RuntimeError):
+                return None
+        try:
+            return table.lanczos_expm_apply(
+                np.ascontiguousarray(vector, dtype=complex),
+                float(dt),
+                int(krylov_dim),
+                float(tol),
+            )
+        except RuntimeError:
+            return None
 
     def metric_matvec(self, vector):
         """

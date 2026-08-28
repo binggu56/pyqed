@@ -704,6 +704,8 @@ def two_site_update(
     optimized_two_site=None,
     solver=None,
     local_operator=None,
+    local_solver=None,
+    post_split=None,
     local_solver_kwargs=None,
     prefer_reduced_local_operator=False,
     mixer_zero_block_noise_scale=0.0,
@@ -741,6 +743,14 @@ def two_site_update(
     local_operator
         Optional effective local operator for Davidson-based optimization.
         Mutually exclusive with ``solver`` and ``optimized_two_site``.
+    local_solver
+        Optional replacement for the Davidson solve. It receives the merged
+        tensor, resolved local operator, norm operator, and canonical-norm
+        flag. This is used by reduced-space real-time propagators.
+    post_split
+        Optional callback applied to the split site pair while the same local
+        effective operator is still alive. Projector-splitting TDVP uses it for
+        the compensating one-site backward evolution.
     local_solver_kwargs
         Optional keyword arguments forwarded to :func:`solve_local_two_site`.
     bond_coupling, max_bond, max_bond_mode, cutoff, absorb
@@ -759,6 +769,10 @@ def two_site_update(
     n_modes = sum(x is not None for x in (solver, optimized_two_site, local_operator))
     if n_modes > 1:
         raise ValueError("Specify only one of solver, optimized_two_site, or local_operator.")
+    if local_solver is not None and local_operator is None:
+        raise ValueError("local_solver requires local_operator.")
+    if post_split is not None and local_operator is None:
+        raise ValueError("post_split requires local_operator.")
 
     timing = {
         "merge_expand": 0.0,
@@ -829,15 +843,24 @@ def two_site_update(
                 norm_operator,
             )
         t0 = time.perf_counter() if profile else None
-        optimized, local_objective = solve_local_two_site(
-            merged,
-            operator_spec,
-            norm_operator=norm_operator,
-            canonical_norm=canonical_norm,
-            profile=profile,
-            **solver_kwargs,
-        )
-        del operator_spec, norm_operator
+        if local_solver is None:
+            optimized, local_objective = solve_local_two_site(
+                merged,
+                operator_spec,
+                norm_operator=norm_operator,
+                canonical_norm=canonical_norm,
+                profile=profile,
+                **solver_kwargs,
+            )
+        else:
+            optimized, local_objective = local_solver(
+                merged,
+                operator_spec,
+                norm_operator=norm_operator,
+                canonical_norm=canonical_norm,
+                profile=profile,
+                **solver_kwargs,
+            )
         if lifecycle_owner is not None:
             lifecycle_owner.release_operator_numeric()
             lifecycle_owner.clear_local_operator()
@@ -924,6 +947,7 @@ def two_site_update(
         local_objective["cpp_active_bond_split"] = True
         if profile:
             timing["svd"] += time.perf_counter() - t0
+
     elif optimized_roots is not None:
         t0 = time.perf_counter() if profile else None
         optimized_roots = [
@@ -983,6 +1007,20 @@ def two_site_update(
         )
         if profile:
             timing["svd"] += time.perf_counter() - t0
+
+    if post_split is not None:
+        left, right, post_objective = post_split(
+            left,
+            right,
+            operator_spec,
+            norm_operator=norm_operator,
+            canonical_norm=canonical_norm,
+        )
+        if post_objective:
+            local_objective.update(post_objective)
+
+    if local_operator is not None:
+        del operator_spec, norm_operator
     kept_states = sum(
         sector_state_weight(q_mid) * int(block.shape[0])
         for q_mid, block in singular_values.items()

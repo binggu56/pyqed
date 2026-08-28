@@ -16,13 +16,13 @@ from pyqed.mps.symmetry import Sector
 from .builder import identity_operator
 from .contraction import normalize_site_tensor_layout
 from .coupling import clebsch_gordan, ordered_two_m_values
-from .mpo import PhysicalLeg, SiteOperator
+from .mpo import Leg, SiteOperator
 from .tensor import NonabelianTensor
 
 
 def _canonical_spatial_leg():
     site = SpatialOrbitalSite()
-    return PhysicalLeg.from_dims(
+    return Leg.from_dims(
         {
             sector: len(indices)
             for sector, indices in zip(site.qn, site.state_index)
@@ -33,7 +33,7 @@ def _canonical_spatial_leg():
 
 def _fully_reduced_spatial_leg():
     site = SpatialOrbitalSite()
-    return PhysicalLeg.from_dims(
+    return Leg.from_dims(
         {sector: 1 for sector in site.qn},
         sectors=site.qn,
     )
@@ -99,16 +99,16 @@ class ReducedTensorOperator:
     """
 
     reduced_blocks: dict[tuple[object, object], complex]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     rank_irrep: SU2Irrep
     component_phases: dict[int, complex] | None = None
 
     def __post_init__(self):
-        if not isinstance(self.phys_out_leg, PhysicalLeg):
-            raise TypeError("ReducedTensorOperator phys_out_leg must be a PhysicalLeg.")
-        if not isinstance(self.phys_in_leg, PhysicalLeg):
-            raise TypeError("ReducedTensorOperator phys_in_leg must be a PhysicalLeg.")
+        if not isinstance(self.phys_out_leg, Leg):
+            raise TypeError("ReducedTensorOperator phys_out_leg must be a Leg.")
+        if not isinstance(self.phys_in_leg, Leg):
+            raise TypeError("ReducedTensorOperator phys_in_leg must be a Leg.")
         if not isinstance(self.rank_irrep, SU2Irrep):
             raise TypeError("ReducedTensorOperator rank_irrep must be an SU2Irrep.")
         normalized_blocks = {}
@@ -119,8 +119,8 @@ class ReducedTensorOperator:
                 raise ValueError(f"Undeclared input sector {q_in!r} in reduced operator.")
             _, out_irrep = _extract_charge_spin(q_out)
             _, in_irrep = _extract_charge_spin(q_in)
-            out_dim = self.phys_out_leg.dim(q_out)
-            in_dim = self.phys_in_leg.dim(q_in)
+            out_dim = self.phys_out_leg.sector_dim(q_out)
+            in_dim = self.phys_in_leg.sector_dim(q_in)
             if out_dim not in {1, out_irrep.dim}:
                 raise NotImplementedError(
                     "ReducedTensorOperator currently requires canonical irrep dimensions or fully reduced output sectors."
@@ -170,7 +170,7 @@ class ReducedTensorOperator:
         _, out_irrep = _extract_charge_spin(q_out)
         _, in_irrep = _extract_charge_spin(q_in)
         phase = self.component_phases[two_m_component]
-        if self.phys_out_leg.dim(q_out) == 1 and self.phys_in_leg.dim(q_in) == 1:
+        if self.phys_out_leg.sector_dim(q_out) == 1 and self.phys_in_leg.sector_dim(q_in) == 1:
             block = np.asarray([[phase * reduced_value]], dtype=self.dtype)
             cache[cache_key] = block
             return block
@@ -517,8 +517,8 @@ class CoupledReducedTensorProductOperator:
     """
 
     component_blocks: dict[int, dict[tuple[object, object], np.ndarray]]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     rank_irrep: SU2Irrep
 
     def __post_init__(self):
@@ -536,7 +536,7 @@ class CoupledReducedTensorProductOperator:
                     raise ValueError(f"Undeclared output sector {q_out!r} in coupled product.")
                 if q_in not in self.phys_in_leg.sectors:
                     raise ValueError(f"Undeclared input sector {q_in!r} in coupled product.")
-                if block.shape != (self.phys_out_leg.dim(q_out), self.phys_in_leg.dim(q_in)):
+                if block.shape != (self.phys_out_leg.sector_dim(q_out), self.phys_in_leg.sector_dim(q_in)):
                     raise ValueError(
                         f"Coupled product block {(q_out, q_in)!r} shape {block.shape!r} "
                         "does not match physical leg dimensions."
@@ -662,7 +662,7 @@ def coupled_reduced_tensor_product(left_operator, right_operator, rank_irrep, *,
         for q_out in phys_out_leg.sectors:
             for q_in in phys_in_leg.sectors:
                 block = np.zeros(
-                    (phys_out_leg.dim(q_out), phys_in_leg.dim(q_in)),
+                    (phys_out_leg.sector_dim(q_out), phys_in_leg.sector_dim(q_in)),
                     dtype=dtype,
                 )
                 for q_mid in phys_mid_leg.sectors:
@@ -713,7 +713,7 @@ def physical_leg_from_spatial_orbital(site=None):
     site
         Optional source object describing the local spatial-orbital basis.
         Accepts ``None`` (canonical basis), :class:`SpatialOrbitalSite`,
-        :class:`PhysicalLeg`, or a rank-3 :class:`NonabelianTensor` MPS site.
+        :class:`Leg`, or a rank-3 :class:`NonabelianTensor` MPS site.
     """
     canonical_leg = _canonical_spatial_leg()
     reduced_leg = _fully_reduced_spatial_leg()
@@ -723,12 +723,12 @@ def physical_leg_from_spatial_orbital(site=None):
         return reduced_leg
     if isinstance(site, SpatialOrbitalSite):
         return _canonical_spatial_leg()
-    if isinstance(site, PhysicalLeg):
+    if isinstance(site, Leg):
         if site == canonical_leg or site == reduced_leg:
             return site
         if site != canonical_leg:
             raise ValueError(
-                "physical_leg_from_spatial_orbital expects a canonical or fully reduced spatial-orbital PhysicalLeg."
+                "physical_leg_from_spatial_orbital expects a canonical or fully reduced spatial-orbital Leg."
             )
         return site
     if isinstance(site, NonabelianTensor):
@@ -748,7 +748,7 @@ def physical_leg_from_spatial_orbital(site=None):
                 raise ValueError(
                     f"Inconsistent physical dimension for sector {sector!r}: {prev} vs {dim}."
                 )
-        leg = PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+        leg = Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
         if leg == canonical_leg or leg == reduced_leg:
             return leg
         if leg != canonical_leg:
@@ -757,7 +757,7 @@ def physical_leg_from_spatial_orbital(site=None):
             )
         return leg
     raise TypeError(
-        "physical_leg_from_spatial_orbital expects None, SpatialOrbitalSite, PhysicalLeg, "
+        "physical_leg_from_spatial_orbital expects None, SpatialOrbitalSite, Leg, "
         "or a rank-3 NonabelianTensor."
     )
 
@@ -766,7 +766,7 @@ def _projector_weights(weights, *, phys_leg, dtype=float):
     blocks = {}
     for sector in phys_leg.sectors:
         blocks[(sector, sector)] = np.asarray(weights[sector], dtype=dtype) * np.eye(
-            phys_leg.dim(sector), dtype=dtype
+            phys_leg.sector_dim(sector), dtype=dtype
         )
     return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
 
@@ -892,7 +892,7 @@ def reduced_spatial_fermion_annihilation(site=None, *, dtype=float):
     q_empty, q_single, q_double = phys_leg.sectors
     empty_single_value = (
         1.0 / np.sqrt(2.0)
-        if phys_leg.dim(q_single) == 1
+        if phys_leg.sector_dim(q_single) == 1
         else np.sqrt(2.0)
     )
     return ReducedTensorOperator(

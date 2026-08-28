@@ -596,7 +596,7 @@ def _is_identity_mpo_core(mpo_core, *, tol=1e-12):
                 if block is None:
                     _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
                     return False
-                eye = np.eye(mpo_core.phys_out_leg.dim(q_out), dtype=np.asarray(block).dtype)
+                eye = np.eye(mpo_core.phys_out_leg.sector_dim(q_out), dtype=np.asarray(block).dtype)
                 if not np.allclose(np.asarray(block)[0, 0], eye, atol=tol, rtol=tol):
                     _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
                     return False
@@ -1137,8 +1137,8 @@ def _sector_irrep(sector):
 def _rank_coupled_degeneracy_only_physical(W):
     if not isinstance(W, RankCoupledMPO):
         return False
-    return all(W.phys_out_leg.dim(sector) == 1 for sector in W.phys_out_leg.sectors) and all(
-        W.phys_in_leg.dim(sector) == 1 for sector in W.phys_in_leg.sectors
+    return all(W.phys_out_leg.sector_dim(sector) == 1 for sector in W.phys_out_leg.sectors) and all(
+        W.phys_in_leg.sector_dim(sector) == 1 for sector in W.phys_in_leg.sectors
     )
 
 
@@ -1262,8 +1262,8 @@ def _rank_coupled_reduced_terms_block(W, phys_out, phys_in):
                 (
                     W.left_channel_irreps[i].dim,
                     W.right_channel_irreps[j].dim,
-                    W.phys_out_leg.dim(phys_out),
-                    W.phys_in_leg.dim(phys_in),
+                    W.phys_out_leg.sector_dim(phys_out),
+                    W.phys_in_leg.sector_dim(phys_in),
                 ),
                 dtype=dtype,
             )
@@ -2546,7 +2546,28 @@ def _contract_rank_coupled_boundary_cpp(
     """Plan one reduced boundary update and execute all numerical routes in C++."""
 
     if (
-        getattr(W, "normal_complementary_owner", None) is moving_environment
+        not isinstance(W, RankCoupledMPO)
+        or parent_bond is None
+        or child_bond is None
+        or not hasattr(moving_environment, "advance_boundary")
+    ):
+        return None
+    side = str(side).lower()
+    edge = "left" if side == "left" else "right"
+    packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
+    if packed_parent is None:
+        return None
+    complex_update = bool(
+        np.iscomplexobj(packed_parent.block_pool.data)
+        or np.dtype(_mpo_dtype(W)).kind == "c"
+        or any(np.iscomplexobj(block) for block in A.data.values())
+        or any(np.iscomplexobj(block) for block in B.data.values())
+    )
+    if complex_update and not hasattr(moving_environment, "advance_boundary_complex"):
+        return None
+    if (
+        not complex_update
+        and getattr(W, "normal_complementary_owner", None) is moving_environment
         and getattr(W, "normal_complementary_plan", None) is not None
     ):
         return _contract_normal_complementary_boundary_cpp(
@@ -2560,22 +2581,6 @@ def _contract_rank_coupled_boundary_cpp(
             child_bond=child_bond,
             numeric_revision=numeric_revision,
         )
-    if (
-        not isinstance(W, RankCoupledMPO)
-        or parent_bond is None
-        or child_bond is None
-        or not hasattr(moving_environment, "advance_boundary")
-        or np.dtype(_mpo_dtype(W)).kind == "c"
-    ):
-        return None
-    side = str(side).lower()
-    edge = "left" if side == "left" else "right"
-    packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
-    if (
-        packed_parent is None
-        or np.iscomplexobj(packed_parent.block_pool.data)
-    ):
-        return None
 
     sectors = tuple(packed_parent.sector_codec.sectors)
     parent_blocks = {}
@@ -2615,15 +2620,19 @@ def _contract_rank_coupled_boundary_cpp(
     )
 
     def register(array, arrays, index, *, block_key=None, keys=None):
-        real = _real64_contiguous_or_none(array)
-        if real is None:
+        packed = (
+            np.ascontiguousarray(array, dtype=np.complex128)
+            if complex_update
+            else _real64_contiguous_or_none(array)
+        )
+        if packed is None:
             return None
-        key = id(real)
+        key = id(packed)
         found = index.get(key)
         if found is None:
             found = len(arrays)
             index[key] = found
-            arrays.append(real)
+            arrays.append(packed)
             if keys is not None:
                 keys.append(block_key)
         return int(found)
@@ -2847,7 +2856,8 @@ def _contract_rank_coupled_boundary_cpp(
         (getattr(B, "metadata", None) or {}).get("_cpp_split_site")
     )
     metric_split_action = (
-        bool(getattr(W, "fully_reduced_identity", False))
+        not complex_update
+        and bool(getattr(W, "fully_reduced_identity", False))
         and bra_split_marker is not None
         and bra_split_marker == ket_split_marker
         and len(bra_split_marker) == 4
@@ -2889,7 +2899,12 @@ def _contract_rank_coupled_boundary_cpp(
             )
         )
     else:
-        values, _same_topology = moving_environment.advance_boundary(
+        advance = (
+            moving_environment.advance_boundary_complex
+            if complex_update
+            else moving_environment.advance_boundary
+        )
+        values, _same_topology = advance(
             side,
             int(parent_bond),
             int(child_bond),
@@ -2919,7 +2934,10 @@ def _contract_rank_coupled_boundary_cpp(
         )
     output_pool = replace(
         output_table.block_pool,
-        data=np.ascontiguousarray(values, dtype=np.float64),
+        data=np.ascontiguousarray(
+            values,
+            dtype=np.complex128 if complex_update else np.float64,
+        ),
         _shape_cache=None,
         _array_cache=None,
     )
@@ -4958,6 +4976,48 @@ class BlockSparseEnvironmentChain:
             mpo_factors,
             site_layouts=site_layouts,
         )
+        lightweight_owner = getattr(
+            sparse_mpo_factors[0],
+            "normal_complementary_owner",
+            None,
+        )
+        if (
+            renormalized_blocks is None
+            and lightweight_owner is not None
+            and all(
+                getattr(factor, "normal_complementary_plan", None) is not None
+                and not factor.reduced_terms
+                for factor in sparse_mpo_factors
+            )
+        ):
+            from pyqed.qchem.dmrg.backends.reduced import (
+                build_su2_normal_complementary_mpo,
+            )
+
+            right_dual = bool(
+                getattr(
+                    sparse_mpo_factors[0],
+                    "normal_complementary_right_dual",
+                    False,
+                )
+            )
+            sparse_mpo_factors = build_su2_normal_complementary_mpo(
+                lightweight_owner,
+                fully_reduced=bool(
+                    getattr(
+                        sparse_mpo_factors[0],
+                        "normal_complementary_fully_reduced",
+                        False,
+                    )
+                ),
+                materialize_reduced_terms=True,
+            )
+            for factor in sparse_mpo_factors:
+                object.__setattr__(
+                    factor,
+                    "normal_complementary_right_dual",
+                    right_dual,
+                )
 
         rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
         nsites = len(sites)
@@ -4968,8 +5028,24 @@ class BlockSparseEnvironmentChain:
         elif reuse_prebuilt_boundary_side == "right":
             build_right = False
         if rank_coupled:
+            normal_complementary_owner = getattr(
+                sparse_mpo_factors[0],
+                "normal_complementary_owner",
+                None,
+            )
             nc_moving_environment = (
-                getattr(renormalized_blocks, "su2_moving_environment", None)
+                (
+                    getattr(
+                        renormalized_blocks,
+                        "su2_moving_environment",
+                        None,
+                    )
+                    or getattr(
+                        renormalized_blocks,
+                        "su2_boundary_environment",
+                        None,
+                    )
+                )
                 if getattr(
                     sparse_mpo_factors[0],
                     "normal_complementary_plan",
@@ -4977,12 +5053,24 @@ class BlockSparseEnvironmentChain:
                 )
                 is not None
                 else None
-            )
+            ) or normal_complementary_owner
             initial_left = LeftBlock(
                 _initial_left_env_blocks_rank_coupled(site_layouts[0], sparse_mpo_factors[0]),
                 rank_coupled=True,
             )
             if build_left:
+                if (
+                    nc_moving_environment is not None
+                    and renormalized_blocks is not None
+                ):
+                    renormalized_blocks.initialize(
+                        "left",
+                        0,
+                        initial_left,
+                        side_table_builders=_renormalized_side_table_builders(
+                            rank_coupled=True,
+                        ),
+                    )
                 left_envs = [initial_left]
                 for i in range(nsites - 1):
                     left_envs.append(
@@ -5004,6 +5092,18 @@ class BlockSparseEnvironmentChain:
                 rank_coupled=True,
             )
             if build_right:
+                if (
+                    nc_moving_environment is not None
+                    and renormalized_blocks is not None
+                ):
+                    renormalized_blocks.initialize(
+                        "right",
+                        nsites - 1,
+                        initial_right,
+                        side_table_builders=_renormalized_side_table_builders(
+                            rank_coupled=True,
+                        ),
+                    )
                 right_envs = [initial_right]
                 for i in range(nsites - 1, 0, -1):
                     right_envs.append(
@@ -5323,7 +5423,15 @@ class BlockSparseEnvironmentChain:
             su2_moving_environment=(
                 None
                 if self.renormalized_blocks is None
-                else self.renormalized_blocks.su2_moving_environment
+                else (
+                    self.renormalized_blocks.su2_moving_environment
+                    or getattr(
+                        self.renormalized_blocks,
+                        "su2_boundary_environment",
+                        None,
+                    )
+                    or getattr(W1, "normal_complementary_owner", None)
+                )
             ),
             name=f"bond-{bond}-block-sparse-effective-H",
         )
@@ -5781,21 +5889,29 @@ def contract_chain_expectation(
     sites,
     mpo_factors,
     *,
+    bra_sites=None,
     moving_environment=None,
+    site_layouts=None,
 ):
     """
-    Contract ``<sites|MPO|sites>`` for one non-Abelian MPS chain.
+    Contract ``<bra|MPO|sites>`` for one non-Abelian MPS chain.
 
     Parameters
     ----------
     sites
-        Sequence of rank-3 non-Abelian MPS site tensors.
+        Ket sequence of rank-3 non-Abelian MPS site tensors.
+    bra_sites
+        Optional bra sequence. Omitting it computes an expectation value.
     mpo_factors
         Sequence of MPO cores (dense or block-sparse ``MPO`` objects), one per
         site.
     moving_environment
         Optional persistent C++ owner for direct normal/complementary
         boundary actions. Omitting it preserves the Python reference path.
+    site_layouts
+        Optional precomputed dense-layout metadata for ``sites``. Supplying it
+        avoids rebuilding identical sector maps when many operators are
+        contracted against the same MPS, as in reduced 1-/2-RDM evaluation.
 
     Returns
     -------
@@ -5806,8 +5922,16 @@ def contract_chain_expectation(
         raise ValueError("contract_chain_expectation requires one MPO core per site tensor.")
     if not sites:
         raise ValueError("contract_chain_expectation requires at least one site tensor.")
+    bra_sites = sites if bra_sites is None else list(bra_sites)
+    if len(bra_sites) != len(sites):
+        raise ValueError("Bra and ket MPS lengths must match.")
 
-    site_layouts = [_tensor_dense_layout(site) for site in sites]
+    if site_layouts is None:
+        site_layouts = [_tensor_dense_layout(site) for site in sites]
+    else:
+        site_layouts = list(site_layouts)
+        if len(site_layouts) != len(sites):
+            raise ValueError("site_layouts must contain one layout per MPS site.")
     phys_slice_maps = [layout["sector_slices"][1] for layout in site_layouts]
     sparse_mpo_factors = _normalize_block_sparse_mpo_factors(
         mpo_factors,
@@ -5817,7 +5941,8 @@ def contract_chain_expectation(
     rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
     if rank_coupled:
         direct_normal_complementary = bool(
-            moving_environment is not None
+            bra_sites is sites
+            and moving_environment is not None
             and getattr(
                 sparse_mpo_factors[0],
                 "normal_complementary_owner",
@@ -5837,7 +5962,7 @@ def contract_chain_expectation(
             for idx in range(len(sites)):
                 env = env.advance(
                     sparse_mpo_factors[idx],
-                    sites[idx],
+                    bra_sites[idx],
                     sites[idx],
                     moving_environment=moving_environment,
                     parent_bond=idx,
@@ -5852,7 +5977,7 @@ def contract_chain_expectation(
             for idx in range(len(sites)):
                 env = _contract_from_left_blocks_rank_coupled(
                     sparse_mpo_factors[idx],
-                    sites[idx],
+                    bra_sites[idx],
                     env,
                     sites[idx],
                 )
@@ -5861,7 +5986,7 @@ def contract_chain_expectation(
         for idx in range(len(sites)):
             env = _contract_from_left_blocks(
                 sparse_mpo_factors[idx],
-                sites[idx],
+                bra_sites[idx],
                 env,
                 sites[idx],
                 phys_slice_maps[idx],

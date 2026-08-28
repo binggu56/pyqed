@@ -86,6 +86,25 @@ extern "C" void cblas_dscal(
 namespace pyqed::su2 {
 namespace {
 
+using Matrix4 = std::array<double, 16>;
+
+struct FermionSpec {
+    bool create = false;
+    std::int32_t spin = 0;
+    std::int64_t site = 0;
+};
+
+std::int32_t component_physical_index(
+    std::int64_t charge,
+    std::int32_t two_j,
+    std::int32_t two_m
+);
+
+Matrix4 component_string_site_operator(
+    std::int64_t site,
+    const std::vector<FermionSpec>& specs
+);
+
 using GroupedDgemmBatchFunction = void (*)(
     int,
     const std::int32_t*,
@@ -666,7 +685,7 @@ std::size_t output_fusion_copy_budget() noexcept {
     const char* value =
         std::getenv("PYQED_SU2_OUTPUT_FUSION_COPY_BUDGET");
     if (value == nullptr || value[0] == '\0') {
-        return 1'536;
+        return 512;
     }
     char* end = nullptr;
     const unsigned long long parsed =
@@ -674,7 +693,7 @@ std::size_t output_fusion_copy_budget() noexcept {
     return (
         end != value && end != nullptr && end[0] == '\0'
         ? static_cast<std::size_t>(parsed)
-        : 1'536
+        : 512
     );
 }
 
@@ -1496,6 +1515,32 @@ void release_boundary_buffer(BoundaryBufferHandle* handle) noexcept {
     delete handle;
 }
 
+const Complex* complex_boundary_buffer_data(
+    const ComplexBoundaryBufferHandle* handle
+) noexcept {
+    return (
+        handle == nullptr || !handle->values
+        ? nullptr
+        : handle->values->data()
+    );
+}
+
+std::size_t complex_boundary_buffer_size(
+    const ComplexBoundaryBufferHandle* handle
+) noexcept {
+    return (
+        handle == nullptr || !handle->values
+        ? 0
+        : handle->values->size()
+    );
+}
+
+void release_complex_boundary_buffer(
+    ComplexBoundaryBufferHandle* handle
+) noexcept {
+    delete handle;
+}
+
 System::System(
     const double* h1,
     const double* eri,
@@ -1684,6 +1729,59 @@ void System::build_families() {
     families_[static_cast<std::int32_t>(Family::Q)] = std::move(q_family);
 }
 
+void System::update_h1(const double* h1, std::size_t n_values) {
+    if (h1 == nullptr || n_values != n_sites_ * n_sites_) {
+        throw std::invalid_argument("Updated h1 has an invalid shape.");
+    }
+    for (std::size_t index = 0; index < n_values; ++index) {
+        if (!std::isfinite(h1[index])) {
+            throw std::invalid_argument("Updated h1 contains a non-finite value.");
+        }
+    }
+    h1_.assign(h1, h1 + n_values);
+    revision_ = mix_revision(revision_, revision_ + 1);
+    build_families();
+    build_normal_complementary_plans();
+    build_normal_complementary_primitives();
+}
+
+void System::update_integrals(
+    const double* h1,
+    std::size_t n_h1_values,
+    const double* eri,
+    std::size_t n_eri_values,
+    double ecore
+) {
+    const std::size_t expected_h1 = n_sites_ * n_sites_;
+    const std::size_t expected_eri = expected_h1 * expected_h1;
+    if (
+        h1 == nullptr || n_h1_values != expected_h1
+        || eri == nullptr || n_eri_values != expected_eri
+    ) {
+        throw std::invalid_argument("Updated SU(2) integrals have invalid shapes.");
+    }
+    if (!std::isfinite(ecore)) {
+        throw std::invalid_argument("Updated SU(2) core energy is non-finite.");
+    }
+    for (std::size_t index = 0; index < n_h1_values; ++index) {
+        if (!std::isfinite(h1[index])) {
+            throw std::invalid_argument("Updated h1 contains a non-finite value.");
+        }
+    }
+    for (std::size_t index = 0; index < n_eri_values; ++index) {
+        if (!std::isfinite(eri[index])) {
+            throw std::invalid_argument("Updated ERI contains a non-finite value.");
+        }
+    }
+    h1_.assign(h1, h1 + n_h1_values);
+    eri_.assign(eri, eri + n_eri_values);
+    ecore_ = ecore;
+    revision_ = mix_revision(revision_, revision_ + 1);
+    build_families();
+    build_normal_complementary_plans();
+    build_normal_complementary_primitives();
+}
+
 void System::build_normal_complementary_plans() {
     // This is the SU(2) normal/complementary (NC) layout used by a QC sweep.
     // At cut c the normal left block owns C/D/A/AD/B and the complementary
@@ -1854,9 +1952,10 @@ void System::build_normal_complementary_plans() {
             double coefficient,
             std::uint64_t family_mask = 0,
             std::int64_t first_index = -1,
-            std::int64_t second_index = -1
+            std::int64_t second_index = -1,
+            bool retain_zero = false
         ) {
-            if (std::abs(coefficient) <= cutoff_) {
+            if (!retain_zero && std::abs(coefficient) <= cutoff_) {
                 return;
             }
             plan.transitions.push_back(
@@ -1915,7 +2014,9 @@ void System::build_normal_complementary_plans() {
                 h1_[static_cast<std::size_t>(i * n + m)] *
                     (1.0 / std::sqrt(2.0)),
                 bit(Family::R),
-                i
+                i,
+                -1,
+                true
             );
             emit(
                 c_channel(i),
@@ -1932,7 +2033,9 @@ void System::build_normal_complementary_plans() {
                 h1_[static_cast<std::size_t>(m * n + i)] *
                     (1.0 / std::sqrt(2.0)),
                 bit(Family::R),
-                i
+                i,
+                -1,
+                true
             );
             emit(
                 d_or_rd_channel(m, i),
@@ -2040,7 +2143,9 @@ void System::build_normal_complementary_plans() {
                 h1_[static_cast<std::size_t>(m * n + i)] *
                     (1.0 / std::sqrt(2.0)),
                 bit(Family::R),
-                i
+                i,
+                -1,
+                true
             );
             emit(
                 1,
@@ -2058,7 +2163,9 @@ void System::build_normal_complementary_plans() {
                 h1_[static_cast<std::size_t>(i * n + m)] *
                     (1.0 / std::sqrt(2.0)),
                 bit(Family::R),
-                i
+                i,
+                -1,
+                true
             );
             emit(
                 1,
@@ -3221,6 +3328,7 @@ bool MovingEnvironment::install_boundary(
         );
     }
     const std::string key = boundary_key(side, bond);
+    complex_boundaries_.erase(key);
     PackedArena& arena = boundaries_[key];
     const bool same_topology =
         arena.topology_revision == topology_revision &&
@@ -3278,6 +3386,7 @@ bool MovingEnvironment::install_metric_boundary(
         );
     }
     const std::string key = boundary_key(side, bond);
+    complex_metric_boundaries_.erase(key);
     PackedArena& arena = metric_boundaries_[key];
     const bool same_topology =
         arena.topology_revision == topology_revision &&
@@ -3309,12 +3418,17 @@ bool MovingEnvironment::release_boundary(
     const std::string& side,
     std::int64_t bond
 ) {
-    return boundaries_.erase(boundary_key(side, bond)) != 0;
+    const std::string key = boundary_key(side, bond);
+    const bool released_real = boundaries_.erase(key) != 0;
+    const bool released_complex = complex_boundaries_.erase(key) != 0;
+    return released_real || released_complex;
 }
 
 void MovingEnvironment::clear_boundaries() {
     boundaries_.clear();
     metric_boundaries_.clear();
+    complex_boundaries_.clear();
+    complex_metric_boundaries_.clear();
 }
 
 void MovingEnvironment::decode_boundary_shapes(PackedArena& arena) {
@@ -4237,6 +4351,356 @@ bool MovingEnvironment::advance_boundary(
         ++boundary_numeric_refreshes_;
         ++boundary_update_calls_;
     }
+    boundary_update_routes_ += n_routes;
+    boundary_update_seconds_ += wall_seconds() - started;
+    return same_topology;
+}
+
+bool MovingEnvironment::advance_boundary_complex(
+    const std::string& side,
+    std::int64_t parent_bond,
+    std::int64_t child_bond,
+    bool left,
+    const std::int64_t* routes,
+    std::size_t n_routes,
+    const Complex* bra_values,
+    std::size_t n_bra_values,
+    const std::int64_t* bra_offsets,
+    std::size_t n_bra_offsets,
+    const std::int64_t* bra_shape_offsets,
+    std::size_t n_bra_shape_offsets,
+    const std::int64_t* bra_shapes,
+    std::size_t n_bra_shapes,
+    const Complex* ket_values,
+    std::size_t n_ket_values,
+    const std::int64_t* ket_offsets,
+    std::size_t n_ket_offsets,
+    const std::int64_t* ket_shape_offsets,
+    std::size_t n_ket_shape_offsets,
+    const std::int64_t* ket_shapes,
+    std::size_t n_ket_shapes,
+    const Complex* mpo_values,
+    std::size_t n_mpo_values,
+    const std::int64_t* mpo_offsets,
+    std::size_t n_mpo_offsets,
+    const std::int64_t* mpo_shape_offsets,
+    std::size_t n_mpo_shape_offsets,
+    const std::int64_t* mpo_shapes,
+    std::size_t n_mpo_shapes,
+    const std::int64_t* output_offsets,
+    std::size_t n_output_offsets,
+    const std::int64_t* output_shape_offsets,
+    std::size_t n_output_shape_offsets,
+    const std::int64_t* output_shapes,
+    std::size_t n_output_shapes,
+    const std::int64_t* output_labels,
+    std::size_t n_output_labels,
+    std::uint64_t topology_revision,
+    std::uint64_t numeric_revision,
+    const double* route_coefficients,
+    bool metric_boundary
+) {
+    const double started = wall_seconds();
+    if (side != (left ? "left" : "right") || parent_bond < 0 || child_bond < 0) {
+        throw std::invalid_argument(
+            "Complex boundary direction and bond metadata are inconsistent."
+        );
+    }
+    if (
+        (n_routes != 0 && routes == nullptr) || bra_values == nullptr ||
+        ket_values == nullptr || mpo_values == nullptr || bra_offsets == nullptr ||
+        ket_offsets == nullptr || mpo_offsets == nullptr ||
+        bra_shape_offsets == nullptr || ket_shape_offsets == nullptr ||
+        mpo_shape_offsets == nullptr || bra_shapes == nullptr ||
+        ket_shapes == nullptr || mpo_shapes == nullptr ||
+        output_offsets == nullptr || output_shape_offsets == nullptr ||
+        output_shapes == nullptr || output_labels == nullptr
+    ) {
+        throw std::invalid_argument("Complex boundary update received a null buffer.");
+    }
+
+    const auto validate_pool = [](
+        std::size_t n_values,
+        const std::int64_t* offsets,
+        std::size_t n_offsets,
+        const std::int64_t* shape_offsets,
+        std::size_t n_shape_offsets,
+        std::size_t n_shapes,
+        const char* name
+    ) {
+        if (
+            n_offsets == 0 || n_shape_offsets != n_offsets ||
+            offsets[0] != 0 || shape_offsets[0] != 0 ||
+            offsets[n_offsets - 1] < 0 || shape_offsets[n_shape_offsets - 1] < 0 ||
+            static_cast<std::size_t>(offsets[n_offsets - 1]) != n_values ||
+            static_cast<std::size_t>(shape_offsets[n_shape_offsets - 1]) != n_shapes
+        ) {
+            throw std::invalid_argument(
+                std::string("Complex boundary ") + name + " pool is inconsistent."
+            );
+        }
+    };
+    validate_pool(
+        n_bra_values, bra_offsets, n_bra_offsets, bra_shape_offsets,
+        n_bra_shape_offsets, n_bra_shapes, "bra"
+    );
+    validate_pool(
+        n_ket_values, ket_offsets, n_ket_offsets, ket_shape_offsets,
+        n_ket_shape_offsets, n_ket_shapes, "ket"
+    );
+    validate_pool(
+        n_mpo_values, mpo_offsets, n_mpo_offsets, mpo_shape_offsets,
+        n_mpo_shape_offsets, n_mpo_shapes, "MPO"
+    );
+    if (
+        n_output_offsets == 0 || n_output_shape_offsets != n_output_offsets ||
+        output_offsets[0] != 0 || output_shape_offsets[0] != 0 ||
+        output_offsets[n_output_offsets - 1] < 0 ||
+        output_shape_offsets[n_output_shape_offsets - 1] < 0 ||
+        static_cast<std::size_t>(
+            output_shape_offsets[n_output_shape_offsets - 1]
+        ) != n_output_shapes
+    ) {
+        throw std::invalid_argument("Complex boundary output pool is inconsistent.");
+    }
+
+    auto& complex_store = metric_boundary
+        ? complex_metric_boundaries_
+        : complex_boundaries_;
+    const auto& real_store = metric_boundary
+        ? metric_boundaries_
+        : boundaries_;
+    const std::string parent_key = boundary_key(side, parent_bond);
+    const auto complex_parent_it = complex_store.find(parent_key);
+    const auto real_parent_it = real_store.find(parent_key);
+    if (complex_parent_it == complex_store.end() && real_parent_it == real_store.end()) {
+        throw std::invalid_argument(
+            "Complex boundary parent is not installed in the moving environment."
+        );
+    }
+    const bool complex_parent = complex_parent_it != complex_store.end();
+    const std::vector<std::int64_t>& parent_offsets = complex_parent
+        ? complex_parent_it->second.offsets
+        : real_parent_it->second.offsets;
+    const std::vector<std::int64_t>& parent_shape_offsets = complex_parent
+        ? complex_parent_it->second.shape_offsets
+        : real_parent_it->second.shape_offsets;
+    const std::vector<std::int64_t>& parent_shapes = complex_parent
+        ? complex_parent_it->second.shapes
+        : real_parent_it->second.shapes;
+    const Complex* complex_parent_values = complex_parent
+        && complex_parent_it->second.owned_values
+        ? complex_parent_it->second.owned_values->data()
+        : nullptr;
+    const double* real_parent_values = complex_parent
+        ? nullptr
+        : real_parent_it->second.values;
+    if (
+        parent_offsets.empty() || parent_shape_offsets.size() != parent_offsets.size() ||
+        (complex_parent && !complex_parent_it->second.owned_values) ||
+        (!complex_parent && real_parent_values == nullptr)
+    ) {
+        throw std::invalid_argument("Complex boundary parent arena is incomplete.");
+    }
+
+    const std::string child_key = boundary_key(side, child_bond);
+    ComplexPackedArena& child = complex_store[child_key];
+    const bool same_topology =
+        child.topology_revision == topology_revision &&
+        child.offsets.size() == n_output_offsets &&
+        child.labels.size() == n_output_labels &&
+        std::equal(child.offsets.begin(), child.offsets.end(), output_offsets) &&
+        std::equal(child.labels.begin(), child.labels.end(), output_labels);
+    if (!same_topology) {
+        child.offsets.assign(output_offsets, output_offsets + n_output_offsets);
+        child.labels.assign(output_labels, output_labels + n_output_labels);
+        child.shape_offsets.assign(
+            output_shape_offsets, output_shape_offsets + n_output_shape_offsets
+        );
+        child.shapes.assign(output_shapes, output_shapes + n_output_shapes);
+        child.topology_revision = topology_revision;
+        ++boundary_topology_builds_;
+        ++boundary_update_topology_builds_;
+    }
+    const std::size_t n_output_values =
+        static_cast<std::size_t>(output_offsets[n_output_offsets - 1]);
+    if (!child.owned_values || child.owned_values.use_count() != 1) {
+        child.owned_values = std::make_shared<std::vector<Complex>>();
+        ++boundary_reallocations_;
+    } else if (child.owned_values->capacity() < n_output_values) {
+        ++boundary_reallocations_;
+    }
+    child.owned_values->assign(n_output_values, Complex{});
+    child.numeric_revision = numeric_revision;
+
+    const auto dims = [](
+        const std::int64_t* offsets,
+        std::size_t n_offsets,
+        const std::int64_t* shape_offsets,
+        std::size_t n_shape_offsets,
+        const std::int64_t* shapes,
+        std::size_t n_shapes,
+        std::int64_t index,
+        std::size_t rank,
+        const char* name
+    ) {
+        if (
+            index < 0 || static_cast<std::size_t>(index + 1) >= n_offsets ||
+            static_cast<std::size_t>(index + 1) >= n_shape_offsets
+        ) {
+            throw std::out_of_range(std::string(name) + " block index is out of range.");
+        }
+        const std::int64_t shape_start = shape_offsets[index];
+        const std::int64_t shape_stop = shape_offsets[index + 1];
+        if (
+            shape_start < 0 || shape_stop - shape_start != static_cast<std::int64_t>(rank) ||
+            static_cast<std::size_t>(shape_stop) > n_shapes
+        ) {
+            throw std::invalid_argument(std::string(name) + " block rank is inconsistent.");
+        }
+        std::array<std::size_t, 4> result{1, 1, 1, 1};
+        std::size_t elements = 1;
+        for (std::size_t axis = 0; axis < rank; ++axis) {
+            const auto extent = shapes[static_cast<std::size_t>(shape_start) + axis];
+            if (extent <= 0) {
+                throw std::invalid_argument(std::string(name) + " block extent is invalid.");
+            }
+            result[axis] = static_cast<std::size_t>(extent);
+            elements *= result[axis];
+        }
+        if (
+            offsets[index] < 0 || offsets[index + 1] - offsets[index] !=
+                static_cast<std::int64_t>(elements)
+        ) {
+            throw std::invalid_argument(std::string(name) + " block size is inconsistent.");
+        }
+        return result;
+    };
+
+    for (std::size_t route_index = 0; route_index < n_routes; ++route_index) {
+        const std::int64_t* route = routes + 5 * route_index;
+        const std::int64_t parent_index = route[0];
+        const std::int64_t bra_index = route[1];
+        const std::int64_t ket_index = route[2];
+        const std::int64_t mpo_index = route[3];
+        const std::int64_t output_index = route[4];
+        const auto parent_dims = dims(
+            parent_offsets.data(), parent_offsets.size(),
+            parent_shape_offsets.data(), parent_shape_offsets.size(),
+            parent_shapes.data(), parent_shapes.size(), parent_index, 3, "parent"
+        );
+        const auto bra_dims = dims(
+            bra_offsets, n_bra_offsets, bra_shape_offsets, n_bra_shape_offsets,
+            bra_shapes, n_bra_shapes, bra_index, 3, "bra"
+        );
+        const auto ket_dims = dims(
+            ket_offsets, n_ket_offsets, ket_shape_offsets, n_ket_shape_offsets,
+            ket_shapes, n_ket_shapes, ket_index, 3, "ket"
+        );
+        const auto mpo_dims = dims(
+            mpo_offsets, n_mpo_offsets, mpo_shape_offsets, n_mpo_shape_offsets,
+            mpo_shapes, n_mpo_shapes, mpo_index, 4, "MPO"
+        );
+        const auto output_dims = dims(
+            output_offsets, n_output_offsets, output_shape_offsets,
+            n_output_shape_offsets, output_shapes, n_output_shapes,
+            output_index, 3, "output"
+        );
+        const std::size_t parent_start =
+            static_cast<std::size_t>(parent_offsets[parent_index]);
+        const Complex* bra = bra_values + bra_offsets[bra_index];
+        const Complex* ket = ket_values + ket_offsets[ket_index];
+        const Complex* mpo = mpo_values + mpo_offsets[mpo_index];
+        Complex* output = child.owned_values->data() + output_offsets[output_index];
+        const double route_coefficient = route_coefficients == nullptr
+            ? 1.0
+            : route_coefficients[route_index];
+        const auto parent_value = [&](std::size_t index) {
+            return complex_parent
+                ? complex_parent_values[parent_start + index]
+                : Complex(real_parent_values[parent_start + index], 0.0);
+        };
+
+        if (left) {
+            const auto [x_dim, i_dim, j_dim, unused_parent] = parent_dims;
+            const auto [bra_i, p_dim, r_dim, unused_bra] = bra_dims;
+            const auto [ket_j, q_dim, s_dim, unused_ket] = ket_dims;
+            const auto [mpo_x, y_dim, mpo_p, mpo_q] = mpo_dims;
+            const auto [out_y, out_r, out_s, unused_output] = output_dims;
+            static_cast<void>(unused_parent); static_cast<void>(unused_bra);
+            static_cast<void>(unused_ket); static_cast<void>(unused_output);
+            if (
+                bra_i != i_dim || ket_j != j_dim || mpo_x != x_dim ||
+                mpo_p != p_dim || mpo_q != q_dim || out_y != y_dim ||
+                out_r != r_dim || out_s != s_dim
+            ) {
+                throw std::invalid_argument("Complex left boundary route dimensions disagree.");
+            }
+            for (std::size_t x = 0; x < x_dim; ++x)
+            for (std::size_t y = 0; y < y_dim; ++y)
+            for (std::size_t p = 0; p < p_dim; ++p)
+            for (std::size_t q = 0; q < q_dim; ++q) {
+                const Complex coefficient = route_coefficient *
+                    mpo[((x * y_dim + y) * p_dim + p) * q_dim + q];
+                if (coefficient == Complex{}) continue;
+                for (std::size_t i = 0; i < i_dim; ++i)
+                for (std::size_t r = 0; r < r_dim; ++r) {
+                    const Complex bra_value =
+                        std::conj(bra[(i * p_dim + p) * r_dim + r]) * coefficient;
+                    if (bra_value == Complex{}) continue;
+                    for (std::size_t j = 0; j < j_dim; ++j) {
+                        const Complex value =
+                            parent_value((x * i_dim + i) * j_dim + j) * bra_value;
+                        if (value == Complex{}) continue;
+                        Complex* output_row = output + (y * r_dim + r) * s_dim;
+                        const Complex* ket_row = ket + (j * q_dim + q) * s_dim;
+                        for (std::size_t s = 0; s < s_dim; ++s)
+                            output_row[s] += value * ket_row[s];
+                    }
+                }
+            }
+        } else {
+            const auto [y_dim, r_dim, s_dim, unused_parent] = parent_dims;
+            const auto [i_dim, p_dim, bra_r, unused_bra] = bra_dims;
+            const auto [j_dim, q_dim, ket_s, unused_ket] = ket_dims;
+            const auto [x_dim, mpo_y, mpo_p, mpo_q] = mpo_dims;
+            const auto [out_x, out_i, out_j, unused_output] = output_dims;
+            static_cast<void>(unused_parent); static_cast<void>(unused_bra);
+            static_cast<void>(unused_ket); static_cast<void>(unused_output);
+            if (
+                bra_r != r_dim || ket_s != s_dim || mpo_y != y_dim ||
+                mpo_p != p_dim || mpo_q != q_dim || out_x != x_dim ||
+                out_i != i_dim || out_j != j_dim
+            ) {
+                throw std::invalid_argument("Complex right boundary route dimensions disagree.");
+            }
+            for (std::size_t x = 0; x < x_dim; ++x)
+            for (std::size_t y = 0; y < y_dim; ++y)
+            for (std::size_t p = 0; p < p_dim; ++p)
+            for (std::size_t q = 0; q < q_dim; ++q) {
+                const Complex coefficient = route_coefficient *
+                    mpo[((x * y_dim + y) * p_dim + p) * q_dim + q];
+                if (coefficient == Complex{}) continue;
+                for (std::size_t i = 0; i < i_dim; ++i)
+                for (std::size_t r = 0; r < r_dim; ++r) {
+                    const Complex bra_value =
+                        std::conj(bra[(i * p_dim + p) * r_dim + r]) * coefficient;
+                    if (bra_value == Complex{}) continue;
+                    for (std::size_t s = 0; s < s_dim; ++s) {
+                        const Complex value =
+                            parent_value((y * r_dim + r) * s_dim + s) * bra_value;
+                        if (value == Complex{}) continue;
+                        const Complex* ket_column = ket + (q * s_dim + s);
+                        Complex* output_row = output + (x * i_dim + i) * j_dim;
+                        for (std::size_t j = 0; j < j_dim; ++j)
+                            output_row[j] += value * ket_column[j * q_dim * s_dim];
+                    }
+                }
+            }
+        }
+    }
+    ++boundary_numeric_refreshes_;
+    ++boundary_update_calls_;
     boundary_update_routes_ += n_routes;
     boundary_update_seconds_ += wall_seconds() - started;
     return same_topology;
@@ -7571,6 +8035,48 @@ std::vector<ContextualCoreBlock> MovingEnvironment::contextual_core(
     );
 }
 
+void MovingEnvironment::refresh_normal_complementary_numerics() {
+    clear_factor_routes();
+    contextual_route_plans_.clear();
+    active_reduced_contextual_execution_schedule_.reset();
+    contextual_action_fragments_.clear();
+    contextual_action_fragment_bytes_ = 0;
+    contextual_route_skeletons_.clear();
+    contextual_route_skeleton_bytes_ = 0;
+    std::vector<std::array<std::int64_t, 11>> keys;
+    keys.reserve(
+        contextual_core_cache_.size() + contextual_zero_core_cache_.size()
+    );
+    for (const auto& item : contextual_core_cache_) {
+        keys.push_back(item.first);
+    }
+    for (const auto& key : contextual_zero_core_cache_) {
+        keys.push_back(key);
+    }
+    contextual_core_cache_.clear();
+    contextual_zero_core_cache_.clear();
+    contextual_core_cache_elements_ = 0;
+    contextual_core_cache_blocks_ = 0;
+    normal_complementary_boundary_actions_.clear();
+    for (const auto& key : keys) {
+        std::vector<ContextualCoreBlock> transient;
+        contextual_core_view(
+            key[0],
+            key[1],
+            key[2],
+            static_cast<std::int32_t>(key[3]),
+            static_cast<std::int32_t>(key[4]),
+            static_cast<std::int32_t>(key[5]),
+            static_cast<std::int32_t>(key[6]),
+            static_cast<std::int32_t>(key[7]),
+            static_cast<std::int32_t>(key[8]),
+            key[9] != 0,
+            key[10] != 0,
+            transient
+        );
+    }
+}
+
 const std::vector<ContextualCoreBlock>*
 MovingEnvironment::contextual_core_view(
     std::int64_t site,
@@ -8073,6 +8579,23 @@ BoundaryBufferHandle* MovingEnvironment::retain_metric_boundary_buffer(
     return new BoundaryBufferHandle{
         materialize_symbolic_identity(it->second)
     };
+}
+
+ComplexBoundaryBufferHandle* MovingEnvironment::retain_complex_boundary_buffer(
+    const std::string& side,
+    std::int64_t bond,
+    bool metric_boundary
+) const {
+    const auto& store = metric_boundary
+        ? complex_metric_boundaries_
+        : complex_boundaries_;
+    const auto it = store.find(boundary_key(side, bond));
+    if (it == store.end() || !it->second.owned_values) {
+        throw std::invalid_argument(
+            "Requested complex boundary does not own a numerical buffer."
+        );
+    }
+    return new ComplexBoundaryBufferHandle{it->second.owned_values};
 }
 
 bool MovingEnvironment::install_local_operator(
@@ -9824,7 +10347,11 @@ void MovingEnvironment::build_raw_execution_groups() {
             const ComplementaryLocalAction& action
         ) {
             std::vector<ComplementaryScheduleAction> rows;
-            std::map<std::int32_t, std::vector<std::uint32_t>> columns;
+            std::vector<std::int32_t> columns;
+            const std::size_t term_count =
+                action.term_stop - action.term_start;
+            rows.reserve(term_count);
+            columns.reserve(std::min<std::size_t>(term_count, 16));
             std::size_t start = action.term_start;
             while (start < action.term_stop) {
                 std::size_t stop = start + 1;
@@ -9840,8 +10367,17 @@ void MovingEnvironment::build_raw_execution_groups() {
                     static_cast<std::uint32_t>(stop),
                 });
                 for (std::size_t term = start; term < stop; ++term) {
-                    columns[complementary_local_terms_[term].right_matrix]
-                        .push_back(static_cast<std::uint32_t>(term));
+                    const std::int32_t right_matrix =
+                        complementary_local_terms_[term].right_matrix;
+                    if (
+                        std::find(
+                            columns.begin(),
+                            columns.end(),
+                            right_matrix
+                        ) == columns.end()
+                    ) {
+                        columns.push_back(right_matrix);
+                    }
                 }
                 start = stop;
             }
@@ -9852,16 +10388,29 @@ void MovingEnvironment::build_raw_execution_groups() {
             ) {
                 return rows;
             }
-            std::vector<ComplementaryScheduleAction> result;
-            result.reserve(columns.size());
-            for (auto& [right_matrix, terms] : columns) {
-                static_cast<void>(right_matrix);
-                result.push_back(ComplementaryScheduleAction{
-                    terms.front(),
-                    static_cast<std::uint32_t>(terms.front() + 1),
-                    std::move(terms),
-                    true,
-                });
+            std::sort(columns.begin(), columns.end());
+            std::vector<ComplementaryScheduleAction> result(
+                columns.size()
+            );
+            for (std::size_t term = action.term_start;
+                 term < action.term_stop;
+                 ++term) {
+                const auto column = std::lower_bound(
+                    columns.begin(),
+                    columns.end(),
+                    complementary_local_terms_[term].right_matrix
+                );
+                result[static_cast<std::size_t>(column - columns.begin())]
+                    .combined_left_terms.push_back(
+                        static_cast<std::uint32_t>(term)
+                    );
+            }
+            for (ComplementaryScheduleAction& scheduled : result) {
+                const std::uint32_t first =
+                    scheduled.combined_left_terms.front();
+                scheduled.start = first;
+                scheduled.stop = first + 1;
+                scheduled.right_grouped = true;
             }
             return result;
         };
@@ -9882,6 +10431,11 @@ void MovingEnvironment::build_raw_execution_groups() {
                 action.dims[8],
             };
         };
+        std::vector<std::vector<ComplementaryScheduleAction>>
+            scheduled_by_action;
+        scheduled_by_action.reserve(complementary_local_actions_.size());
+        std::vector<std::uint32_t> execution_by_action;
+        execution_by_action.reserve(complementary_local_actions_.size());
         for (
             std::size_t action_index = 0;
             action_index < complementary_local_actions_.size();
@@ -9922,7 +10476,21 @@ void MovingEnvironment::build_raw_execution_groups() {
             } else {
                 execution_index = found->second;
             }
-            const std::size_t count = scheduled_actions(action).size();
+            if (
+                execution_index >
+                    static_cast<std::size_t>(
+                        std::numeric_limits<std::uint32_t>::max()
+                    )
+            ) {
+                throw std::overflow_error(
+                    "Complementary execution group index is too large."
+                );
+            }
+            execution_by_action.push_back(
+                static_cast<std::uint32_t>(execution_index)
+            );
+            scheduled_by_action.push_back(scheduled_actions(action));
+            const std::size_t count = scheduled_by_action.back().size();
             RawExecutionGroup& execution =
                 raw_execution_groups_[execution_index];
             if (
@@ -9956,16 +10524,11 @@ void MovingEnvironment::build_raw_execution_groups() {
             action_index < complementary_local_actions_.size();
             ++action_index
         ) {
-            const ComplementaryLocalAction& action =
-                complementary_local_actions_[action_index];
-            const auto found = lookup.find(execution_key(action));
-            if (found == lookup.end()) {
-                throw std::logic_error(
-                    "Complementary execution group disappeared."
-                );
-            }
-            std::uint32_t& position = positions[found->second];
-            for (auto scheduled : scheduled_actions(action)) {
+            std::uint32_t& position = positions[
+                execution_by_action[action_index]
+            ];
+            for (const ComplementaryScheduleAction& scheduled :
+                 scheduled_by_action[action_index]) {
                 if (scheduled.start > static_cast<std::uint32_t>(
                     std::numeric_limits<std::int32_t>::max()
                 )) {
@@ -10274,7 +10837,8 @@ void MovingEnvironment::build_raw_input_superchannels() {
     const std::size_t target_batch_elements =
         complementary_batch_target_elements();
     using Key = std::array<std::int64_t, 3>;
-    std::map<Key, std::size_t> lookup;
+    std::unordered_map<Key, std::size_t, IntegerArrayHash<3>> lookup;
+    lookup.reserve(raw_execution_groups_.size());
     raw_input_superchannels_.clear();
     raw_input_superchannel_tiles_ = 0;
     raw_input_superchannel_batches_ = 0;
@@ -10314,19 +10878,17 @@ void MovingEnvironment::build_raw_input_superchannels() {
             )
         );
         const Key key{execution.input_offset, kb, cr};
-        auto found = lookup.find(key);
-        if (found == lookup.end()) {
-            const std::size_t index = raw_input_superchannels_.size();
-            lookup.emplace(key, index);
+        const std::size_t candidate = raw_input_superchannels_.size();
+        auto inserted = lookup.emplace(key, candidate);
+        if (inserted.second) {
             RawInputSuperchannel channel;
             channel.input_offset = execution.input_offset;
             channel.kb = kb;
             channel.cr = cr;
             raw_input_superchannels_.push_back(std::move(channel));
-            found = lookup.find(key);
         }
         RawInputSuperchannel& channel =
-            raw_input_superchannels_[found->second];
+            raw_input_superchannels_[inserted.first->second];
         std::size_t start = execution.action_start;
         while (start < execution.action_stop) {
             std::size_t stop = start;
@@ -10430,7 +10992,11 @@ void MovingEnvironment::build_raw_input_superchannels() {
             });
             RawExecutionBatch& batch = channel.batches.back();
             if (!complementary_local_actions_.empty()) {
-                std::unordered_map<std::int64_t, std::int64_t>
+                std::unordered_map<
+                    std::array<std::int64_t, 3>,
+                    std::int64_t,
+                    IntegerArrayHash<3>
+                >
                     left_row_offsets;
                 std::int64_t packed_left_rows = 0;
                 for (
@@ -10481,8 +11047,11 @@ void MovingEnvironment::build_raw_input_superchannels() {
                                 static_cast<std::size_t>(action.factor)
                             );
                         const std::int64_t rows = la * local.dims[2];
-                        const std::int64_t left_key =
-                            raw_execution_action_left_key(action);
+                        const std::array<std::int64_t, 3> left_key{
+                            raw_execution_action_left_key(action),
+                            la,
+                            local.dims[2],
+                        };
                         auto found =
                             left_row_offsets.find(left_key);
                         if (found == left_row_offsets.end()) {
@@ -10520,8 +11089,25 @@ void MovingEnvironment::build_raw_input_superchannels() {
                         );
                     }
                 }
-                batch.packed_left_rows = packed_left_rows;
-                if (packed_left_rows == batch.total_left_rows) {
+                if (shared_right_copy_budget() > 0) {
+                    batch.packed_left_rows = packed_left_rows;
+                    if (packed_left_rows == batch.total_left_rows) {
+                        std::vector<std::uint32_t>().swap(
+                            batch.unique_left_actions
+                        );
+                        std::vector<std::int64_t>().swap(
+                            batch.unique_left_row_offsets
+                        );
+                        std::vector<std::int64_t>().swap(
+                            batch.action_left_row_offsets
+                        );
+                    }
+                } else {
+                    // Reusing flattened left panels across changing
+                    // reduced-sector actions is not exact.  The optional
+                    // shared-right planner uses the complete shape key above;
+                    // ordinary batches retain explicit rows.
+                    batch.packed_left_rows = batch.total_left_rows;
                     std::vector<std::uint32_t>().swap(
                         batch.unique_left_actions
                     );
@@ -10593,8 +11179,11 @@ void MovingEnvironment::build_raw_input_superchannels() {
         std::size_t shared_left_panel_count = 0;
         std::size_t shared_left_occurrence_count = 0;
         for (RawInputSuperchannel& channel : raw_input_superchannels_) {
-            std::map<std::array<std::int64_t, 3>, std::uint16_t>
-                left_indices;
+            std::unordered_map<
+                std::array<std::int64_t, 3>,
+                std::uint16_t,
+                IntegerArrayHash<3>
+            > left_indices;
             std::vector<std::size_t> left_uses;
             for (RawExecutionBatch& batch : channel.batches) {
                 batch.channel_left_indices.clear();
@@ -11786,6 +12375,44 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                         )
                     ) {
                         candidate_active[candidate_index] = false;
+                        changed = true;
+                    }
+                }
+                // Sharing only part of an output group mixes panel products
+                // with deferred per-tile products.  That representation is
+                // not invariant under changing reduced-sector topologies.
+                // Keep the optimization only when it owns the complete group.
+                std::vector<std::size_t> active_group_bindings(
+                    wave.groups.size(),
+                    0
+                );
+                for (
+                    std::size_t binding_index = 0;
+                    binding_index < binding_active.size();
+                    ++binding_index
+                ) {
+                    if (binding_active[binding_index]) {
+                        ++active_group_bindings.at(
+                            wave.bindings.at(binding_index).group
+                        );
+                    }
+                }
+                for (
+                    std::size_t binding_index = 0;
+                    binding_index < binding_active.size();
+                    ++binding_index
+                ) {
+                    if (!binding_active[binding_index]) {
+                        continue;
+                    }
+                    const RawOutputFusionGroup& group = wave.groups.at(
+                        wave.bindings.at(binding_index).group
+                    );
+                    const std::size_t active = active_group_bindings.at(
+                        wave.bindings.at(binding_index).group
+                    );
+                    if (active != group.tile_count) {
+                        binding_active[binding_index] = false;
                         changed = true;
                     }
                 }
@@ -15099,6 +15726,7 @@ void MovingEnvironment::select_direct_complementary_tiles() {
     if (
         term_limit == 0
         || action_limit == 0
+        || raw_output_fusion_waves_.empty()
         || shared_right_copy_budget() > 0
         || complementary_local_actions_.empty()
     ) {
@@ -17564,7 +18192,23 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             );
         }
     }
-    if (!raw_output_fusion_waves_.empty()) {
+    if (
+        reduced_contextual_routes_
+        && raw_output_fusion_waves_.empty()
+    ) {
+        // A fusion plan can legitimately be empty under a tight copy budget.
+        // The generic packed fallback does not preserve every changing
+        // reduced-sector route, so use the exact contextual executor here.
+        for (const RawExecutionGroup& execution : raw_execution_groups_) {
+            apply_direct_complementary_actions_real(
+                execution,
+                execution.action_start,
+                execution.action_stop,
+                raw_packed_input_real_.data(),
+                output
+            );
+        }
+    } else if (!raw_output_fusion_waves_.empty()) {
         constexpr std::size_t no_offset =
             std::numeric_limits<std::size_t>::max();
         for (
@@ -21307,6 +21951,15 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
         result.rows = source.rows;
         result.cols = source.cols;
         result.rank = expected_rank;
+        result.pivot_basis = true;
+        result.pivot_offset = cache.pivot_components.size();
+        cache.pivot_components.insert(
+            cache.pivot_components.end(),
+            pivot_components.begin()
+                + static_cast<std::ptrdiff_t>(pivot_offset),
+            pivot_components.begin()
+                + static_cast<std::ptrdiff_t>(pivot_offset + rank)
+        );
         const std::size_t slice_size =
             static_cast<std::size_t>(source.rows * source.cols);
         const auto pivot_matrix = [
@@ -21329,19 +21982,86 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
             }
         }
         if (rank == components) {
+            if (!specialize_pivot_scale_refresh()) {
+                result.component_offset = cache.component_values.size();
+                cache.component_values.resize(
+                    result.component_offset + components * rank,
+                    0.0
+                );
+                for (std::size_t basis = 0; basis < rank; ++basis) {
+                    const std::size_t pivot = pivot_components[
+                        static_cast<std::size_t>(pivot_offset) + basis
+                    ];
+                    cache.component_values[
+                        result.component_offset + pivot * rank + basis
+                    ] = 1.0;
+                }
+            }
+            // A full-rank pivot basis is just a permutation of the component
+            // slices.  The production path keeps that identity implicit: the
+            // matrices borrow the selected slices directly and invariant
+            // scale recipes use the pivot indices.
+            cache.ready[static_cast<std::size_t>(block)] = 1;
+            return &result;
+        }
+        if (rank == 1) {
+            const double* pivot_values = pivot_matrix(0);
+            double gram = 0.0;
+#ifdef __APPLE__
+            if (slice_size >= 64) {
+                gram = cblas_ddot(
+                    static_cast<int>(slice_size),
+                    pivot_values,
+                    1,
+                    pivot_values,
+                    1
+                );
+            } else
+#endif
+            for (std::size_t index = 0; index < slice_size; ++index) {
+                gram += pivot_values[index] * pivot_values[index];
+            }
+            if (
+                !std::isfinite(gram) ||
+                gram <= std::numeric_limits<double>::min()
+            ) {
+                return nullptr;
+            }
             result.component_offset = cache.component_values.size();
             cache.component_values.resize(
-                result.component_offset + components * rank,
-                0.0
+                result.component_offset + components
             );
-            for (std::size_t basis = 0; basis < rank; ++basis) {
-                const std::size_t pivot = pivot_components[
-                    static_cast<std::size_t>(pivot_offset) + basis
-                ];
+            const double inverse_gram = 1.0 / gram;
+            for (
+                std::size_t component = 0;
+                component < components;
+                ++component
+            ) {
+                const double* values =
+                    source.values + component * slice_size;
+                double overlap = 0.0;
+#ifdef __APPLE__
+                if (slice_size >= 64) {
+                    overlap = cblas_ddot(
+                        static_cast<int>(slice_size),
+                        values,
+                        1,
+                        pivot_values,
+                        1
+                    );
+                } else
+#endif
+                for (std::size_t index = 0; index < slice_size; ++index) {
+                    overlap += values[index] * pivot_values[index];
+                }
                 cache.component_values[
-                    result.component_offset + pivot * rank + basis
-                ] = 1.0;
+                    result.component_offset + component
+                ] = overlap * inverse_gram;
             }
+            const std::size_t pivot = pivot_components[pivot_offset];
+            cache.component_values[
+                result.component_offset + pivot
+            ] = 1.0;
             cache.ready[static_cast<std::size_t>(block)] = 1;
             return &result;
         }
@@ -21670,6 +22390,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
         !plan.execution->local_actions.empty() &&
         !plan.execution->local_terms.empty()
     ) {
+        const double boundary_refresh_started = wall_seconds();
         bool valid = true;
         bool shape_changed = false;
         left_matrices.resize(plan.decomposed.left_matrices.size());
@@ -21835,9 +22556,14 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                 }
             }
         }
-        const std::vector<ComplementaryLocalTerm>& plan_terms =
+        reduced_contextual_boundary_refresh_seconds_ +=
+            wall_seconds() - boundary_refresh_started;
+        const double scale_refresh_started = wall_seconds();
+        std::vector<ComplementaryLocalTerm>& plan_terms =
             plan.execution->local_terms;
-        refreshed_complementary_scales_.assign(plan_terms.size(), 0.0);
+        if (plan.decomposed.scale_recipes.size() != plan_terms.size()) {
+            valid = false;
+        }
         for (
             const ContextualDecomposedScaleRecipe& recipe :
             plan.decomposed.scale_recipes
@@ -21846,7 +22572,23 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                 valid = false;
                 break;
             }
-            const ComplementaryLocalTerm& term =
+            constexpr std::uint32_t invariant_scale_mask =
+                std::uint32_t{1} << 31;
+            if ((recipe.core_offset & invariant_scale_mask) != 0) {
+                const std::size_t invariant_index =
+                    recipe.core_offset & ~invariant_scale_mask;
+                if (
+                    invariant_index
+                    >= plan.decomposed.invariant_scales.size()
+                ) {
+                    valid = false;
+                    break;
+                }
+                plan_terms[recipe.term].scale =
+                    plan.decomposed.invariant_scales[invariant_index];
+                continue;
+            }
+            ComplementaryLocalTerm& term =
                 plan_terms[recipe.term];
             if (
                 term.left_matrix < 0 ||
@@ -22025,8 +22767,10 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                     }
                 }
             }
-            refreshed_complementary_scales_[recipe.term] += scalar;
+            term.scale = scalar;
         }
+        reduced_contextual_scale_refresh_seconds_ +=
+            wall_seconds() - scale_refresh_started;
         if (valid) {
             for (
                 const ComplementaryLocalAction& action :
@@ -22900,6 +23644,27 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
             }
             const std::uint32_t offset =
                 static_cast<std::uint32_t>(pivot_components.size());
+            if (item.pivot_basis) {
+                if (
+                    item.pivot_offset > source.pivot_components.size() ||
+                    rank > source.pivot_components.size()
+                        - item.pivot_offset
+                ) {
+                    throw std::logic_error(
+                        "Reduced boundary pivot basis is incomplete."
+                    );
+                }
+                pivot_components.insert(
+                    pivot_components.end(),
+                    source.pivot_components.begin()
+                        + static_cast<std::ptrdiff_t>(item.pivot_offset),
+                    source.pivot_components.begin()
+                        + static_cast<std::ptrdiff_t>(
+                            item.pivot_offset + rank
+                        )
+                );
+                return offset;
+            }
             const double* component_values = source.components(item);
             std::vector<double> elimination(
                 component_values,
@@ -23495,6 +24260,11 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                         ) * static_cast<std::size_t>(
                             right_binding.expected_components
                         );
+                    // A scalar core is already one indexed load on refresh;
+                    // moving it to a second arena saves no work or memory.
+                    if (core_elements == 1) {
+                        continue;
+                    }
                     if (
                         recipe.core_offset >
                             plan.decomposed.scale_cores.size() ||
@@ -23565,6 +24335,175 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                 }
             }
         }
+        if (!plan.decomposed.scale_cores.empty()) {
+            constexpr std::uint32_t invariant_scale_mask =
+                std::uint32_t{1} << 31;
+            if (specialize_pivot_scale_refresh()) {
+                for (
+                    ContextualDecomposedScaleRecipe& recipe :
+                    plan.decomposed.scale_recipes
+                ) {
+                    if (recipe.term >= complementary_local_terms_.size()) {
+                        throw std::logic_error(
+                            "Reduced contextual invariant scale term is "
+                            "invalid."
+                        );
+                    }
+                    const ComplementaryLocalTerm& term =
+                        complementary_local_terms_[recipe.term];
+                    if (
+                        term.left_matrix < 0 || term.right_matrix < 0 ||
+                        static_cast<std::size_t>(term.left_matrix)
+                            >= plan.decomposed.left_matrices.size() ||
+                        static_cast<std::size_t>(term.right_matrix)
+                            >= plan.decomposed.right_matrices.size()
+                    ) {
+                        throw std::logic_error(
+                            "Reduced contextual invariant scale binding is "
+                            "invalid."
+                        );
+                    }
+                    const ContextualDecomposedMatrixBinding& left_binding =
+                        plan.decomposed.left_matrices[
+                            static_cast<std::size_t>(term.left_matrix)
+                        ];
+                    const ContextualDecomposedMatrixBinding& right_binding =
+                        plan.decomposed.right_matrices[
+                            static_cast<std::size_t>(term.right_matrix)
+                        ];
+                    if (
+                        left_binding.expected_rank
+                            != left_binding.expected_components ||
+                        right_binding.expected_rank
+                            != right_binding.expected_components
+                    ) {
+                        continue;
+                    }
+                    const std::size_t left_pivot_index =
+                        static_cast<std::size_t>(
+                            left_binding.reduction_offset
+                        ) + left_binding.rank_index;
+                    const std::size_t right_pivot_index =
+                        static_cast<std::size_t>(
+                            right_binding.reduction_offset
+                        ) + right_binding.rank_index;
+                    const std::size_t core_elements =
+                        static_cast<std::size_t>(
+                            left_binding.expected_components
+                        ) * static_cast<std::size_t>(
+                            right_binding.expected_components
+                        );
+                    if (
+                        left_pivot_index
+                            >= plan.decomposed.left_pivot_components.size() ||
+                        right_pivot_index
+                            >= plan.decomposed.right_pivot_components.size() ||
+                        recipe.core_offset
+                            > plan.decomposed.scale_cores.size() ||
+                        core_elements > plan.decomposed.scale_cores.size()
+                            - recipe.core_offset ||
+                        plan.decomposed.invariant_scales.size()
+                            >= invariant_scale_mask
+                    ) {
+                        throw std::logic_error(
+                            "Reduced contextual invariant scale topology "
+                            "changed."
+                        );
+                    }
+                    const std::size_t left_pivot =
+                        plan.decomposed.left_pivot_components[
+                            left_pivot_index
+                        ];
+                    const std::size_t right_pivot =
+                        plan.decomposed.right_pivot_components[
+                            right_pivot_index
+                        ];
+                    if (
+                        left_pivot >= left_binding.expected_components ||
+                        right_pivot >= right_binding.expected_components
+                    ) {
+                        throw std::logic_error(
+                            "Reduced contextual invariant pivot is invalid."
+                        );
+                    }
+                    const double invariant_scale =
+                        plan.decomposed.scale_cores[
+                            recipe.core_offset
+                            + left_pivot
+                                * right_binding.expected_components
+                            + right_pivot
+                        ];
+                    const std::uint32_t invariant_index =
+                        static_cast<std::uint32_t>(
+                            plan.decomposed.invariant_scales.size()
+                        );
+                    plan.decomposed.invariant_scales.push_back(
+                        invariant_scale
+                    );
+                    recipe.core_offset =
+                        invariant_scale_mask | invariant_index;
+                }
+            }
+            std::vector<double> dynamic_scale_cores;
+            for (
+                ContextualDecomposedScaleRecipe& recipe :
+                plan.decomposed.scale_recipes
+            ) {
+                if ((recipe.core_offset & invariant_scale_mask) != 0) {
+                    continue;
+                }
+                if (recipe.term >= complementary_local_terms_.size()) {
+                    throw std::logic_error(
+                        "Reduced contextual dynamic scale term is invalid."
+                    );
+                }
+                const ComplementaryLocalTerm& term =
+                    complementary_local_terms_[recipe.term];
+                const ContextualDecomposedMatrixBinding& left_binding =
+                    plan.decomposed.left_matrices.at(
+                        static_cast<std::size_t>(term.left_matrix)
+                    );
+                const ContextualDecomposedMatrixBinding& right_binding =
+                    plan.decomposed.right_matrices.at(
+                        static_cast<std::size_t>(term.right_matrix)
+                    );
+                const std::size_t core_elements =
+                    static_cast<std::size_t>(
+                        left_binding.expected_components
+                    ) * static_cast<std::size_t>(
+                        right_binding.expected_components
+                    );
+                if (
+                    recipe.core_offset > plan.decomposed.scale_cores.size()
+                    || core_elements > plan.decomposed.scale_cores.size()
+                        - recipe.core_offset
+                    || dynamic_scale_cores.size()
+                        >= invariant_scale_mask
+                    || core_elements
+                        > invariant_scale_mask
+                            - dynamic_scale_cores.size()
+                ) {
+                    throw std::logic_error(
+                        "Reduced contextual dynamic scale core is invalid."
+                    );
+                }
+                const std::size_t source_offset = recipe.core_offset;
+                recipe.core_offset = static_cast<std::uint32_t>(
+                    dynamic_scale_cores.size()
+                );
+                dynamic_scale_cores.insert(
+                    dynamic_scale_cores.end(),
+                    plan.decomposed.scale_cores.begin()
+                        + static_cast<std::ptrdiff_t>(source_offset),
+                    plan.decomposed.scale_cores.begin()
+                        + static_cast<std::ptrdiff_t>(
+                            source_offset + core_elements
+                        )
+                );
+            }
+            plan.decomposed.scale_cores =
+                std::move(dynamic_scale_cores);
+        }
         ++decomposed_action_plan_builds_;
     }
     std::size_t reduced_matrix_elements = 0;
@@ -23625,11 +24564,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
         );
     bool rebuilt_execution_shape = false;
     if (refreshed_decomposed_plan) {
-        if (
-            !restored_execution ||
-            complementary_local_terms_.size()
-                != refreshed_complementary_scales_.size()
-        ) {
+        if (!restored_execution) {
             throw std::logic_error(
                 "Reduced contextual action schedule changed."
             );
@@ -23707,14 +24642,6 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                 plan.execution.reset();
                 restored_execution = false;
             }
-        }
-        for (
-            std::size_t index = 0;
-            index < refreshed_complementary_scales_.size();
-            ++index
-        ) {
-            complementary_local_terms_[index].scale =
-                refreshed_complementary_scales_[index];
         }
         if (!raw_combined_left_schedule_valid()) {
             active_reduced_contextual_execution_schedule_.reset();
@@ -24010,6 +24937,9 @@ bool MovingEnvironment::install_contextual_factor_routes(
     mix_structural(static_cast<std::uint64_t>(bond));
     mix_structural(static_cast<std::uint64_t>(dual_right_basis));
     mix_structural(static_cast<std::uint64_t>(n_basis));
+    for (std::size_t index = 0; index < 4 * n_basis; ++index) {
+        mix_structural(static_cast<std::uint64_t>(basis_shapes[index]));
+    }
     for (std::size_t index = 0; index < 10 * n_basis; ++index) {
         mix_structural(
             static_cast<std::uint64_t>(basis_quantum_numbers[index])
@@ -24023,6 +24953,7 @@ bool MovingEnvironment::install_contextual_factor_routes(
         cached_plan != contextual_route_plans_.end() &&
         cached_plan->second.bond == bond &&
         cached_plan->second.topology_revision == topology_revision &&
+        cached_plan->second.structural_revision == structural_revision &&
         cached_plan->second.n_basis == n_basis
     ) {
         ContextualFactorRoutePlan& plan = cached_plan->second;
@@ -24267,7 +25198,6 @@ bool MovingEnvironment::install_contextual_factor_routes(
             ++candidate;
         }
     }
-
     using LookupKey = std::array<std::int64_t, 3>;
     auto boundary_lookup = [](const PackedArena& arena) {
         if (arena.labels.size() < 7) {
@@ -24311,6 +25241,7 @@ bool MovingEnvironment::install_contextual_factor_routes(
             std::int64_t,
             IntegerArrayHash<3>
         > lookup;
+        lookup.reserve(sizes[4]);
         for (std::size_t row = 0; row < sizes[0]; ++row) {
             const std::int64_t entry_start = entry_offsets[row];
             const std::int64_t entry_stop = entry_offsets[row + 1];
@@ -24626,7 +25557,8 @@ bool MovingEnvironment::install_contextual_factor_routes(
         return static_cast<std::uint32_t>(value);
     };
     const double match_start = wall_seconds();
-    constexpr bool use_route_skeleton_cache = false;
+    constexpr bool use_route_skeleton_cache = true;
+    constexpr std::size_t route_skeleton_cache_limit = 16U << 20;
     using RightCoreBuckets =
         std::vector<std::vector<const ContextualCoreReference*>>;
     std::unordered_map<
@@ -24672,7 +25604,7 @@ bool MovingEnvironment::install_contextual_factor_routes(
                     pair_key[12 + field] = qn(input, field);
                 }
             }
-            const ContextualActionFragmentKey skeleton_key{
+            const ContextualRouteSkeletonKey skeleton_key{
                 bond,
                 dual_right_basis ? std::int64_t{1} : std::int64_t{0},
                 qn(output, 2), qn(input, 2),
@@ -24682,7 +25614,6 @@ bool MovingEnvironment::install_contextual_factor_routes(
                 qn(output, 6), qn(input, 6),
                 qn(output, 9), qn(input, 9),
                 qn(output, 7), qn(input, 7),
-                qn(output, 5), qn(input, 5),
             };
             if (
                 contextual_action_fragment_cache_enabled_ &&
@@ -24736,6 +25667,9 @@ bool MovingEnvironment::install_contextual_factor_routes(
                   contextual_route_skeletons_.find(skeleton_key);
               if (cached_skeleton != contextual_route_skeletons_.end()) {
                 ++contextual_route_skeleton_hits_;
+                if (cached_skeleton->second.terms.empty()) {
+                    continue;
+                }
                 const ContextualCoreKey left_key{
                     qn(output, 2), qn(input, 2),
                     qn(output, 1), qn(input, 1),
@@ -24987,6 +25921,29 @@ bool MovingEnvironment::install_contextual_factor_routes(
                     core_pair_key,
                     std::move(pairs)
                 ).first;
+            }
+            if constexpr (use_route_skeleton_cache) {
+                if (
+                    contextual_route_skeletons_.find(skeleton_key) ==
+                    contextual_route_skeletons_.end()
+                ) {
+                    ContextualRouteSkeleton skeleton;
+                    skeleton.terms = matched->second;
+                    const std::size_t skeleton_bytes =
+                        sizeof(ContextualRouteSkeletonKey) +
+                        skeleton.memory_bytes();
+                    if (
+                        skeleton_bytes <= route_skeleton_cache_limit &&
+                        contextual_route_skeleton_bytes_ <=
+                            route_skeleton_cache_limit - skeleton_bytes
+                    ) {
+                        contextual_route_skeleton_bytes_ += skeleton_bytes;
+                        contextual_route_skeletons_.emplace(
+                            skeleton_key,
+                            std::move(skeleton)
+                        );
+                    }
+                }
             }
             std::size_t previous_left_core =
                 std::numeric_limits<std::size_t>::max();
@@ -33409,6 +34366,1635 @@ MovingEnvironment::export_owned_split_sites() const {
     return result;
 }
 
+namespace {
+
+struct ReducedNPDMQuantumNumber {
+    std::int64_t charge = 0;
+    std::int32_t two_j = 0;
+
+    bool operator==(const ReducedNPDMQuantumNumber& other) const noexcept {
+        return charge == other.charge && two_j == other.two_j;
+    }
+
+    bool operator!=(const ReducedNPDMQuantumNumber& other) const noexcept {
+        return !(*this == other);
+    }
+
+    bool operator<(const ReducedNPDMQuantumNumber& other) const noexcept {
+        return std::tie(charge, two_j)
+            < std::tie(other.charge, other.two_j);
+    }
+};
+
+struct ReducedNPDMAxisSector {
+    ReducedNPDMQuantumNumber quantum_number;
+    std::size_t multiplicity = 0;
+};
+
+struct ReducedNPDMSiteBlock {
+    ReducedNPDMQuantumNumber left;
+    ReducedNPDMQuantumNumber physical;
+    ReducedNPDMQuantumNumber right;
+    std::size_t left_dimension = 0;
+    std::size_t right_dimension = 0;
+    const double* values = nullptr;
+};
+
+struct ReducedNPDMSite {
+    std::vector<ReducedNPDMSiteBlock> blocks;
+    std::map<ReducedNPDMQuantumNumber, std::vector<std::size_t>> by_left;
+    std::map<ReducedNPDMQuantumNumber, std::vector<std::size_t>> by_right;
+    std::vector<ReducedNPDMAxisSector> left_sectors;
+    std::vector<ReducedNPDMAxisSector> right_sectors;
+    std::size_t maximum_multiplicity = 0;
+};
+
+struct ReducedNPDMDenseMatrix {
+    std::size_t rows = 0;
+    std::size_t cols = 0;
+    std::vector<double> values;
+};
+
+struct ReducedNPDMOperatorKey {
+    ReducedNPDMQuantumNumber bra;
+    ReducedNPDMQuantumNumber ket;
+    std::int32_t two_j = 0;
+    std::int32_t two_m = 0;
+
+    bool operator<(const ReducedNPDMOperatorKey& other) const noexcept {
+        return std::tie(bra, ket, two_j, two_m)
+            < std::tie(other.bra, other.ket, other.two_j, other.two_m);
+    }
+};
+
+struct ReducedNPDMLocalTerm {
+    std::int32_t two_j = 0;
+    std::int32_t two_m = 0;
+    double coefficient = 0.0;
+};
+
+using ReducedNPDMScalarEnvironment = std::map<
+    ReducedNPDMQuantumNumber,
+    ReducedNPDMDenseMatrix
+>;
+using ReducedNPDMOperatorEnvironment = std::map<
+    ReducedNPDMOperatorKey,
+    ReducedNPDMDenseMatrix
+>;
+using ReducedNPDMRecouplingKey = std::array<std::int32_t, 12>;
+using ReducedNPDMRecouplingCache = std::map<
+    ReducedNPDMRecouplingKey,
+    double
+>;
+using ReducedNPDMLocalDecompositionCache = std::map<
+    std::tuple<
+        Matrix4,
+        ReducedNPDMQuantumNumber,
+        ReducedNPDMQuantumNumber
+    >,
+    std::vector<ReducedNPDMLocalTerm>
+>;
+
+std::vector<ReducedNPDMAxisSector> reduced_npdm_axis_sectors(
+    const PackedArena& arena,
+    std::size_t axis
+) {
+    if (
+        arena.leg_sector_offsets.size() != 4
+        || axis >= 3
+        || arena.leg_sector_offsets[axis] < 0
+        || arena.leg_sector_offsets[axis + 1]
+            < arena.leg_sector_offsets[axis]
+    ) {
+        throw std::logic_error("Packed reduced NPDM leg metadata is incomplete.");
+    }
+    const std::size_t begin = static_cast<std::size_t>(
+        arena.leg_sector_offsets[axis]
+    );
+    const std::size_t end = static_cast<std::size_t>(
+        arena.leg_sector_offsets[axis + 1]
+    );
+    if (
+        end > arena.leg_sector_dims.size()
+        || 2 * end > arena.leg_sector_labels.size()
+    ) {
+        throw std::logic_error("Packed reduced NPDM leg metadata is truncated.");
+    }
+    std::vector<ReducedNPDMAxisSector> result;
+    result.reserve(end - begin);
+    for (std::size_t index = begin; index < end; ++index) {
+        const std::int64_t multiplicity = arena.leg_sector_dims[index];
+        const std::int64_t two_j = arena.leg_sector_labels[2 * index + 1];
+        if (multiplicity <= 0 || two_j < 0) {
+            throw std::logic_error("Packed reduced NPDM sector is invalid.");
+        }
+        result.push_back(ReducedNPDMAxisSector{
+            ReducedNPDMQuantumNumber{
+                arena.leg_sector_labels[2 * index],
+                static_cast<std::int32_t>(two_j),
+            },
+            static_cast<std::size_t>(multiplicity),
+        });
+    }
+    return result;
+}
+
+ReducedNPDMSite reduced_npdm_site_view(const PackedArena& arena) {
+    if (
+        arena.values == nullptr
+        || arena.offsets.empty()
+        || arena.labels.size() != 6 * (arena.offsets.size() - 1)
+        || arena.shape_offsets.size() != arena.offsets.size()
+    ) {
+        throw std::logic_error("A C++-owned reduced NPDM site is incomplete.");
+    }
+    ReducedNPDMSite result;
+    result.left_sectors = reduced_npdm_axis_sectors(arena, 0);
+    const auto physical_sectors = reduced_npdm_axis_sectors(arena, 1);
+    result.right_sectors = reduced_npdm_axis_sectors(arena, 2);
+    std::size_t physical_dimension = 0;
+    for (const ReducedNPDMAxisSector& sector : physical_sectors) {
+        physical_dimension += sector.multiplicity
+            * static_cast<std::size_t>(sector.quantum_number.two_j + 1);
+    }
+    if (physical_dimension != 4) {
+        throw std::logic_error(
+            "Fully reduced spatial NPDM sites require four component states."
+        );
+    }
+    for (const ReducedNPDMAxisSector& sector : result.left_sectors) {
+        result.maximum_multiplicity = std::max(
+            result.maximum_multiplicity,
+            sector.multiplicity
+        );
+    }
+    for (const ReducedNPDMAxisSector& sector : result.right_sectors) {
+        result.maximum_multiplicity = std::max(
+            result.maximum_multiplicity,
+            sector.multiplicity
+        );
+    }
+    result.blocks.reserve(arena.offsets.size() - 1);
+    for (std::size_t block = 0; block + 1 < arena.offsets.size(); ++block) {
+        if (
+            arena.shape_offsets[block] < 0
+            || arena.shape_offsets[block + 1] - arena.shape_offsets[block] != 3
+        ) {
+            throw std::logic_error("Reduced NPDM site blocks must be rank three.");
+        }
+        const std::size_t shape_start = static_cast<std::size_t>(
+            arena.shape_offsets[block]
+        );
+        if (shape_start + 2 >= arena.shapes.size()) {
+            throw std::logic_error("Reduced NPDM site block shape is truncated.");
+        }
+        const std::int64_t left_dimension = arena.shapes[shape_start];
+        const std::int64_t physical_dimension_block = arena.shapes[shape_start + 1];
+        const std::int64_t right_dimension = arena.shapes[shape_start + 2];
+        if (
+            left_dimension <= 0
+            || physical_dimension_block != 1
+            || right_dimension <= 0
+        ) {
+            throw std::logic_error("Reduced NPDM site block dimensions are invalid.");
+        }
+        const std::size_t value_start = static_cast<std::size_t>(
+            arena.offsets[block]
+        );
+        const std::size_t value_stop = static_cast<std::size_t>(
+            arena.offsets[block + 1]
+        );
+        if (
+            value_stop < value_start
+            || value_stop > arena.n_values
+            || value_stop - value_start
+                != static_cast<std::size_t>(left_dimension * right_dimension)
+        ) {
+            throw std::logic_error("Reduced NPDM site value arena is inconsistent.");
+        }
+        ReducedNPDMSiteBlock entry;
+        entry.left = ReducedNPDMQuantumNumber{
+            arena.labels[6 * block],
+            static_cast<std::int32_t>(arena.labels[6 * block + 1]),
+        };
+        entry.physical = ReducedNPDMQuantumNumber{
+            arena.labels[6 * block + 2],
+            static_cast<std::int32_t>(arena.labels[6 * block + 3]),
+        };
+        entry.right = ReducedNPDMQuantumNumber{
+            arena.labels[6 * block + 4],
+            static_cast<std::int32_t>(arena.labels[6 * block + 5]),
+        };
+        entry.left_dimension = static_cast<std::size_t>(left_dimension);
+        entry.right_dimension = static_cast<std::size_t>(right_dimension);
+        entry.values = arena.values + value_start;
+        const std::size_t index = result.blocks.size();
+        result.blocks.push_back(entry);
+        result.by_left[entry.left].push_back(index);
+        result.by_right[entry.right].push_back(index);
+    }
+    return result;
+}
+
+void reduced_npdm_gemm(
+    bool transpose_left,
+    bool transpose_right,
+    std::size_t rows,
+    std::size_t cols,
+    std::size_t inner,
+    const double* left,
+    std::size_t left_stride,
+    const double* right,
+    std::size_t right_stride,
+    double* output,
+    std::size_t output_stride
+) {
+    if (rows == 0 || cols == 0 || inner == 0) return;
+#ifdef __APPLE__
+    cblas_dgemm(
+        101,
+        transpose_left ? 112 : 111,
+        transpose_right ? 112 : 111,
+        static_cast<int>(rows),
+        static_cast<int>(cols),
+        static_cast<int>(inner),
+        1.0,
+        left,
+        static_cast<int>(left_stride),
+        right,
+        static_cast<int>(right_stride),
+        0.0,
+        output,
+        static_cast<int>(output_stride)
+    );
+#else
+    for (std::size_t row = 0; row < rows; ++row)
+    for (std::size_t column = 0; column < cols; ++column) {
+        double value = 0.0;
+        for (std::size_t index = 0; index < inner; ++index) {
+            value += (
+                transpose_left
+                ? left[index * left_stride + row]
+                : left[row * left_stride + index]
+            ) * (
+                transpose_right
+                ? right[column * right_stride + index]
+                : right[index * right_stride + column]
+            );
+        }
+        output[row * output_stride + column] = value;
+    }
+#endif
+}
+
+ReducedNPDMDenseMatrix reduced_npdm_left_product(
+    const ReducedNPDMDenseMatrix& environment,
+    const ReducedNPDMSiteBlock& bra,
+    const ReducedNPDMSiteBlock& ket,
+    std::vector<double>& temporary
+) {
+    if (
+        environment.rows != bra.left_dimension
+        || environment.cols != ket.left_dimension
+    ) {
+        throw std::logic_error("Reduced NPDM left environment shape is stale.");
+    }
+    temporary.resize(environment.rows * ket.right_dimension);
+    reduced_npdm_gemm(
+        false,
+        false,
+        environment.rows,
+        ket.right_dimension,
+        environment.cols,
+        environment.values.data(),
+        environment.cols,
+        ket.values,
+        ket.right_dimension,
+        temporary.data(),
+        ket.right_dimension
+    );
+    ReducedNPDMDenseMatrix output;
+    output.rows = bra.right_dimension;
+    output.cols = ket.right_dimension;
+    output.values.resize(output.rows * output.cols);
+    reduced_npdm_gemm(
+        true,
+        false,
+        output.rows,
+        output.cols,
+        bra.left_dimension,
+        bra.values,
+        bra.right_dimension,
+        temporary.data(),
+        ket.right_dimension,
+        output.values.data(),
+        output.cols
+    );
+    return output;
+}
+
+ReducedNPDMDenseMatrix reduced_npdm_right_product(
+    const ReducedNPDMSiteBlock& bra,
+    const ReducedNPDMDenseMatrix& environment,
+    const ReducedNPDMSiteBlock& ket,
+    std::vector<double>& temporary
+) {
+    if (
+        environment.rows != bra.right_dimension
+        || environment.cols != ket.right_dimension
+    ) {
+        throw std::logic_error("Reduced NPDM right environment shape is stale.");
+    }
+    temporary.resize(bra.left_dimension * environment.cols);
+    reduced_npdm_gemm(
+        false,
+        false,
+        bra.left_dimension,
+        environment.cols,
+        bra.right_dimension,
+        bra.values,
+        bra.right_dimension,
+        environment.values.data(),
+        environment.cols,
+        temporary.data(),
+        environment.cols
+    );
+    ReducedNPDMDenseMatrix output;
+    output.rows = bra.left_dimension;
+    output.cols = ket.left_dimension;
+    output.values.resize(output.rows * output.cols);
+    reduced_npdm_gemm(
+        false,
+        true,
+        output.rows,
+        output.cols,
+        ket.right_dimension,
+        temporary.data(),
+        environment.cols,
+        ket.values,
+        ket.right_dimension,
+        output.values.data(),
+        output.cols
+    );
+    return output;
+}
+
+void reduced_npdm_accumulate(
+    ReducedNPDMDenseMatrix& target,
+    const ReducedNPDMDenseMatrix& source,
+    double scale = 1.0
+) {
+    if (target.values.empty()) {
+        target.rows = source.rows;
+        target.cols = source.cols;
+        target.values.assign(source.values.size(), 0.0);
+    }
+    if (target.rows != source.rows || target.cols != source.cols) {
+        throw std::logic_error("Reduced NPDM environment topology changed.");
+    }
+    for (std::size_t index = 0; index < source.values.size(); ++index) {
+        target.values[index] += scale * source.values[index];
+    }
+}
+
+std::vector<ReducedNPDMScalarEnvironment> reduced_npdm_left_identities(
+    const std::vector<ReducedNPDMSite>& sites
+) {
+    std::vector<ReducedNPDMScalarEnvironment> result(sites.size() + 1);
+    if (sites.front().left_sectors.size() != 1) {
+        throw std::logic_error("Reduced NPDM MPS must have one left boundary sector.");
+    }
+    const ReducedNPDMAxisSector& boundary = sites.front().left_sectors.front();
+    ReducedNPDMDenseMatrix identity;
+    identity.rows = identity.cols = boundary.multiplicity;
+    identity.values.assign(identity.rows * identity.cols, 0.0);
+    for (std::size_t index = 0; index < identity.rows; ++index) {
+        identity.values[index * identity.cols + index] = 1.0;
+    }
+    result[0][boundary.quantum_number] = std::move(identity);
+    std::vector<double> temporary;
+    for (std::size_t site_index = 0; site_index < sites.size(); ++site_index) {
+        const ReducedNPDMSite& site = sites[site_index];
+        ReducedNPDMScalarEnvironment output;
+        for (const auto& [left_qn, environment] : result[site_index]) {
+            const auto found = site.by_left.find(left_qn);
+            if (found == site.by_left.end()) continue;
+            for (const std::size_t bra_index : found->second)
+            for (const std::size_t ket_index : found->second) {
+                const ReducedNPDMSiteBlock& bra = site.blocks[bra_index];
+                const ReducedNPDMSiteBlock& ket = site.blocks[ket_index];
+                if (bra.physical != ket.physical || bra.right != ket.right) {
+                    continue;
+                }
+                const ReducedNPDMDenseMatrix product = reduced_npdm_left_product(
+                    environment,
+                    bra,
+                    ket,
+                    temporary
+                );
+                reduced_npdm_accumulate(output[bra.right], product);
+            }
+        }
+        result[site_index + 1] = std::move(output);
+    }
+    return result;
+}
+
+std::vector<ReducedNPDMScalarEnvironment> reduced_npdm_right_identities(
+    const std::vector<ReducedNPDMSite>& sites
+) {
+    std::vector<ReducedNPDMScalarEnvironment> result(sites.size() + 1);
+    if (sites.back().right_sectors.size() != 1) {
+        throw std::logic_error("Reduced NPDM MPS must have one right boundary sector.");
+    }
+    const ReducedNPDMAxisSector& boundary = sites.back().right_sectors.front();
+    ReducedNPDMDenseMatrix identity;
+    identity.rows = identity.cols = boundary.multiplicity;
+    identity.values.assign(identity.rows * identity.cols, 0.0);
+    for (std::size_t index = 0; index < identity.rows; ++index) {
+        identity.values[index * identity.cols + index] = 1.0;
+    }
+    result.back()[boundary.quantum_number] = std::move(identity);
+    std::vector<double> temporary;
+    for (std::size_t site_index = sites.size(); site_index-- > 0;) {
+        const ReducedNPDMSite& site = sites[site_index];
+        ReducedNPDMScalarEnvironment output;
+        for (const auto& [right_qn, environment] : result[site_index + 1]) {
+            const auto found = site.by_right.find(right_qn);
+            if (found == site.by_right.end()) continue;
+            for (const std::size_t bra_index : found->second)
+            for (const std::size_t ket_index : found->second) {
+                const ReducedNPDMSiteBlock& bra = site.blocks[bra_index];
+                const ReducedNPDMSiteBlock& ket = site.blocks[ket_index];
+                if (bra.physical != ket.physical || bra.left != ket.left) {
+                    continue;
+                }
+                const ReducedNPDMDenseMatrix product = reduced_npdm_right_product(
+                    bra,
+                    environment,
+                    ket,
+                    temporary
+                );
+                reduced_npdm_accumulate(output[bra.left], product);
+            }
+        }
+        result[site_index] = std::move(output);
+    }
+    return result;
+}
+
+double reduced_npdm_standard_recoupling(
+    const ReducedNPDMRecouplingKey& key,
+    ReducedNPDMRecouplingCache& cache
+) {
+    const auto found = cache.find(key);
+    if (found != cache.end()) return found->second;
+    const std::int32_t boundary_bra_two_j = key[0];
+    const std::int32_t boundary_ket_two_j = key[1];
+    const std::int32_t physical_bra_two_j = key[2];
+    const std::int32_t physical_ket_two_j = key[3];
+    const std::int32_t next_bra_two_j = key[4];
+    const std::int32_t next_ket_two_j = key[5];
+    const std::int32_t left_two_j = key[6];
+    const std::int32_t right_two_j = key[7];
+    const std::int32_t operator_two_j = key[8];
+    const std::int32_t left_two_m = key[9];
+    const std::int32_t right_two_m = key[10];
+    const std::int32_t operator_two_m = key[11];
+    double numerator = 0.0;
+    double denominator = 0.0;
+    for (std::int32_t next_bra_two_m = next_bra_two_j;
+         next_bra_two_m >= -next_bra_two_j;
+         next_bra_two_m -= 2)
+    for (std::int32_t next_ket_two_m = next_ket_two_j;
+         next_ket_two_m >= -next_ket_two_j;
+         next_ket_two_m -= 2) {
+        const double basis = clebsch_gordan_doubled(
+            next_ket_two_j,
+            right_two_j,
+            next_bra_two_j,
+            next_ket_two_m,
+            right_two_m,
+            next_bra_two_m
+        );
+        denominator += basis * basis;
+    }
+    if (denominator > 1.0e-14) {
+        for (std::int32_t boundary_bra_two_m = boundary_bra_two_j;
+             boundary_bra_two_m >= -boundary_bra_two_j;
+             boundary_bra_two_m -= 2)
+        for (std::int32_t boundary_ket_two_m = boundary_ket_two_j;
+             boundary_ket_two_m >= -boundary_ket_two_j;
+             boundary_ket_two_m -= 2) {
+            const double left_basis = clebsch_gordan_doubled(
+                boundary_ket_two_j,
+                left_two_j,
+                boundary_bra_two_j,
+                boundary_ket_two_m,
+                left_two_m,
+                boundary_bra_two_m
+            );
+            if (left_basis == 0.0) continue;
+            for (std::int32_t physical_bra_two_m = physical_bra_two_j;
+                 physical_bra_two_m >= -physical_bra_two_j;
+                 physical_bra_two_m -= 2)
+            for (std::int32_t physical_ket_two_m = physical_ket_two_j;
+                 physical_ket_two_m >= -physical_ket_two_j;
+                 physical_ket_two_m -= 2) {
+                const double local_basis = clebsch_gordan_doubled(
+                    physical_ket_two_j,
+                    operator_two_j,
+                    physical_bra_two_j,
+                    physical_ket_two_m,
+                    operator_two_m,
+                    physical_bra_two_m
+                );
+                if (local_basis == 0.0) continue;
+                for (std::int32_t next_bra_two_m = next_bra_two_j;
+                     next_bra_two_m >= -next_bra_two_j;
+                     next_bra_two_m -= 2) {
+                    const double bra_cg = clebsch_gordan_doubled(
+                        boundary_bra_two_j,
+                        physical_bra_two_j,
+                        next_bra_two_j,
+                        boundary_bra_two_m,
+                        physical_bra_two_m,
+                        next_bra_two_m
+                    );
+                    if (bra_cg == 0.0) continue;
+                    for (std::int32_t next_ket_two_m = next_ket_two_j;
+                         next_ket_two_m >= -next_ket_two_j;
+                         next_ket_two_m -= 2) {
+                        const double ket_cg = clebsch_gordan_doubled(
+                            boundary_ket_two_j,
+                            physical_ket_two_j,
+                            next_ket_two_j,
+                            boundary_ket_two_m,
+                            physical_ket_two_m,
+                            next_ket_two_m
+                        );
+                        if (ket_cg == 0.0) continue;
+                        const double right_basis = clebsch_gordan_doubled(
+                            next_ket_two_j,
+                            right_two_j,
+                            next_bra_two_j,
+                            next_ket_two_m,
+                            right_two_m,
+                            next_bra_two_m
+                        );
+                        numerator += left_basis * local_basis * right_basis
+                            * bra_cg * ket_cg;
+                    }
+                }
+            }
+        }
+    }
+    const double result = denominator <= 1.0e-14
+        ? 0.0
+        : numerator / denominator;
+    cache.emplace(key, result);
+    return result;
+}
+
+std::vector<ReducedNPDMLocalTerm> reduced_npdm_local_decomposition(
+    const Matrix4& op,
+    const ReducedNPDMQuantumNumber& physical_bra,
+    const ReducedNPDMQuantumNumber& physical_ket
+) {
+    std::vector<ReducedNPDMLocalTerm> result;
+    for (std::int32_t operator_two_j = std::abs(
+             physical_bra.two_j - physical_ket.two_j
+         );
+         operator_two_j <= physical_bra.two_j + physical_ket.two_j;
+         operator_two_j += 2) {
+        for (std::int32_t operator_two_m = operator_two_j;
+             operator_two_m >= -operator_two_j;
+             operator_two_m -= 2) {
+            double numerator = 0.0;
+            double denominator = 0.0;
+            for (std::int32_t physical_bra_two_m = physical_bra.two_j;
+                 physical_bra_two_m >= -physical_bra.two_j;
+                 physical_bra_two_m -= 2)
+            for (std::int32_t physical_ket_two_m = physical_ket.two_j;
+                 physical_ket_two_m >= -physical_ket.two_j;
+                 physical_ket_two_m -= 2) {
+                const double basis = clebsch_gordan_doubled(
+                    physical_ket.two_j,
+                    operator_two_j,
+                    physical_bra.two_j,
+                    physical_ket_two_m,
+                    operator_two_m,
+                    physical_bra_two_m
+                );
+                if (basis == 0.0) continue;
+                const std::size_t row = static_cast<std::size_t>(
+                    component_physical_index(
+                        physical_bra.charge,
+                        physical_bra.two_j,
+                        physical_bra_two_m
+                    )
+                );
+                const std::size_t column = static_cast<std::size_t>(
+                    component_physical_index(
+                        physical_ket.charge,
+                        physical_ket.two_j,
+                        physical_ket_two_m
+                    )
+                );
+                numerator += basis * op[4 * row + column];
+                denominator += basis * basis;
+            }
+            if (denominator <= 1.0e-14) continue;
+            const double coefficient = numerator / denominator;
+            if (std::abs(coefficient) > 1.0e-13) {
+                result.push_back(ReducedNPDMLocalTerm{
+                    operator_two_j,
+                    operator_two_m,
+                    coefficient,
+                });
+            }
+        }
+    }
+    return result;
+}
+
+double reduced_npdm_string_expectation(
+    const std::vector<ReducedNPDMSite>& sites,
+    const std::vector<ReducedNPDMScalarEnvironment>& left_identity,
+    const std::vector<ReducedNPDMScalarEnvironment>& right_identity,
+    const std::vector<FermionSpec>& specs,
+    double norm,
+    ReducedNPDMRecouplingCache& recoupling_cache,
+    ReducedNPDMLocalDecompositionCache& local_decomposition_cache,
+    std::vector<double>& product_temporary,
+    std::size_t& maximum_operator_channels,
+    std::int32_t& maximum_operator_two_j
+) {
+    std::int64_t first = specs.front().site;
+    std::int64_t last = specs.front().site;
+    for (const FermionSpec& spec : specs) {
+        first = std::min(first, spec.site);
+        last = std::max(last, spec.site);
+    }
+    ReducedNPDMOperatorEnvironment environment;
+    for (const auto& [quantum_number, matrix] : left_identity[
+        static_cast<std::size_t>(first)
+    ]) {
+        environment[ReducedNPDMOperatorKey{
+            quantum_number,
+            quantum_number,
+            0,
+            0,
+        }] = matrix;
+    }
+    for (std::int64_t site_index = first; site_index <= last; ++site_index) {
+        const ReducedNPDMSite& site = sites[static_cast<std::size_t>(site_index)];
+        const Matrix4 local_operator = component_string_site_operator(
+            site_index,
+            specs
+        );
+        ReducedNPDMOperatorEnvironment output;
+        for (const auto& [environment_key, environment_matrix] : environment) {
+            const auto bra_found = site.by_left.find(environment_key.bra);
+            const auto ket_found = site.by_left.find(environment_key.ket);
+            if (
+                bra_found == site.by_left.end()
+                || ket_found == site.by_left.end()
+            ) {
+                continue;
+            }
+            for (const std::size_t bra_index : bra_found->second)
+            for (const std::size_t ket_index : ket_found->second) {
+                const ReducedNPDMSiteBlock& bra = site.blocks[bra_index];
+                const ReducedNPDMSiteBlock& ket = site.blocks[ket_index];
+                const auto physical_key = std::make_tuple(
+                    local_operator,
+                    bra.physical,
+                    ket.physical
+                );
+                auto local_found = local_decomposition_cache.find(physical_key);
+                if (local_found == local_decomposition_cache.end()) {
+                    local_found = local_decomposition_cache.emplace(
+                        physical_key,
+                        reduced_npdm_local_decomposition(
+                            local_operator,
+                            bra.physical,
+                            ket.physical
+                        )
+                    ).first;
+                }
+                if (local_found->second.empty()) continue;
+                const ReducedNPDMDenseMatrix product = reduced_npdm_left_product(
+                    environment_matrix,
+                    bra,
+                    ket,
+                    product_temporary
+                );
+                for (const ReducedNPDMLocalTerm& local : local_found->second) {
+                    for (std::int32_t right_two_j = std::abs(
+                             environment_key.two_j - local.two_j
+                         );
+                         right_two_j <= environment_key.two_j + local.two_j;
+                         right_two_j += 2) {
+                        for (std::int32_t right_two_m = right_two_j;
+                             right_two_m >= -right_two_j;
+                             right_two_m -= 2) {
+                            if (clebsch_gordan_doubled(
+                                    environment_key.two_j,
+                                    local.two_j,
+                                    right_two_j,
+                                    environment_key.two_m,
+                                    local.two_m,
+                                    right_two_m
+                                ) == 0.0) {
+                                continue;
+                            }
+                            const ReducedNPDMRecouplingKey recoupling_key{
+                                environment_key.bra.two_j,
+                                environment_key.ket.two_j,
+                                bra.physical.two_j,
+                                ket.physical.two_j,
+                                bra.right.two_j,
+                                ket.right.two_j,
+                                environment_key.two_j,
+                                right_two_j,
+                                local.two_j,
+                                environment_key.two_m,
+                                right_two_m,
+                                local.two_m,
+                            };
+                            const double recoupling =
+                                reduced_npdm_standard_recoupling(
+                                    recoupling_key,
+                                    recoupling_cache
+                                );
+                            const double scale = local.coefficient * recoupling;
+                            if (std::abs(scale) <= 1.0e-14) continue;
+                            const ReducedNPDMOperatorKey output_key{
+                                bra.right,
+                                ket.right,
+                                right_two_j,
+                                right_two_m,
+                            };
+                            reduced_npdm_accumulate(
+                                output[output_key],
+                                product,
+                                scale
+                            );
+                            maximum_operator_two_j = std::max(
+                                maximum_operator_two_j,
+                                right_two_j
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        environment = std::move(output);
+        maximum_operator_channels = std::max(
+            maximum_operator_channels,
+            environment.size()
+        );
+    }
+    double value = 0.0;
+    const ReducedNPDMScalarEnvironment& right = right_identity[
+        static_cast<std::size_t>(last + 1)
+    ];
+    for (const auto& [key, matrix] : environment) {
+        if (key.bra != key.ket || key.two_j != 0 || key.two_m != 0) continue;
+        const auto found = right.find(key.bra);
+        if (found == right.end()) continue;
+        if (
+            found->second.rows != matrix.rows
+            || found->second.cols != matrix.cols
+        ) {
+            throw std::logic_error("Reduced NPDM right closure shape changed.");
+        }
+        for (std::size_t index = 0; index < matrix.values.size(); ++index) {
+            value += matrix.values[index] * found->second.values[index];
+        }
+    }
+    return value / norm;
+}
+
+struct ComponentMPSSite {
+    std::size_t left = 0;
+    std::size_t right = 0;
+    // Physical-major matrices: data[(physical * left + l) * right + r].
+    std::vector<double> data;
+};
+
+struct ComponentTransferWorkspace {
+    std::vector<double> current;
+    std::vector<double> next;
+    std::vector<double> temporary;
+};
+
+struct ComponentAxisSector {
+    std::int64_t charge = 0;
+    std::int32_t two_j = 0;
+    std::size_t multiplicity = 0;
+    std::size_t offset = 0;
+};
+
+const ComponentAxisSector& find_component_sector(
+    const std::vector<ComponentAxisSector>& sectors,
+    std::int64_t charge,
+    std::int32_t two_j
+) {
+    const auto found = std::find_if(
+        sectors.begin(),
+        sectors.end(),
+        [charge, two_j](const ComponentAxisSector& sector) {
+            return sector.charge == charge && sector.two_j == two_j;
+        }
+    );
+    if (found == sectors.end()) {
+        throw std::logic_error("Reduced MPS block uses an undeclared leg sector.");
+    }
+    return *found;
+}
+
+std::vector<ComponentAxisSector> component_axis_layout(
+    const PackedArena& arena,
+    std::size_t axis,
+    std::size_t& total_dimension
+) {
+    if (
+        arena.leg_sector_offsets.size() != 4
+        || axis >= 3
+        || arena.leg_sector_offsets[axis] < 0
+        || arena.leg_sector_offsets[axis + 1]
+            < arena.leg_sector_offsets[axis]
+    ) {
+        throw std::logic_error("Packed reduced MPS leg metadata is incomplete.");
+    }
+    const std::size_t begin = static_cast<std::size_t>(
+        arena.leg_sector_offsets[axis]
+    );
+    const std::size_t end = static_cast<std::size_t>(
+        arena.leg_sector_offsets[axis + 1]
+    );
+    if (
+        end > arena.leg_sector_dims.size()
+        || 2 * end > arena.leg_sector_labels.size()
+    ) {
+        throw std::logic_error("Packed reduced MPS leg sector arena is truncated.");
+    }
+    std::vector<ComponentAxisSector> result;
+    result.reserve(end - begin);
+    total_dimension = 0;
+    for (std::size_t index = begin; index < end; ++index) {
+        const std::int64_t multiplicity = arena.leg_sector_dims[index];
+        const std::int64_t two_j = arena.leg_sector_labels[2 * index + 1];
+        if (multiplicity <= 0 || two_j < 0) {
+            throw std::logic_error("Packed reduced MPS sector has an invalid dimension.");
+        }
+        result.push_back(ComponentAxisSector{
+            arena.leg_sector_labels[2 * index],
+            static_cast<std::int32_t>(two_j),
+            static_cast<std::size_t>(multiplicity),
+            total_dimension,
+        });
+        total_dimension += static_cast<std::size_t>(multiplicity)
+            * static_cast<std::size_t>(two_j + 1);
+    }
+    return result;
+}
+
+std::int32_t component_physical_index(
+    std::int64_t charge,
+    std::int32_t two_j,
+    std::int32_t two_m
+) {
+    if (charge == 0 && two_j == 0 && two_m == 0) return 0;
+    if (charge == 1 && two_j == 1 && two_m == 1) return 1;
+    if (charge == 1 && two_j == 1 && two_m == -1) return 2;
+    if (charge == 2 && two_j == 0 && two_m == 0) return 3;
+    throw std::logic_error("Unsupported fully reduced spatial physical sector.");
+}
+
+ComponentMPSSite expand_reduced_site_components(const PackedArena& arena) {
+    if (
+        arena.values == nullptr
+        || arena.offsets.empty()
+        || arena.labels.size() != 6 * (arena.offsets.size() - 1)
+        || arena.shape_offsets.size() != arena.offsets.size()
+    ) {
+        throw std::logic_error("A C++-owned reduced MPS site is incomplete.");
+    }
+    std::size_t left_dimension = 0;
+    std::size_t physical_dimension = 0;
+    std::size_t right_dimension = 0;
+    const auto left_layout = component_axis_layout(arena, 0, left_dimension);
+    const auto physical_layout = component_axis_layout(
+        arena,
+        1,
+        physical_dimension
+    );
+    const auto right_layout = component_axis_layout(arena, 2, right_dimension);
+    static_cast<void>(physical_layout);
+    if (physical_dimension != 4) {
+        throw std::logic_error(
+            "Fully reduced spatial MPS sites must expand to four local states."
+        );
+    }
+
+    ComponentMPSSite result;
+    result.left = left_dimension;
+    result.right = right_dimension;
+    result.data.assign(4 * left_dimension * right_dimension, 0.0);
+    for (std::size_t block = 0; block + 1 < arena.offsets.size(); ++block) {
+        if (
+            arena.shape_offsets[block] < 0
+            || arena.shape_offsets[block + 1] - arena.shape_offsets[block] != 3
+        ) {
+            throw std::logic_error("Reduced MPS site blocks must be rank three.");
+        }
+        const std::size_t shape_start = static_cast<std::size_t>(
+            arena.shape_offsets[block]
+        );
+        if (shape_start + 2 >= arena.shapes.size()) {
+            throw std::logic_error("Reduced MPS site block shape is truncated.");
+        }
+        const std::int64_t left_multiplicity = arena.shapes[shape_start];
+        const std::int64_t physical_multiplicity = arena.shapes[shape_start + 1];
+        const std::int64_t right_multiplicity = arena.shapes[shape_start + 2];
+        const std::int64_t left_charge = arena.labels[6 * block];
+        const std::int32_t left_two_j = static_cast<std::int32_t>(
+            arena.labels[6 * block + 1]
+        );
+        const std::int64_t physical_charge = arena.labels[6 * block + 2];
+        const std::int32_t physical_two_j = static_cast<std::int32_t>(
+            arena.labels[6 * block + 3]
+        );
+        const std::int64_t right_charge = arena.labels[6 * block + 4];
+        const std::int32_t right_two_j = static_cast<std::int32_t>(
+            arena.labels[6 * block + 5]
+        );
+        const auto& left_sector = find_component_sector(
+            left_layout,
+            left_charge,
+            left_two_j
+        );
+        const auto& right_sector = find_component_sector(
+            right_layout,
+            right_charge,
+            right_two_j
+        );
+        if (
+            left_multiplicity != static_cast<std::int64_t>(
+                left_sector.multiplicity
+            )
+            || physical_multiplicity != 1
+            || right_multiplicity != static_cast<std::int64_t>(
+                right_sector.multiplicity
+            )
+        ) {
+            throw std::logic_error(
+                "Reduced MPS block dimensions disagree with leg multiplicities."
+            );
+        }
+        const std::size_t value_start = static_cast<std::size_t>(
+            arena.offsets[block]
+        );
+        const std::size_t value_stop = static_cast<std::size_t>(
+            arena.offsets[block + 1]
+        );
+        if (
+            value_stop < value_start
+            || value_stop > arena.n_values
+            || value_stop - value_start
+                != left_sector.multiplicity * right_sector.multiplicity
+        ) {
+            throw std::logic_error("Reduced MPS block value arena is inconsistent.");
+        }
+        for (std::size_t left_slot = 0;
+             left_slot < left_sector.multiplicity;
+             ++left_slot) {
+            for (std::size_t right_slot = 0;
+                 right_slot < right_sector.multiplicity;
+                 ++right_slot) {
+                const double reduced_value = arena.values[
+                    value_start
+                    + left_slot * right_sector.multiplicity
+                    + right_slot
+                ];
+                if (reduced_value == 0.0) continue;
+                for (std::int32_t left_m = left_two_j;
+                     left_m >= -left_two_j;
+                     left_m -= 2) {
+                    const std::size_t left_component = static_cast<std::size_t>(
+                        (left_two_j - left_m) / 2
+                    );
+                    for (std::int32_t physical_m = physical_two_j;
+                         physical_m >= -physical_two_j;
+                         physical_m -= 2) {
+                        const std::int32_t right_m = left_m + physical_m;
+                        if (
+                            right_m > right_two_j
+                            || right_m < -right_two_j
+                            || ((right_two_j - right_m) & 1) != 0
+                        ) {
+                            continue;
+                        }
+                        const double coefficient = clebsch_gordan_doubled(
+                            left_two_j,
+                            physical_two_j,
+                            right_two_j,
+                            left_m,
+                            physical_m,
+                            right_m
+                        );
+                        if (coefficient == 0.0) continue;
+                        const std::size_t right_component =
+                            static_cast<std::size_t>((right_two_j - right_m) / 2);
+                        const std::size_t left_index = left_sector.offset
+                            + left_slot * static_cast<std::size_t>(left_two_j + 1)
+                            + left_component;
+                        const std::size_t right_index = right_sector.offset
+                            + right_slot * static_cast<std::size_t>(right_two_j + 1)
+                            + right_component;
+                        const std::size_t physical_index = static_cast<std::size_t>(
+                            component_physical_index(
+                                physical_charge,
+                                physical_two_j,
+                                physical_m
+                            )
+                        );
+                        result.data[
+                            (physical_index * result.left + left_index)
+                                * result.right
+                            + right_index
+                        ] += reduced_value * coefficient;
+                    }
+                }
+            }
+        }
+    }
+    return result;
+}
+
+Matrix4 identity4() {
+    Matrix4 result{};
+    result[0] = result[5] = result[10] = result[15] = 1.0;
+    return result;
+}
+
+Matrix4 multiply4(const Matrix4& left, const Matrix4& right) {
+    Matrix4 result{};
+    for (std::size_t row = 0; row < 4; ++row) {
+        for (std::size_t inner = 0; inner < 4; ++inner) {
+            const double value = left[4 * row + inner];
+            if (value == 0.0) continue;
+            for (std::size_t col = 0; col < 4; ++col) {
+                result[4 * row + col] += value * right[4 * inner + col];
+            }
+        }
+    }
+    return result;
+}
+
+const Matrix4& fermion_local_operator(bool create, std::int32_t spin) {
+    static const Matrix4 create_up = [] {
+        Matrix4 op{};
+        op[4] = 1.0;
+        op[14] = 1.0;
+        return op;
+    }();
+    static const Matrix4 annihilate_up = [] {
+        Matrix4 op{};
+        op[1] = 1.0;
+        op[11] = 1.0;
+        return op;
+    }();
+    static const Matrix4 create_down = [] {
+        Matrix4 op{};
+        op[8] = 1.0;
+        op[13] = -1.0;
+        return op;
+    }();
+    static const Matrix4 annihilate_down = [] {
+        Matrix4 op{};
+        op[2] = 1.0;
+        op[7] = -1.0;
+        return op;
+    }();
+    if (spin == 0) return create ? create_up : annihilate_up;
+    if (spin == 1) return create ? create_down : annihilate_down;
+    throw std::logic_error("Spatial NPDM spin index must be zero or one.");
+}
+
+const Matrix4& jordan_wigner4() {
+    static const Matrix4 op = [] {
+        Matrix4 value{};
+        value[0] = 1.0;
+        value[5] = -1.0;
+        value[10] = -1.0;
+        value[15] = 1.0;
+        return value;
+    }();
+    return op;
+}
+
+void component_transfer_into(
+    const std::vector<double>& input,
+    const ComponentMPSSite& site,
+    const Matrix4& op,
+    std::vector<double>& output,
+    std::vector<double>& temporary
+) {
+    if (input.size() != site.left * site.left) {
+        throw std::logic_error("Component NPDM left environment has a stale shape.");
+    }
+    output.assign(site.right * site.right, 0.0);
+    temporary.resize(site.left * site.right);
+    for (std::size_t physical_bra = 0; physical_bra < 4; ++physical_bra) {
+        const double* bra = site.data.data()
+            + physical_bra * site.left * site.right;
+        for (std::size_t physical_ket = 0; physical_ket < 4; ++physical_ket) {
+            const double coefficient = op[4 * physical_bra + physical_ket];
+            if (coefficient == 0.0) continue;
+            const double* ket = site.data.data()
+                + physical_ket * site.left * site.right;
+            std::fill(temporary.begin(), temporary.end(), 0.0);
+            for (std::size_t left_bra = 0;
+                 left_bra < site.left;
+                 ++left_bra) {
+                double* row = temporary.data() + left_bra * site.right;
+                for (std::size_t left_ket = 0;
+                     left_ket < site.left;
+                     ++left_ket) {
+                    const double environment = input[
+                        left_bra * site.left + left_ket
+                    ];
+                    if (environment == 0.0) continue;
+                    const double* ket_row = ket + left_ket * site.right;
+                    for (std::size_t right_ket = 0;
+                         right_ket < site.right;
+                         ++right_ket) {
+                        row[right_ket] += environment * ket_row[right_ket];
+                    }
+                }
+            }
+            for (std::size_t left = 0; left < site.left; ++left) {
+                const double* bra_row = bra + left * site.right;
+                const double* temporary_row = temporary.data()
+                    + left * site.right;
+                for (std::size_t right_bra = 0;
+                     right_bra < site.right;
+                     ++right_bra) {
+                    const double bra_value = bra_row[right_bra];
+                    if (bra_value == 0.0) continue;
+                    double* output_row = output.data()
+                        + right_bra * site.right;
+                    for (std::size_t right_ket = 0;
+                         right_ket < site.right;
+                         ++right_ket) {
+                        output_row[right_ket] += coefficient
+                            * bra_value * temporary_row[right_ket];
+                    }
+                }
+            }
+        }
+    }
+}
+
+std::vector<double> component_transfer(
+    const std::vector<double>& input,
+    const ComponentMPSSite& site,
+    const Matrix4& op
+) {
+    std::vector<double> output;
+    std::vector<double> temporary;
+    component_transfer_into(input, site, op, output, temporary);
+    return output;
+}
+
+std::vector<double> component_right_identity_transfer(
+    const std::vector<double>& output_environment,
+    const ComponentMPSSite& site
+) {
+    if (output_environment.size() != site.right * site.right) {
+        throw std::logic_error("Component NPDM right environment has a stale shape.");
+    }
+    std::vector<double> input_environment(site.left * site.left, 0.0);
+    std::vector<double> temporary(site.left * site.right, 0.0);
+    for (std::size_t physical = 0; physical < 4; ++physical) {
+        const double* matrix = site.data.data()
+            + physical * site.left * site.right;
+        std::fill(temporary.begin(), temporary.end(), 0.0);
+        for (std::size_t left = 0; left < site.left; ++left) {
+            double* temporary_row = temporary.data() + left * site.right;
+            const double* matrix_row = matrix + left * site.right;
+            for (std::size_t right_bra = 0;
+                 right_bra < site.right;
+                 ++right_bra) {
+                const double value = matrix_row[right_bra];
+                if (value == 0.0) continue;
+                const double* environment_row = output_environment.data()
+                    + right_bra * site.right;
+                for (std::size_t right_ket = 0;
+                     right_ket < site.right;
+                     ++right_ket) {
+                    temporary_row[right_ket] += value
+                        * environment_row[right_ket];
+                }
+            }
+        }
+        for (std::size_t left_bra = 0;
+             left_bra < site.left;
+             ++left_bra) {
+            const double* temporary_row = temporary.data()
+                + left_bra * site.right;
+            double* input_row = input_environment.data()
+                + left_bra * site.left;
+            for (std::size_t left_ket = 0;
+                 left_ket < site.left;
+                 ++left_ket) {
+                const double* matrix_row = matrix
+                    + left_ket * site.right;
+                double value = 0.0;
+                for (std::size_t right = 0; right < site.right; ++right) {
+                    value += temporary_row[right] * matrix_row[right];
+                }
+                input_row[left_ket] += value;
+            }
+        }
+    }
+    return input_environment;
+}
+
+Matrix4 component_string_site_operator(
+    std::int64_t site,
+    const std::vector<FermionSpec>& specs
+) {
+    Matrix4 result = identity4();
+    for (const FermionSpec& spec : specs) {
+        if (site < spec.site) {
+            result = multiply4(result, jordan_wigner4());
+        } else if (site == spec.site) {
+            result = multiply4(
+                result,
+                fermion_local_operator(spec.create, spec.spin)
+            );
+        }
+    }
+    return result;
+}
+
+double component_string_expectation(
+    const std::vector<ComponentMPSSite>& sites,
+    const std::vector<std::vector<double>>& left_identity,
+    const std::vector<std::vector<double>>& right_identity,
+    const std::vector<FermionSpec>& specs,
+    double norm,
+    ComponentTransferWorkspace& workspace
+) {
+    std::int64_t first = specs.front().site;
+    std::int64_t last = specs.front().site;
+    for (const FermionSpec& spec : specs) {
+        first = std::min(first, spec.site);
+        last = std::max(last, spec.site);
+    }
+    workspace.current = left_identity[
+        static_cast<std::size_t>(first)
+    ];
+    for (std::int64_t site = first; site <= last; ++site) {
+        component_transfer_into(
+            workspace.current,
+            sites[static_cast<std::size_t>(site)],
+            component_string_site_operator(site, specs),
+            workspace.next,
+            workspace.temporary
+        );
+        workspace.current.swap(workspace.next);
+    }
+    const auto& right = right_identity[static_cast<std::size_t>(last + 1)];
+    if (workspace.current.size() != right.size()) {
+        throw std::logic_error("Component NPDM environments cannot be closed.");
+    }
+    double value = 0.0;
+    for (std::size_t index = 0; index < workspace.current.size(); ++index) {
+        value += workspace.current[index] * right[index];
+    }
+    return value / norm;
+}
+
+}  // namespace
+
+SpatialNPDMResult MovingEnvironment::spatial_npdm(
+    bool spin_rotation_reduction
+) const {
+    const double setup_started = wall_seconds();
+    if (system_ == nullptr || split_sites_.size() != system_->n_sites()) {
+        throw std::logic_error(
+            "A complete C++-owned reduced MPS is required for spatial NPDMs."
+        );
+    }
+    const std::size_t n_sites = system_->n_sites();
+    std::vector<ReducedNPDMSite> reduced_sites;
+    reduced_sites.reserve(n_sites);
+    SpatialNPDMResult result;
+    result.spin_rotation_reduction = spin_rotation_reduction;
+    result.magnetic_component_expansion = false;
+    for (std::size_t site = 0; site < n_sites; ++site) {
+        const auto found = split_sites_.find(static_cast<std::int64_t>(site));
+        if (found == split_sites_.end()) {
+            throw std::logic_error("The C++-owned reduced MPS has a missing site.");
+        }
+        ReducedNPDMSite reduced = reduced_npdm_site_view(found->second);
+        if (!reduced_sites.empty()) {
+            const auto& previous = reduced_sites.back().right_sectors;
+            const auto& current = reduced.left_sectors;
+            if (previous.size() != current.size()) {
+                throw std::logic_error("Reduced NPDM bond sector counts disagree.");
+            }
+            for (std::size_t sector = 0; sector < previous.size(); ++sector) {
+                if (
+                    previous[sector].quantum_number
+                        != current[sector].quantum_number
+                    || previous[sector].multiplicity
+                        != current[sector].multiplicity
+                ) {
+                    throw std::logic_error("Reduced NPDM bond sectors disagree.");
+                }
+            }
+        }
+        result.max_reduced_bond_dimension = std::max(
+            result.max_reduced_bond_dimension,
+            reduced.maximum_multiplicity
+        );
+        reduced_sites.push_back(std::move(reduced));
+    }
+    result.setup_seconds = wall_seconds() - setup_started;
+
+    const double environment_started = wall_seconds();
+    const auto left_identity = reduced_npdm_left_identities(reduced_sites);
+    const auto right_identity = reduced_npdm_right_identities(reduced_sites);
+    result.norm = 0.0;
+    for (const auto& [quantum_number, matrix] : left_identity.back()) {
+        static_cast<void>(quantum_number);
+        if (matrix.rows != matrix.cols) {
+            throw std::logic_error("Reduced NPDM norm boundary is nonsquare.");
+        }
+        for (std::size_t index = 0; index < matrix.rows; ++index) {
+            result.norm += matrix.values[index * matrix.cols + index];
+        }
+    }
+    if (std::abs(result.norm) <= 1.0e-14) {
+        throw std::logic_error("Cannot build NPDMs from a zero-norm reduced MPS.");
+    }
+    result.environment_seconds = wall_seconds() - environment_started;
+
+    ReducedNPDMRecouplingCache recoupling_cache;
+    ReducedNPDMLocalDecompositionCache local_decomposition_cache;
+    std::vector<double> product_temporary;
+    const double rdm1_started = wall_seconds();
+    result.rdm1.assign(n_sites * n_sites, 0.0);
+    const std::int32_t rdm1_spins = spin_rotation_reduction ? 1 : 2;
+    const double rdm1_scale = spin_rotation_reduction ? 2.0 : 1.0;
+    for (std::size_t p = 0; p < n_sites; ++p) {
+        for (std::size_t q = p; q < n_sites; ++q) {
+            double value = 0.0;
+            for (std::int32_t spin = 0; spin < rdm1_spins; ++spin) {
+                value += rdm1_scale * reduced_npdm_string_expectation(
+                    reduced_sites,
+                    left_identity,
+                    right_identity,
+                    {
+                        FermionSpec{true, spin, static_cast<std::int64_t>(p)},
+                        FermionSpec{false, spin, static_cast<std::int64_t>(q)},
+                    },
+                    result.norm,
+                    recoupling_cache,
+                    local_decomposition_cache,
+                    product_temporary,
+                    result.max_operator_channels,
+                    result.max_operator_two_j
+                );
+                ++result.string_contractions;
+            }
+            result.rdm1[p * n_sites + q] = value;
+            result.rdm1[q * n_sites + p] = value;
+        }
+    }
+    result.rdm1_seconds = wall_seconds() - rdm1_started;
+
+    const double rdm2_started = wall_seconds();
+    const std::size_t n2 = n_sites * n_sites;
+    result.rdm2.assign(n2 * n2, 0.0);
+    const std::vector<std::tuple<std::int32_t, std::int32_t, double>>
+        spin_channels = spin_rotation_reduction
+        ? std::vector<std::tuple<std::int32_t, std::int32_t, double>>{
+            {0, 0, 2.0},
+            {0, 1, 2.0},
+        }
+        : std::vector<std::tuple<std::int32_t, std::int32_t, double>>{
+            {0, 0, 1.0},
+            {0, 1, 1.0},
+            {1, 0, 1.0},
+            {1, 1, 1.0},
+        };
+    for (const auto& [spin, tau, scale] : spin_channels) {
+        for (std::size_t left_pair = 0; left_pair < n2; ++left_pair) {
+            const std::size_t p = left_pair / n_sites;
+            const std::size_t r = left_pair % n_sites;
+            for (std::size_t right_pair = left_pair;
+                 right_pair < n2;
+                 ++right_pair) {
+                const std::size_t q = right_pair / n_sites;
+                const std::size_t s = right_pair % n_sites;
+                const double value = scale * reduced_npdm_string_expectation(
+                    reduced_sites,
+                    left_identity,
+                    right_identity,
+                    {
+                        FermionSpec{true, spin, static_cast<std::int64_t>(p)},
+                        FermionSpec{true, tau, static_cast<std::int64_t>(r)},
+                        FermionSpec{false, tau, static_cast<std::int64_t>(s)},
+                        FermionSpec{false, spin, static_cast<std::int64_t>(q)},
+                    },
+                    result.norm,
+                    recoupling_cache,
+                    local_decomposition_cache,
+                    product_temporary,
+                    result.max_operator_channels,
+                    result.max_operator_two_j
+                );
+                ++result.string_contractions;
+                const std::size_t index =
+                    ((p * n_sites + q) * n_sites + r) * n_sites + s;
+                result.rdm2[index] += value;
+                if (left_pair != right_pair) {
+                    const std::size_t reverse =
+                        ((q * n_sites + p) * n_sites + s) * n_sites + r;
+                    result.rdm2[reverse] += value;
+                }
+            }
+        }
+    }
+    result.rdm2_seconds = wall_seconds() - rdm2_started;
+    return result;
+}
+
+SpatialNPDMResult MovingEnvironment::spatial_npdm_component_reference(
+    bool spin_rotation_reduction
+) const {
+    const double expansion_started = wall_seconds();
+    if (system_ == nullptr || split_sites_.size() != system_->n_sites()) {
+        throw std::logic_error(
+            "A complete C++-owned reduced MPS is required for spatial NPDMs."
+        );
+    }
+    const std::size_t n_sites = system_->n_sites();
+    std::vector<ComponentMPSSite> component_sites;
+    component_sites.reserve(n_sites);
+    SpatialNPDMResult result;
+    result.spin_rotation_reduction = spin_rotation_reduction;
+    result.magnetic_component_expansion = true;
+    for (std::size_t site = 0; site < n_sites; ++site) {
+        const auto found = split_sites_.find(static_cast<std::int64_t>(site));
+        if (found == split_sites_.end()) {
+            throw std::logic_error("The C++-owned reduced MPS has a missing site.");
+        }
+        ComponentMPSSite expanded = expand_reduced_site_components(found->second);
+        if (!component_sites.empty() && component_sites.back().right != expanded.left) {
+            throw std::logic_error("Expanded SU(2) component bonds are inconsistent.");
+        }
+        result.max_component_bond_dimension = std::max(
+            result.max_component_bond_dimension,
+            std::max(expanded.left, expanded.right)
+        );
+        component_sites.push_back(std::move(expanded));
+    }
+    if (component_sites.front().left != 1) {
+        throw std::logic_error("A finite reduced MPS must begin at a scalar boundary.");
+    }
+    if (component_sites.back().right != 1) {
+        ComponentMPSSite& final = component_sites.back();
+        std::vector<double> selected(4 * final.left, 0.0);
+        for (std::size_t physical = 0; physical < 4; ++physical) {
+            for (std::size_t left = 0; left < final.left; ++left) {
+                selected[physical * final.left + left] = final.data[
+                    (physical * final.left + left) * final.right
+                ];
+            }
+        }
+        final.right = 1;
+        final.data.swap(selected);
+    }
+    result.setup_seconds = wall_seconds() - expansion_started;
+
+    const double environment_started = wall_seconds();
+    std::vector<std::vector<double>> left_identity(n_sites + 1);
+    std::vector<std::vector<double>> right_identity(n_sites + 1);
+    left_identity[0] = {1.0};
+    const Matrix4 identity = identity4();
+    for (std::size_t site = 0; site < n_sites; ++site) {
+        left_identity[site + 1] = component_transfer(
+            left_identity[site],
+            component_sites[site],
+            identity
+        );
+    }
+    right_identity[n_sites] = {1.0};
+    for (std::size_t site = n_sites; site-- > 0;) {
+        right_identity[site] = component_right_identity_transfer(
+            right_identity[site + 1],
+            component_sites[site]
+        );
+    }
+    if (left_identity[n_sites].size() != 1) {
+        throw std::logic_error("The selected component MPS has a nonscalar boundary.");
+    }
+    result.norm = left_identity[n_sites][0];
+    if (std::abs(result.norm) <= 1.0e-14) {
+        throw std::logic_error("Cannot build NPDMs from a zero-norm reduced MPS.");
+    }
+    result.environment_seconds = wall_seconds() - environment_started;
+
+    const double rdm1_started = wall_seconds();
+    result.rdm1.assign(n_sites * n_sites, 0.0);
+    ComponentTransferWorkspace contraction_workspace;
+    const std::int32_t rdm1_spins = spin_rotation_reduction ? 1 : 2;
+    const double rdm1_scale = spin_rotation_reduction ? 2.0 : 1.0;
+    for (std::size_t p = 0; p < n_sites; ++p) {
+        for (std::size_t q = p; q < n_sites; ++q) {
+            double value = 0.0;
+            for (std::int32_t spin = 0; spin < rdm1_spins; ++spin) {
+                value += rdm1_scale * component_string_expectation(
+                    component_sites,
+                    left_identity,
+                    right_identity,
+                    {
+                        FermionSpec{true, spin, static_cast<std::int64_t>(p)},
+                        FermionSpec{false, spin, static_cast<std::int64_t>(q)},
+                    },
+                    result.norm,
+                    contraction_workspace
+                );
+                ++result.string_contractions;
+            }
+            result.rdm1[p * n_sites + q] = value;
+            result.rdm1[q * n_sites + p] = value;
+        }
+    }
+    result.rdm1_seconds = wall_seconds() - rdm1_started;
+
+    const double rdm2_started = wall_seconds();
+    const std::size_t n2 = n_sites * n_sites;
+    result.rdm2.assign(n2 * n2, 0.0);
+    const std::vector<std::tuple<std::int32_t, std::int32_t, double>>
+        spin_channels = spin_rotation_reduction
+        ? std::vector<std::tuple<std::int32_t, std::int32_t, double>>{
+            {0, 0, 2.0},
+            {0, 1, 2.0},
+        }
+        : std::vector<std::tuple<std::int32_t, std::int32_t, double>>{
+            {0, 0, 1.0},
+            {0, 1, 1.0},
+            {1, 0, 1.0},
+            {1, 1, 1.0},
+        };
+    for (const auto& [spin, tau, scale] : spin_channels) {
+        for (std::size_t left_pair = 0; left_pair < n2; ++left_pair) {
+            const std::size_t p = left_pair / n_sites;
+            const std::size_t r = left_pair % n_sites;
+            for (std::size_t right_pair = left_pair;
+                 right_pair < n2;
+                 ++right_pair) {
+                const std::size_t q = right_pair / n_sites;
+                const std::size_t s = right_pair % n_sites;
+                const double value = scale * component_string_expectation(
+                    component_sites,
+                    left_identity,
+                    right_identity,
+                    {
+                        FermionSpec{true, spin, static_cast<std::int64_t>(p)},
+                        FermionSpec{true, tau, static_cast<std::int64_t>(r)},
+                        FermionSpec{false, tau, static_cast<std::int64_t>(s)},
+                        FermionSpec{false, spin, static_cast<std::int64_t>(q)},
+                    },
+                    result.norm,
+                    contraction_workspace
+                );
+                ++result.string_contractions;
+                const std::size_t index =
+                    ((p * n_sites + q) * n_sites + r) * n_sites + s;
+                result.rdm2[index] += value;
+                if (left_pair != right_pair) {
+                    const std::size_t reverse =
+                        ((q * n_sites + p) * n_sites + s) * n_sites + r;
+                    result.rdm2[reverse] += value;
+                }
+            }
+        }
+    }
+    result.rdm2_seconds = wall_seconds() - rdm2_started;
+    return result;
+}
+
 void MovingEnvironment::release_workspaces() {
     if (!direction_.empty() || lifecycle_phase_ != "idle") {
         throw std::logic_error(
@@ -33758,7 +36344,7 @@ MovingEnvironment::normal_complementary_boundary_action_bytes() const noexcept {
     return total;
 }
 std::size_t MovingEnvironment::metric_boundary_count() const noexcept {
-    return metric_boundaries_.size();
+    return metric_boundaries_.size() + complex_metric_boundaries_.size();
 }
 std::size_t
 MovingEnvironment::metric_boundary_action_count() const noexcept {
@@ -33963,6 +36549,18 @@ MovingEnvironment::contextual_core_cache_hits() const noexcept {
 std::uint64_t
 MovingEnvironment::contextual_core_reuse_hits() const noexcept {
     return contextual_core_reuse_hits_;
+}
+std::size_t
+MovingEnvironment::contextual_route_skeleton_count() const noexcept {
+    return contextual_route_skeletons_.size();
+}
+std::size_t
+MovingEnvironment::contextual_route_skeleton_bytes() const noexcept {
+    return contextual_route_skeleton_bytes_;
+}
+std::uint64_t
+MovingEnvironment::contextual_route_skeleton_hits() const noexcept {
+    return contextual_route_skeleton_hits_;
 }
 double MovingEnvironment::contextual_route_match_seconds() const noexcept {
     return contextual_route_match_seconds_;
@@ -34450,6 +37048,16 @@ MovingEnvironment::reduced_contextual_numeric_refresh_seconds()
     return reduced_contextual_numeric_refresh_seconds_;
 }
 double
+MovingEnvironment::reduced_contextual_boundary_refresh_seconds()
+    const noexcept {
+    return reduced_contextual_boundary_refresh_seconds_;
+}
+double
+MovingEnvironment::reduced_contextual_scale_refresh_seconds()
+    const noexcept {
+    return reduced_contextual_scale_refresh_seconds_;
+}
+double
 MovingEnvironment::reduced_contextual_execution_refresh_seconds()
     const noexcept {
     return reduced_contextual_execution_refresh_seconds_;
@@ -34740,7 +37348,7 @@ double MovingEnvironment::last_half_sweep_energy() const noexcept {
     return last_half_sweep_energy_;
 }
 std::size_t MovingEnvironment::boundary_count() const noexcept {
-    return boundaries_.size();
+    return boundaries_.size() + complex_boundaries_.size();
 }
 std::size_t MovingEnvironment::borrowed_boundary_bytes() const noexcept {
     std::size_t total = 0;
@@ -34761,6 +37369,18 @@ std::size_t MovingEnvironment::owned_boundary_bytes() const noexcept {
                 arena.owned_values ? arena.owned_values->size() : 0
             ) * sizeof(double);
         }
+    }
+    for (const auto& [key, arena] : complex_boundaries_) {
+        static_cast<void>(key);
+        total += (
+            arena.owned_values ? arena.owned_values->size() : 0
+        ) * sizeof(Complex);
+    }
+    for (const auto& [key, arena] : complex_metric_boundaries_) {
+        static_cast<void>(key);
+        total += (
+            arena.owned_values ? arena.owned_values->size() : 0
+        ) * sizeof(Complex);
     }
     return total;
 }
@@ -34807,7 +37427,9 @@ std::size_t MovingEnvironment::factor_route_table_bytes() const noexcept {
                 + workspace.matrix_values.capacity()
                 + workspace.square_scratch.capacity()
                 + workspace.residual_scratch.capacity()
-            ) * sizeof(double);
+            ) * sizeof(double)
+            + workspace.pivot_components.capacity()
+                * sizeof(std::uint16_t);
     };
     total += decomposition_workspace_bytes(
         left_decomposition_workspace_
@@ -34917,7 +37539,6 @@ std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
             + real_matvec_output_.capacity()
             + active_bond_h_diagonal_real_.capacity()
             + active_bond_n_diagonal_real_.capacity()
-            + refreshed_complementary_scales_.capacity()
             + complementary_panel_scratch_.capacity()
         ) * sizeof(double)
         + (

@@ -28,7 +28,9 @@ from .direct_ci import (
     _sigma_compact_derivative_batch_numba,
 )
 from .orbopt import (
+    apply_factor_hessian_workspace,
     augmented_hessian_direction,
+    create_factor_hessian_workspace,
     davidson_augmented_hessian_direction,
     diagonal_hessian,
     diagonal_inverse_hessian,
@@ -52,6 +54,7 @@ from .orbopt import (
     update_lbfgs_history,
 )
 from .reduced_ci import ReducedCISubspace, _transition_rdms_with_core, ci_diagonal
+from ..ci.fci import FCIStringBasis
 
 
 class OrbitalDIIS:
@@ -123,6 +126,9 @@ class FirstOrderCASSCF:
         mf,
         ncas,
         nelecas,
+        spin=None,
+        ms2=None,
+        multiplicity=None,
         max_cycle=12,
         conv_tol=1.0e-7,
         conv_tol_grad=1.0e-5,
@@ -157,6 +163,9 @@ class FirstOrderCASSCF:
         self.mol = mf.mol
         self.ncas = int(ncas)
         self.nelecas = nelecas
+        self.spin = spin
+        self.ms2 = ms2
+        self.multiplicity = multiplicity
         self.verbose = int(verbose)
         self.max_cycle = int(max_cycle)
         self.max_cycles = self.max_cycle
@@ -369,6 +378,9 @@ class FirstOrderCASSCF:
             self.mf,
             ncas=self.ncas,
             nelecas=self.nelecas,
+            spin=self.spin,
+            ms2=self.ms2,
+            multiplicity=self.multiplicity,
             verbose=self._casci_verbose(),
         )
         probe.fix_spin(s=s, ss=ss, shift=shift)
@@ -382,6 +394,9 @@ class FirstOrderCASSCF:
             self.mf,
             ncas=self.ncas,
             nelecas=self.nelecas,
+            spin=self.spin,
+            ms2=self.ms2,
+            multiplicity=self.multiplicity,
             verbose=self._casci_verbose(),
         )
         if self._casci_binary_cache is not None:
@@ -515,6 +530,13 @@ class FirstOrderCASSCF:
             dm2_small = mc.make_rdm2(state_id, with_core=True)
             return dm1, embed_rdm2(dm2_small, self.nmo)
 
+        averaged = getattr(mc, "make_state_average_rdms", None)
+        if callable(averaged):
+            dm1_small, dm2_small = averaged(self.weights, with_core=True)
+            dm1 = np.zeros((self.nmo, self.nmo), dtype=dm1_small.dtype)
+            dm1[: dm1_small.shape[0], : dm1_small.shape[1]] = dm1_small
+            return dm1, embed_rdm2(dm2_small, self.nmo)
+
         dm1 = np.zeros((self.nmo, self.nmo), dtype=float)
         dm2 = np.zeros((self.nmo, self.nmo, self.nmo, self.nmo), dtype=float)
         for root, weight in enumerate(self.weights):
@@ -532,6 +554,12 @@ class FirstOrderCASSCF:
         if self.weights is None:
             dm1 = mc.make_rdm1(state_id, with_core=True)
             dm2 = mc.make_rdm2(state_id, with_core=True)
+            self._update_casci_cache(mc)
+            return dm1, dm2
+
+        averaged = getattr(mc, "make_state_average_rdms", None)
+        if callable(averaged):
+            dm1, dm2 = averaged(self.weights, with_core=True)
             self._update_casci_cache(mc)
             return dm1, dm2
 
@@ -666,6 +694,8 @@ class FirstOrderCASSCF:
 
         if ratio < 0.25:
             radius = max(min_radius, 0.5 * max(used_peak, min_radius))
+        elif accepted_scale < 0.9 and used_peak > 0.0:
+            radius = max(min_radius, min(radius, used_peak))
         elif ratio > 0.75 and accepted_scale > 0.9 and step_peak >= 0.8 * radius:
             radius = min(max_radius, max(radius, used_peak) * 1.5)
         else:
@@ -870,10 +900,9 @@ class FirstOrderCASSCF:
             "Inspect mc.history for the per-cycle energy/gradient trend.",
             "Try a smaller orbital step or more damping: reduce step_size/max_step or increase level_shift.",
         ]
-        if getattr(self.mol, "_build_driver", None) == "pyscf":
-            suggestions.append(
-                "Compare against pure PySCF with examples/qchem/casscf_compare_vs_pyscf.py."
-            )
+        suggestions.append(
+            "Compare against pure PySCF with examples/qchem/casscf_compare_vs_pyscf.py."
+        )
         lines.append("Next steps: " + " ".join(suggestions))
         return "\n".join(lines)
 
@@ -882,6 +911,7 @@ class FirstOrderCASSCF:
         nstates=1,
         state_id=0,
         mo_coeff=None,
+        ci0=None,
         use_cholesky=None,
         active_orbitals=None,
     ):
@@ -935,7 +965,7 @@ class FirstOrderCASSCF:
         mo_coeff = self.reorder_mo_for_active_orbitals(mo_coeff, active_orbitals)
         prev_energy = None
         prev_step_norm = None
-        ci_guess = None
+        ci_guess = self._copy_ci_guess(ci0)
         prev_grad_vec = None
         accepted_step_vec = None
 
@@ -1205,6 +1235,11 @@ class FirstOrderCASSCF:
             prev_grad_vec = grad_vec.copy()
 
         if not self.converged:
+            self.mo_coeff = np.array(mo_coeff, copy=True)
+            self.casci = mc
+            self.ci = mc.ci
+            self.e_tot = mc.e_tot
+            self.ncore = mc.ncore
             raise RuntimeError(
                 self._format_stall_message(
                     "Max macro steps reached before the CASSCF optimizer converged."
@@ -1281,6 +1316,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         mf,
         ncas,
         nelecas,
+        spin=None,
+        ms2=None,
+        multiplicity=None,
         max_cycle=50,
         max_micro_cycle=8,
         conv_tol=1.0e-7,
@@ -1303,6 +1341,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ah_adaptive_trust=False,
         ah_fd_step=5.0e-4,
         ah_hessian="analytic",
+        ah_conv_tol=1.0e-8,
+        keyframe_interval=4,
+        keyframe_gradient_trust=3.0,
+        active_overlap_floor=0.0,
+        nonmonotonic_energy_window=0.0,
+        zero_step_recovery_max=1,
+        micro_ci_mode="full",
         ci_method="direct_ci",
         use_cholesky=None,
         coupling="qn",
@@ -1350,6 +1395,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             mf,
             ncas,
             nelecas,
+            spin=spin,
+            ms2=ms2,
+            multiplicity=multiplicity,
             max_cycle=max_cycle,
             conv_tol=conv_tol,
             conv_tol_grad=conv_tol_grad,
@@ -1379,6 +1427,27 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         if self.ah_trust_metric not in {"component", "norm"}:
             raise ValueError("ah_trust_metric must be 'component' or 'norm'.")
         self.ah_adaptive_trust = bool(ah_adaptive_trust)
+        self.ah_conv_tol = float(ah_conv_tol)
+        if self.ah_conv_tol <= 0.0:
+            raise ValueError("ah_conv_tol must be positive.")
+        self.keyframe_interval = int(keyframe_interval)
+        self.keyframe_gradient_trust = float(keyframe_gradient_trust)
+        if self.keyframe_interval < 0:
+            raise ValueError("keyframe_interval must be non-negative.")
+        if self.keyframe_gradient_trust <= 1.0:
+            raise ValueError("keyframe_gradient_trust must be greater than one.")
+        self.active_overlap_floor = float(active_overlap_floor)
+        if not 0.0 <= self.active_overlap_floor <= 1.0:
+            raise ValueError("active_overlap_floor must lie in [0, 1].")
+        self.nonmonotonic_energy_window = float(nonmonotonic_energy_window)
+        if self.nonmonotonic_energy_window < 0.0:
+            raise ValueError("nonmonotonic_energy_window must be non-negative.")
+        self.zero_step_recovery_max = int(zero_step_recovery_max)
+        if self.zero_step_recovery_max < 0:
+            raise ValueError("zero_step_recovery_max must be non-negative.")
+        self.micro_ci_mode = str(micro_ci_mode).lower().replace("-", "_")
+        if self.micro_ci_mode not in {"full", "keyframe"}:
+            raise ValueError("micro_ci_mode must be 'full' or 'keyframe'.")
         self.coupling = str(coupling).lower().replace("-", "_")
         if self.coupling not in {
             "uncoupled",
@@ -1501,8 +1570,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self.active_restart_max = int(active_restart_max)
         self.exact_state_specific_gradient = bool(exact_state_specific_gradient)
         self.active_restart_history = []
+        self.zero_step_recovery_history = []
         self.internal_preopt_history = []
         self.micro_history = []
+        self.active_overlap_history = []
+        self.active_reference_mo = None
         self._qn_updates = []
         self._full_derivative_cache = None
         self._full_derivative_sigma_cache = None
@@ -1640,6 +1712,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             frozen_mf,
             ncas=self.ncas,
             nelecas=self.nelecas,
+            spin=self.spin,
+            ms2=self.ms2,
+            multiplicity=self.multiplicity,
             verbose=self._casci_verbose(),
         )
         if self.spin_purification:
@@ -1679,6 +1754,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             frozen_mf,
             ncas=self.ncas,
             nelecas=self.nelecas,
+            spin=self.spin,
+            ms2=self.ms2,
+            multiplicity=self.multiplicity,
             verbose=self._casci_verbose(),
         )
         if self.spin_purification:
@@ -1707,32 +1785,92 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self._update_casci_cache(mc)
         return mc
 
-    def _micro_line_search(self, h1_ref, eri_ref, U, kappa, energy, ci0):
+    def _fixed_ci_trial(self, template_mc, h1_mo, eri_mo, ci0):
+        trial_mc = self._make_integral_sigma_casci(template_mc, h1_mo, eri_mo)
+        roots = self._orthonormalize_ci_roots(ci0, fallback_roots=template_mc.ci)
+        energies = [
+            float(trial_mc.e_core + np.real(np.vdot(ci, trial_mc.ci_sigma(ci))))
+            for ci in roots
+        ]
+        trial_mc.ci = roots
+        trial_mc.e_tot = np.asarray(energies, dtype=float)
+        trial_mc.nstates = len(roots)
+        trial_mc.solver_backend = "fixed_ci_keyframe"
+        return trial_mc
+
+    def _fixed_factor_ci_trial(self, template_mc, h1_mo, pair_factors, ci0):
+        trial_mc = self._make_factor_integral_sigma_casci(
+            template_mc,
+            h1_mo,
+            pair_factors,
+        )
+        roots = self._orthonormalize_ci_roots(ci0, fallback_roots=template_mc.ci)
+        energies = [
+            float(trial_mc.e_core + np.real(np.vdot(ci, trial_mc.ci_sigma(ci))))
+            for ci in roots
+        ]
+        trial_mc.ci = roots
+        trial_mc.e_tot = np.asarray(energies, dtype=float)
+        trial_mc.nstates = len(roots)
+        trial_mc.solver_backend = "fixed_ci_keyframe_factor"
+        return trial_mc
+
+    def _micro_line_search(
+        self,
+        h1_ref,
+        eri_ref,
+        U,
+        kappa,
+        energy,
+        ci0,
+        template_mc=None,
+        relax_ci=True,
+    ):
         scale = 1.0
         best = None
+        minimum_decrease = max(1.0e-14, min(1.0e-10, 1.0e-5 * self.conv_tol))
         while scale >= 0.125:
             trial_U = self._apply_orbital_update(U, scale * kappa)
             h1_trial, eri_trial = self._transform_frozen_integrals(h1_ref, eri_ref, trial_U)
-            trial_mc = self._make_integral_casci(
-                h1_trial,
-                eri_trial,
-                self.mo_coeff_ref,
-                self.nstates,
-                ci0=ci0,
-            )
+            if relax_ci:
+                trial_mc = self._make_integral_casci(
+                    h1_trial,
+                    eri_trial,
+                    self.mo_coeff_ref,
+                    self.nstates,
+                    ci0=ci0,
+                )
+            else:
+                trial_mc = self._fixed_ci_trial(
+                    template_mc,
+                    h1_trial,
+                    eri_trial,
+                    ci0,
+                )
             trial_energy = self._objective_energy(trial_mc, self.state_id)
             if best is None or trial_energy < best[1]:
                 best = (trial_U, trial_energy, trial_mc, scale)
-            if trial_energy < energy - 1.0e-10:
+            if trial_energy < energy - minimum_decrease:
                 return True, trial_U, trial_energy, trial_mc, scale
             scale *= 0.5
         if best is None:
             return False, U, energy, None, 0.0
         return False, best[0], best[1], best[2], best[3]
 
-    def _factor_micro_line_search(self, h1_ref, pair_ref, U, kappa, energy, ci0):
+    def _factor_micro_line_search(
+        self,
+        h1_ref,
+        pair_ref,
+        U,
+        kappa,
+        energy,
+        ci0,
+        template_mc=None,
+        relax_ci=True,
+    ):
         scale = 1.0
         best = None
+        minimum_decrease = max(1.0e-14, min(1.0e-10, 1.0e-5 * self.conv_tol))
         while scale >= 0.125:
             trial_U = self._apply_orbital_update(U, scale * kappa)
             h1_trial, pair_trial = self._transform_frozen_factor_integrals(
@@ -1740,17 +1878,25 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 pair_ref,
                 trial_U,
             )
-            trial_mc = self._make_factor_integral_casci(
-                h1_trial,
-                pair_trial,
-                self.mo_coeff_ref,
-                self.nstates,
-                ci0=ci0,
-            )
+            if relax_ci:
+                trial_mc = self._make_factor_integral_casci(
+                    h1_trial,
+                    pair_trial,
+                    self.mo_coeff_ref,
+                    self.nstates,
+                    ci0=ci0,
+                )
+            else:
+                trial_mc = self._fixed_factor_ci_trial(
+                    template_mc,
+                    h1_trial,
+                    pair_trial,
+                    ci0,
+                )
             trial_energy = self._objective_energy(trial_mc, self.state_id)
             if best is None or trial_energy < best[1]:
                 best = (trial_U, trial_energy, trial_mc, scale)
-            if trial_energy < energy - 1.0e-10:
+            if trial_energy < energy - minimum_decrease:
                 return True, trial_U, trial_energy, trial_mc, scale
             scale *= 0.5
         if best is None:
@@ -1975,6 +2121,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             out -= bs * (np.dot(bs, vec) / denom_b)
         return out
 
+    def _qn_hessian_action_block(self, vectors, base_matvec_block):
+        vectors = np.asarray(vectors, dtype=float)
+        out = np.asarray(base_matvec_block(vectors), dtype=float).copy()
+        for y, s, bs, denom_y, denom_b in self._qn_updates:
+            out += y[:, None] * ((y @ vectors) / denom_y)
+            out -= bs[:, None] * ((bs @ vectors) / denom_b)
+        return out
+
     def _append_qn_update(self, step_vec, delta_grad_vec, base_matvec):
         step_vec = np.asarray(step_vec, dtype=float)
         delta_grad_vec = np.asarray(delta_grad_vec, dtype=float)
@@ -2133,40 +2287,61 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         grad = orbital_gradient(fock)
         return self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
 
-    def _pair_factor_response_slices(self, pair_factors, kappa, nocc_like):
+    def _pair_factor_response_slices(
+        self,
+        pair_factors,
+        kappa,
+        nocc_like,
+        *,
+        factor_cache=None,
+    ):
         pair_factors = np.asarray(pair_factors)
         kappa = np.asarray(kappa)
         nocc_like = int(nocc_like)
         kappa_occ = kappa[:, :nocc_like]
+        pair_full_occ = pair_factors[:, :, :nocc_like]
+        naux, nmo, _ = pair_full_occ.shape
+        pair_full_occ_matrix = None
+        if factor_cache is not None:
+            pair_full_occ_matrix = factor_cache.get("pair_full_occ_matrix")
+        if pair_full_occ_matrix is None:
+            pair_full_occ_matrix = np.ascontiguousarray(
+                pair_full_occ.transpose(1, 0, 2)
+            ).reshape(nmo, naux * nocc_like)
+            if factor_cache is not None:
+                factor_cache["pair_full_occ_matrix"] = pair_full_occ_matrix
         d_full_occ = (
-            np.einsum(
-                "Ppj,pi->Pij",
-                pair_factors[:, :, :nocc_like],
-                kappa,
-                optimize=True,
-            )
-            + np.einsum(
-                "Piq,qj->Pij",
-                pair_factors,
-                kappa_occ,
-                optimize=True,
-            )
+            np.matmul(kappa.T, pair_full_occ)
+            + np.matmul(pair_factors, kappa_occ)
         )
         return d_full_occ, d_full_occ[:, :nocc_like, :]
 
-    def _generalized_fock_factor_product_sliced(self, left_full_occ, right_occ_occ, dm2_occ):
-        contracted = np.einsum(
-            "Pst,rqst->Prq",
-            right_occ_occ,
-            dm2_occ,
-            optimize=True,
+    def _contract_factor_dm2(self, right_occ_occ, dm2_occ):
+        right_occ_occ = np.asarray(right_occ_occ)
+        dm2_occ = np.asarray(dm2_occ)
+        naux, nocc, _ = right_occ_occ.shape
+        contracted = right_occ_occ.reshape(naux, nocc * nocc) @ (
+            dm2_occ.reshape(nocc * nocc, nocc * nocc).T
         )
-        return np.einsum(
-            "Ppr,Prq->pq",
-            left_full_occ,
-            contracted,
-            optimize=True,
-        )
+        return contracted.reshape(naux, nocc, nocc)
+
+    def _generalized_fock_factor_product_sliced(
+        self,
+        left_full_occ,
+        right_occ_occ,
+        dm2_occ,
+        *,
+        contracted_dm2=None,
+        left_matrix=None,
+    ):
+        if contracted_dm2 is None:
+            contracted_dm2 = self._contract_factor_dm2(right_occ_occ, dm2_occ)
+        naux, nfull, nocc = left_full_occ.shape
+        if left_matrix is None:
+            left_matrix = np.ascontiguousarray(
+                left_full_occ.transpose(1, 0, 2)
+            ).reshape(nfull, naux * nocc)
+        return left_matrix @ contracted_dm2.reshape(naux * nocc, nocc)
 
     def _orbital_hessian_action_from_factors(
         self,
@@ -2175,6 +2350,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         dm1_occ,
         dm2_occ,
         kappa,
+        factor_cache=None,
     ):
         h1_mo = np.asarray(h1_mo)
         pair_factors = np.asarray(pair_factors)
@@ -2183,13 +2359,49 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         kappa = np.asarray(kappa)
         nocc_like = int(dm1_occ.shape[0])
 
-        dh1 = h1_mo @ kappa - kappa @ h1_mo
         pair_full_occ = pair_factors[:, :, :nocc_like]
         pair_occ_occ = pair_full_occ[:, :nocc_like, :]
+        pair_full_occ_matrix = None
+        if factor_cache is not None:
+            pair_full_occ_matrix = factor_cache.get("pair_full_occ_matrix")
+        if pair_full_occ_matrix is None:
+            pair_full_occ_matrix = np.ascontiguousarray(
+                pair_full_occ.transpose(1, 0, 2)
+            ).reshape(pair_factors.shape[1], -1)
+            if factor_cache is not None:
+                factor_cache["pair_full_occ_matrix"] = pair_full_occ_matrix
+        contracted_dm2 = None
+        if factor_cache is not None:
+            contracted_dm2 = factor_cache.get("contracted_dm2")
+            if contracted_dm2 is None:
+                contracted_dm2 = self._contract_factor_dm2(
+                    pair_occ_occ,
+                    dm2_occ,
+                )
+                factor_cache["contracted_dm2"] = contracted_dm2
+
+            if "native_workspace" not in factor_cache:
+                factor_cache["native_workspace"] = create_factor_hessian_workspace(
+                    h1_mo,
+                    pair_factors,
+                    dm1_occ,
+                    dm2_occ,
+                    pair_full_occ_matrix,
+                    contracted_dm2,
+                )
+            native_action = apply_factor_hessian_workspace(
+                factor_cache["native_workspace"],
+                kappa,
+            )
+            if native_action is not None:
+                return native_action
+
+        dh1 = h1_mo @ kappa - kappa @ h1_mo
         d_full_occ, d_occ_occ = self._pair_factor_response_slices(
             pair_factors,
             kappa,
             nocc_like,
+            factor_cache=factor_cache,
         )
 
         dfock = np.zeros_like(h1_mo, dtype=np.result_type(h1_mo, pair_factors, dm2_occ))
@@ -2203,13 +2415,103 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             d_full_occ,
             pair_occ_occ,
             dm2_occ,
+            contracted_dm2=contracted_dm2,
         )
         dfock[:, :nocc_like] += self._generalized_fock_factor_product_sliced(
             pair_full_occ,
             d_occ_occ,
             dm2_occ,
+            left_matrix=pair_full_occ_matrix,
         )
         return orbital_gradient(dfock)
+
+    def _orbital_hessian_action_from_factors_batch(
+        self,
+        h1_mo,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappas,
+        factor_cache=None,
+    ):
+        h1_mo = np.asarray(h1_mo)
+        pair_factors = np.asarray(pair_factors)
+        dm1_occ = np.asarray(dm1_occ)
+        dm2_occ = np.asarray(dm2_occ)
+        kappas = np.asarray(kappas)
+        if kappas.ndim != 3:
+            raise ValueError("kappas must have shape (nvec, nmo, nmo).")
+
+        nvec, nmo, _ = kappas.shape
+        nocc = int(dm1_occ.shape[0])
+        naux = int(pair_factors.shape[0])
+        pair_full_occ = pair_factors[:, :, :nocc]
+        pair_occ_occ = pair_full_occ[:, :nocc, :]
+        if factor_cache is None:
+            factor_cache = {}
+
+        pair_matrix = factor_cache.get("pair_full_occ_matrix")
+        if pair_matrix is None:
+            pair_matrix = np.ascontiguousarray(
+                pair_full_occ.transpose(1, 0, 2)
+            ).reshape(nmo, naux * nocc)
+            factor_cache["pair_full_occ_matrix"] = pair_matrix
+        contracted_base = factor_cache.get("contracted_dm2")
+        if contracted_base is None:
+            contracted_base = self._contract_factor_dm2(pair_occ_occ, dm2_occ)
+            factor_cache["contracted_dm2"] = contracted_base
+
+        if "native_workspace" not in factor_cache:
+            factor_cache["native_workspace"] = create_factor_hessian_workspace(
+                h1_mo,
+                pair_factors,
+                dm1_occ,
+                dm2_occ,
+                pair_matrix,
+                contracted_base,
+            )
+        native_action = apply_factor_hessian_workspace(
+            factor_cache["native_workspace"],
+            kappas,
+        )
+        if native_action is not None:
+            return native_action
+
+        left_response = np.matmul(
+            kappas.transpose(0, 2, 1),
+            pair_matrix,
+        ).reshape(nvec, nmo, naux, nocc).transpose(0, 2, 1, 3)
+        right_response = np.matmul(
+            pair_factors.reshape(naux * nmo, nmo),
+            kappas[:, :, :nocc],
+        ).reshape(nvec, naux, nmo, nocc)
+        d_full_occ = left_response + right_response
+        d_occ_occ = d_full_occ[:, :, :nocc, :]
+
+        dm2_matrix_t = dm2_occ.reshape(nocc * nocc, nocc * nocc).T
+        contracted_response = (
+            d_occ_occ.reshape(nvec * naux, nocc * nocc) @ dm2_matrix_t
+        ).reshape(nvec, naux, nocc, nocc)
+        d_left_matrix = np.ascontiguousarray(
+            d_full_occ.transpose(0, 2, 1, 3)
+        ).reshape(nvec, nmo, naux * nocc)
+        two_electron = np.matmul(
+            d_left_matrix,
+            contracted_base.reshape(naux * nocc, nocc),
+        )
+        two_electron += np.matmul(
+            pair_matrix,
+            contracted_response.reshape(nvec, naux * nocc, nocc),
+        )
+
+        dh1 = np.matmul(h1_mo, kappas) - np.matmul(kappas, h1_mo)
+        dfock = np.zeros(
+            (nvec, nmo, nmo),
+            dtype=np.result_type(h1_mo, pair_factors, dm2_occ),
+        )
+        dfock[:, :, :nocc] = np.matmul(dh1[:, :, :nocc], dm1_occ)
+        dfock[:, :, :nocc] += two_electron
+        return 2.0 * (dfock - dfock.conj().transpose(0, 2, 1))
 
     def _parameterized_orbital_hessian_action(
         self,
@@ -3156,6 +3458,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         sigma_mc._direct_factor_H_AA = None
         sigma_mc._direct_factor_H_BB = None
         sigma_mc._direct_factor_H_AB = None
+        sigma_mc._direct_H_diag = None
+        sigma_mc._spin_string_alpha_cross_diag = None
+        sigma_mc._spin_string_beta_cross_diag = None
+        sigma_mc._direct_rhf_blas_matvec = None
         sigma_mc.direct_connectivity = mc.direct_connectivity
         sigma_mc.binary = mc.binary
         return sigma_mc
@@ -3164,9 +3470,22 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         """
         Lightweight CASCI-like object for CI sigma with active-space pair factors.
         """
-        sigma_mc = copy.copy(mc)
         h1_active = np.asarray(h1_active)
         pair_active = np.asarray(pair_active)
+        if isinstance(mc.binary, FCIStringBasis):
+            # The spin-fixed solver deliberately keeps a product of alpha/beta
+            # strings instead of expanding determinant-level factor tables.
+            # In the active space the four-index tensor is small, and using it
+            # preserves the native spin-string contraction for fixed-CI trials.
+            eri_active = np.einsum(
+                "Ppq,Prs->pqrs",
+                pair_active,
+                pair_active,
+                optimize=True,
+            )
+            return self._make_active_sigma_casci(mc, h1_active, eri_active)
+
+        sigma_mc = copy.copy(mc)
         sigma_mc.hcore = np.asarray([h1_active, h1_active])
         sigma_mc.h2e_cas = None
         sigma_mc.eri_so = None
@@ -4452,11 +4771,50 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 break
         return unique
 
+    def _ao_overlap(self):
+        overlap = getattr(self.mol, "overlap", None)
+        if overlap is not None:
+            return np.asarray(overlap)
+        get_ovlp = getattr(self.mf, "get_ovlp", None)
+        if callable(get_ovlp):
+            return np.asarray(get_ovlp())
+        if self.active_overlap_floor > 0.0:
+            raise ValueError(
+                "active_overlap_floor requires an AO overlap matrix on mol.overlap "
+                "or mf.get_ovlp()."
+            )
+        return None
+
+    def _active_overlap_singular_values(self, reference_mo, current_mo, ncore, ncas):
+        overlap = self._ao_overlap()
+        if overlap is None:
+            return np.ones(int(ncas), dtype=float)
+        active = slice(int(ncore), int(ncore) + int(ncas))
+        metric = (
+            np.asarray(reference_mo)[:, active].conj().T
+            @ overlap
+            @ np.asarray(current_mo)[:, active]
+        )
+        return np.linalg.svd(metric, compute_uv=False)
+
+    def _active_overlap_ok(self, current_mo, ncore, ncas):
+        singular = self._active_overlap_singular_values(
+            self.active_reference_mo,
+            current_mo,
+            ncore,
+            ncas,
+        )
+        minimum = float(np.min(singular)) if singular.size else 1.0
+        return minimum >= self.active_overlap_floor, singular
+
     def _restart_solver(self):
         trial = SecondOrderCASSCF(
             self.mf,
             self.ncas,
             self.nelecas,
+            spin=self.spin,
+            ms2=self.ms2,
+            multiplicity=self.multiplicity,
             max_cycle=self.max_cycle,
             max_micro_cycle=self.max_micro_cycle,
             conv_tol=self.conv_tol,
@@ -4479,6 +4837,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             ah_adaptive_trust=self.ah_adaptive_trust,
             ah_fd_step=self.ah_fd_step,
             ah_hessian=self.ah_hessian,
+            ah_conv_tol=self.ah_conv_tol,
+            keyframe_interval=self.keyframe_interval,
+            keyframe_gradient_trust=self.keyframe_gradient_trust,
+            active_overlap_floor=self.active_overlap_floor,
+            nonmonotonic_energy_window=self.nonmonotonic_energy_window,
+            zero_step_recovery_max=self.zero_step_recovery_max,
+            micro_ci_mode=self.micro_ci_mode,
             ci_method=self.ci_method,
             use_cholesky=self.use_cholesky,
             coupling=self.coupling,
@@ -4578,12 +4943,21 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         nstates=1,
         state_id=0,
         mo_coeff=None,
+        ci0=None,
         use_cholesky=None,
         active_orbitals=None,
     ):
         if isinstance(self.mf.mo_coeff, tuple):
             raise NotImplementedError(
                 "SecondOrderCASSCF currently supports restricted references only."
+            )
+        if self.micro_ci_mode == "keyframe" and self.coupling not in {
+            "qn",
+            "uncoupled",
+        }:
+            raise ValueError(
+                "micro_ci_mode='keyframe' currently supports coupling='qn' "
+                "or 'uncoupled'."
             )
         self.use_cholesky_integrals = self._resolve_use_cholesky(use_cholesky)
         if self.use_cholesky_integrals:
@@ -4615,12 +4989,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self.state_id = int(state_id)
         self.history = []
         self.micro_history = []
+        self.active_overlap_history = []
         self.converged = False
         self.casci = None
         self.mo_coeff = None
         self.e_tot = None
         self.ci = None
         self.active_restart_history = []
+        self.zero_step_recovery_history = []
         self.internal_preopt_history = []
         self.internal_optimization_converged = False
         self.active_orbitals = active_orbitals
@@ -4639,9 +5015,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             mo_coeff = np.array(mo_coeff, copy=True)
         initial_mo_coeff = np.array(mo_coeff, copy=True)
         mo_coeff = self.reorder_mo_for_active_orbitals(mo_coeff, active_orbitals)
+        self.active_reference_mo = np.array(mo_coeff, copy=True)
 
         prev_energy = None
-        ci_guess = None
+        ci_guess = self._copy_ci_guess(ci0)
+        zero_step_recoveries = 0
 
         for macro in range(1, self.max_cycle + 1):
             mo_coeff, ci_guess = self._internal_preopt(mo_coeff, ci_guess, macro)
@@ -4666,11 +5044,19 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             micro_energy = None
             micro_gnorm = None
             micro_step = None
+            micro_ci_relaxed = False
+            zero_step_keyframe = False
             local_ci_guess = self._copy_ci_guess(ci_guess)
             prev_micro_grad_vec = None
             prev_micro_step_vec = None
             qn_base_hessian_action = None
+            qn_base_hessian_action_block = None
             self._qn_updates = []
+            keyframe_energy = None
+            keyframe_gradient = None
+            keyframe_mc = None
+            keyframe_ci = None
+            ci_keyframe_mc = None
 
             for micro in range(1, self.max_micro_cycle + 1):
                 if self.use_cholesky_integrals:
@@ -4686,22 +5072,41 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 solve_nstates = self.nstates
                 if self.coupling == "partial":
                     solve_nstates += max(0, self.coupled_ci_roots)
+                ci_relaxed = self.micro_ci_mode == "full" or micro == 1
                 if self.use_cholesky_integrals:
-                    mc = self._make_factor_integral_casci(
-                        h1_cur,
-                        pair_cur,
-                        mo_coeff,
-                        solve_nstates,
-                        ci0=local_ci_guess,
-                    )
+                    if ci_relaxed:
+                        mc = self._make_factor_integral_casci(
+                            h1_cur,
+                            pair_cur,
+                            mo_coeff,
+                            solve_nstates,
+                            ci0=local_ci_guess,
+                        )
+                    else:
+                        mc = self._fixed_factor_ci_trial(
+                            ci_keyframe_mc,
+                            h1_cur,
+                            pair_cur,
+                            local_ci_guess,
+                        )
                 else:
-                    mc = self._make_integral_casci(
-                        h1_cur,
-                        eri_cur,
-                        mo_coeff,
-                        solve_nstates,
-                        ci0=local_ci_guess,
-                    )
+                    if ci_relaxed:
+                        mc = self._make_integral_casci(
+                            h1_cur,
+                            eri_cur,
+                            mo_coeff,
+                            solve_nstates,
+                            ci0=local_ci_guess,
+                        )
+                    else:
+                        mc = self._fixed_ci_trial(
+                            ci_keyframe_mc,
+                            h1_cur,
+                            eri_cur,
+                            local_ci_guess,
+                        )
+                if ci_relaxed:
+                    ci_keyframe_mc = mc
                 energy = self._objective_energy(mc, self.state_id)
                 if self.use_cholesky_integrals:
                     dm1_occ, dm2_occ = self._effective_rdms_occ(mc, self.state_id)
@@ -4752,6 +5157,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 else:
                     orbital_hessian_model = "analytic_integral_response"
 
+                factor_hessian_cache = {}
+
                 def base_hessian_action(vec):
                     if self.use_cholesky_integrals and not use_parameterized_hessian:
                         return self._pack_orbitals(
@@ -4761,6 +5168,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 dm1,
                                 dm2,
                                 self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo),
+                                factor_cache=factor_hessian_cache,
                             ),
                             mc.ncore,
                             mc.ncas,
@@ -4795,6 +5203,41 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         vec,
                     )
 
+                base_hessian_action_block = None
+                if self.use_cholesky_integrals and not use_parameterized_hessian:
+                    def base_hessian_action_block(vectors):
+                        vectors = np.asarray(vectors, dtype=float)
+                        kappas = np.stack(
+                            [
+                                self._unpack_orbitals(
+                                    vectors[:, column],
+                                    mc.ncore,
+                                    mc.ncas,
+                                    self.nmo,
+                                )
+                                for column in range(vectors.shape[1])
+                            ]
+                        )
+                        actions = self._orbital_hessian_action_from_factors_batch(
+                            h1_cur,
+                            pair_cur,
+                            dm1,
+                            dm2,
+                            kappas,
+                            factor_cache=factor_hessian_cache,
+                        )
+                        return np.column_stack(
+                            [
+                                self._pack_orbitals(
+                                    actions[column],
+                                    mc.ncore,
+                                    mc.ncas,
+                                    self.nmo,
+                                )
+                                for column in range(actions.shape[0])
+                            ]
+                        )
+
                 if self.coupling == "qn" and qn_base_hessian_action is None:
                     h1_qn = np.array(h1_cur, copy=True)
                     if self.use_cholesky_integrals:
@@ -4808,8 +5251,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     ncore_qn = mc.ncore
                     ncas_qn = mc.ncas
                     nmo_qn = self.nmo
+                    qn_factor_hessian_cache = {}
 
-                    ci_qn = np.array(mc.ci[self.state_id], copy=True)
+                    ci_qn = None
+                    if not (
+                        self.use_cholesky_integrals
+                        and not use_parameterized_hessian
+                    ):
+                        ci_qn = np.array(mc.ci[self.state_id], copy=True)
                     grad_qn = np.array(grad_vec, copy=True)
 
                     def qn_base_hessian_action(vec):
@@ -4821,6 +5270,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                     dm1_qn,
                                     dm2_qn,
                                     self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo),
+                                    factor_cache=qn_factor_hessian_cache,
                                 ),
                                 mc.ncore,
                                 mc.ncas,
@@ -4855,10 +5305,52 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             vec,
                         )
 
+                    if self.use_cholesky_integrals and not use_parameterized_hessian:
+                        def qn_base_hessian_action_block(vectors):
+                            vectors = np.asarray(vectors, dtype=float)
+                            kappas = np.stack(
+                                [
+                                    self._unpack_orbitals(
+                                        vectors[:, column],
+                                        ncore_qn,
+                                        ncas_qn,
+                                        nmo_qn,
+                                    )
+                                    for column in range(vectors.shape[1])
+                                ]
+                            )
+                            actions = self._orbital_hessian_action_from_factors_batch(
+                                h1_qn,
+                                pair_qn,
+                                dm1_qn,
+                                dm2_qn,
+                                kappas,
+                                factor_cache=qn_factor_hessian_cache,
+                            )
+                            return np.column_stack(
+                                [
+                                    self._pack_orbitals(
+                                        actions[column],
+                                        ncore_qn,
+                                        ncas_qn,
+                                        nmo_qn,
+                                    )
+                                    for column in range(actions.shape[0])
+                                ]
+                            )
+
                 if self.coupling == "qn":
                     hessian_action = lambda vec: self._qn_hessian_action(
                         vec,
                         qn_base_hessian_action,
+                    )
+                    hessian_action_block = (
+                        None
+                        if qn_base_hessian_action_block is None
+                        else lambda vectors: self._qn_hessian_action_block(
+                            vectors,
+                            qn_base_hessian_action_block,
+                        )
                     )
                 elif self.coupling == "relaxed_fd":
                     if self.use_cholesky_integrals:
@@ -4882,9 +5374,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             mc,
                             mc.ci,
                             vec,
-                    )
+                        )
+                    hessian_action_block = None
                 else:
                     hessian_action = base_hessian_action
+                    hessian_action_block = base_hessian_action_block
 
                 if (
                     self.coupling == "qn"
@@ -4904,13 +5398,64 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     "gradient_norm": gnorm,
                     "orbital_parameterization": self.orbital_parameterization,
                     "orbital_hessian_model": orbital_hessian_model,
+                    "ci_relaxed": bool(ci_relaxed),
+                    "ci_mode": self.micro_ci_mode,
                 }
                 self.micro_history.append(micro_record)
 
                 micro_mc = mc
                 micro_energy = energy
                 micro_gnorm = gnorm
+                micro_ci_relaxed = bool(ci_relaxed)
                 local_ci_guess = self._copy_ci_guess(mc.ci)
+
+                active_ok, active_singular = self._active_overlap_ok(
+                    mo_coeff @ U,
+                    mc.ncore,
+                    mc.ncas,
+                )
+                active_minimum = (
+                    float(np.min(active_singular)) if active_singular.size else 1.0
+                )
+                micro_record["active_overlap_min"] = active_minimum
+                self.active_overlap_history.append(active_singular.copy())
+
+                if micro == 1:
+                    keyframe_energy = float(energy)
+                    keyframe_gradient = float(gnorm)
+                    keyframe_mc = mc
+                    keyframe_ci = self._copy_ci_guess(mc.ci)
+                elif energy > keyframe_energy + max(self.conv_tol, 1.0e-10):
+                    micro_record["keyframe_rollback"] = "energy_increase"
+                    U = np.eye(self.nmo)
+                    mc = keyframe_mc
+                    energy = keyframe_energy
+                    gnorm = keyframe_gradient
+                    local_ci_guess = keyframe_ci
+                    micro_mc = mc
+                    micro_energy = energy
+                    micro_gnorm = gnorm
+                    micro_step = 0.0
+                    break
+                elif gnorm > self.keyframe_gradient_trust * max(
+                    keyframe_gradient,
+                    self.conv_tol_grad,
+                ):
+                    micro_record["keyframe_refresh"] = "gradient_trust"
+                    break
+
+                if not active_ok:
+                    micro_record["keyframe_rollback"] = "active_space_overlap"
+                    U = np.eye(self.nmo)
+                    mc = keyframe_mc
+                    energy = keyframe_energy
+                    gnorm = keyframe_gradient
+                    local_ci_guess = keyframe_ci
+                    micro_mc = mc
+                    micro_energy = energy
+                    micro_gnorm = gnorm
+                    micro_step = 0.0
+                    break
 
                 if gnorm < self.conv_tol_grad:
                     micro_step = 0.0
@@ -5010,11 +5555,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         grad_vec,
                         hess_diag,
                         matvec=hessian_action,
+                        matvec_block=hessian_action_block,
                         max_step=ah_step_bound,
                         regularization=self.level_shift,
                         max_cycle=ah_max_cycle,
                         max_subspace=ah_max_subspace,
-                        tol=max(self.conv_tol_grad, 1.0e-4),
+                        tol=self.ah_conv_tol,
                         guess=ah_guess,
                         fallback_step=diag_step,
                         return_info=True,
@@ -5031,6 +5577,22 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             "ah_used_fallback": bool(ah_info["used_fallback"]),
                         }
                     )
+                exact_keyframe_converged = bool(
+                    ci_relaxed
+                    and bool(getattr(mc, "converged", True))
+                    and gnorm < self.conv_tol_grad_relaxed
+                )
+                orbital_step_zero = bool(
+                    step_vec.size == 0
+                    or np.max(np.abs(step_vec)) <= 1.0e-15
+                )
+                if exact_keyframe_converged and orbital_step_zero:
+                    micro_step = 0.0
+                    zero_step_keyframe = True
+                    micro_record["stationary_keyframe"] = True
+                    micro_record["termination_reason"] = "converged_exact_keyframe_zero_step"
+                    break
+
                 def limited_candidate(raw_step):
                     candidate = np.asarray(raw_step, dtype=float)
                     if np.dot(candidate, grad_vec) >= 0.0:
@@ -5041,6 +5603,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                 def evaluate_micro_candidate(label, raw_step, ci_guess):
                     candidate_step, candidate_limit = limited_candidate(raw_step)
+                    exact_tail_retry = False
                     kappa = self._unpack_orbitals(
                         candidate_step,
                         mc.ncore,
@@ -5103,10 +5666,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         )
                     else:
                         step_hv = np.asarray(hessian_action(candidate_step), dtype=float)
-                        predicted = -float(
-                            np.dot(grad_vec, candidate_step)
-                            + 0.5 * np.dot(candidate_step, step_hv)
-                        )
+                        model_linear = float(np.dot(grad_vec, candidate_step))
+                        model_quadratic = float(np.dot(candidate_step, step_hv))
+                        predicted = -(model_linear + 0.5 * model_quadratic)
                         if self.use_cholesky_integrals:
                             trial_accepted, trial_U, _, trial_mc, trial_scale = (
                                 self._factor_micro_line_search(
@@ -5116,6 +5678,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                     kappa,
                                     energy,
                                     ci_guess,
+                                    template_mc=ci_keyframe_mc,
+                                    relax_ci=self.micro_ci_mode == "full",
                                 )
                             )
                         else:
@@ -5127,19 +5691,70 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                     kappa,
                                     energy,
                                     ci_guess,
+                                    template_mc=ci_keyframe_mc,
+                                    relax_ci=self.micro_ci_mode == "full",
                                 )
                             )
+                        if (
+                            not trial_accepted
+                            and self.micro_ci_mode == "keyframe"
+                            and ci_relaxed
+                            and gnorm
+                            <= self.keyframe_gradient_trust
+                            * max(self.conv_tol_grad, 1.0e-12)
+                        ):
+                            # Fixed-CI line searches can become too restrictive
+                            # near convergence: the orbital decrease appears only
+                            # after the roots relax. Retry exactly only in this
+                            # narrow tail instead of diagonalizing every trial.
+                            exact_tail_retry = True
+                            if self.use_cholesky_integrals:
+                                trial_accepted, trial_U, _, trial_mc, trial_scale = (
+                                    self._factor_micro_line_search(
+                                        h1_ref,
+                                        pair_ref,
+                                        U,
+                                        kappa,
+                                        energy,
+                                        ci_guess,
+                                        template_mc=ci_keyframe_mc,
+                                        relax_ci=True,
+                                    )
+                                )
+                            else:
+                                trial_accepted, trial_U, _, trial_mc, trial_scale = (
+                                    self._micro_line_search(
+                                        h1_ref,
+                                        eri_ref,
+                                        U,
+                                        kappa,
+                                        energy,
+                                        ci_guess,
+                                        template_mc=ci_keyframe_mc,
+                                        relax_ci=True,
+                                    )
+                                )
                         if trial_mc is None:
                             actual = 0.0
                             trial_energy = energy
                         else:
                             trial_energy = self._objective_energy(trial_mc, self.state_id)
                             actual = float(energy - trial_energy)
-                        scaled_predicted = predicted * float(trial_scale) ** 2
+                        scaled_predicted = -(
+                            float(trial_scale) * model_linear
+                            + 0.5 * float(trial_scale) ** 2 * model_quadratic
+                        )
                         if scaled_predicted <= 1.0e-12:
                             ratio = np.inf if actual > 0.0 else -np.inf
                         else:
                             ratio = actual / scaled_predicted
+                    trial_active_ok, trial_active_singular = self._active_overlap_ok(
+                        mo_coeff @ trial_U,
+                        mc.ncore,
+                        mc.ncas,
+                    )
+                    if not trial_active_ok:
+                        trial_accepted = False
                     return {
                         "label": label,
                         "accepted": bool(trial_accepted),
@@ -5148,9 +5763,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         "trial_mc": trial_mc,
                         "accepted_scale": float(trial_scale),
                         "step_vec": candidate_step,
-                        "predicted_reduction": float(predicted),
+                        "predicted_reduction": float(scaled_predicted),
                         "actual_reduction": float(actual),
                         "ratio": float(ratio),
+                        "active_overlap_min": (
+                            float(np.min(trial_active_singular))
+                            if trial_active_singular.size
+                            else 1.0
+                        ),
+                        "active_overlap_accepted": bool(trial_active_ok),
+                        "exact_tail_retry": bool(exact_tail_retry),
                     }
 
                 coupled_mode = self.coupling in {"partial", "full"}
@@ -5160,6 +5782,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     if coupled_ci_guess is not None
                     else mc.ci[: self.nstates]
                 )
+                U_before_trial = np.array(U, copy=True)
                 primary_result = evaluate_micro_candidate(
                     primary_label,
                     step_vec,
@@ -5231,6 +5854,60 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 ),
                             }
                         )
+                elif not primary_result["accepted"]:
+                    fallback_result = evaluate_micro_candidate(
+                        "diagonal_fallback",
+                        orbital_fallback_step_vec,
+                        mc.ci[: self.nstates],
+                    )
+                    if fallback_result["accepted"]:
+                        chosen_result = fallback_result
+                    if self.nonmonotonic_energy_window > 0.0:
+                        uphill_candidates = [primary_result, fallback_result]
+                        uphill_candidates = [
+                            result
+                            for result in uphill_candidates
+                            if result["trial_mc"] is not None
+                            and result["active_overlap_accepted"]
+                            and result["predicted_reduction"] > 0.0
+                            and result["actual_reduction"] < 0.0
+                            and result["actual_reduction"]
+                            >= -self.nonmonotonic_energy_window
+                        ]
+                        if uphill_candidates:
+                            uphill = min(
+                                uphill_candidates,
+                                key=lambda result: result["trial_energy"],
+                            )
+                            competing_drop = max(
+                                0.0,
+                                float(chosen_result["actual_reduction"]),
+                            )
+                            if (
+                                not chosen_result["accepted"]
+                                or uphill["predicted_reduction"]
+                                > 2.0 * max(competing_drop, 1.0e-12)
+                            ):
+                                chosen_result = dict(uphill)
+                                chosen_result["accepted"] = True
+                                chosen_result["nonmonotonic"] = True
+                    micro_record.update(
+                        {
+                            "orbital_fallback_attempted": True,
+                            "orbital_fallback_accepted": bool(
+                                fallback_result["accepted"]
+                            ),
+                            "orbital_primary_actual_reduction": float(
+                                primary_result["actual_reduction"]
+                            ),
+                            "orbital_primary_predicted_reduction": float(
+                                primary_result["predicted_reduction"]
+                            ),
+                            "orbital_fallback_actual_reduction": float(
+                                fallback_result["actual_reduction"]
+                            ),
+                        }
+                    )
 
                 step_vec = chosen_result["step_vec"]
                 accepted = bool(chosen_result["accepted"])
@@ -5246,9 +5923,20 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     else 0.0
                 )
                 micro_record["ah_predicted_reduction"] = predicted_reduction
+                micro_record["exact_tail_retry"] = bool(
+                    chosen_result.get("exact_tail_retry", False)
+                )
+                micro_record["trial_active_overlap_min"] = float(
+                    chosen_result["active_overlap_min"]
+                )
+                nonmonotonic_step = bool(chosen_result.get("nonmonotonic", False))
+                micro_record["nonmonotonic_step"] = nonmonotonic_step
                 if not accepted:
+                    U = U_before_trial
+                    micro_step = 0.0
                     micro_record["ah_actual_reduction"] = 0.0
                     micro_record["ah_ratio"] = -np.inf
+                    micro_record["rejected_step_rolled_back"] = True
                     if self.ah_adaptive_trust:
                         self._update_ah_trust_radius(step_limit, -np.inf, 0.0, step_vec)
                     break
@@ -5265,6 +5953,18 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 local_ci_guess = self._copy_ci_guess(trial_mc.ci)
                 prev_micro_grad_vec = grad_vec.copy()
                 prev_micro_step_vec = accepted_scale * step_vec
+                if nonmonotonic_step:
+                    self._update_ah_trust_radius(
+                        step_limit,
+                        -np.inf,
+                        accepted_scale,
+                        step_vec,
+                    )
+                    micro_record["keyframe_refresh"] = "nonmonotonic_step"
+                    break
+                if self.keyframe_interval and micro >= self.keyframe_interval:
+                    micro_record["keyframe_refresh"] = "interval"
+                    break
 
             mo_coeff = mo_coeff @ U
             self.history.append(
@@ -5274,6 +5974,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     "gradient_norm": float(micro_gnorm),
                     "step_norm": 0.0 if micro_step is None else float(micro_step),
                     "micro_cycles": micro,
+                    "ci_relaxed": bool(micro_ci_relaxed),
                 }
             )
             self._log_casscf_cycle(
@@ -5285,10 +5986,62 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             )
             self.casci = micro_mc
 
-            if (
+            zero_step_plateau = bool(
+                micro_ci_relaxed
+                and bool(getattr(micro_mc, "converged", True))
+                and micro_gnorm >= self.conv_tol_grad_relaxed
+                and (micro_step is None or abs(float(micro_step)) <= 1.0e-15)
+            )
+            if zero_step_plateau:
+                if zero_step_recoveries < self.zero_step_recovery_max:
+                    zero_step_recoveries += 1
+                    recovery = {
+                        "macro": int(macro),
+                        "energy": float(micro_energy),
+                        "gradient_norm": float(micro_gnorm),
+                        "action": "reset_ah_and_active_reference",
+                    }
+                    self.zero_step_recovery_history.append(recovery)
+                    self.history[-1]["zero_step_recovery"] = True
+                    micro_record["zero_step_recovery"] = recovery["action"]
+                    self._ah_trust_radius = self.max_step
+                    self.active_reference_mo = np.array(mo_coeff, copy=True)
+                    self._invalidate_ah_reference_cache()
+                    self._qn_updates = []
+                    prev_energy = None
+                    ci_guess = self._copy_ci_guess(micro_mc.ci)
+                    continue
+
+                micro_record["termination_reason"] = "unresolved_zero_step_plateau"
+                self.mo_coeff = np.array(mo_coeff, copy=True)
+                self.casci = micro_mc
+                self.ci = micro_mc.ci
+                self.e_tot = micro_mc.e_tot
+                self.ncore = micro_mc.ncore
+                raise RuntimeError(
+                    self._format_stall_message(
+                        "Second-order CASSCF encountered a repeated zero-step "
+                        "plateau before reaching the gradient tolerance."
+                    )
+                )
+
+            stationary_keyframe = bool(
+                zero_step_keyframe
+                or (
+                    micro_ci_relaxed
+                    and bool(getattr(micro_mc, "converged", True))
+                    and micro_gnorm < self.conv_tol_grad_relaxed
+                    and (micro_step is None or abs(float(micro_step)) <= 1.0e-15)
+                )
+            )
+            energy_converged = bool(
                 prev_energy is not None
                 and abs(micro_energy - prev_energy) < self.conv_tol
+            )
+            if stationary_keyframe or (
+                energy_converged
                 and micro_gnorm < self.conv_tol_grad_relaxed
+                and micro_ci_relaxed
             ):
                 self.converged = True
                 break
@@ -5306,6 +6059,15 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 self._try_active_restarts(initial_mo_coeff, min(finite_energies))
             if self.converged:
                 return self
+            self.mo_coeff = np.array(mo_coeff, copy=True)
+            self.casci = self._make_casci(
+                self.mo_coeff,
+                nstates=self.nstates,
+                ci0=ci_guess,
+            )
+            self.ci = self.casci.ci
+            self.e_tot = self.casci.e_tot
+            self.ncore = self.casci.ncore
             raise RuntimeError(
                 self._format_stall_message(
                     "Max macro steps reached before the second-order CASSCF "
@@ -5314,13 +6076,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             )
 
         self.mo_coeff = mo_coeff
-        # Rebuild final CASCI on the actual reference object for a consistent
-        # public-facing result container.
-        self.casci = self._make_casci(
-            mo_coeff,
-            nstates=self.nstates,
-            ci0=ci_guess,
-        )
+        if stationary_keyframe:
+            # The exact keyframe already represents the final orbitals. Reusing
+            # it avoids an otherwise identical public-result diagonalization.
+            self.casci = micro_mc
+            self.casci.mo_coeff = np.array(mo_coeff, copy=True)
+        else:
+            self.casci = self._make_casci(
+                mo_coeff,
+                nstates=self.nstates,
+                ci0=ci_guess,
+            )
         self.ci = self.casci.ci
         self.e_tot = self.casci.e_tot
         self.ncore = self.casci.ncore

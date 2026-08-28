@@ -81,8 +81,10 @@ contextual_fill_local_table_cache_misses = None
 contextual_partition_pending_rows = None
 packed_left_boundary_advance_payload = None
 packed_left_identity_boundary_advance_payload = None
+packed_left_identity_boundary_advance_payload_many = None
 packed_right_boundary_advance_payload = None
 packed_right_identity_boundary_advance_payload = None
+packed_right_identity_boundary_advance_payload_many = None
 contextual_left_finalize_batch = None
 contextual_right_finalize_batch = None
 contextual_left_prepare_local_table_batch = None
@@ -91,6 +93,7 @@ contextual_left_finalize_prebuilt_batch = None
 contextual_right_finalize_prebuilt_batch = None
 build_spatial_qchem_family_entries = None
 build_spatial_qchem_family_term_maps = None
+build_spatial_same_side_p_pattern_spans = None
 build_spatial_qchem_family_mpos = None
 build_spatial_block2_carrier_mpo = None
 build_spatial_qchem_block2_setup = None
@@ -174,6 +177,7 @@ def _compile_extension():
             sys.version.split()[0],
             sysconfig.get_config_var("CXX") or "",
             os.environ.get("CXX", ""),
+            "mcpu=native" if sys.platform == "darwin" else "generic-cpu",
         ]
     )
     force_rebuild = _enabled(
@@ -206,6 +210,7 @@ def _compile_extension():
     cmd.extend(
         [
             "-O3",
+            *(["-mcpu=native"] if sys.platform == "darwin" else []),
             "-std=c++17",
             "-shared",
             "-fPIC",
@@ -322,8 +327,10 @@ def _initialize():
     global contextual_partition_pending_rows
     global packed_left_boundary_advance_payload
     global packed_left_identity_boundary_advance_payload
+    global packed_left_identity_boundary_advance_payload_many
     global packed_right_boundary_advance_payload
     global packed_right_identity_boundary_advance_payload
+    global packed_right_identity_boundary_advance_payload_many
     global contextual_left_finalize_batch
     global contextual_right_finalize_batch
     global contextual_left_prepare_local_table_batch
@@ -332,6 +339,7 @@ def _initialize():
     global contextual_right_finalize_prebuilt_batch
     global build_spatial_qchem_family_entries
     global build_spatial_qchem_family_term_maps
+    global build_spatial_same_side_p_pattern_spans
     global build_spatial_qchem_family_mpos
     global build_spatial_block2_carrier_mpo
     global build_spatial_qchem_block2_setup
@@ -340,9 +348,31 @@ def _initialize():
 
     if _disabled(os.environ.get("PYQED_MPS_DISABLE_CPP_DAVIDSON", "0")):
         return
-    try:
-        from . import _cpp_davidson as module
-    except Exception:
+    module = None
+    source = Path(__file__).with_name("davidson.cpp")
+    extension_spec = importlib.util.find_spec("pyqed.mps._cpp_davidson")
+    extension_path = (
+        None
+        if extension_spec is None or extension_spec.origin is None
+        else Path(extension_spec.origin)
+    )
+    force_rebuild = _enabled(
+        os.environ.get("PYQED_MPS_FORCE_CPP_DAVIDSON_REBUILD", "0")
+    )
+    stale_extension = bool(
+        source.exists()
+        and extension_path is not None
+        and extension_path.exists()
+        and source.stat().st_mtime_ns > extension_path.stat().st_mtime_ns
+    )
+    if force_rebuild or stale_extension:
+        module = _compile_extension()
+    if module is None:
+        try:
+            from . import _cpp_davidson as module
+        except Exception:
+            module = None
+    if module is None:
         if not _enabled(os.environ.get("PYQED_MPS_AUTO_CPP_DAVIDSON", "1")):
             CPP_DAVIDSON_BUILD_ERROR = "auto build disabled"
             return
@@ -587,6 +617,11 @@ def _initialize():
         "packed_left_identity_boundary_advance_payload",
         None,
     )
+    packed_left_identity_boundary_advance_payload_many = getattr(
+        module,
+        "packed_left_identity_boundary_advance_payload_many",
+        None,
+    )
     packed_right_boundary_advance_payload = getattr(
         module,
         "packed_right_boundary_advance_payload",
@@ -595,6 +630,11 @@ def _initialize():
     packed_right_identity_boundary_advance_payload = getattr(
         module,
         "packed_right_identity_boundary_advance_payload",
+        None,
+    )
+    packed_right_identity_boundary_advance_payload_many = getattr(
+        module,
+        "packed_right_identity_boundary_advance_payload_many",
         None,
     )
     contextual_left_finalize_batch = getattr(
@@ -635,6 +675,11 @@ def _initialize():
     build_spatial_qchem_family_term_maps = getattr(
         module,
         "build_spatial_qchem_family_term_maps",
+        None,
+    )
+    build_spatial_same_side_p_pattern_spans = getattr(
+        module,
+        "build_spatial_same_side_p_pattern_spans",
         None,
     )
     build_spatial_qchem_family_mpos = getattr(

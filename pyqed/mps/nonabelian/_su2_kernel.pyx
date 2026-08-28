@@ -337,6 +337,9 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
     cdef cppclass CppBoundaryBufferHandle "pyqed::su2::BoundaryBufferHandle":
         pass
 
+    cdef cppclass CppComplexBoundaryBufferHandle "pyqed::su2::ComplexBoundaryBufferHandle":
+        pass
+
     const double* boundary_buffer_data(
         const CppBoundaryBufferHandle* handle,
     ) noexcept
@@ -345,6 +348,15 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
     ) noexcept
     void release_boundary_buffer(
         CppBoundaryBufferHandle* handle,
+    ) noexcept
+    const cpp_complex[double]* complex_boundary_buffer_data(
+        const CppComplexBoundaryBufferHandle* handle,
+    ) noexcept
+    size_t complex_boundary_buffer_size(
+        const CppComplexBoundaryBufferHandle* handle,
+    ) noexcept
+    void release_complex_boundary_buffer(
+        CppComplexBoundaryBufferHandle* handle,
     ) noexcept
 
     cdef cppclass CppFamilyData "pyqed::su2::FamilyData":
@@ -444,6 +456,14 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             size_t n_output,
         ) except +
         size_t memory_bytes() noexcept
+        void update_h1(const double* h1, size_t n_values) except +
+        void update_integrals(
+            const double* h1,
+            size_t n_h1_values,
+            const double* eri,
+            size_t n_eri_values,
+            double ecore,
+        ) except +
         void family_partition_counts(
             int family_id,
             cpp_bool left,
@@ -574,6 +594,22 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         uint64_t topology_revision
         uint64_t numeric_revision
 
+    cdef cppclass CppSpatialNPDMResult "pyqed::su2::SpatialNPDMResult":
+        vector[double] rdm1
+        vector[double] rdm2
+        double norm
+        size_t max_reduced_bond_dimension
+        size_t max_component_bond_dimension
+        size_t max_operator_channels
+        int32_t max_operator_two_j
+        uint64_t string_contractions
+        cpp_bool spin_rotation_reduction
+        cpp_bool magnetic_component_expansion
+        double setup_seconds
+        double environment_seconds
+        double rdm1_seconds
+        double rdm2_seconds
+
     cdef cppclass CppMovingEnvironment "pyqed::su2::MovingEnvironment":
         CppMovingEnvironment(const CppSystem* system) except +
         cpp_bool install_boundary(
@@ -638,6 +674,50 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             const int64_t* ket_shapes,
             size_t n_ket_shapes,
             const double* mpo_values,
+            size_t n_mpo_values,
+            const int64_t* mpo_offsets,
+            size_t n_mpo_offsets,
+            const int64_t* mpo_shape_offsets,
+            size_t n_mpo_shape_offsets,
+            const int64_t* mpo_shapes,
+            size_t n_mpo_shapes,
+            const int64_t* output_offsets,
+            size_t n_output_offsets,
+            const int64_t* output_shape_offsets,
+            size_t n_output_shape_offsets,
+            const int64_t* output_shapes,
+            size_t n_output_shapes,
+            const int64_t* output_labels,
+            size_t n_output_labels,
+            uint64_t topology_revision,
+            uint64_t numeric_revision,
+            const double* route_coefficients,
+            cpp_bool metric_boundary,
+        ) except +
+        cpp_bool advance_boundary_complex(
+            const string& side,
+            int64_t parent_bond,
+            int64_t child_bond,
+            cpp_bool left,
+            const int64_t* routes,
+            size_t n_routes,
+            const cpp_complex[double]* bra_values,
+            size_t n_bra_values,
+            const int64_t* bra_offsets,
+            size_t n_bra_offsets,
+            const int64_t* bra_shape_offsets,
+            size_t n_bra_shape_offsets,
+            const int64_t* bra_shapes,
+            size_t n_bra_shapes,
+            const cpp_complex[double]* ket_values,
+            size_t n_ket_values,
+            const int64_t* ket_offsets,
+            size_t n_ket_offsets,
+            const int64_t* ket_shape_offsets,
+            size_t n_ket_shape_offsets,
+            const int64_t* ket_shapes,
+            size_t n_ket_shapes,
+            const cpp_complex[double]* mpo_values,
             size_t n_mpo_values,
             const int64_t* mpo_offsets,
             size_t n_mpo_offsets,
@@ -813,6 +893,7 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             cpp_bool left,
             cpp_bool dual_right_basis,
         ) except +
+        void refresh_normal_complementary_numerics() except +
         size_t boundary_value_count(
             const string& side,
             int64_t bond,
@@ -840,6 +921,11 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         CppBoundaryBufferHandle* retain_metric_boundary_buffer(
             const string& side,
             int64_t bond,
+        ) except +
+        CppComplexBoundaryBufferHandle* retain_complex_boundary_buffer(
+            const string& side,
+            int64_t bond,
+            cpp_bool metric_boundary,
         ) except +
         cpp_bool install_local_operator(
             const string& key,
@@ -1303,6 +1389,12 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             cpp_bool accept_unconverged,
         ) except +
         vector[CppOwnedSplitSiteExport] export_owned_split_sites() except +
+        CppSpatialNPDMResult spatial_npdm(
+            cpp_bool spin_rotation_reduction,
+        ) except +
+        CppSpatialNPDMResult spatial_npdm_component_reference(
+            cpp_bool spin_rotation_reduction,
+        ) except +
         void release_workspaces() except +
         size_t execute_half_sweep(
             HalfSweepBondExecutor executor,
@@ -1440,6 +1532,9 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         size_t contextual_core_cache_bytes() noexcept
         uint64_t contextual_core_cache_hits() noexcept
         uint64_t contextual_core_reuse_hits() noexcept
+        size_t contextual_route_skeleton_count() noexcept
+        size_t contextual_route_skeleton_bytes() noexcept
+        uint64_t contextual_route_skeleton_hits() noexcept
         double contextual_route_match_seconds() noexcept
         double contextual_route_activation_seconds() noexcept
         double contextual_core_build_seconds() noexcept
@@ -1553,6 +1648,8 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         double reduced_contextual_fallback_boundary_norm() noexcept
         double reduced_contextual_build_seconds() noexcept
         double reduced_contextual_numeric_refresh_seconds() noexcept
+        double reduced_contextual_boundary_refresh_seconds() noexcept
+        double reduced_contextual_scale_refresh_seconds() noexcept
         double reduced_contextual_execution_refresh_seconds() noexcept
         double reduced_contextual_diagonal_seconds() noexcept
         double reduced_contextual_matvec_seconds() noexcept
@@ -1664,6 +1761,20 @@ cdef class _SU2BoundaryBuffer:
             self._handle = NULL
 
 
+cdef class _SU2ComplexBoundaryBuffer:
+    """Lifetime owner for a complex NumPy view of a C++ boundary arena."""
+
+    cdef CppComplexBoundaryBufferHandle* _handle
+
+    def __cinit__(self):
+        self._handle = NULL
+
+    def __dealloc__(self):
+        if self._handle != NULL:
+            release_complex_boundary_buffer(self._handle)
+            self._handle = NULL
+
+
 cdef class SU2MovingEnvironment:
     """Persistent C++ owner for active integrals and packed SU(2) sweep state."""
 
@@ -1676,6 +1787,9 @@ cdef class SU2MovingEnvironment:
     cdef object _factorized_metric_owners
     cdef object _factor_route_key
     cdef object _factor_route_revision
+    cdef object _h1_values
+    cdef object _eri_values
+    cdef double _ecore_value
     cdef dict _split_site_keys
     cdef dict _split_site_key_indices
     cdef dict _split_site_topologies
@@ -1708,6 +1822,9 @@ cdef class SU2MovingEnvironment:
         self._factorized_metric_owners = None
         self._factor_route_key = None
         self._factor_route_revision = None
+        self._h1_values = None
+        self._eri_values = None
+        self._ecore_value = ecore
         self._split_site_keys = {}
         self._split_site_key_indices = {}
         self._split_site_topologies = {}
@@ -1745,6 +1862,8 @@ cdef class SU2MovingEnvironment:
             cutoff,
             <cpp_bool>include_half,
         )
+        self._h1_values = np.asarray(h1_arr).copy()
+        self._eri_values = np.asarray(eri_arr).copy()
         self._engine = new CppMovingEnvironment(self._system)
 
     def __dealloc__(self):
@@ -1783,6 +1902,151 @@ cdef class SU2MovingEnvironment:
             ),
             "memory_bytes": int(self._system.memory_bytes()),
         }
+
+    def update_h1(self, object h1):
+        """Replace one-body integrals and invalidate numerical sweep caches."""
+
+        cdef cnp.ndarray[cnp.double_t, ndim=2, mode="c"] h1_arr
+        cdef size_t n_sites = self._system.n_sites()
+        if np.iscomplexobj(h1):
+            raise TypeError("SU(2) one-body updates currently require real integrals.")
+        h1_arr = np.ascontiguousarray(h1, dtype=np.float64)
+        if h1_arr.shape[0] != n_sites or h1_arr.shape[1] != n_sites:
+            raise ValueError("Updated h1 must match the active-orbital dimension.")
+        if self._h1_values is not None and np.array_equal(h1_arr, self._h1_values):
+            return False
+        self._system.update_h1(
+            <const double*>cnp.PyArray_DATA(h1_arr),
+            <size_t>h1_arr.size,
+        )
+        self._h1_values = np.asarray(h1_arr).copy()
+        self._engine.refresh_normal_complementary_numerics()
+        self._engine.clear_boundaries()
+        self._engine.clear_local_operator()
+        self._engine.clear_factor_route_projection()
+        self._boundary_value_owners.clear()
+        self._factor_route_projection_owners = None
+        return True
+
+    def update_integrals(self, object h1, object eri, double ecore=0.0):
+        """Replace active integrals while retaining the C++ system owner."""
+
+        cdef cnp.ndarray[cnp.double_t, ndim=2, mode="c"] h1_arr
+        cdef cnp.ndarray[cnp.double_t, ndim=4, mode="c"] eri_arr
+        cdef size_t n_sites = self._system.n_sites()
+        if np.iscomplexobj(h1) or np.iscomplexobj(eri):
+            raise TypeError("SU(2) integral updates currently require real integrals.")
+        h1_arr = np.ascontiguousarray(h1, dtype=np.float64)
+        eri_arr = np.ascontiguousarray(eri, dtype=np.float64)
+        if h1_arr.shape[0] != n_sites or h1_arr.shape[1] != n_sites:
+            raise ValueError("Updated h1 must match the active-orbital dimension.")
+        if (
+            eri_arr.shape[0] != n_sites
+            or eri_arr.shape[1] != n_sites
+            or eri_arr.shape[2] != n_sites
+            or eri_arr.shape[3] != n_sites
+        ):
+            raise ValueError("Updated eri must have shape (n_sites,)*4.")
+        if (
+            self._h1_values is not None
+            and self._eri_values is not None
+            and np.array_equal(h1_arr, self._h1_values)
+            and np.array_equal(eri_arr, self._eri_values)
+            and ecore == self._ecore_value
+        ):
+            return False
+        self._system.update_integrals(
+            <const double*>cnp.PyArray_DATA(h1_arr),
+            <size_t>h1_arr.size,
+            <const double*>cnp.PyArray_DATA(eri_arr),
+            <size_t>eri_arr.size,
+            ecore,
+        )
+        self._h1_values = np.asarray(h1_arr).copy()
+        self._eri_values = np.asarray(eri_arr).copy()
+        self._ecore_value = ecore
+        self._engine.refresh_normal_complementary_numerics()
+        self._engine.clear_boundaries()
+        self._engine.clear_local_operator()
+        self._engine.clear_factor_route_projection()
+        self._boundary_value_owners.clear()
+        self._factor_route_projection_owners = None
+        return True
+
+    def refresh_contextual_cores(self, object factors):
+        """Refresh Python-owned contextual core arrays from the C++ cache."""
+
+        cdef object factor
+        cdef object cache
+        cdef object key
+        cdef object cached
+        cdef object block_key
+        cdef long long site
+        cdef bint left
+        cdef bint dual_right_basis
+        cdef int boundary_bra_two_j
+        cdef int boundary_ket_two_j
+        cdef int next_bra_two_j
+        cdef int next_ket_two_j
+        cdef vector[CppContextualCoreBlock] blocks
+        cdef CppContextualCoreBlock block
+        cdef cnp.ndarray[cnp.double_t, ndim=4, mode="c"] target
+        cdef Py_ssize_t index
+        for factor in factors:
+            cache = getattr(factor, "_contextual_angular_core_cache", None)
+            if not cache:
+                continue
+            site = int(getattr(factor, "normal_complementary_site", -1))
+            if site < 0:
+                return False
+            for key, cached in tuple(cache.items()):
+                if len(key) != 10 or not isinstance(cached, dict):
+                    return False
+                left = bool(key[0])
+                dual_right_basis = bool(key[1])
+                boundary_bra_two_j = int(key[2] if left else key[8])
+                boundary_ket_two_j = int(key[3] if left else key[9])
+                next_bra_two_j = int(key[8] if left else key[2])
+                next_ket_two_j = int(key[9] if left else key[3])
+                blocks = self._engine.contextual_core(
+                    <int64_t>site,
+                    <int64_t>int(key[4]),
+                    <int64_t>int(key[6]),
+                    <int32_t>boundary_bra_two_j,
+                    <int32_t>boundary_ket_two_j,
+                    <int32_t>int(key[5]),
+                    <int32_t>int(key[7]),
+                    <int32_t>next_bra_two_j,
+                    <int32_t>next_ket_two_j,
+                    <cpp_bool>left,
+                    <cpp_bool>dual_right_basis,
+                )
+                if blocks.size() != len(cached):
+                    return False
+                for index in range(blocks.size()):
+                    block = blocks[index]
+                    block_key = (
+                        int(block.left_channel),
+                        int(block.right_channel),
+                    )
+                    if block_key not in cached:
+                        return False
+                    target = cached[block_key]
+                    if (
+                        target.shape[0] != block.rows
+                        or target.shape[1] != block.cols
+                        or target.shape[2] != 1
+                        or target.shape[3] != 1
+                        or block.values.size()
+                        != <size_t>(block.rows * block.cols)
+                    ):
+                        return False
+                    memcpy(
+                        <void*>cnp.PyArray_DATA(target),
+                        <const void*>block.values.data(),
+                        block.values.size() * sizeof(double),
+                    )
+        return True
 
     def normal_complementary_plan(self, long long site):
         """Return one C++-owned SU(2) NC transition table for diagnostics.
@@ -2366,6 +2630,153 @@ cdef class SU2MovingEnvironment:
         )
         cnp.set_array_base(result, buffer_owner)
         self._boundary_value_owners.pop(owner_key, None)
+        return result, bool(same_topology)
+
+    def advance_boundary_complex(
+        self,
+        object side,
+        long long parent_bond,
+        long long child_bond,
+        object routes,
+        object bra_data,
+        object bra_offsets,
+        object bra_shape_offsets,
+        object bra_shapes,
+        object ket_data,
+        object ket_offsets,
+        object ket_shape_offsets,
+        object ket_shapes,
+        object mpo_data,
+        object mpo_offsets,
+        object mpo_shape_offsets,
+        object mpo_shapes,
+        object output_offsets,
+        object output_shape_offsets,
+        object output_shapes,
+        object output_labels,
+        unsigned long long topology_revision,
+        unsigned long long numeric_revision,
+        bint metric_boundary=False,
+        object route_coefficients=None,
+    ):
+        """Advance one complex reduced boundary in the owned C++ arena."""
+
+        cdef str normalized_side = str(side).lower()
+        cdef string side_name = normalized_side.encode()
+        cdef cnp.ndarray[cnp.int64_t, ndim=2, mode="c"] route_arr
+        cdef cnp.ndarray[cnp.double_t, ndim=1, mode="c"] coefficient_arr
+        cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] bra_data_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] bra_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] bra_shape_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] bra_shape_arr
+        cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] ket_data_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] ket_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] ket_shape_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] ket_shape_arr
+        cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] mpo_data_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] mpo_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] mpo_shape_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] mpo_shape_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] output_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] output_shape_offset_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] output_shape_arr
+        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] output_label_arr
+        cdef CppComplexBoundaryBufferHandle* buffer_handle = NULL
+        cdef _SU2ComplexBoundaryBuffer buffer_owner
+        cdef cnp.ndarray result
+        cdef cnp.npy_intp result_shape[1]
+        cdef size_t n_values
+        cdef bint same_topology
+
+        if normalized_side not in {"left", "right"}:
+            raise ValueError("side must be 'left' or 'right'.")
+        route_arr = np.ascontiguousarray(routes, dtype=np.int64).reshape((-1, 5))
+        coefficient_arr = np.ascontiguousarray(
+            np.ones(route_arr.shape[0], dtype=np.float64)
+            if route_coefficients is None else route_coefficients,
+            dtype=np.float64,
+        ).reshape(-1)
+        if coefficient_arr.size != route_arr.shape[0]:
+            raise ValueError("route_coefficients must match the route count.")
+        bra_data_arr = np.ascontiguousarray(bra_data, dtype=np.complex128).reshape(-1)
+        bra_offset_arr = np.ascontiguousarray(bra_offsets, dtype=np.int64).reshape(-1)
+        bra_shape_offset_arr = np.ascontiguousarray(bra_shape_offsets, dtype=np.int64).reshape(-1)
+        bra_shape_arr = np.ascontiguousarray(bra_shapes, dtype=np.int64).reshape(-1)
+        ket_data_arr = np.ascontiguousarray(ket_data, dtype=np.complex128).reshape(-1)
+        ket_offset_arr = np.ascontiguousarray(ket_offsets, dtype=np.int64).reshape(-1)
+        ket_shape_offset_arr = np.ascontiguousarray(ket_shape_offsets, dtype=np.int64).reshape(-1)
+        ket_shape_arr = np.ascontiguousarray(ket_shapes, dtype=np.int64).reshape(-1)
+        mpo_data_arr = np.ascontiguousarray(mpo_data, dtype=np.complex128).reshape(-1)
+        mpo_offset_arr = np.ascontiguousarray(mpo_offsets, dtype=np.int64).reshape(-1)
+        mpo_shape_offset_arr = np.ascontiguousarray(mpo_shape_offsets, dtype=np.int64).reshape(-1)
+        mpo_shape_arr = np.ascontiguousarray(mpo_shapes, dtype=np.int64).reshape(-1)
+        output_offset_arr = np.ascontiguousarray(output_offsets, dtype=np.int64).reshape(-1)
+        output_shape_offset_arr = np.ascontiguousarray(output_shape_offsets, dtype=np.int64).reshape(-1)
+        output_shape_arr = np.ascontiguousarray(output_shapes, dtype=np.int64).reshape(-1)
+        output_label_arr = np.ascontiguousarray(output_labels, dtype=np.int64).reshape(-1)
+
+        same_topology = self._engine.advance_boundary_complex(
+            side_name,
+            <int64_t>parent_bond,
+            <int64_t>child_bond,
+            <cpp_bool>(normalized_side == "left"),
+            <const int64_t*>cnp.PyArray_DATA(route_arr),
+            <size_t>route_arr.shape[0],
+            <const cpp_complex[double]*>cnp.PyArray_DATA(bra_data_arr),
+            <size_t>bra_data_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(bra_offset_arr),
+            <size_t>bra_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(bra_shape_offset_arr),
+            <size_t>bra_shape_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(bra_shape_arr),
+            <size_t>bra_shape_arr.size,
+            <const cpp_complex[double]*>cnp.PyArray_DATA(ket_data_arr),
+            <size_t>ket_data_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(ket_offset_arr),
+            <size_t>ket_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(ket_shape_offset_arr),
+            <size_t>ket_shape_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(ket_shape_arr),
+            <size_t>ket_shape_arr.size,
+            <const cpp_complex[double]*>cnp.PyArray_DATA(mpo_data_arr),
+            <size_t>mpo_data_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(mpo_offset_arr),
+            <size_t>mpo_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(mpo_shape_offset_arr),
+            <size_t>mpo_shape_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(mpo_shape_arr),
+            <size_t>mpo_shape_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(output_offset_arr),
+            <size_t>output_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(output_shape_offset_arr),
+            <size_t>output_shape_offset_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(output_shape_arr),
+            <size_t>output_shape_arr.size,
+            <const int64_t*>cnp.PyArray_DATA(output_label_arr),
+            <size_t>output_label_arr.size,
+            <uint64_t>topology_revision,
+            <uint64_t>numeric_revision,
+            <const double*>cnp.PyArray_DATA(coefficient_arr),
+            <cpp_bool>metric_boundary,
+        )
+        buffer_handle = self._engine.retain_complex_boundary_buffer(
+            side_name, <int64_t>child_bond, <cpp_bool>metric_boundary,
+        )
+        n_values = complex_boundary_buffer_size(buffer_handle)
+        if n_values != <size_t>output_offset_arr[output_offset_arr.size - 1]:
+            release_complex_boundary_buffer(buffer_handle)
+            raise RuntimeError("C++ complex boundary arena has an inconsistent size.")
+        buffer_owner = _SU2ComplexBoundaryBuffer.__new__(_SU2ComplexBoundaryBuffer)
+        buffer_owner._handle = buffer_handle
+        buffer_handle = NULL
+        result_shape[0] = <cnp.npy_intp>n_values
+        result = cnp.PyArray_SimpleNewFromData(
+            1,
+            result_shape,
+            cnp.NPY_COMPLEX128,
+            <void*>complex_boundary_buffer_data(buffer_owner._handle),
+        )
+        cnp.set_array_base(result, buffer_owner)
         return result, bool(same_topology)
 
     def advance_normal_complementary_boundary(
@@ -5859,6 +6270,69 @@ cdef class SU2MovingEnvironment:
             )
         return output
 
+    def spatial_npdm(
+        self,
+        object sites,
+        bint spin_rotation_reduction=False,
+        bint component_reference=False,
+    ):
+        """Contract spatial 1-/2-NPDMs from the C++-owned reduced MPS."""
+
+        cdef CppSpatialNPDMResult result
+        cdef size_t n_sites = self._system.n_sites()
+        cdef cnp.ndarray[cnp.double_t, ndim=2, mode="c"] rdm1
+        cdef cnp.ndarray[cnp.double_t, ndim=4, mode="c"] rdm2
+        self.install_mps(sites)
+        if component_reference:
+            result = self._engine.spatial_npdm_component_reference(
+                <cpp_bool>spin_rotation_reduction,
+            )
+        else:
+            result = self._engine.spatial_npdm(
+                <cpp_bool>spin_rotation_reduction,
+            )
+        if (
+            result.rdm1.size() != n_sites * n_sites
+            or result.rdm2.size() != n_sites * n_sites * n_sites * n_sites
+        ):
+            raise RuntimeError("C++ spatial NPDM returned inconsistent tensor sizes.")
+        rdm1 = np.empty((n_sites, n_sites), dtype=np.float64)
+        rdm2 = np.empty((n_sites, n_sites, n_sites, n_sites), dtype=np.float64)
+        if result.rdm1.size():
+            memcpy(
+                <void*>cnp.PyArray_DATA(rdm1),
+                <const void*>result.rdm1.data(),
+                result.rdm1.size() * sizeof(double),
+            )
+        if result.rdm2.size():
+            memcpy(
+                <void*>cnp.PyArray_DATA(rdm2),
+                <const void*>result.rdm2.data(),
+                result.rdm2.size() * sizeof(double),
+            )
+        return {
+            "rdm1": rdm1,
+            "rdm2": rdm2,
+            "norm": float(result.norm),
+            "max_reduced_bond_dimension": int(
+                result.max_reduced_bond_dimension
+            ),
+            "max_component_bond_dimension": int(
+                result.max_component_bond_dimension
+            ),
+            "max_operator_channels": int(result.max_operator_channels),
+            "max_operator_two_j": int(result.max_operator_two_j),
+            "string_contractions": int(result.string_contractions),
+            "spin_rotation_reduction": bool(result.spin_rotation_reduction),
+            "magnetic_component_expansion": bool(
+                result.magnetic_component_expansion
+            ),
+            "setup_seconds": float(result.setup_seconds),
+            "environment_seconds": float(result.environment_seconds),
+            "rdm1_seconds": float(result.rdm1_seconds),
+            "rdm2_seconds": float(result.rdm2_seconds),
+        }
+
     def export_owned_split_sites(self):
         """Materialize the final C++-owned MPS once at solver completion."""
 
@@ -6159,6 +6633,15 @@ cdef class SU2MovingEnvironment:
             ),
             "contextual_core_reuse_hits": int(
                 self._engine.contextual_core_reuse_hits()
+            ),
+            "contextual_route_skeleton_count": int(
+                self._engine.contextual_route_skeleton_count()
+            ),
+            "contextual_route_skeleton_bytes": int(
+                self._engine.contextual_route_skeleton_bytes()
+            ),
+            "contextual_route_skeleton_hits": int(
+                self._engine.contextual_route_skeleton_hits()
             ),
             "contextual_route_match_seconds": float(
                 self._engine.contextual_route_match_seconds()
@@ -6608,6 +7091,12 @@ cdef class SU2MovingEnvironment:
             ),
             "reduced_contextual_numeric_refresh_seconds": float(
                 self._engine.reduced_contextual_numeric_refresh_seconds()
+            ),
+            "reduced_contextual_boundary_refresh_seconds": float(
+                self._engine.reduced_contextual_boundary_refresh_seconds()
+            ),
+            "reduced_contextual_scale_refresh_seconds": float(
+                self._engine.reduced_contextual_scale_refresh_seconds()
             ),
             "reduced_contextual_execution_refresh_seconds": float(
                 self._engine.reduced_contextual_execution_refresh_seconds()

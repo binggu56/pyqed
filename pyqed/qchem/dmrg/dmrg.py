@@ -14,6 +14,7 @@ Quantum Chemitry DMRG with U(1) particle number Symmetry Support
 import numpy as np
 import scipy.constants as const
 import hashlib
+import math
 import operator
 
 from scipy.sparse.linalg import eigsh
@@ -27,8 +28,16 @@ from pyqed.davidson import davidson
 
 from pyqed import au2ev, au2angstrom
 
-from pyqed.qchem.ci.fci import SpinOuterProduct, givenΛgetB
-from pyqed.qchem.mcscf.casci import h1e_for_cas
+from pyqed.qchem.ci.fci import (
+    SpinOuterProduct,
+    givenΛgetB,
+    get_fci_string_basis,
+)
+from pyqed.qchem.mcscf.casci import (
+    h1e_for_cas,
+    make_rdm1 as _make_ci_rdm1,
+    make_rdm2 as _make_ci_rdm2,
+)
 
 
 _GLOBAL_HAMILTONIAN_MPO_CACHE = {}
@@ -154,6 +163,10 @@ from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.mps.autompo.automatic_mpo_helper import (
+    construct_symbolic_mpo,
+    symbolic_mo_to_numeric_mo,
+)
 from pyqed.qchem.dmrg.spatial_terms import (
     BasisSpatialFermion,
     accumulate_spatial_jw_term as _accumulate_spatial_jw_term,
@@ -231,7 +244,9 @@ def _normalize_site(site):
 
 
 def _normalize_integral_backend(integral_backend):
-    backend = str(integral_backend or "auto").lower().replace("-", "_")
+    if integral_backend is None:
+        return None
+    backend = str(integral_backend).lower().replace("-", "_")
     aliases = {
         "cd": "cholesky",
         "chol": "cholesky",
@@ -242,9 +257,14 @@ def _normalize_integral_backend(integral_backend):
         "df": "ri",
     }
     backend = aliases.get(backend, backend)
-    if backend not in {"auto", "dense", "ri", "cholesky"}:
+    if backend == "auto":
         raise ValueError(
-            "integral_backend must be 'auto', 'dense', 'ri', or 'cholesky' "
+            "Omit integral_backend to infer the representation from the "
+            "mean-field object; 'auto' is not a backend."
+        )
+    if backend not in {"dense", "ri", "cholesky"}:
+        raise ValueError(
+            "integral_backend must be 'dense', 'ri', or 'cholesky' "
             f"(got {integral_backend!r})."
         )
     return backend
@@ -269,6 +289,18 @@ def _normalize_spatial_abelian_symbolic_algo(algo):
 
 def _normalize_spatial_family_environment_backend(backend):
     key = str(backend or "block2_table").strip().lower().replace("-", "_")
+    retired_generator_tables = {
+        "generator_table",
+        "native_table",
+        "block2_generator_table",
+        "renormalized_generator_table",
+    }
+    if key in retired_generator_tables:
+        raise ValueError(
+            "generator-table spatial environments were retired because they "
+            "are not variationally exact; use 'none' for the compiled symbolic "
+            "MPO or 'block2_table' for the native family-MPO path."
+        )
     aliases = {
         "off": "none",
         "none": "none",
@@ -283,10 +315,6 @@ def _normalize_spatial_family_environment_backend(backend):
         "operator_table": "block2_table",
         "renormalized_table": "block2_table",
         "renormalized_operator_table": "block2_table",
-        "generator_table": "generator_table",
-        "native_table": "generator_table",
-        "block2_generator_table": "generator_table",
-        "renormalized_generator_table": "generator_table",
         "block2_adaptive": "block2_adaptive",
         "adaptive_block2": "block2_adaptive",
         "block2_native": "block2_native",
@@ -307,7 +335,7 @@ def _normalize_spatial_family_environment_backend(backend):
     if key not in aliases:
         raise ValueError(
             "spatial_family_environment_backend must be 'block2', "
-            "'block2_table', 'generator_table', 'block2_native', 'none', 'autompo', "
+            "'block2_table', 'block2_native', 'none', 'autompo', "
             "'direct_terms', or 'generator_terms'."
         )
     return aliases[key]
@@ -355,6 +383,41 @@ def _mf_has_dense_eris(mf):
         or getattr(mol, "eri", None) is not None
         or getattr(mol, "eri_s4", None) is not None
         or getattr(mol, "eri_s8", None) is not None
+    )
+
+
+def _factorized_integral_backend(mf):
+    """Infer RI versus Cholesky provenance for mean-field pair factors."""
+
+    mol = getattr(mf, "mol", None)
+    representation = getattr(
+        mol,
+        "builtin_resolved_eri_representation",
+        getattr(mol, "native_resolved_eri_representation", None),
+    )
+    representation = str(representation or "").lower()
+    if representation in {"ri", "dense+ri"}:
+        return "ri"
+    return "cholesky"
+
+
+def _infer_integral_backend(mf, override=None):
+    """Resolve the active-integral representation directly from ``mf``."""
+
+    override = _normalize_integral_backend(override)
+    if override is not None:
+        return override
+    if _mf_has_factorized_eris(mf):
+        return _factorized_integral_backend(mf)
+    if _mf_has_dense_eris(mf):
+        return "dense"
+    if callable(getattr(mf, "active_space_integrals", None)):
+        return None
+    if callable(getattr(mf, "get_eri_mo", None)):
+        return "dense"
+    raise ValueError(
+        "Cannot infer DMRG active integrals from the mean-field object: "
+        "no dense ERIs, pair factors, or active-space integral provider found."
     )
 
 
@@ -530,19 +593,196 @@ def _nonabelian_mps_to_dense_vector(state):
 def _spatial_rdm_dense_mps(state, site_qn_maps=None):
     """Return a standard dense d=4 MPS for spatial-site RDM contractions."""
 
-    if hasattr(state, "sites"):
+    # Standard MPS objects also expose physical-site descriptors through a
+    # ``sites`` attribute.  Their actual Abelian tensors live in ``factors``
+    # and can be expanded one tensor at a time without constructing the full
+    # determinant vector.  Reserve the non-Abelian fallback for state objects
+    # that genuinely do not carry standard MPS factors.
+    if not getattr(state, "factors", None):
         return None
-    if hasattr(state.Bs[0], "qns"):
+    if hasattr(state.factors[0], "qns"):
         from pyqed.mps.mps import symmetric_to_dense
 
         state = symmetric_to_dense(state, site_qn_maps=site_qn_maps)
     else:
         state = state.to_order(["lv", "p", "rv"])
-    if state.Bs[0].shape[1] != 4:
+    if state.factors[0].shape[1] != 4:
         raise NotImplementedError(
-            f"Spatial-site RDM contractions require d=4 sites, got d={state.Bs[0].shape[1]}."
+            f"Spatial-site RDM contractions require d=4 sites, got d={state.factors[0].shape[1]}."
         )
     return state
+
+
+def _fully_reduced_spatial_mps_to_component_mps(state):
+    """Expand SU(2) multiplet legs into a canonical ``d=4`` MPS.
+
+    This is a local Clebsch--Gordan expansion of every reduced site tensor.
+    It enlarges only the MPS bond spaces by the irrep dimensions and never
+    forms a determinant vector or a ``4**L`` occupation tensor.
+    """
+
+    from pyqed.mps.nonabelian.coupling import (
+        clebsch_gordan,
+        ordered_two_m_values,
+    )
+    from pyqed.mps.su2 import SpatialOrbitalSite
+
+    sites = list(getattr(state, "sites", state))
+    if not sites:
+        raise ValueError("Cannot expand an empty fully reduced MPS.")
+
+    canonical_site = SpatialOrbitalSite()
+    physical_indices = {}
+    for sector_index, sector in enumerate(canonical_site.qn):
+        two_ms = ordered_two_m_values(sector.irrep)
+        state_indices = canonical_site.state_index[sector_index]
+        if len(two_ms) != len(state_indices):
+            raise ValueError("Canonical spatial-site SU(2) metadata is inconsistent.")
+        physical_indices[sector] = tuple(int(index) for index in state_indices)
+
+    def axis_layout(tensor, axis):
+        sectors = []
+        for sector in tensor.qns[axis]:
+            if sector not in sectors:
+                sectors.append(sector)
+        layout = {}
+        offset = 0
+        for sector in sectors:
+            multiplicity = tensor.qns[axis].count(sector)
+            width = multiplicity * sector.irrep.dim
+            layout[sector] = (offset, multiplicity, width)
+            offset += width
+        return layout, offset
+
+    factors = []
+    previous_right_signature = None
+    expanded_bonds = []
+    for site_index, tensor in enumerate(sites):
+        if (tensor.metadata or {}).get("physical_basis") != "fully_reduced_su2":
+            raise ValueError("Expected fully reduced SU(2) spatial-site tensors.")
+        left_layout, left_dim = axis_layout(tensor, 0)
+        right_layout, right_dim = axis_layout(tensor, 2)
+        left_signature = tuple(
+            (sector, multiplicity)
+            for sector, (_offset, multiplicity, _width) in left_layout.items()
+        )
+        right_signature = tuple(
+            (sector, multiplicity)
+            for sector, (_offset, multiplicity, _width) in right_layout.items()
+        )
+        if previous_right_signature is not None and left_signature != previous_right_signature:
+            raise ValueError(
+                f"Reduced MPS bond metadata mismatch before site {site_index}."
+            )
+
+        dtype = np.result_type(
+            float,
+            *(np.asarray(block).dtype for block in tensor.data.values()),
+        )
+        dense = np.zeros((left_dim, canonical_site.d, right_dim), dtype=dtype)
+        for (q_left, q_phys, q_right), raw_block in tensor.data.items():
+            block = np.asarray(raw_block)
+            left_offset, left_multiplicity, left_width = left_layout[q_left]
+            right_offset, right_multiplicity, right_width = right_layout[q_right]
+            if block.shape != (left_multiplicity, 1, right_multiplicity):
+                raise ValueError(
+                    "Fully reduced spatial MPS blocks must have one physical "
+                    "multiplicity and match their declared bond multiplicities."
+                )
+            if q_phys not in physical_indices:
+                raise ValueError(f"Unsupported reduced spatial physical sector {q_phys!r}.")
+
+            left_ms = ordered_two_m_values(q_left.irrep)
+            phys_ms = ordered_two_m_values(q_phys.irrep)
+            right_ms = ordered_two_m_values(q_right.irrep)
+            cg = np.empty((len(left_ms), len(phys_ms), len(right_ms)))
+            for left_index, two_m_left in enumerate(left_ms):
+                for phys_index, two_m_phys in enumerate(phys_ms):
+                    for right_index, two_m_right in enumerate(right_ms):
+                        cg[left_index, phys_index, right_index] = clebsch_gordan(
+                            q_left.irrep,
+                            q_phys.irrep,
+                            q_right.irrep,
+                            two_m_left,
+                            two_m_phys,
+                            two_m_right,
+                        )
+            component_block = np.einsum(
+                "ab,lpr->alpbr",
+                block[:, 0, :],
+                cg,
+                optimize=True,
+            ).reshape(left_width, len(phys_ms), right_width)
+            left_slice = slice(left_offset, left_offset + left_width)
+            right_slice = slice(right_offset, right_offset + right_width)
+            dense[left_slice, physical_indices[q_phys], right_slice] += component_block
+
+        factors.append(dense)
+        expanded_bonds.append((left_dim, right_dim))
+        previous_right_signature = right_signature
+
+    if factors[0].shape[0] != 1:
+        raise ValueError("A fully reduced finite MPS must start from the vacuum boundary.")
+    # A reduced non-singlet represents a complete final multiplet. Spin-free
+    # observables are independent of M, so select the first (highest-M)
+    # component without changing any internal bond representation.
+    if factors[-1].shape[2] != 1:
+        factors[-1] = factors[-1][:, :, :1]
+        expanded_bonds[-1] = (expanded_bonds[-1][0], 1)
+
+    component_mps = MPS(factors, labels=["lv", "p", "rv"], bc="finite")
+    component_mps.su2_component_expansion = {
+        "bond_dimensions": tuple(int(right) for _left, right in expanded_bonds[:-1]),
+        "max_bond_dimension": max(
+            [1] + [int(right) for _left, right in expanded_bonds[:-1]]
+        ),
+    }
+    return component_mps
+
+
+def _spatial_mps_to_spin_string_ci(state, ncas, nelecas, spin):
+    """Export a fixed-charge spatial MPS to an alpha/beta string matrix."""
+
+    ncas = int(ncas)
+    nelecas = int(nelecas)
+    spin = int(spin)
+    if (nelecas + spin) % 2 or (nelecas - spin) % 2:
+        raise ValueError("nelecas and spin are incompatible with integer spin populations.")
+    nalpha = (nelecas + spin) // 2
+    nbeta = (nelecas - spin) // 2
+    if not 0 <= nalpha <= ncas or not 0 <= nbeta <= ncas:
+        raise ValueError("Active-space spin populations are outside the orbital range.")
+
+    occupations = np.zeros((2, ncas), dtype=np.int8)
+    occupations[0, :nalpha] = 1
+    occupations[1, :nbeta] = 1
+    basis = get_fci_string_basis(occupations)
+    alpha = np.asarray(basis.alpha_occ, dtype=np.int8)
+    beta = np.asarray(basis.beta_occ, dtype=np.int8)
+
+    dense = _mps_to_dense_vector(state)
+    expected = 4 ** ncas
+    if dense.size != expected:
+        raise ValueError(
+            f"Spatial MPS has {dense.size} amplitudes; expected 4**{ncas}={expected}."
+        )
+    place = np.power(4, np.arange(ncas - 1, -1, -1), dtype=np.int64)
+    local = alpha[:, None, :] + 2 * beta[None, :, :]
+    indices = np.tensordot(local, place, axes=([2], [0])).astype(np.intp, copy=False)
+
+    # The spatial MPS uses interleaved (alpha_p, beta_p) local modes, whereas
+    # FCIStringBasis orders all alpha modes before all beta modes.  Correct the
+    # parity of the occupied-mode permutation without expanding occupations to
+    # the determinant outer product.
+    alpha_right = np.cumsum(alpha[:, ::-1], axis=1)[:, ::-1] - alpha
+    inversions = np.einsum("bi,ai->ab", beta, alpha_right, optimize=True)
+    phase = 1 - 2 * (inversions & 1)
+    coefficients = np.asarray(dense[indices] * phase)
+    norm = float(np.linalg.norm(coefficients))
+    if norm <= 1.0e-14:
+        raise ValueError("The requested charge/Sz sector has zero MPS norm.")
+    coefficients /= norm
+    return basis, coefficients.reshape(-1)
 
 
 def _apply_spatial_annihilation_mps(state, sigma, site):
@@ -587,7 +827,7 @@ def _two_hole_gram_block(two_hole_states, norm, *, zero_tol=1.0e-14):
 def _spatial_fermion_string_expectation_mps(state, op_specs, norm):
     """Contract a spatial-site fermion string directly against a dense MPS."""
 
-    from pyqed.mps.mps import expect_mps
+    from pyqed.mps.mps import _expect_factors
 
     local = SpinHalfFermionOperators()
     eye = np.eye(4, dtype=complex)
@@ -611,7 +851,7 @@ def _spatial_fermion_string_expectation_mps(state, op_specs, norm):
                 factor = eye
             op_i = op_i @ factor
         mpo.append(op_i.reshape(1, 1, 4, 4))
-    return expect_mps(state.Bs, mpo, state.Bs) / norm
+    return _expect_factors(state.factors, mpo, state.factors) / norm
 
 
 class _SpatialNPDMContractions:
@@ -1104,7 +1344,7 @@ def _group_spin_orbital_mpo_pairs(tensor_mpo):
         pair = pair.transpose(0, 3, 1, 4, 2, 5).reshape(up.shape[0], down.shape[1], 4, 4)
         pair = pair[:, :, product_for_spatial, :][:, :, :, product_for_spatial]
         grouped.append(pair)
-    return TensorMPO(grouped, homogenous=False)
+    return TensorMPO(grouped, homogeneous=False)
 
 
 def _build_grouped_spatial_s2_tensor_mpo(ncas, *, cutoff=1e-10):
@@ -1140,11 +1380,73 @@ def _materialize_symbolic_terms(term_map, tol=1e-14):
 
 def _build_tensor_mpo_from_symbolic_terms(basis_sites, term_map, *, cutoff=1e-14, algo="qr"):
     """Build a dense MPO from symbolic terms and wrap it in the high-level MPO class."""
+    canonical_terms = [
+        (str(symbol), tuple(dofs), complex(factor))
+        for (symbol, dofs), factor in term_map.items()
+        if abs(factor) > cutoff
+    ]
+    if canonical_terms and all(
+        len(symbol.split()) == len(dofs) and len(set(dofs)) == len(dofs)
+        for symbol, dofs, _factor in canonical_terms
+    ):
+        qn_size = int(basis_sites[0].sigmaqn.shape[1])
+        primary_ops = []
+        primary_index = {}
+        identity_indices = []
+        for site, basis in enumerate(basis_sites):
+            identity = Op.identity(basis.dof, qn_size=qn_size)
+            identity_indices.append(len(primary_ops))
+            primary_index[(site, "I")] = len(primary_ops)
+            primary_ops.append(identity)
+
+        table = np.empty((len(canonical_terms), len(basis_sites)), dtype=np.uint16)
+        factors = np.empty(len(canonical_terms), dtype=np.complex128)
+        for row_index, (symbol, dofs, factor) in enumerate(canonical_terms):
+            table[row_index] = identity_indices
+            for local_symbol, dof in zip(symbol.split(), dofs):
+                site = int(dof)
+                key = (site, local_symbol)
+                op_index = primary_index.get(key)
+                if op_index is None:
+                    op_index = len(primary_ops)
+                    primary_index[key] = op_index
+                    primary_ops.append(Op(local_symbol, dof))
+                table[row_index, site] = op_index
+            factors[row_index] = factor
+
+        # Different fermionic strings can reduce to the same local operator
+        # row after Jordan-Wigner materialization.  AutoMPO requires unique
+        # rows, so combine their coefficients before factorization.
+        combined = {}
+        for row, factor in zip(table, factors):
+            key = tuple(int(value) for value in row)
+            combined[key] = combined.get(key, 0.0j) + factor
+        combined = [
+            (row, factor)
+            for row, factor in combined.items()
+            if abs(factor) > cutoff
+        ]
+        table = np.asarray([row for row, _factor in combined], dtype=np.uint16)
+        factors = np.asarray(
+            [factor for _row, factor in combined],
+            dtype=np.complex128,
+        )
+
+        symbolic_mpo, _mpoqn, _qntot, _qnidx, _out_ops, _primary = (
+            construct_symbolic_mpo(table, primary_ops, factors, algo=algo)
+        )
+        matrices = [
+            symbolic_mo_to_numeric_mo(basis, symbolic, factors.dtype)
+            for basis, symbolic in zip(basis_sites, symbolic_mpo)
+        ]
+        factors_out = [matrix.transpose(0, 3, 1, 2) for matrix in matrices]
+        return TensorMPO(factors_out, homogeneous=False), len(canonical_terms)
+
     terms = _materialize_symbolic_terms(term_map, tol=cutoff)
     model = Model(basis=basis_sites, ham_terms=terms)
     mpo = Mpo(model, algo=algo)
     factors = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-    return TensorMPO(factors, homogenous=False), len(terms)
+    return TensorMPO(factors, homogeneous=False), len(terms)
 
 
 def _build_one_body_tensor_mpo(basis_sites, spatial_matrix, *, cutoff=1e-14):
@@ -1179,7 +1481,7 @@ def _compress_tensor_mpo(tensor_mpo, chi_max=None):
     for B, (d_up, d_down) in zip(compressed_factors, phys_dims):
         B_transposed = B.transpose(0, 2, 1)
         final_factors.append(B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down))
-    return TensorMPO(final_factors, homogenous=False)
+    return TensorMPO(final_factors, homogeneous=False)
 
 
 def _maybe_compress_tensor_mpo(tensor_mpo, *, chi_max=None, trigger_bond=None):
@@ -1307,7 +1609,7 @@ def _build_low_rank_hamiltonian_tensor_mpo(
             pair_factor,
             cutoff=cutoff,
         )
-        product_mpo = left_mpo.matmul(right_mpo)
+        product_mpo = left_mpo @ right_mpo
         product_mpo = _maybe_compress_tensor_mpo(
             product_mpo,
             chi_max=chi_max,
@@ -1867,16 +2169,20 @@ def graphic(sys_block, env_block, sys_label="l"):
 
 class DMRG(CASCI):
     """
-    ab initio DRMG quantum chemistry calculation
+    Ab initio DMRG quantum-chemistry calculation.
+
+    The production default is the fully reduced spatial-orbital SU(2) solver.
+    Pass ``symmetry=None`` or ``symmetry="sz"`` explicitly to select a dense
+    or Abelian reference path.
     """
     def __init__(self, mf, ncas, nelecas, D=None, init_guess='hf', m_warmup=None,\
                  spin=None, tol=1e-6, low_rank_mpo=False, low_rank_mpo_bond=None,
-                 low_rank_mpo_batch_size=4, verbose=0, site='spin_orbital',\
+                 low_rank_mpo_batch_size=4, verbose=0, site='auto',\
                  orbital_layout=None, spatial_reduced_mpo=None,
-                 symmetry=None, spatial_site_basis="canonical",
-                 integral_backend="auto", spatial_abelian_mpo="auto",
+                 symmetry="su2", spatial_site_basis="auto",
+                 integral_backend=None, spatial_abelian_mpo="auto",
                  spatial_abelian_symbolic_algo="Hopcroft-Karp",
-                 spatial_family_environment_backend="generator_table",
+                 spatial_family_environment_backend="none",
                  spatial_native_p_grouping="first_site_order",
                  spatial_block2_table_p_split_metric="auto",
                  spatial_block2_table_p_split_groups="auto",
@@ -1895,7 +2201,7 @@ class DMRG(CASCI):
                  spatial_validate_cpp_boundary_p=False,
                  spatial_cpp_boundary_p_validation_policy="off",
                  spatial_direct_operator_batch_min_entries=2,
-                 dmrg_performance="block2-like",
+                 dmrg_performance="auto",
                  abelian_matvec_options=None,
                  debug_complementary_action_check=False,
                  debug_complementary_action_check_tol=1.0e-10,
@@ -1930,12 +2236,24 @@ class DMRG(CASCI):
 
         if orbital_layout is not None:
             site = orbital_layout
+        if str(site).lower() == "auto":
+            site = (
+                "spatial"
+                if normalized_symmetry is not None and "su2" in normalized_symmetry
+                else "spin_orbital"
+            )
         if normalized_symmetry is not None and "su2" in normalized_symmetry:
             site = "spatial"
         self.site = _normalize_site(site)
         self.site_basis = self.site
         self.orbital_layout = self.site
         spatial_site_basis = str(spatial_site_basis).lower()
+        if spatial_site_basis == "auto":
+            spatial_site_basis = (
+                "fully_reduced"
+                if normalized_symmetry is not None and "su2" in normalized_symmetry
+                else "canonical"
+            )
         if spatial_site_basis in {"reduced", "fully-reduced", "fully_reduced_su2"}:
             spatial_site_basis = "fully_reduced"
         if spatial_site_basis not in {"canonical", "fully_reduced"}:
@@ -2021,13 +2339,19 @@ class DMRG(CASCI):
         self._symmetric_mpo_cache = {}
         self._s2_mpo_cache = {}
         self._spatial_operator_cache = None
-        self.spatial_rdm2_algorithm = "npdm"
+        self._fully_reduced_rdm_state_context = None
+        self._spatial_string_rdm_cache = None
+        self.spatial_rdm_diagnostics = None
+        self.spatial_rdm2_algorithm = "auto"
+        self.spatial_string_rdm_max_fock_dim = 1 << 22
+        self.spatial_string_rdm_max_determinants = 1_000_000
         self._active_hamiltonian = None
+        self._su2_runtime = None
         self.complementary_operators = None
         self.complementary_operator_mpos = None
         self.complementary_operator_term_maps = None
         self.complementary_operator_generator_entries = None
-        self._active_integral_build_info = None
+        self.build_info = None
 
 
         self.hcore = self.h1e_cas = None # effective 1e CAS Hamiltonian including the influence of frozen orbitals
@@ -2041,7 +2365,13 @@ class DMRG(CASCI):
         self.h2e_factors = None
 
         self.init_guess = init_guess
-        self.integral_backend = _normalize_integral_backend(integral_backend)
+        self.integral_backend_override = _normalize_integral_backend(
+            integral_backend
+        )
+        self.integral_mode = _infer_integral_backend(
+            mf,
+            self.integral_backend_override,
+        )
         self.orb_sym = None if orb_sym is None else tuple(int(x) for x in orb_sym)
         self.low_rank_mpo = bool(low_rank_mpo)
         self.low_rank_mpo_bond = low_rank_mpo_bond
@@ -2153,14 +2483,7 @@ class DMRG(CASCI):
             performance_key = performance_key.replace("_", "-")
             block2_like_performance = performance_key in {
                 "auto",
-                "block2",
-                "block2-like",
-                "block2-style",
-                "packed-block2-style",
-                "cpp",
-                "c++",
-                "block2-cpp",
-                "packed-cpp-fast",
+                "symmetric",
                 "packed-compiled-fast",
             }
             can_use_block2_carrier = bool(
@@ -2172,10 +2495,12 @@ class DMRG(CASCI):
                 in {"block2_table", "generator_table"}
                 and block2_like_performance
             )
-            spatial_abelian_mpo = "spatial" if can_use_block2_carrier else "grouped"
-        if spatial_abelian_mpo not in {"spatial", "direct", "grouped"}:
+            spatial_abelian_mpo = "spatial" if can_use_block2_carrier else "direct"
+        if spatial_abelian_mpo not in {"spatial", "direct", "reference_grouped"}:
             raise ValueError(
-                "spatial_abelian_mpo must be 'auto', 'spatial', 'direct', or 'grouped'."
+                "spatial_abelian_mpo must be 'auto', 'spatial', 'direct', or "
+                "'reference_grouped'. The grouped spin-orbital carrier is no longer "
+                "a production route."
             )
         self.spatial_abelian_mpo = spatial_abelian_mpo
         self.spatial_abelian_symbolic_algo = _normalize_spatial_abelian_symbolic_algo(
@@ -2184,6 +2509,15 @@ class DMRG(CASCI):
         self.spatial_native_p_grouping = _normalize_spatial_native_p_grouping(
             spatial_native_p_grouping
         )
+        if (
+            normalized_symmetry is not None
+            and "su2" in normalized_symmetry
+            and spatial_reduced_mpo is False
+        ):
+            raise ValueError(
+                "symmetry='su2' has one production representation: the reduced "
+                "spatial normal/complementary Hamiltonian."
+            )
         if spatial_reduced_mpo is None:
             spatial_reduced_mpo = normalized_symmetry is not None and "su2" in normalized_symmetry
         self.spatial_reduced_mpo = bool(spatial_reduced_mpo)
@@ -2202,6 +2536,9 @@ class DMRG(CASCI):
         self._symmetric_mpo_cache = {}
         self._s2_mpo_cache = {}
         self._spatial_operator_cache = None
+        self._fully_reduced_rdm_state_context = None
+        self._spatial_string_rdm_cache = None
+        self.spatial_rdm_diagnostics = None
         self._active_hamiltonian = None
         self.complementary_operators = None
         self.complementary_operator_mpos = None
@@ -2210,7 +2547,6 @@ class DMRG(CASCI):
 
     def _require_su2_cpp_integral_reference(self):
         mol = getattr(self.mf, "mol", None)
-        driver = str(getattr(mol, "_build_driver", "") or "").lower()
         info = getattr(mol, "_builtin_build_info", None)
         info = info if isinstance(info, dict) else {}
         eri_backend = str(info.get("eri_backend", "") or "").lower()
@@ -2233,11 +2569,11 @@ class DMRG(CASCI):
             or "cpp" in ri_builder
             or "native" in ri_builder
         )
-        if driver != "builtin" or not compiled_builder:
+        if not compiled_builder:
             raise RuntimeError(
-                "SU(2) DMRG requires Molecule.build(driver='builtin', ...) "
-                "with PyQED's compiled C++ integral builder; GBasis, PySCF, "
-                "and uncompiled integral references are not supported."
+                "SU(2) DMRG requires Molecule.build(...) with PyQED's "
+                "compiled C++ integral builder; uncompiled integral "
+                "references are not supported."
             )
 
     def export_ground_state(self, state=0, dense=False):
@@ -2368,7 +2704,7 @@ class DMRG(CASCI):
         raise TypeError(f"Unsupported initial guess type: {type(guess)}")
 
     def fix_nelec(self, shift):
-        """
+        r"""
         fix the number of electrons by energy penalty
 
         .. math::
@@ -2412,7 +2748,7 @@ class DMRG(CASCI):
     #     return self
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
-        """
+        r"""
         Bias the DMRG optimization toward spin-pure states with a linear ``S^2`` penalty.
 
         .. math::
@@ -2486,10 +2822,12 @@ class DMRG(CASCI):
         # from pyscf import ao2mo
 
         mf = self.mf
-        backend = self.integral_backend
-        use_cholesky = backend in {"ri", "cholesky"} or (
-            backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
+        backend = _infer_integral_backend(
+            mf,
+            self.integral_backend_override,
         )
+        self.integral_mode = backend
+        use_cholesky = backend in {"ri", "cholesky"}
 
         # molecular orbitals
         Ca, Cb = [self.mo_cas, ] * 2
@@ -2514,18 +2852,7 @@ class DMRG(CASCI):
             pair_factors = transform_eri_factors_to_mo_pair(eri_factors, Ca)
             flat_pair_factors = pair_factors.reshape(pair_factors.shape[0], -1)
             eri_aa = (flat_pair_factors.conj().T @ flat_pair_factors).reshape(self.ncas, self.ncas, self.ncas, self.ncas)
-            factor_source = getattr(
-                getattr(mf, "mol", None),
-                "builtin_resolved_eri_representation",
-                getattr(getattr(mf, "mol", None), "native_resolved_eri_representation", None),
-            )
-            if factor_source is None:
-                factor_source = "cholesky" if getattr(mf, "cholesky_jk", False) else "ri"
-            if str(factor_source).lower() in {"dense+ri"}:
-                factor_source = "ri"
-            elif str(factor_source).lower() in {"dense", "dense+factors", "factors"}:
-                factor_source = "cholesky"
-            build_mode = str(factor_source).lower()
+            build_mode = backend
             aux_rank = int(pair_factors.shape[0])
         else:
             eri = mf.eri  # (pq||rs) 1^* 1 2^* 2
@@ -2566,11 +2893,12 @@ class DMRG(CASCI):
         # compact=False)).reshape((n,n,n,n), order="C")
 
         H2 = np.stack(( np.stack((eri_aa, eri_ab)), np.stack((eri_ba, eri_bb)) ))
-        self._active_integral_build_info = {
+        self.build_info = {
             'mode': build_mode,
             'factorized_integrals': bool(use_cholesky),
             'aux_rank': aux_rank,
             'ncas': self.ncas,
+            'integral_mode': backend,
         }
 
         # H1 = np.asarray([np.einsum("AB, Ap, Bq -> pq", H, Ca, Ca),
@@ -2610,13 +2938,29 @@ class DMRG(CASCI):
                 nelecas=self.nelecas,
             )
             self.e_core = float(energy_core)
-            self._active_integral_build_info = dict(info)
+            self.build_info = dict(info)
+            if pair_factors is not None:
+                mode = str(info.get("mode", "")).lower()
+                self.integral_mode = (
+                    "ri" if "ri" in mode else "cholesky"
+                )
+            elif eri is not None:
+                self.integral_mode = "dense"
+            else:
+                self.integral_mode = str(
+                    info.get("mode", "provider")
+                )
+            self.build_info["integral_mode"] = (
+                self.integral_mode
+            )
             return h1e, eri, pair_factors
 
-        backend = self.integral_backend
-        use_factors = backend in {"ri", "cholesky"} or (
-            backend == "auto" and not _mf_has_dense_eris(mf) and _mf_has_factorized_eris(mf)
+        backend = _infer_integral_backend(
+            mf,
+            self.integral_backend_override,
         )
+        self.integral_mode = backend
+        use_factors = backend in {"ri", "cholesky"}
 
         H, energy_core = h1e_for_cas(
             mf,
@@ -2631,39 +2975,47 @@ class DMRG(CASCI):
                 _get_mf_cholesky_factors(mf),
                 self.mo_cas,
             )
-            factor_source = getattr(
-                getattr(mf, "mol", None),
-                "builtin_resolved_eri_representation",
-                getattr(getattr(mf, "mol", None), "native_resolved_eri_representation", None),
-            )
-            if factor_source is None:
-                factor_source = "cholesky" if getattr(mf, "cholesky_jk", False) else "ri"
-            if str(factor_source).lower() in {"dense+ri"}:
-                factor_source = "ri"
-            elif str(factor_source).lower() in {"dense", "dense+factors", "factors"}:
-                factor_source = "cholesky"
-            self._active_integral_build_info = {
-                "mode": str(factor_source).lower(),
+            self.build_info = {
+                "mode": backend,
                 "factorized_integrals": True,
                 "aux_rank": int(pair_factors.shape[0]),
                 "ncas": self.ncas,
+                "integral_mode": backend,
             }
             return [H, H], None, pair_factors
 
         eri = mf.eri
-        if eri is None:
-            raise ValueError(
-                "DMRG dense active-integral build requires mf.eri. "
-                "Enable cholesky on the mean-field reference when running "
-                "on factor-only RHF references."
+        if eri is not None:
+            eri_aa = contract(
+                "ip, jq, ijkl, kr, ls -> pqrs",
+                self.mo_cas.conj(),
+                self.mo_cas,
+                eri,
+                self.mo_cas.conj(),
+                self.mo_cas,
             )
-        eri_aa = contract("ip, jq, ijkl, kr, ls -> pqrs", self.mo_cas.conj(), self.mo_cas, eri, self.mo_cas.conj(), self.mo_cas)
+        else:
+            get_eri_mo = getattr(mf, "get_eri_mo", None)
+            if get_eri_mo is None:
+                raise ValueError(
+                    "DMRG dense active-integral build requires a mean-field "
+                    "AO-to-MO ERI transform."
+                )
+            eri_aa = np.asarray(
+                get_eri_mo(mo_coeff=self.mo_cas, notation="chem")
+            )
+            if eri_aa.shape != (self.ncas,) * 4:
+                raise ValueError(
+                    "The mean-field AO-to-MO ERI transform returned an "
+                    "inconsistent active-space shape."
+                )
         H2 = np.stack((np.stack((eri_aa, eri_aa.copy())), np.stack((eri_aa.copy(), eri_aa.copy()))))
-        self._active_integral_build_info = {
+        self.build_info = {
             "mode": "dense",
             "factorized_integrals": False,
             "aux_rank": None,
             "ncas": self.ncas,
+            "integral_mode": backend,
         }
         return [H, H], H2, None
 
@@ -3689,7 +4041,7 @@ class DMRG(CASCI):
             self.H = cached["factors"]
             self._hamiltonian_mpo_cache_key = cache_key
             self._symmetric_mpo_cache = {}
-            self._active_integral_build_info.update(deepcopy(dict(cached["info"])))
+            self.build_info.update(deepcopy(dict(cached["info"])))
             return self
 
 
@@ -3730,7 +4082,7 @@ class DMRG(CASCI):
                     self.H = cached["factors"]
                     self._hamiltonian_mpo_cache_key = cache_key
                     self._symmetric_mpo_cache = {}
-                    self._active_integral_build_info.update(
+                    self.build_info.update(
                         deepcopy(dict(cached["info"]))
                     )
                     return self
@@ -3745,15 +4097,18 @@ class DMRG(CASCI):
                     n_elec=self.nelecas,
                     spin=self.spin,
                     ecore=self.e_core,
+                    orb_sym=self.orb_sym,
+                    reuse=self._su2_runtime,
                 )
                 self._spatial_operator_cache = None
                 self._active_hamiltonian = reduced_hamiltonian
+                self._su2_runtime = reduced_hamiltonian
                 self.complementary_operators = reduced_hamiltonian.complementary_operators
                 self.H_raw = reduced_hamiltonian.factors
                 self.H = reduced_hamiltonian.factors
                 self._hamiltonian_mpo_cache_key = cache_key
                 self._symmetric_mpo_cache = {}
-                self._active_integral_build_info.update(reduced_hamiltonian.info)
+                self.build_info.update(reduced_hamiltonian.info)
                 if not owns_su2_solver_state:
                     _store_global_hamiltonian_mpo_cache(
                         cache_key,
@@ -3775,40 +4130,21 @@ class DMRG(CASCI):
                     symbolic_algo=self.spatial_abelian_symbolic_algo,
                 )
                 _record_build_time("carrier_build_s", t_carrier)
-                t_family_data = time.perf_counter()
-                family_data = self._build_spatial_complementary_family_data(
-                    h1e,
-                    eri,
-                    cutoff=1e-10,
-                )
-                _record_build_time("family_data_s", t_family_data)
-                complementary = family_data["complementary"]
-                t_family_mpo = time.perf_counter()
-                family_tensor_mpos, family_mpo_info = (
-                    self._build_spatial_family_environment_mpos(
-                        complementary,
-                        family_data["term_maps"],
-                        cutoff=1e-10,
-                        native_family_mpos=family_data.get("native_family_mpos"),
-                        native_family_mpo_info=family_data.get(
-                            "native_family_mpo_info"
-                        ),
-                    )
-                )
-                _record_build_time("family_mpo_build_s", t_family_mpo)
-                self._expose_spatial_family_environment(
-                    complementary,
-                    family_data["term_maps"],
-                    family_tensor_mpos,
-                    expose_direct_terms=True,
-                )
+                # The full symbolic MPO owns the Hamiltonian.  Complementary
+                # R/P routes must not be exposed beside it: doing so duplicates
+                # the operator and recreates the route-expanded execution that
+                # this channel MPO is intended to replace.
+                self.complementary_operators = None
+                self.complementary_operator_mpos = None
+                self.complementary_operator_term_maps = None
+                self.complementary_operator_generator_entries = None
                 self._spatial_operator_cache = None
                 self._active_hamiltonian = None
                 self.H_raw = tensor_mpo.factors
                 self.H = tensor_mpo.factors
                 self._hamiltonian_mpo_cache_key = cache_key
                 self._symmetric_mpo_cache = {}
-                self._active_integral_build_info.update(
+                self.build_info.update(
                     {
                         "representation": "spatial_direct_symbolic_mpo",
                         "symbolic_terms": int(spatial_term_count),
@@ -3823,19 +4159,17 @@ class DMRG(CASCI):
                         "pipeline": (
                             "qchem_integrals->spatial_d4_symbolic_terms"
                             f"->autompo_{self.spatial_abelian_symbolic_algo}"
+                            "->native_u1_channels->compiled_moving_environment"
                         ),
                         "build_timings": dict(build_timings),
-                        "spatial_direct_term_representation": "spinfree_R/P_compatible",
-                        **self._spatial_family_build_metadata(
-                            family_data,
-                            family_tensor_mpos=family_tensor_mpos,
-                            family_mpo_info=family_mpo_info,
-                            expose_direct_terms=True,
-                        ),
+                        "spatial_direct_term_representation": "sector_channel_mpo",
+                        "spatial_u1_execution": "compiled_sector_channel_mpo",
+                        "sector_complete_environment_movement": True,
+                        "complementary_route_expansion": False,
                     }
                 )
                 if self.spin_purification:
-                    self._active_integral_build_info["spin_penalty_terms"] = int(spin_penalty_term_count)
+                    self.build_info["spin_penalty_terms"] = int(spin_penalty_term_count)
                 return self
 
             t_family_data = time.perf_counter()
@@ -3904,7 +4238,7 @@ class DMRG(CASCI):
                     family_pipeline_stage = "block2_table_family_mpos"
                 else:
                     family_pipeline_stage = "carrier_only"
-                self._active_integral_build_info.update(
+                self.build_info.update(
                     {
                         **carrier.info,
                         "spatial_abelian_mpo": "spatial",
@@ -3928,7 +4262,7 @@ class DMRG(CASCI):
                 _store_global_hamiltonian_mpo_cache(
                     cache_key,
                     factors=carrier.factors,
-                    info=self._active_integral_build_info,
+                    info=self.build_info,
                     hamiltonian=None,
                     complementary_operators=self.complementary_operators,
                     complementary_operator_mpos=self.complementary_operator_mpos,
@@ -3941,7 +4275,13 @@ class DMRG(CASCI):
                 )
                 return self
 
-            self._log("  Building spatial-orbital Hamiltonian MPO by grouping spin-orbital pairs...")
+            if self.spatial_abelian_mpo != "reference_grouped":
+                raise RuntimeError(
+                    "The native spatial carrier could not be built with the selected "
+                    "options. Choose spatial_abelian_mpo='direct'; the grouped "
+                    "spin-orbital carrier is reference-only."
+                )
+            self._log("  Building reference spatial MPO by grouping spin-orbital pairs...")
             self._active_hamiltonian = None
             t_carrier = time.perf_counter()
             spin_tensor_mpo, spin_term_count, spin_penalty_term_count = _build_spin_orbital_dense_hamiltonian_tensor_mpo(
@@ -3971,25 +4311,20 @@ class DMRG(CASCI):
             self.H = tensor_mpo.factors
             self._hamiltonian_mpo_cache_key = cache_key
             self._symmetric_mpo_cache = {}
-            self._active_integral_build_info.update(
+            self.build_info.update(
                 {
-                    "representation": "spatial_grouped_spin_mpo",
+                    "representation": "reference_spatial_grouped_spin_mpo",
                     "symbolic_terms": int(spin_term_count),
                     "mpo_max_bond": int(max(tensor_mpo.bond_orders())),
                     "site": "spatial",
-                    "spatial_abelian_mpo": "grouped",
+                    "spatial_abelian_mpo": "reference_grouped",
+                    "production_route": False,
                     "spatial_family_environment_backend": (
                         self.spatial_family_environment_backend
                     ),
                     "spatial_native_p_grouping": self.spatial_native_p_grouping,
                     "spatial_grouped_carrier_reason": (
-                        "requested_grouped"
-                        if self.spatial_abelian_mpo == "grouped"
-                        else "dense_run_requires_full_carrier"
-                        if not self._can_use_spatial_block2_carrier()
-                        else "spatial_carrier_requires_family_mpos"
-                        if not family_tensor_mpos
-                        else "spin_purification_requires_full_carrier"
+                        "explicit_reference_validation"
                     ),
                     "build_timings": dict(build_timings),
                     **self._spatial_family_build_metadata(
@@ -4001,7 +4336,7 @@ class DMRG(CASCI):
                 }
             )
             if self.spin_purification:
-                self._active_integral_build_info["spin_penalty_terms"] = int(spin_penalty_term_count)
+                self.build_info["spin_penalty_terms"] = int(spin_penalty_term_count)
             return self
 
         # 2. Build Hamiltonian (Using Robust JW Builder)
@@ -4022,9 +4357,9 @@ class DMRG(CASCI):
                 trigger_bond=low_rank_trigger_bond,
                 batch_size=self.low_rank_mpo_batch_size,
             )
-            self._active_integral_build_info.update(low_rank_info)
-            self._active_integral_build_info["compression_bond"] = int(low_rank_chi_max)
-            self._active_integral_build_info["compression_trigger_bond"] = int(low_rank_trigger_bond)
+            self.build_info.update(low_rank_info)
+            self.build_info["compression_bond"] = int(low_rank_chi_max)
+            self.build_info["compression_trigger_bond"] = int(low_rank_trigger_bond)
         else:
             ham_term_map = {}
             # --- One-Body Terms: h_pq a+_p a_q ---
@@ -4069,7 +4404,7 @@ class DMRG(CASCI):
                 cutoff=cutoff,
             )
             representation = "dense_term_mpo" if pair_factors is None else "cholesky_dense_active_mpo"
-            self._active_integral_build_info.update(
+            self.build_info.update(
                 {
                     "representation": representation,
                     "symbolic_terms": int(dense_term_count),
@@ -4085,7 +4420,7 @@ class DMRG(CASCI):
                 cutoff=cutoff,
             )
             tensor_mpo = tensor_mpo + spin_mpo
-            self._active_integral_build_info["spin_penalty_terms"] = int(spin_term_count)
+            self.build_info["spin_penalty_terms"] = int(spin_term_count)
 
         self.H_raw = tensor_mpo.factors
         self.H = tensor_mpo.factors
@@ -4124,14 +4459,14 @@ class DMRG(CASCI):
                     s2_mat = _build_spatial_s2_matrix(self._get_spatial_ops_for_rdm())
                     s2_vals.append(float(np.real(np.vdot(psi, s2_mat @ psi) / norm)))
                     continue
-                if hasattr(state_for_eval.Bs[0], 'qns'):
+                if hasattr(state_for_eval.factors[0], 'qns'):
                     from pyqed.mps.mps import symmetric_to_dense
                     state_for_eval = symmetric_to_dense(
                         state,
                         site_qn_maps=self._dense_site_qn_maps(),
                     )
-                s2 = mps_lib.expect_mps(state_for_eval.Bs, s2_mpo.factors, state_for_eval.Bs)
-                norm = state_for_eval.norm()
+                s2 = mps_lib._expect_factors(state_for_eval.factors, s2_mpo.factors, state_for_eval.factors)
+                norm = state_for_eval.norm_squared()
                 s2_vals.append(float(np.real(s2 / norm)))
             return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
 
@@ -4158,16 +4493,16 @@ class DMRG(CASCI):
         s2_vals = []
 
         for state in states_to_eval:
-            if hasattr(state.Bs[0], 'qns'):
+            if hasattr(state.factors[0], 'qns'):
                 dense_state = mps_lib.symmetric_to_dense(
                     state,
                     site_qn_maps=self._dense_site_qn_maps(),
                 )
-                psi_for_eval = dense_state.Bs
+                psi_for_eval = dense_state.factors
             else:
-                psi_for_eval = state.Bs
+                psi_for_eval = state.factors
 
-            s2 = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
+            s2 = mps_lib._expect_factors(psi_for_eval, mpo_dense, psi_for_eval)
             s2_vals.append(float(np.real(s2)))
 
         return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
@@ -4510,7 +4845,7 @@ class DMRG(CASCI):
         if mo_coeff is not None:
             self.build(mo_coeff=mo_coeff)
         if self.H_raw is None:
-            self.build()
+            self.build(mo_coeff=getattr(self, "mo_coeff", None))
         sweep_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.tol))
         davidson_tol_explicit = "davidson_tol" in kwargs
         davidson_max_iter_explicit = "davidson_max_iter" in kwargs
@@ -4519,6 +4854,7 @@ class DMRG(CASCI):
             1.0e-3 if has_su2 else 1.0e-5,
         )
         davidson_max_iter = kwargs.pop("davidson_max_iter", 30)
+        noise_explicit = "noise" in kwargs
         noise = kwargs.pop("noise", 1.0e-4)
         noise_decay = kwargs.pop("noise_decay", 0.1)
         noise_cutoff = kwargs.pop("noise_cutoff", 1.0e-9)
@@ -4601,9 +4937,10 @@ class DMRG(CASCI):
                 )
                 self.dmrg = dmrg
                 includes_core_energy = bool(
-                    (self._active_integral_build_info or {}).get(
+                    getattr(
+                        dmrg,
                         "includes_core_energy",
-                        False,
+                        (self.build_info or {}).get("includes_core_energy", False),
                     )
                 )
                 raw_dmrg_energy = np.asarray(dmrg.e_tot, dtype=float)
@@ -4718,7 +5055,7 @@ class DMRG(CASCI):
                                 str(family_name),
                             )
                         ] = family_final
-                timings = self._active_integral_build_info.setdefault(
+                timings = self.build_info.setdefault(
                     "build_timings",
                     {},
                 )
@@ -4739,7 +5076,7 @@ class DMRG(CASCI):
                         site_qn_maps,
                         native_site_storage=native_symmetric_mpo_storage,
                     )
-                    timings = self._active_integral_build_info.setdefault(
+                    timings = self.build_info.setdefault(
                         "build_timings",
                         {},
                     )
@@ -4775,7 +5112,7 @@ class DMRG(CASCI):
                             self._symmetric_mpo_cache[family_cache_key] = family_final
                         final_complementary_mpos[str(family_name)] = family_final
                     if family_convert_by_name:
-                        timings = self._active_integral_build_info.setdefault(
+                        timings = self.build_info.setdefault(
                             "build_timings",
                             {},
                         )
@@ -4793,7 +5130,7 @@ class DMRG(CASCI):
                     complementary_mpos=final_complementary_mpos,
                 )
                 if global_sym_cache_key is not None:
-                    timings = self._active_integral_build_info.setdefault(
+                    timings = self.build_info.setdefault(
                         "build_timings",
                         {},
                     )
@@ -4823,12 +5160,29 @@ class DMRG(CASCI):
             use_symmetry = False
             self.sym_mgr = None
             site_qn_maps = None
+        if not isinstance(final_H, TensorMPO):
+            final_H = TensorMPO(final_H)
+        if final_complementary_mpos is not None:
+            final_complementary_mpos = {
+                name: (
+                    mpo
+                    if isinstance(mpo, TensorMPO)
+                    else TensorMPO(mpo)
+                )
+                for name, mpo in final_complementary_mpos.items()
+            }
         self._site_qn_maps = site_qn_maps if use_symmetry else None
-        active_info = self._active_integral_build_info or {}
+        active_info = self.build_info or {}
         carrier_only_family_hamiltonian = (
             active_info.get("representation") == "spatial_block2_table_carrier_mpo"
         )
+        compiled_channel_hamiltonian = (
+            active_info.get("spatial_u1_execution")
+            == "compiled_sector_channel_mpo"
+        )
         if carrier_only_family_hamiltonian:
+            if not noise_explicit:
+                noise = 0.0
             abelian_matvec_options = dict(abelian_matvec_options or {})
             abelian_matvec_options.update(
                 {
@@ -4892,7 +5246,7 @@ class DMRG(CASCI):
                         native_family_mpo_owner.install_owned_family_mpos(
                             owned_family_mpo_key,
                             family_names,
-                            tuple(factors for _, factors in family_items),
+                            tuple(mpo.factors for _, mpo in family_items),
                         )
                         abelian_matvec_options[
                             "moving_environment_cpp_owned_family_mpo_key"
@@ -4900,7 +5254,7 @@ class DMRG(CASCI):
                         abelian_matvec_options[
                             "moving_environment_cpp_owned_family_mpo_names"
                         ] = family_names
-                        timings = self._active_integral_build_info.setdefault(
+                        timings = self.build_info.setdefault(
                             "build_timings",
                             {},
                         )
@@ -4911,7 +5265,7 @@ class DMRG(CASCI):
                             "cpp_owned_converted_family_mpo_families"
                         ] = int(len(family_names))
                     except Exception as exc:
-                        timings = self._active_integral_build_info.setdefault(
+                        timings = self.build_info.setdefault(
                             "build_timings",
                             {},
                         )
@@ -4919,39 +5273,55 @@ class DMRG(CASCI):
                             "cpp_owned_converted_family_mpo_register_error"
                         ] = repr(exc)
             final_expectation = False
-            if self._active_integral_build_info is not None:
-                self._active_integral_build_info[
+            if self.build_info is not None:
+                self.build_info[
                     "carrier_only_family_hamiltonian"
                 ] = True
-                self._active_integral_build_info[
+                self.build_info[
                     "carrier_only_sweep_energy_final"
                 ] = True
-                self._active_integral_build_info[
+                self.build_info[
                     "carrier_only_disabled_flat_local_shortcuts"
                 ] = True
-                self._active_integral_build_info[
+                self.build_info[
                     "carrier_only_forced_family_flat_csr"
                 ] = True
-                self._active_integral_build_info[
+                self.build_info[
                     "moving_environment_cpp_owner_reused_from_build"
                 ] = reuse_native_family_mpo_owner
+        elif (
+            compiled_channel_hamiltonian
+            and final_expectation is None
+            and self.nstates == 1
+        ):
+            # The final two-site eigenvalue is already the normalized energy of
+            # this complete Hamiltonian MPO.  A separate full-chain expectation
+            # repeats the dominant contraction without changing that result.
+            final_expectation = False
+            if self.build_info is not None:
+                self.build_info[
+                    "compiled_channel_sweep_energy_final"
+                ] = True
+                self.build_info[
+                    "compiled_channel_skipped_redundant_final_expectation"
+                ] = True
         native_initial_guess_storage = bool(
             use_symmetry
             and resolved_abelian_options.get("native_site_storage", False)
         )
-        if self._active_integral_build_info is not None:
-            self._active_integral_build_info["dmrg_performance"] = str(
+        if self.build_info is not None:
+            self.build_info["dmrg_performance"] = str(
                 dmrg_performance or "auto"
             )
-            self._active_integral_build_info["abelian_matvec_options"] = (
+            self.build_info["abelian_matvec_options"] = (
                 None
                 if abelian_matvec_options is None
                 else _metadata_abelian_options(abelian_matvec_options)
             )
-            self._active_integral_build_info[
+            self.build_info[
                 "native_initial_guess_storage"
             ] = bool(native_initial_guess_storage)
-            self._active_integral_build_info[
+            self.build_info[
                 "native_symmetric_mpo_storage"
             ] = bool(use_symmetry and native_symmetric_mpo_storage)
         mps0 = self._resolve_initial_guess(
@@ -4965,6 +5335,12 @@ class DMRG(CASCI):
         completed_sweeps = 0
         completed_half_sweeps = 0
         for stage_idx, (stage_D, stage_sweeps) in enumerate(schedule, start=1):
+            if not isinstance(current_guess, MPS):
+                current_guess = MPS(
+                    current_guess,
+                    labels=["lv", "rv", "p"] if use_symmetry else ["lv", "p", "rv"],
+                    sites=final_H.input_sites,
+                )
             if len(schedule) == 1:
                 self._log(f"  Starting Complete Sweeps (D={stage_D})...")
             else:
@@ -5003,8 +5379,8 @@ class DMRG(CASCI):
                 ),
                 converge_on_full_sweeps=True,
             )
-            if self._active_integral_build_info is not None:
-                self._active_integral_build_info[
+            if self.build_info is not None:
+                self.build_info[
                     "resolved_abelian_matvec_options"
                 ] = _metadata_abelian_options(
                     getattr(dmrg, "abelian_matvec_options", {}) or {}
@@ -5184,48 +5560,242 @@ class DMRG(CASCI):
             return self.dmrg.states[state_id]
         return self.dmrg.ground_state
 
+    def _resolve_spatial_rdm2_algorithm(self):
+        algorithm = str(getattr(self, "spatial_rdm2_algorithm", "auto")).lower()
+        if algorithm not in {"auto", "string", "gram", "direct", "npdm"}:
+            raise ValueError(
+                "spatial_rdm2_algorithm must be 'auto', 'string', 'gram', "
+                "'direct', or 'npdm'."
+            )
+        if algorithm != "auto":
+            return algorithm
+
+        ncas = int(self.ncas)
+        spin = int(self.spin)
+        nalpha = (int(self.nelecas) + spin) // 2
+        nbeta = (int(self.nelecas) - spin) // 2
+        determinant_count = math.comb(ncas, nalpha) * math.comb(ncas, nbeta)
+        if (
+            4 ** ncas <= int(self.spatial_string_rdm_max_fock_dim)
+            and determinant_count <= int(self.spatial_string_rdm_max_determinants)
+        ):
+            return "string"
+        return "npdm"
+
+    def _make_spatial_string_rdms(self, state, mps_state):
+        cache = self._spatial_string_rdm_cache
+        if cache is not None and cache["state"] is state:
+            cache["diagnostics"]["cache_hits"] += 1
+            return cache["dm1"], cache["dm2"]
+
+        started = time.perf_counter()
+        basis, coefficients = _spatial_mps_to_spin_string_ci(
+            mps_state,
+            self.ncas,
+            self.nelecas,
+            self.spin,
+        )
+        export_seconds = time.perf_counter() - started
+        rdm1_started = time.perf_counter()
+        dm1 = np.real_if_close(_make_ci_rdm1(coefficients, basis, None))
+        rdm1_seconds = time.perf_counter() - rdm1_started
+        rdm2_started = time.perf_counter()
+        dm2 = np.real_if_close(_make_ci_rdm2(coefficients, basis, None, None))
+        rdm2_seconds = time.perf_counter() - rdm2_started
+        diagnostics = {
+            "algorithm": "alpha_beta_strings",
+            "fock_dimension": int(4 ** int(self.ncas)),
+            "determinants": int(basis.nalpha * basis.nbeta),
+            "export_seconds": float(export_seconds),
+            "rdm1_seconds": float(rdm1_seconds),
+            "rdm2_seconds": float(rdm2_seconds),
+            "total_seconds": float(time.perf_counter() - started),
+            "cache_hits": 0,
+        }
+        self.spatial_rdm_diagnostics = diagnostics
+        self._spatial_string_rdm_cache = {
+            "state": state,
+            "dm1": dm1,
+            "dm2": dm2,
+            "diagnostics": diagnostics,
+        }
+        return dm1, dm2
+
     def _get_spatial_ops_for_rdm(self):
         if self._spatial_operator_cache is None:
             self._spatial_operator_cache = _build_spatial_fermion_operators(self.ncas)
         return self._spatial_operator_cache
 
-    def _fully_reduced_spatial_expectation(self, state, *, h1=None, eri=None):
-        """Evaluate a spin-free operator directly in the reduced SU(2) MPS."""
-        from pyqed.mps.nonabelian.environment import contract_chain_expectation
-        from pyqed.mps.nonabelian.models import (
-            build_spatial_one_body_reduced_mpo,
-            build_spatial_spinfree_eri_mpo,
-        )
-        from pyqed.qchem.dmrg.backends.nonabelian import (
-            _identity_mpo_factors_for_sites_and_mpo,
-        )
+    def _fully_reduced_rdm_context(self, state):
+        context = self._fully_reduced_rdm_state_context
+        if context is not None and context["state"] is state:
+            context["diagnostics"]["cache_hits"] += 1
+            self.spatial_rdm_diagnostics = context["diagnostics"]
+            return context
 
-        sites = state.sites
-        if h1 is not None:
-            mpo = build_spatial_one_body_reduced_mpo(sites, h1)
-        elif eri is not None:
-            mpo = build_spatial_spinfree_eri_mpo(
-                sites,
-                eri,
-                include_half=False,
+        started = time.perf_counter()
+        target = getattr(state, "target_sector", None)
+        is_singlet = bool(
+            target is not None
+            and getattr(getattr(target, "irrep", None), "two_j", None) == 0
+        )
+        runtime = getattr(self, "_su2_runtime", None)
+        moving_environment = getattr(runtime, "moving_environment", None)
+        native_npdm = getattr(moving_environment, "spatial_npdm", None)
+        if native_npdm is not None:
+            payload = native_npdm(
+                state.sites,
+                spin_rotation_reduction=is_singlet,
             )
-        else:
-            raise ValueError("A reduced one- or two-body operator is required.")
-        numerator = contract_chain_expectation(sites, mpo)
-        identity = _identity_mpo_factors_for_sites_and_mpo(sites, mpo)
-        denominator = contract_chain_expectation(sites, identity)
-        if abs(denominator) <= 1.0e-14:
+            diagnostics = {
+                "algorithm": "cpp_su2_wigner_eckart_npdm",
+                "determinant_expansion": False,
+                "magnetic_component_expansion": bool(
+                    payload["magnetic_component_expansion"]
+                ),
+                "reduced_max_bond_dimension": int(
+                    payload["max_reduced_bond_dimension"]
+                ),
+                "component_max_bond_dimension": int(
+                    payload["max_component_bond_dimension"]
+                ),
+                "max_operator_channels": int(payload["max_operator_channels"]),
+                "max_operator_two_j": int(payload["max_operator_two_j"]),
+                "string_contractions": int(payload["string_contractions"]),
+                "spin_rotation_reduction": bool(
+                    payload["spin_rotation_reduction"]
+                ),
+                "setup_seconds": float(payload["setup_seconds"]),
+                "environment_seconds": float(payload["environment_seconds"]),
+                "rdm1_seconds": float(payload["rdm1_seconds"]),
+                "rdm2_seconds": float(payload["rdm2_seconds"]),
+                "total_seconds": float(time.perf_counter() - started),
+                "cache_hits": 0,
+            }
+            context = {
+                "state": state,
+                "component_state": None,
+                "npdm": None,
+                "dm1": np.asarray(payload["rdm1"]),
+                "dm2": np.asarray(payload["rdm2"]),
+                "started": started,
+                "diagnostics": diagnostics,
+            }
+            self._fully_reduced_rdm_state_context = context
+            self.spatial_rdm_diagnostics = diagnostics
+            return context
+
+        component_state = _fully_reduced_spatial_mps_to_component_mps(state)
+        expansion_seconds = time.perf_counter() - started
+        environment_started = time.perf_counter()
+        npdm = _SpatialNPDMContractions(component_state)
+        if abs(npdm.norm) <= 1.0e-14:
             raise ValueError("Cannot build RDMs from a zero-norm MPS.")
-        return float(np.real(numerator / denominator))
+        environment_seconds = time.perf_counter() - environment_started
+        expansion = component_state.su2_component_expansion
+        diagnostics = {
+            "algorithm": "su2_component_mps_npdm",
+            "determinant_expansion": False,
+            "component_bond_dimensions": expansion["bond_dimensions"],
+            "component_max_bond_dimension": expansion["max_bond_dimension"],
+            "expansion_seconds": float(expansion_seconds),
+            "environment_seconds": float(environment_seconds),
+            "rdm1_seconds": 0.0,
+            "rdm2_seconds": 0.0,
+            "total_seconds": float(time.perf_counter() - started),
+            "cache_hits": 0,
+        }
+        context = {
+            "state": state,
+            "component_state": component_state,
+            "npdm": npdm,
+            "dm1": None,
+            "dm2": None,
+            "started": started,
+            "diagnostics": diagnostics,
+        }
+        self._fully_reduced_rdm_state_context = context
+        self.spatial_rdm_diagnostics = diagnostics
+        return context
+
+    def _fully_reduced_component_rdm1(self, state):
+        context = self._fully_reduced_rdm_context(state)
+        if context["dm1"] is not None:
+            return context["dm1"]
+
+        started = time.perf_counter()
+        npdm = context["npdm"]
+        target = getattr(state, "target_sector", None)
+        is_singlet = bool(
+            target is not None
+            and getattr(getattr(target, "irrep", None), "two_j", None) == 0
+        )
+        spin_terms = ((0, 2.0),) if is_singlet else ((0, 1.0), (1, 1.0))
+        gamma = np.zeros((self.ncas, self.ncas), dtype=float)
+        for p in range(self.ncas):
+            for q in range(p, self.ncas):
+                value = 0.0
+                for sigma, scale in spin_terms:
+                    value += scale * npdm.expect_string(
+                        [
+                            ("cre", sigma, p),
+                            ("ann", sigma, q),
+                        ]
+                    ).real
+                gamma[p, q] = value
+                gamma[q, p] = value
+        context["dm1"] = gamma
+        context["diagnostics"]["spin_rotation_reduction"] = is_singlet
+        context["diagnostics"]["rdm1_seconds"] = float(time.perf_counter() - started)
+        context["diagnostics"]["total_seconds"] = float(
+            time.perf_counter() - context["started"]
+        )
+        return gamma
+
+    def _fully_reduced_component_rdm2(self, state):
+        context = self._fully_reduced_rdm_context(state)
+        if context["dm2"] is not None:
+            return context["dm2"]
+
+        started = time.perf_counter()
+        npdm = context["npdm"]
+        target = getattr(state, "target_sector", None)
+        is_singlet = bool(
+            target is not None
+            and getattr(getattr(target, "irrep", None), "two_j", None) == 0
+        )
+        spin_pairs = (
+            ((0, 0, 2.0), (0, 1, 2.0))
+            if is_singlet
+            else tuple((sigma, tau, 1.0) for sigma in range(2) for tau in range(2))
+        )
+        gamma2 = np.zeros((self.ncas,) * 4, dtype=float)
+        pairs = [(p, r) for p in range(self.ncas) for r in range(self.ncas)]
+        for sigma, tau, scale in spin_pairs:
+            for left_index, (p, r) in enumerate(pairs):
+                for q, s in pairs[left_index:]:
+                    value = scale * npdm.expect_string(
+                        [
+                            ("cre", sigma, p),
+                            ("cre", tau, r),
+                            ("ann", tau, s),
+                            ("ann", sigma, q),
+                        ]
+                    ).real
+                    gamma2[p, q, r, s] += value
+                    if (p, r) != (q, s):
+                        gamma2[q, p, s, r] += value
+        context["dm2"] = gamma2
+        context["diagnostics"]["spin_rotation_reduction"] = is_singlet
+        context["diagnostics"]["rdm2_seconds"] = float(time.perf_counter() - started)
+        context["diagnostics"]["total_seconds"] = float(
+            time.perf_counter() - context["started"]
+        )
+        return gamma2
 
     def _make_fully_reduced_spatial_rdm1(self, state_id=0, spatial=False, with_core=False):
         state = self._get_state_for_rdm(state_id)
-        gamma = np.zeros((self.ncas, self.ncas), dtype=float)
-        for p in range(self.ncas):
-            for q in range(self.ncas):
-                h1 = np.zeros((self.ncas, self.ncas), dtype=float)
-                h1[p, q] = 1.0
-                gamma[q, p] = self._fully_reduced_spatial_expectation(state, h1=h1)
+        gamma = self._fully_reduced_component_rdm1(state)
         if spatial or with_core:
             out = gamma
         else:
@@ -5244,17 +5814,7 @@ class DMRG(CASCI):
 
     def _make_fully_reduced_spatial_rdm2(self, state_id=0, spatial=False, with_core=False):
         state = self._get_state_for_rdm(state_id)
-        gamma2 = np.zeros((self.ncas,) * 4, dtype=float)
-        for p in range(self.ncas):
-            for q in range(self.ncas):
-                for r in range(self.ncas):
-                    for s in range(self.ncas):
-                        eri = np.zeros((self.ncas,) * 4, dtype=float)
-                        eri[p, q, r, s] = 1.0
-                        gamma2[p, q, r, s] = self._fully_reduced_spatial_expectation(
-                            state,
-                            eri=eri,
-                        )
+        gamma2 = self._fully_reduced_component_rdm2(state)
         if not (spatial or with_core):
             raise NotImplementedError(
                 "The fully reduced SU(2) backend exposes the spin-traced spatial 2-RDM only."
@@ -5285,7 +5845,7 @@ class DMRG(CASCI):
 
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
-        if self.spatial_site_basis == "fully_reduced":
+        if getattr(self, "spatial_site_basis", "canonical") == "fully_reduced":
             return self._make_fully_reduced_spatial_rdm1(
                 state_id,
                 spatial=spatial,
@@ -5294,51 +5854,64 @@ class DMRG(CASCI):
         state = self._get_state_for_rdm(state_id)
         mps_state = _spatial_rdm_dense_mps(
             state,
-            site_qn_maps=self._dense_site_qn_maps(),
+            site_qn_maps=(
+                self._dense_site_qn_maps()
+                if hasattr(self, "_dense_site_qn_maps")
+                else None
+            ),
         )
-        if mps_state is not None:
-            norm = mps_state._mps_dot(mps_state, mps_state)
-            if abs(norm) < 1e-14:
-                raise ValueError("Cannot build RDMs from a zero-norm MPS.")
-            holes = {
-                (sigma, p): _apply_spatial_annihilation_mps(mps_state, sigma, p)
-                for sigma in range(2)
-                for p in range(self.ncas)
-            }
+        string_route = (
+            mps_state is not None
+            and (spatial or with_core)
+            and self._resolve_spatial_rdm2_algorithm() == "string"
+        )
+        if string_route:
+            p_out, _ = self._make_spatial_string_rdms(state, mps_state)
+            p_out = np.asarray(p_out).real
+        else:
+            if mps_state is not None:
+                norm = mps_state._mps_dot(mps_state, mps_state)
+                if abs(norm) < 1e-14:
+                    raise ValueError("Cannot build RDMs from a zero-norm MPS.")
+                holes = {
+                    (sigma, p): _apply_spatial_annihilation_mps(mps_state, sigma, p)
+                    for sigma in range(2)
+                    for p in range(self.ncas)
+                }
 
-            p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
-            for sigma in range(2):
+                p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
+                for sigma in range(2):
+                    for p in range(self.ncas):
+                        for q in range(self.ncas):
+                            p_raw[2 * p + sigma, 2 * q + sigma] = (
+                                holes[(sigma, p)]._mps_dot(holes[(sigma, p)], holes[(sigma, q)])
+                                / norm
+                            )
+            else:
+                psi = _nonabelian_mps_to_dense_vector(state)
+                norm = np.vdot(psi, psi)
+                ops = self._get_spatial_ops_for_rdm()
+                holes = {
+                    (sigma, p): ops["ann"][sigma][p] @ psi
+                    for sigma in range(2)
+                    for p in range(self.ncas)
+                }
+
+                p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
+                for sigma in range(2):
+                    for p in range(self.ncas):
+                        for q in range(self.ncas):
+                            p_raw[2 * p + sigma, 2 * q + sigma] = np.vdot(holes[(sigma, p)], holes[(sigma, q)]) / norm
+
+            if spatial or with_core:
+                p_spatial = np.zeros((self.ncas, self.ncas), dtype=float)
                 for p in range(self.ncas):
                     for q in range(self.ncas):
-                        p_raw[2 * p + sigma, 2 * q + sigma] = (
-                            holes[(sigma, p)]._mps_dot(holes[(sigma, p)], holes[(sigma, q)])
-                            / norm
-                        )
-        else:
-            psi = _nonabelian_mps_to_dense_vector(state)
-            norm = np.vdot(psi, psi)
-            ops = self._get_spatial_ops_for_rdm()
-            holes = {
-                (sigma, p): ops["ann"][sigma][p] @ psi
-                for sigma in range(2)
-                for p in range(self.ncas)
-            }
-
-            p_raw = np.zeros((2 * self.ncas, 2 * self.ncas), dtype=complex)
-            for sigma in range(2):
-                for p in range(self.ncas):
-                    for q in range(self.ncas):
-                        p_raw[2 * p + sigma, 2 * q + sigma] = np.vdot(holes[(sigma, p)], holes[(sigma, q)]) / norm
-
-        if spatial or with_core:
-            p_spatial = np.zeros((self.ncas, self.ncas), dtype=float)
-            for p in range(self.ncas):
-                for q in range(self.ncas):
-                    val = p_raw[2 * p, 2 * q] + p_raw[2 * p + 1, 2 * q + 1]
-                    p_spatial[q, p] = float(np.real(val))
-            p_out = p_spatial
-        else:
-            p_out = p_raw
+                        val = p_raw[2 * p, 2 * q] + p_raw[2 * p + 1, 2 * q + 1]
+                        p_spatial[q, p] = float(np.real(val))
+                p_out = p_spatial
+            else:
+                p_out = p_raw
 
         if with_core:
             ncore = self.ncore
@@ -5353,7 +5926,7 @@ class DMRG(CASCI):
 
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
-        if self.spatial_site_basis == "fully_reduced":
+        if getattr(self, "spatial_site_basis", "canonical") == "fully_reduced":
             if idx_pairs is not None:
                 raise NotImplementedError(
                     "idx_pairs is not implemented for the fully reduced SU(2) 2-RDM."
@@ -5366,16 +5939,49 @@ class DMRG(CASCI):
         state = self._get_state_for_rdm(state_id)
         mps_state = _spatial_rdm_dense_mps(
             state,
-            site_qn_maps=self._dense_site_qn_maps(),
+            site_qn_maps=(
+                self._dense_site_qn_maps()
+                if hasattr(self, "_dense_site_qn_maps")
+                else None
+            ),
         )
+        rdm2_algorithm = str(getattr(self, "spatial_rdm2_algorithm", "auto")).lower()
+        if rdm2_algorithm == "auto":
+            rdm2_algorithm = self._resolve_spatial_rdm2_algorithm()
+        if (
+            mps_state is not None
+            and (spatial or with_core)
+            and rdm2_algorithm == "string"
+        ):
+            if idx_pairs is not None:
+                raise NotImplementedError("idx_pairs is not implemented for string-basis 2-RDMs.")
+            active_dm1, active_dm2 = self._make_spatial_string_rdms(state, mps_state)
+            active_dm2 = np.asarray(active_dm2).real
+            if not with_core:
+                return active_dm2
+
+            ncore = self.ncore
+            norb = ncore + self.ncas
+            d2 = np.zeros((norb, norb, norb, norb), dtype=float)
+            if ncore > 0:
+                eye = np.eye(ncore)
+                d2[:ncore, :ncore, :ncore, :ncore] = (
+                    4 * np.einsum('ij,kl->ijkl', eye, eye)
+                    - 2 * np.einsum('ps,rq->pqrs', eye, eye)
+                )
+                active_dm1 = np.asarray(active_dm1).real
+                for i in range(ncore):
+                    d2[i, i, ncore:norb, ncore:norb] = 2 * active_dm1
+                    d2[ncore:norb, ncore:norb, i, i] = 2 * active_dm1
+                    d2[i, ncore:norb, i, ncore:norb] = -active_dm1
+                    d2[ncore:norb, i, ncore:norb, i] = -active_dm1
+            d2[ncore:norb, ncore:norb, ncore:norb, ncore:norb] = active_dm2
+            return d2
+
         if mps_state is not None:
             norm = mps_state._mps_dot(mps_state, mps_state)
             if abs(norm) < 1e-14:
                 raise ValueError("Cannot build RDMs from a zero-norm MPS.")
-
-            rdm2_algorithm = getattr(self, "spatial_rdm2_algorithm", "gram")
-            if rdm2_algorithm not in {"gram", "direct", "npdm"}:
-                raise ValueError("spatial_rdm2_algorithm must be 'gram', 'direct', or 'npdm'.")
 
             double_holes = {}
             if rdm2_algorithm == "gram":
@@ -5562,7 +6168,7 @@ class DMRG(CASCI):
         return g_out
 
     def make_rdm1(self, state_id=0, spatial=False, with_core=False):
-        """
+        r"""
         Calculates the 1-RDM.
         If spatial=True, spin-traces to the spatial MO basis.
         If with_core=True, re-embeds the frozen core electrons on the diagonal.
@@ -5592,7 +6198,7 @@ class DMRG(CASCI):
             state = self.dmrg.ground_state
 
         # Get Spin-Orbital RDM
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state.factors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(
                 state,
@@ -5664,7 +6270,7 @@ class DMRG(CASCI):
             state = self.dmrg.ground_state
 
         # Get Spin-Orbital RDM
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state.factors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(
                 state,
@@ -5765,7 +6371,7 @@ class DMRG(CASCI):
         return self.dmrg.make_local_site_rdm(idx=idx)
 
     def make_diagonal_rdm2(self, idx_pairs=None):
-        """
+        r"""
         Calculate the diagonal blocks of the 2-site reduced density matrix.
 
         Extracts the two-site quantum state :math:`\rho_{ij}` needed to compute
@@ -5818,7 +6424,7 @@ if __name__=='__main__':
 
     # mol.basis = 'aug-ccpvdz'
     mol.basis = 'ccpvdz'
-    mol.build(driver='pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
 

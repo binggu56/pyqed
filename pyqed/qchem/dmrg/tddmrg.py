@@ -4,8 +4,25 @@ from scipy.linalg import expm
 from pyqed.mps import MPS
 from pyqed.mps.mps import MPO as TensorMPO
 from pyqed.mps.mps import symmetric_to_dense
-from pyqed.mps.tdmps import TDMPS
+from pyqed.mps.tdmps import _normalize_projection_setting, TDMPS
 from pyqed.mps.decompose import decompose, tt_to_tensor
+from pyqed.mps.symmetry import AbelianSector
+from pyqed.mps.nonabelian import MPS as NonabelianMPS
+from pyqed.mps.nonabelian.models import (
+    build_spatial_one_body_reduced_mpo,
+    build_spatial_spinfree_eri_mpo,
+)
+from pyqed.mps.nonabelian.mpo import (
+    direct_sum_rank_coupled_mpo,
+    scale_mpo_chain,
+    sum_mpo_chains,
+)
+from pyqed.mps.nonabelian.environment import contract_chain_expectation
+from pyqed.mps.nonabelian.sweep import (
+    MovingEnvironment as SU2MovingEnvironment,
+    _identity_mpo_factors_for_sites_and_mpo,
+)
+from pyqed.mps.nonabelian.tdvp import two_site_tdvp_step as su2_two_site_tdvp_step
 
 from ..rttdhf import gaussian_pulse
 from .dmrg import DMRG, _build_one_body_tensor_mpo, BasisSimpleElectron
@@ -116,7 +133,7 @@ def _dense_mpo_for_taylor(mpo):
         return mpo
     return TensorMPO(
         [_mpo_site_to_dense_factor(site) for site in factors],
-        homogenous=False,
+        homogeneous=False,
     )
 
 
@@ -154,7 +171,8 @@ class TDDMRG(DMRG):
     Quantum-chemistry time-dependent DMRG wrapper built on top of `TDMPS`.
 
     This class reuses the active-space Hamiltonian MPO construction from the
-    static `DMRG` driver and exposes a dense-MPS propagation interface.
+    static `DMRG` driver. Abelian calculations use ``TDMPS``; SU(2)
+    calculations retain the non-Abelian reduced MPS and MPO throughout TDVP.
     """
 
     def __init__(
@@ -169,6 +187,9 @@ class TDDMRG(DMRG):
         low_rank_mpo=False,
         low_rank_mpo_bond=None,
         low_rank_mpo_batch_size=4,
+        symmetry=None,
+        spatial_site_basis="fully_reduced",
+        dmrg_performance="auto",
     ):
         super().__init__(
             mf,
@@ -182,6 +203,9 @@ class TDDMRG(DMRG):
             low_rank_mpo=low_rank_mpo,
             low_rank_mpo_bond=low_rank_mpo_bond,
             low_rank_mpo_batch_size=low_rank_mpo_batch_size,
+            symmetry=symmetry,
+            spatial_site_basis=spatial_site_basis,
+            dmrg_performance=dmrg_performance,
         )
         self.bond_dim = None
         self.tdmps = None
@@ -197,12 +221,26 @@ class TDDMRG(DMRG):
         self.energy_drift = None
         self.time_reversal_diagnostic = None
         self.tdvp_truncation_errors = None
+        self.tdvp_propagation_backends = None
+        self.tdvp_moving_environment_stats = None
         self._interaction_mpo_cache = None
+        self._native_interaction_mpo_cache = None
+        self._native_affine_static_mpo_cache = None
+        self._native_dynamic_mpo_bulk_cache = None
+        self._native_dynamic_mpo_cache_key = None
         self._interaction_spatial_cache = None
         self._interaction_unitary_cache = None
 
     @staticmethod
     def _mps_bond_dim(psi):
+        if isinstance(psi, NonabelianMPS):
+            dims = [
+                int(block.shape[axis])
+                for site in psi.sites
+                for block in site.data.values()
+                for axis in (0, 2)
+            ]
+            return max(dims, default=1)
         if not isinstance(psi, MPS) or not psi.factors:
             return None
         dims = []
@@ -228,7 +266,7 @@ class TDDMRG(DMRG):
         return self.bond_dim
 
     def _use_exact_dense_td(self):
-        return (2 * self.ncas) <= 8
+        return not self._has_nonabelian_symmetry() and (2 * self.ncas) <= 8
 
     def _state_from_dense_vector(self, vec):
         if self.H is not None:
@@ -241,13 +279,27 @@ class TDDMRG(DMRG):
         factors = decompose(tensor, rank=tensor.size)
         return MPS(factors, labels=["lv", "p", "rv"]).normalize()
 
-    def _run_exact_dense_td(self, psi, dt, steps, observables, field=None, t0=0.0):
+    def _run_exact_dense_td(
+        self,
+        psi,
+        dt,
+        steps,
+        observables,
+        field=None,
+        t0=0.0,
+        interaction_mpo=None,
+    ):
         h_dense = _mpo_to_dense_matrix(self._get_td_hamiltonian())
         obs_dense = [_mpo_to_dense_matrix(op) for op in observables]
 
         interaction_dense = None
         if field is not None:
-            interaction_dense = [_mpo_to_dense_matrix(self.get_interaction_mpo(axis=i)) for i in range(3)]
+            interactions = (
+                self.get_interaction_mpo()
+                if interaction_mpo is None
+                else interaction_mpo
+            )
+            interaction_dense = [_mpo_to_dense_matrix(operator) for operator in interactions]
 
         checkpoints = list(range(1, steps + 1))
         self.times = float(t0) + np.asarray(checkpoints, dtype=float) * dt
@@ -341,6 +393,10 @@ class TDDMRG(DMRG):
 
     def _clear_interaction_caches(self):
         self._interaction_mpo_cache = None
+        self._native_interaction_mpo_cache = None
+        self._native_affine_static_mpo_cache = None
+        self._native_dynamic_mpo_bulk_cache = None
+        self._native_dynamic_mpo_cache_key = None
         self._interaction_spatial_cache = None
         self._interaction_unitary_cache = None
 
@@ -357,7 +413,7 @@ class TDDMRG(DMRG):
                 for p in range(phys_dim):
                     core[0, 0, p, p] = 1.0
             factors.append(core)
-        return TensorMPO(factors, homogenous=False)
+        return TensorMPO(factors, homogeneous=False)
 
     def optimize_ground_state(self, *args, **kwargs):
         """Run the static DMRG optimizer and keep the converged state for propagation."""
@@ -380,11 +436,24 @@ class TDDMRG(DMRG):
 
     def _auto_ground_state_kwargs(self, *, projection=None):
         del projection
+        if self._has_nonabelian_symmetry():
+            return {
+                "D": self._set_bond_dim(),
+                "symmetry": "su2",
+                "compute_s2": False,
+            }
         return {
             "D": self._set_bond_dim(),
             "symmetry_list": ["charge", "sz"],
             "compute_s2": False,
         }
+
+    def _has_nonabelian_symmetry(self):
+        sym_mgr = getattr(self, "sym_mgr", None)
+        return bool(
+            sym_mgr is not None and getattr(sym_mgr, "has_nonabelian", False)
+            or "su2" in tuple(getattr(self, "symmetry", None) or ())
+        )
 
     def _ensure_ground_state_for_run(self, *, projection=None):
         if self._has_ground_state():
@@ -438,6 +507,22 @@ class TDDMRG(DMRG):
             return guess.copy()
         return self._default_initial_state()
 
+    def _block_sparse_requested(self, projection):
+        if self._has_nonabelian_symmetry():
+            return False
+        return (
+            _is_block_sparse_projection(projection)
+            and hasattr(self, "_tdvp_sector_settings")
+        )
+
+    def _is_quantum_number_state(self, state):
+        return bool(
+            state is not None
+            and isinstance(state, MPS)
+            and state.factors
+            and hasattr(state.factors[0], "qns")
+        )
+
     def default_initial_condition(self, D=None, *, projection=None):
         """Return the default real-time initial condition for ``run(psi0=...)``."""
         if D is not None:
@@ -448,10 +533,16 @@ class TDDMRG(DMRG):
         )
 
     def _initial_state_for_run(self, psi0, *, projection=None):
-        block_sparse = (
-            _is_block_sparse_projection(projection)
-            and hasattr(self, "_tdvp_sector_settings")
-        )
+        if self._has_nonabelian_symmetry():
+            if psi0 is None:
+                self._ensure_ground_state_for_run(projection=projection)
+                psi0 = self.ground_state
+            if not isinstance(psi0, NonabelianMPS):
+                raise TypeError(
+                    "Native SU(2) TDDMRG requires a reduced non-Abelian MPS initial state."
+                )
+            return psi0.copy()
+        block_sparse = self._block_sparse_requested(projection)
         if psi0 is None:
             self._ensure_ground_state_for_run(
                 projection=projection,
@@ -459,19 +550,64 @@ class TDDMRG(DMRG):
             if block_sparse:
                 return self._default_block_sparse_initial_state()
             return self._default_initial_state()
-        if (
-            block_sparse
-            and isinstance(psi0, MPS)
-            and psi0.factors
-            and hasattr(psi0.factors[0], "qns")
-        ):
+        if block_sparse and self._is_quantum_number_state(psi0):
             return psi0.copy()
         return self._ensure_dense_mps(psi0)
 
     def _resolve_projection(self, integrator, projection):
         """Resolve an optional TDVP projection selection for this driver."""
-        del integrator
-        return None if projection is False else projection
+        if self._has_nonabelian_symmetry():
+            if projection not in (None, True, "su2", "SU2"):
+                raise ValueError("SU(2) TDDMRG uses the native projection='su2' path.")
+            return "su2"
+        if projection is False:
+            return None
+        if projection is not None or self._use_exact_dense_td():
+            return _normalize_projection_setting(projection)
+        key = str(integrator).lower().replace("_", "-")
+        if key in {"tdvp", "tdvp1", "1tdvp", "one-site-tdvp", "1site-tdvp"}:
+            return "block-sparse"
+        return _normalize_projection_setting(projection)
+
+    def _tdvp_sector_settings(self):
+        sym_mgr = getattr(self, "sym_mgr", None)
+        if sym_mgr is None or not getattr(sym_mgr, "enabled", False):
+            sym_mgr = None
+        if sym_mgr is not None and getattr(sym_mgr, "has_nonabelian", False):
+            return {}
+
+        local_state_labels = ("empty", "occ") if self.site == "spin_orbital" else ("empty", "up", "down", "double")
+        local_sectors = []
+        for site in range(int(self.L)):
+            if sym_mgr is not None:
+                local_sectors.append([
+                    sym_mgr.get_phys_qn(site, label, site_model=self.site)
+                    for label in local_state_labels
+                ])
+            else:
+                if self.site == "spin_orbital":
+                    empty = AbelianSector(("charge", "sz"), (0, 0))
+                    occ = AbelianSector(("charge", "sz"), (1, 1 if (site % 2 == 0) else -1))
+                    local_sectors.append([empty, occ])
+                elif self.site == "spatial":
+                    local_sectors.append([
+                        AbelianSector(("charge", "sz"), (0, 0)),
+                        AbelianSector(("charge", "sz"), (1, 1)),
+                        AbelianSector(("charge", "sz"), (1, -1)),
+                        AbelianSector(("charge", "sz"), (2, 0)),
+                    ])
+                else:
+                    return {}
+        return {
+            "local_sectors": local_sectors,
+            "target_sector": self._tdvp_target_sector(sym_mgr),
+        }
+
+    def _tdvp_target_sector(self, sym_mgr):
+        nelec = int(sum(self.nelecas)) if isinstance(self.nelecas, (tuple, list)) else int(self.nelecas)
+        if sym_mgr is None:
+            return AbelianSector(("charge", "sz"), (nelec, 0 if self.spin is None else int(self.spin)))
+        return sym_mgr.get_target_qn(nelec, 0 if self.spin is None else int(self.spin))
 
     def _normalize_observables(self, e_ops):
         if e_ops is None:
@@ -486,7 +622,7 @@ class TDDMRG(DMRG):
                 if key in {"h", "ham", "hamiltonian"}:
                     if self.H is None:
                         self.build()
-                    h_mpo = TensorMPO([w.copy() for w in self.H], homogenous=False)
+                    h_mpo = TensorMPO([w.copy() for w in self.H], homogeneous=False)
                     cache_key = getattr(self, "_hamiltonian_mpo_cache_key", None)
                     if cache_key is not None:
                         h_mpo._pyqed_cache_key = cache_key
@@ -508,7 +644,7 @@ class TDDMRG(DMRG):
                 continue
 
             if _is_mpo_like(op):
-                copied = TensorMPO(_copy_mpo_factors(op.factors), homogenous=False)
+                copied = TensorMPO(_copy_mpo_factors(op.factors), homogeneous=False)
                 cache_key = getattr(op, "_pyqed_cache_key", None)
                 if cache_key is not None:
                     copied._pyqed_cache_key = cache_key
@@ -516,7 +652,7 @@ class TDDMRG(DMRG):
                 continue
 
             if _is_mpo_factor_list(op):
-                normalized.append(TensorMPO(_copy_mpo_factors(op), homogenous=False))
+                normalized.append(TensorMPO(_copy_mpo_factors(op), homogeneous=False))
                 continue
 
             raise TypeError(f"Unsupported observable type: {type(op)}")
@@ -528,11 +664,430 @@ class TDDMRG(DMRG):
             self.build(mo_coeff=mo_coeff)
         elif self.H is None:
             self.build()
-        out = TensorMPO([w.copy() for w in self.H], homogenous=False)
+        out = TensorMPO([w.copy() for w in self.H], homogeneous=False)
         cache_key = getattr(self, "_hamiltonian_mpo_cache_key", None)
         if cache_key is not None:
             out._pyqed_cache_key = cache_key
         return out
+
+    def _native_su2_hamiltonian(self):
+        active = getattr(self, "_active_hamiltonian", None)
+        factors = None if active is None else getattr(active, "mpo", None)
+        if factors is None:
+            factors = self.H
+        if factors is None or len(factors) != int(self.ncas):
+            raise RuntimeError("The native SU(2) Hamiltonian MPO is not available.")
+        if not all(hasattr(factor, "phys_in_leg") for factor in factors):
+            raise RuntimeError(
+                "SU(2) TDDMRG requires the reduced non-Abelian Hamiltonian MPO."
+            )
+        return tuple(factors)
+
+    def _native_su2_boundary_environment(self):
+        """Return the persistent reduced C++ boundary owner, when available."""
+
+        active = getattr(self, "_active_hamiltonian", None)
+        return None if active is None else getattr(active, "moving_environment", None)
+
+    def _native_su2_interactions(self, interaction_mpo=None):
+        if interaction_mpo is None:
+            if self._native_interaction_mpo_cache is None:
+                hamiltonian = self._native_su2_hamiltonian()
+                site_legs = [factor.phys_in_leg for factor in hamiltonian]
+                self._native_interaction_mpo_cache = tuple(
+                    tuple(build_spatial_one_body_reduced_mpo(site_legs, operator))
+                    for operator in self.get_interaction_spatial()
+                )
+            return self._native_interaction_mpo_cache
+
+        factors = getattr(interaction_mpo, "mpo", None)
+        if factors is None:
+            factors = getattr(interaction_mpo, "factors", None)
+        if factors is not None:
+            interactions = [tuple(factors)]
+        else:
+            values = list(interaction_mpo)
+            if len(values) == int(self.ncas) and all(
+                hasattr(factor, "phys_in_leg") for factor in values
+            ):
+                interactions = [tuple(values)]
+            else:
+                interactions = []
+                for operator in values:
+                    chain = getattr(operator, "mpo", None)
+                    if chain is None:
+                        chain = getattr(operator, "factors", operator)
+                    interactions.append(tuple(chain))
+
+        if len(interactions) not in (1, 3):
+            raise ValueError(
+                "Native SU(2) interaction_mpo must be one reduced MPO or three Cartesian reduced MPOs."
+            )
+        for chain in interactions:
+            if len(chain) != int(self.ncas) or not all(
+                hasattr(factor, "phys_in_leg") for factor in chain
+            ):
+                raise TypeError(
+                    "Native SU(2) interaction MPOs must contain one reduced factor per spatial site."
+                )
+        return tuple(interactions)
+
+    def _native_su2_affine_static_hamiltonian(self):
+        if self._native_affine_static_mpo_cache is not None:
+            return self._native_affine_static_mpo_cache
+        production = self._native_su2_hamiltonian()
+        site_legs = [factor.phys_in_leg for factor in production]
+        h1e = np.asarray(self.h1e)
+        if h1e.ndim == 3:
+            h1e = h1e[0]
+        if h1e.shape != (int(self.ncas), int(self.ncas)):
+            raise ValueError("Native SU(2) one-electron integrals have an invalid shape.")
+        electron_count = (
+            int(sum(self.nelecas))
+            if isinstance(self.nelecas, (tuple, list))
+            else int(self.nelecas)
+        )
+        if electron_count > 0 and self.e_core:
+            h1e = np.array(h1e, copy=True)
+            h1e += (float(self.e_core) / electron_count) * np.eye(int(self.ncas))
+        terms = [build_spatial_one_body_reduced_mpo(site_legs, h1e)]
+        if self.h2e is not None:
+            eri = np.asarray(self.h2e)
+            if eri.ndim == 6:
+                eri = eri[0, 0]
+            terms.append(
+                build_spatial_spinfree_eri_mpo(
+                    site_legs,
+                    eri,
+                    include_half=True,
+                )
+            )
+        self._native_affine_static_mpo_cache = tuple(sum_mpo_chains(*terms))
+        return self._native_affine_static_mpo_cache
+
+    def _native_su2_dynamic_hamiltonian(self, hamiltonian, interactions, field_vector):
+        field_vector = np.asarray(field_vector, dtype=float).reshape(3)
+        if len(interactions) == 1:
+            coefficients = (-field_vector[0],)
+        elif len(interactions) == 3:
+            coefficients = tuple(-field_vector[axis] for axis in range(3))
+        else:
+            raise ValueError("Native SU(2) propagation expects one or three interaction MPOs.")
+        active_interactions = tuple(
+            (tuple(operator), coefficient)
+            for operator, coefficient in zip(interactions, coefficients)
+            if operator
+        )
+        chains = (
+            tuple(hamiltonian),
+            *(operator for operator, _coefficient in active_interactions),
+        )
+        cache_key = tuple(tuple(id(core) for core in chain) for chain in chains)
+        if self._native_dynamic_mpo_cache_key != cache_key:
+            self._native_dynamic_mpo_bulk_cache = tuple(sum_mpo_chains(*chains))
+            self._native_dynamic_mpo_cache_key = cache_key
+
+        first = chains[0][0]
+        for operator, coefficient in active_interactions:
+            scaled_first = scale_mpo_chain(operator, coefficient, site=0)[0]
+            first = direct_sum_rank_coupled_mpo(
+                first,
+                scaled_first,
+                site=0,
+                nsites=len(hamiltonian),
+            )
+        return (
+            first,
+            *self._native_dynamic_mpo_bulk_cache[1:],
+        )
+
+    def _native_su2_update_normal_hamiltonian(
+        self,
+        owner,
+        field_vector,
+        *,
+        mpo_factors=None,
+        moving_environment=None,
+    ):
+        """Update the production NC Hamiltonian through its one-body integrals."""
+
+        h1e = np.asarray(self.h1e)
+        if h1e.ndim == 3:
+            h1e = h1e[0]
+        h1e = np.asarray(h1e, dtype=float)
+        for coefficient, interaction in zip(
+            np.asarray(field_vector, dtype=float).reshape(3),
+            self.get_interaction_spatial(),
+        ):
+            h1e = h1e - coefficient * np.asarray(interaction, dtype=float)
+        changed = bool(owner.update_h1(h1e))
+        from .backends.reduced import (
+            build_su2_normal_complementary_mpo,
+            refresh_su2_normal_complementary_mpo,
+        )
+
+        if mpo_factors is None:
+            return tuple(
+                build_su2_normal_complementary_mpo(
+                    owner,
+                    fully_reduced=True,
+                )
+            )
+        if changed:
+            refresh_su2_normal_complementary_mpo(owner, mpo_factors)
+            if moving_environment is not None:
+                moving_environment.refresh_hamiltonian()
+        return tuple(mpo_factors)
+
+    def _native_su2_restore_normal_hamiltonian(
+        self,
+        owner,
+        *,
+        mpo_factors=None,
+        moving_environment=None,
+    ):
+        h1e = np.asarray(self.h1e)
+        if h1e.ndim == 3:
+            h1e = h1e[0]
+        changed = bool(owner.update_h1(np.asarray(h1e, dtype=float)))
+        if changed and mpo_factors is not None:
+            from .backends.reduced import refresh_su2_normal_complementary_mpo
+
+            refresh_su2_normal_complementary_mpo(owner, mpo_factors)
+            if moving_environment is not None:
+                moving_environment.refresh_hamiltonian()
+
+    def _native_su2_observables(self, e_ops, hamiltonian):
+        if e_ops is None:
+            return []
+        items = [e_ops] if isinstance(e_ops, str) else list(e_ops)
+        observables = []
+        for operator in items:
+            if isinstance(operator, str):
+                key = operator.lower()
+                if key in {"h", "ham", "hamiltonian"}:
+                    observables.append(hamiltonian)
+                    continue
+                dipoles = {
+                    "mu_x": 0,
+                    "dipole_x": 0,
+                    "mu_y": 1,
+                    "dipole_y": 1,
+                    "mu_z": 2,
+                    "dipole_z": 2,
+                }
+                if key not in dipoles:
+                    raise ValueError(f"Unsupported native SU(2) observable string: {operator}")
+                observables.append(
+                    self._native_su2_interactions()[dipoles[key]]
+                )
+                continue
+            factors = getattr(operator, "mpo", None)
+            if factors is None:
+                factors = getattr(operator, "factors", operator)
+            factors = tuple(factors)
+            if len(factors) != int(self.ncas):
+                raise ValueError("A native SU(2) observable must have one MPO factor per site.")
+            observables.append(factors)
+        return observables
+
+    @staticmethod
+    def _native_su2_expectation(state, operator, identity):
+        denominator = contract_chain_expectation(state.sites, identity)
+        if abs(denominator) <= 1.0e-30:
+            raise ValueError("Cannot measure an observable on a zero-norm SU(2) MPS.")
+        numerator = contract_chain_expectation(state.sites, operator)
+        return numerator / denominator
+
+    def _run_native_su2_tdvp(
+        self,
+        state,
+        *,
+        dt,
+        steps,
+        e_ops,
+        interval,
+        integrator,
+        krylov_dim,
+        krylov_tol,
+        krylov_method,
+        measure_observables,
+        track_energy,
+        progress,
+        D,
+        t0,
+        field,
+        interaction_mpo,
+    ):
+        key = str(integrator).lower().replace("_", "-")
+        if key not in {
+            "tdvp",
+            "tdvp2",
+            "2tdvp",
+            "two-site-tdvp",
+            "2site-tdvp",
+        }:
+            raise ValueError("Native SU(2) TDDMRG currently supports two-site TDVP only.")
+        interval = int(interval)
+        if interval < 1:
+            raise ValueError("interval must be positive.")
+        hamiltonian = self._native_su2_hamiltonian()
+        boundary_environment = self._native_su2_boundary_environment()
+        interactions = (
+            None
+            if field is None
+            else self._native_su2_interactions(interaction_mpo)
+        )
+        normal_dynamic = bool(
+            interactions is not None
+            and interaction_mpo is None
+            and boundary_environment is not None
+            and callable(getattr(boundary_environment, "update_h1", None))
+        )
+        propagation_hamiltonian = (
+            hamiltonian
+            if interactions is None or normal_dynamic
+            else self._native_su2_affine_static_hamiltonian()
+        )
+        if normal_dynamic:
+            from .backends.reduced import build_su2_normal_complementary_mpo
+
+            propagation_hamiltonian = tuple(
+                build_su2_normal_complementary_mpo(
+                    boundary_environment,
+                    fully_reduced=True,
+                )
+            )
+        observables = self._native_su2_observables(e_ops, hamiltonian)
+        identity = _identity_mpo_factors_for_sites_and_mpo(state.sites, hamiltonian)
+        checkpoints = [index for index in range(1, int(steps) + 1) if index % interval == 0]
+        measured = []
+        energies = []
+        if track_energy:
+            energies.append(self._native_su2_expectation(state, hamiltonian, identity))
+        pre_norms = np.empty(int(steps), dtype=float)
+        pre_norm2 = np.empty(int(steps), dtype=float)
+        truncation_errors = np.empty(int(steps), dtype=float)
+        propagation_backends = []
+        checkpoint_set = set(checkpoints)
+        moving_environment = None
+        if interactions is None or normal_dynamic:
+            work = state.copy().right_canonicalize(
+                cutoff=0.0,
+                max_bond=None,
+                max_bond_mode="reduced",
+            )
+            moving_environment = SU2MovingEnvironment(
+                work.sites,
+                mpo_factors=propagation_hamiltonian,
+                su2_boundary_environment=boundary_environment,
+            )
+        else:
+            work = state
+        for step in range(1, int(steps) + 1):
+            midpoint = float(t0) + (step - 0.5) * dt
+            field_vector = self._field_vector(midpoint, field)
+            step_hamiltonian = (
+                propagation_hamiltonian
+                if interactions is None
+                else self._native_su2_update_normal_hamiltonian(
+                    boundary_environment,
+                    field_vector,
+                    mpo_factors=propagation_hamiltonian,
+                    moving_environment=moving_environment,
+                )
+                if normal_dynamic
+                else self._native_su2_dynamic_hamiltonian(
+                    propagation_hamiltonian,
+                    interactions,
+                    field_vector,
+                )
+            )
+            work, info = su2_two_site_tdvp_step(
+                work,
+                step_hamiltonian,
+                dt,
+                max_bond=self._set_bond_dim(D, psi=work),
+                cutoff=0.0,
+                max_bond_mode="reduced",
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                boundary_environment=boundary_environment,
+                moving_environment=moving_environment,
+            )
+            pre_norms[step - 1] = info["pre_normalization_norm"]
+            pre_norm2[step - 1] = info["pre_normalization_norm2"]
+            truncation_errors[step - 1] = info["truncation_error"]
+            propagation_backends.append(
+                tuple(
+                    update.get("local_objective", {}).get(
+                        "propagation_backend",
+                        "python",
+                    )
+                    for half_sweep in info["half_sweeps"]
+                    for update in half_sweep["updates"]
+                )
+            )
+            identity = _identity_mpo_factors_for_sites_and_mpo(work.sites, hamiltonian)
+            if track_energy:
+                energies.append(self._native_su2_expectation(work, hamiltonian, identity))
+            if step in checkpoint_set:
+                measured.append(
+                    [
+                        self._native_su2_expectation(work, operator, identity)
+                        for operator in observables
+                    ]
+                    if measure_observables
+                    else []
+                )
+            if progress:
+                print(f"SU(2) TDVP2 step {step}/{steps}", end="\r" if step < steps else "\n")
+
+        if normal_dynamic:
+            self._native_su2_restore_normal_hamiltonian(
+                boundary_environment,
+                mpo_factors=propagation_hamiltonian,
+                moving_environment=moving_environment,
+            )
+
+        self.projection = "su2"
+        self.tdmps = None
+        self.final_state = work
+        self.times = float(t0) + np.asarray(checkpoints, dtype=float) * dt
+        self.observables = np.asarray(measured, dtype=complex).reshape(
+            len(checkpoints),
+            len(observables) if measure_observables else 0,
+        )
+        self.fields = np.asarray(
+            [self._field_vector(float(t0) + checkpoint * dt, field) for checkpoint in checkpoints],
+            dtype=float,
+        ).reshape(len(checkpoints), 3)
+        self.pre_normalization_norms = pre_norms
+        self.pre_normalization_norm2 = pre_norm2
+        self.substep_pre_normalization_norms = None
+        self.energy_times = float(t0) + np.arange(int(steps) + 1, dtype=float) * dt
+        self.static_energies = np.asarray(energies, dtype=complex) if track_energy else None
+        self.energy_drift = (
+            None
+            if self.static_energies is None
+            else self.static_energies - self.static_energies[0]
+        )
+        self.tdvp_truncation_errors = truncation_errors
+        self.tdvp_propagation_backends = tuple(propagation_backends)
+        self.tdvp_moving_environment_stats = (
+            {
+                "persistent": False,
+                "su2_boundary_environment": (
+                    None
+                    if boundary_environment is None
+                    else boundary_environment.stats
+                ),
+            }
+            if moving_environment is None
+            else {"persistent": True, **moving_environment.stats}
+        )
+        return self
 
     def get_interaction_ao(self):
         op = np.asarray(self.mf.dipole(basis='ao'), dtype=float)
@@ -549,22 +1104,25 @@ class TDDMRG(DMRG):
             self.build()
 
         if self._interaction_mpo_cache is None:
-            ao_op = self.get_interaction_ao()
-            basis_sites = [BasisSimpleElectron(i) for i in range(2 * self.ncas)]
-            mpo_list = []
-            for comp in range(3):
-                spatial_matrix = self.mo_cas.conj().T @ ao_op[comp] @ self.mo_cas
-                if not np.any(np.abs(spatial_matrix) > 1e-14):
-                    mpo = self._zero_mpo(2 * self.ncas, dtype=np.asarray(spatial_matrix).dtype)
-                else:
-                    mpo, _ = _build_one_body_tensor_mpo(basis_sites, np.asarray(spatial_matrix))
-                mpo_list.append(mpo)
-            self._interaction_mpo_cache = tuple(mpo_list)
+            self._interaction_mpo_cache = [None, None, None]
+
+        components = range(3) if axis is None else (int(axis),)
+        ao_op = self.get_interaction_ao()
+        basis_sites = [BasisSimpleElectron(i) for i in range(2 * self.ncas)]
+        for comp in components:
+            if self._interaction_mpo_cache[comp] is not None:
+                continue
+            spatial_matrix = self.mo_cas.conj().T @ ao_op[comp] @ self.mo_cas
+            if not np.any(np.abs(spatial_matrix) > 1e-14):
+                mpo = self._zero_mpo(2 * self.ncas, dtype=np.asarray(spatial_matrix).dtype)
+            else:
+                mpo, _ = _build_one_body_tensor_mpo(basis_sites, np.asarray(spatial_matrix))
+            self._interaction_mpo_cache[comp] = mpo
 
         mpo_list = self._interaction_mpo_cache
         if axis is None:
-            return [TensorMPO([w.copy() for w in mpo.factors], homogenous=False) for mpo in mpo_list]
-        return TensorMPO([w.copy() for w in mpo_list[int(axis)].factors], homogenous=False)
+            return [TensorMPO([w.copy() for w in mpo.factors], homogeneous=False) for mpo in mpo_list]
+        return TensorMPO([w.copy() for w in mpo_list[int(axis)].factors], homogeneous=False)
 
     def get_interaction_spatial(self, axis=None):
         if self.mo_cas is None:
@@ -761,6 +1319,25 @@ class TDDMRG(DMRG):
         projection = self._resolve_projection(integrator, projection)
         psi = self._initial_state_for_run(psi0, projection=projection)
         bond_dim = self._set_bond_dim(D, psi=psi)
+        if self._has_nonabelian_symmetry():
+            return self._run_native_su2_tdvp(
+                psi,
+                dt=dt,
+                steps=steps,
+                e_ops=e_ops,
+                interval=interval,
+                integrator=integrator,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                measure_observables=measure_observables,
+                track_energy=track_energy,
+                progress=progress,
+                D=bond_dim,
+                t0=t0,
+                field=field,
+                interaction_mpo=interaction_mpo,
+            )
         observables = self._normalize_observables(e_ops)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
@@ -773,11 +1350,18 @@ class TDDMRG(DMRG):
                 observables=observables,
                 field=field,
                 t0=t0,
+                interaction_mpo=interaction_mpo,
             )
 
         sector_kwargs = {}
-        if projection is not None and hasattr(self, "_tdvp_sector_settings"):
+        if (
+            projection is not None
+            and _is_block_sparse_projection(projection)
+            and hasattr(self, "_tdvp_sector_settings")
+        ):
             sector_kwargs = dict(self._tdvp_sector_settings())
+            if not sector_kwargs:
+                projection = None
 
         hamiltonian = self._get_td_hamiltonian(mo_coeff=mo_coeff)
         integrator_key = str(integrator).lower().replace("_", "-")
@@ -869,6 +1453,148 @@ class TDDMRG(DMRG):
         projection = self._resolve_projection(integrator, projection)
         psi = self._initial_state_for_run(psi0, projection=projection)
         bond_dim = self._set_bond_dim(D, psi=psi)
+        if self._has_nonabelian_symmetry():
+            hamiltonian = self._native_su2_hamiltonian()
+            boundary_environment = self._native_su2_boundary_environment()
+            interactions = (
+                None
+                if field is None
+                else self._native_su2_interactions(interaction_mpo)
+            )
+            normal_dynamic = bool(
+                interactions is not None
+                and interaction_mpo is None
+                and boundary_environment is not None
+                and callable(getattr(boundary_environment, "update_h1", None))
+            )
+            propagation_hamiltonian = (
+                hamiltonian
+                if interactions is None or normal_dynamic
+                else self._native_su2_affine_static_hamiltonian()
+            )
+            if normal_dynamic:
+                from .backends.reduced import build_su2_normal_complementary_mpo
+
+                propagation_hamiltonian = tuple(
+                    build_su2_normal_complementary_mpo(
+                        boundary_environment,
+                        fully_reduced=True,
+                    )
+                )
+            returned = psi
+            moving_environment = None
+            if interactions is None or normal_dynamic:
+                returned = psi.copy().right_canonicalize(
+                    cutoff=0.0,
+                    max_bond=None,
+                    max_bond_mode="reduced",
+                )
+                moving_environment = SU2MovingEnvironment(
+                    returned.sites,
+                    mpo_factors=propagation_hamiltonian,
+                    su2_boundary_environment=boundary_environment,
+                )
+            for step in range(int(steps)):
+                midpoint = float(t0) + (step + 0.5) * dt
+                field_vector = self._field_vector(midpoint, field)
+                step_hamiltonian = (
+                    propagation_hamiltonian
+                    if interactions is None
+                    else self._native_su2_update_normal_hamiltonian(
+                        boundary_environment,
+                        field_vector,
+                        mpo_factors=propagation_hamiltonian,
+                        moving_environment=moving_environment,
+                    )
+                    if normal_dynamic
+                    else self._native_su2_dynamic_hamiltonian(
+                        propagation_hamiltonian,
+                        interactions,
+                        field_vector,
+                    )
+                )
+                returned, _ = su2_two_site_tdvp_step(
+                    returned,
+                    step_hamiltonian,
+                    dt,
+                    max_bond=bond_dim,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    boundary_environment=boundary_environment,
+                    moving_environment=moving_environment,
+                )
+            final_time = float(t0) + int(steps) * dt
+            for step in range(int(steps)):
+                midpoint = final_time - (step + 0.5) * dt
+                field_vector = self._field_vector(midpoint, field)
+                step_hamiltonian = (
+                    propagation_hamiltonian
+                    if interactions is None
+                    else self._native_su2_update_normal_hamiltonian(
+                        boundary_environment,
+                        field_vector,
+                        mpo_factors=propagation_hamiltonian,
+                        moving_environment=moving_environment,
+                    )
+                    if normal_dynamic
+                    else self._native_su2_dynamic_hamiltonian(
+                        propagation_hamiltonian,
+                        interactions,
+                        field_vector,
+                    )
+                )
+                returned, _ = su2_two_site_tdvp_step(
+                    returned,
+                    step_hamiltonian,
+                    -dt,
+                    max_bond=bond_dim,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    boundary_environment=boundary_environment,
+                    moving_environment=moving_environment,
+                )
+            if normal_dynamic:
+                self._native_su2_restore_normal_hamiltonian(
+                    boundary_environment,
+                    mpo_factors=propagation_hamiltonian,
+                    moving_environment=moving_environment,
+                )
+            identity = _identity_mpo_factors_for_sites_and_mpo(
+                psi.sites,
+                hamiltonian,
+            )
+            overlap = contract_chain_expectation(
+                psi.sites,
+                identity,
+                bra_sites=returned.sites,
+            )
+            norm_initial = contract_chain_expectation(psi.sites, identity)
+            returned_identity = _identity_mpo_factors_for_sites_and_mpo(
+                returned.sites,
+                hamiltonian,
+            )
+            norm_returned = contract_chain_expectation(
+                returned.sites,
+                returned_identity,
+            )
+            diagnostic = TDMPS.overlap_diagnostic(
+                overlap,
+                norm_initial,
+                norm_returned,
+            )
+            diagnostic.update(
+                {
+                    "steps": int(steps),
+                    "dt": float(dt),
+                    "t0": float(t0),
+                    "projection_backend": "su2",
+                    "native_reduced": True,
+                }
+            )
+            self.time_reversal_diagnostic = diagnostic
+            return diagnostic
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
 
@@ -906,11 +1632,19 @@ class TDDMRG(DMRG):
             return diagnostic
 
         sector_kwargs = {}
-        if projection is not None and hasattr(self, "_tdvp_sector_settings"):
+        if (
+            projection is not None
+            and _is_block_sparse_projection(projection)
+            and hasattr(self, "_tdvp_sector_settings")
+        ):
             sector_kwargs = dict(self._tdvp_sector_settings())
+            if not sector_kwargs:
+                projection = None
+
+        hamiltonian = self._get_td_hamiltonian(mo_coeff=mo_coeff)
 
         solver = TDMPS(
-            self._get_td_hamiltonian(mo_coeff=mo_coeff),
+            hamiltonian,
             D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,

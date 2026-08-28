@@ -6,6 +6,7 @@ Created on Sun Nov 16 22:07:30 2025
 @author: bingg
 """
 import numpy as np
+import time
 from scipy.linalg import eigh
 # from pyqed.qchem.mcscf.casci import CASCI
 from opt_einsum import contract
@@ -18,7 +19,7 @@ from pyqed.qchem.mcscf.casci import (
 # from pyqed.qchem.mcscf.casci import CASCI
 
 
-from pyqed.optimize import minimize
+from pyqed.optimize import OrbitalContractionPlan, minimize
 from pyqed.optimize import grad as opt_grad
 from pyqed.optimize import gradient as opt_gradient
 from pyqed.optimize import norm as opt_norm
@@ -57,23 +58,29 @@ class OrbitalDIIS:
         self.vectors = []
         self.errors = []
 
-    def update(self, U):
-        """Store the latest ``U`` and return a DIIS-mixed candidate if ready."""
+    def reset(self):
+        self.vectors.clear()
+        self.errors.clear()
 
-        self.vectors.append(U.copy())
-        if len(self.vectors) > 1:
-            self.errors.append((self.vectors[-1] - self.vectors[-2]).copy())
+    def update(self, base, candidate, *, ncore, ncas, active_active):
+        """Extrapolate the outer CO fixed-point residual ``candidate - base``."""
 
-        # ``errors`` is always one item shorter than ``vectors`` because each
-        # error is defined as a difference between consecutive iterates.
+        candidate = _align_redundant_gauge(
+            base,
+            candidate,
+            ncore,
+            ncas,
+            active_active=active_active,
+        )
+        self.vectors.append(candidate.copy())
+        self.errors.append((candidate - base).copy())
+
         if len(self.errors) > self.max_space:
             self.errors.pop(0)
             self.vectors.pop(0)
 
-        # The first extrapolated guess needs at least two error vectors, which
-        # matches the original main-branch behavior.
         if len(self.errors) < self.start:
-            return U
+            return candidate
 
         bsize = len(self.errors)
         bmat = -1.0 * np.ones((bsize + 1, bsize + 1), dtype=float)
@@ -84,60 +91,76 @@ class OrbitalDIIS:
         for i in range(bsize):
             for j in range(bsize):
                 bmat[i, j] = np.vdot(self.errors[i], self.errors[j]).real
+        bmat[:bsize, :bsize] += np.eye(bsize) * self.regularization
 
         try:
             coeff = np.linalg.solve(bmat, rhs)
         except np.linalg.LinAlgError:
-            try:
-                bmat[:-1, :-1] += np.eye(bsize) * self.regularization
-                coeff = np.linalg.solve(bmat, rhs)
-            except np.linalg.LinAlgError:
-                return U
+            return candidate
+        if np.max(np.abs(coeff[:-1])) > 5.0:
+            return candidate
 
-        U_new = np.zeros_like(U, dtype=U.dtype)
-        for i, weight in enumerate(coeff[:-1]):
-            U_new += weight * self.vectors[i + 1]
+        U_new = np.zeros_like(candidate, dtype=candidate.dtype)
+        for weight, vector in zip(coeff[:-1], self.vectors):
+            U_new += weight * vector
 
-        return _orthonormalize_columns(U_new)
+        U_new = _orthonormalize_columns(U_new)
+        return _align_redundant_gauge(
+            base,
+            U_new,
+            ncore,
+            ncas,
+            active_active=active_active,
+        )
 
 
-def _apply_orbital_diis(diis_helper, U, h1e, eri, dm1, dm2, current_energy):
-    """Accept a DIIS-mixed ``U`` only if it improves the current objective.
-
-    The historical main-branch DIIS scheme extrapolated blindly, which can
-    overshoot when combined with the newer RCG/L-BFGS optimizers on ``bg``.
-    We keep the same Pulay idea, but guard it with the same orbital objective
-    that the minimizer is currently solving.
-    """
+def _apply_orbital_diis(
+    diis_helper, base, candidate, *, ncore, ncas, active_active
+):
+    """Apply residual-based DIIS to the outer CO fixed-point map."""
 
     if diis_helper is None:
-        return U
-
-    U_diis = diis_helper.update(U)
-    if U_diis is U:
-        return U
-
-    candidate_energy = energy(U_diis, h1e, eri, dm1, dm2)
-    current_energy = np.asarray(current_energy).real.item()
-    candidate_energy = np.asarray(candidate_energy).real.item()
-
-    if np.isfinite(candidate_energy) and candidate_energy <= current_energy + 1.0e-10:
-        return U_diis
-    return U
+        return candidate
+    return diis_helper.update(
+        base,
+        candidate,
+        ncore=ncore,
+        ncas=ncas,
+        active_active=active_active,
+    )
 
 
-def _fresh_casci_like(source):
+def _align_redundant_gauge(base, candidate, ncore, ncas, *, active_active):
+    """Align only orbital blocks that are redundant for the active solver."""
+
+    base = np.asarray(base)
+    aligned = np.asarray(candidate).copy()
+    blocks = [(0, int(ncore))]
+    if not active_active:
+        blocks.append((int(ncore), int(ncore) + int(ncas)))
+    for start, stop in blocks:
+        if stop - start <= 0:
+            continue
+        block = slice(start, stop)
+        overlap = aligned[:, block].conj().T @ base[:, block]
+        left, _, right_h = np.linalg.svd(overlap, full_matrices=False)
+        aligned[:, block] = aligned[:, block] @ (left @ right_h)
+    return aligned
+
+
+def _fresh_casci_like(source, *, solver_cls=None):
     """Build a fresh CASCI object while preserving solver configuration."""
 
     if hasattr(source, "D"):
-        mc = source.__class__(
+        cls = source.__class__ if solver_cls is None else solver_cls
+        mc = cls(
             source.mf,
             ncas=source.ncas,
             nelecas=source.nelecas,
             D=source.D,
             init_guess=getattr(source, "init_guess", "hf"),
             m_warmup=getattr(source, "m_warmup", None),
-            tol=getattr(source, "tol", 1.0e-6),
+            tol=getattr(source, "dmrg_conv_tol", getattr(source, "tol", 1.0e-6)),
             low_rank_mpo=getattr(source, "low_rank_mpo", False),
             low_rank_mpo_bond=getattr(source, "low_rank_mpo_bond", None),
             low_rank_mpo_batch_size=getattr(source, "low_rank_mpo_batch_size", 4),
@@ -145,8 +168,8 @@ def _fresh_casci_like(source):
             spatial_reduced_mpo=getattr(source, "spatial_reduced_mpo", None),
             symmetry=getattr(source, "symmetry", None),
             spatial_site_basis=getattr(source, "spatial_site_basis", "canonical"),
-            integral_backend=getattr(source, "integral_backend", "auto"),
-            spatial_abelian_mpo=getattr(source, "spatial_abelian_mpo", "grouped"),
+            integral_backend=getattr(source, "integral_backend_override", None),
+            spatial_abelian_mpo=getattr(source, "spatial_abelian_mpo", "auto"),
             spatial_abelian_symbolic_algo=getattr(
                 source,
                 "spatial_abelian_symbolic_algo",
@@ -217,6 +240,16 @@ def _fresh_casci_like(source):
                 "spatial_exact_component_compression_max_group_size",
                 64,
             ),
+            spatial_enable_cpp_boundary_r=getattr(
+                source,
+                "spatial_enable_cpp_boundary_r",
+                False,
+            ),
+            spatial_validate_cpp_boundary_r=getattr(
+                source,
+                "spatial_validate_cpp_boundary_r",
+                True,
+            ),
             spatial_enable_cpp_boundary_p=getattr(
                 source,
                 "spatial_enable_cpp_boundary_p",
@@ -237,7 +270,7 @@ def _fresh_casci_like(source):
                 "spatial_direct_operator_batch_min_entries",
                 2,
             ),
-            dmrg_performance=getattr(source, "dmrg_performance", "block2-like"),
+            dmrg_performance=getattr(source, "dmrg_performance", "auto"),
             abelian_matvec_options=getattr(source, "abelian_matvec_options", None),
             debug_complementary_action_check=getattr(
                 source,
@@ -284,11 +317,91 @@ def _fresh_casci_like(source):
         if value is not None:
             setattr(mc, name, value)
     mc.use_cholesky_integrals = getattr(source, 'use_cholesky_integrals', False)
+    mc._su2_runtime = getattr(
+        source,
+        "_su2_runtime",
+        getattr(source, "_active_hamiltonian", None),
+    )
     mc.binary = getattr(source, 'binary', None)
     mc.direct_connectivity = getattr(source, 'direct_connectivity', None)
     mc.SC1 = getattr(source, 'SC1', None)
     mc.SC2 = getattr(source, 'SC2', None)
     return mc
+
+
+def _is_su2_dmrg(mc):
+    """Return whether ``mc`` owns the reduced SU(2) DMRG runtime."""
+
+    symmetry = getattr(mc, "symmetry", ()) or ()
+    if isinstance(symmetry, str):
+        symmetry = (symmetry,)
+    return bool(
+        hasattr(mc, "D")
+        and "su2" in symmetry
+        and getattr(mc, "spatial_reduced_mpo", False)
+    )
+
+
+def _fresh_macro_casci(source, *, rebuild_runtime=False):
+    """Create an orbital-trial solver, optionally rebuilding SU(2) routes."""
+
+    mc = _fresh_casci_like(source)
+    if rebuild_runtime and _is_su2_dmrg(mc):
+        mc._su2_runtime = None
+    return mc
+
+
+def _run_macro_casci(
+    source,
+    *args,
+    warm_start=True,
+    method="direct_ci",
+    **kwargs,
+):
+    """Run one CO active solve with a clean retry for stale SU(2) routes."""
+
+    def is_stale_route_error(exc):
+        message = str(exc).lower()
+        return (
+            "route" in message
+            and ("incompatible" in message or "inconsistent" in message)
+            and (
+                "shape" in message
+                or "dimension" in message
+                or "topology" in message
+            )
+        )
+
+    def solve(owner):
+        trial = _fresh_macro_casci(owner)
+        if warm_start:
+            _wguess(owner, trial)
+        try:
+            _run_casci_like(trial, *args, method=method, **kwargs)
+        except ValueError as exc:
+            if not _is_su2_dmrg(trial) or not is_stale_route_error(exc):
+                raise
+            trial = _fresh_macro_casci(owner, rebuild_runtime=True)
+            if warm_start:
+                _wguess(owner, trial)
+            _run_casci_like(trial, *args, method=method, **kwargs)
+            trial._co_su2_runtime_rebuilt = True
+        else:
+            trial._co_su2_runtime_rebuilt = False
+        return trial
+
+    trial = solve(source)
+    solver_retried = bool(
+        _is_su2_dmrg(trial) and not _solver_converged(trial)
+    )
+    if solver_retried:
+        rebuilt = bool(getattr(trial, "_co_su2_runtime_rebuilt", False))
+        trial = solve(trial)
+        trial._co_su2_runtime_rebuilt = bool(
+            rebuilt or getattr(trial, "_co_su2_runtime_rebuilt", False)
+        )
+    trial._co_solver_retried = solver_retried
+    return trial
 
 
 def _run_casci_like(mc, *args, method="direct_ci", **kwargs):
@@ -315,23 +428,149 @@ def _wguess(src, dst, state=0):
         return
 
 
-def _cap(cap0, tr):
-    if tr is None:
-        return cap0
-    if cap0 is None:
-        return tr
-    return min(float(cap0), float(tr))
+def _physical_orbital_gradient(
+    U, euclidean_gradient, ncore, ncas, *, active_active
+):
+    """Remove only gauge blocks redundant for the chosen active solver."""
+
+    components = _orbital_gradient_components(
+        U,
+        euclidean_gradient,
+        ncore,
+        ncas,
+    )
+    gradient = components["nonredundant"]
+    if active_active:
+        gradient = gradient + components["active_active"]
+    return gradient
 
 
-def _gn(U, h1e, eri, dm1, dm2):
-    g = opt_gradient(U, h1e, eri, dm1, dm2)
-    return float(opt_norm(opt_grad(U, g)))
+def _orbital_gradient_components(U, euclidean_gradient, ncore, ncas):
+    """Return nonredundant, active-active, and discarded core-core blocks."""
+
+    tangent = opt_grad(U, euclidean_gradient)
+    vertical = U.conj().T @ tangent
+    horizontal = tangent - U @ vertical
+
+    ncore = int(ncore)
+    ncas = int(ncas)
+    core_active = np.zeros_like(vertical)
+    active_internal = np.zeros_like(vertical)
+    core_internal = np.zeros_like(vertical)
+    active = slice(ncore, ncore + ncas)
+    core = slice(0, ncore)
+    core_active[core, active] = vertical[core, active]
+    core_active[active, core] = vertical[active, core]
+    active_internal[active, active] = vertical[active, active]
+    core_internal[core, core] = vertical[core, core]
+    return {
+        "nonredundant": horizontal + U @ core_active,
+        "active_active": U @ active_internal,
+        "core_core": U @ core_internal,
+    }
+
+
+def _gn_details(
+    U,
+    h1e,
+    eri,
+    dm1,
+    dm2,
+    contraction_plan=None,
+    *,
+    ncore=0,
+    ncas,
+    active_active=False,
+):
+    gradient_fn = (
+        opt_gradient if contraction_plan is None else contraction_plan.gradient
+    )
+    euclidean = gradient_fn(U, h1e, eri, dm1, dm2)
+    components = _orbital_gradient_components(U, euclidean, ncore, ncas)
+    nonredundant = float(opt_norm(components["nonredundant"]))
+    active_norm = float(opt_norm(components["active_active"]))
+    total = float(
+        opt_norm(
+            components["nonredundant"]
+            + (components["active_active"] if active_active else 0.0)
+        )
+    )
+    return {
+        "total": total,
+        "nonredundant": nonredundant,
+        "active_active": active_norm,
+        "core_core_discarded": float(opt_norm(components["core_core"])),
+    }
+
+
+def _gn(
+    U,
+    h1e,
+    eri,
+    dm1,
+    dm2,
+    contraction_plan=None,
+    *,
+    ncore=0,
+    ncas=None,
+    active_active=False,
+):
+    gradient_fn = (
+        opt_gradient if contraction_plan is None else contraction_plan.gradient
+    )
+    if ncas is None:
+        g = gradient_fn(U, h1e, eri, dm1, dm2)
+        return float(opt_norm(opt_grad(U, g)))
+    return _gn_details(
+        U,
+        h1e,
+        eri,
+        dm1,
+        dm2,
+        contraction_plan,
+        ncore=ncore,
+        ncas=ncas,
+        active_active=active_active,
+    )["total"]
+
+
+def _limit_stiefel_displacement(base, candidate, trust_radius):
+    """Apply a trust radius to the complete CO macro displacement."""
+
+    base = np.asarray(base)
+    candidate = _orthonormalize_columns(np.asarray(candidate))
+    displacement = float(opt_norm(candidate - base))
+    if trust_radius is None or displacement <= float(trust_radius):
+        return candidate, displacement
+
+    radius = float(trust_radius)
+    if radius <= 0.0:
+        return base.copy(), 0.0
+
+    direction = candidate - base
+    lo = 0.0
+    hi = 1.0
+    limited = base.copy()
+    limited_norm = 0.0
+    # Polar projection can change the chord length slightly. A short bisection
+    # makes the returned displacement a genuine hard macro trust radius.
+    for _ in range(32):
+        fraction = 0.5 * (lo + hi)
+        trial = _orthonormalize_columns(base + fraction * direction)
+        trial_norm = float(opt_norm(trial - base))
+        if trial_norm <= radius:
+            lo = fraction
+            limited = trial
+            limited_norm = trial_norm
+        else:
+            hi = fraction
+    return limited, limited_norm
 
 
 def _sdiag(mc):
     dmrg = getattr(mc, "dmrg", None)
     hist = getattr(dmrg, "sweep_history", None)
-    out = {"solver": bool(getattr(dmrg, "converged", False))}
+    out = {"solver": True if dmrg is None else bool(getattr(dmrg, "converged", False))}
     if not hist:
         return out
     out["nsw"] = len(hist)
@@ -383,6 +622,7 @@ class COCAS(CASCI):
                  optimizer_max_steps=200,
                  optimizer_max_step_norm=None,
                  macro_tol=1.0e-6,
+                 ci_tol=0.0,
                  orb_grad_tol=None,
                  reject_macro_energy=True,
                  macro_energy_rise_tol=1.0e-8,
@@ -396,10 +636,10 @@ class COCAS(CASCI):
                  use_cholesky=None,
                  verbose=0,
                  **kwargs):
-        super().__init__(mf, ncas, nelecas, verbose=verbose, **kwargs)
+        super().__init__(mf, ncas, nelecas, tol=ci_tol, verbose=verbose, **kwargs)
 
         self.max_cycles = max_cycles # macroiterations
-        self.tol = float(macro_tol) # macro energy tol
+        self.macro_tol = float(macro_tol)
         self.mo_coeff = None # opt orb
         # Orbital optimization backend for the U-matrix formulation.
         self.optimizer = optimizer.upper()
@@ -442,6 +682,10 @@ class COCAS(CASCI):
         self.weights = None
         self.nstates = 1
         self.e_history = []
+        self.converged = False
+        self.macro_converged = False
+        self.solver_converged = False
+        self.macro_iterations = 0
 
 
     def run(self, nstates= None, weights = None, use_cholesky=None):
@@ -500,7 +744,7 @@ class COCAS(CASCI):
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
                 optimizer_max_step_norm=self.optimizer_max_step_norm,
-                tol=self.tol,
+                tol=self.macro_tol,
                 orb_grad_tol=self.orb_grad_tol,
                 reject_macro_energy=self.reject_macro_energy,
                 macro_energy_rise_tol=self.macro_energy_rise_tol,
@@ -532,7 +776,7 @@ class COCAS(CASCI):
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
                 optimizer_max_step_norm=self.optimizer_max_step_norm,
-                tol=self.tol,
+                tol=self.macro_tol,
                 orb_grad_tol=self.orb_grad_tol,
                 reject_macro_energy=self.reject_macro_energy,
                 macro_energy_rise_tol=self.macro_energy_rise_tol,
@@ -569,6 +813,10 @@ class COCAS(CASCI):
         self.mo_cas = getattr(mc, 'mo_cas', None)
         self.nstates = mc.nstates
         self.solver_backend = getattr(mc, 'solver_backend', None)
+        self.converged = bool(getattr(mc, "converged", False))
+        self.macro_converged = bool(getattr(mc, "macro_converged", False))
+        self.solver_converged = bool(getattr(mc, "solver_converged", False))
+        self.macro_iterations = int(getattr(mc, "macro_iterations", 0))
 
         return self
 
@@ -663,7 +911,18 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     else:
         with_core = False
 
+    timing = {
+        "solver_seconds": 0.0,
+        "rdm_seconds": 0.0,
+        "orbital_gradient_seconds": 0.0,
+        "orbital_opt_seconds": 0.0,
+    }
+    timing_start = time.perf_counter()
     dm1, dm2 = mc.make_rdm12(0, with_core=with_core)
+    timing["rdm_seconds"] += time.perf_counter() - timing_start
+    contraction_plan = OrbitalContractionPlan(
+        h1e, eri, U0.shape, dm1.shape, dm2.shape
+    )
 
     # eri = mc.eri_so[0, 0] # for spin-restricted calculation
     # nmo = self.nmo
@@ -683,23 +942,58 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     tr_max = float(macro_trust_max)
     tr_dn = float(macro_trust_shrink)
     tr_up = float(macro_trust_grow)
+    active_active = hasattr(mc, "D")
     diag = []
 
-    def opt_u(u, d1, d2, st, cap, use_diis=True):
+    def opt_u(u, d1, d2, use_diis=True):
+        timing_start = time.perf_counter()
         u1, e1 = minimize(
-            energy, u, args=(h1e, eri, d1, d2), tau=st,
+            contraction_plan.energy,
+            u,
+            args=(h1e, eri, d1, d2),
+            tau=1.0,
             algorithm=optimizer, history_size=optimizer_history,
             epsilon=optimizer_tol,
             max_iterations=optimizer_max_steps,
-            max_step_norm=cap,
+            max_step_norm=cap0,
+            gradient_fn=contraction_plan.gradient,
+        )
+        u1 = _align_redundant_gauge(
+            u,
+            u1,
+            mc.ncore,
+            ncas,
+            active_active=active_active,
         )
         if use_diis:
-            u1 = _apply_orbital_diis(orbital_diis, u1, h1e, eri, d1, d2, e1)
+            u1 = _apply_orbital_diis(
+                orbital_diis,
+                u,
+                u1,
+                ncore=mc.ncore,
+                ncas=ncas,
+                active_active=active_active,
+            )
+        timing["orbital_opt_seconds"] += time.perf_counter() - timing_start
         return u1
 
     U_acc = U0
-    gn = _gn(U_acc, h1e, eri, dm1, dm2)
-    U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
+    timing_start = time.perf_counter()
+    gn_components = _gn_details(
+        U_acc,
+        h1e,
+        eri,
+        dm1,
+        dm2,
+        contraction_plan,
+        ncore=mc.ncore,
+        ncas=ncas,
+        active_active=active_active,
+    )
+    gn = gn_components["total"]
+    timing["orbital_gradient_seconds"] += time.perf_counter() - timing_start
+    U_target = opt_u(U_acc, dm1, dm2)
+    U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
 
     k = 0
 
@@ -713,27 +1007,55 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     converged = False
     while k < max_cycles:
 
-        st = 1.0
-        cap = _cap(cap0, tr)
         ok = False
         rej = 0
         for ir in range(int(macro_reject_max) + 1):
             mo_coeff = C0 @ U
 
-            current_mc = _fresh_casci_like(mc)
-            if warm_start_dmrg:
-                _wguess(mc, current_mc)
-            _run_casci_like(current_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+            timing_start = time.perf_counter()
+            current_mc = _run_macro_casci(
+                mc,
+                mo_coeff=mo_coeff,
+                warm_start=warm_start_dmrg,
+                method=ci_method,
+                **kwargs,
+            )
+            timing["solver_seconds"] += time.perf_counter() - timing_start
+
+            if _is_su2_dmrg(current_mc) and not _solver_converged(current_mc):
+                diag.append(
+                    {
+                        "macro": k + 1,
+                        "energy": float(
+                            np.real(np.asarray(current_mc.e_tot).reshape(-1)[0])
+                        ),
+                        "accepted": False,
+                        "reason": "active_solver_unconverged",
+                        "tr": tr,
+                        "rej": rej,
+                        "active_active_optimized": active_active,
+                        "su2_runtime_rebuilt": bool(
+                            getattr(
+                                current_mc,
+                                "_co_su2_runtime_rebuilt",
+                                False,
+                            )
+                        ),
+                        "solver_retried": bool(
+                            getattr(current_mc, "_co_solver_retried", False)
+                        ),
+                        "solver": False,
+                    }
+                )
+                break
 
             if (not reject_macro_energy) or current_mc.e_tot <= e_old + macro_energy_rise_tol:
                 ok = True
                 break
 
             rej += 1
-            st *= 0.5
             tr = None if tr is None else max(tr_min, tr * tr_dn)
-            cap = _cap(cap0, tr)
-            U = opt_u(U_acc, dm1, dm2, st, cap, use_diis=False)
+            U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
 
         if not ok:
             break
@@ -742,18 +1064,63 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
         e_history.append(current_mc.e_tot)
         de = float(np.real(np.asarray(current_mc.e_tot - e_old).reshape(-1)[0]))
         e_now = float(np.real(np.asarray(current_mc.e_tot).reshape(-1)[0]))
-        row = {"macro": k + 1, "energy": e_now, "dE": de, "gn": gn, "tr": tr, "rej": rej}
+        timing_start = time.perf_counter()
+        dm1_new, dm2_new = current_mc.make_rdm12(0, with_core=with_core)
+        timing["rdm_seconds"] += time.perf_counter() - timing_start
+        timing_start = time.perf_counter()
+        gn_components_new = _gn_details(
+            U,
+            h1e,
+            eri,
+            dm1_new,
+            dm2_new,
+            contraction_plan,
+            ncore=current_mc.ncore,
+            ncas=ncas,
+            active_active=active_active,
+        )
+        gn_new = gn_components_new["total"]
+        timing["orbital_gradient_seconds"] += time.perf_counter() - timing_start
+        row = {
+            "macro": k + 1,
+            "energy": e_now,
+            "accepted": True,
+            "dE": de,
+            "gn": gn_new,
+            "gn_nonredundant": gn_components_new["nonredundant"],
+            "gn_active_active": gn_components_new["active_active"],
+            "gn_core_core_discarded": gn_components_new[
+                "core_core_discarded"
+            ],
+            "gn_start": gn,
+            "gn_start_nonredundant": gn_components["nonredundant"],
+            "gn_start_active_active": gn_components["active_active"],
+            "step": step_norm,
+            "tr": tr,
+            "rej": rej,
+            "active_active_optimized": active_active,
+            "su2_runtime_rebuilt": bool(
+                getattr(current_mc, "_co_su2_runtime_rebuilt", False)
+            ),
+            "solver_retried": bool(
+                getattr(current_mc, "_co_solver_retried", False)
+            ),
+        }
         row.update(_sdiag(current_mc))
+        gradient_spike = bool(gn > 0.0 and gn_new > 1.5 * gn)
+        row["diis_reset"] = gradient_spike
         diag.append(row)
         if e_now < best_e:
             best_e = e_now
             best_mc = current_mc
             best_C = mo_coeff
 
-        if tr is not None and rej == 0:
+        if gradient_spike and orbital_diis is not None:
+            orbital_diis.reset()
+        if tr is not None and rej == 0 and not gradient_spike:
             tr = min(tr_max, tr * tr_up)
 
-        if abs(current_mc.e_tot - e_old) < tol and gn < gt:
+        if abs(current_mc.e_tot - e_old) < tol and gn_new < gt:
             if getattr(mc, "verbose", 0) >= 1:
                 print('\nCASSCF converged at macroiteration {}'.format(k))
                 print("E(CASSCF) = {}".format(current_mc.e_tot))
@@ -764,22 +1131,30 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
         U_acc = U
         mc = current_mc
         e_old = mc.e_tot
-
-
-        dm1, dm2 = mc.make_rdm12(0, with_core=with_core)
-        gn = _gn(U_acc, h1e, eri, dm1, dm2)
-
-        U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
-        # print(E + mol.energy_nuc())
+        dm1, dm2 = dm1_new, dm2_new
+        gn = gn_new
+        gn_components = gn_components_new
 
         k += 1
+        if k >= max_cycles:
+            break
+
+        U_target = opt_u(U_acc, dm1, dm2)
+        U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
+        # print(E + mol.energy_nuc())
 
     if not converged:
         if raise_on_nonconvergence:
+            if diag and diag[-1].get("reason") == "active_solver_unconverged":
+                raise RuntimeError(
+                    "CO active-space DMRG did not converge after its warm "
+                    "continuation; the orbital macro step was not accepted."
+                )
             raise RuntimeError('Max macro steps reached. CASSCF not converged.')
         mc = best_mc
         mc.e_history = e_history
         mc.macro_diagnostics = diag
+        mc.dmrgscf_timing = dict(timing)
         _set_convergence_metadata(
             mc,
             macro_converged=False,
@@ -792,6 +1167,13 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     # final reported energy out of sync with the best orbitals, while a fresh
     # CASCI solve at ``mo_coeff`` is consistent.
     final_mc = _fresh_casci_like(mc)
+    final_su2_runtime_rebuilt = getattr(final_mc, "_su2_runtime", None) is not None
+    if final_su2_runtime_rebuilt:
+        # The verification solve is a correctness boundary. Its MPS can have
+        # different sector multiplicities from the accepted macro state, so a
+        # clean owner avoids carrying bond-contextual execution plans across
+        # that topology change. Macroiterations still use the normal reuse path.
+        final_mc._su2_runtime = None
     final_mc.spin_purification = mc.spin_purification
     final_mc.ss = mc.ss
     final_mc.shift = mc.shift
@@ -808,8 +1190,13 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     if warm_start_dmrg:
         _wguess(mc, final_mc)
     _run_casci_like(final_mc, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+    if getattr(final_mc, "build_info", None) is not None:
+        final_mc.build_info[
+            "final_su2_runtime_rebuilt"
+        ] = bool(final_su2_runtime_rebuilt)
     final_mc.e_history = e_history
     final_mc.macro_diagnostics = diag
+    final_mc.dmrgscf_timing = dict(timing)
     _set_convergence_metadata(
         final_mc,
         macro_converged=True,
@@ -853,6 +1240,9 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         _dm1, _dm2 = mc.make_rdm12(n, with_core=with_core)
         dm1 += _dm1 * weights[n]
         dm2 += _dm2 * weights[n]
+    contraction_plan = OrbitalContractionPlan(
+        h1e, eri, U0.shape, dm1.shape, dm2.shape
+    )
 
     # State-averaged CASSCF uses the same ``U`` variable as the state-specific
     # kernel, so it should also keep improving the latest orbital transform
@@ -864,25 +1254,56 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     tr_max = float(macro_trust_max)
     tr_dn = float(macro_trust_shrink)
     tr_up = float(macro_trust_grow)
+    active_active = hasattr(mc, "D")
     diag = []
 
-    def opt_u(u, d1, d2, st, cap, use_diis=True):
+    def opt_u(u, d1, d2, use_diis=True):
         u1, e1 = minimize(
-            energy, u, args=(h1e, eri, d1, d2), tau=st,
+            contraction_plan.energy,
+            u,
+            args=(h1e, eri, d1, d2),
+            tau=1.0,
             algorithm=optimizer, history_size=optimizer_history,
             epsilon=optimizer_tol,
             max_iterations=optimizer_max_steps,
-            max_step_norm=cap,
+            max_step_norm=cap0,
+            gradient_fn=contraction_plan.gradient,
+        )
+        u1 = _align_redundant_gauge(
+            u,
+            u1,
+            mc.ncore,
+            ncas,
+            active_active=active_active,
         )
         if use_diis:
-            u1 = _apply_orbital_diis(orbital_diis, u1, h1e, eri, d1, d2, e1)
+            u1 = _apply_orbital_diis(
+                orbital_diis,
+                u,
+                u1,
+                ncore=mc.ncore,
+                ncas=ncas,
+                active_active=active_active,
+            )
         return u1
 
 
     e_old = sum(weights * mc.e_tot)
     U_acc = U0
-    gn = _gn(U_acc, h1e, eri, dm1, dm2)
-    U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
+    gn_components = _gn_details(
+        U_acc,
+        h1e,
+        eri,
+        dm1,
+        dm2,
+        contraction_plan,
+        ncore=mc.ncore,
+        ncas=ncas,
+        active_active=active_active,
+    )
+    gn = gn_components["total"]
+    U_target = opt_u(U_acc, dm1, dm2)
+    U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
     last_mo_coeff = C0 @ U_acc
     best_e = float(np.real(np.asarray(e_old).reshape(-1)[0]))
     best_mc = mc
@@ -892,35 +1313,53 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     k = 0
     while k < max_cycles:
 
-        st = 1.0
-        cap = _cap(cap0, tr)
         ok = False
         rej = 0
         for ir in range(int(macro_reject_max) + 1):
             mo_coeff = C0 @ U
 
-            current_mc = _fresh_casci_like(mc)
-            if warm_start_dmrg:
-                _wguess(mc, current_mc)
-            _run_casci_like(
-                current_mc,
+            current_mc = _run_macro_casci(
+                mc,
                 nstates,
                 mo_coeff=mo_coeff,
+                warm_start=warm_start_dmrg,
                 method=ci_method,
                 **kwargs,
             )
             current_mc.nstates = nstates
 
             eAve = sum(weights * current_mc.e_tot)
+            if _is_su2_dmrg(current_mc) and not _solver_converged(current_mc):
+                diag.append(
+                    {
+                        "macro": k + 1,
+                        "energy": float(np.real(np.asarray(eAve).reshape(-1)[0])),
+                        "accepted": False,
+                        "reason": "active_solver_unconverged",
+                        "tr": tr,
+                        "rej": rej,
+                        "active_active_optimized": active_active,
+                        "su2_runtime_rebuilt": bool(
+                            getattr(
+                                current_mc,
+                                "_co_su2_runtime_rebuilt",
+                                False,
+                            )
+                        ),
+                        "solver_retried": bool(
+                            getattr(current_mc, "_co_solver_retried", False)
+                        ),
+                        "solver": False,
+                    }
+                )
+                break
             if (not reject_macro_energy) or eAve <= e_old + macro_energy_rise_tol:
                 ok = True
                 break
 
             rej += 1
-            st *= 0.5
             tr = None if tr is None else max(tr_min, tr * tr_dn)
-            cap = _cap(cap0, tr)
-            U = opt_u(U_acc, dm1, dm2, st, cap, use_diis=False)
+            U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
 
         if not ok:
             break
@@ -929,18 +1368,64 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         e_history.append(current_mc.e_tot)
         de = float(np.real(np.asarray(eAve - e_old).reshape(-1)[0]))
         e_now = float(np.real(np.asarray(eAve).reshape(-1)[0]))
-        row = {"macro": k + 1, "energy": e_now, "dE": de, "gn": gn, "tr": tr, "rej": rej}
+        dm1_new = 0
+        dm2_new = 0
+        for n in range(nstates):
+            _dm1, _dm2 = current_mc.make_rdm12(n, with_core=with_core)
+            dm1_new += _dm1 * weights[n]
+            dm2_new += _dm2 * weights[n]
+        gn_components_new = _gn_details(
+            U,
+            h1e,
+            eri,
+            dm1_new,
+            dm2_new,
+            contraction_plan,
+            ncore=current_mc.ncore,
+            ncas=ncas,
+            active_active=active_active,
+        )
+        gn_new = gn_components_new["total"]
+        row = {
+            "macro": k + 1,
+            "energy": e_now,
+            "accepted": True,
+            "dE": de,
+            "gn": gn_new,
+            "gn_nonredundant": gn_components_new["nonredundant"],
+            "gn_active_active": gn_components_new["active_active"],
+            "gn_core_core_discarded": gn_components_new[
+                "core_core_discarded"
+            ],
+            "gn_start": gn,
+            "gn_start_nonredundant": gn_components["nonredundant"],
+            "gn_start_active_active": gn_components["active_active"],
+            "step": step_norm,
+            "tr": tr,
+            "rej": rej,
+            "active_active_optimized": active_active,
+            "su2_runtime_rebuilt": bool(
+                getattr(current_mc, "_co_su2_runtime_rebuilt", False)
+            ),
+            "solver_retried": bool(
+                getattr(current_mc, "_co_solver_retried", False)
+            ),
+        }
         row.update(_sdiag(current_mc))
+        gradient_spike = bool(gn > 0.0 and gn_new > 1.5 * gn)
+        row["diis_reset"] = gradient_spike
         diag.append(row)
         if e_now < best_e:
             best_e = e_now
             best_mc = current_mc
             best_C = mo_coeff
 
-        if tr is not None and rej == 0:
+        if gradient_spike and orbital_diis is not None:
+            orbital_diis.reset()
+        if tr is not None and rej == 0 and not gradient_spike:
             tr = min(tr_max, tr * tr_up)
 
-        if abs(eAve - e_old) < tol and gn < gt:
+        if abs(eAve - e_old) < tol and gn_new < gt:
             if getattr(mc, "verbose", 0) >= 1:
                 print('CASSCF converged at macroiteration {}'.format(k))
                 print("E(CASSCF) = {}".format(current_mc.e_tot))
@@ -951,27 +1436,27 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         U_acc = U
         mc = current_mc
         e_old = eAve
-
-        # update 1- and 2-RDMs
-        dm1 = 0
-        dm2 = 0
-        for n in range(nstates):
-            _dm1, _dm2 = mc.make_rdm12(n, with_core=with_core)
-            dm1 += _dm1 * weights[n]
-            dm2 += _dm2 * weights[n]
-        gn = _gn(U_acc, h1e, eri, dm1, dm2)
+        dm1, dm2 = dm1_new, dm2_new
+        gn = gn_new
+        gn_components = gn_components_new
 
         # Reuse the more conservative restart step from the state-specific
         # kernel.  The state-averaged surface is typically flatter, so jumping
         # back to the global default ``tau=2`` every macroiteration is often
         # too aggressive.
-        U = opt_u(U_acc, dm1, dm2, 1.0, _cap(cap0, tr))
+        U_target = opt_u(U_acc, dm1, dm2)
+        U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
         # print(E + mol.energy_nuc())
 
         k += 1
 
     if not converged:
         if raise_on_nonconvergence:
+            if diag and diag[-1].get("reason") == "active_solver_unconverged":
+                raise RuntimeError(
+                    "CO active-space DMRG did not converge after its warm "
+                    "continuation; the orbital macro step was not accepted."
+                )
             raise RuntimeError('Max macro steps reached. CASSCF not converged.')
         mc = best_mc
         mc.e_history = e_history
@@ -986,6 +1471,9 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     # As in the state-specific kernel, build a fresh final CASCI result so the
     # returned state-averaged orbitals and energies are self-consistent.
     final_mc = _fresh_casci_like(mc)
+    final_su2_runtime_rebuilt = getattr(final_mc, "_su2_runtime", None) is not None
+    if final_su2_runtime_rebuilt:
+        final_mc._su2_runtime = None
     final_mc.spin_purification = mc.spin_purification
     final_mc.ss = mc.ss
     final_mc.shift = mc.shift
@@ -1003,6 +1491,10 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     if warm_start_dmrg:
         _wguess(mc, final_mc)
     _run_casci_like(final_mc, nstates, mo_coeff=mo_coeff, method=ci_method, **kwargs)
+    if getattr(final_mc, "build_info", None) is not None:
+        final_mc.build_info[
+            "final_su2_runtime_rebuilt"
+        ] = bool(final_su2_runtime_rebuilt)
     final_mc.e_history = e_history
     final_mc.macro_diagnostics = diag
     _set_convergence_metadata(
@@ -1097,7 +1589,7 @@ if __name__=='__main__':
     # from pyqed.qchem.mcscf.direct_ci import CASCI
 
     mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
-    mol.build(driver='pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
 

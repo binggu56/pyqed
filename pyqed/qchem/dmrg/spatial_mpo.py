@@ -24,7 +24,7 @@ class SpatialCarrierMPO:
 
     @property
     def tensor_mpo(self):
-        return TensorMPO(self.factors, homogenous=False)
+        return TensorMPO(self.factors, homogeneous=False)
 
 
 def build_spatial_block2_carrier_mpo(n_sites, *, local_dim=4):

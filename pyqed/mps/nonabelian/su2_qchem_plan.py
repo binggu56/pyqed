@@ -2665,10 +2665,7 @@ class PackedSU2QChemCompiledTerms:
                 )
                 self.cpp_factor_diagonal_calls += 1
                 return result
-        if (
-            hasattr(left, "factor_diagonal")
-            and hasattr(right, "factor_diagonal")
-        ):
+        if hasattr(left, "factor_diagonal") and hasattr(right, "factor_diagonal"):
             diagonal = np.zeros(int(self.total_dim), dtype=float)
             left_cache = {}
             right_cache = {}
@@ -2679,14 +2676,12 @@ class PackedSU2QChemCompiledTerms:
                     continue
                 lidx = int(self.left_indices[match_idx])
                 ridx = int(self.right_indices[match_idx])
-                left_diag = left_cache.get(lidx)
-                if left_diag is None:
-                    left_diag = left.factor_diagonal(lidx)
-                    left_cache[lidx] = left_diag
-                right_diag = right_cache.get(ridx)
-                if right_diag is None:
-                    right_diag = right.factor_diagonal(ridx)
-                    right_cache[ridx] = right_diag
+                left_diag = left_cache.setdefault(
+                    lidx, left.factor_diagonal(lidx)
+                )
+                right_diag = right_cache.setdefault(
+                    ridx, right.factor_diagonal(ridx)
+                )
                 entry = self.basis[int(in_idx)]
                 contribution = np.einsum(
                     "kbw,wrc->kbcr",
@@ -2694,7 +2689,13 @@ class PackedSU2QChemCompiledTerms:
                     right_diag,
                     optimize=True,
                 )
-                diagonal[entry.slice] += np.real(contribution).reshape(-1)
+                selected = contribution[
+                    : entry.shape[0],
+                    : entry.shape[1],
+                    : entry.shape[2],
+                    : entry.shape[3],
+                ]
+                diagonal[entry.slice] += np.real(selected).reshape(-1)
             return diagonal
         diagonal = np.zeros(int(self.total_dim), dtype=float)
         for entry in self.basis:
@@ -3339,6 +3340,23 @@ class SU2QChemSweepPlan:
 
     @staticmethod
     def _factorized_kernel(left_stack, right_stack, input_entry, output_entry):
+        def select_entry_channels(kernel):
+            output_shape = tuple(int(dim) for dim in output_entry.shape)
+            input_shape = tuple(int(dim) for dim in input_entry.shape)
+            selected = kernel[
+                : output_shape[0],
+                : output_shape[1],
+                : output_shape[2],
+                : output_shape[3],
+                : input_shape[0],
+                : input_shape[1],
+                : input_shape[2],
+                : input_shape[3],
+            ]
+            return np.ascontiguousarray(
+                selected.reshape(int(output_entry.size), int(input_entry.size))
+            )
+
         left = np.asarray(left_stack)
         right = np.asarray(right_stack)
         if left.ndim != 6 or right.ndim != 6:
@@ -3348,9 +3366,7 @@ class SU2QChemSweepPlan:
                 right,
                 optimize=False,
             )
-            return np.ascontiguousarray(
-                kernel.reshape(int(output_entry.size), int(input_entry.size))
-            )
+            return select_entry_channels(kernel)
         tdim, ldim, kdim, wdim, adim, bdim = (
             int(dim) for dim in left.shape
         )
@@ -3364,9 +3380,7 @@ class SU2QChemSweepPlan:
                 right,
                 optimize=False,
             )
-            return np.ascontiguousarray(
-                kernel.reshape(int(output_entry.size), int(input_entry.size))
-            )
+            return select_entry_channels(kernel)
         left_mat = np.ascontiguousarray(
             left.transpose(1, 4, 2, 5, 0, 3).reshape(
                 ldim * adim * kdim * bdim,
@@ -3390,9 +3404,7 @@ class SU2QChemSweepPlan:
             rdim,
         )
         kernel = kernel.transpose(0, 1, 4, 5, 2, 3, 6, 7)
-        return np.ascontiguousarray(
-            kernel.reshape(int(output_entry.size), int(input_entry.size))
-        )
+        return select_entry_channels(kernel)
 
     def _compile_factorized_terms_from_matches(self, basis, matches):
         from .local_operator import CompiledFactorizedBlock, CompiledFactorizedTerms
@@ -4830,19 +4842,25 @@ def build_contextual_channel_compiled_terms(
                         int(boundary_topology_revision),
                         numeric_revision,
                     )
-            direct_result = direct_action_builder(
-                int(left_boundary.bond),
-                int(right_boundary.bond),
-                int(len(entries)),
-                int(basis.size),
-                bool(
-                    getattr(
-                        W2,
-                        "normal_complementary_right_dual",
-                        False,
-                    )
-                ),
-            )
+            try:
+                direct_result = direct_action_builder(
+                    int(left_boundary.bond),
+                    int(right_boundary.bond),
+                    int(len(entries)),
+                    int(basis.size),
+                    bool(
+                        getattr(
+                            W2,
+                            "normal_complementary_right_dual",
+                            False,
+                        )
+                    ),
+                )
+            except RuntimeError:
+                # A retained owner can be idle when an operator is inspected
+                # after its sweep.  The ordinary contextual route installer
+                # below does not require an active half-sweep.
+                direct_result = {}
             if bool(direct_result.get("compatible", False)):
                 moving_environment.set_factor_routes_hermitianized(False)
                 family_counts = {

@@ -218,6 +218,7 @@ class ED:
             nelecas=self.nelecas,
             D=self.dmrg_kwargs.pop("D", 1),
             site="spatial",
+            spatial_site_basis="canonical",
             symmetry=self.symmetry,
             spin=self.spin,
             verbose=self.verbose,

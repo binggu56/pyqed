@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .builder import AutoMPO
-from .mpo import PhysicalLeg
+from .mpo import Leg, as_rank_coupled_mpo
 from .operators import (
     ReducedTensorOperator,
     SiteOperator,
@@ -222,7 +222,7 @@ def _normalize_site_legs(sites_or_legs, *, min_sites=2):
 
     site_legs = []
     for item in sites_or_legs:
-        if isinstance(item, PhysicalLeg):
+        if isinstance(item, Leg):
             site_legs.append(item)
         elif isinstance(item, NonabelianTensor):
             site_legs.append(physical_leg_from_spatial_orbital(item))
@@ -601,7 +601,7 @@ def _fully_reduced_double_transition_phase(phys_leg, *, dtype):
     for sector in phys_leg.sectors:
         scale = -1.0 if int(getattr(sector, "charge", -1)) == 2 else 1.0
         blocks[(sector, sector)] = np.asarray(scale, dtype=dtype) * np.eye(
-            phys_leg.dim(sector),
+            phys_leg.sector_dim(sector),
             dtype=dtype,
         )
     return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
@@ -636,7 +636,7 @@ def add_spatial_one_body_terms(
         )
     if any(phys_leg != autompo.site_legs[0] for phys_leg in autompo.site_legs):
         raise ValueError(
-            "add_spatial_one_body_terms expects a uniform spatial-orbital PhysicalLeg across all sites."
+            "add_spatial_one_body_terms expects a uniform spatial-orbital Leg across all sites."
         )
     phys_leg = autompo.site_legs[0]
     # Validate the leg is one of the supported spatial-orbital conventions.
@@ -714,7 +714,10 @@ def build_spatial_one_body_reduced_mpo(sites_or_legs, h1e, *, cutoff=1.0e-12):
     site_legs = _normalize_site_legs(sites_or_legs)
     autompo = AutoMPO(site_legs)
     add_spatial_one_body_terms(autompo, h1e, cutoff=cutoff)
-    return autompo.build()
+    factors = autompo.build()
+    if factors and _is_fully_reduced_spatial_leg(site_legs[0]):
+        factors = [as_rank_coupled_mpo(factor) for factor in factors]
+    return factors
 
 
 def _canonical_spatial_jw_site_operators(operators, sites, *, phys_leg, dtype, cutoff):
@@ -1642,8 +1645,9 @@ class SpatialSpinFreeERIBuilder:
                 raise NotImplementedError(
                     "Fully reduced spin-free ERI growth does not yet carry the four-site "
                     "recoupling data required for four-distinct index strings. Use the "
-                    "canonical spatial SU(2) site basis; determinant-space projection is "
-                    "reserved for validation and is not substituted into the active solver."
+                    "sitewise SU(2) component NPDM route for 2-RDMs; determinant-space "
+                    "projection is reserved for validation and is not substituted into "
+                    "the active solver."
                 )
         we_product_terms = 0
         scalar_product_terms = 0
@@ -1836,6 +1840,8 @@ class SpatialSpinFreeERIBuilder:
         autompo = AutoMPO(self.site_legs)
         info = self.add_to(autompo, return_info=True)
         factors = autompo.build() if info["total_terms"] else []
+        if factors and _is_fully_reduced_spatial_leg(self.site_legs[0]):
+            factors = [as_rank_coupled_mpo(factor) for factor in factors]
         if return_info:
             return factors, info
         return factors
@@ -2008,7 +2014,7 @@ def add_spatial_two_generator_product_terms(
         raise TypeError("add_spatial_two_generator_product_terms expects an AutoMPO.")
     if any(phys_leg != autompo.site_legs[0] for phys_leg in autompo.site_legs):
         raise ValueError(
-            "add_spatial_two_generator_product_terms expects a uniform spatial-orbital PhysicalLeg."
+            "add_spatial_two_generator_product_terms expects a uniform spatial-orbital Leg."
         )
     phys_leg = physical_leg_from_spatial_orbital(autompo.site_legs[0])
     if phys_leg != physical_leg_from_spatial_orbital():
@@ -2125,7 +2131,7 @@ def add_spatial_density_terms(
         raise TypeError("add_spatial_density_terms expects an AutoMPO.")
     if any(phys_leg != autompo.site_legs[0] for phys_leg in autompo.site_legs):
         raise ValueError(
-            "add_spatial_density_terms expects a uniform spatial-orbital PhysicalLeg across all sites."
+            "add_spatial_density_terms expects a uniform spatial-orbital Leg across all sites."
         )
     phys_leg = autompo.site_legs[0]
     physical_leg_from_spatial_orbital(phys_leg)

@@ -7,6 +7,59 @@ import numpy as np
 from pyqed.mps.mps import MPO
 
 
+def nearest_neighbor_mpo(bond_hamiltonians, dims, *, check_hermitian=True):
+    """Build an exact finite MPO for ``sum_i h[i, i+1]``."""
+    dims = tuple(int(dim) for dim in dims)
+    terms = list(bond_hamiltonians)
+    if len(dims) < 2 or len(terms) != len(dims) - 1:
+        raise ValueError("Expected one Hamiltonian for every nearest-neighbour bond.")
+    factors = []
+    for bond, (raw, left_dim, right_dim) in enumerate(zip(terms, dims[:-1], dims[1:])):
+        matrix = np.asarray(raw, dtype=complex).reshape(
+            left_dim * right_dim, left_dim * right_dim
+        )
+        if check_hermitian and not np.allclose(
+            matrix, matrix.conj().T, rtol=1.0e-10, atol=1.0e-12
+        ):
+            error = np.max(np.abs(matrix - matrix.conj().T))
+            raise ValueError(
+                f"Bond Hamiltonian {bond} is not Hermitian "
+                f"(max |h-h^dagger|={error:.3e})."
+            )
+        unfolding = matrix.reshape(
+            left_dim, right_dim, left_dim, right_dim
+        ).transpose(0, 2, 1, 3).reshape(left_dim**2, right_dim**2)
+        u, values, vh = np.linalg.svd(unfolding, full_matrices=False)
+        if values.size == 0 or values[0] == 0.0:
+            raise ValueError("Nearest-neighbour Hamiltonian terms cannot be zero.")
+        tolerance = np.finfo(values.dtype).eps * max(unfolding.shape)
+        rank = max(1, int(np.count_nonzero(values > tolerance * values[0])))
+        root = np.sqrt(values[:rank])
+        left = (u[:, :rank] * root).T.reshape(rank, left_dim, left_dim)
+        right = (root[:, None] * vh[:rank]).reshape(rank, right_dim, right_dim)
+        factors.append((left, right))
+
+    cores = []
+    for site, dimension in enumerate(dims):
+        previous = factors[site - 1][1].shape[0] if site else 0
+        following = factors[site][0].shape[0] if site < len(dims) - 1 else 0
+        left_rank = 1 if site == 0 else previous + 2
+        right_rank = 1 if site == len(dims) - 1 else following + 2
+        core = np.zeros((left_rank, right_rank, dimension, dimension), dtype=complex)
+        identity = np.eye(dimension, dtype=complex)
+        if site < len(dims) - 1:
+            core[0, 0] = identity
+            for channel in range(following):
+                core[0, channel + 1] = factors[site][0][channel]
+        if site:
+            destination = 0 if site == len(dims) - 1 else following + 1
+            for channel in range(previous):
+                core[channel + 1, destination] = factors[site - 1][1][channel]
+            core[previous + 1, destination] = identity
+        cores.append(core)
+    return MPO(cores)
+
+
 def _as_square_operator(value, dim, *, term_index, site):
     if value is None:
         return None
@@ -199,4 +252,4 @@ def sop_to_mpo(dims, terms, *, max_rank=None, dtype=None):
     return mpo.compress(max_rank)
 
 
-__all__ = ["sop_to_mpo"]
+__all__ = ["nearest_neighbor_mpo", "sop_to_mpo"]

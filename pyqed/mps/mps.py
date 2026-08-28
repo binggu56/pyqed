@@ -9,11 +9,13 @@ independent compatibility helpers live in dedicated sibling modules.
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import logging
 import math
+import sys
 import time
 import warnings
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from copy import deepcopy
 
 import numpy as np
@@ -27,11 +29,52 @@ except ImportError:  # tensorly is needed only for dense-operator MPO factoring.
     tensor_train_matrix = None
 
 from pyqed.mps.decompose import compress, decompose
+from pyqed.mps._dense_ops import (
+    apply_mpo_factors as _apply_mpo_factors,
+    apply_mpo_uncompressed as _apply_mpo_uncompressed_factors,
+    product_mpo_factors as _product_mpo_factors,
+)
 from pyqed.mps.dense_canonical import LeftCanonical, RightCanonical
-from pyqed.mps.legacy_sites import Block, DMRGException, PauliSite, Site
+from pyqed.lattice.site import (
+    Leg,
+    Site,
+    normalize_sites,
+    richer_sites,
+    sites_compatible,
+)
 from pyqed.mps.umps import UniformMPS
 
 logger = logging.getLogger(__name__)
+
+_NUMERIC_ALLOCATOR_RELIEF = None
+_NUMERIC_ALLOCATOR_RELIEF_INITIALIZED = False
+_GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE = OrderedDict()
+_GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE_MAXSIZE = 8
+
+
+def _release_free_numeric_pages():
+    """Return unused large numerical workspaces to the operating system."""
+    global _NUMERIC_ALLOCATOR_RELIEF
+    global _NUMERIC_ALLOCATOR_RELIEF_INITIALIZED
+    if not _NUMERIC_ALLOCATOR_RELIEF_INITIALIZED:
+        _NUMERIC_ALLOCATOR_RELIEF_INITIALIZED = True
+        try:
+            if sys.platform == "darwin":
+                library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+                hook = library.malloc_zone_pressure_relief
+                hook.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+                hook.restype = ctypes.c_size_t
+                _NUMERIC_ALLOCATOR_RELIEF = lambda: hook(None, 0)
+            elif sys.platform.startswith("linux"):
+                library = ctypes.CDLL(None)
+                hook = library.malloc_trim
+                hook.argtypes = [ctypes.c_size_t]
+                hook.restype = ctypes.c_int
+                _NUMERIC_ALLOCATOR_RELIEF = lambda: hook(0)
+        except (AttributeError, OSError):
+            _NUMERIC_ALLOCATOR_RELIEF = None
+    if _NUMERIC_ALLOCATOR_RELIEF is not None:
+        _NUMERIC_ALLOCATOR_RELIEF()
 
 try:
     from numba import njit as _numba_njit
@@ -8711,7 +8754,13 @@ class HamiltonianMultiplyU1:
             )
         return tuple(out)
 
-    def _build_compact_matrix_chain_plan(self, A, *, target_layout=None):
+    def _build_compact_matrix_chain_plan(
+        self,
+        A,
+        *,
+        target_layout=None,
+        build_static_stacks=True,
+    ):
         layout = self._layout(A)
         target_layout_key = None if target_layout is None else tuple(target_layout)
         cache_key = (
@@ -8719,6 +8768,7 @@ class HamiltonianMultiplyU1:
             layout,
             "compact_matrix_chain",
             target_layout_key,
+            bool(build_static_stacks),
         )
         cached = self._compact_matrix_chain_plan_cache.get(cache_key)
         if cached is not None:
@@ -8849,46 +8899,39 @@ class HamiltonianMultiplyU1:
                 ),
             }
         )
-        plan.update(
-            {
-                "batched_r_e_stacks": self._batched_compact_static_stacks(
-                    plan["batched_r_entries"],
-                    plan["e_blocks"],
-                    0,
-                ),
-                "batched_t2_w_stacks": self._batched_compact_static_stacks(
-                    plan["batched_t2_entries"],
-                    plan["w1_blocks"],
-                    1,
-                ),
-                "batched_t3_w_stacks": self._batched_compact_static_stacks(
-                    plan["batched_t3_entries"],
-                    plan["w2_blocks"],
-                    1,
-                ),
-                "batched_out_f_stacks": self._batched_compact_static_stacks(
-                    plan["batched_out_entries"],
-                    plan["f_blocks"],
-                    1,
-                ),
-            }
-        )
-        plan.update(
-            {
-                "batched_r_e_left_stacks": self._batched_compact_r_left_stacks(
-                    plan["batched_r_e_stacks"],
-                ),
-                "batched_t2_w_right_stacks": self._batched_compact_w_right_stacks(
-                    plan["batched_t2_w_stacks"],
-                ),
-                "batched_t3_w_right_stacks": self._batched_compact_w_right_stacks(
-                    plan["batched_t3_w_stacks"],
-                ),
-                "batched_out_f_right_stacks": self._batched_compact_f_right_stacks(
-                    plan["batched_out_f_stacks"],
-                ),
-            }
-        )
+        if build_static_stacks:
+            plan.update(
+                {
+                    "batched_r_e_stacks": self._batched_compact_static_stacks(
+                        plan["batched_r_entries"], plan["e_blocks"], 0
+                    ),
+                    "batched_t2_w_stacks": self._batched_compact_static_stacks(
+                        plan["batched_t2_entries"], plan["w1_blocks"], 1
+                    ),
+                    "batched_t3_w_stacks": self._batched_compact_static_stacks(
+                        plan["batched_t3_entries"], plan["w2_blocks"], 1
+                    ),
+                    "batched_out_f_stacks": self._batched_compact_static_stacks(
+                        plan["batched_out_entries"], plan["f_blocks"], 1
+                    ),
+                }
+            )
+            plan.update(
+                {
+                    "batched_r_e_left_stacks": self._batched_compact_r_left_stacks(
+                        plan["batched_r_e_stacks"]
+                    ),
+                    "batched_t2_w_right_stacks": self._batched_compact_w_right_stacks(
+                        plan["batched_t2_w_stacks"]
+                    ),
+                    "batched_t3_w_right_stacks": self._batched_compact_w_right_stacks(
+                        plan["batched_t3_w_stacks"]
+                    ),
+                    "batched_out_f_right_stacks": self._batched_compact_f_right_stacks(
+                        plan["batched_out_f_stacks"]
+                    ),
+                }
+            )
         plan.update(
             {
                 "batched_r_specs": self._batched_compact_position_specs(
@@ -13512,11 +13555,12 @@ class MovingEnvironmentCompiledBackend:
                             entry_count=entry_count,
                             family_names=family_names,
                         )
-            return operator._flat_named_family_csr_kernels(
-                proto,
-                layout,
-                build_groups=build_groups,
-            )
+            flat_builder = getattr(operator, "_flat_named_family_csr_kernels", None)
+            if flat_builder is None:
+                raise RuntimeError(
+                    "C++ family descriptor did not produce an operatorless payload"
+                )
+            return flat_builder(proto, layout, build_groups=build_groups)
         finally:
             elapsed = float(time.perf_counter() - start)
             stats = self.environment.moving_profile_stats
@@ -13981,7 +14025,7 @@ class MovingEnvironmentCompiledBackend:
         }
         for src, dst in mapping.items():
             if src in owner_stats:
-                if src.endswith("_seconds"):
+                if src.endswith("_seconds") or src.endswith("_imag"):
                     stats[dst] = float(owner_stats[src])
                 else:
                     stats[dst] = int(owner_stats[src])
@@ -14691,6 +14735,14 @@ class MovingEnvironment:
             "dense_cpp_sweep_workspace_two_site_mps_builds": 0,
             "dense_cpp_sweep_workspace_failures": 0,
             "dense_cpp_sweep_workspace_last_error": None,
+            "dense_cpp_dmrg_sweep_calls": 0,
+            "dense_cpp_dmrg_sweep_accepts": 0,
+            "dense_cpp_dmrg_sweep_failures": 0,
+            "dense_cpp_dmrg_sweep_bonds": 0,
+            "dense_cpp_dmrg_sweep_seconds": 0.0,
+            "dense_cpp_dmrg_sweep_last_seconds": 0.0,
+            "dense_cpp_dmrg_sweep_backend_actual": None,
+            "dense_cpp_dmrg_sweep_last_error": None,
             "dense_cpp_tensor_primitive_calls": 0,
             "dense_cpp_tensor_primitive_seconds": 0.0,
             "dense_cpp_tensor_primitive_failures": 0,
@@ -14724,6 +14776,12 @@ class MovingEnvironment:
             "cpp_moving_environment_enabled": self._cpp_moving_environment is not None,
             "cpp_moving_environment_compact_plan_installs": 0,
             "cpp_moving_environment_compact_plan_records": 0,
+            "cpp_moving_environment_compact_plan_real_stack_records": 0,
+            "cpp_moving_environment_compact_plan_real_matvec_calls": 0,
+            "cpp_moving_environment_compact_plan_complex_matvec_calls": 0,
+            "cpp_moving_environment_compact_plan_real_solution_phase_fixes": 0,
+            "cpp_moving_environment_compact_plan_real_output_phase_fixes": 0,
+            "cpp_moving_environment_compact_plan_max_stack_imag": 0.0,
             "cpp_moving_environment_compact_plan_replacements": 0,
             "cpp_moving_environment_compact_plan_davidson_calls": 0,
             "cpp_moving_environment_compact_plan_davidson_workspace_reuses": 0,
@@ -18231,6 +18289,211 @@ class MovingEnvironment:
         except Exception:
             return {}
 
+    def run_dense_cpp_dmrg_half_sweep(
+        self,
+        factors,
+        mpo,
+        left_boundary,
+        right_boundary,
+        *,
+        direction,
+        m_max,
+        left_environments=None,
+        right_environments=None,
+        tol=1.0e-5,
+        max_iter=30,
+        matvec_options=None,
+    ):
+        options = self.matvec_options if matvec_options is None else matvec_options
+        requested = self._option_value(
+            options,
+            "moving_environment_dense_cpp_dmrg_sweep",
+            False,
+        )
+        if isinstance(requested, str) and requested.strip().lower() == "auto":
+            enabled = True
+        else:
+            enabled = bool(requested)
+        if not enabled or not all(
+            isinstance(value, np.ndarray) for value in (*factors, *mpo)
+        ):
+            return None
+        owner = self._dense_cpp_sweep_owner(options)
+        if owner is None or not hasattr(owner, "dmrg_half_sweep"):
+            return None
+        restart_dim = int(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson_restart_dim",
+                min(max(8, int(max_iter)), 64),
+            )
+        )
+        backend = str(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson_backend",
+                "blas",
+            )
+        )
+        accept_unconverged = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_davidson_accept_unconverged",
+                False,
+            )
+        )
+        reuse_static_w = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_reuse_static_w",
+                True,
+            )
+        )
+        block_davidson = bool(
+            self._option_value(
+                options,
+                "moving_environment_dense_cpp_block_davidson",
+                False,
+            )
+        )
+        block_size = max(
+            1,
+            int(
+                self._option_value(
+                    options,
+                    "moving_environment_dense_cpp_block_davidson_size",
+                    2,
+                )
+            ),
+        )
+        chain_key = "dense-dmrg-chain"
+        start = time.perf_counter()
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_calls"] = int(
+            self.moving_profile_stats.get("dense_cpp_dmrg_sweep_calls", 0)
+        ) + 1
+        try:
+            result = dict(
+                owner.dmrg_half_sweep(
+                    tuple(factors),
+                    tuple(mpo),
+                    np.asarray(left_boundary, dtype=np.complex128),
+                    np.asarray(right_boundary, dtype=np.complex128),
+                    str(direction),
+                    int(m_max),
+                    float(tol),
+                    int(max_iter),
+                    int(restart_dim),
+                    bool(accept_unconverged),
+                    backend,
+                    bool(reuse_static_w),
+                    bool(block_davidson),
+                    int(block_size),
+                    None if left_environments is None else tuple(left_environments),
+                    None if right_environments is None else tuple(right_environments),
+                    chain_key,
+                )
+            )
+        except Exception as exc:
+            if hasattr(owner, "clear_dmrg_chain"):
+                owner.clear_dmrg_chain(chain_key)
+            self.moving_profile_stats["dense_cpp_dmrg_sweep_failures"] = int(
+                self.moving_profile_stats.get("dense_cpp_dmrg_sweep_failures", 0)
+            ) + 1
+            self.moving_profile_stats["dense_cpp_dmrg_sweep_last_error"] = str(exc)
+            return None
+        elapsed = float(time.perf_counter() - start)
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_accepts"] = int(
+            self.moving_profile_stats.get("dense_cpp_dmrg_sweep_accepts", 0)
+        ) + 1
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_bonds"] = int(
+            self.moving_profile_stats.get("dense_cpp_dmrg_sweep_bonds", 0)
+        ) + max(0, len(factors) - 2)
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_seconds"] = float(
+            self.moving_profile_stats.get("dense_cpp_dmrg_sweep_seconds", 0.0)
+        ) + elapsed
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_last_seconds"] = elapsed
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_backend_actual"] = str(
+            result.get("backend", "cpp_dense_dmrg_half_sweep")
+        )
+        self.moving_profile_stats["dense_cpp_dmrg_sweep_last_error"] = None
+        updates = []
+        for raw_row in result.get("updates", ()):
+            row = dict(raw_row)
+            raw_profile = dict(row.get("matvec_profile", {}))
+            local_kind = str(raw_profile.get("kind", "cpp_dense_davidson"))
+            local_backend = str(raw_profile.get("backend", backend))
+            matvec_calls = int(raw_profile.get("matvec_calls", 0))
+            matvec_seconds = float(raw_profile.get("seconds", row.get("seconds", 0.0)))
+            row["matvec_profile"] = {
+                "bond": int(row.get("bond", -1)),
+                "matvec_calls": matvec_calls,
+                "matvec_seconds": matvec_seconds,
+                "dominant_path": f"{local_kind}_{local_backend}",
+                "paths": {},
+                "local_solver": {
+                    "kind": local_kind,
+                    "dimension": int(raw_profile.get("dimension", 0)),
+                    "roots": 1,
+                    "seconds": matvec_seconds,
+                    "tol": float(tol),
+                    "max_iter": int(max_iter),
+                    "backend": local_backend,
+                    "iterations": int(raw_profile.get("iterations", 0)),
+                    "residual_norm": float(raw_profile.get("residual_norm", np.nan)),
+                    "workspace_reused": bool(raw_profile.get("workspace_reused", False)),
+                    "matvec_calls": matvec_calls,
+                    "operatorless": True,
+                    "two_site_solver": True,
+                    "block_davidson": bool(raw_profile.get("block_davidson", False)),
+                    "block_size": int(raw_profile.get("block_size", 1)),
+                },
+                "cpp_dense_davidson": raw_profile,
+                "operatorless": True,
+            }
+            updates.append(row)
+        result["updates"] = updates
+        n_updates = len(updates)
+        self.moving_profile_stats[
+            "dense_cpp_sweep_workspace_two_site_solve_calls"
+        ] = int(
+            self.moving_profile_stats.get(
+                "dense_cpp_sweep_workspace_two_site_solve_calls",
+                0,
+            )
+        ) + n_updates
+        self.moving_profile_stats[
+            "dense_cpp_sweep_workspace_two_site_solve_accepts"
+        ] = int(
+            self.moving_profile_stats.get(
+                "dense_cpp_sweep_workspace_two_site_solve_accepts",
+                0,
+            )
+        ) + n_updates
+        static_reuses = sum(
+            bool(row["matvec_profile"]["cpp_dense_davidson"].get(
+                "two_site_static_w_reused",
+                False,
+            ))
+            for row in updates
+        )
+        self.moving_profile_stats[
+            "dense_cpp_sweep_workspace_two_site_static_w_reuses"
+        ] = int(
+            self.moving_profile_stats.get(
+                "dense_cpp_sweep_workspace_two_site_static_w_reuses",
+                0,
+            )
+        ) + int(static_reuses)
+        self._dense_cpp_sweep_bind_signatures.clear()
+        try:
+            stats = dict(owner.stats())
+            self.moving_profile_stats["dense_cpp_sweep_workspace_records"] = int(
+                stats.get("records", 0)
+            )
+        except Exception:
+            pass
+        return result
+
     def split_dense_single_state_cpp(
         self,
         flat,
@@ -20909,6 +21172,12 @@ class MovingEnvironment:
             return
         mapping = {
             "compact_plan_records": "cpp_moving_environment_compact_plan_records",
+            "compact_plan_real_stack_records": "cpp_moving_environment_compact_plan_real_stack_records",
+            "compact_plan_real_matvec_calls": "cpp_moving_environment_compact_plan_real_matvec_calls",
+            "compact_plan_complex_matvec_calls": "cpp_moving_environment_compact_plan_complex_matvec_calls",
+            "compact_plan_real_solution_phase_fixes": "cpp_moving_environment_compact_plan_real_solution_phase_fixes",
+            "compact_plan_real_output_phase_fixes": "cpp_moving_environment_compact_plan_real_output_phase_fixes",
+            "compact_plan_max_stack_imag": "cpp_moving_environment_compact_plan_max_stack_imag",
             "compact_plan_installs": "cpp_moving_environment_compact_plan_installs",
             "compact_plan_replacements": "cpp_moving_environment_compact_plan_replacements",
             "compact_plan_matvec_calls": "cpp_moving_environment_compact_plan_matvec_calls",
@@ -21529,24 +21798,11 @@ class MovingEnvironment:
             return False
         key = self._cpp_moving_environment_compact_key(operator)
         layout_blocks = int(len(tuple(layout)))
-        if (
-            getattr(direct, "cpp_moving_environment", None) is env
-            and getattr(direct, "cpp_moving_environment_key", None) == key
-            and int(getattr(direct, "_cpp_moving_environment_layout_blocks", -1))
-            == layout_blocks
-            and getattr(direct, "_cpp_moving_environment_plan", None)
-            is getattr(direct, "cpp_plan", None)
-            and getattr(direct, "_cpp_moving_environment_routes", None) is routes
-        ):
-            self.moving_profile_stats[
-                "cpp_moving_environment_compact_plan_install_skips"
-            ] = int(
-                self.moving_profile_stats.get(
-                    "cpp_moving_environment_compact_plan_install_skips",
-                    0,
-                )
-            ) + 1
-            return True
+        # Native compact records are intentionally keyed by bond.  Different
+        # sector layouts can therefore replace the same owner record between
+        # visits to a cached table.  Always rebind the active table: checking
+        # only this wrapper's previous binding can leave the owner pointing at
+        # another layout with a different flat dimension.
         try:
             env.install_compact_plan(
                 key,
@@ -21817,7 +22073,10 @@ class MovingEnvironment:
             if np.dtype(dtype) != np.dtype(np.complex128):
                 dtype = np.complex128
             proto_full = operator._zero_proto_from_layout(proto, layout, dtype)
-            plan = operator._build_compact_matrix_chain_plan(proto_full)
+            plan = operator._build_compact_matrix_chain_plan(
+                proto_full,
+                build_static_stacks=False,
+            )
             if plan is None:
                 self._compact_renormalized_table_cache[cache_key] = None
                 return None
@@ -21963,10 +22222,11 @@ class MovingEnvironment:
                     "out": plan["batched_out_entries"],
                 },
             )
-            diagonal_routes = self._compact_diagonal_routes(
-                plan,
-                offsets,
-                layout_shapes,
+            diagonal_route_builder = getattr(cpp_plan, "diagonal_routes", None)
+            diagonal_routes = (
+                diagonal_route_builder()
+                if diagonal_route_builder is not None
+                else self._compact_diagonal_routes(plan, offsets, layout_shapes)
             )
             direct.install_diagonal_routes(diagonal_routes)
             direct.n_entries = int(
@@ -22802,10 +23062,44 @@ class MovingEnvironment:
                 table is None
                 or getattr(table, "cpp_moving_environment", None) is not env
             ):
+                # Spin-orbital QC commonly resolves to a compact plan rather
+                # than a grouped table.  Solve that native plan and feed its
+                # flat vector into the existing compiled sector-aware split;
+                # the caller can then advance the prepared environment step.
+                result = self.solve_cpp_davidson(
+                    operator,
+                    proto,
+                    layout,
+                    v_flat,
+                    tol=float(tol),
+                    max_iter=int(max_iter),
+                    restart_dim=int(restart_dim),
+                    accept_unconverged=bool(accept_unconverged),
+                )
+                if result is None or not bool(result.get("accepted", False)):
+                    self.moving_profile_stats[
+                        "cpp_moving_environment_solve_update_backend"
+                    ] = "compact_plan_rejected"
+                    return None if result is None else (result, None)
+                update = self.split_flat_two_site_update(
+                    np.asarray(result["vector"], dtype=np.complex128),
+                    layout,
+                    qns=getattr(proto, "qns", None),
+                    dirs=getattr(proto, "dirs", None),
+                    direction=direction,
+                    m_max=m_max,
+                )
+                if update is None:
+                    self.moving_profile_stats[
+                        "cpp_moving_environment_solve_update_backend"
+                    ] = "compact_plan_split_failed"
+                    return result, None
+                result = dict(result)
+                result["table_source"] = "compact_plan_owner_update"
                 self.moving_profile_stats[
                     "cpp_moving_environment_solve_update_backend"
-                ] = "unsupported"
-                return None
+                ] = "cpp_compact_plan_update"
+                return result, update
             packed_layout, sector_decoder = (
                 _pack_two_site_split_layout_integer_sector_ids(layout)
             )
@@ -26759,7 +27053,18 @@ def dense_to_symmetric_mpo(
         all_phys_out = sorted(list(set(phys_qns.values())))
         all_phys_in = sorted(list(set(phys_qns.values())))
         unique_phys_qns = len(all_phys_out) == len(phys_qns)
-        if unique_phys_qns:
+        # AutoMPO/QC cores are channel sparse even though their temporary
+        # carrier is a dense ndarray.  Slicing every (left-sector, physical)
+        # combination scans the full virtual matrix repeatedly and used to
+        # dominate CAS(10,10) U1 setup.  Reuse one sparse support scan for such
+        # cores; keep the block slicing path for genuinely dense operators.
+        support = np.abs(W) > tol
+        support_nnz = int(np.count_nonzero(support))
+        use_dense_block_scan = bool(
+            unique_phys_qns
+            and support_nnz * 8 >= int(np.asarray(W).size)
+        )
+        if use_dense_block_scan:
             curr_by_q = defaultdict(list)
             for l_idx, q_l in current_nodes:
                 if not is_sector_like(q_l):
@@ -26836,7 +27141,7 @@ def dense_to_symmetric_mpo(
             if l_idx not in valid_incoming: valid_incoming[l_idx] = set()
             valid_incoming[l_idx].add(q_l)
         # W shape: (Left, Right, Out, In)
-        idxs = np.nonzero(np.abs(W) > tol)
+        idxs = np.nonzero(support)
         for i in range(len(idxs[0])):
             l, r, out_s, in_s = idxs[0][i], idxs[1][i], idxs[2][i], idxs[3][i]
             val = W[l, r, out_s, in_s]
@@ -26918,6 +27223,408 @@ def dense_to_symmetric_mpo(
     return sym_H
 
 
+def compress_symmetric_mpo(mpo, *, rtol=1.0e-12, max_bond=None):
+    """Round an Abelian MPO without mixing its virtual charge sectors.
+
+    The first sweep right-orthogonalizes every incoming-charge block.  The
+    second sweep performs the numerical truncation independently inside each
+    outgoing-charge block, then applies an optional cap to the combined bond.
+    This is the block-sparse counterpart of dense TT rounding.
+    """
+    if not isinstance(mpo, MPO):
+        raise TypeError("compress_symmetric_mpo expects an MPO")
+    if not np.isfinite(rtol) or float(rtol) < 0.0:
+        raise ValueError("rtol must be finite and nonnegative")
+    if max_bond is not None and int(max_bond) < 1:
+        raise ValueError("max_bond must be a positive integer")
+    if not mpo.factors or not all(
+        isinstance(tensor, (AbelianSiteTensorData, BlockTensor))
+        for tensor in mpo.factors
+    ):
+        raise TypeError("MPO factors must be Abelian block tensors")
+
+    factors = [tensor.copy() for tensor in mpo.factors]
+
+    def ordered_sectors(axis_qns, groups):
+        ordered = [sector for sector in axis_qns if sector in groups]
+        ordered.extend(sector for sector in groups if sector not in ordered)
+        return tuple(ordered)
+
+    def make_tensor(prototype, data, qns):
+        if isinstance(prototype, AbelianSiteTensorData):
+            return AbelianSiteTensorData(
+                data,
+                tuple(tuple(axis) for axis in qns),
+                prototype.dirs,
+                copy=False,
+            )
+        return BlockTensor(
+            data,
+            [list(axis) for axis in qns],
+            list(prototype.dirs),
+        )
+
+    # Right orthogonalization.  Charge blocks cannot be combined because the
+    # left virtual charge is part of the conserved fused index.
+    for site in range(len(factors) - 1, 0, -1):
+        tensor = factors[site]
+        groups = defaultdict(list)
+        for key, block in tensor.data.items():
+            groups[key[0]].append((key, np.asarray(block)))
+
+        new_data = OrderedDict()
+        transfers = {}
+        for sector, items in groups.items():
+            widths = [
+                int(block.shape[1] * block.shape[2] * block.shape[3])
+                for _key, block in items
+            ]
+            matrix = np.concatenate(
+                [block.reshape(block.shape[0], -1) for _key, block in items],
+                axis=1,
+            )
+            q_transpose, center_transpose = np.linalg.qr(
+                matrix.T,
+                mode="reduced",
+            )
+            transfers[sector] = center_transpose.T
+            offset = 0
+            for (key, block), width in zip(items, widths):
+                new_data[key] = q_transpose.T[
+                    :, offset : offset + width
+                ].reshape(q_transpose.shape[1], *block.shape[1:])
+                offset += width
+
+        left_sectors = ordered_sectors(tensor.qns[0], groups)
+        factors[site] = make_tensor(
+            tensor,
+            new_data,
+            (left_sectors, tensor.qns[1], tensor.qns[2], tensor.qns[3]),
+        )
+        previous = factors[site - 1]
+        previous_data = OrderedDict()
+        for key, block in previous.data.items():
+            transfer = transfers.get(key[1])
+            if transfer is not None:
+                previous_data[key] = np.einsum(
+                    "aboi,br->aroi",
+                    block,
+                    transfer,
+                    optimize=True,
+                )
+        factors[site - 1] = make_tensor(
+            previous,
+            previous_data,
+            (previous.qns[0], left_sectors, previous.qns[2], previous.qns[3]),
+        )
+
+    # Left-to-right SVD truncation.  After the right sweep these are the true
+    # operator Schmidt spectra, resolved by outgoing virtual charge.
+    for site in range(len(factors) - 1):
+        tensor = factors[site]
+        groups = defaultdict(list)
+        for key, block in tensor.data.items():
+            groups[key[1]].append((key, np.asarray(block)))
+
+        decompositions = {}
+        candidates = []
+        for sector, items in groups.items():
+            heights = [
+                int(block.shape[0] * block.shape[2] * block.shape[3])
+                for _key, block in items
+            ]
+            matrix = np.concatenate(
+                [
+                    block.transpose(0, 2, 3, 1).reshape(-1, block.shape[1])
+                    for _key, block in items
+                ],
+                axis=0,
+            )
+            left, singular, right = np.linalg.svd(matrix, full_matrices=False)
+            threshold = float(rtol) * singular[0] if singular.size else 0.0
+            rank = int(np.count_nonzero(singular > threshold))
+            decompositions[sector] = (items, heights, left, singular, right, rank)
+            candidates.extend(
+                (float(value), sector, index)
+                for index, value in enumerate(singular[:rank])
+            )
+
+        if max_bond is not None and len(candidates) > int(max_bond):
+            retained = sorted(candidates, key=lambda item: item[0], reverse=True)[
+                : int(max_bond)
+            ]
+            ranks = defaultdict(int)
+            for _value, sector, _index in retained:
+                ranks[sector] += 1
+        else:
+            ranks = {
+                sector: values[-1]
+                for sector, values in decompositions.items()
+            }
+
+        new_data = OrderedDict()
+        transfers = {}
+        surviving = {}
+        for sector, values in decompositions.items():
+            items, heights, left, singular, right, _rank = values
+            rank = int(ranks.get(sector, 0))
+            if rank == 0:
+                continue
+            surviving[sector] = items
+            transfers[sector] = singular[:rank, None] * right[:rank]
+            offset = 0
+            for (key, block), height in zip(items, heights):
+                new_data[key] = left[
+                    offset : offset + height, :rank
+                ].reshape(
+                    block.shape[0], block.shape[2], block.shape[3], rank
+                ).transpose(0, 3, 1, 2)
+                offset += height
+
+        right_sectors = ordered_sectors(tensor.qns[1], surviving)
+        factors[site] = make_tensor(
+            tensor,
+            new_data,
+            (tensor.qns[0], right_sectors, tensor.qns[2], tensor.qns[3]),
+        )
+        following = factors[site + 1]
+        following_data = OrderedDict()
+        for key, block in following.data.items():
+            transfer = transfers.get(key[0])
+            if transfer is not None:
+                following_data[key] = np.einsum(
+                    "ab,broi->aroi",
+                    transfer,
+                    block,
+                    optimize=True,
+                )
+        factors[site + 1] = make_tensor(
+            following,
+            following_data,
+            (right_sectors, following.qns[1], following.qns[2], following.qns[3]),
+        )
+
+    return MPO(
+        factors,
+        target_qn=mpo.target_qn,
+        sites=mpo.sites,
+        input_sites=mpo.input_sites,
+    )
+
+
+def symmetric_mpo_to_dense(mpo, site_qn_maps=None):
+    """Expand Abelian MPO blocks into dense MPO factors.
+
+    ``site_qn_maps`` restores the primitive local-state order when several
+    states share a charge sector.  Without it, those states are grouped by the
+    sector order stored on each physical leg.
+    """
+    if not isinstance(mpo, MPO):
+        raise TypeError("symmetric_mpo_to_dense expects an MPO")
+    if site_qn_maps is not None and len(site_qn_maps) != mpo.L:
+        raise ValueError("site_qn_maps must contain one map per MPO site")
+
+    dense_factors = []
+    for site, tensor in enumerate(mpo.factors):
+        if not isinstance(tensor, (AbelianSiteTensorData, BlockTensor)):
+            dense_factors.append(np.asarray(tensor))
+            continue
+
+        dimensions = []
+        for axis, qns in enumerate(tensor.qns):
+            axis_dimensions = Counter(qns)
+            for key, block in tensor.data.items():
+                axis_dimensions[key[axis]] = max(
+                    int(axis_dimensions.get(key[axis], 0)),
+                    int(np.asarray(block).shape[axis]),
+                )
+            dimensions.append(axis_dimensions)
+
+        axis_maps = []
+        shape = []
+        for axis, (qns, axis_dimensions) in enumerate(
+            zip(tensor.qns, dimensions)
+        ):
+            if site_qn_maps is not None and axis in (2, 3):
+                primitive = defaultdict(list)
+                for state, sector in sorted(site_qn_maps[site].items()):
+                    primitive[sector].append(int(state))
+                axis_maps.append(dict(primitive))
+                shape.append(max(state for states in primitive.values() for state in states) + 1)
+                continue
+            mapping = {}
+            offset = 0
+            for sector in qns:
+                if sector in mapping:
+                    continue
+                dimension = int(axis_dimensions[sector])
+                mapping[sector] = list(range(offset, offset + dimension))
+                offset += dimension
+            axis_maps.append(mapping)
+            shape.append(offset)
+
+        dense = np.zeros(tuple(shape), dtype=complex)
+        for key, block in tensor.data.items():
+            indices = [axis_maps[axis][sector] for axis, sector in enumerate(key)]
+            dense[np.ix_(*indices)] += block
+        dense_factors.append(dense)
+
+    return MPO(
+        dense_factors,
+        target_qn=mpo.target_qn,
+        sites=mpo.sites,
+        input_sites=mpo.input_sites,
+    )
+
+
+def compress_symmetric_mps(mps, *, rtol=1.0e-12, max_bond=None):
+    """Round a charge-resolved MPS with sector-preserving TT sweeps."""
+    if not isinstance(mps, MPS):
+        raise TypeError("compress_symmetric_mps expects an MPS")
+    if not np.isfinite(rtol) or float(rtol) < 0.0:
+        raise ValueError("rtol must be finite and nonnegative")
+    if max_bond is not None and int(max_bond) < 1:
+        raise ValueError("max_bond must be a positive integer")
+    if tuple(mps.labels) != ("lv", "rv", "p"):
+        raise ValueError("symmetric MPS tensors must use ('lv', 'rv', 'p') order")
+    if not all(
+        isinstance(tensor, (AbelianSiteTensorData, BlockTensor))
+        for tensor in mps.factors
+    ):
+        raise TypeError("MPS factors must be Abelian block tensors")
+
+    factors = [tensor.copy() for tensor in mps.factors]
+
+    def ordered_sectors(axis_qns, groups):
+        ordered = [sector for sector in axis_qns if sector in groups]
+        ordered.extend(sector for sector in groups if sector not in ordered)
+        return tuple(ordered)
+
+    def make_tensor(prototype, data, qns):
+        if isinstance(prototype, AbelianSiteTensorData):
+            return AbelianSiteTensorData(
+                data,
+                tuple(tuple(axis) for axis in qns),
+                prototype.dirs,
+                copy=False,
+            )
+        return BlockTensor(
+            data,
+            [list(axis) for axis in qns],
+            list(prototype.dirs),
+        )
+
+    for site in range(len(factors) - 1, 0, -1):
+        tensor = factors[site]
+        groups = defaultdict(list)
+        for key, block in tensor.data.items():
+            groups[key[0]].append((key, np.asarray(block)))
+        new_data = OrderedDict()
+        transfers = {}
+        for sector, items in groups.items():
+            widths = [int(block.shape[1] * block.shape[2]) for _key, block in items]
+            matrix = np.concatenate(
+                [block.reshape(block.shape[0], -1) for _key, block in items],
+                axis=1,
+            )
+            q_transpose, center_transpose = np.linalg.qr(matrix.T, mode="reduced")
+            transfers[sector] = center_transpose.T
+            offset = 0
+            for (key, block), width in zip(items, widths):
+                new_data[key] = q_transpose.T[
+                    :, offset : offset + width
+                ].reshape(q_transpose.shape[1], *block.shape[1:])
+                offset += width
+        left_sectors = ordered_sectors(tensor.qns[0], groups)
+        factors[site] = make_tensor(
+            tensor,
+            new_data,
+            (left_sectors, tensor.qns[1], tensor.qns[2]),
+        )
+        previous = factors[site - 1]
+        previous_data = OrderedDict()
+        for key, block in previous.data.items():
+            transfer = transfers.get(key[1])
+            if transfer is not None:
+                previous_data[key] = np.einsum(
+                    "abp,br->arp", block, transfer, optimize=True
+                )
+        factors[site - 1] = make_tensor(
+            previous,
+            previous_data,
+            (previous.qns[0], left_sectors, previous.qns[2]),
+        )
+
+    for site in range(len(factors) - 1):
+        tensor = factors[site]
+        groups = defaultdict(list)
+        for key, block in tensor.data.items():
+            groups[key[1]].append((key, np.asarray(block)))
+        decompositions = {}
+        candidates = []
+        for sector, items in groups.items():
+            heights = [int(block.shape[0] * block.shape[2]) for _key, block in items]
+            matrix = np.concatenate(
+                [block.transpose(0, 2, 1).reshape(-1, block.shape[1]) for _key, block in items],
+                axis=0,
+            )
+            left, singular, right = np.linalg.svd(matrix, full_matrices=False)
+            threshold = float(rtol) * singular[0] if singular.size else 0.0
+            rank = int(np.count_nonzero(singular > threshold))
+            decompositions[sector] = (items, heights, left, singular, right, rank)
+            candidates.extend(
+                (float(value), sector, index)
+                for index, value in enumerate(singular[:rank])
+            )
+        if max_bond is not None and len(candidates) > int(max_bond):
+            retained = sorted(candidates, key=lambda item: item[0], reverse=True)[
+                : int(max_bond)
+            ]
+            ranks = defaultdict(int)
+            for _value, sector, _index in retained:
+                ranks[sector] += 1
+        else:
+            ranks = {sector: values[-1] for sector, values in decompositions.items()}
+
+        new_data = OrderedDict()
+        transfers = {}
+        surviving = {}
+        for sector, values in decompositions.items():
+            items, heights, left, singular, right, _rank = values
+            rank = int(ranks.get(sector, 0))
+            if rank == 0:
+                continue
+            surviving[sector] = items
+            transfers[sector] = singular[:rank, None] * right[:rank]
+            offset = 0
+            for (key, block), height in zip(items, heights):
+                new_data[key] = left[
+                    offset : offset + height, :rank
+                ].reshape(block.shape[0], block.shape[2], rank).transpose(0, 2, 1)
+                offset += height
+        right_sectors = ordered_sectors(tensor.qns[1], surviving)
+        factors[site] = make_tensor(
+            tensor,
+            new_data,
+            (tensor.qns[0], right_sectors, tensor.qns[2]),
+        )
+        following = factors[site + 1]
+        following_data = OrderedDict()
+        for key, block in following.data.items():
+            transfer = transfers.get(key[0])
+            if transfer is not None:
+                following_data[key] = np.einsum(
+                    "ab,brp->arp", transfer, block, optimize=True
+                )
+        factors[site + 1] = make_tensor(
+            following,
+            following_data,
+            (right_sectors, following.qns[1], following.qns[2]),
+        )
+
+    return MPS(factors, labels=mps.labels, sites=mps.sites)
+
+
 class MPS:
     """Finite matrix-product state.
 
@@ -26943,44 +27650,50 @@ class MPS:
 
     def __init__(
         self,
-        Bs,
-        Ss=None,
+        factors,
+        singular_values=None,
         bc="finite",
         labels=STANDARD_LABELS,
-        homogenous=False,
+        homogeneous=False,
         center=-1,
         gauge=None,
+        sites=None,
     ):
         """Create a finite MPS.
 
         Parameters
         ----------
-        Bs
+        factors
             Rank-three site tensors in the ordering declared by labels.
-        Ss
+        singular_values
             Optional Schmidt-value arrays, one per bond.
         bc
             Either "finite" or "periodic".
         labels
             A permutation of ("lv", "p", "rv").
-        homogenous
+        homogeneous
             Whether all sites are known to have the same physical dimension.
         center
             Orthogonality-center index, or -1 when unspecified.
         gauge
             Optional canonical-gauge name or alias.
+        sites
+            Ordered :class:`~pyqed.lattice.site.Site` metadata.  Anonymous
+            sites are inferred from the physical dimensions when omitted.
         """
         if bc not in {"finite", "periodic"}:
             raise ValueError("bc must be either 'finite' or 'periodic'.")
 
-        tensors = list(Bs)
+        tensors = list(factors)
         if not tensors:
             raise ValueError("An MPS must contain at least one site tensor.")
 
         self.bc = bc
         self.L = len(tensors)
         self.nbonds = self.L - 1 if bc == "finite" else self.L
-        self.Ss = None if Ss is None else list(Ss)
+        self.singular_values = (
+            None if singular_values is None else list(singular_values)
+        )
 
         self.labels = self._validated_labels(labels)
         self.lv_idx = self.labels.index("lv")
@@ -26988,15 +27701,31 @@ class MPS:
         self.rv_idx = self.labels.index("rv")
         self.center, self.gauge = self._resolved_gauge(center, gauge)
 
-        self.Bs = tensors
-        self.data = self.Bs
-        self.factors = self.Bs
-        self.homogenous = bool(homogenous)
-        self.dims = [int(tensor.shape[self.p_idx]) for tensor in tensors]
-        if self.homogenous:
+        self.factors = tensors
+        self.homogeneous = bool(homogeneous)
+        stored_dims = [int(tensor.shape[self.p_idx]) for tensor in tensors]
+        block_sparse = all(
+            hasattr(tensor, "qns") and isinstance(getattr(tensor, "data", None), dict)
+            for tensor in tensors
+        )
+        if sites is not None and block_sparse:
+            supplied_sites = tuple(sites)
+            if len(supplied_sites) != self.L:
+                raise ValueError(
+                    "The number of sites must match the tensor chain length."
+                )
+            if any(not isinstance(site, (Site, Leg)) for site in supplied_sites):
+                raise TypeError("sites must contain Site or Leg objects.")
+            self.dims = [int(site.dim) for site in supplied_sites]
+            sites = supplied_sites
+        else:
+            self.dims = stored_dims
+        self.sites = normalize_sites(sites, self.dims)
+        self.legs = tuple(site.leg for site in self.sites)
+        if self.homogeneous:
             if len(set(self.dims)) != 1:
                 raise ValueError(
-                    "homogenous=True requires the same physical dimension at every site."
+                    "homogeneous=True requires the same physical dimension at every site."
                 )
             self.dim = self.dims[0]
 
@@ -27053,11 +27782,11 @@ class MPS:
         """Validate tensor ranks, open boundaries, bonds, and metadata."""
         if self.L == 0:
             raise ValueError("An MPS must contain at least one site tensor.")
-        if len(self.Bs) != self.L:
+        if len(self.factors) != self.L:
             raise ValueError("The stored MPS length is inconsistent with its tensors.")
 
         dense_shapes = []
-        for i, tensor in enumerate(self.Bs):
+        for i, tensor in enumerate(self.factors):
             rank = getattr(tensor, "rank", getattr(tensor, "ndim", None))
             if rank != 3:
                 raise ValueError(f"MPS site {i} must have rank 3; got rank {rank}.")
@@ -27081,12 +27810,12 @@ class MPS:
                         f"{left[2]} and {right[0]}."
                     )
 
-        if self.Ss is not None:
-            if len(self.Ss) != self.nbonds:
+        if self.singular_values is not None:
+            if len(self.singular_values) != self.nbonds:
                 raise ValueError(
-                    f"Expected {self.nbonds} Schmidt-value arrays, got {len(self.Ss)}."
+                    f"Expected {self.nbonds} Schmidt-value arrays, got {len(self.singular_values)}."
                 )
-            for i, values in enumerate(self.Ss):
+            for i, values in enumerate(self.singular_values):
                 if values is not None and np.asarray(values).ndim != 1:
                     raise ValueError(f"Schmidt values for bond {i} must be one-dimensional.")
                 if dense_shapes and values is not None:
@@ -27122,13 +27851,14 @@ class MPS:
 
     def copy(self):
         copied = type(self)(
-            [B.copy() for B in self.Bs],
-            [None if S is None else S.copy() for S in self.Ss]
-            if self.Ss is not None else None,
+            [B.copy() for B in self.factors],
+            [None if S is None else S.copy() for S in self.singular_values]
+            if self.singular_values is not None else None,
             self.bc,
             labels=self.labels,
-            homogenous=self.homogenous,
+            homogeneous=self.homogeneous,
             center=self.center,
+            sites=self.sites,
         )
         copied.gauge = self.gauge
         return copied
@@ -27139,10 +27869,10 @@ class MPS:
 
     def norm_squared(self):
         """Return the squared Hilbert-space norm ``<psi|psi>``."""
-        if self.Bs and hasattr(self.Bs[0], "qns"):
-            identity = [make_identity_mpo_site_from_mps_site(site) for site in self.Bs]
+        if self.factors and hasattr(self.factors[0], "qns"):
+            identity = [make_identity_mpo_site_from_mps_site(site) for site in self.factors]
             env = initial_E(identity[0])
-            for W, site in zip(identity, self.Bs):
+            for W, site in zip(identity, self.factors):
                 env = contract_from_left(W, site, env, site)
             return np.abs(abelian_environment_scalar(env))
 
@@ -27157,12 +27887,25 @@ class MPS:
         return np.abs(val[0, 0])
 
     def norm(self):
-        """Return ``<psi|psi>`` (the historical squared-norm API).
+        """Return the Hilbert-space norm ``sqrt(<psi|psi>)``."""
+        return np.sqrt(np.real_if_close(self.norm_squared()))
 
-        Use ``sqrt(mps.norm())`` for the Hilbert-space norm.  The explicit
-        :meth:`norm_squared` spelling is available for new code.
-        """
-        return self.norm_squared()
+    def expectation(self, operator):
+        """Return ``<self|operator|self>`` for an :class:`MPO`."""
+        if not isinstance(operator, MPO):
+            raise TypeError("MPS.expectation expects an MPO.")
+        if self.L != operator.L:
+            raise ValueError("MPS and MPO lengths must match.")
+        if not sites_compatible(self.sites, operator.input_sites):
+            raise ValueError("MPS sites are incompatible with the MPO input sites.")
+        if not sites_compatible(self.sites, operator.sites):
+            raise ValueError("MPS sites are incompatible with the MPO output sites.")
+        factors = (
+            self.factors
+            if self.factors and hasattr(self.factors[0], "qns")
+            else [self._get_std_B(site) for site in range(self.L)]
+        )
+        return _expect_factors(factors, operator.factors)
 
     def normalize(self):
         """Normalize the MPS in place to ``<psi|psi> = 1``."""
@@ -27170,7 +27913,7 @@ class MPS:
         if norm2 < 1.0e-24:
             raise ValueError("Cannot normalize a zero MPS.")
         site = self.center if self.gauge is not None else 0
-        self.Bs[site] = self.Bs[site] * (1.0 / np.sqrt(norm2))
+        self.factors[site] = self.factors[site] * (1.0 / np.sqrt(norm2))
         return self
 
 
@@ -27180,7 +27923,7 @@ class MPS:
         if new_labels == self.labels:
             return self
         perm = [self.labels.index(label) for label in new_labels]
-        self.Bs[:] = [tensor.transpose(perm) for tensor in self.Bs]
+        self.factors[:] = [tensor.transpose(perm) for tensor in self.factors]
         self.labels = new_labels
         self.lv_idx = self.labels.index('lv')
         self.rv_idx = self.labels.index('rv')
@@ -27195,14 +27938,15 @@ class MPS:
             return self.copy()
 
         perm = [self.labels.index(l) for l in target_labels]
-        new_Bs = [B.transpose(perm) for B in self.Bs]
+        new_Bs = [B.transpose(perm) for B in self.factors]
         result = MPS(
             new_Bs,
-            self.Ss,
+            self.singular_values,
             self.bc,
             labels=target_labels,
-            homogenous=self.homogenous,
+            homogeneous=self.homogeneous,
             center=self.center,
+            sites=self.sites,
         )
         result.gauge = self.gauge
         return result
@@ -27213,7 +27957,7 @@ class MPS:
 
     def _get_std_B(self, i):
         """Return dense site ``i`` in ``(left, physical, right)`` order."""
-        B = self.Bs[i]
+        B = self.factors[i]
         # Symmetry tensors retain their native (left, right, physical) layout;
         # their contraction kernels consume that representation directly.
         if hasattr(B, "qns") and isinstance(B.data, dict):
@@ -27222,7 +27966,7 @@ class MPS:
 
     def get_bond_dimensions(self):
         """Return the dimension of every internal right bond."""
-        return [int(self.Bs[i].shape[self.rv_idx]) for i in range(self.nbonds)]
+        return [int(self.factors[i].shape[self.rv_idx]) for i in range(self.nbonds)]
 
     def get_singular_values(self, bond_id):
         if not isinstance(bond_id, (int, np.integer)):
@@ -27232,11 +27976,11 @@ class MPS:
             raise IndexError(
                 f"Bond {bond_id} out of range for an MPS with {self.nbonds} bonds."
             )
-        if self.Ss is None or self.Ss[bond_id] is None:
+        if self.singular_values is None or self.singular_values[bond_id] is None:
             raise ValueError(
                 "Schmidt values are unavailable; canonicalize the MPS first."
             )
-        return np.asarray(self.Ss[bond_id]).copy()
+        return np.asarray(self.singular_values[bond_id]).copy()
 
     def __add__(self, other):
         """Return the direct-sum MPS representing ``self + other``."""
@@ -27244,10 +27988,15 @@ class MPS:
             return NotImplemented
         if self.L != other.L or self.dims != other.dims:
             raise ValueError("MPS addition requires matching site dimensions.")
+        if not sites_compatible(self.sites, other.sites):
+            raise ValueError("MPS addition requires compatible ordered sites.")
+        sites = richer_sites(self.sites, other.sites)
         if self.bc != "finite" or other.bc != "finite":
             raise NotImplementedError("MPS addition currently supports finite states only.")
         if self.L == 1:
-            return type(self)([self._get_std_B(0) + other._get_std_B(0)])
+            return type(self)(
+                [self._get_std_B(0) + other._get_std_B(0)], sites=sites
+            )
 
         factors = []
         for site in range(self.L):
@@ -27271,17 +28020,22 @@ class MPS:
                 new_tensor[la:, :, ra:] = B
             factors.append(new_tensor)
 
-        return type(self)(factors)
+        return type(self)(factors, sites=sites)
 
     def __getitem__(self, i):
         """Return site tensor ``i``."""
-        return self.Bs[i]
+        return self.factors[i]
 
     def __setitem__(self, i, value):
         """Replace site tensor ``i`` and invalidate canonical metadata."""
-        self.Bs[i] = value
-        self.dims[i] = int(value.shape[self.p_idx])
-        self.Ss = None
+        new_dim = int(value.shape[self.p_idx])
+        if new_dim != self.sites[i].dim:
+            raise ValueError(
+                f"Replacement physical dimension {new_dim} does not match "
+                f"site {i} dimension {self.sites[i].dim}."
+            )
+        self.factors[i] = value
+        self.singular_values = None
         self.center = -1
         self.gauge = None
 
@@ -27296,7 +28050,7 @@ class MPS:
         bonds = range(1, self.L) if self.bc == 'finite' else range(0, self.L)
         result = []
         for i in bonds:
-            S = self.Ss[i-1].copy()
+            S = self.singular_values[i-1].copy()
             S[S < 1.e-20] = 0.  # 0*log(0) should give 0; avoid warning or NaN.
             S2 = S * S
             assert abs(np.linalg.norm(S) - 1.) < 1.e-13
@@ -27315,16 +28069,16 @@ class MPS:
         if i > self.center:
             if i == 0:
                 if self.bc == 'periodic':
-                    S_left = self.Ss[-1]
+                    S_left = self.singular_values[-1]
                 else:
                     return tensor # Open Boundary, no left weights
             else:
-                S_left = self.Ss[i-1]
+                S_left = self.singular_values[i-1]
             # Contract S_left (diag) with Tensor (Left Index 0)
             return np.tensordot(np.diag(S_left), tensor, axes=([1], [0]))
         # Left of Center
         elif i < self.center:
-            S_right = self.Ss[i]
+            S_right = self.singular_values[i]
             # Contract Tensor (Right Index 2) with S_right (diag)
             return np.tensordot(tensor, np.diag(S_right), axes=([2], [0]))
         # At Center
@@ -27442,6 +28196,8 @@ class MPS:
         """Return the sitewise physical-index product with ``other``."""
         if not isinstance(other, MPS) or other.L != self.L or other.dims != self.dims:
             raise ValueError("Sitewise MPS products require matching site dimensions.")
+        if not sites_compatible(self.sites, other.sites):
+            raise ValueError("Sitewise MPS products require compatible ordered sites.")
 
         factors = []
         for site in range(self.L):
@@ -27457,28 +28213,28 @@ class MPS:
                     right_state * right_operator,
                 )
             )
-        return type(self)(factors)
+        return type(self)(factors, sites=richer_sites(self.sites, other.sites))
 
     def left_canonicalize(self):
         """
         Sweeps from Left (0) to Right (L-1) to transform the MPS into Left-Canonical Form.
         Effect:
-        - Tensors Bs[0]...Bs[L-2] become Left-Isometries (A).
-        - Populates self.Ss with bond weights.
+        - Tensors Bs[0]...factors[L-2] become Left-Isometries (A).
+        - Populates self.singular_values with bond weights.
         - Moves orthogonality center to the last site (L-1).
         """
-        if isinstance(self.Bs[0], AbelianSiteTensorData):
+        if isinstance(self.factors[0], AbelianSiteTensorData):
             self.center = self.L - 1
             self.gauge = 'left_canonical'
             return self
-        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
+        if SYMMETRY_AVAILABLE and isinstance(self.factors[0], BlockTensor):
             self.center = self.L - 1
             self.gauge = 'left_canonical'
             return self
         if self.norm_squared() < 1.0e-24:
             raise ValueError("Cannot canonicalize a zero MPS.")
-        if self.Ss is None or len(self.Ss) != self.nbonds:
-            self.Ss = [None] * self.nbonds
+        if self.singular_values is None or len(self.singular_values) != self.nbonds:
+            self.singular_values = [None] * self.nbonds
         perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
         for i in range(self.L - 1):
             B = self._get_std_B(i)
@@ -27486,17 +28242,17 @@ class MPS:
             mat = B.reshape(dl * dp, dr)
             U, S, Vh = np.linalg.svd(mat, full_matrices=False)
             chi = len(S)
-            self.Bs[i] = U.reshape(dl, dp, chi).transpose(perm_inv)
-            self.Ss[i] = S / np.linalg.norm(S)
+            self.factors[i] = U.reshape(dl, dp, chi).transpose(perm_inv)
+            self.singular_values[i] = S / np.linalg.norm(S)
             transfer = S[:, None] * Vh
             B_next = self._get_std_B(i + 1)
             B_next_updated = np.tensordot(
                 transfer, B_next, axes=([1], [0])
             )
-            self.Bs[i+1] = B_next_updated.transpose(perm_inv)
+            self.factors[i+1] = B_next_updated.transpose(perm_inv)
         B_last = self._get_std_B(self.L - 1)
         B_last /= np.linalg.norm(B_last)
-        self.Bs[self.L - 1] = B_last.transpose(perm_inv)
+        self.factors[self.L - 1] = B_last.transpose(perm_inv)
         self.center = self.L - 1
         self.gauge = "left_canonical"
         return self
@@ -27505,22 +28261,22 @@ class MPS:
         """
         Sweeps from Right (L-1) to Left (0) to transform the MPS into Right-Canonical Form.
         Effect:
-        - Tensors Bs[1]...Bs[L-1] become Right-Isometries (B).
-        - Populates self.Ss with bond weights.
+        - Tensors Bs[1]...factors[L-1] become Right-Isometries (B).
+        - Populates self.singular_values with bond weights.
         - Moves orthogonality center to the first site (0).
         """
-        if isinstance(self.Bs[0], AbelianSiteTensorData):
+        if isinstance(self.factors[0], AbelianSiteTensorData):
             self.center = 0
             self.gauge = 'right_canonical'
             return self
-        if SYMMETRY_AVAILABLE and isinstance(self.Bs[0], BlockTensor):
+        if SYMMETRY_AVAILABLE and isinstance(self.factors[0], BlockTensor):
             self.center = 0
             self.gauge = 'right_canonical'
             return self
         if self.norm_squared() < 1.0e-24:
             raise ValueError("Cannot canonicalize a zero MPS.")
-        if self.Ss is None or len(self.Ss) != self.nbonds:
-            self.Ss = [None] * self.nbonds
+        if self.singular_values is None or len(self.singular_values) != self.nbonds:
+            self.singular_values = [None] * self.nbonds
         perm_inv = np.argsort([self.lv_idx, self.p_idx, self.rv_idx])
         for i in range(self.L - 1, 0, -1):
             B = self._get_std_B(i)
@@ -27528,17 +28284,17 @@ class MPS:
             mat = B.reshape(dl, dp * dr)
             U, S, Vh = np.linalg.svd(mat, full_matrices=False)
             chi = len(S)
-            self.Bs[i] = Vh.reshape(chi, dp, dr).transpose(perm_inv)
-            self.Ss[i-1] = S / np.linalg.norm(S)
+            self.factors[i] = Vh.reshape(chi, dp, dr).transpose(perm_inv)
+            self.singular_values[i-1] = S / np.linalg.norm(S)
             transfer = U * S[None, :]
             B_prev = self._get_std_B(i - 1)
             B_prev_updated = np.tensordot(
                 B_prev, transfer, axes=([2], [0])
             )
-            self.Bs[i-1] = B_prev_updated.transpose(perm_inv)
+            self.factors[i-1] = B_prev_updated.transpose(perm_inv)
         B_first = self._get_std_B(0)
         B_first /= np.linalg.norm(B_first)
-        self.Bs[0] = B_first.transpose(perm_inv)
+        self.factors[0] = B_first.transpose(perm_inv)
         self.center = 0
         self.gauge = "right_canonical"
         return self
@@ -27550,7 +28306,7 @@ class MPS:
         reconstruct the state as ``Gamma[0] Lambda[0] Gamma[1] ...``.  They are
         copies and do not replace the canonical tensors stored by this object.
         """
-        if self.Bs and hasattr(self.Bs[0], 'qns'):
+        if self.factors and hasattr(self.factors[0], 'qns'):
             raise NotImplementedError(
                 "Vidal conversion is currently defined only for dense MPS tensors."
             )
@@ -27572,15 +28328,15 @@ class MPS:
         """Convert the state in place to right-canonical form."""
         return self.right_canonicalize()
 
-    def compress(self, chi_max):
-        """Return a scale-preserving dense MPS truncated to ``chi_max``."""
+    def compress(self, max_bond):
+        """Return a scale-preserving dense MPS truncated to ``max_bond``."""
         dense_factors = [self._get_std_B(i) for i in range(self.L)]
         compressed_factors = compress(
-            dense_factors, chi_max, renormalize=False
+            dense_factors, max_bond, renormalize=False
         )
         if isinstance(compressed_factors, tuple):
             compressed_factors = compressed_factors[0]
-        return type(self)(compressed_factors)
+        return type(self)(compressed_factors, sites=self.sites)
 
     def _calc_local_site_rdms(self, idx=None):
         r"""
@@ -27619,7 +28375,7 @@ class MPS:
         if self.L == 0:
             return {}
 
-        if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
+        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
             return dense_self._calc_local_site_rdms(idx=idx)
@@ -27695,7 +28451,7 @@ class MPS:
         is d=2 (Empty, Occupied). The returned scalar corresponds to the bottom-right
         diagonal element of the theoretical 4x4 two-site reduced density matrix.
         """
-        if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
+        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
             return dense_self.make_diagonal_rdm2(idx_pairs=idx_pairs)
@@ -27812,7 +28568,7 @@ class MPS:
         L = self.L
 
         # 1. Symmetric Branch
-        if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
+        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
             if sym_mgr is None:
                 raise ValueError("[Error] Symmetric RDM requires sym_mgr.")
 
@@ -27832,7 +28588,7 @@ class MPS:
 
                 W_a = build_annihilation_mpo_symmetric(spatial_idx, L, sym_mgr, spin)
                 try:
-                    phi_data = apply_mpo_symmetric(W_a, self.Bs)
+                    phi_data = apply_mpo_symmetric(W_a, self.factors)
                     if phi_data:
                         phis[spin_idx] = MPS(phi_data, labels=self.labels, bc=self.bc)
                 except Exception:
@@ -27852,7 +28608,7 @@ class MPS:
         # 2. Dense Branch (Exact O(L^2 D^3) evaluation with JW strings)
         else:
             P = np.zeros((L, L), dtype=complex)
-            d = self.Bs[0].shape[1]
+            d = self.factors[0].shape[1]
 
             if d == 2:
                 c_op    = np.array([[0, 1], [0, 0]], dtype=complex)
@@ -27938,7 +28694,7 @@ class MPS:
         L = self.L
         G = np.zeros((L, L, L, L), dtype=complex)
 
-        if SYMMETRY_AVAILABLE and hasattr(self.Bs[0], 'qns'):
+        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
             if not sym_mgr:
                 warnings.warn("Symmetric 2-RDM requires sym_mgr.", stacklevel=2)
                 return G
@@ -27948,59 +28704,46 @@ class MPS:
                 spin = 'up' if q % 2 == 0 else 'down'
                 W_q = build_annihilation_mpo_symmetric(q, L, sym_mgr, spin)
                 try:
-                    d = apply_mpo_symmetric(W_q, self.Bs)
+                    d = apply_mpo_symmetric(W_q, self.factors)
                     if d:
                         phis[q] = MPS(d, labels=self.labels, bc=self.bc)
                 except Exception as exc:
                     logger.debug("Failed to build one-hole state %d: %s", q, exc)
 
-            for p in range(L):
-                if phis[p] is None:
+            # Build each ordered two-hole state once.  The old four-index loop
+            # rebuilt |phi_{q,s}> for every bra pair, multiplying the expensive
+            # MPO application count by O(L^2).
+            pair_states = {}
+            for q, phi_q in enumerate(phis):
+                if phi_q is None:
                     continue
-                for r in range(L):
-                    spin_r = 'up' if r % 2 == 0 else 'down'
-                    W_r = build_annihilation_mpo_symmetric(r, L, sym_mgr, spin_r)
+                for s in range(q + 1, L):
+                    spin_s = 'up' if s % 2 == 0 else 'down'
+                    W_s = build_annihilation_mpo_symmetric(s, L, sym_mgr, spin_s)
                     try:
-                        bra_data = apply_mpo_symmetric(W_r, phis[p].Bs)
-                        if not bra_data:
-                            continue
-                        bra_mps = MPS(bra_data, labels=self.labels, bc=self.bc)
+                        pair_data = apply_mpo_symmetric(W_s, phi_q.factors)
+                        if pair_data:
+                            pair_states[(q, s)] = MPS(
+                                pair_data, labels=self.labels, bc=self.bc
+                            )
                     except Exception as exc:
                         logger.debug(
-                            "Failed to build two-hole bra (%d, %d): %s", p, r, exc
+                            "Failed to build two-hole state (%d, %d): %s", q, s, exc
                         )
+
+            for (p, r), bra_mps in pair_states.items():
+                bra_spin = (p % 2) + (r % 2)
+                for (q, s), ket_mps in pair_states.items():
+                    if bra_spin != (q % 2) + (s % 2):
                         continue
-
-                    for s in range(L):
-                        if phis[s] is None:
-                            continue
-                        for q in range(L):
-                            if phis[q] is None:
-                                continue
-                            if (p % 2) + (r % 2) != (s % 2) + (q % 2):
-                                continue
-
-                            spin_s = 'up' if s % 2 == 0 else 'down'
-                            W_s = build_annihilation_mpo_symmetric(s, L, sym_mgr, spin_s)
-                            try:
-                                ket_data = apply_mpo_symmetric(W_s, phis[q].Bs)
-                                if not ket_data:
-                                    continue
-                                ket_mps = MPS(ket_data, labels=self.labels, bc=self.bc)
-                            except Exception as exc:
-                                logger.debug(
-                                    "Failed to build two-hole ket (%d, %d): %s",
-                                    q,
-                                    s,
-                                    exc,
-                                )
-                                continue
-
-                            val = self._mps_dot(bra_mps, ket_mps)
-                            G[p, r, s, q] = val
+                    value = self._mps_dot(bra_mps, ket_mps)
+                    G[p, r, s, q] = value
+                    G[r, p, s, q] = -value
+                    G[p, r, q, s] = -value
+                    G[r, p, q, s] = value
             return G
         else:
-            d = self.Bs[0].shape[1]
+            d = self.factors[0].shape[1]
             if d != 2:
                 raise NotImplementedError(f"Dense 2-RDM currently supports d=2 spin-orbitals, got d={d}.")
 
@@ -28021,7 +28764,12 @@ class MPS:
                         new_B = B_std.copy()
                     # Restore original index order
                     new_Bs.append(new_B.transpose(perm_inv))
-                return MPS(new_Bs, labels=mps_obj.labels, bc=mps_obj.bc)
+                return MPS(
+                    new_Bs,
+                    labels=mps_obj.labels,
+                    bc=mps_obj.bc,
+                    sites=mps_obj.sites,
+                )
 
             # Pre-calculate 1-hole states: |phi_q> = c_q |Psi>
             phis = [None] * L
@@ -28031,26 +28779,25 @@ class MPS:
                 if abs(self._mps_dot(tmp, tmp)) > 1e-14:
                     phis[q] = tmp
 
-            # Double loop O(L^4) for two-hole overlaps
-            for p in range(L):
-                if phis[p] is None:
+            pair_states = {}
+            for q, phi_q in enumerate(phis):
+                if phi_q is None:
                     continue
-                for r in range(L):
-                    bra_mps = apply_annihilation(phis[p], r)
-                    if abs(self._mps_dot(bra_mps, bra_mps)) < 1e-14:
+                for s in range(q + 1, L):
+                    pair_mps = apply_annihilation(phi_q, s)
+                    if abs(self._mps_dot(pair_mps, pair_mps)) > 1e-14:
+                        pair_states[(q, s)] = pair_mps
+
+            for (p, r), bra_mps in pair_states.items():
+                bra_spin = (p % 2) + (r % 2)
+                for (q, s), ket_mps in pair_states.items():
+                    if bra_spin != (q % 2) + (s % 2):
                         continue
-
-                    for s in range(L):
-                        for q in range(L):
-                            if phis[q] is None:
-                                continue
-                            # Spin conservation check
-                            if (p % 2) + (r % 2) != (s % 2) + (q % 2):
-                                continue
-
-                            ket_mps = apply_annihilation(phis[q], s)
-                            val = self._mps_dot(bra_mps, ket_mps)
-                            G[p, r, s, q] = val
+                    value = self._mps_dot(bra_mps, ket_mps)
+                    G[p, r, s, q] = value
+                    G[r, p, s, q] = -value
+                    G[p, r, q, s] = -value
+                    G[r, p, q, s] = value
 
             return G
 
@@ -28075,14 +28822,14 @@ class MPS:
             two MPS chains.
         """
         # Symmetric Branch (BlockTensor)
-        if SYMMETRY_AVAILABLE and isinstance(mps1.Bs[0], BlockTensor):
+        if SYMMETRY_AVAILABLE and isinstance(mps1.factors[0], BlockTensor):
             mps1_std = mps1.to_order(['lv', 'rv', 'p'])
             mps2_std = mps2.to_order(['lv', 'rv', 'p'])
-            if len(mps1_std.Bs[0].data) == 0 or len(mps2_std.Bs[0].data) == 0:
+            if len(mps1_std.factors[0].data) == 0 or len(mps2_std.factors[0].data) == 0:
                 return 0.0j
             # E[q_bra_bond, q_ket_bond] = Matrix(dim_bra x dim_ket)
             # Detect Vacuum QN from the first block
-            first_key = next(iter(mps1_std.Bs[0].data.keys()))
+            first_key = next(iter(mps1_std.factors[0].data.keys()))
             vac_qn = first_key[0] # Left Bond QN
 
             # Initialize Environment as 1x1 Identity in Vacuum sector
@@ -28090,8 +28837,8 @@ class MPS:
             E_blocks = { (vac_qn, vac_qn): np.ones((1, 1), dtype=complex) }
 
             for i in range(self.L):
-                A = mps1_std.Bs[i] # Bra state (will be conjugated)
-                B = mps2_std.Bs[i] # Ket state
+                A = mps1_std.factors[i] # Bra state (will be conjugated)
+                B = mps2_std.factors[i] # Ket state
                 E_next = {}
 
                 # Iterate over current Environment sectors
@@ -28146,8 +28893,8 @@ class MPS:
             mps2_std = mps2.to_order(['lv', 'p', 'rv'])
             val = np.array([[1.0]], dtype=complex)
             for i in range(self.L):
-                A = mps1_std.Bs[i] # (Left, Phys, Right)
-                B = mps2_std.Bs[i]
+                A = mps1_std.factors[i] # (Left, Phys, Right)
+                B = mps2_std.factors[i]
 
                 # E(la, lb) * A*(la, p, ra) -> T(lb, p, ra)
                 T = np.tensordot(val, A.conj(), axes=(0, 0))
@@ -28156,8 +28903,375 @@ class MPS:
 
             return val.flatten()[0]
 
+def _round_dense_tensor_train(factors, max_bond, *, rtol=1.0e-8):
+    """Round dense TT cores without forming a two-site physical tensor."""
+    max_bond = int(max_bond)
+    if max_bond < 1:
+        raise ValueError("max_bond must be a positive integer")
+    result = [np.asarray(factor) for factor in factors]
+    if not result:
+        return result
+
+    for site in range(len(result) - 1, 0, -1):
+        left, physical, right = result[site].shape
+        q_transpose, center_transpose = np.linalg.qr(
+            result[site].reshape(left, physical * right).T,
+            mode="reduced",
+        )
+        rank = q_transpose.shape[1]
+        result[site] = q_transpose.T.reshape(rank, physical, right)
+        result[site - 1] = np.tensordot(
+            result[site - 1], center_transpose.T, axes=([2], [0])
+        )
+
+    for site in range(len(result) - 1):
+        left, physical, right = result[site].shape
+        matrix = result[site].reshape(left * physical, right)
+        u, singular, vh = np.linalg.svd(matrix, full_matrices=False)
+        threshold = float(rtol) * singular[0] if len(singular) else 0.0
+        numerical_rank = max(1, int(np.sum(singular > threshold)))
+        rank = min(max_bond, numerical_rank, len(singular))
+        result[site] = u[:, :rank].reshape(left, physical, rank)
+        transfer = singular[:rank, None] * vh[:rank]
+        result[site + 1] = np.tensordot(
+            transfer, result[site + 1], axes=([1], [0])
+        )
+    return result
+
+
+def _implicit_hadamard_right_environments(
+    left_factors,
+    right_factors,
+    *,
+    workspace_elements=2_000_000,
+):
+    """Contract product-MPO norm environments without forming product cores."""
+    count = len(left_factors)
+    environments = [None] * count
+    dtype = np.result_type(*left_factors, *right_factors)
+    environment = np.ones((1, 1, 1, 1), dtype=dtype)
+    for site in range(count - 1, -1, -1):
+        left = np.asarray(left_factors[site])
+        right = np.asarray(right_factors[site])
+        left_a, right_a, d_out, d_in = map(int, left.shape)
+        left_b, right_b, other_out, other_in = map(int, right.shape)
+        if (d_out, d_in) != (other_out, other_in):
+            raise ValueError("MPO Hadamard factors have incompatible physical dimensions")
+        environments[site] = environment.reshape(
+            right_a * right_b, right_a * right_b
+        )
+        physical = d_out * d_in
+        left_values = left.reshape(left_a, right_a, physical)
+        right_values = right.reshape(left_b, right_b, physical)
+        result = np.zeros((left_a, left_b, left_a, left_b), dtype=dtype)
+        per_point = max(
+            left_a * right_b * right_a * right_b,
+            left_a * right_b * left_a * right_b,
+            left_a * left_b * left_a * right_b,
+            1,
+        )
+        block = max(1, min(physical, int(workspace_elements) // per_point))
+        for start in range(0, physical, block):
+            stop = min(start + block, physical)
+            left_block = left_values[:, :, start:stop]
+            right_block = right_values[:, :, start:stop]
+            first = np.einsum(
+                "arp,rstu->apstu", left_block, environment, optimize=True
+            )
+            second = np.einsum(
+                "apstu,ctp->apscu", first, left_block.conj(), optimize=True
+            )
+            third = np.einsum(
+                "bsp,apscu->apbcu", right_block, second, optimize=True
+            )
+            result += np.einsum(
+                "dup,apbcu->abcd", right_block.conj(), third, optimize=True
+            )
+        matrix = result.reshape(left_a * left_b, left_a * left_b)
+        matrix = 0.5 * (matrix + matrix.conj().T)
+        scale = np.linalg.norm(matrix)
+        if scale > 0.0:
+            matrix /= scale
+        environment = matrix.reshape(left_a, left_b, left_a, left_b)
+    return environments
+
+
+def _matrix_free_hadamard_density_svd(
+    left,
+    right,
+    transfer,
+    right_environment,
+    max_bond,
+    *,
+    rtol,
+    rng,
+    oversampling=8,
+    power_iterations=2,
+    workspace_elements=2_000_000,
+):
+    """Truncate one implicit product core using its exact right metric."""
+    left = np.asarray(left)
+    right = np.asarray(right)
+    left_a, right_a, d_out, d_in = map(int, left.shape)
+    left_b, right_b, other_out, other_in = map(int, right.shape)
+    if (d_out, d_in) != (other_out, other_in):
+        raise ValueError("MPO Hadamard factors have incompatible physical dimensions")
+    physical = d_out * d_in
+    left_values = left.reshape(left_a, right_a, physical)
+    right_values = right.reshape(left_b, right_b, physical)
+    transfer = np.asarray(transfer).reshape(-1, left_a, left_b)
+    left_rank = int(transfer.shape[0])
+    right_product = right_a * right_b
+    row_count = left_rank * physical
+    sample_count = min(
+        row_count,
+        right_product,
+        int(max_bond) + max(0, int(oversampling)),
+    )
+    dtype = np.result_type(left, right, transfer, right_environment)
+    right_environment = np.asarray(right_environment, dtype=dtype).reshape(
+        right_product, right_product
+    )
+
+    def physical_block(sample_width):
+        per_point = max(
+            left_a * right_b * sample_width,
+            left_a * left_b * sample_width,
+            left_b * right_a * sample_width,
+            right_a * right_b * sample_width,
+            1,
+        )
+        return max(1, min(physical, int(workspace_elements) // per_point))
+
+    def matmat(vectors):
+        vectors = np.asarray(vectors, dtype=dtype).reshape(right_a, right_b, -1)
+        width = int(vectors.shape[-1])
+        output = np.empty((left_rank, physical, width), dtype=dtype)
+        block = physical_block(width)
+        for start in range(0, physical, block):
+            stop = min(start + block, physical)
+            left_block = left_values[:, :, start:stop]
+            right_block = right_values[:, :, start:stop]
+            first = np.einsum(
+                "rsq,arp->aspq", vectors, left_block, optimize=True
+            )
+            second = np.einsum(
+                "aspq,bsp->abpq", first, right_block, optimize=True
+            )
+            output[:, start:stop] = np.einsum(
+                "kab,abpq->kpq", transfer, second, optimize=True
+            )
+        return output.reshape(row_count, width)
+
+    def rmatmat(vectors):
+        vectors = np.asarray(vectors, dtype=dtype).reshape(
+            left_rank, physical, -1
+        )
+        width = int(vectors.shape[-1])
+        output = np.zeros((right_a, right_b, width), dtype=dtype)
+        block = physical_block(width)
+        for start in range(0, physical, block):
+            stop = min(start + block, physical)
+            left_block = left_values[:, :, start:stop]
+            right_block = right_values[:, :, start:stop]
+            first = np.einsum(
+                "kab,kpq->abpq",
+                transfer.conj(),
+                vectors[:, start:stop],
+                optimize=True,
+            )
+            second = np.einsum(
+                "abpq,arp->brpq", first, left_block.conj(), optimize=True
+            )
+            output += np.einsum(
+                "brpq,bsp->rsq", second, right_block.conj(), optimize=True
+            )
+        return output.reshape(right_product, width)
+
+    def density_action(vectors):
+        dual = rmatmat(vectors)
+        return matmat(right_environment @ dual)
+
+    samples = rng.standard_normal((row_count, sample_count))
+    if np.issubdtype(np.dtype(dtype), np.complexfloating):
+        samples = samples + 1j * rng.standard_normal(samples.shape)
+    basis, _unused = np.linalg.qr(density_action(samples), mode="reduced")
+    for _iteration in range(max(0, int(power_iterations))):
+        basis, _unused = np.linalg.qr(density_action(basis), mode="reduced")
+
+    projected = basis.conj().T @ density_action(basis)
+    projected = 0.5 * (projected + projected.conj().T)
+    eigenvalues, rotation = np.linalg.eigh(projected)
+    order = np.argsort(eigenvalues)[::-1]
+    eigenvalues = np.maximum(eigenvalues[order], 0.0)
+    rotation = rotation[:, order]
+    singular = np.sqrt(eigenvalues)
+    threshold = float(rtol) * singular[0] if len(singular) else 0.0
+    numerical_rank = max(1, int(np.sum(singular > threshold)))
+    rank = min(int(max_bond), numerical_rank, len(singular))
+    basis = basis @ rotation[:, :rank]
+    core = basis.reshape(left_rank, physical, rank)
+    next_transfer = rmatmat(basis).conj().T
+    return core, next_transfer
+
+
+def _round_hadamard_mpo_factors_matrix_free(
+    left_factors,
+    right_factors,
+    max_bond,
+    *,
+    rtol,
+):
+    """Density-matrix TT rounding of an implicit MPO Hadamard product."""
+    count = len(left_factors)
+    physical_dims = [tuple(map(int, factor.shape[2:])) for factor in left_factors]
+    environments = _implicit_hadamard_right_environments(
+        left_factors, right_factors
+    )
+    dtype = np.result_type(*left_factors, *right_factors)
+    transfer = np.ones((1, 1, 1), dtype=dtype)
+    result = [None] * count
+    rng = np.random.default_rng(0)
+    for site in range(count - 1):
+        core, next_transfer = _matrix_free_hadamard_density_svd(
+            left_factors[site],
+            right_factors[site],
+            transfer,
+            environments[site],
+            max_bond,
+            rtol=rtol,
+            rng=rng,
+        )
+        result[site] = core
+        right_a = int(left_factors[site].shape[1])
+        right_b = int(right_factors[site].shape[1])
+        transfer = next_transfer.reshape(next_transfer.shape[0], right_a, right_b)
+
+    left = np.asarray(left_factors[-1])
+    right = np.asarray(right_factors[-1])
+    physical = int(left.shape[2] * left.shape[3])
+    last = np.einsum(
+        "kab,arp,bsp->kprs",
+        transfer,
+        left.reshape(left.shape[0], left.shape[1], physical),
+        right.reshape(right.shape[0], right.shape[1], physical),
+        optimize=True,
+    )
+    result[-1] = last.reshape(transfer.shape[0], physical, -1)
+
+    factors = []
+    for core, (d_out, d_in) in zip(result, physical_dims):
+        left_rank, _physical, right_rank = core.shape
+        factors.append(
+            core.transpose(0, 2, 1).reshape(
+                left_rank, right_rank, d_out, d_in
+            )
+        )
+    return factors
+
+
+def _round_hadamard_mpo_factors(
+    left_factors,
+    right_factors,
+    max_bond,
+    *,
+    rtol=1.0e-8,
+    matrix_free=None,
+):
+    """Round an MPO Hadamard product without retaining large raw cores."""
+    max_bond = int(max_bond)
+    if max_bond < 1:
+        raise ValueError("max_bond must be a positive integer")
+    if len(left_factors) != len(right_factors):
+        raise ValueError("MPOs must contain the same number of factors")
+    count = len(left_factors)
+    if not count:
+        return []
+
+    physical_dims = []
+    for left, right in zip(left_factors, right_factors):
+        if left.shape[2:] != right.shape[2:]:
+            raise ValueError("MPO Hadamard factors have incompatible physical dimensions")
+        physical_dims.append(tuple(map(int, left.shape[2:])))
+
+    largest_raw_core = max(
+        int(left.shape[0])
+        * int(right.shape[0])
+        * int(left.shape[1])
+        * int(right.shape[1])
+        * int(left.shape[2])
+        * int(left.shape[3])
+        for left, right in zip(left_factors, right_factors)
+    )
+    if matrix_free is None:
+        matrix_free = largest_raw_core > 2_000_000
+    if matrix_free:
+        return _round_hadamard_mpo_factors_matrix_free(
+            left_factors,
+            right_factors,
+            max_bond,
+            rtol=rtol,
+        )
+
+    def product_core(site):
+        left = np.asarray(left_factors[site])
+        right = np.asarray(right_factors[site])
+        product = np.einsum("abij,mnij->ambnij", left, right, optimize=True)
+        mpo = product.reshape(
+            left.shape[0] * right.shape[0],
+            left.shape[1] * right.shape[1],
+            left.shape[2],
+            left.shape[3],
+        )
+        return mpo.reshape(mpo.shape[0], mpo.shape[1], -1).transpose(0, 2, 1)
+
+    result = [None] * count
+    center_transpose = None
+    for site in range(count - 1, 0, -1):
+        core = product_core(site)
+        if center_transpose is not None:
+            core = np.tensordot(core, center_transpose.T, axes=([2], [0]))
+        left, physical, right = core.shape
+        q_transpose, center_transpose = np.linalg.qr(
+            core.reshape(left, physical * right).T,
+            mode="reduced",
+        )
+        rank = q_transpose.shape[1]
+        result[site] = q_transpose.T.reshape(rank, physical, right)
+    result[0] = product_core(0)
+    if center_transpose is not None:
+        result[0] = np.tensordot(
+            result[0], center_transpose.T, axes=([2], [0])
+        )
+
+    for site in range(count - 1):
+        left, physical, right = result[site].shape
+        matrix = result[site].reshape(left * physical, right)
+        u, singular, vh = np.linalg.svd(matrix, full_matrices=False)
+        threshold = float(rtol) * singular[0] if len(singular) else 0.0
+        numerical_rank = max(1, int(np.sum(singular > threshold)))
+        rank = min(max_bond, numerical_rank, len(singular))
+        result[site] = u[:, :rank].reshape(left, physical, rank)
+        transfer = singular[:rank, None] * vh[:rank]
+        result[site + 1] = np.tensordot(
+            transfer, result[site + 1], axes=([1], [0])
+        )
+
+    factors = []
+    for core, (d_out, d_in) in zip(result, physical_dims):
+        left, _physical, right = core.shape
+        factors.append(
+            core.transpose(0, 2, 1).reshape(left, right, d_out, d_in)
+        )
+    return factors
+
+
 class MPO:
-    """Finite matrix-product operator in (left, right, out, in) order."""
+    """Finite matrix-product operator in ``(left, right, out, in)`` order.
+
+    ``sites`` and ``input_sites`` describe the output and input physical bases,
+    respectively.  Square operators may supply only ``sites``.
+    """
 
     STANDARD_LABELS = ("left", "right", "up", "down")
 
@@ -28166,7 +29280,9 @@ class MPO:
         factors,
         target_qn=None,
         labels=STANDARD_LABELS,
-        homogenous=False,
+        homogeneous=False,
+        sites=None,
+        input_sites=None,
     ):
         factors = list(factors)
         if not factors:
@@ -28184,25 +29300,38 @@ class MPO:
             )
 
         self.factors = factors
-        self.data = self.factors
-        self.cores = self.factors
         self.target_qn = target_qn
         self.labels = labels
-        self.homogenous = bool(homogenous)
+        self.homogeneous = bool(homogeneous)
         self.nsites = self.L = len(factors)
         self.nbonds = self.L - 1
         self.dims = [int(tensor.shape[2]) for tensor in factors]
-        if self.homogenous and len(set(self.dims)) != 1:
+        self.input_dims = [int(tensor.shape[3]) for tensor in factors]
+        self.sites = normalize_sites(sites, self.dims)
+        if input_sites is None and sites is not None and self.input_dims == self.dims:
+            input_sites = sites
+        self.input_sites = normalize_sites(input_sites, self.input_dims)
+        self.legs = tuple(site.leg for site in self.sites)
+        self.input_legs = tuple(site.leg for site in self.input_sites)
+        if self.homogeneous and len(set(self.dims)) != 1:
             raise ValueError(
-                "homogenous=True requires the same physical dimension at every site."
+                "homogeneous=True requires the same physical dimension at every site."
             )
 
     def bond_orders(self):
         """Return right bond dimensions for each site."""
         return [int(tensor.shape[1]) for tensor in self.factors]
 
-    def compress(self, chi_max):
-        """Return a scale-preserving MPO truncated to ``chi_max``."""
+    def compress(self, max_bond):
+        """Return a scale-preserving MPO truncated by canonical TT rounding.
+
+        Right-canonicalizing before the truncating sweep avoids materializing
+        the two-site matrices whose physical dimension scales as
+        ``d_i**2 * d_{i+1}**2`` for an MPO.
+        """
+        max_bond = int(max_bond)
+        if max_bond < 1:
+            raise ValueError("max_bond must be a positive integer")
         mps_factors = []
         physical_dims = []
         for W in self.factors:
@@ -28212,112 +29341,210 @@ class MPO:
                 W.reshape(left, right, d_out * d_in).transpose(0, 2, 1)
             )
 
-        compressed = compress(mps_factors, chi_max, renormalize=False)
+        compressed = _round_dense_tensor_train(mps_factors, max_bond)
         factors = []
         for B, (d_out, d_in) in zip(compressed, physical_dims):
             left, _, right = B.shape
             factors.append(
                 B.transpose(0, 2, 1).reshape(left, right, d_out, d_in)
             )
-        return type(self)(factors, target_qn=self.target_qn)
+        return type(self)(
+            factors,
+            target_qn=self.target_qn,
+            sites=self.sites,
+            input_sites=self.input_sites,
+        )
 
-    def dot(self, mps, D=None):
-        """Apply this MPO and compress the resulting MPS."""
-        if not isinstance(mps, MPS):
-            raise TypeError("MPO.dot expects an MPS.")
-        if D is None:
-            D = 2 * max(mps.bond_orders())
+    def adjoint(self):
+        """Return the Hermitian adjoint without changing virtual bonds."""
+        factors = [
+            tensor.conj().swapaxes(2, 3) for tensor in self.factors
+        ]
+        return type(self)(
+            factors,
+            target_qn=self.target_qn,
+            sites=self.input_sites,
+            input_sites=self.sites,
+        )
 
-        factors = apply_mpo(self, mps, D)
-        return MPS(factors)
+    def compress_hermitian(self, max_bond):
+        """Compress a square MPO while preserving Hermiticity exactly.
 
-
-    def matmul(self, other, chi_max=None):
+        A half-sized approximation is paired with its adjoint, keeping the
+        resulting virtual bonds no larger than ``max_bond``.
         """
-        MPO @ MPO -> MPO
-        MPO @ MPS -> MPS
+        max_bond = int(max_bond)
+        if max_bond < 2:
+            raise ValueError("Hermitian MPO compression requires max_bond >= 2")
+        if self.dims != self.input_dims:
+            raise ValueError("Hermitian compression requires a square MPO")
+        half = self.compress(max_bond // 2)
+        return half.hermitian_part()
+
+    def hermitian_part(self):
+        """Return ``(self + self.adjoint()) / 2`` with one output allocation."""
+        if self.dims != self.input_dims:
+            raise ValueError("Hermitian projection requires a square MPO")
+        if self.L == 1:
+            factor = self.factors[0]
+            return type(self)(
+                [0.5 * (factor + factor.conj().swapaxes(2, 3))],
+                target_qn=self.target_qn,
+                sites=self.sites,
+                input_sites=self.input_sites,
+            )
+
+        factors = []
+        for site, factor in enumerate(self.factors):
+            left, right, d_out, d_in = factor.shape
+            if site == 0:
+                paired = np.empty(
+                    (left, 2 * right, d_out, d_in), dtype=factor.dtype
+                )
+                paired[:, :right] = 0.5 * factor
+                paired[:, right:] = 0.5 * factor.conj().swapaxes(2, 3)
+            elif site == self.L - 1:
+                paired = np.empty(
+                    (2 * left, right, d_out, d_in), dtype=factor.dtype
+                )
+                paired[:left] = factor
+                paired[left:] = factor.conj().swapaxes(2, 3)
+            else:
+                paired = np.zeros(
+                    (2 * left, 2 * right, d_out, d_in), dtype=factor.dtype
+                )
+                paired[:left, :right] = factor
+                paired[left:, right:] = factor.conj().swapaxes(2, 3)
+            factors.append(paired)
+        return type(self)(
+            factors,
+            target_qn=self.target_qn,
+            sites=self.sites,
+            input_sites=self.input_sites,
+        )
+
+    def hadamard_compress(self, other, max_bond):
+        """Compress an elementwise MPO product without retaining raw product cores."""
+        if not isinstance(other, MPO):
+            raise TypeError("MPO Hadamard compression expects another MPO")
+        if self.L != other.L:
+            raise ValueError(f"MPOs must have same length: {self.L} vs {other.L}")
+        if self.dims != other.dims or self.input_dims != other.input_dims:
+            raise ValueError("MPO Hadamard products require matching physical dimensions")
+        if not sites_compatible(self.sites, other.sites) or not sites_compatible(
+            self.input_sites, other.input_sites
+        ):
+            raise ValueError("MPO Hadamard products require compatible sites")
+        largest_raw_core = max(
+            int(left.shape[0])
+            * int(right.shape[0])
+            * int(left.shape[1])
+            * int(right.shape[1])
+            * int(left.shape[2])
+            * int(left.shape[3])
+            for left, right in zip(self.factors, other.factors)
+        )
+        matrix_free = largest_raw_core > 2_000_000
+        result = type(self)(
+            _round_hadamard_mpo_factors(
+                self.factors,
+                other.factors,
+                int(max_bond),
+                matrix_free=matrix_free,
+            ),
+            sites=richer_sites(self.sites, other.sites),
+            input_sites=richer_sites(self.input_sites, other.input_sites),
+        )
+        result.compression_info = {
+            "backend": (
+                "matrix-free-density" if matrix_free else "materialized-streaming"
+            ),
+            "largest_raw_core_elements": largest_raw_core,
+            "rank": int(max_bond),
+        }
+        _release_free_numeric_pages()
+        return result
+
+    def hadamard_compress_hermitian(self, other, max_bond):
+        """Stream, compress, and exactly Hermitize an elementwise MPO product."""
+        max_bond = int(max_bond)
+        if max_bond < 2:
+            raise ValueError("Hermitian MPO compression requires max_bond >= 2")
+        half = self.hadamard_compress(other, max_bond // 2)
+        result = half.hermitian_part()
+        result.compression_info = dict(half.compression_info)
+        result.compression_info["hermitian_rank"] = max_bond
+        del half
+        _release_free_numeric_pages()
+        return result
+
+    def to_dense(self):
+        """Contract this MPO into a dense matrix."""
+        return _mpo_to_dense_operator(self)
+
+    def _output_sites_for(self, mps):
+        if self.L != mps.L:
+            raise ValueError(
+                f"MPO and MPS lengths must match; got {self.L} and {mps.L}."
+            )
+        if not sites_compatible(self.input_sites, mps.sites):
+            raise ValueError("MPO input sites are incompatible with the MPS sites.")
+        if self.dims == self.input_dims and sites_compatible(self.sites, mps.sites):
+            return richer_sites(self.sites, mps.sites)
+        return self.sites
+
+    def _product_sites(self, other):
+        output_sites = self.sites
+        if self.dims == self.input_dims and sites_compatible(
+            self.sites, other.sites
+        ):
+            output_sites = richer_sites(self.sites, other.sites)
+        input_sites = other.input_sites
+        if other.dims == other.input_dims and sites_compatible(
+            other.input_sites, self.input_sites
+        ):
+            input_sites = richer_sites(other.input_sites, self.input_sites)
+        return output_sites, input_sites
+
+    def apply(self, state, *, max_bond=None):
+        """Apply this operator to an :class:`MPS`.
+
+        ``max_bond=None`` preserves the exact product bond dimension.
         """
+        if not isinstance(state, MPS):
+            raise TypeError("MPO.apply expects an MPS.")
+        output_sites = self._output_sites_for(state)
+        state_factors = [state._get_std_B(site) for site in range(state.L)]
+        if max_bond is None:
+            factors = _apply_mpo_uncompressed_factors(
+                self.factors, state_factors
+            )
+        else:
+            factors = _apply_mpo_factors(
+                self.factors, state_factors, max_bond
+            )
+        return MPS(factors, sites=output_sites)
 
-        # if self.labels :  # TODO: add label treatment to label (actual we want to do it in initilization stage)
-
-        if isinstance(other, MPO):
-            if chi_max is None:
-                # Preserve the exact MPO product by default. Compressing to
-                # `max(self.bond_orders()+other.bond_orders())` is generally too
-                # aggressive for operator products and breaks routines such as
-                # expmpo(..., D=None), which expect an untruncated Taylor build.
-                return self.__matmul__(other)
-
-            raw_product = MPO(product_MPO(self.factors, other.factors))
-            return raw_product.compress(chi_max)
-
-        elif isinstance(other, MPS):
-            if chi_max is None:
-                return self.__matmul__(other)
-            new_factors = apply_mpo(self, other, chi_max)
-            return MPS(new_factors)
-
-        raise TypeError(f"Unsupported operand type: {type(other)}")
+    def compose(self, other, *, max_bond=None):
+        """Return ``self @ other``, optionally truncating MPO bonds."""
+        if not isinstance(other, MPO):
+            raise TypeError("MPO.compose expects another MPO.")
+        if not sites_compatible(self.input_sites, other.sites):
+            raise ValueError("MPO product requires compatible contracted sites.")
+        output_sites, input_sites = self._product_sites(other)
+        product = MPO(
+            _product_mpo_factors(self.factors, other.factors),
+            sites=output_sites,
+            input_sites=input_sites,
+        )
+        return product if max_bond is None else product.compress(max_bond)
 
     def __matmul__(self, other):
-        """
-        UNCOMPRESSED
-
-        MPO @ MPO -> MPO
-        MPO @ MPS -> MPS
-
-        Args:
-            other: List of MPO tensors. shape: (Left, Right, Phys_Out, Phys_In)
-            or MPS object (left, phys, right)
-
-        Returns:
-            list: New tensors in standard (Left, Phys, Right) layout.
-        """
-
-
-
+        if isinstance(other, MPS):
+            return self.apply(other)
         if isinstance(other, MPO):
-            # 1. Compute raw product
-            # Output format of product_MPO is (Left, Right, Up, Down)
-            raw_factors = product_MPO(self.factors, other.factors)
-
-            # 2. Prepare for compress
-            # decompose.py strictly requires shape: (Left, Physical, Right)
-            # But our MPO product produces: (Left, Right, Up, Down)
-            factors = []
-            phys_dims = []
-
-            for W in raw_factors:
-                s = W.shape
-                # Store original physical dims (d_up, d_down)
-                phys_dims.append((s[2], s[3]))
-
-                # Step A: Merge physical legs -> (Left, Right, Phys_Combined)
-                W_flat = W.reshape(s[0], s[1], s[2] * s[3])
-
-                # Step B: Transpose to match decompose.py -> (Left, Phys_Combined, Right)
-                W_ready = W_flat.transpose(0, 2, 1)
-
-                factors.append(W_ready)
-
-            # 4. Restore MPO format
-            final_factors = []
-            for i, B in enumerate(factors):
-                # B shape: (new_chi_L, d_combined, new_chi_R)
-
-                # Step A: Transpose back -> (new_chi_L, new_chi_R, d_combined)
-                B_transposed = B.transpose(0, 2, 1)
-
-                # Step B: Split physical legs -> (new_chi_L, new_chi_R, d_up, d_down)
-                d_up, d_down = phys_dims[i]
-                W_final = B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down)
-
-                final_factors.append(W_final)
-
-            return MPO(final_factors)
-
-        elif isinstance(other, MPS):
-            return MPS(_apply_mpo_uncompressed(self, other))
+            return self.compose(other)
+        return NotImplemented
 
 
     def __mul__(self, other):
@@ -28329,7 +29556,12 @@ class MPO:
         if isinstance(other, (int, float, complex)):
             factors_new = [W.copy() for W in self.factors]
             factors_new[0] = factors_new[0] * other
-            return MPO(factors_new)
+            return MPO(
+                factors_new,
+                target_qn=self.target_qn,
+                sites=self.sites,
+                input_sites=self.input_sites,
+            )
 
         # MPO * MPO element-wise multiplication
         elif isinstance(other, MPO):
@@ -28340,6 +29572,15 @@ class MPO:
             if self.dims != other.dims:
                 raise ValueError(
                     f"Physical dimensions must match: {self.dims} vs {other.dims}")
+            if self.input_dims != other.input_dims:
+                raise ValueError(
+                    "MPO input physical dimensions must match: "
+                    f"{self.input_dims} vs {other.input_dims}"
+                )
+            if not sites_compatible(self.sites, other.sites) or not sites_compatible(
+                self.input_sites, other.input_sites
+            ):
+                raise ValueError("MPO element-wise products require compatible sites.")
 
             factors_new = []
             for i in range(self.L):
@@ -28357,7 +29598,11 @@ class MPO:
                      W1.shape[3]])                 # d_down
                 factors_new.append(core)
 
-            return MPO(factors_new)
+            return MPO(
+                factors_new,
+                sites=richer_sites(self.sites, other.sites),
+                input_sites=richer_sites(self.input_sites, other.input_sites),
+            )
 
         else:
             raise ValueError(
@@ -28379,6 +29624,15 @@ class MPO:
         if self.dims != other.dims:
             raise ValueError(
                 f"Physical dimensions must match: {self.dims} vs {other.dims}")
+        if self.input_dims != other.input_dims:
+            raise ValueError(
+                "MPO input physical dimensions must match: "
+                f"{self.input_dims} vs {other.input_dims}"
+            )
+        if not sites_compatible(self.sites, other.sites) or not sites_compatible(
+            self.input_sites, other.input_sites
+        ):
+            raise ValueError("MPO addition requires compatible ordered sites.")
 
         sum_factors = []
         for i in range(self.L):
@@ -28404,7 +29658,11 @@ class MPO:
 
             sum_factors.append(W_sum)
 
-        return MPO(sum_factors)
+        return MPO(
+            sum_factors,
+            sites=richer_sites(self.sites, other.sites),
+            input_sites=richer_sites(self.input_sites, other.input_sites),
+        )
 
     def __rmul__(self, other):
         """
@@ -28727,7 +29985,7 @@ def _mpo_to_dense_operator(mpo):
     return tensor.reshape((dim, dim))
 
 
-def _dense_operator_to_mpo(matrix, dims):
+def _dense_operator_to_mpo(matrix, dims, *, sites=None):
     """Factor a dense operator into an MPO exactly on small Hilbert spaces."""
     if tensor_train_matrix is None:
         raise ImportError(
@@ -28736,7 +29994,11 @@ def _dense_operator_to_mpo(matrix, dims):
     matrix = np.asarray(matrix, dtype=complex)
     tensor = matrix.reshape(tuple(dims) + tuple(dims))
     tt = tensor_train_matrix(tensor, rank=matrix.shape[0])
-    return MPO([np.asarray(core).transpose(0, 3, 1, 2) for core in tt.factors])
+    return MPO(
+        [np.asarray(core).transpose(0, 3, 1, 2) for core in tt.factors],
+        sites=sites,
+        input_sites=sites,
+    )
 
 
 def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
@@ -28785,7 +30047,9 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
     dense_dim = int(np.prod(H.dims))
     if D is None and dense_dim <= 256:
         dense_h = _mpo_to_dense_operator(H)
-        return _dense_operator_to_mpo(expm(constant * dense_h), H.dims)
+        return _dense_operator_to_mpo(
+            expm(constant * dense_h), H.dims, sites=H.sites
+        )
 
     scaled_constant = constant / (2 ** scale)
 
@@ -28803,12 +30067,12 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
             W[0, 0, j, j] = 1.0
         identity_factors.append(W)
 
-    result = MPO(identity_factors)
-    term = MPO(identity_factors)
+    result = MPO(identity_factors, sites=H.sites, input_sites=H.input_sites)
+    term = MPO(identity_factors, sites=H.sites, input_sites=H.input_sites)
 
     factorial = 1
     for k in range(1, order + 1):
-        term = term.matmul(H, chi_max=D)
+        term = term.compose(H, max_bond=D)
         factorial = factorial * k
         coefficient = (scaled_constant ** k) / factorial
         result = result + (term * coefficient)
@@ -28819,153 +30083,19 @@ def expmpo(H, constant=1.0, D=None, method='taylor', order=4, scale=0):
             result = result.compress(D)
 
     for _ in range(scale):
-        result = result.matmul(result, chi_max=D)
+        result = result.compose(result, max_bond=D)
 
     return result
 
-def _apply_mpo_uncompressed(w_list, B_list):
-    """Contract a dense MPO and MPS into standard-order MPS tensors."""
-    mpo_factors = w_list.factors if isinstance(w_list, MPO) else list(w_list)
-    if isinstance(B_list, MPS):
-        mps_factors = [B_list._get_std_B(i) for i in range(B_list.L)]
-    else:
-        mps_factors = list(B_list)
+def apply_mpo(operator, state, *, max_bond=None):
+    """Apply an :class:`MPO` to an :class:`MPS` and return an :class:`MPS`.
 
-    if len(mpo_factors) != len(mps_factors):
-        raise ValueError(
-            "MPO and MPS lengths must match; got "
-            f"{len(mpo_factors)} and {len(mps_factors)}."
-        )
-    if not mpo_factors:
-        raise ValueError("MPO and MPS must contain at least one site.")
-
-    result = []
-    previous_mpo_right = previous_mps_right = None
-    for site, (W, B) in enumerate(zip(mpo_factors, mps_factors)):
-        if getattr(W, "ndim", None) != 4:
-            raise ValueError(f"MPO site {site} must have rank 4.")
-        if getattr(B, "ndim", None) != 3:
-            raise ValueError(f"MPS site {site} must have rank 3.")
-
-        b_left, b_right, d_out, d_in_mpo = W.shape
-        chi_left, d_in_mps, chi_right = B.shape
-        if d_in_mpo != d_in_mps:
-            raise ValueError(
-                f"Physical input dimension mismatch at site {site}: "
-                f"MPO has {d_in_mpo}, MPS has {d_in_mps}."
-            )
-        if site and b_left != previous_mpo_right:
-            raise ValueError(f"Incompatible MPO virtual bond before site {site}.")
-        if site and chi_left != previous_mps_right:
-            raise ValueError(f"Incompatible MPS virtual bond before site {site}.")
-
-        # Fuse virtual legs in the same order on both sides: (MPS, MPO).
-        # Mixing (MPO, MPS) on the left with (MPS, MPO) on the right silently
-        # scrambles the next-site contraction when both bonds are nontrivial.
-        contracted = np.einsum("abij,kjl->kailb", W, B, optimize=True)
-        result.append(
-            contracted.reshape(
-                b_left * chi_left,
-                d_out,
-                chi_right * b_right,
-            )
-        )
-        previous_mpo_right = b_right
-        previous_mps_right = chi_right
-
-    return result
-
-
-def apply_mpo(w_list, B_list, chi_max):
+    Use ``operator @ state`` for the exact product.  ``max_bond`` requests a
+    scale-preserving truncation after application.
     """
-    Apply the MPO to an MPS.
-
-    MPS index order: [chi_L, d, chi_R] = [Left, Phys, Right]
-    MPO index order: [b_L, b_R, d_out, d_in] = [Left, Right, Out, In]
-
-    Parameters
-    ----------
-    w_list : list
-        MPO tensors, each with shape [chi1, chi2, d_up, d_down].
-    B_list : list
-        MPS tensors, each with shape [chi_L, d, chi_R].
-    chi_max : int
-        Maximum bond dimension for compression.
-
-    Returns
-    -------
-    list
-        Compressed MPS tensors in ``(left, physical, right)`` order.  The
-        contraction and truncation preserve the state's overall scale.
-
-    Note
-    ----
-    This function does NOT modify the input B_list.
-    """
-    result = _apply_mpo_uncompressed(w_list, B_list)
-    return compress(result, chi_max, renormalize=False)
-
-
-
-def product_W(W, X):
-    """
-    'Vertical' product of MPO W-matrices.
-
-    MPO index order: [chi1, chi2, d_up, d_down]
-
-    Diagram:
-           |d_up (from W)
-          -W-
-           | (W's d_down contracts with X's d_up)
-          -X-
-           |d_down (from X)
-
-    W acts first (on ket), X acts second.
-    Result: [chi1_W * chi1_X, chi2_W * chi2_X, d_up_W, d_down_X]
-    """
-    # W: [a, b, s, t] = [chi1, chi2, d_up, d_down]
-    # X: [c, d, t, u] = [chi1, chi2, d_up, d_down]
-    # Contract W's d_down (t) with X's d_up (t)
-    # Result indices: a, b, s (from W), c, d, u (from X)
-    # Final shape: [a*c, b*d, s, u]
-    return np.reshape(
-        np.einsum("abst,cdtu->acbdsu", W, X),
-        [W.shape[0] * X.shape[0],   # chi1
-         W.shape[1] * X.shape[1],   # chi2
-         W.shape[2],                 # d_up (from W)
-         X.shape[3]]                 # d_down (from X)
-    )
-
-
-def product_MPO(M1, M2):
-    """
-    Vertical product of two MPOs: M1 @ M2.
-
-    M1 acts first (closer to ket), M2 acts second (closer to bra).
-
-    Note: This function does NOT modify M1 or M2.
-    """
-    if isinstance(M1, MPO):
-        M1_copy = M1.factors
-    else:
-        M1_copy = M1
-    if isinstance(M2, MPO):
-        M2_copy = M2.factors
-    else:
-        M2_copy = M2
-
-    L=min(len(M1_copy), len(M2_copy))
-
-    Result = []
-    for i in range(L):
-        Result.append(product_W(M1_copy[i], M2_copy[i]))
-    if len(M1_copy) > L:
-        for i in range(L, len(M1_copy)):
-            Result.append(M1_copy[i])
-    if len(M2_copy) > L:
-        for i in range(L, len(M2_copy)):
-            Result.append(M2_copy[i])
-    return Result
+    if not isinstance(operator, MPO) or not isinstance(state, MPS):
+        raise TypeError("apply_mpo expects (MPO, MPS) objects.")
+    return operator.apply(state, max_bond=max_bond)
 
 
 
@@ -29104,9 +30234,9 @@ def dense_to_symmetric(
                 seen.add(value)
         return out
 
-    def _zero_sector():
-        if phys_qns and is_sector_like(phys_qns[0]):
-            return zero_like_sector(phys_qns[0])
+    def _zero_sector(site_phys_qns):
+        if site_phys_qns and is_sector_like(site_phys_qns[0]):
+            return zero_like_sector(site_phys_qns[0])
         return 0
 
     def _fuse(left, phys):
@@ -29127,7 +30257,8 @@ def dense_to_symmetric(
             f"for local dimension {phys_dim}."
         )
 
-    # Infer phys_qns from d if not given
+    # Infer phys_qns from d if not given.  Explicit input may be either one
+    # homogeneous local list or one local list per MPS site.
     if phys_qns is None:
         # peek at first site to infer d
         M0 = np.asarray(mps_list[0])
@@ -29147,12 +30278,30 @@ def dense_to_symmetric(
         else:
             raise ValueError(f"Cannot infer phys_qns for local dimension d={d}. Pass phys_qns explicitly.")
     phys_qns = list(phys_qns)
-    phys_unique = _unique_in_order(phys_qns)
-    phys_dim = len(phys_qns)
-    dense_sites = [_as_lpr(M, site, phys_dim) for site, M in enumerate(mps_list)]
+    per_site = (
+        len(phys_qns) == len(mps_list)
+        and all(
+            isinstance(values, (list, tuple)) and not is_sector_like(values)
+            for values in phys_qns
+        )
+        and all(
+            any(int(axis) == len(values) for axis in np.asarray(tensor).shape)
+            for tensor, values in zip(mps_list, phys_qns)
+        )
+    )
+    if per_site:
+        site_phys_qns = [list(values) for values in phys_qns]
+    else:
+        site_phys_qns = [list(phys_qns) for _ in mps_list]
+    dense_sites = [
+        _as_lpr(M, site, len(site_phys_qns[site]))
+        for site, M in enumerate(mps_list)
+    ]
 
-    bond_qns = [[_zero_sector()]]
+    bond_qns = [[_zero_sector(site_phys_qns[0])]]
     for site, M in enumerate(dense_sites):
+        local_phys_qns = site_phys_qns[site]
+        phys_dim = len(local_phys_qns)
         left_qns = bond_qns[-1]
         if M.shape[0] != len(left_qns):
             raise ValueError(
@@ -29164,7 +30313,7 @@ def dense_to_symmetric(
 
         candidates = [set() for _ in range(M.shape[2])]
         for left_idx, q_left in enumerate(left_qns):
-            for phys_idx, q_phys in enumerate(phys_qns):
+            for phys_idx, q_phys in enumerate(local_phys_qns):
                 nz = np.flatnonzero(np.abs(M[left_idx, phys_idx, :]) > tol)
                 if nz.size == 0:
                     continue
@@ -29175,7 +30324,7 @@ def dense_to_symmetric(
         right_qns = []
         for right_idx, qset in enumerate(candidates):
             if not qset:
-                right_qns.append(_zero_sector())
+                right_qns.append(_zero_sector(local_phys_qns))
                 continue
             if len(qset) != 1:
                 raise ValueError(
@@ -29187,13 +30336,17 @@ def dense_to_symmetric(
 
     new_list = []
     for site, M in enumerate(dense_sites):
+        local_phys_qns = site_phys_qns[site]
+        phys_unique = _unique_in_order(local_phys_qns)
         left_qns = bond_qns[site]
         right_qns = bond_qns[site + 1]
         data = {}
         for q_left in _unique_in_order(left_qns):
             left_idxs = [idx for idx, qn in enumerate(left_qns) if qn == q_left]
             for q_phys in phys_unique:
-                phys_idxs = [idx for idx, qn in enumerate(phys_qns) if qn == q_phys]
+                phys_idxs = [
+                    idx for idx, qn in enumerate(local_phys_qns) if qn == q_phys
+                ]
                 q_right = _fuse(q_left, q_phys)
                 right_idxs = [idx for idx, qn in enumerate(right_qns) if qn == q_right]
                 if not right_idxs:
@@ -30060,12 +31213,22 @@ def optimize_site(A, W, E, F, tol=1E-8):
     E, V = sparse.linalg.eigsh(H,1,v0=A,which='SA', tol=tol)
     return (E[0],np.reshape(V[:,0], H.req_shape))
 
+def _symmetric_operators_are_complex(*tensors):
+    return any(
+        np.max(np.abs(np.imag(block))) > 1.0e-13
+        for tensor in tensors
+        for block in tensor.data.values()
+        if block.size and np.iscomplexobj(block)
+    )
+
+
 def inject_noise_symmetric(
     AA,
     sym_mgr,
     noise_val=1e-4,
     phys_dims_left=None,
     phys_dims_right=None,
+    complex_noise=None,
 ):
     """
     Injects noise into ALL valid symmetry sectors.
@@ -30076,7 +31239,21 @@ def inject_noise_symmetric(
     valid_qR = {}
 
     first_blk = next(iter(AA.data.values()))
-    is_complex = np.iscomplexobj(first_blk)
+    max_real_scale = max(
+        (float(np.max(np.abs(block))) for block in AA.data.values() if block.size),
+        default=0.0,
+    )
+    max_imag = max(
+        (
+            float(np.max(np.abs(np.imag(block))))
+            for block in AA.data.values()
+            if block.size and np.iscomplexobj(block)
+        ),
+        default=0.0,
+    )
+    is_complex = max_imag > 1.0e-13 * max(1.0, max_real_scale)
+    if complex_noise is not None:
+        is_complex = bool(complex_noise)
     dtype = first_blk.dtype
 
     for (qL, qR, qP1, qP2), blk in AA.data.items():
@@ -30369,6 +31546,7 @@ def optimize_two_sites(
                     sym_mgr=sym_mgr,
                     phys_dims_left=_phys_dims_from_mpo(W1),
                     phys_dims_right=_phys_dims_from_mpo(W2),
+                    complex_noise=_symmetric_operators_are_complex(W1, W2),
                 )
         else:
             raise ValueError(f"Unexpected tensor rank {A.rank} in symmetric opt")
@@ -30603,22 +31781,25 @@ def optimize_two_sites(
                 if H_op._packed_local_davidson_max_iter > 0:
                     packed_max_iter = min(packed_max_iter, H_op._packed_local_davidson_max_iter)
                 if isinstance(moving_environment, MovingEnvironment):
-                    packed_solution = moving_environment.solve_local(
-                        AA_start,
-                        operator=H_op,
-                        nstates=1,
-                        tol=float(davidson_tol),
-                        max_iter=packed_max_iter,
-                        preconditioner=preconditioner,
-                        current=AA,
-                        return_flat=True,
-                        initial_flat=flat_start,
-                        initial_layout=flat_start_layout,
-                        initial_is_current=flat_start_is_current,
-                        return_update=True,
-                        update_direction=dir,
-                        update_m_max=m,
-                    )
+                    def _solve_with_moving_environment():
+                        return moving_environment.solve_local(
+                            AA_start,
+                            operator=H_op,
+                            nstates=1,
+                            tol=float(davidson_tol),
+                            max_iter=packed_max_iter,
+                            preconditioner=preconditioner,
+                            current=AA,
+                            return_flat=True,
+                            initial_flat=flat_start,
+                            initial_layout=flat_start_layout,
+                            initial_is_current=flat_start_is_current,
+                            return_update=True,
+                            update_direction=dir,
+                            update_m_max=m,
+                        )
+
+                    packed_solution = _solve_with_moving_environment()
                 else:
                     packed_solution = H_op.solve_packed_davidson(
                         AA_start,
@@ -30692,6 +31873,23 @@ def optimize_two_sites(
                     packed_stats = dict(H_op.profile_stats.get("packed_local_davidson", {}))
                     reason = packed_stats.get("rejected_reason", "unknown")
                     dim = packed_stats.get("safe_layout_dimension", packed_stats.get("dimension"))
+                    if reason == "unknown" and isinstance(
+                        moving_environment,
+                        MovingEnvironment,
+                    ):
+                        moving_stats = moving_environment.moving_profile_stats
+                        reason = next(
+                            (
+                                str(moving_stats[key])
+                                for key in (
+                                    "cpp_davidson_last_error",
+                                    "owner_local_grouped_direct_prepare_last_error",
+                                    "solve_local_rejected_reason",
+                                )
+                                if moving_stats.get(key)
+                            ),
+                            "operatorless_local_solver_rejected",
+                        )
                     raise RuntimeError(
                         "Packed local Davidson rejected the two-site problem "
                         f"(reason={reason}, dimension={dim}). Increase "
@@ -30813,8 +32011,8 @@ def optimize_two_sites(
                 B,
                 bond=bond,
                 nstates=nstates,
-                tol=1.0e-9,
-                max_iter=5000,
+                tol=float(davidson_tol),
+                max_iter=int(davidson_max_iter),
                 matvec_options=matvec_options,
             )
             if dense_solution is not None:
@@ -30852,8 +32050,8 @@ def optimize_two_sites(
                 dense_solution = H_env.solve_dense_local(
                     AA,
                     nstates=nstates,
-                    tol=1.0e-9,
-                    max_iter=5000,
+                    tol=float(davidson_tol),
+                    max_iter=int(davidson_max_iter),
                 )
                 if dense_solution is None:
                     H_env = None
@@ -30871,7 +32069,12 @@ def optimize_two_sites(
                 if use_dense_solver:
                     raise ValueError("dense fallback requested")
                 E, V_flat = sparse.linalg.eigsh(
-                    H, nstates, v0=AA, which='SA', tol=1e-9, maxiter=5000
+                    H,
+                    nstates,
+                    v0=AA,
+                    which='SA',
+                    tol=float(davidson_tol),
+                    maxiter=int(davidson_max_iter),
                 )
             except (sparse.linalg.ArpackNoConvergence, ValueError):
                 # Robust fallback for small local spaces when ARPACK stalls.
@@ -31246,6 +32449,8 @@ def two_site_dmrg(
     native_p_owner_record_cache = {}
     native_p_supported_owner_record_cache = {}
     same_side_pair_candidate_cache = {}
+    same_side_pair_static_layout_cache = [None]
+    same_side_pair_static_layout_signature = [None]
     direct_family_sym_pattern_cache = {}
     direct_family_left_env_cache = {}
     direct_family_right_env_cache = {}
@@ -31453,8 +32658,15 @@ def two_site_dmrg(
         direct_family_right_env_cache.clear()
         direct_family_contextual_left_env_cache.clear()
         direct_family_contextual_right_env_cache.clear()
-        direct_family_contextual_left_local_table_cache.clear()
-        direct_family_contextual_right_local_table_cache.clear()
+        preserve_local_sector_operators = bool(
+            abelian_matvec_options.get(
+                "generator_table_preserve_contextual_local_sector_operators",
+                True,
+            )
+        )
+        if not preserve_local_sector_operators:
+            direct_family_contextual_left_local_table_cache.clear()
+            direct_family_contextual_right_local_table_cache.clear()
         direct_family_contextual_left_prefix_cache.clear()
         direct_family_contextual_right_suffix_cache.clear()
         direct_family_contextual_prefix_closure_cache.clear()
@@ -31593,10 +32805,20 @@ def two_site_dmrg(
             None if boundary_bond is None else int(boundary_bond)
         )
         stats["revision_only"] = True
-        if clear_side == "left":
-            direct_family_contextual_left_local_table_cache.clear()
-        else:
-            direct_family_contextual_right_local_table_cache.clear()
+        preserve_local_sector_operators = bool(
+            abelian_matvec_options.get(
+                "generator_table_preserve_contextual_local_sector_operators",
+                True,
+            )
+        )
+        stats["local_sector_operator_cache_preserved"] = bool(
+            preserve_local_sector_operators
+        )
+        if not preserve_local_sector_operators:
+            if clear_side == "left":
+                direct_family_contextual_left_local_table_cache.clear()
+            else:
+                direct_family_contextual_right_local_table_cache.clear()
 
     def _generator_expansion(p, q):
         key = ("E", int(p), int(q))
@@ -31622,12 +32844,17 @@ def two_site_dmrg(
         cached = generator_expansion_cache.get(key)
         if cached is not None:
             return cached
+        from pyqed.qchem.dmrg.spatial_terms import spatial_jw_pattern_spec
+
         terms = []
-        for symbol, dofs, factor in _generator_expansion(p, q):
-            per_site = ["I"] * len(MPS)
-            for piece, site in zip(str(symbol).split(), dofs):
-                per_site[int(site)] = str(piece)
-            terms.append((tuple(per_site), complex(factor)))
+        for create, destroy in (("cdu", "cu"), ("cdd", "cd")):
+            pattern, factor = spatial_jw_pattern_spec(
+                (create, destroy),
+                (int(p), int(q)),
+                len(MPS),
+            )
+            if pattern and abs(factor) > 1.0e-14:
+                terms.append((pattern, complex(factor)))
         generator_expansion_cache[key] = tuple(terms)
         return generator_expansion_cache[key]
 
@@ -32161,12 +33388,23 @@ def two_site_dmrg(
         cached = generator_expansion_cache.get(key)
         if cached is not None:
             return cached
+        from pyqed.qchem.dmrg.spatial_terms import spatial_jw_pattern_spec
+
         terms = []
-        for symbol, dofs, factor in _two_generator_expansion(p, q, r, s):
-            per_site = ["I"] * len(MPS)
-            for piece, site in zip(str(symbol).split(), dofs):
-                per_site[int(site)] = str(piece)
-            terms.append((tuple(per_site), complex(factor)))
+        for left_create, left_destroy in (("cdu", "cu"), ("cdd", "cd")):
+            for right_create, right_destroy in (("cdu", "cu"), ("cdd", "cd")):
+                pattern, factor = spatial_jw_pattern_spec(
+                    (
+                        left_create,
+                        left_destroy,
+                        right_create,
+                        right_destroy,
+                    ),
+                    (int(p), int(q), int(r), int(s)),
+                    len(MPS),
+                )
+                if pattern and abs(factor) > 1.0e-14:
+                    terms.append((pattern, complex(factor)))
         generator_expansion_cache[key] = tuple(terms)
         return generator_expansion_cache[key]
 
@@ -32806,6 +34044,8 @@ def two_site_dmrg(
 
         def _pack_boundary_tensor(tensor, role):
             if not pack_boundary_tensors or tensor is None:
+                return tensor
+            if is_abelian_packed_boundary_tensor(tensor):
                 return tensor
             try:
                 packed = pack_abelian_boundary_tensor(
@@ -38806,6 +40046,7 @@ def two_site_dmrg(
             ), consumed
 
         def _native_boundary_p_entries():
+            global _GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE
             if bool(
                 abelian_matvec_options.get(
                     "generator_table_disable_native_boundary_p",
@@ -38923,6 +40164,156 @@ def two_site_dmrg(
             left_identity_pattern = tuple("I" for _ in range(bond))
             right_identity_pattern = tuple("I" for _ in range(max(0, L - bond - 2)))
             p_entries_signature = (id(p_entries), int(len(p_entries)))
+            if same_side_pair_static_layout_cache[0] is None:
+                layout_keys = tuple(
+                    sorted(
+                        tuple(int(index) for index in raw_key)
+                        for raw_key, coeff in p_entries.items()
+                        if abs(complex(coeff)) > 1.0e-14
+                    )
+                )
+                layout_array = np.asarray(layout_keys, dtype=np.int64).reshape((-1, 4))
+                layout_digest = hashlib.blake2b(
+                    layout_array.tobytes(),
+                    digest_size=16,
+                ).digest()
+                layout_signature = (
+                    "same_side_p_route_layout",
+                    int(L),
+                    int(len(layout_keys)),
+                    layout_digest,
+                )
+                static_layout = _GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE.get(
+                    layout_signature
+                )
+                layout_stats = direct_family_builder_stats.setdefault(
+                    "same_side_pair_prebuild",
+                    {},
+                ).setdefault(
+                    "static_layout_cache",
+                    {"hits": 0, "misses": 0},
+                )
+                if static_layout is None:
+                    static_layout = {}
+                    _GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE[layout_signature] = (
+                        static_layout
+                    )
+                    layout_stats["misses"] = int(layout_stats.get("misses", 0)) + 1
+                    while (
+                        len(_GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE)
+                        > _GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE_MAXSIZE
+                    ):
+                        _GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE.popitem(last=False)
+                else:
+                    _GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE.move_to_end(
+                        layout_signature
+                    )
+                    layout_stats["hits"] = int(layout_stats.get("hits", 0)) + 1
+                layout_stats["keys"] = int(len(layout_keys))
+                layout_stats["cache_size"] = int(
+                    len(_GLOBAL_SAME_SIDE_P_ROUTE_LAYOUT_CACHE)
+                )
+                compiled_span_key = ("compiled_pattern_spans", int(L))
+                if compiled_span_key not in static_layout:
+                    compiled_span_builder = (
+                        None
+                        if _cpp_davidson is None
+                        else getattr(
+                            _cpp_davidson,
+                            "build_spatial_same_side_p_pattern_spans",
+                            None,
+                        )
+                    )
+                    if compiled_span_builder is not None and bool(
+                        abelian_matvec_options.get(
+                            "generator_table_cpp_same_side_pattern_spans",
+                            True,
+                        )
+                    ):
+                        try:
+                            compiled_spans = compiled_span_builder(
+                                layout_keys,
+                                int(L),
+                            )
+                            from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+
+                            local_ops = spatial_local_ops()
+                            piece_map = {}
+                            for cpp_piece, matrix in dict(
+                                compiled_spans.get("local_ops") or {}
+                            ).items():
+                                mapped = None
+                                for py_piece, reference in tuple(local_ops.items()):
+                                    if np.allclose(
+                                        matrix,
+                                        reference,
+                                        atol=1.0e-14,
+                                        rtol=0.0,
+                                    ):
+                                        mapped = (str(py_piece), 1.0)
+                                        break
+                                    if np.allclose(
+                                        matrix,
+                                        -reference,
+                                        atol=1.0e-14,
+                                        rtol=0.0,
+                                    ):
+                                        mapped = (str(py_piece), -1.0)
+                                        break
+                                if mapped is None:
+                                    py_piece = f"spop{len(local_ops)}"
+                                    local_ops[py_piece] = np.asarray(
+                                        matrix,
+                                        dtype=complex,
+                                    )
+                                    mapped = (py_piece, 1.0)
+                                piece_map[str(cpp_piece)] = mapped
+                            translated_spans = {}
+                            for raw_key, terms in dict(
+                                compiled_spans.get("spans") or {}
+                            ).items():
+                                translated_terms = []
+                                for pattern, factor, min_site, max_site in terms:
+                                    translated_pattern = []
+                                    translated_factor = complex(factor)
+                                    for piece in pattern:
+                                        mapped_piece, mapped_factor = piece_map.get(
+                                            str(piece),
+                                            (str(piece), 1.0),
+                                        )
+                                        translated_pattern.append(mapped_piece)
+                                        translated_factor *= complex(mapped_factor)
+                                    translated_terms.append(
+                                        (
+                                            tuple(translated_pattern),
+                                            translated_factor,
+                                            int(min_site),
+                                            int(max_site),
+                                        )
+                                    )
+                                translated_spans[
+                                    tuple(int(index) for index in raw_key)
+                                ] = tuple(translated_terms)
+                            static_layout[compiled_span_key] = translated_spans
+                            layout_stats["compiled_span_backend"] = (
+                                "cpp_spatial_operator_algebra"
+                            )
+                            layout_stats["compiled_span_keys"] = int(
+                                compiled_spans.get("keys") or 0
+                            )
+                            layout_stats["compiled_span_terms"] = int(
+                                compiled_spans.get("terms") or 0
+                            )
+                            layout_stats["compiled_span_seconds"] = float(
+                                compiled_spans.get("seconds") or 0.0
+                            )
+                        except Exception as exc:
+                            layout_stats["compiled_span_backend"] = "python"
+                            layout_stats["compiled_span_error"] = repr(exc)
+                same_side_pair_static_layout_cache[0] = static_layout
+                same_side_pair_static_layout_signature[0] = layout_signature
+            static_layout_cache = same_side_pair_static_layout_cache[0]
+            p_entries_layout_signature = same_side_pair_static_layout_signature[0]
             validate = bool(
                 getattr(
                     complementary_operator_families,
@@ -40469,6 +41860,54 @@ def two_site_dmrg(
                     except Exception:
                         return None
 
+                def _cpp_parent_advance_args():
+                    if not pack_boundary_tensors:
+                        return ()
+                    site = (
+                        int(boundary_bond) - 1
+                        if side == "left"
+                        else int(boundary_bond) + 1
+                    )
+                    if site < 0 or site >= L:
+                        return ()
+                    site_tensor = _current_site_tensor(site)
+                    A = _packed_tensor_view(
+                        site_tensor,
+                        f"{side}_same_side_parent_advance_A",
+                    )
+                    B = _packed_tensor_view(
+                        site_tensor,
+                        f"{side}_same_side_parent_advance_B",
+                    )
+                    A_conj = _packed_tensor_conj(
+                        A,
+                        f"{side}_same_side_parent_advance_A_conj",
+                    )
+
+                    def _local_operator(local_piece, parent_value):
+                        qns = abelian_packed_tensor_axis_qns(parent_value, 0)
+                        return (
+                            _packed_site_operator_from_left(
+                                str(local_piece),
+                                site,
+                                qns,
+                            )
+                            if side == "left"
+                            else _packed_site_operator_from_right(
+                                str(local_piece),
+                                site,
+                                qns,
+                            )
+                        )
+
+                    return (
+                        side,
+                        A_conj,
+                        B,
+                        AbelianPackedBoundaryTensor,
+                        _local_operator,
+                    )
+
                 def _advance_pair_operator(operator):
                     site = boundary_bond - 1 if side == "left" else boundary_bond + 1
                     try:
@@ -40659,23 +42098,105 @@ def two_site_dmrg(
                     else None
                 )
                 if prev_table is not None:
-                    for raw_key, operator in (
-                        getattr(prev_table, "operators", {}) or {}
-                    ).items():
-                        raw_key = tuple(int(index) for index in raw_key)
-                        if table.get_operator(raw_key) is not None:
-                            continue
-                        advanced_operator = _advance_pair_operator(operator)
-                        if advanced_operator is None:
-                            advance_failures += 1
-                            continue
-                        table.add_operator(raw_key, advanced_operator)
-                        advanced += 1
+                    previous_items = [
+                        (tuple(int(index) for index in raw_key), operator)
+                        for raw_key, operator in (
+                            getattr(prev_table, "operators", {}) or {}
+                        ).items()
+                        if table.get_operator(
+                            tuple(int(index) for index in raw_key)
+                        )
+                        is None
+                    ]
+                    batch_payloads = None
+                    batch_fn = (
+                        None
+                        if _cpp_davidson is None
+                        else getattr(
+                            _cpp_davidson,
+                            (
+                                "packed_left_identity_boundary_advance_payload_many"
+                                if side == "left"
+                                else "packed_right_identity_boundary_advance_payload_many"
+                            ),
+                            None,
+                        )
+                    )
+                    if (
+                        previous_items
+                        and batch_fn is not None
+                        and bool(
+                            abelian_matvec_options.get(
+                                "generator_table_cpp_same_side_pair_batch_advance",
+                                True,
+                            )
+                        )
+                        and all(
+                            is_abelian_packed_boundary_tensor(operator)
+                            for _raw_key, operator in previous_items
+                        )
+                    ):
+                        site = (
+                            int(boundary_bond) - 1
+                            if side == "left"
+                            else int(boundary_bond) + 1
+                        )
+                        try:
+                            A = _packed_tensor_view(
+                                _current_site_tensor(site),
+                                f"{side}_same_side_pair_batch_A",
+                            )
+                            B = _packed_tensor_view(
+                                _current_site_tensor(site),
+                                f"{side}_same_side_pair_batch_B",
+                            )
+                            A_conj = _packed_tensor_conj(
+                                A,
+                                f"{side}_same_side_pair_batch_A_conj",
+                            )
+                            batch_payloads = batch_fn(
+                                A_conj,
+                                tuple(operator for _key, operator in previous_items),
+                                B,
+                            )
+                        except Exception:
+                            batch_payloads = None
+                    if batch_payloads is not None:
+                        for (raw_key, _operator), payload in zip(
+                            previous_items,
+                            batch_payloads,
+                        ):
+                            keys, blocks, qns, dirs = payload
+                            advanced_operator = AbelianPackedBoundaryTensor(
+                                tuple(keys),
+                                tuple(blocks),
+                                dirs=list(dirs),
+                                qns=[list(axis) for axis in qns],
+                                source=f"{side}_same_side_pair_batch_environment",
+                                assume_unique=True,
+                            )
+                            table.add_operator(raw_key, advanced_operator)
+                            advanced += 1
+                        native_stats = direct_family_builder_stats.setdefault(
+                            "native_boundary_p",
+                            {"enabled": True},
+                        )
+                        native_stats["same_side_pair_batch_advances"] = int(
+                            native_stats.get("same_side_pair_batch_advances", 0)
+                        ) + int(len(previous_items))
+                    else:
+                        for raw_key, operator in previous_items:
+                            advanced_operator = _advance_pair_operator(operator)
+                            if advanced_operator is None:
+                                advance_failures += 1
+                                continue
+                            table.add_operator(raw_key, advanced_operator)
+                            advanced += 1
                 _add_prebuild_phase("advance", time.perf_counter() - t_phase)
 
                 def _same_side_candidate_index():
                     cache_key = ("same_side_support_index", int(L))
-                    cached = same_side_pair_candidate_cache.get(cache_key)
+                    cached = static_layout_cache.get(cache_key)
                     if cached is not None:
                         return cached
                     t_index = time.perf_counter()
@@ -40728,7 +42249,7 @@ def two_site_dmrg(
                         "total_records": int(total_records),
                         "valid_records": int(len(valid_records)),
                     }
-                    same_side_pair_candidate_cache[cache_key] = index
+                    static_layout_cache[cache_key] = index
                     stats = direct_family_builder_stats.setdefault(
                         "same_side_pair_prebuild",
                         {},
@@ -40750,7 +42271,7 @@ def two_site_dmrg(
 
                 def _same_side_candidate_keys(only_new):
                     cache_key = (side, int(boundary_bond), bool(only_new))
-                    cached = same_side_pair_candidate_cache.get(cache_key)
+                    cached = static_layout_cache.get(cache_key)
                     if cached is not None:
                         return cached
                     index = _same_side_candidate_index()
@@ -40762,7 +42283,7 @@ def two_site_dmrg(
                     )
                     skipped = int(index["total_records"]) - int(len(candidates))
                     cached = (tuple(candidates), int(skipped))
-                    same_side_pair_candidate_cache[cache_key] = cached
+                    static_layout_cache[cache_key] = cached
                     return cached
 
                 def _same_side_raw_pattern_terms(raw_key):
@@ -40787,14 +42308,14 @@ def two_site_dmrg(
                             "seconds": 0.0,
                         },
                     )
-                    if cache_key in same_side_pair_candidate_cache:
+                    if cache_key in static_layout_cache:
                         term_stats["raw_hits"] = (
                             int(term_stats.get("raw_hits", 0)) + 1
                         )
-                        return same_side_pair_candidate_cache[cache_key]
+                        return static_layout_cache[cache_key]
                     t_terms = time.perf_counter()
                     terms = tuple(_two_generator_expansion(*raw_key))
-                    same_side_pair_candidate_cache[cache_key] = terms
+                    static_layout_cache[cache_key] = terms
                     term_stats["raw_builds"] = (
                         int(term_stats.get("raw_builds", 0)) + 1
                     )
@@ -40827,15 +42348,15 @@ def two_site_dmrg(
                             "seconds": 0.0,
                         },
                     )
-                    if cache_key in same_side_pair_candidate_cache:
+                    if cache_key in static_layout_cache:
                         term_stats["boundary_hits"] = (
                             int(term_stats.get("boundary_hits", 0)) + 1
                         )
-                        return same_side_pair_candidate_cache[cache_key]
+                        return static_layout_cache[cache_key]
                     t_terms = time.perf_counter()
                     local_site = int(boundary_bond)
                     if local_site < 0 or local_site >= int(L):
-                        same_side_pair_candidate_cache[cache_key] = None
+                        static_layout_cache[cache_key] = None
                         term_stats["boundary_builds"] = (
                             int(term_stats.get("boundary_builds", 0)) + 1
                         )
@@ -40852,12 +42373,24 @@ def two_site_dmrg(
                     if boundary_len < 0:
                         supported = False
                     if supported:
+                        compiled_span_table = static_layout_cache.get(
+                            ("compiled_pattern_spans", int(L))
+                        )
+                        pattern_spans = (
+                            compiled_span_table.get(raw_key)
+                            if compiled_span_table is not None
+                            else None
+                        )
+                        if pattern_spans is None:
+                            pattern_spans = _two_generator_pattern_span_expansion(
+                                *raw_key
+                            )
                         for (
                             full_pattern,
                             factor,
                             min_site,
                             max_site,
-                        ) in _two_generator_pattern_span_expansion(*raw_key):
+                        ) in pattern_spans:
                             if side == "left":
                                 if int(max_site) >= int(local_site):
                                     supported = False
@@ -40875,7 +42408,7 @@ def two_site_dmrg(
                                 )
                             )
                     cached_terms = tuple(terms) if supported and terms else None
-                    same_side_pair_candidate_cache[cache_key] = cached_terms
+                    static_layout_cache[cache_key] = cached_terms
                     term_stats["boundary_builds"] = (
                         int(term_stats.get("boundary_builds", 0)) + 1
                     )
@@ -40896,9 +42429,9 @@ def two_site_dmrg(
                         int(bond),
                         int(boundary_bond),
                         bool(only_new),
-                        p_entries_signature,
+                        p_entries_layout_signature,
                     )
-                    cached = same_side_pair_candidate_cache.get(cache_key)
+                    cached = static_layout_cache.get(cache_key)
                     stats = direct_family_builder_stats.setdefault(
                         "same_side_pair_prebuild",
                         {},
@@ -40920,7 +42453,7 @@ def two_site_dmrg(
                         else:
                             unsupported_keys.append(raw_key)
                     cached = (tuple(planned), tuple(unsupported_keys))
-                    same_side_pair_candidate_cache[cache_key] = cached
+                    static_layout_cache[cache_key] = cached
                     plan_stats["builds"] = int(plan_stats.get("builds", 0)) + 1
                     plan_stats["seconds"] = (
                         float(plan_stats.get("seconds", 0.0))
@@ -40942,12 +42475,12 @@ def two_site_dmrg(
                             side,
                             int(boundary_bond),
                             bool(only_new),
-                            p_entries_signature,
+                            p_entries_layout_signature,
                         )
                     cached = (
                         None
                         if cache_key is None
-                        else same_side_pair_candidate_cache.get(cache_key)
+                        else static_layout_cache.get(cache_key)
                     )
                     stats = direct_family_builder_stats.setdefault(
                         "same_side_pair_prebuild",
@@ -40970,7 +42503,7 @@ def two_site_dmrg(
                         only_new=only_new,
                     )
                     if cache_key is not None:
-                        same_side_pair_candidate_cache[cache_key] = plan
+                        static_layout_cache[cache_key] = plan
                     plan_stats["builds"] = int(plan_stats.get("builds", 0)) + 1
                     plan_stats["seconds"] = (
                         float(plan_stats.get("seconds", 0.0))
@@ -40983,7 +42516,7 @@ def two_site_dmrg(
                         plan_stats["cache_size"] = int(
                             sum(
                                 1
-                                for key in same_side_pair_candidate_cache
+                                for key in static_layout_cache
                                 if isinstance(key, tuple)
                                 and key
                                 and key[0] == "same_side_route_plan"
@@ -41601,6 +43134,7 @@ def two_site_dmrg(
                                             advance_plan = apply_parent_advances(
                                                 tuple(available_parent_rows),
                                                 _advance_parent_from_owner,
+                                                *_cpp_parent_advance_args(),
                                             )
                                             advanced_keys.extend(
                                                 tuple(
@@ -41700,6 +43234,27 @@ def two_site_dmrg(
                                                 )
                                             ) + int(
                                                 advance_plan.get("advanced") or 0
+                                            )
+                                            batch_stats[
+                                                "cpp_parent_advance_native_identity"
+                                            ] = int(
+                                                batch_stats.get(
+                                                    "cpp_parent_advance_native_identity",
+                                                    0,
+                                                )
+                                            ) + int(
+                                                advance_plan.get("native_identity")
+                                                or 0
+                                            )
+                                            batch_stats[
+                                                "cpp_parent_advance_native_local"
+                                            ] = int(
+                                                batch_stats.get(
+                                                    "cpp_parent_advance_native_local",
+                                                    0,
+                                                )
+                                            ) + int(
+                                                advance_plan.get("native_local") or 0
                                             )
                                         except Exception as exc:
                                             use_cpp_parent_advance = False
@@ -42230,6 +43785,7 @@ def two_site_dmrg(
                                                         (
                                                             _advance_built_parent_from_owner
                                                         ),
+                                                        *_cpp_parent_advance_args(),
                                                     )
                                                 )
                                                 advanced_keys.extend(
@@ -42287,6 +43843,23 @@ def two_site_dmrg(
                                                 parent_cache_failures += int(
                                                     advance_plan.get("none") or 0
                                                 )
+                                                batch_stats[
+                                                    (
+                                                        "cpp_built_parent_advance_"
+                                                        "native_local"
+                                                    )
+                                                ] = int(
+                                                    batch_stats.get(
+                                                        (
+                                                            "cpp_built_parent_advance_"
+                                                            "native_local"
+                                                        ),
+                                                        0,
+                                                    )
+                                                ) + int(
+                                                    advance_plan.get("native_local")
+                                                    or 0
+                                                )
                                                 if need_values:
                                                     for pos, advanced in zip(
                                                         tuple(
@@ -42339,6 +43912,25 @@ def two_site_dmrg(
                                                     )
                                                 ) + int(
                                                     advance_plan.get("rows") or 0
+                                                )
+                                                batch_stats[
+                                                    (
+                                                        "cpp_built_parent_"
+                                                        "advance_native_identity"
+                                                    )
+                                                ] = int(
+                                                    batch_stats.get(
+                                                        (
+                                                            "cpp_built_parent_"
+                                                            "advance_native_identity"
+                                                        ),
+                                                        0,
+                                                    )
+                                                ) + int(
+                                                    advance_plan.get(
+                                                        "native_identity"
+                                                    )
+                                                    or 0
                                                 )
                                             except Exception as exc:
                                                 use_cpp_built_parent_advance = (
@@ -43986,6 +45578,8 @@ def two_site_dmrg(
                     self.planned_right_table_ids = []
                     self.planned_left_values = []
                     self.planned_right_values = []
+                    self.planned_left_keys = []
+                    self.planned_right_keys = []
                     self.planned_left_map = {}
                     self.planned_right_map = {}
                     self.entries = 0
@@ -44005,6 +45599,8 @@ def two_site_dmrg(
                     self.true_identity_validation_fallbacks = 0
 
                 def _pack(self, tensor, role):
+                    if is_abelian_packed_boundary_tensor(tensor):
+                        return tensor
                     key = id(tensor)
                     packed = self.pack_cache.get(key)
                     if packed is not None:
@@ -44105,6 +45701,58 @@ def two_site_dmrg(
                         table_ids.append(key)
                     return int(local_id)
 
+                def _flush_planned_table_pairs(self):
+                    if not self.table_backed or not self.planned_coeffs:
+                        return
+
+                    def _store_side(table, keys, values):
+                        before = int(len(table.entries))
+                        stored = int(
+                            table.put_many_packed(
+                                keys,
+                                values,
+                                family_name="P_identity",
+                                normalized=True,
+                            )
+                        )
+                        if stored != len(keys):
+                            raise ValueError(
+                                "packed native P boundary batch is incomplete"
+                            )
+                        table_ids, missing, _positions, _hits, _misses = (
+                            table.resolve_current_ids_many(keys, normalized=True)
+                        )
+                        if missing or any(int(table_id) < 0 for table_id in table_ids):
+                            raise ValueError(
+                                "packed native P boundary ids are incomplete"
+                            )
+                        after = int(len(table.entries))
+                        new_entries = max(0, after - before)
+                        self.table_puts += new_entries
+                        self.table_reuses += max(0, len(keys) - new_entries)
+                        unique_ids, inverse = np.unique(
+                            np.asarray(table_ids, dtype=np.int64),
+                            return_inverse=True,
+                        )
+                        return unique_ids.tolist(), inverse.tolist()
+
+                    (
+                        self.planned_left_table_ids,
+                        self.planned_left_ids,
+                    ) = _store_side(
+                        self.left_table,
+                        self.planned_left_keys,
+                        self.planned_left_values,
+                    )
+                    (
+                        self.planned_right_table_ids,
+                        self.planned_right_ids,
+                    ) = _store_side(
+                        self.right_table,
+                        self.planned_right_keys,
+                        self.planned_right_values,
+                    )
+
                 def _identity_group(self, source):
                     source = str(source)
                     group = self.identity_groups.get(source)
@@ -44199,32 +45847,25 @@ def two_site_dmrg(
                         F_packed = self._pack(F_term, "identity_F")
                         if self.planned:
                             if self.table_backed:
-                                left_table_id = self._put_planned_pair(
-                                    self.left_table,
+                                left_key = self._planned_pair_key(
                                     "left",
                                     E_packed,
                                     W_left_packed,
                                     route_key=left_route_key,
                                 )
-                                right_table_id = self._put_planned_pair(
-                                    self.right_table,
+                                right_key = self._planned_pair_key(
                                     "right",
                                     W_right_packed,
                                     F_packed,
                                     route_key=right_route_key,
                                 )
-                                if left_table_id is None or right_table_id is None:
-                                    self.pack_failures += 1
-                                    return False
-                                left_id = self._planned_table_local_id(
-                                    self.planned_left_map,
-                                    self.planned_left_table_ids,
-                                    left_table_id,
+                                self.planned_left_keys.append(left_key)
+                                self.planned_right_keys.append(right_key)
+                                self.planned_left_values.append(
+                                    (E_packed, W_left_packed)
                                 )
-                                right_id = self._planned_table_local_id(
-                                    self.planned_right_map,
-                                    self.planned_right_table_ids,
-                                    right_table_id,
+                                self.planned_right_values.append(
+                                    (W_right_packed, F_packed)
                                 )
                             else:
                                 left_key = (
@@ -44250,8 +45891,9 @@ def two_site_dmrg(
                                         (W_right_packed, F_packed)
                                     )
                             self.planned_coeffs.append(complex(coeff))
-                            self.planned_left_ids.append(int(left_id))
-                            self.planned_right_ids.append(int(right_id))
+                            if not self.table_backed:
+                                self.planned_left_ids.append(int(left_id))
+                                self.planned_right_ids.append(int(right_id))
                             self.entries += 1
                             self.local_entries += 1
                             return True
@@ -44305,32 +45947,25 @@ def two_site_dmrg(
                         return False
                     try:
                         if self.table_backed:
-                            left_table_id = self._put_planned_pair(
-                                self.left_table,
+                            left_key = self._planned_pair_key(
                                 "left",
                                 E_packed,
                                 W_left_packed,
                                 route_key=left_route_key,
                             )
-                            right_table_id = self._put_planned_pair(
-                                self.right_table,
+                            right_key = self._planned_pair_key(
                                 "right",
                                 W_right_packed,
                                 F_packed,
                                 route_key=right_route_key,
                             )
-                            if left_table_id is None or right_table_id is None:
-                                self.pack_failures += 1
-                                return False
-                            left_id = self._planned_table_local_id(
-                                self.planned_left_map,
-                                self.planned_left_table_ids,
-                                left_table_id,
+                            self.planned_left_keys.append(left_key)
+                            self.planned_right_keys.append(right_key)
+                            self.planned_left_values.append(
+                                (E_packed, W_left_packed)
                             )
-                            right_id = self._planned_table_local_id(
-                                self.planned_right_map,
-                                self.planned_right_table_ids,
-                                right_table_id,
+                            self.planned_right_values.append(
+                                (W_right_packed, F_packed)
                             )
                         else:
                             left_key = (
@@ -44356,8 +45991,9 @@ def two_site_dmrg(
                                     (W_right_packed, F_packed)
                                 )
                         self.planned_coeffs.append(complex(coeff))
-                        self.planned_left_ids.append(int(left_id))
-                        self.planned_right_ids.append(int(right_id))
+                        if not self.table_backed:
+                            self.planned_left_ids.append(int(left_id))
+                            self.planned_right_ids.append(int(right_id))
                         self.entries += 1
                         self.local_entries += 1
                         return True
@@ -44407,6 +46043,7 @@ def two_site_dmrg(
                             self.buffer.extend(reference)
                             self.groups += int(len(self.reference_local_groups))
                     if self.planned_coeffs:
+                        self._flush_planned_table_pairs()
                         planned_entries = None
                         cache_key = self._planned_entry_cache_key()
                         if cache_key is not None:
@@ -44418,8 +46055,8 @@ def two_site_dmrg(
                                 self.planned_coeffs,
                                 self.planned_left_ids,
                                 self.planned_right_ids,
-                                self.planned_left_values,
-                                self.planned_right_values,
+                                () if self.table_backed else self.planned_left_values,
+                                () if self.table_backed else self.planned_right_values,
                                 left_table_ids=(
                                     self.planned_left_table_ids
                                     if self.table_backed
@@ -44477,6 +46114,8 @@ def two_site_dmrg(
                     self.planned_right_table_ids = []
                     self.planned_left_values = []
                     self.planned_right_values = []
+                    self.planned_left_keys = []
+                    self.planned_right_keys = []
                     self.planned_left_map = {}
                     self.planned_right_map = {}
                     self.identity_groups.clear()
@@ -44553,7 +46192,7 @@ def two_site_dmrg(
             max_same_side_route_identity_terms = int(
                 abelian_matvec_options.get(
                     "generator_table_same_side_route_identity_max_terms",
-                    0,
+                    100_000,
                 )
                 or 0
             )
@@ -45679,6 +47318,115 @@ def two_site_dmrg(
             _append_same_side_route_identity_bulk("right")
             _record_native_p_subphase(
                 "same_side_route_bulk",
+                time.perf_counter() - t_native_p_subphase,
+            )
+
+            t_native_p_subphase = time.perf_counter()
+            cpp_identity_owner = getattr(
+                moving_environment,
+                "_cpp_moving_environment",
+                None,
+            )
+            cpp_identity_builder = (
+                None
+                if cpp_identity_owner is None
+                else getattr(
+                    cpp_identity_owner,
+                    "build_native_p_identity_entries",
+                    None,
+                )
+            )
+            if (
+                cpp_identity_builder is not None
+                and fast_identity_append
+                and use_planned_native_p_identity_entries
+                and planned_identity_left_table is not None
+                and planned_identity_right_table is not None
+                and bool(
+                    abelian_matvec_options.get(
+                        "generator_table_cpp_native_p_identity_entries",
+                        True,
+                    )
+                )
+            ):
+                try:
+                    cpp_owner_records = tuple(
+                        row
+                        for row in supported_owner_records
+                        if tuple(int(index) for index in row[0]) not in consumed
+                    )
+                    needs_left_same = any(
+                        own_l == "left" and own_r == "left"
+                        for _raw_key, own_l, own_r in cpp_owner_records
+                    )
+                    needs_right_same = any(
+                        own_l == "right" and own_r == "right"
+                        for _raw_key, own_l, own_r in cpp_owner_records
+                    )
+                    left_same_table = (
+                        _prebuild_same_side_pair_table("left")
+                        if needs_left_same
+                        else None
+                    )
+                    right_same_table = (
+                        _prebuild_same_side_pair_table("right")
+                        if needs_right_same
+                        else None
+                    )
+                    cpp_planned, cpp_consumed, cpp_ownership = (
+                        cpp_identity_builder(
+                            AbelianPlannedPackedDirectFamilyEntries,
+                            cpp_owner_records,
+                            p_entries,
+                            getattr(left_table, "operators", {}) or {},
+                            getattr(right_table, "operators", {}) or {},
+                            (
+                                {}
+                                if left_same_table is None
+                                else getattr(left_same_table, "operators", {}) or {}
+                            ),
+                            (
+                                {}
+                                if right_same_table is None
+                                else getattr(right_same_table, "operators", {}) or {}
+                            ),
+                            _id_left_env(),
+                            _id_right_env(),
+                            _packed_local_generator_w_pair,
+                            planned_identity_left_table,
+                            planned_identity_right_table,
+                            int(bond),
+                            "native_contextual_p_identity_local_csr",
+                        )
+                    )
+                    cpp_consumed = tuple(
+                        tuple(int(index) for index in raw_key)
+                        for raw_key in cpp_consumed
+                    )
+                    if cpp_planned is not None and cpp_consumed:
+                        entries.extend(cpp_planned)
+                        consumed.update(cpp_consumed)
+                        direct_identity_appends += int(len(cpp_consumed))
+                        for owner_key, count in dict(cpp_ownership).items():
+                            native_p_ownership_counts[str(owner_key)] += int(count)
+                        native_stats = direct_family_builder_stats.setdefault(
+                            "native_boundary_p",
+                            {"enabled": True},
+                        )
+                        native_stats["cpp_identity_entries"] = int(
+                            native_stats.get("cpp_identity_entries", 0)
+                        ) + int(len(cpp_consumed))
+                except Exception as exc:
+                    native_stats = direct_family_builder_stats.setdefault(
+                        "native_boundary_p",
+                        {"enabled": True},
+                    )
+                    native_stats["cpp_identity_entry_failures"] = int(
+                        native_stats.get("cpp_identity_entry_failures", 0)
+                    ) + 1
+                    native_stats["cpp_identity_entry_error"] = repr(exc)
+            _record_native_p_subphase(
+                "cpp_identity_entries",
                 time.perf_counter() - t_native_p_subphase,
             )
 
@@ -47025,6 +48773,9 @@ def two_site_dmrg(
                 planned_without_precompute_table_ids_only=(
                     build_options.planned_without_precompute_table_ids_only
                 ),
+                snapshot_table_backed_planned_entries=(
+                    build_options.snapshot_table_backed_planned_entries
+                ),
             )
             cpp_contextual_precompute_disabled_reason = (
                 "attached_cpp_table_backed_contextual_plan_uses_lazy_table_ids"
@@ -47054,6 +48805,9 @@ def two_site_dmrg(
                     planned_without_precompute_table_ids_only=(
                         build_options.planned_without_precompute_table_ids_only
                     ),
+                    snapshot_table_backed_planned_entries=(
+                        build_options.snapshot_table_backed_planned_entries
+                    ),
                 )
         elif (
             build_options.packed_buffer
@@ -47075,6 +48829,9 @@ def two_site_dmrg(
                 planned_without_precompute_batch=False,
                 planned_without_precompute_table_lookup=False,
                 planned_without_precompute_table_ids_only=False,
+                snapshot_table_backed_planned_entries=(
+                    build_options.snapshot_table_backed_planned_entries
+                ),
             )
         direct_family_builder_stats["contextual_build_options"] = {
             "precompute_boundaries": build_options.precompute_boundaries,
@@ -49000,6 +50757,52 @@ def two_site_dmrg(
             return tuple(range(0, ci + 1))
         raise ValueError(f"unknown DMRG sweep direction: {direction}")
 
+    def _run_dense_cpp_half_sweep(direction):
+        nonlocal last_i
+        if (
+            U1
+            or nstates != 1
+            or moving_environment is None
+            or len(MPS) < 3
+            or complementary_operator_families
+            or complementary_operator_mpos
+            or complementary_operator_term_maps
+            or complementary_operator_generator_entries
+            or not all(isinstance(value, np.ndarray) for value in (*MPS, *MPO))
+        ):
+            return None
+        result = moving_environment.run_dense_cpp_dmrg_half_sweep(
+            MPS,
+            MPO,
+            initial_E(MPO[0]),
+            initial_F(MPO[-1]),
+            direction=direction,
+            m_max=m,
+            left_environments=E,
+            right_environments=F,
+            tol=float(davidson_tol),
+            max_iter=int(davidson_max_iter),
+            matvec_options=abelian_matvec_options,
+        )
+        if result is None:
+            return None
+        MPS[:] = [np.asarray(site) for site in result["factors"]]
+        E[:] = [np.asarray(env) for env in result["left_environments"]]
+        F[:] = [np.asarray(env) for env in result["right_environments"]]
+        last_i = int(result["last_bond"])
+        energy = float(result["energy"])
+        truncation = float(result["truncation"])
+        states_kept = int(result["states_kept"])
+        return {
+            "Energy": energy,
+            "trunc": truncation,
+            "states": states_kept,
+            "E_ground_state": energy,
+            "updates": list(result.get("updates", ())),
+            "last_i": last_i,
+            "backend": str(result.get("backend", "cpp_dense_dmrg_half_sweep")),
+        }
+
     def _run_single_state_owner_half_sweep(
         direction,
         sweep_index,
@@ -49179,6 +50982,10 @@ def two_site_dmrg(
                     sym_mgr=sym_mgr,
                     phys_dims_left=self._phys_dims_from_mpo_site(MPO[bond_index]),
                     phys_dims_right=self._phys_dims_from_mpo_site(MPO[bond_index + 1]),
+                    complex_noise=_symmetric_operators_are_complex(
+                        MPO[bond_index],
+                        MPO[bond_index + 1],
+                    ),
                 )
                 norm = float(np.real(np.asarray(AA.norm()).reshape(-1)[0]))
                 if norm <= 0.0:
@@ -49337,6 +51144,10 @@ def two_site_dmrg(
                             sym_mgr=sym_mgr,
                             phys_dims_left=_phys_dims_from_mpo_site(MPO[i]),
                             phys_dims_right=_phys_dims_from_mpo_site(MPO[i + 1]),
+                            complex_noise=_symmetric_operators_are_complex(
+                                MPO[i],
+                                MPO[i + 1],
+                            ),
                         )
                         norm = float(np.real(np.asarray(AA.norm()).reshape(-1)[0]))
                         if norm <= 0.0:
@@ -50398,7 +52209,17 @@ def two_site_dmrg(
                 None,
                 float(np.real(np.asarray(Eold).reshape(-1)[0])),
                 float(conv),
-                2 if converge_on_full_sweeps else 1,
+                (
+                    2 if converge_on_full_sweeps else 1
+                )
+                if bool(
+                    moving_environment._option_value(
+                        abelian_matvec_options,
+                        "moving_environment_cpp_owner_sweep_schedule_use_local_convergence",
+                        True,
+                    )
+                )
+                else nsweep_half_local + 1,
             )
             if owner_site_chain_key:
                 _mark_cpp_owner_site_chain_dirty()
@@ -50558,15 +52379,15 @@ def two_site_dmrg(
         nz = _noise(sweep * 2)
         half_start = time.perf_counter()
         half_updates = []
-        owner_half = None
-        if nstates == 1 and moving_environment is not None:
+        owner_half = _run_dense_cpp_half_sweep("lr")
+        if owner_half is None and nstates == 1 and moving_environment is not None:
             owner_half = _run_single_state_owner_half_sweep("lr", sweep * 2, nz)
-            if owner_half is not None:
-                Energy = owner_half["Energy"]
-                trunc = owner_half["trunc"]
-                states = owner_half["states"]
-                E_ground_state = owner_half["E_ground_state"]
-                half_updates = owner_half["updates"]
+        if owner_half is not None:
+            Energy = owner_half["Energy"]
+            trunc = owner_half["trunc"]
+            states = owner_half["states"]
+            E_ground_state = owner_half["E_ground_state"]
+            half_updates = owner_half["updates"]
         if owner_half is None:
             _sync_cpp_owner_site_chain(force=True)
         for i in (() if owner_half is not None else _sweep_bonds("lr")):
@@ -50705,6 +52526,18 @@ def two_site_dmrg(
         )
         gauge = "Left"
 
+        if (
+            converge_on_full_sweeps
+            and sweep > 0
+            and abs(e_avg - Eold) < conv
+        ):
+            if verbose >= 1:
+                print(
+                    "DMRG converged after the left-to-right confirmation "
+                    f"pass at sweep {sweep}.\n average energy = {e_avg}"
+                )
+            converged = True
+            break
         if not converge_on_full_sweeps and abs(e_avg - Eold) < conv:
             if verbose >= 1:
                 print("DMRG Converged at sweep {}. \n average energy = {}".format(sweep, e_avg))
@@ -50718,15 +52551,15 @@ def two_site_dmrg(
         nz = _noise(sweep * 2 + 1)
         half_start = time.perf_counter()
         half_updates = []
-        owner_half = None
-        if nstates == 1 and moving_environment is not None:
+        owner_half = _run_dense_cpp_half_sweep("rl")
+        if owner_half is None and nstates == 1 and moving_environment is not None:
             owner_half = _run_single_state_owner_half_sweep("rl", sweep * 2 + 1, nz)
-            if owner_half is not None:
-                Energy = owner_half["Energy"]
-                trunc = owner_half["trunc"]
-                states = owner_half["states"]
-                E_ground_state = owner_half["E_ground_state"]
-                half_updates = owner_half["updates"]
+        if owner_half is not None:
+            Energy = owner_half["Energy"]
+            trunc = owner_half["trunc"]
+            states = owner_half["states"]
+            E_ground_state = owner_half["E_ground_state"]
+            half_updates = owner_half["updates"]
         if owner_half is None:
             _sync_cpp_owner_site_chain(force=True)
         for i in (() if owner_half is not None else _sweep_bonds("rl")):
@@ -51154,7 +52987,7 @@ def two_site_dmrg(
         return Energy, final_states, gauge, converged
 
 
-def expect_mps(bra, MPO, ket=None):
+def _expect_factors(bra, MPO, ket=None):
     """
     Evaluate the expectation value of an MPO on a given MPS
     .. math::
@@ -51563,9 +53396,12 @@ if __name__ == '__main__':
     # the complete MPO
     H = [Wfirst] + ([W] * (N-2)) + [Wlast]
 
-    dmrg = DMRG(H, D=10, nsweeps=8)
-    dmrg.init_guess = initial_mps
-    dmrg.init_guess = MPS(initial_mps, labels=['lv', 'p', 'rv'])
+    dmrg = DMRG(
+        MPO(H),
+        D=10,
+        nsweeps=8,
+        init_guess=MPS(initial_mps, labels=['lv', 'p', 'rv']),
+    )
     dmrg.run()
     # print(dmrg.ground_state.calc_1site_rdm())
 

@@ -45,6 +45,7 @@ class SU2DMRG:
         self.e_active = None
         self.e_core = None
         self.e_tot = None
+        self.includes_core_energy = False
         self.ground_state = None
         self.states = []
         self.history = []
@@ -115,6 +116,7 @@ def _make_initial_mps(
     initial_guess=None,
     bond_multiplicity=2,
     seed=7,
+    fully_reduced=None,
 ):
     guess = qcdmrg.init_guess if initial_guess is None else initial_guess
     if isinstance(guess, MPS):
@@ -126,10 +128,12 @@ def _make_initial_mps(
         raise TypeError(f"Unsupported non-Abelian initial guess type: {type(guess)}")
 
     method = guess.lower()
-    fully_reduced = getattr(qcdmrg, "spatial_site_basis", "canonical") in {
-        "fully_reduced",
-        "fully_reduced_su2",
-    }
+    if fully_reduced is None:
+        fully_reduced = getattr(qcdmrg, "spatial_site_basis", "canonical") in {
+            "fully_reduced",
+            "fully_reduced_su2",
+        }
+    fully_reduced = bool(fully_reduced)
     if method in {"hf", "product"}:
         if fully_reduced:
             # A fully reduced SU(2) site has no spin-projection product state;
@@ -443,14 +447,48 @@ def _run_spatial_qchem_dmrg(
             False,
         )
     )
+    reference_complementary_families = bool(
+        sweep_kwargs.pop("su2_reference_complementary_families", False)
+        or str(sweep_kwargs.get("su2_kernel_backend", "auto")).lower() == "python"
+    )
+    fully_reduced_sites = getattr(qcdmrg, "spatial_site_basis", "canonical") in {
+        "fully_reduced",
+        "fully_reduced_su2",
+    }
+    if normal_complementary_production and reference_complementary_families:
+        from pyqed.qchem.dmrg.backends.reduced import (
+            build_spatial_reduced_hamiltonian_mpo,
+        )
+
+        source_complementary_families = complementary_operator_families
+        active_hamiltonian = build_spatial_reduced_hamiltonian_mpo(
+            qcdmrg.h1e,
+            qcdmrg.h2e,
+            fully_reduced=False,
+            n_elec=None,
+            spin=int(qcdmrg.spin),
+            ecore=0.0,
+            orb_sym=getattr(qcdmrg, "orb_sym", None),
+        )
+        mpo_factors = active_hamiltonian.mpo
+        complementary_operator_families = (
+            active_hamiltonian.complementary_operators
+        )
+        for name in (
+            "prefer_recursive_operator_matvec",
+            "prefer_direct_orthonormal_projection",
+        ):
+            if hasattr(source_complementary_families, name):
+                object.__setattr__(
+                    complementary_operator_families,
+                    name,
+                    getattr(source_complementary_families, name),
+                )
+        normal_complementary_production = False
+        fully_reduced_sites = False
     if (
         normal_complementary_production
-        and not bool(
-            sweep_kwargs.pop(
-                "su2_reference_complementary_families",
-                False,
-            )
-        )
+        and not reference_complementary_families
     ):
         # The NC MPO and its C++ moving environment already own the complete
         # S/R/A/P/B/Q operator graph.  Building the historical Python family
@@ -478,10 +516,6 @@ def _run_spatial_qchem_dmrg(
     if max_bond is None:
         max_bond = qcdmrg.D
 
-    fully_reduced_sites = getattr(qcdmrg, "spatial_site_basis", "canonical") in {
-        "fully_reduced",
-        "fully_reduced_su2",
-    }
     state_average_spin_tol = float(sweep_kwargs.pop("state_average_spin_tol", 1.0e-6))
     state_average_validate_spin = bool(
         sweep_kwargs.pop("state_average_validate_spin", not fully_reduced_sites)
@@ -595,6 +629,7 @@ def _run_spatial_qchem_dmrg(
         initial_guess=initial_guess,
         bond_multiplicity=bond_multiplicity,
         seed=seed,
+        fully_reduced=fully_reduced_sites,
     )
     state_initialization_seconds = (
         time.perf_counter() - state_initialization_started
@@ -874,7 +909,7 @@ def _run_spatial_qchem_dmrg(
             "prefer_complementary_payload_tensor_matvec",
             su2_force_family_table,
         )
-    if local_basis_policy == "orthonormalized_operator":
+    if int(nstates) > 1 and local_basis_policy == "orthonormalized_operator":
         default_max_bond_mode = "per_sector"
     elif block2_like_state_average and not cpp_state_average:
         default_max_bond_mode = "states"
@@ -1175,6 +1210,7 @@ def _run_spatial_qchem_dmrg(
     solver.state_average_energy = float(np.dot(selected_weights, energies))
     solver.e_active = float(energies[0]) if nstates == 1 else energies.copy()
     solver.e_tot = solver.e_active
+    solver.includes_core_energy = bool(normal_complementary_production)
     solver.ground_state = states[0]
     solver.states = states
     solver.history = result["history"]

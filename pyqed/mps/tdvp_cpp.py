@@ -14,8 +14,14 @@ CPP_TDVP_AVAILABLE = False
 CPP_TDVP_BUILD_ERROR = None
 CPP_TDVP_HAS_BLAS = False
 site_lanczos = None
+site_lanczos_sum = None
 two_site_lanczos = None
+two_site_lanczos_sum = None
 bond_lanczos = None
+bond_lanczos_sum = None
+one_site_lanczos_sum_sweep = None
+reset_kernel_stats = None
+kernel_stats = None
 
 
 def _disabled(value):
@@ -162,23 +168,50 @@ def _initialize():
     global CPP_TDVP_AVAILABLE
     global CPP_TDVP_HAS_BLAS
     global site_lanczos
+    global site_lanczos_sum
     global two_site_lanczos
+    global two_site_lanczos_sum
     global bond_lanczos
+    global bond_lanczos_sum
+    global one_site_lanczos_sum_sweep
+    global reset_kernel_stats
+    global kernel_stats
 
     if _disabled(os.environ.get("PYQED_MPS_DISABLE_CPP_TDVP", "0")):
         return
-    try:
-        from . import _cpp_tdvp as module
-    except Exception:
-        if not _enabled(os.environ.get("PYQED_MPS_AUTO_CPP_TDVP", "1")):
-            return
+    source = Path(__file__).with_name("tdvp_kernels.cpp")
+    suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
+    packaged = Path(__file__).with_name("_cpp_tdvp" + suffix)
+    source_is_newer = source.exists() and (
+        not packaged.exists() or source.stat().st_mtime_ns > packaged.stat().st_mtime_ns
+    )
+    if source_is_newer and _enabled(
+        os.environ.get("PYQED_MPS_AUTO_CPP_TDVP", "1")
+    ):
         module = _compile_extension()
         if module is None:
             return
+    else:
+        try:
+            from . import _cpp_tdvp as module
+        except Exception:
+            if not _enabled(os.environ.get("PYQED_MPS_AUTO_CPP_TDVP", "1")):
+                return
+            module = _compile_extension()
+            if module is None:
+                return
 
     site_lanczos = getattr(module, "site_lanczos", None)
+    site_lanczos_sum = getattr(module, "site_lanczos_sum", None)
     two_site_lanczos = getattr(module, "two_site_lanczos", None)
+    two_site_lanczos_sum = getattr(module, "two_site_lanczos_sum", None)
     bond_lanczos = getattr(module, "bond_lanczos", None)
+    bond_lanczos_sum = getattr(module, "bond_lanczos_sum", None)
+    one_site_lanczos_sum_sweep = getattr(
+        module, "one_site_lanczos_sum_sweep", None
+    )
+    reset_kernel_stats = getattr(module, "reset_kernel_stats", None)
+    kernel_stats = getattr(module, "kernel_stats", None)
     CPP_TDVP_HAS_BLAS = bool(getattr(module, "HAS_BLAS", False))
     CPP_TDVP_AVAILABLE = (
         site_lanczos is not None

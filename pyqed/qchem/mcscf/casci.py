@@ -1069,7 +1069,6 @@ class CASCI:
         self,
         nstates=None,
         method=None,
-        build_driver=None,
         run_kwargs=None,
         reuse_ci=False,
         root_homing=False,
@@ -1091,7 +1090,6 @@ class CASCI:
             self,
             nstates=nstates,
             method=method,
-            build_driver=build_driver,
             run_kwargs=options,
             reuse_ci=reuse_ci,
             root_homing=root_homing,
@@ -3332,6 +3330,51 @@ def make_rdm2(ci, Binary, SC1, SC2):
     return _make_tdm2_link_contractions(ci, ci, Binary)
 
 
+def make_state_average_rdms(ci_roots, weights, binary):
+    """Build weighted spin-traced active-space 1- and 2-RDMs for many roots."""
+    roots = list(ci_roots)
+    weights = np.asarray(weights, dtype=float)
+    if weights.ndim != 1 or len(roots) != weights.size or weights.size == 0:
+        raise ValueError("ci_roots and weights must be non-empty and have equal lengths.")
+
+    alpha, beta, first = _ci_to_spin_string_matrix(roots[0], binary)
+    matrices = [np.asarray(first)]
+    for root in roots[1:]:
+        root_alpha, root_beta, matrix = _ci_to_spin_string_matrix(root, binary)
+        if not np.array_equal(root_alpha, alpha) or not np.array_equal(root_beta, beta):
+            raise ValueError("All CI roots must use the same spin-string basis.")
+        matrices.append(np.asarray(matrix))
+    coefficient_matrices = np.asarray(matrices)
+    nmo = int(binary.norb if isinstance(binary, FCIStringBasis) else binary.shape[2])
+
+    native = _cpp_attr("state_average_spin_rdms")
+    if native is not None and not np.iscomplexobj(coefficient_matrices):
+        alpha_one, alpha_two = _spin_string_links(alpha)
+        beta_one, beta_two = _spin_string_links(beta)
+        link_arrays = tuple(
+            np.ascontiguousarray(array, dtype=np.intp)
+            for group in (alpha_one, alpha_two, beta_one, beta_two)
+            for array in group
+        )
+        try:
+            return native(
+                nmo,
+                np.ascontiguousarray(coefficient_matrices, dtype=np.float64),
+                np.ascontiguousarray(weights, dtype=np.float64),
+                *link_arrays,
+            )
+        except Exception:
+            pass
+
+    dtype = np.result_type(coefficient_matrices, weights, float)
+    dm1 = np.zeros((nmo, nmo), dtype=dtype)
+    dm2 = np.zeros((nmo, nmo, nmo, nmo), dtype=dtype)
+    for weight, root in zip(weights, roots):
+        dm1 += weight * make_rdm1(root, binary, None)
+        dm2 += weight * make_rdm2(root, binary, None, None)
+    return dm1, dm2
+
+
 def make_tdm2(cibra, ciket, Binary, SC1, SC2):
     """
     Build the spin-traced two-particle transition density matrix.
@@ -3791,7 +3834,6 @@ class CASCIScanner:
         mc,
         nstates=None,
         method='direct_ci',
-        build_driver=None,
         run_kwargs=None,
         reuse_ci=False,
         root_homing=False,
@@ -3810,11 +3852,7 @@ class CASCIScanner:
         self.last_frame = None
         self.root_tracking_overlaps = None
         self.root_tracking_permutation = None
-        self._mf_scanner = (
-            self.mf.as_scanner(build_driver=build_driver)
-            if hasattr(self.mf, "as_scanner")
-            else None
-        )
+        self._mf_scanner = self.mf.as_scanner() if hasattr(self.mf, "as_scanner") else None
 
     def __call__(self, mol_or_geom):
         if self._mf_scanner is not None:
@@ -3825,7 +3863,7 @@ class CASCIScanner:
             if hasattr(mf, "mol") and isinstance(mol_or_geom, np.ndarray):
                 mol = mf.mol
                 mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
-                mol.build(driver=getattr(mol, "_build_driver", None) or "gbasis")
+                mol.build()
                 mf.run()
             elif mol_or_geom is not None and mol_or_geom is not getattr(mf, "mol", None):
                 mf.mol = mol_or_geom

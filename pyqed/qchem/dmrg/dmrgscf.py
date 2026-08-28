@@ -1,17 +1,118 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Created on Mon Feb  9 18:10:50 2026
+"""Density-matrix-renormalization-group self-consistent field."""
 
-DMRGSCF
-
-@author: Bing Gu (gubing at westlake dot edu dot cn)
-"""
-# TODO: so since we are sharing CASSCF optimization code, currently after the DMRGSCF, final print get E(CASSCF) = xxxxxxx, it might be better if we fix that.
-from pyqed.qchem import CASSCF
-from pyqed.qchem.dmrg.dmrg import QCDMRG
-from pyqed.qchem.mcscf.cocas import kernel, kernel_state_average
 import numpy as np
+
+from pyqed.qchem.dmrg.dmrg import QCDMRG
+from pyqed.qchem.mcscf.casscf import FirstOrderCASSCF, SecondOrderCASSCF
+from pyqed.qchem.mcscf.cocas import _fresh_casci_like, kernel, kernel_state_average
+from pyqed.qchem.mcscf.orbopt import embed_rdm2
+from pyqed.qchem.mcscf.casci import (
+    _get_mf_cholesky_factors,
+    _resolve_use_cholesky_integrals,
+    transform_eri_factors_to_mo_pair,
+)
+
+
+class _DMRGFirstOrderCASSCF(FirstOrderCASSCF):
+    """Nonredundant orbital optimizer backed by the production DMRG solver."""
+
+    def __init__(self, prototype, dmrg_options, **kwargs):
+        super().__init__(prototype.mf, prototype.ncas, prototype.nelecas, **kwargs)
+        self.prototype = prototype
+        self.dmrg_options = dict(dmrg_options)
+        self.weights = prototype.weights
+        self.spin_purification = prototype.spin_purification
+        self.ss = prototype.ss
+        self.shift = prototype.shift
+
+    @staticmethod
+    def _copy_ci_guess(ci):
+        if ci is None:
+            return None
+        return list(ci) if isinstance(ci, (list, tuple)) else [ci]
+
+    def _objective_energy(self, mc, state_id):
+        energies = np.asarray(mc.e_tot, dtype=float).reshape(-1)
+        if self.weights is None:
+            return float(energies[int(state_id)])
+        return float(np.dot(np.asarray(self.weights, dtype=float), energies))
+
+    def _effective_rdms(self, mc, state_id):
+        dm1_occ, dm2_occ = self._effective_rdms_occ(mc, state_id)
+        dm1 = np.zeros((self.nmo, self.nmo), dtype=dm1_occ.dtype)
+        size = dm1_occ.shape[0]
+        dm1[:size, :size] = dm1_occ
+        return dm1, embed_rdm2(dm2_occ, self.nmo)
+
+    def _make_casci(self, mo_coeff, nstates, ci0=None):
+        mc = _fresh_casci_like(self.prototype, solver_cls=QCDMRG)
+        mc._su2_runtime = None
+        if ci0:
+            mc.init_guess = ci0[0]
+        options = dict(self.dmrg_options)
+        options["require_convergence"] = False
+        QCDMRG.run(
+            mc,
+            nstates=int(nstates),
+            weights=self.weights,
+            mo_coeff=mo_coeff,
+            **options,
+        )
+        mc.ci = [mc.export_ground_state(state=root) for root in range(int(nstates))]
+        self.ncore = mc.ncore
+        return mc
+
+
+class _DMRGSecondOrderCASSCF(SecondOrderCASSCF):
+    """One-keyframe augmented-Hessian CASSCF backed by reduced DMRG."""
+
+    def __init__(self, prototype, dmrg_options, **kwargs):
+        super().__init__(prototype.mf, prototype.ncas, prototype.nelecas, **kwargs)
+        self.prototype = prototype
+        self.dmrg_options = dict(dmrg_options)
+        self.weights = prototype.weights
+        self.spin_purification = prototype.spin_purification
+        self.ss = prototype.ss
+        self.shift = prototype.shift
+
+    _copy_ci_guess = staticmethod(_DMRGFirstOrderCASSCF._copy_ci_guess)
+    _objective_energy = _DMRGFirstOrderCASSCF._objective_energy
+    _effective_rdms = _DMRGFirstOrderCASSCF._effective_rdms
+
+    def _run_dmrg(self, mean_field, mo_coeff, nstates, ci0):
+        mc = _fresh_casci_like(self.prototype, solver_cls=QCDMRG)
+        mc.mf = mean_field
+        mc.mol = mean_field.mol
+        mc._su2_runtime = None
+        if ci0:
+            mc.init_guess = ci0[0]
+        options = dict(self.dmrg_options)
+        options["require_convergence"] = False
+        QCDMRG.run(
+            mc,
+            nstates=int(nstates),
+            weights=self.weights,
+            mo_coeff=mo_coeff,
+            **options,
+        )
+        mc.ci = [mc.export_ground_state(state=root) for root in range(int(nstates))]
+        self.ncore = mc.ncore
+        return mc
+
+    def _make_casci(self, mo_coeff, nstates, ci0=None):
+        return self._run_dmrg(self.mf, mo_coeff, nstates, ci0)
+
+    def _make_factor_integral_casci(
+        self, h1_mo, pair_factors, mo_coeff, nstates, ci0=None
+    ):
+        frozen = self._FrozenFactorRHF(self.mf, h1_mo, pair_factors, mo_coeff)
+        return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0)
+
+    def _make_integral_casci(
+        self, h1_mo, eri_mo, mo_coeff, nstates, ci0=None
+    ):
+        frozen = self._FrozenIntegralRHF(self.mf, h1_mo, eri_mo, mo_coeff)
+        return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0)
 
 
 def _ao_overlap(mf):
@@ -95,7 +196,7 @@ class DMRGSCF(QCDMRG):
         max_cycles=30,
         macro_tol=1e-6,
         dmrg_conv_tol=1e-7,
-        integral_backend="auto",
+        integral_backend=None,
         **kwargs,
     ):
        
@@ -112,6 +213,7 @@ class DMRGSCF(QCDMRG):
         self.tol = float(macro_tol) # macro energy tol
         self.dmrg_conv_tol = float(dmrg_conv_tol)
         self.mo_coeff = None # opt orb
+        self.use_cholesky_integrals = False
 
 
         self.weights = None
@@ -122,13 +224,36 @@ class DMRGSCF(QCDMRG):
         self.macro_iterations = 0
 
 
-    def run(self, nstates=1, weights = None, require_conv=True, mo_coeff=None, **kwargs):
+    def run(self, nstates=1, weights=None, require_conv=True, mo_coeff=None, **kwargs):
         mf = self.mf
+        orbital_driver = str(kwargs.pop("orbital_driver", "constrained")).lower().replace(
+            "-", "_"
+        )
+        if orbital_driver not in {"constrained", "nonredundant", "second_order"}:
+            raise ValueError(
+                "orbital_driver must be 'constrained', 'nonredundant', or "
+                "'second_order'."
+            )
+        orbital_options = {
+            "optimizer": kwargs.pop("optimizer", "RCG"),
+            "optimizer_history": kwargs.pop("optimizer_history", 7),
+            "optimizer_tol": kwargs.pop("optimizer_tol", 1.0e-4),
+            "optimizer_max_steps": kwargs.pop("optimizer_max_steps", 200),
+            "optimizer_max_step_norm": kwargs.pop("optimizer_max_step_norm", None),
+            "diis": kwargs.pop("diis", True),
+            "diis_space": kwargs.pop("diis_space", 6),
+            "diis_start": kwargs.pop("diis_start", 2),
+            "ci_method": kwargs.pop("ci_method", "direct_ci"),
+        }
+        orbital_micro_cycles = int(kwargs.pop("orbital_micro_cycles", 1))
+        if orbital_micro_cycles < 1:
+            raise ValueError("orbital_micro_cycles must be positive.")
         rej = kwargs.pop("reject_macro_energy", True)
         rise = kwargs.pop("macro_energy_rise_tol", 1.0e-8)
         rmax = kwargs.pop("macro_reject_max", 8)
         mtol = kwargs.pop("macro_tol", self.tol)
         gtol = kwargs.pop("orb_grad_tol", None)
+        gtol_relaxed = kwargs.pop("orb_grad_tol_relaxed", gtol)
         tr = kwargs.pop("macro_trust_radius", 0.25)
         tr_min = kwargs.pop("macro_trust_min", 1.0e-4)
         tr_max = kwargs.pop("macro_trust_max", 1.0)
@@ -148,161 +273,134 @@ class DMRGSCF(QCDMRG):
         C0 = _complete_mo_basis(mf, mo_coeff)
 
         # CASCI roots
-        if nstates == None:
+        if nstates is None:
             nstates = self.nstates
         else:
             self.nstates = nstates
-        if weights != None:
+        if weights is not None:
             self.weights = weights
             if nstates != len(self.weights):
-                raise ValueError("the nstates you requires does not align with the nstates indicated by the weights. check input.")
+                raise ValueError("nstates must match the number of state-average weights.")
 
         nmo = self.mf.nao
         ncas = self.ncas
         nelecas = self.nelecas
         ncore = self.ncore
 
-        mc = QCDMRG(
-            mf,
-            ncas=ncas,
-            nelecas=nelecas,
-            D=self.D,
-            site=getattr(self, "site", getattr(self, "site_basis", "spin_orbital")),
-            spatial_reduced_mpo=getattr(self, "spatial_reduced_mpo", None),
-            symmetry=getattr(self, "symmetry", None),
-            spatial_site_basis=getattr(self, "spatial_site_basis", "canonical"),
-            spatial_abelian_mpo=getattr(self, "spatial_abelian_mpo", "grouped"),
-            spatial_abelian_symbolic_algo=getattr(
-                self,
-                "spatial_abelian_symbolic_algo",
-                "Hopcroft-Karp",
-            ),
-            spatial_family_environment_backend=getattr(
-                self,
-                "spatial_family_environment_backend",
-                "block2_table",
-            ),
-            spatial_native_p_grouping=getattr(
-                self,
-                "spatial_native_p_grouping",
-                "first_site_order",
-            ),
-            spatial_block2_table_p_split_metric=getattr(
-                self,
-                "spatial_block2_table_p_split_metric",
-                "auto",
-            ),
-            spatial_block2_table_p_split_groups=getattr(
-                self,
-                "spatial_block2_table_p_split_groups",
-                "auto",
-            ),
-            spatial_block2_table_native_p=getattr(
-                self,
-                "spatial_block2_table_native_p",
-                False,
-            ),
-            spatial_complementary_payload_tensor_matvec=getattr(
-                self,
-                "spatial_complementary_payload_tensor_matvec",
-                True,
-            ),
-            spatial_precontracted_family_environment=getattr(
-                self,
-                "spatial_precontracted_family_environment",
-                True,
-            ),
-            spatial_boundary_table_max_dim=getattr(
-                self,
-                "spatial_boundary_table_max_dim",
-                32,
-            ),
-            spatial_exact_component_compression_policy=getattr(
-                self,
-                "spatial_exact_component_compression_policy",
-                "auto",
-            ),
-            spatial_exact_component_compression_validate=getattr(
-                self,
-                "spatial_exact_component_compression_validate",
-                True,
-            ),
-            spatial_exact_component_compression_validation_vectors=getattr(
-                self,
-                "spatial_exact_component_compression_validation_vectors",
-                1,
-            ),
-            spatial_exact_component_compression_min_reduction=getattr(
-                self,
-                "spatial_exact_component_compression_min_reduction",
-                1,
-            ),
-            spatial_exact_component_compression_max_group_size=getattr(
-                self,
-                "spatial_exact_component_compression_max_group_size",
-                64,
-            ),
-            spatial_enable_cpp_boundary_p=getattr(
-                self,
-                "spatial_enable_cpp_boundary_p",
-                True,
-            ),
-            spatial_validate_cpp_boundary_p=getattr(
-                self,
-                "spatial_validate_cpp_boundary_p",
-                True,
-            ),
-            spatial_cpp_boundary_p_validation_policy=getattr(
-                self,
-                "spatial_cpp_boundary_p_validation_policy",
-                "first_pass",
-            ),
-            spatial_direct_operator_batch_min_entries=getattr(
-                self,
-                "spatial_direct_operator_batch_min_entries",
-                2,
-            ),
-            dmrg_performance=getattr(self, "dmrg_performance", "block2-like"),
-            abelian_matvec_options=getattr(self, "abelian_matvec_options", None),
-            debug_complementary_action_check=getattr(
-                self,
-                "debug_complementary_action_check",
-                False,
-            ),
-            debug_complementary_action_check_tol=getattr(
-                self,
-                "debug_complementary_action_check_tol",
-                1.0e-10,
-            ),
-            debug_complementary_action_check_limit=getattr(
-                self,
-                "debug_complementary_action_check_limit",
-                32,
-            ),
-            debug_spatial_family_hamiltonian_check=getattr(
-                self,
-                "debug_spatial_family_hamiltonian_check",
-                False,
-            ),
-            integral_backend=getattr(self, "integral_backend", "auto"),
-            verbose=getattr(self, "verbose", 0),
-        )
-
-        # spin
-        mc.spin_purification = self.spin_purification
-        mc.ss = self.ss
-        mc.shift = self.shift
-
         kwargs.setdefault("sweep_tol", sw_tol)
         kwargs.setdefault("local_dense_max_dim", ldense)
-        # DMRGSCF owns the final convergence policy so it can distinguish the
-        # active-space solve from macro-iteration convergence in its error.
         kwargs["require_convergence"] = False
 
+        if orbital_driver in {"nonredundant", "second_order"}:
+            orbital_use_cholesky = _resolve_use_cholesky_integrals(mf)
+            self.use_cholesky_integrals = orbital_use_cholesky
+            optimizer = orbital_options["optimizer"].upper()
+            if optimizer not in {"DIAG", "LBFGS", "AH"}:
+                optimizer = "LBFGS"
+            max_step = orbital_options["optimizer_max_step_norm"]
+            if max_step is None:
+                max_step = 0.10 if tr is None else min(0.10, float(tr))
+            common = dict(
+                max_cycle=self.max_cycles,
+                conv_tol=mtol,
+                conv_tol_grad=1.0e-4 if gtol is None else gtol,
+                conv_tol_grad_relaxed=(
+                    1.0e-4 if gtol_relaxed is None else gtol_relaxed
+                ),
+                max_step=max_step,
+                use_cholesky=orbital_use_cholesky,
+                verbose=getattr(self, "verbose", 0),
+            )
+            if orbital_driver == "second_order":
+                driver = _DMRGSecondOrderCASSCF(
+                    self,
+                    kwargs,
+                    max_micro_cycle=orbital_micro_cycles,
+                    coupling="qn",
+                    micro_ci_mode="full",
+                    optimizer="AH",
+                    diis=False,
+                    auto_active_restarts=False,
+                    **common,
+                )
+            else:
+                driver = _DMRGFirstOrderCASSCF(
+                    self,
+                    kwargs,
+                    step_size=1.0,
+                    optimizer=optimizer,
+                    optimizer_history=orbital_options["optimizer_history"],
+                    diis=orbital_options["diis"],
+                    diis_space=orbital_options["diis_space"],
+                    diis_start=orbital_options["diis_start"],
+                    **common,
+                )
+            try:
+                driver.run(
+                    nstates=nstates,
+                    mo_coeff=C0,
+                    use_cholesky=orbital_use_cholesky,
+                )
+            except RuntimeError:
+                if require_conv:
+                    raise
+
+            mc = driver.casci
+            self.mo_coeff = driver.mo_coeff
+            self.e_tot = mc.e_tot
+            self.ci = mc.ci
+            self.e_history = [row["energy"] for row in driver.history]
+            self.macro_diagnostics = []
+            previous = None
+            for row in driver.history:
+                energy = float(row["energy"])
+                self.macro_diagnostics.append(
+                    {
+                        "macro": int(row["cycle"]),
+                        "energy": energy,
+                        "dE": None if previous is None else energy - previous,
+                        "gn": float(row["gradient_norm"]),
+                        "step": row.get("step_norm"),
+                        "solver": bool(getattr(mc.dmrg, "converged", False)),
+                    }
+                )
+                previous = energy
+            self.macro_converged = bool(driver.converged)
+            self.solver_converged = bool(getattr(mc.dmrg, "converged", False))
+            self.converged = bool(self.macro_converged and self.solver_converged)
+            self.macro_iterations = len(driver.history)
+            self.dmrg = mc.dmrg
+            self.H = getattr(mc, "H", None)
+            self.H_raw = getattr(mc, "H_raw", None)
+            self.e_core = getattr(mc, "e_core", None)
+            self.integral_mode = getattr(
+                mc,
+                "integral_mode",
+                self.integral_mode,
+            )
+            self.casci = mc
+            if require_conv and not self.converged:
+                raise RuntimeError(
+                    "Nonredundant DMRGSCF did not converge both its orbital and "
+                    "active-space solver criteria."
+                )
+            return self
+
+        mc = _fresh_casci_like(self, solver_cls=QCDMRG)
+
+        # DMRGSCF owns the final convergence policy so it can distinguish the
+        # active-space solve from macro-iteration convergence in its error.
         mc.run(nstates=self.nstates, weights=self.weights, mo_coeff=C0, **kwargs)
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo(C0)
-        eri = mf.get_eri_mo(C0)
+        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(mf)
+        if self.use_cholesky_integrals:
+            eri = transform_eri_factors_to_mo_pair(
+                _get_mf_cholesky_factors(mf),
+                C0,
+            )
+        else:
+            eri = mf.get_eri_mo(C0)
 
         U0 = np.zeros((nmo, ncas+ncore))
         for i in range(ncas+ncore):
@@ -330,6 +428,7 @@ class DMRGSCF(QCDMRG):
                 macro_trust_grow=tr_up,
                 warm_start_dmrg=warm,
                 raise_on_nonconvergence=require_conv,
+                **orbital_options,
                 **kwargs,
             )
 
@@ -361,6 +460,7 @@ class DMRGSCF(QCDMRG):
                 macro_trust_grow=tr_up,
                 warm_start_dmrg=warm,
                 raise_on_nonconvergence=require_conv,
+                **orbital_options,
                 **kwargs,
             )
 
@@ -369,6 +469,7 @@ class DMRGSCF(QCDMRG):
         self.ci = getattr(mc, "ci", None)
         self.e_history = getattr(mc, 'e_history', [self.e_tot])
         self.macro_diagnostics = getattr(mc, "macro_diagnostics", [])
+        self.dmrgscf_timing = getattr(mc, "dmrgscf_timing", {})
         self.converged = bool(getattr(mc, "converged", False))
         self.macro_converged = bool(getattr(mc, "macro_converged", False))
         self.solver_converged = bool(getattr(mc, "solver_converged", False))
@@ -377,6 +478,11 @@ class DMRGSCF(QCDMRG):
         self.H = getattr(mc, "H", None)
         self.H_raw = getattr(mc, "H_raw", None)
         self.e_core = getattr(mc, "e_core", None)
+        self.integral_mode = getattr(
+            mc,
+            "integral_mode",
+            self.integral_mode,
+        )
         self.casci = mc
 
         if require_conv and not self.solver_converged:
@@ -392,21 +498,3 @@ class DMRGSCF(QCDMRG):
         self.nstates = len(weights)
         self.weights = weights
         return self
-
-if __name__=='__main__':
-
-    from pyqed import Molecule
-
-    mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
-    mol.build(driver='pyscf')
-
-    mf = mol.RHF().run()
-
-    mc = DMRGSCF(mf, ncas=6, nelecas=6, D=60, max_cycles=50)
-
-    mc.fix_spin(ss=0, shift=0.2)
-    mc.run(
-        nstates=1,
-        symmetry_list=['charge', 'sz'], 
-        initial_guess='cid'
-    )

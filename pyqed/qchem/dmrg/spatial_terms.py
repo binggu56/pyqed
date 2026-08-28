@@ -14,6 +14,7 @@ from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 _SPATIAL_LOCAL_OPS = None
 _CANONICAL_SPATIAL_LOCAL_SYMBOL_CACHE = {}
 _SPATIAL_JW_TERM_SPEC_CACHE = {}
+_SPATIAL_JW_PATTERN_SPEC_CACHE = {}
 
 
 def spatial_local_ops():
@@ -130,6 +131,40 @@ def spatial_jw_term_spec(local_symbols, sites, factor):
     result = (" ".join(final_symbols), tuple(final_sites), local_factor)
     _SPATIAL_JW_TERM_SPEC_CACHE[key] = result
     return result[0], list(result[1]), factor * result[2]
+
+
+def spatial_jw_pattern_spec(local_symbols, sites, n_sites):
+    """Return the full site pattern without constructing symbolic dof lists."""
+
+    key = (
+        tuple(str(symbol) for symbol in local_symbols),
+        tuple(int(site) for site in sites),
+        int(n_sites),
+    )
+    cached = _SPATIAL_JW_PATTERN_SPEC_CACHE.get(key)
+    if cached is not None:
+        return cached
+    pattern = ["I"] * int(n_sites)
+    factor = 1.0
+    for site in range(int(n_sites)):
+        site_symbols = []
+        for symbol, op_site in zip(key[0], key[1]):
+            if site < op_site:
+                site_symbols.append("JW")
+            elif site == op_site:
+                site_symbols.append(symbol)
+        if not site_symbols:
+            continue
+        local_symbol, local_factor = canonical_spatial_local_symbol(site_symbols)
+        if local_symbol is None:
+            result = ((), 0.0)
+            _SPATIAL_JW_PATTERN_SPEC_CACHE[key] = result
+            return result
+        pattern[site] = local_symbol
+        factor *= local_factor
+    result = (tuple(pattern), factor)
+    _SPATIAL_JW_PATTERN_SPEC_CACHE[key] = result
+    return result
 
 
 def accumulate_symbolic_term(term_map, symbol, dofs, factor, tol=1.0e-14):

@@ -3,23 +3,27 @@
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
 import os
 import time
 
 import numpy as np
 from scipy.linalg import eigh_tridiagonal, expm
 
+from pyqed.mps.dense_canonical import left_qr as _left_qr
+from pyqed.mps.dense_canonical import right_rq as _right_rq
 from pyqed.mps.decompose import decompose, tt_to_tensor
 from pyqed.mps.mps import (
     MPS,
     MPO,
+    _release_free_numeric_pages,
     contract_from_left,
     contract_from_right,
     dense_to_symmetric,
     dense_to_symmetric_mpo,
     initial_E,
     initial_F,
-    symmetric_to_dense,
+    symmetric_to_dense,  # noqa: F401 - retained as a TDVP module helper
 )
 from pyqed.mps.abelian_direct import (
     AbelianEnvironmentTensorData,
@@ -98,11 +102,20 @@ def _env_int(name, default):
         return int(default)
 
 
-_BLOCK_HEFF_CPP_MAX_ROUTE_ESTIMATE = _env_int("PYQED_TDVP_BLOCK_HEFF_CPP_MAX_ROUTE", 20_000_000)
-_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE_ESTIMATE = _env_int("PYQED_TDVP_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE", 20_000_000)
-_BLOCK_QR_CPP_MIN_ELEMENTS = _env_int("PYQED_TDVP_BLOCK_QR_CPP_MIN_ELEMENTS", 1_000_000_000)
+_BLOCK_HEFF_CPP_MAX_ROUTE_ESTIMATE = _env_int(
+    "PYQED_TDVP_BLOCK_HEFF_CPP_MAX_ROUTE", 20_000_000
+)
+_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE_ESTIMATE = _env_int(
+    "PYQED_TDVP_BLOCK_HEFF_AUTOTUNE_MAX_ROUTE", 20_000_000
+)
+_BLOCK_QR_CPP_MIN_ELEMENTS = _env_int(
+    "PYQED_TDVP_BLOCK_QR_CPP_MIN_ELEMENTS", 1_000_000_000
+)
 _BLOCK_ONE_SITE_CPP_ENGINE = _env_int("PYQED_TDVP_CPP_ONE_SITE_ENGINE", 1)
 _BLOCK_TWO_SITE_CPP_ENGINE = _env_int("PYQED_TDVP_CPP_TWO_SITE_ENGINE", 1)
+_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS = _env_int(
+    "PYQED_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS", 20_000_000
+)
 _AFFINE_BLOCK_SPARSE_MPO_CACHE = OrderedDict()
 _AFFINE_BLOCK_SPARSE_MPO_CACHE_MAX = 64
 _BLOCK_SPARSE_MPO_CACHE = OrderedDict()
@@ -151,9 +164,8 @@ def _cpp_dense_tdvp_workspace_type():
             _dense_tdvp_cpp = module
         except Exception:
             _dense_tdvp_cpp = None
-    if (
-        _dense_tdvp_cpp is None
-        or not getattr(_dense_tdvp_cpp, "CPP_DAVIDSON_AVAILABLE", False)
+    if _dense_tdvp_cpp is None or not getattr(
+        _dense_tdvp_cpp, "CPP_DAVIDSON_AVAILABLE", False
     ):
         return None
     workspace_type = getattr(_dense_tdvp_cpp, "DenseSweepWorkspace", None)
@@ -244,6 +256,8 @@ def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-1
     actual_dim = mmax
     q_prev = None
     beta_prev = 0.0
+    previous_action = None
+    small_action = None
     for j in range(mmax):
         q = basis[:, j]
         trial = apply_heff(q.reshape(shape)).reshape(-1)
@@ -255,6 +269,28 @@ def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-1
 
         beta_j = np.linalg.norm(trial)
         actual_dim = j + 1
+        if actual_dim == 1:
+            current_action = np.array(
+                [norm * np.exp(-1j * dt * alpha[0])], dtype=complex
+            )
+        else:
+            evals, evecs = eigh_tridiagonal(
+                alpha[:actual_dim], beta[: actual_dim - 1]
+            )
+            e1 = np.zeros(actual_dim, dtype=complex)
+            e1[0] = norm
+            current_action = evecs @ (
+                np.exp(-1j * dt * evals) * (evecs.T.conj() @ e1)
+            )
+        if previous_action is not None and tol > 0.0:
+            action_delta = np.linalg.norm(
+                current_action
+                - np.pad(previous_action, (0, 1))
+            )
+            if action_delta <= tol * max(1.0, norm):
+                small_action = current_action
+                break
+        previous_action = current_action
         if beta_j <= tol or j + 1 == mmax:
             break
         beta[j] = beta_j
@@ -262,13 +298,8 @@ def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-1
         beta_prev = beta_j
         basis[:, j + 1] = trial / beta_j
 
-    if actual_dim == 1:
-        small_action = np.array([norm * np.exp(-1j * dt * alpha[0])], dtype=complex)
-    else:
-        evals, evecs = eigh_tridiagonal(alpha[:actual_dim], beta[:actual_dim - 1])
-        e1 = np.zeros(actual_dim, dtype=complex)
-        e1[0] = norm
-        small_action = evecs @ (np.exp(-1j * dt * evals) * (evecs.T.conj() @ e1))
+    if small_action is None:
+        small_action = previous_action
     evolved = basis[:, :actual_dim] @ small_action
     return evolved.reshape(shape)
 
@@ -332,14 +363,14 @@ def _normalize_mps_factors_inplace(psi, norm2):
     if norm <= 0.0:
         raise ValueError("Cannot normalize a zero-norm MPS.")
     psi.factors[0] = psi.factors[0] / norm
-    psi.Bs[0] = psi.factors[0]
-    psi.data[0] = psi.factors[0]
     return psi
 
 
 def _sector_labels_and_components(sector):
     if hasattr(sector, "labels") and hasattr(sector, "components"):
-        return tuple(str(label).lower() for label in sector.labels), tuple(sector.components)
+        return tuple(str(label).lower() for label in sector.labels), tuple(
+            sector.components
+        )
     if isinstance(sector, (tuple, list, np.ndarray)):
         return None, tuple(sector)
     return None, (sector,)
@@ -362,9 +393,9 @@ def _sector_components_equal(left, right, *, atol=1.0e-12):
     if len(left) != len(right):
         return False
     for a, b in zip(left, right):
-        if isinstance(a, (float, complex, np.floating, np.complexfloating)) or isinstance(
-            b, (float, complex, np.floating, np.complexfloating)
-        ):
+        if isinstance(
+            a, (float, complex, np.floating, np.complexfloating)
+        ) or isinstance(b, (float, complex, np.floating, np.complexfloating)):
             if not np.isclose(a, b, atol=atol, rtol=0.0):
                 return False
         elif a != b:
@@ -382,9 +413,7 @@ def _site_sector_table(local_sectors, nsites, phys_dims):
 
     first = local_sectors[0]
     first_is_site_table = (
-        isinstance(first, list)
-        and first
-        and not hasattr(first, "components")
+        isinstance(first, list) and first and not hasattr(first, "components")
     ) or (
         isinstance(first, tuple)
         and first
@@ -415,9 +444,7 @@ def _local_sector_phys_dims(local_sectors, nsites):
 
     first = local_sectors[0]
     first_is_site_table = (
-        isinstance(first, list)
-        and first
-        and not hasattr(first, "components")
+        isinstance(first, list) and first and not hasattr(first, "components")
     ) or (
         isinstance(first, tuple)
         and first
@@ -457,8 +484,14 @@ def _normalized_sector_tables(local_sectors, nsites, phys_dims, target_sector):
         normalized = []
         for sector in table:
             labels, components = _sector_labels_and_components(sector)
-            if target_labels is not None and labels is not None and labels != target_labels:
-                raise ValueError("local_sectors and target_sector use different Abelian labels.")
+            if (
+                target_labels is not None
+                and labels is not None
+                and labels != target_labels
+            ):
+                raise ValueError(
+                    "local_sectors and target_sector use different Abelian labels."
+                )
             normalized.append(components)
         normalized_tables.append(normalized)
 
@@ -477,14 +510,18 @@ def _normalized_sector_tables(local_sectors, nsites, phys_dims, target_sector):
 
 def _can_finish_sector(prefix, suffixes, target, labels):
     for suffix in suffixes:
-        if _sector_components_equal(_add_sector_components(prefix, suffix, labels=labels), target):
+        if _sector_components_equal(
+            _add_sector_components(prefix, suffix, labels=labels), target
+        ):
             return True
     return False
 
 
 def _sector_projector_mpo(shape, local_sectors, target_sector):
     nsites = len(shape)
-    labels, target, tables = _normalized_sector_tables(local_sectors, nsites, shape, target_sector)
+    labels, target, tables = _normalized_sector_tables(
+        local_sectors, nsites, shape, target_sector
+    )
     zero = tuple(0 for _ in target)
 
     prefix_possible = [set() for _ in range(nsites + 1)]
@@ -492,14 +529,18 @@ def _sector_projector_mpo(shape, local_sectors, target_sector):
     for site, table in enumerate(tables):
         for prefix in prefix_possible[site]:
             for components in table:
-                prefix_possible[site + 1].add(_add_sector_components(prefix, components, labels=labels))
+                prefix_possible[site + 1].add(
+                    _add_sector_components(prefix, components, labels=labels)
+                )
 
     suffix_possible = [set() for _ in range(nsites + 1)]
     suffix_possible[nsites].add(zero)
     for site in range(nsites - 1, -1, -1):
         for components in tables[site]:
             for suffix in suffix_possible[site + 1]:
-                suffix_possible[site].add(_add_sector_components(components, suffix, labels=labels))
+                suffix_possible[site].add(
+                    _add_sector_components(components, suffix, labels=labels)
+                )
 
     bond_states = []
     for site in range(nsites + 1):
@@ -509,9 +550,13 @@ def _sector_projector_mpo(shape, local_sectors, target_sector):
             if _can_finish_sector(state, suffix_possible[site], target, labels)
         ]
         if site == 0:
-            states = [state for state in states if _sector_components_equal(state, zero)]
+            states = [
+                state for state in states if _sector_components_equal(state, zero)
+            ]
         if site == nsites:
-            states = [state for state in states if _sector_components_equal(state, target)]
+            states = [
+                state for state in states if _sector_components_equal(state, target)
+            ]
         states = sorted(states)
         if not states:
             raise ValueError("No product states exist in the requested target sector.")
@@ -522,15 +567,19 @@ def _sector_projector_mpo(shape, local_sectors, target_sector):
         left_states = bond_states[site]
         right_states = bond_states[site + 1]
         right_lookup = {state: idx for idx, state in enumerate(right_states)}
-        W = np.zeros((len(left_states), len(right_states), phys_dim, phys_dim), dtype=complex)
+        W = np.zeros(
+            (len(left_states), len(right_states), phys_dim, phys_dim), dtype=complex
+        )
         for left_idx, left_state in enumerate(left_states):
             for phys_index, components in enumerate(tables[site]):
-                right_state = _add_sector_components(left_state, components, labels=labels)
+                right_state = _add_sector_components(
+                    left_state, components, labels=labels
+                )
                 right_idx = right_lookup.get(right_state)
                 if right_idx is not None:
                     W[left_idx, right_idx, phys_index, phys_index] = 1.0
         factors.append(W)
-    return MPO(factors, homogenous=False), tuple(len(states) for states in bond_states)
+    return MPO(factors, homogeneous=False), tuple(len(states) for states in bond_states)
 
 
 def _full_tt_rank(shape):
@@ -552,8 +601,10 @@ def spatial_fermion_number_sz_sectors():
 def _update_left_env(left, A, W, *, dense_cpp=False):
     if dense_cpp:
         workspace_type = _cpp_dense_tdvp_workspace_type()
-        updater = None if _dense_tdvp_cpp is None else getattr(
-            _dense_tdvp_cpp, "dense_environment_update_left", None
+        updater = (
+            None
+            if _dense_tdvp_cpp is None
+            else getattr(_dense_tdvp_cpp, "dense_environment_update_left", None)
         )
         if workspace_type is not None and updater is not None:
             try:
@@ -574,8 +625,10 @@ def _update_left_env(left, A, W, *, dense_cpp=False):
 def _update_right_env(right, A, W, *, dense_cpp=False):
     if dense_cpp:
         workspace_type = _cpp_dense_tdvp_workspace_type()
-        updater = None if _dense_tdvp_cpp is None else getattr(
-            _dense_tdvp_cpp, "dense_environment_update_right", None
+        updater = (
+            None
+            if _dense_tdvp_cpp is None
+            else getattr(_dense_tdvp_cpp, "dense_environment_update_right", None)
         )
         if workspace_type is not None and updater is not None:
             try:
@@ -756,11 +809,12 @@ def _affine_first_site_template(meta, site_qn_map):
 
     if not next_nodes:
         return None
-    r_map = {qn: sorted([node for node in next_nodes if node[1] == qn]) for qn in set(qn for _, qn in next_nodes)}
+    r_map = {
+        qn: sorted([node for node in next_nodes if node[1] == qn])
+        for qn in set(qn for _, qn in next_nodes)
+    }
     col_lookup = {
-        node: idx
-        for nodes in r_map.values()
-        for idx, node in enumerate(nodes)
+        node: idx for nodes in r_map.values() for idx, node in enumerate(nodes)
     }
     out_lookup = {
         qn: {state: idx for idx, state in enumerate(states)}
@@ -781,8 +835,7 @@ def _affine_first_site_template(meta, site_qn_map):
     ordered_keys = sorted(block_keys)
     for entries in entries_by_component:
         data = OrderedDict(
-            (key, np.zeros(block_shapes[key], dtype=dtype))
-            for key in ordered_keys
+            (key, np.zeros(block_shapes[key], dtype=dtype)) for key in ordered_keys
         )
         for right_idx, out_s, in_s, key, value in entries:
             _q_l, q_r, q_o, q_i = key
@@ -814,7 +867,10 @@ def _affine_first_site_from_template(template, coeffs):
         return None
     data = OrderedDict()
     for key in component_data[0]:
-        block = np.zeros_like(component_data[0][key], dtype=np.result_type(*all_coeffs, component_data[0][key]))
+        block = np.zeros_like(
+            component_data[0][key],
+            dtype=np.result_type(*all_coeffs, component_data[0][key]),
+        )
         for coeff, basis_data in zip(all_coeffs, component_data):
             if coeff != 0:
                 block = block + coeff * basis_data[key]
@@ -830,7 +886,10 @@ def _as_affine_block_sparse_mpo(H, site_qn_maps):
     if shared is None:
         return None
 
-    key = (meta.get("cache_id", int(meta["template_id"])), _site_qn_maps_signature(site_qn_maps))
+    key = (
+        meta.get("cache_id", int(meta["template_id"])),
+        _site_qn_maps_signature(site_qn_maps),
+    )
     first = _affine_first_factor(meta)
     cached = _AFFINE_BLOCK_SPARSE_MPO_CACHE.get(key)
     if cached is None:
@@ -851,7 +910,11 @@ def _as_affine_block_sparse_mpo(H, site_qn_maps):
         return converted
 
     template = cached.get("site0_template")
-    site0 = _affine_first_site_from_template(template, meta["coeffs"]) if template is not None else None
+    site0 = (
+        _affine_first_site_from_template(template, meta["coeffs"])
+        if template is not None
+        else None
+    )
     if site0 is None:
         site0 = dense_to_symmetric_mpo(
             [first],
@@ -866,7 +929,9 @@ def _as_affine_block_sparse_mpo(H, site_qn_maps):
             native_site_storage=True,
         )
         cached["shared_tail"] = converted[1:]
-        cached["site1_left_qns"] = tuple(converted[1].qns[0]) if len(converted) > 1 else ()
+        cached["site1_left_qns"] = (
+            tuple(converted[1].qns[0]) if len(converted) > 1 else ()
+        )
         cached["site0_template"] = _affine_first_site_template(meta, site_qn_maps[0])
         return converted
     _AFFINE_BLOCK_SPARSE_MPO_CACHE.move_to_end(key)
@@ -919,9 +984,7 @@ def _block_mps_norm2(factors):
 def _right_canonical_block_mps_norm2(factors):
     if not factors:
         return 1.0
-    return float(
-        sum(np.vdot(block, block).real for block in factors[0].data.values())
-    )
+    return float(sum(np.vdot(block, block).real for block in factors[0].data.values()))
 
 
 def _normalize_block_factors_inplace(factors, norm2=None):
@@ -1038,10 +1101,7 @@ def _block_environment_advance_signature(direction, W, A, env, B):
             tuple(tuple(key) for key in data.keys()),
         )
 
-    signatures = tuple(
-        route_signature(tensor)
-        for tensor in (W, A, env, B)
-    )
+    signatures = tuple(route_signature(tensor) for tensor in (W, A, env, B))
     if any(signature is None for signature in signatures):
         return None
     return repr((str(direction), signatures))
@@ -1059,7 +1119,9 @@ def _advance_block_environment(
 ):
     direction = str(direction).lower()
     if direction not in {"left", "right"}:
-        raise ValueError("Block environment advance direction must be 'left' or 'right'.")
+        raise ValueError(
+            "Block environment advance direction must be 'left' or 'right'."
+        )
 
     if moving_environment is not None:
         if plan_key is None:
@@ -1118,13 +1180,16 @@ def _cpp_one_site_tdvp_sweep(
 ):
     if not bool(_BLOCK_ONE_SITE_CPP_ENGINE):
         return None
-    if moving_environment is None or not hasattr(moving_environment, "one_site_tdvp_sweep"):
+    if moving_environment is None or not hasattr(
+        moving_environment, "one_site_tdvp_sweep"
+    ):
         return None
 
     krylov_key = str(krylov_method).lower().replace("_", "-")
     if krylov_key in {"lanczos", "hermitian", "hermitian-lanczos"}:
         callbacks = {}
     else:
+
         def evolve_site(theta, left, W, right, local_dt):
             return _evolve_block_site(
                 theta,
@@ -1193,9 +1258,8 @@ def _cpp_two_site_tdvp_sweep(
 ):
     if not bool(_BLOCK_TWO_SITE_CPP_ENGINE):
         return None
-    if (
-        moving_environment is None
-        or not hasattr(moving_environment, "two_site_tdvp_sweep")
+    if moving_environment is None or not hasattr(
+        moving_environment, "two_site_tdvp_sweep"
     ):
         return None
     krylov_key = str(krylov_method).lower().replace("_", "-")
@@ -1366,8 +1430,7 @@ def _cpp_payload_to_abelian_tensor(payload, carrier=AbelianSiteTensorData):
         out._layout_signature = None
         return out
     data = {
-        tuple(key): np.asarray(block)
-        for key, block in zip(tuple(keys), tuple(blocks))
+        tuple(key): np.asarray(block) for key, block in zip(tuple(keys), tuple(blocks))
     }
     return carrier(data, qns, dirs, copy=False)
 
@@ -1499,7 +1562,9 @@ def _apply_block_site_heff(theta, left, W, right):
             plan = _cached_block_heff_plan("site", theta, left, W, right)
             if plan is not None:
                 try:
-                    return _cpp_payload_to_abelian_tensor(plan.apply(theta, left, W, right))
+                    return _cpp_payload_to_abelian_tensor(
+                        plan.apply(theta, left, W, right)
+                    )
                 except Exception:
                     pass
         kernel = _cpp_table_kernel("abelian_tdvp_site_heff_data")
@@ -1517,7 +1582,9 @@ def _apply_block_bond_heff(center, left, right):
             plan = _cached_block_heff_plan("bond", center, left, right)
             if plan is not None:
                 try:
-                    return _cpp_payload_to_abelian_tensor(plan.apply(center, left, right))
+                    return _cpp_payload_to_abelian_tensor(
+                        plan.apply(center, left, right)
+                    )
                 except Exception:
                     pass
         kernel = _cpp_table_kernel("abelian_tdvp_bond_heff_data")
@@ -1567,7 +1634,9 @@ def _make_planned_block_site_heff(theta, left, W, right):
                     python_out = _apply_block_site_heff_python(local, left, W, right)
                     python_seconds = time.perf_counter() - start
                     start = time.perf_counter()
-                    cpp_out = _cpp_payload_to_abelian_tensor(plan.apply(local, left, W, right))
+                    cpp_out = _cpp_payload_to_abelian_tensor(
+                        plan.apply(local, left, W, right)
+                    )
                     cpp_seconds = time.perf_counter() - start
                     if _block_tensor_max_abs_diff(python_out, cpp_out) <= 1.0e-9:
                         decision = "cpp" if cpp_seconds < python_seconds else "python"
@@ -1580,7 +1649,9 @@ def _make_planned_block_site_heff(theta, left, W, right):
                     return _apply_block_site_heff_python(local, left, W, right)
             if decision == "cpp":
                 try:
-                    return _cpp_payload_to_abelian_tensor(plan.apply(local, left, W, right))
+                    return _cpp_payload_to_abelian_tensor(
+                        plan.apply(local, left, W, right)
+                    )
                 except Exception:
                     _cache_block_heff_backend_decision(backend_key, "python")
             return _apply_block_site_heff_python(local, left, W, right)
@@ -1599,7 +1670,9 @@ def _make_planned_block_site_heff(theta, left, W, right):
                 local_plan_cache[local_signature] = local_plan
             if local_plan is not None:
                 try:
-                    return _cpp_payload_to_abelian_tensor(local_plan.apply(local, left, W, right))
+                    return _cpp_payload_to_abelian_tensor(
+                        local_plan.apply(local, left, W, right)
+                    )
                 except Exception:
                     pass
             kernel = _cpp_table_kernel("abelian_tdvp_site_heff_data")
@@ -1614,10 +1687,9 @@ def _make_planned_block_site_heff(theta, left, W, right):
 
 
 def _make_planned_block_bond_heff(center, left, right):
-    if (
-        not _should_try_block_heff_cpp(center, left, right)
-        or not _should_try_block_heff_plan(center, left, right)
-    ):
+    if not _should_try_block_heff_cpp(
+        center, left, right
+    ) or not _should_try_block_heff_plan(center, left, right):
         return lambda local: _apply_block_bond_heff(local, left, right)
     expected_signature = _abelian_block_layout_signature(center)
     fixed_signatures = (
@@ -1658,8 +1730,7 @@ def _block_linear_combination(coeffs, basis):
                 break
             if out is None:
                 out = OrderedDict(
-                    (key, np.asarray(block) * coeff)
-                    for key, block in vec.data.items()
+                    (key, np.asarray(block) * coeff) for key, block in vec.data.items()
                 )
                 continue
             for key, block in vec.data.items():
@@ -1732,13 +1803,7 @@ def _block_krylov_expm_apply(
                     np.exp(-1j * dt * evals) * (evecs.T.conj() @ e1)
                 )
             if previous_coeffs is not None:
-                delta2 = np.sum(
-                    np.abs(
-                        current_coeffs[:-1]
-                        - previous_coeffs
-                    )
-                    ** 2
-                )
+                delta2 = np.sum(np.abs(current_coeffs[:-1] - previous_coeffs) ** 2)
                 delta2 += abs(current_coeffs[-1]) ** 2
                 if np.sqrt(delta2) <= tol * max(1.0, norm):
                     coeffs = current_coeffs
@@ -1917,12 +1982,17 @@ def _block_left_qr(theta):
             rows.append((key, left_dim, phys_dim))
         if cols is None:
             continue
-        mat = np.zeros((sum(left_dim * phys_dim for _, left_dim, phys_dim in rows), cols), dtype=dtype)
+        mat = np.zeros(
+            (sum(left_dim * phys_dim for _, left_dim, phys_dim in rows), cols),
+            dtype=dtype,
+        )
         offset = 0
         for key, left_dim, phys_dim in rows:
             block = theta.data[key]
             size = left_dim * phys_dim
-            mat[offset : offset + size] = np.asarray(block).transpose(0, 2, 1).reshape(size, cols)
+            mat[offset : offset + size] = (
+                np.asarray(block).transpose(0, 2, 1).reshape(size, cols)
+            )
             offset += size
         qr = _cpp_lapack_qr(mat)
         if qr is None:
@@ -1937,7 +2007,11 @@ def _block_left_qr(theta):
         offset = 0
         for key, left_dim, phys_dim in rows:
             size = left_dim * phys_dim
-            q_block = q_mat[offset : offset + size].reshape(left_dim, phys_dim, chi).transpose(0, 2, 1)
+            q_block = (
+                q_mat[offset : offset + size]
+                .reshape(left_dim, phys_dim, chi)
+                .transpose(0, 2, 1)
+            )
             data_q[(key[0], q_right, key[2])] = q_block
             offset += size
 
@@ -1980,12 +2054,17 @@ def _block_right_rq(theta):
             cols.append((key, right_dim, phys_dim))
         if left_dim is None:
             continue
-        mat = np.zeros((left_dim, sum(right_dim * phys_dim for _, right_dim, phys_dim in cols)), dtype=dtype)
+        mat = np.zeros(
+            (left_dim, sum(right_dim * phys_dim for _, right_dim, phys_dim in cols)),
+            dtype=dtype,
+        )
         offset = 0
         for key, right_dim, phys_dim in cols:
             block = theta.data[key]
             size = right_dim * phys_dim
-            mat[:, offset : offset + size] = np.asarray(block).transpose(0, 2, 1).reshape(left_dim, size)
+            mat[:, offset : offset + size] = (
+                np.asarray(block).transpose(0, 2, 1).reshape(left_dim, size)
+            )
             offset += size
         qr = _cpp_lapack_qr(mat.T)
         if qr is None:
@@ -2002,7 +2081,11 @@ def _block_right_rq(theta):
         offset = 0
         for key, right_dim, phys_dim in cols:
             size = right_dim * phys_dim
-            q_block = q_mat[:, offset : offset + size].reshape(chi, phys_dim, right_dim).transpose(0, 2, 1)
+            q_block = (
+                q_mat[:, offset : offset + size]
+                .reshape(chi, phys_dim, right_dim)
+                .transpose(0, 2, 1)
+            )
             data_q[(q_left, key[1], key[2])] = q_block
             offset += size
 
@@ -2171,20 +2254,24 @@ def _build_sparse_two_site_kernel(left, W_left, W_right, right, *, cutoff=1.0e-1
         left_by_q = []
         for terms in raw_left_by_q:
             if terms:
-                left_by_q.append((
-                    np.asarray([p for p, _ in terms], dtype=int),
-                    np.stack([block for _, block in terms], axis=0),
-                ))
+                left_by_q.append(
+                    (
+                        np.asarray([p for p, _ in terms], dtype=int),
+                        np.stack([block for _, block in terms], axis=0),
+                    )
+                )
             else:
                 left_by_q.append(None)
 
         right_by_s = []
         for terms in raw_right_by_s:
             if terms:
-                right_by_s.append((
-                    np.asarray([r for r, _ in terms], dtype=int),
-                    np.stack([block for _, block in terms], axis=0),
-                ))
+                right_by_s.append(
+                    (
+                        np.asarray([r for r, _ in terms], dtype=int),
+                        np.stack([block for _, block in terms], axis=0),
+                    )
+                )
             else:
                 right_by_s.append(None)
 
@@ -2225,8 +2312,12 @@ def _apply_sparse_two_site_kernel(theta, kernels, shape):
                     continue
                 r_indices, right_stack = right_terms
                 local_block = theta[:, q, s, :]
-                projected = np.einsum("xab,bd->xad", left_stack, local_block, optimize=True)
-                contribution = np.einsum("xad,ycd->xayc", projected, right_stack, optimize=True)
+                projected = np.einsum(
+                    "xab,bd->xad", left_stack, local_block, optimize=True
+                )
+                contribution = np.einsum(
+                    "xad,ycd->xayc", projected, right_stack, optimize=True
+                )
                 for ix, p in enumerate(p_indices):
                     for iy, r in enumerate(r_indices):
                         out[:, p, r, :] += contribution[ix, :, iy, :]
@@ -2245,9 +2336,15 @@ def _apply_sparse_two_site_kernel_vectorized(theta, kernels, shape):
                     continue
                 r_indices, right_stack = right_terms
                 local_block = theta[:, q, s, :]
-                projected = np.einsum("xab,bd->xad", left_stack, local_block, optimize=True)
-                contribution = np.einsum("xad,ycd->xayc", projected, right_stack, optimize=True)
-                out[:, p_indices[:, None], r_indices[None, :], :] += contribution.transpose(1, 0, 2, 3)
+                projected = np.einsum(
+                    "xab,bd->xad", left_stack, local_block, optimize=True
+                )
+                contribution = np.einsum(
+                    "xad,ycd->xayc", projected, right_stack, optimize=True
+                )
+                out[:, p_indices[:, None], r_indices[None, :], :] += (
+                    contribution.transpose(1, 0, 2, 3)
+                )
     return out
 
 
@@ -2328,7 +2425,10 @@ def _evolve_two_site(
         ]
 
         def apply_heff(local):
-            out = np.zeros(shape, dtype=np.result_type(local, left, W_left, W_right, right, complex))
+            out = np.zeros(
+                shape,
+                dtype=np.result_type(local, left, W_left, W_right, right, complex),
+            )
             for p, left_kernel in enumerate(left_kernels):
                 for r, right_kernel in enumerate(right_kernels):
                     out[:, p, r, :] = np.einsum(
@@ -2340,7 +2440,9 @@ def _evolve_two_site(
                     )
             return out
     else:
-        estimated_sparse_pairs, dense_pairs = _estimate_sparse_two_site_pairs(W_left, W_right)
+        estimated_sparse_pairs, dense_pairs = _estimate_sparse_two_site_pairs(
+            W_left, W_right
+        )
         sparse_kernel = None
         threshold = float(sparse_threshold)
         if threshold > 0.0 and estimated_sparse_pairs <= threshold * dense_pairs:
@@ -2355,9 +2457,12 @@ def _evolve_two_site(
             use_sparse = False
 
         if use_sparse:
+
             def apply_heff(local):
                 if sparse_vectorized:
-                    return _apply_sparse_two_site_kernel_vectorized(local, sparse_kernel, shape)
+                    return _apply_sparse_two_site_kernel_vectorized(
+                        local, sparse_kernel, shape
+                    )
                 return _apply_sparse_two_site_kernel(local, sparse_kernel, shape)
         else:
             left_kernel = np.einsum("amb,mnpq->abnpq", left, W_left, optimize=True)
@@ -2419,22 +2524,6 @@ def _evolve_bond(
         tol=krylov_tol,
         method=krylov_method,
     )
-
-
-def _left_qr(theta):
-    left_dim, phys_dim, right_dim = theta.shape
-    q, r = np.linalg.qr(theta.reshape(left_dim * phys_dim, right_dim), mode="reduced")
-    chi = q.shape[1]
-    return q.reshape(left_dim, phys_dim, chi), r
-
-
-def _right_rq(theta):
-    left_dim, phys_dim, right_dim = theta.shape
-    q_t, r_t = np.linalg.qr(theta.reshape(left_dim, phys_dim * right_dim).T, mode="reduced")
-    chi = q_t.shape[1]
-    center = r_t.T
-    q = q_t.T.reshape(chi, phys_dim, right_dim)
-    return center, q
 
 
 def _merge_two_site(left_site, right_site):
@@ -2534,8 +2623,8 @@ def one_site_tdvp_step(
             krylov_method=krylov_method,
             diagonal_fast_path=diagonal_fast_path,
         )
-        out = MPS(factors, labels=["lv", "p", "rv"])
-        norm2 = out.norm()
+        out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
+        norm2 = out.norm_squared()
         if normalize:
             out.normalize()
         info = {
@@ -2582,7 +2671,7 @@ def one_site_tdvp_step(
         left_envs[-1],
         mpo[-1],
         right_identity,
-        half_dt,
+        dt,
         krylov_dim=krylov_dim,
         krylov_tol=krylov_tol,
         krylov_method=krylov_method,
@@ -2591,17 +2680,18 @@ def one_site_tdvp_step(
 
     right = right_identity
     for i in range(nsites - 1, 0, -1):
-        factors[i] = _evolve_site(
-            factors[i],
-            left_envs[i],
-            mpo[i],
-            right,
-            half_dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-            diagonal_fast_path=diagonal_fast_path,
-        )
+        if i != nsites - 1:
+            factors[i] = _evolve_site(
+                factors[i],
+                left_envs[i],
+                mpo[i],
+                right,
+                half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                diagonal_fast_path=diagonal_fast_path,
+            )
         center, q = _right_rq(factors[i])
         factors[i] = q
         right = _update_right_env(right, q, mpo[i])
@@ -2628,8 +2718,8 @@ def one_site_tdvp_step(
         diagonal_fast_path=diagonal_fast_path,
     )
 
-    out = MPS(factors, labels=["lv", "p", "rv"])
-    norm2 = out.norm()
+    out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
+    norm2 = out.norm_squared()
     if normalize:
         out.normalize()
     info = {
@@ -2725,7 +2815,7 @@ def block_sparse_one_site_tdvp_step(
     pre_norm2 = _right_canonical_block_mps_norm2(factors)
     if normalize:
         factors, pre_norm2 = _normalize_block_factors_inplace(factors, pre_norm2)
-    out = MPS(factors, labels=["lv", "rv", "p"])
+    out = MPS(factors, labels=["lv", "rv", "p"], sites=psi.sites)
     info = {
         "backend": "block-sparse",
         "projection_backend": "block-sparse",
@@ -2846,7 +2936,7 @@ def block_sparse_two_site_tdvp_step(
                 factors,
                 pre_norm2,
             )
-        out = MPS(factors, labels=["lv", "rv", "p"])
+        out = MPS(factors, labels=["lv", "rv", "p"], sites=psi.sites)
         info = {
             "backend": "block-sparse",
             "projection_backend": "block-sparse",
@@ -2854,9 +2944,7 @@ def block_sparse_two_site_tdvp_step(
             "target_sector": target_sector,
             "target_qn": target_qn,
             "pre_normalization_norm2": float(pre_norm2),
-            "pre_normalization_norm": float(
-                np.sqrt(max(float(pre_norm2), 0.0))
-            ),
+            "pre_normalization_norm": float(np.sqrt(max(float(pre_norm2), 0.0))),
             "truncation_error": float(sweep_info["truncation_error"]),
             "max_kept_states": int(sweep_info["max_kept_states"]),
             "input_sector_weight": 1.0,
@@ -2996,7 +3084,7 @@ def block_sparse_two_site_tdvp_step(
     pre_norm2 = _right_canonical_block_mps_norm2(factors)
     if normalize:
         factors, pre_norm2 = _normalize_block_factors_inplace(factors, pre_norm2)
-    out = MPS(factors, labels=["lv", "rv", "p"])
+    out = MPS(factors, labels=["lv", "rv", "p"], sites=psi.sites)
     info = {
         "backend": "block-sparse",
         "projection_backend": "block-sparse",
@@ -3167,8 +3255,8 @@ def two_site_tdvp_step(
             )
         factors[i] = left_center
 
-    out = MPS(factors, labels=["lv", "p", "rv"])
-    norm2 = out.norm()
+    out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
+    norm2 = out.norm_squared()
     if normalize:
         out.normalize()
     info = {
@@ -3179,8 +3267,719 @@ def two_site_tdvp_step(
     return (out, info) if return_info else out
 
 
+def _evolve_site_sum(
+    theta,
+    environments,
+    dt,
+    *,
+    krylov_dim,
+    krylov_tol,
+    krylov_method,
+    executor=None,
+):
+    shape = theta.shape
+    environments = tuple(environments)
+    native = (
+        _tdvp_cpp
+        if _cpp_tdvp_available()
+        and _is_lanczos_method(krylov_method)
+        and getattr(_tdvp_cpp, "site_lanczos_sum", None) is not None
+        else None
+    )
+    if native is not None:
+        try:
+            result = native.site_lanczos_sum(
+                np.asarray(theta, dtype=complex),
+                [np.asarray(item[0], dtype=complex) for item in environments],
+                [np.asarray(item[1], dtype=complex) for item in environments],
+                [np.asarray(item[2], dtype=complex) for item in environments],
+                float(dt),
+                int(krylov_dim),
+                float(krylov_tol),
+                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+                int(getattr(executor, "_max_workers", 1)),
+            )
+            _release_free_numeric_pages()
+            if os.environ.get("PYQED_TDVP_MEMORY_PROFILE"):
+                try:
+                    import platform
+                    import psutil
+                    import resource
+
+                    stats = dict(native.kernel_stats())
+                    rss = psutil.Process().memory_info().rss / 2**30
+                    peak_scale = 1.0 if platform.system() == "Darwin" else 1024.0
+                    peak = (
+                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                        * peak_scale / 2**30
+                    )
+                    print(
+                        "[sum-TDVP memory] site "
+                        f"shape={shape} rss={rss:.4f} GiB peak={peak:.4f} GiB "
+                        f"stats={stats}",
+                        flush=True,
+                    )
+                except Exception:
+                    pass
+            return result
+        except Exception as exc:
+            if os.environ.get("PYQED_TDVP_MEMORY_PROFILE"):
+                print(
+                    f"[sum-TDVP native fallback] shape={shape}: {exc}",
+                    flush=True,
+                )
+
+    def build_kernel(environment):
+        left, operator, right = environment
+        return (
+            np.einsum("amb,mnpq->abnpq", left, operator, optimize=True),
+            right,
+        )
+
+    kernels = list(map(build_kernel, environments)) if executor is None else list(
+        executor.map(build_kernel, environments)
+    )
+
+    def apply_kernel(kernel, local):
+        left_kernel, right = kernel
+        tmp = np.tensordot(local, right, axes=([2], [2]))
+        return np.tensordot(
+            left_kernel,
+            tmp,
+            axes=([1, 2, 4], [0, 3, 1]),
+        )
+
+    def apply_heff(local):
+        if executor is None:
+            values = iter(apply_kernel(kernel, local) for kernel in kernels)
+        else:
+            values = iter(
+                executor.map(
+                    apply_kernel,
+                    kernels,
+                    (local,) * len(kernels),
+                )
+            )
+        result = next(values)
+        for value in values:
+            result += value
+        return result
+
+    return _krylov_expm_apply(
+        theta,
+        shape,
+        apply_heff,
+        dt,
+        krylov_dim=krylov_dim,
+        tol=krylov_tol,
+        method=krylov_method,
+    )
+
+
+def _evolve_two_site_sum(
+    theta,
+    environments,
+    dt,
+    *,
+    krylov_dim,
+    krylov_tol,
+    krylov_method,
+    executor=None,
+):
+    shape = theta.shape
+    environments = tuple(environments)
+    native = (
+        _tdvp_cpp
+        if _cpp_tdvp_available()
+        and _is_lanczos_method(krylov_method)
+        and getattr(_tdvp_cpp, "two_site_lanczos_sum", None) is not None
+        else None
+    )
+    if native is not None:
+        try:
+            return native.two_site_lanczos_sum(
+                np.asarray(theta, dtype=complex),
+                [np.asarray(item[0], dtype=complex) for item in environments],
+                [np.asarray(item[1], dtype=complex) for item in environments],
+                [np.asarray(item[2], dtype=complex) for item in environments],
+                [np.asarray(item[3], dtype=complex) for item in environments],
+                float(dt),
+                int(krylov_dim),
+                float(krylov_tol),
+                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+                int(getattr(executor, "_max_workers", 1)),
+            )
+        except Exception:
+            pass
+
+    def build_kernel(environment):
+        left, first, second, right = environment
+        return (
+            np.einsum("amb,mnpq->abnpq", left, first, optimize=True),
+            np.einsum("nors,cod->nrscd", second, right, optimize=True),
+        )
+
+    kernels = list(map(build_kernel, environments)) if executor is None else list(
+        executor.map(build_kernel, environments)
+    )
+
+    def apply_kernel(kernel, local):
+        left_kernel, right_kernel = kernel
+        tmp = np.tensordot(
+            left_kernel,
+            local,
+            axes=([1, 4], [0, 1]),
+        )
+        return np.tensordot(
+            tmp,
+            right_kernel,
+            axes=([1, 3, 4], [0, 2, 4]),
+        )
+
+    def apply_heff(local):
+        if executor is None:
+            values = iter(apply_kernel(kernel, local) for kernel in kernels)
+        else:
+            values = iter(
+                executor.map(
+                    apply_kernel,
+                    kernels,
+                    (local,) * len(kernels),
+                )
+            )
+        result = next(values)
+        for value in values:
+            result += value
+        return result
+
+    return _krylov_expm_apply(
+        theta,
+        shape,
+        apply_heff,
+        dt,
+        krylov_dim=krylov_dim,
+        tol=krylov_tol,
+        method=krylov_method,
+    )
+
+
+def _evolve_bond_sum(
+    center,
+    environments,
+    dt,
+    *,
+    krylov_dim,
+    krylov_tol,
+    krylov_method,
+):
+    environments = tuple(environments)
+    native = (
+        _tdvp_cpp
+        if _cpp_tdvp_available()
+        and _is_lanczos_method(krylov_method)
+        and getattr(_tdvp_cpp, "bond_lanczos_sum", None) is not None
+        else None
+    )
+    if native is not None:
+        try:
+            return native.bond_lanczos_sum(
+                np.asarray(center, dtype=complex),
+                [np.asarray(item[0], dtype=complex) for item in environments],
+                [np.asarray(item[1], dtype=complex) for item in environments],
+                float(-dt),
+                int(krylov_dim),
+                float(krylov_tol),
+                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+            )
+        except Exception:
+            pass
+
+    def apply_heff(local):
+        result = np.zeros_like(local, dtype=complex)
+        for left, right in environments:
+            result += _apply_bond_heff(local, left, right)
+        return result
+
+    return _krylov_expm_apply(
+        center,
+        center.shape,
+        apply_heff,
+        -dt,
+        krylov_dim=krylov_dim,
+        tol=krylov_tol,
+        method=krylov_method,
+    )
+
+
+def one_site_tdvp_sum_step(
+    psi,
+    operators,
+    dt,
+    *,
+    max_bond=None,
+    cutoff=0.0,
+    krylov_dim=12,
+    krylov_tol=1.0e-13,
+    krylov_method="lanczos",
+    canonicalize=True,
+    normalize=True,
+    imaginary_time=False,
+    return_info=False,
+    _executor=None,
+    _right_environments=None,
+    _cache_right_environments=False,
+):
+    r"""Propagate at fixed MPS ranks with a sum of compact MPO components.
+
+    Set ``imaginary_time=True`` to apply the normalized projector
+    :math:`\exp(-H\,dt)` instead of real-time evolution.
+    """
+    if not isinstance(psi, MPS):
+        raise TypeError("one_site_tdvp_sum_step expects an MPS initial state")
+    operators = tuple(operators)
+    if not operators or not all(isinstance(operator, MPO) for operator in operators):
+        raise TypeError("operators must be a non-empty sequence of MPOs")
+    mpos = [
+        [np.asarray(factor) for factor in operator.factors] for operator in operators
+    ]
+    if any(len(mpo) != psi.L for mpo in mpos):
+        raise ValueError("MPS and all MPO lengths must match")
+
+    work = psi.copy().to_order(["lv", "p", "rv"])
+    if canonicalize:
+        work = work.right_canonicalize()
+    factors = _standard_mps_factors(work)
+    nsites = len(factors)
+    if nsites == 0:
+        raise ValueError("sum TDVP requires at least one site")
+    for mpo in mpos:
+        for site, (state_factor, operator_factor) in enumerate(zip(factors, mpo)):
+            if (
+                state_factor.shape[1] != operator_factor.shape[2]
+                or state_factor.shape[1] != operator_factor.shape[3]
+            ):
+                raise ValueError(f"physical dimension mismatch at site {site}")
+
+    native_sweep = (
+        _tdvp_cpp
+        if _cpp_tdvp_available()
+        and _is_lanczos_method(krylov_method)
+        and getattr(_tdvp_cpp, "one_site_lanczos_sum_sweep", None) is not None
+        and _env_int("PYQED_SUM_TDVP_CPP_SWEEP", 1) != 0
+        else None
+    )
+    if native_sweep is not None:
+        try:
+            result = native_sweep.one_site_lanczos_sum_sweep(
+                [np.asarray(factor, dtype=complex) for factor in factors],
+                [
+                    [np.asarray(factor, dtype=complex) for factor in mpo]
+                    for mpo in mpos
+                ],
+                [] if _right_environments is None else _right_environments,
+                float(dt),
+                int(krylov_dim),
+                float(krylov_tol),
+                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+                int(getattr(_executor, "_max_workers", 1)),
+                bool(normalize),
+                bool(imaginary_time),
+            )
+            factors = [np.asarray(factor) for factor in result["factors"]]
+            norm2 = float(result["pre_normalization_norm2"])
+            out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
+            out.gauge = "right_canonical"
+            out.center = 0
+            info = {
+                "pre_normalization_norm2": norm2,
+                "pre_normalization_norm": float(np.sqrt(max(norm2, 0.0))),
+                "truncation_error": 0.0,
+                "components": len(mpos),
+                "integrator": "tdvp",
+                "backend": "compiled-sum-tdvp-sweep",
+                "imaginary_time": bool(imaginary_time),
+                "right_environments_reused": bool(
+                    result["reused_right_environments"]
+                ),
+            }
+            if _cache_right_environments:
+                info["_right_environments"] = result["right_environments"]
+            _release_free_numeric_pages()
+            return (out, info) if return_info else out
+        except Exception as exc:
+            if os.environ.get("PYQED_TDVP_MEMORY_PROFILE"):
+                print(f"[sum-TDVP compiled sweep fallback] {exc}", flush=True)
+
+    if imaginary_time:
+        dt = -1j * float(dt)
+
+    identity = np.ones((1, 1, 1), dtype=complex)
+    if nsites == 1:
+        factors[0] = _evolve_site_sum(
+            factors[0],
+            [(identity, mpo[0], identity) for mpo in mpos],
+            dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            executor=_executor,
+        )
+    else:
+        half_dt = 0.5 * dt
+
+        def build_right_environments(mpo):
+            return _build_right_envs(factors, mpo)
+
+        right_envs = (
+            list(map(build_right_environments, mpos))
+            if _executor is None
+            else list(_executor.map(build_right_environments, mpos))
+        )
+        left_envs = [[None] * nsites for _ in mpos]
+        for storage in left_envs:
+            storage[0] = identity
+
+        for site in range(nsites - 1):
+            factors[site] = _evolve_site_sum(
+                factors[site],
+                [
+                    (
+                        left_envs[term][site],
+                        mpo[site],
+                        right_envs[term][site + 1],
+                    )
+                    for term, mpo in enumerate(mpos)
+                ],
+                half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                executor=_executor,
+            )
+            factors[site], center = _left_qr(factors[site])
+
+            def update_left_environment(item):
+                term, mpo = item
+                return term, _update_left_env(
+                    left_envs[term][site], factors[site], mpo[site]
+                )
+
+            updates = (
+                map(update_left_environment, enumerate(mpos))
+                if _executor is None
+                else _executor.map(update_left_environment, enumerate(mpos))
+            )
+            for term, environment in updates:
+                left_envs[term][site + 1] = environment
+            center = _evolve_bond_sum(
+                center,
+                [
+                    (
+                        left_envs[term][site + 1],
+                        right_envs[term][site + 1],
+                    )
+                    for term in range(len(mpos))
+                ],
+                half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+            )
+            factors[site + 1] = np.tensordot(
+                center, factors[site + 1], axes=([1], [0])
+            )
+
+        factors[-1] = _evolve_site_sum(
+            factors[-1],
+            [
+                (left_envs[term][-1], mpo[-1], identity)
+                for term, mpo in enumerate(mpos)
+            ],
+            dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            executor=_executor,
+        )
+
+        rights = [identity for _ in mpos]
+        for site in range(nsites - 1, 0, -1):
+            if site != nsites - 1:
+                factors[site] = _evolve_site_sum(
+                    factors[site],
+                    [
+                        (left_envs[term][site], mpo[site], rights[term])
+                        for term, mpo in enumerate(mpos)
+                    ],
+                    half_dt,
+                    krylov_dim=krylov_dim,
+                    krylov_tol=krylov_tol,
+                    krylov_method=krylov_method,
+                    executor=_executor,
+                )
+            center, factors[site] = _right_rq(factors[site])
+
+            def update_right_environment(item):
+                term, mpo = item
+                return term, _update_right_env(
+                    rights[term], factors[site], mpo[site]
+                )
+
+            updates = (
+                map(update_right_environment, enumerate(mpos))
+                if _executor is None
+                else _executor.map(update_right_environment, enumerate(mpos))
+            )
+            for term, environment in updates:
+                rights[term] = environment
+            center = _evolve_bond_sum(
+                center,
+                [
+                    (left_envs[term][site], rights[term])
+                    for term in range(len(mpos))
+                ],
+                half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+            )
+            factors[site - 1] = np.tensordot(
+                factors[site - 1], center, axes=([2], [0])
+            )
+
+        factors[0] = _evolve_site_sum(
+            factors[0],
+            [(identity, mpo[0], rights[term]) for term, mpo in enumerate(mpos)],
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            executor=_executor,
+        )
+
+    out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
+    out.gauge = "right_canonical"
+    out.center = 0
+    norm2 = float(np.real(out.norm_squared()))
+    if normalize:
+        out.normalize()
+    info = {
+        "pre_normalization_norm2": norm2,
+        "pre_normalization_norm": float(np.sqrt(max(norm2, 0.0))),
+        "truncation_error": 0.0,
+        "components": len(mpos),
+        "integrator": "tdvp",
+        "imaginary_time": bool(imaginary_time),
+    }
+    return (out, info) if return_info else out
+
+
+def two_site_tdvp_sum_step(
+    psi,
+    operators,
+    dt,
+    *,
+    max_bond=None,
+    cutoff=0.0,
+    krylov_dim=12,
+    krylov_tol=1.0e-13,
+    krylov_method="lanczos",
+    canonicalize=True,
+    normalize=True,
+    return_info=False,
+    _executor=None,
+):
+    """Propagate with a sum of MPOs without forming their direct-sum bonds."""
+    if not isinstance(psi, MPS):
+        raise TypeError("two_site_tdvp_sum_step expects an MPS initial state")
+    operators = tuple(operators)
+    if not operators or not all(isinstance(operator, MPO) for operator in operators):
+        raise TypeError("operators must be a non-empty sequence of MPOs")
+    mpos = [
+        [np.asarray(factor) for factor in operator.factors] for operator in operators
+    ]
+    if any(len(mpo) != psi.L for mpo in mpos):
+        raise ValueError("MPS and all MPO lengths must match")
+
+    work = psi.copy().to_order(["lv", "p", "rv"])
+    if canonicalize:
+        work = work.right_canonicalize()
+    factors = _standard_mps_factors(work)
+    nsites = len(factors)
+    if nsites < 2:
+        raise ValueError("sum TDVP2 requires at least two sites")
+    for mpo in mpos:
+        for site, (state_factor, operator_factor) in enumerate(zip(factors, mpo)):
+            if (
+                state_factor.shape[1] != operator_factor.shape[2]
+                or state_factor.shape[1] != operator_factor.shape[3]
+            ):
+                raise ValueError(f"physical dimension mismatch at site {site}")
+
+    half_dt = 0.5 * dt
+    truncation_error = 0.0
+
+    def build_right_environments(mpo):
+        return _build_right_envs(factors, mpo)
+
+    right_envs = (
+        list(map(build_right_environments, mpos))
+        if _executor is None
+        else list(_executor.map(build_right_environments, mpos))
+    )
+    left_envs = [[None] * nsites for _ in mpos]
+    for term, (mpo, storage) in enumerate(zip(mpos, left_envs)):
+        storage[0] = np.ones(
+            (1, 1, 1),
+            dtype=np.result_type(*(factors + mpo), complex),
+        )
+
+    for site in range(nsites - 1):
+        theta = _merge_two_site(factors[site], factors[site + 1])
+        theta = _evolve_two_site_sum(
+            theta,
+            [
+                (
+                    left_envs[term][site],
+                    mpo[site],
+                    mpo[site + 1],
+                    right_envs[term][site + 2],
+                )
+                for term, mpo in enumerate(mpos)
+            ],
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            executor=_executor,
+        )
+        factors[site], center, discarded = _split_two_site_left(
+            theta,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+        truncation_error += discarded
+
+        def update_left_environment(item):
+            term, mpo = item
+            return term, _update_left_env(
+                left_envs[term][site], factors[site], mpo[site]
+            )
+
+        updates = (
+            map(update_left_environment, enumerate(mpos))
+            if _executor is None
+            else _executor.map(update_left_environment, enumerate(mpos))
+        )
+        for term, environment in updates:
+            left_envs[term][site + 1] = environment
+        if site < nsites - 2:
+            center = _evolve_site_sum(
+                center,
+                [
+                    (
+                        left_envs[term][site + 1],
+                        mpo[site + 1],
+                        right_envs[term][site + 2],
+                    )
+                    for term, mpo in enumerate(mpos)
+                ],
+                -half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                executor=_executor,
+            )
+        factors[site + 1] = center
+
+    right = [
+        np.ones((1, 1, 1), dtype=np.result_type(*(factors + mpo), complex))
+        for mpo in mpos
+    ]
+    for site in range(nsites - 2, -1, -1):
+        theta = _merge_two_site(factors[site], factors[site + 1])
+        theta = _evolve_two_site_sum(
+            theta,
+            [
+                (
+                    left_envs[term][site],
+                    mpo[site],
+                    mpo[site + 1],
+                    right[term],
+                )
+                for term, mpo in enumerate(mpos)
+            ],
+            half_dt,
+            krylov_dim=krylov_dim,
+            krylov_tol=krylov_tol,
+            krylov_method=krylov_method,
+            executor=_executor,
+        )
+        center, factors[site + 1], discarded = _split_two_site_right(
+            theta,
+            max_bond=max_bond,
+            cutoff=cutoff,
+        )
+        truncation_error += discarded
+
+        def update_right_environment(item):
+            term, mpo = item
+            return term, _update_right_env(
+                right[term], factors[site + 1], mpo[site + 1]
+            )
+
+        updates = (
+            map(update_right_environment, enumerate(mpos))
+            if _executor is None
+            else _executor.map(update_right_environment, enumerate(mpos))
+        )
+        for term, environment in updates:
+            right[term] = environment
+        if site > 0:
+            center = _evolve_site_sum(
+                center,
+                [
+                    (
+                        left_envs[term][site],
+                        mpo[site],
+                        right[term],
+                    )
+                    for term, mpo in enumerate(mpos)
+                ],
+                -half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                executor=_executor,
+            )
+        factors[site] = center
+
+    out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
+    out.gauge = "right_canonical"
+    out.center = 0
+    norm2 = float(np.real(out.norm_squared()))
+    if normalize:
+        out.normalize()
+    info = {
+        "pre_normalization_norm2": norm2,
+        "pre_normalization_norm": float(np.sqrt(max(norm2, 0.0))),
+        "truncation_error": float(truncation_error),
+        "components": len(mpos),
+    }
+    return (out, info) if return_info else out
+
+
+def _sum_tdvp_right_signature(state):
+    """Fingerprint sites right of the TDVP center for safe environment reuse."""
+    factors = _standard_mps_factors(state)
+    return tuple(
+        (factor.shape, hash(np.ascontiguousarray(factor).tobytes()))
+        for factor in factors[1:]
+    )
+
+
 class TDVPEngine:
-    """Small reusable TDVP engine for repeated steps with one fixed MPO."""
+    """Reusable TDVP engine for one MPO or a compact sum of MPO components."""
 
     def __init__(
         self,
@@ -3198,6 +3997,7 @@ class TDVPEngine:
         canonicalize_first=True,
         canonicalize_each_step=False,
         dense_cpp_workspace="auto",
+        workers=1,
     ):
         global _dense_tdvp_cpp_last_error
         key = str(integrator).lower().replace("_", "-")
@@ -3207,11 +4007,31 @@ class TDVPEngine:
             self.integrator = "tdvp2"
         else:
             raise ValueError("integrator must be 'tdvp' or 'tdvp2'.")
-        self.mpo = [np.asarray(w) for w in _mpo_factors(H)]
+        if isinstance(H, MPO):
+            self.components = (H,)
+        else:
+            try:
+                self.components = tuple(H)
+            except TypeError as exc:
+                raise TypeError(
+                    "TDVPEngine requires an MPO or a non-empty sequence of MPOs."
+                ) from exc
+            if not self.components or not all(
+                isinstance(operator, MPO) for operator in self.components
+            ):
+                raise TypeError(
+                    "TDVPEngine requires an MPO or a non-empty sequence of MPOs."
+                )
+        self.operator_mode = "single" if len(self.components) == 1 else "sum"
+        self.mpo = (
+            [np.asarray(w) for w in _mpo_factors(self.components[0])]
+            if self.operator_mode == "single"
+            else None
+        )
         self.max_bond = max_bond
-        self.cutoff = cutoff
-        self.krylov_dim = krylov_dim
-        self.krylov_tol = krylov_tol
+        self.cutoff = float(cutoff)
+        self.krylov_dim = int(krylov_dim)
+        self.krylov_tol = float(krylov_tol)
         self.krylov_method = str(krylov_method).lower().replace("_", "-")
         self.diagonal_fast_path = diagonal_fast_path
         self.sparse_threshold = sparse_threshold
@@ -3222,19 +4042,87 @@ class TDVPEngine:
         if workspace_mode not in {"auto", "on", "off"}:
             raise ValueError("dense_cpp_workspace must be 'auto', 'on', or 'off'.")
         self.dense_cpp_workspace = (
-            None if workspace_mode == "off" else _new_cpp_dense_tdvp_workspace()
+            None
+            if workspace_mode == "off" or self.operator_mode == "sum"
+            else _new_cpp_dense_tdvp_workspace()
         )
-        self._dense_cpp_workspace_dense_mpo = _dense_mpo_for_workspace(self.mpo)
-        self.dense_cpp_env = workspace_mode == "on" and _cpp_dense_tdvp_workspace_type() is not None
+        self._dense_cpp_workspace_dense_mpo = (
+            _dense_mpo_for_workspace(self.mpo)
+            if self.operator_mode == "single"
+            else False
+        )
+        self.dense_cpp_env = (
+            self.operator_mode == "single"
+            and workspace_mode == "on"
+            and _cpp_dense_tdvp_workspace_type() is not None
+        )
+        self.workers = int(workers)
+        if self.workers < 1:
+            raise ValueError("workers must be positive")
+        self._executor = (
+            ThreadPoolExecutor(max_workers=self.workers)
+            if self.operator_mode == "sum" and self.workers > 1
+            else None
+        )
         _dense_tdvp_cpp_last_error = None
         self._prepared = False
+        self._right_environments = None
+        self._right_signature = None
+
+    def close(self):
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+            self._executor = None
+        self._right_environments = None
+        self._right_signature = None
+
+    def __del__(self):
+        self.close()
 
     def reset(self):
         self._prepared = False
+        self._right_environments = None
+        self._right_signature = None
 
     def step(self, psi, dt, *, normalize=True, return_info=True):
-        canonicalize = self.canonicalize_each_step or (self.canonicalize_first and not self._prepared)
-        if self.integrator == "tdvp2":
+        canonicalize = self.canonicalize_each_step or (
+            self.canonicalize_first and not self._prepared
+        )
+        if self.operator_mode == "sum":
+            stepper = (
+                one_site_tdvp_sum_step
+                if self.integrator == "tdvp"
+                else two_site_tdvp_sum_step
+            )
+            arguments = {
+                "max_bond": self.max_bond,
+                "cutoff": self.cutoff,
+                "krylov_dim": self.krylov_dim,
+                "krylov_tol": self.krylov_tol,
+                "krylov_method": self.krylov_method,
+                "canonicalize": canonicalize,
+                "normalize": normalize,
+                "return_info": True,
+                "_executor": self._executor,
+            }
+            if self.integrator == "tdvp":
+                signature = _sum_tdvp_right_signature(psi)
+                arguments["_right_environments"] = (
+                    self._right_environments
+                    if signature == self._right_signature
+                    else None
+                )
+                arguments["_cache_right_environments"] = True
+            out, info = stepper(psi, self.components, dt, **arguments)
+            if self.integrator == "tdvp":
+                self._right_environments = info.pop("_right_environments", None)
+                self._right_signature = (
+                    _sum_tdvp_right_signature(out)
+                    if self._right_environments is not None
+                    else None
+                )
+        elif self.integrator == "tdvp2":
             out, info = two_site_tdvp_step(
                 psi,
                 self.mpo,
@@ -3271,6 +4159,10 @@ class TDVPEngine:
                 return_info=True,
             )
         self._prepared = True
+        info["integrator"] = self.integrator
+        info["operator_mode"] = self.operator_mode
+        info["components"] = len(self.components)
+        info["workers"] = self.workers if self.operator_mode == "sum" else 1
         if self.dense_cpp_workspace is not None:
             try:
                 native_stats = dict(self.dense_cpp_workspace.stats())
@@ -3345,7 +4237,9 @@ class SymmetricTDVP:
             "abelian",
             "abelian-block",
         }:
-            raise ValueError("projection_backend must be 'mpo', 'dense', or 'block-sparse'.")
+            raise ValueError(
+                "projection_backend must be 'mpo', 'dense', or 'block-sparse'."
+            )
         if projection_backend in {"mpo", "sector-mpo"}:
             self.projection_backend = "mpo"
         elif projection_backend in {"dense", "dense-sector"}:
@@ -3431,7 +4325,9 @@ class SymmetricTDVP:
             )
         key = shape
         if key not in self._mask_cache:
-            self._mask_cache[key] = _dense_sector_mask(shape, self.local_sectors, self.target_sector)
+            self._mask_cache[key] = _dense_sector_mask(
+                shape, self.local_sectors, self.target_sector
+            )
         return self._mask_cache[key]
 
     def projector(self, shape):
@@ -3453,19 +4349,29 @@ class SymmetricTDVP:
         tensor = np.asarray(tt_to_tensor(factors), dtype=complex).reshape(shape)
         norm2 = float(np.vdot(tensor.reshape(-1), tensor.reshape(-1)).real)
         projected = np.where(mask, tensor, 0.0)
-        projected_norm2 = float(np.vdot(projected.reshape(-1), projected.reshape(-1)).real)
+        projected_norm2 = float(
+            np.vdot(projected.reshape(-1), projected.reshape(-1)).real
+        )
         if projected_norm2 <= 0.0:
-            raise ValueError("The requested target sector has zero weight in the supplied state.")
+            raise ValueError(
+                "The requested target sector has zero weight in the supplied state."
+            )
 
         rank = _full_tt_rank(shape) if self.max_bond is None else int(self.max_bond)
-        out = MPS(decompose(projected, rank=rank), labels=["lv", "p", "rv"])
+        out = MPS(
+            decompose(projected, rank=rank),
+            labels=["lv", "p", "rv"],
+            sites=psi.sites,
+        )
         if normalize:
             out.normalize()
         info = {
             "backend": "dense-sector",
             "target_sector": self.target_sector,
             "sector_weight": 0.0 if norm2 <= 0.0 else projected_norm2 / norm2,
-            "discarded_sector_weight": 0.0 if norm2 <= 0.0 else max(0.0, 1.0 - projected_norm2 / norm2),
+            "discarded_sector_weight": 0.0
+            if norm2 <= 0.0
+            else max(0.0, 1.0 - projected_norm2 / norm2),
             "pre_projection_norm2": norm2,
             "projected_norm2": projected_norm2,
             "rank": rank,
@@ -3480,10 +4386,18 @@ class SymmetricTDVP:
             block_factors = _as_block_sparse_factors(psi, site_qn_maps)
             norm2 = _block_mps_norm2(block_factors)
             if norm2 <= 0.0:
-                raise ValueError("The requested target sector has zero weight in the supplied state.")
+                raise ValueError(
+                    "The requested target sector has zero weight in the supplied state."
+                )
             if normalize:
-                block_factors, norm2 = _normalize_block_factors_inplace(block_factors, norm2)
-            out = MPS(block_factors, labels=["lv", "rv", "p"])
+                block_factors, norm2 = _normalize_block_factors_inplace(
+                    block_factors, norm2
+                )
+            out = MPS(
+                block_factors,
+                labels=["lv", "rv", "p"],
+                sites=psi.sites,
+            )
             info = {
                 "backend": "block-sparse",
                 "target_sector": self.target_sector,
@@ -3508,7 +4422,9 @@ class SymmetricTDVP:
         out = projector @ work
         if self.max_bond is not None and max(out.bond_orders()) > int(self.max_bond):
             if not normalize:
-                raise ValueError("SymmetricTDVP cannot compress a projected state while normalize=False.")
+                raise ValueError(
+                    "SymmetricTDVP cannot compress a projected state while normalize=False."
+                )
             out = out.compress(int(self.max_bond))
             out = projector @ out
             if max(out.bond_orders()) > int(self.max_bond):
@@ -3518,7 +4434,9 @@ class SymmetricTDVP:
             post_compression_projection = False
         projected_norm2 = _mps_factors_norm2(out.factors)
         if projected_norm2 <= 0.0:
-            raise ValueError("The requested target sector has zero weight in the supplied state.")
+            raise ValueError(
+                "The requested target sector has zero weight in the supplied state."
+            )
         compressed_norm2 = projected_norm2
         projected_norm2_after_compress = projected_norm2
         if normalize:
@@ -3529,7 +4447,9 @@ class SymmetricTDVP:
             "backend": "sector-mpo",
             "target_sector": self.target_sector,
             "sector_weight": sector_weight,
-            "discarded_sector_weight": 0.0 if norm2 <= 0.0 else max(0.0, 1.0 - sector_weight),
+            "discarded_sector_weight": 0.0
+            if norm2 <= 0.0
+            else max(0.0, 1.0 - sector_weight),
             "pre_projection_norm2": norm2,
             "projected_norm2": projected_norm2,
             "compressed_norm2": compressed_norm2,
@@ -3541,7 +4461,9 @@ class SymmetricTDVP:
         return (out, info) if return_info else out
 
     def step(self, psi, dt, *, normalize=True, return_info=True):
-        canonicalize = self.canonicalize_each_step or (self.canonicalize_first and not self._prepared)
+        canonicalize = self.canonicalize_each_step or (
+            self.canonicalize_first and not self._prepared
+        )
         if self.projection_backend == "block-sparse":
             phys_dims, site_qn_maps, target_qn = self._block_sparse_sector_data(psi)
             block_mpo = self._block_sparse_cached_mpo(phys_dims, site_qn_maps)
@@ -3591,7 +4513,9 @@ class SymmetricTDVP:
             self._prepared = True
             return (out, info) if return_info else out
 
-        projected_in, input_info = self.project(psi, normalize=normalize, return_info=True)
+        projected_in, input_info = self.project(
+            psi, normalize=normalize, return_info=True
+        )
         if self.integrator == "tdvp2":
             out, step_info = two_site_tdvp_step(
                 projected_in,
@@ -3632,7 +4556,9 @@ class SymmetricTDVP:
                 "input_sector_weight": input_info["sector_weight"],
                 "input_discarded_sector_weight": input_info["discarded_sector_weight"],
                 "output_sector_weight": output_info["sector_weight"],
-                "output_discarded_sector_weight": output_info["discarded_sector_weight"],
+                "output_discarded_sector_weight": output_info[
+                    "discarded_sector_weight"
+                ],
                 "max_projector_bond": max(
                     int(input_info.get("max_projector_bond", 1)),
                     int(output_info.get("max_projector_bond", 1)),

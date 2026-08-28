@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <cstdlib>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -85,6 +86,21 @@ extern "C" void cblas_dgemm(
     const int ldc
 );
 
+extern "C" void cblas_dgemv(
+    const int order,
+    const int trans_a,
+    const int m,
+    const int n,
+    const double alpha,
+    const double* a,
+    const int lda,
+    const double* x,
+    const int inc_x,
+    const double beta,
+    double* y,
+    const int inc_y
+);
+
 extern "C" void zgesvd_(
     char* jobu,
     char* jobvt,
@@ -100,6 +116,23 @@ extern "C" void zgesvd_(
     cdouble* work,
     int* lwork,
     double* rwork,
+    int* info
+);
+
+extern "C" void dgesvd_(
+    char* jobu,
+    char* jobvt,
+    int* m,
+    int* n,
+    double* a,
+    int* lda,
+    double* s,
+    double* u,
+    int* ldu,
+    double* vt,
+    int* ldvt,
+    double* work,
+    int* lwork,
     int* info
 );
 
@@ -146,6 +179,49 @@ static double wall_seconds() {
 }
 
 static py::object tuple_from_sequence_object(const py::object& value);
+static py::dict packed_tensor_group_by_axis(py::object tensor, ssize_t axis);
+static py::dict packed_tensor_group_by_axes(
+    py::object tensor,
+    ssize_t first_axis,
+    ssize_t second_axis
+);
+static py::tuple packed_left_boundary_advance_payload_grouped(
+    py::object W,
+    py::object A_conj,
+    py::object E,
+    py::object B,
+    py::dict a_by_left,
+    py::dict w_by_left_phys,
+    py::dict b_by_left_phys
+);
+static py::tuple packed_left_identity_boundary_advance_payload_grouped(
+    py::object A_conj,
+    py::object E,
+    py::object B,
+    py::dict a_by_left,
+    py::dict b_by_left_phys
+);
+static py::tuple packed_right_identity_boundary_advance_payload_grouped(
+    py::object A_conj,
+    py::object F,
+    py::object B,
+    py::dict a_by_right,
+    py::dict b_by_right_phys
+);
+static py::tuple packed_right_boundary_advance_payload_grouped(
+    py::object W,
+    py::object A_conj,
+    py::object F,
+    py::object B,
+    py::dict a_by_right,
+    py::dict w_by_right_phys,
+    py::dict b_by_right_phys
+);
+static py::object packed_tensor_from_payload(
+    py::object tensor_cls,
+    py::tuple payload,
+    const std::string& source
+);
 
 static void add_long_attr(py::object obj, const char* name, long long amount) {
     long long current = 0;
@@ -275,6 +351,82 @@ static py::tuple lapack_svd(py::object matrix_obj) {
     if (m == 0 || n == 0) {
         return py::make_tuple(u_out, s_out, vt_out);
     }
+#ifdef __APPLE__
+    double max_imag = 0.0;
+    double max_abs = 0.0;
+    const cdouble* matrix_data = static_cast<const cdouble*>(matrix.data());
+    for (std::size_t index = 0; index < m * n; ++index) {
+        max_imag = std::max(max_imag, std::abs(matrix_data[index].imag()));
+        max_abs = std::max(max_abs, std::abs(matrix_data[index]));
+    }
+    if (max_imag <= 1.0e-13 * std::max(1.0, max_abs)) {
+        const int mi = static_cast<int>(m);
+        const int ni = static_cast<int>(n);
+        const int ki = static_cast<int>(k);
+        const int lda = std::max(1, mi);
+        const int ldu = std::max(1, mi);
+        const int ldvt = std::max(1, ki);
+        std::vector<double> a(static_cast<size_t>(lda) * static_cast<size_t>(ni));
+        std::vector<double> u(static_cast<size_t>(ldu) * static_cast<size_t>(ki));
+        std::vector<double> vt(static_cast<size_t>(ldvt) * static_cast<size_t>(ni));
+        std::vector<double> singular(static_cast<size_t>(ki));
+        for (int row = 0; row < mi; ++row) {
+            for (int col = 0; col < ni; ++col) {
+                a[static_cast<size_t>(row + col * lda)] =
+                    matrix_data[static_cast<size_t>(row * ni + col)].real();
+            }
+        }
+        char jobu = 'S';
+        char jobvt = 'S';
+        int m_arg = mi;
+        int n_arg = ni;
+        int lda_arg = lda;
+        int ldu_arg = ldu;
+        int ldvt_arg = ldvt;
+        int info = 0;
+        int lwork = -1;
+        double work_query = 0.0;
+        dgesvd_(
+            &jobu, &jobvt, &m_arg, &n_arg, a.data(), &lda_arg,
+            singular.data(), u.data(), &ldu_arg, vt.data(), &ldvt_arg,
+            &work_query, &lwork, &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("real thin SVD workspace query failed");
+        }
+        lwork = std::max(1, static_cast<int>(work_query));
+        std::vector<double> work(static_cast<size_t>(lwork));
+        dgesvd_(
+            &jobu, &jobvt, &m_arg, &n_arg, a.data(), &lda_arg,
+            singular.data(), u.data(), &ldu_arg, vt.data(), &ldvt_arg,
+            work.data(), &lwork, &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("real thin SVD failed to converge");
+        }
+        auto u_view = u_out.mutable_unchecked<2>();
+        auto s_view = s_out.mutable_unchecked<1>();
+        auto vt_view = vt_out.mutable_unchecked<2>();
+        for (int col = 0; col < ki; ++col) {
+            s_view(col) = singular[static_cast<size_t>(col)];
+            for (int row = 0; row < mi; ++row) {
+                u_view(row, col) = cdouble(
+                    u[static_cast<size_t>(row + col * ldu)],
+                    0.0
+                );
+            }
+        }
+        for (int col = 0; col < ni; ++col) {
+            for (int row = 0; row < ki; ++row) {
+                vt_view(row, col) = cdouble(
+                    vt[static_cast<size_t>(row + col * ldvt)],
+                    0.0
+                );
+            }
+        }
+        return py::make_tuple(u_out, s_out, vt_out);
+    }
+#endif
     static thread_local pyqed::dmrg::ComplexThinSVDWorkspace workspace;
     pyqed::dmrg::complex_thin_svd(
         static_cast<const cdouble*>(matrix.data()),
@@ -2342,6 +2494,21 @@ static py::dict davidson(
     for (auto& x : v) {
         x /= vn;
     }
+    bool real_problem = true;
+    for (ssize_t index = 0; index < dim; ++index) {
+        if (
+            std::abs(v[static_cast<size_t>(index)].imag()) > 1.0e-13
+            || std::abs(diag[static_cast<size_t>(index)].imag()) > 1.0e-13
+        ) {
+            real_problem = false;
+            break;
+        }
+    }
+    if (real_problem) {
+        for (auto& value : v) {
+            value = cdouble(value.real(), 0.0);
+        }
+    }
 
     const ssize_t requested_basis = std::max<ssize_t>(
         static_cast<ssize_t>(
@@ -2398,6 +2565,21 @@ static py::dict davidson(
         for (ssize_t newest = hv_size; newest < basis_size; ++newest) {
             workspace.HV[static_cast<size_t>(newest)] =
                 matvec(workspace.V[static_cast<size_t>(newest)]);
+            if (real_problem) {
+                double max_imag = 0.0;
+                double max_abs = 0.0;
+                for (const cdouble& value : workspace.HV[static_cast<size_t>(newest)]) {
+                    max_imag = std::max(max_imag, std::abs(value.imag()));
+                    max_abs = std::max(max_abs, std::abs(value));
+                }
+                if (max_imag <= 1.0e-12 * std::max(1.0, max_abs)) {
+                    for (cdouble& value : workspace.HV[static_cast<size_t>(newest)]) {
+                        value = cdouble(value.real(), 0.0);
+                    }
+                } else {
+                    real_problem = false;
+                }
+            }
             ++operator_vectors_applied;
         }
         const ssize_t m = basis_size;
@@ -2434,6 +2616,14 @@ static py::dict davidson(
         const double current_energy = eig.values_asc[0];
         for (ssize_t i = 0; i < m; ++i) {
             workspace.coeff[static_cast<size_t>(i)] = eig.vector(i, 0);
+        }
+        if (real_problem) {
+            for (ssize_t i = 0; i < m; ++i) {
+                workspace.coeff[static_cast<size_t>(i)] = cdouble(
+                    workspace.coeff[static_cast<size_t>(i)].real(),
+                    0.0
+                );
+            }
         }
         double cn = 0.0;
         for (ssize_t i = 0; i < m; ++i) {
@@ -2478,7 +2668,9 @@ static py::dict davidson(
             break;
         }
         for (ssize_t i = 0; i < dim; ++i) {
-            cdouble denom = current_energy - diag[static_cast<size_t>(i)];
+            cdouble denom = real_problem
+                ? cdouble(current_energy - diag[static_cast<size_t>(i)].real(), 0.0)
+                : current_energy - diag[static_cast<size_t>(i)];
             if (std::abs(denom) < 1.0e-8) {
                 denom = cdouble(
                     (denom.real() >= 0.0 ? 1.0e-8 : -1.0e-8),
@@ -2536,7 +2728,9 @@ static py::dict davidson(
                     cdouble(0.0, 0.0)
                 );
                 for (ssize_t ibasis = 0; ibasis < m; ++ibasis) {
-                    const cdouble coefficient = eig.vector(ibasis, root);
+                    const cdouble coefficient = real_problem
+                        ? cdouble(eig.vector(ibasis, root).real(), 0.0)
+                        : eig.vector(ibasis, root);
                     axpy(
                         candidate,
                         coefficient,
@@ -3402,6 +3596,7 @@ static std::vector<ssize_t> copy_int_array(
 struct CompactStageSpec {
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> owned_stack;
     const cdouble* stack = nullptr;
+    std::vector<double> real_stack;
     std::vector<ssize_t> stack_shape;
     ssize_t input_group = 0;
     ssize_t output_group = 0;
@@ -3688,6 +3883,14 @@ static void update_stage_stacks_from_blocks(
 
 class CppCompactPlan {
 public:
+    struct RealDenseBlock {
+        std::vector<double> data;
+        ssize_t rows = 0;
+        ssize_t cols = 0;
+        ssize_t in_start = 0;
+        ssize_t out_start = 0;
+    };
+
     ssize_t dim;
     std::vector<CompactStageSpec> r_specs;
     std::vector<CompactStageSpec> t2_specs;
@@ -3722,6 +3925,22 @@ public:
     std::vector<cdouble> scratch_t3_arena;
     std::vector<cdouble> scratch_out_arena;
     std::vector<cdouble> scratch_out;
+    std::vector<double> real_a_arena;
+    std::vector<double> real_r_arena;
+    std::vector<double> real_t2_arena;
+    std::vector<double> real_t3_arena;
+    std::vector<double> real_out_arena;
+    std::vector<double> real_dense_input;
+    std::vector<double> real_dense_output;
+    std::vector<RealDenseBlock> real_dense_blocks;
+    bool real_dense_blocks_attempted = false;
+    bool real_dense_blocks_enabled = false;
+    ssize_t real_dense_block_elements = 0;
+    bool real_stacks = false;
+    double max_stack_imag = 0.0;
+    long long real_matvec_calls = 0;
+    long long complex_matvec_calls = 0;
+    long long real_solution_phase_fixes = 0;
 
     CppCompactPlan(
         py::sequence py_r_stacks,
@@ -3879,6 +4098,19 @@ public:
         scratch_t3_arena.resize(static_cast<size_t>(t3_total));
         scratch_out_arena.resize(static_cast<size_t>(out_total));
         scratch_out.resize(static_cast<size_t>(dim));
+        real_a_arena.resize(static_cast<size_t>(a_total));
+        real_r_arena.resize(static_cast<size_t>(r_total));
+        real_t2_arena.resize(static_cast<size_t>(t2_total));
+        real_t3_arena.resize(static_cast<size_t>(t3_total));
+        real_out_arena.resize(static_cast<size_t>(out_total));
+        real_dense_input.resize(static_cast<size_t>(dim));
+        real_dense_output.resize(static_cast<size_t>(dim));
+        refresh_real_stacks();
+        const char* dense_env = std::getenv("PYQED_U1_MATERIALIZE_REAL_BLOCKS");
+        real_dense_blocks_enabled = dense_env != nullptr && std::string(dense_env) == "1";
+        if (real_dense_blocks_enabled && real_stacks) {
+            materialize_real_dense_blocks();
+        }
     }
 
     void update_stacks(
@@ -3891,6 +4123,13 @@ public:
         update_stage_stacks(t2_specs, py_t2_stacks, 5);
         update_stage_stacks(t3_specs, py_t3_stacks, 5);
         update_stage_stacks(out_specs, py_out_stacks, 4);
+        refresh_real_stacks();
+        if (real_dense_blocks_enabled && real_stacks) {
+            materialize_real_dense_blocks();
+        } else {
+            real_dense_blocks.clear();
+            real_dense_block_elements = 0;
+        }
     }
 
     void update_stacks_from_blocks(
@@ -3907,12 +4146,33 @@ public:
         update_stage_stacks_from_blocks(t2_specs, py_w1_blocks, py_t2_entries, 1, 4);
         update_stage_stacks_from_blocks(t3_specs, py_w2_blocks, py_t3_entries, 1, 4);
         update_stage_stacks_from_blocks(out_specs, py_f_blocks, py_out_entries, 1, 3);
+        refresh_real_stacks();
+        if (real_dense_blocks_enabled && real_stacks) {
+            materialize_real_dense_blocks();
+        } else {
+            real_dense_blocks.clear();
+            real_dense_block_elements = 0;
+        }
     }
 
     const std::vector<cdouble>& matvec_ptr(const cdouble* vec, ssize_t vec_dim) {
         if (vec_dim != dim) {
             throw std::runtime_error("vector dimension does not match CompactPlan dimension");
         }
+        if (std::isfinite(max_stack_imag) && max_stack_imag <= 1.0e-13) {
+            bool real_input = true;
+            for (ssize_t index = 0; index < dim; ++index) {
+                if (vec[index].imag() != 0.0) {
+                    real_input = false;
+                    break;
+                }
+            }
+            if (real_input) {
+                ++real_matvec_calls;
+                return matvec_ptr_real(vec);
+            }
+        }
+        ++complex_matvec_calls;
         std::fill(scratch_a_arena.begin(), scratch_a_arena.end(), cdouble(0.0, 0.0));
         std::fill(scratch_r_arena.begin(), scratch_r_arena.end(), cdouble(0.0, 0.0));
         std::fill(scratch_t2_arena.begin(), scratch_t2_arena.end(), cdouble(0.0, 0.0));
@@ -3993,6 +4253,130 @@ public:
             out_mut(i) = result[static_cast<size_t>(i)];
         }
         return py_out;
+    }
+
+    py::array_t<long long> diagonal_routes() const {
+        using Position = std::pair<ssize_t, ssize_t>;
+        using EntryRef = std::pair<ssize_t, ssize_t>;
+        using Route = std::array<long long, 13>;
+
+        auto index_stage_inputs = [](const std::vector<CompactStageSpec>& specs) {
+            std::map<Position, std::vector<EntryRef>> indexed;
+            for (ssize_t group = 0; group < static_cast<ssize_t>(specs.size()); ++group) {
+                const CompactStageSpec& spec = specs[static_cast<size_t>(group)];
+                for (ssize_t entry = 0; entry < static_cast<ssize_t>(spec.input_pos.size()); ++entry) {
+                    indexed[{spec.input_group, spec.input_pos[static_cast<size_t>(entry)]}]
+                        .push_back({group, entry});
+                }
+            }
+            return indexed;
+        };
+        auto block_by_position = [](
+            const std::vector<ssize_t>& groups,
+            const std::vector<ssize_t>& positions
+        ) {
+            std::map<Position, ssize_t> indexed;
+            for (ssize_t block = 0; block < static_cast<ssize_t>(groups.size()); ++block) {
+                indexed[{groups[static_cast<size_t>(block)], positions[static_cast<size_t>(block)]}] = block;
+            }
+            return indexed;
+        };
+
+        const auto t2_inputs = index_stage_inputs(t2_specs);
+        const auto t3_inputs = index_stage_inputs(t3_specs);
+        const auto out_inputs = index_stage_inputs(out_specs);
+        const auto a_blocks = block_by_position(a_block_group, a_block_pos);
+        const auto output_blocks = block_by_position(out_block_group, out_block_pos);
+        std::vector<Route> rows;
+
+        for (ssize_t r_group = 0; r_group < static_cast<ssize_t>(r_specs.size()); ++r_group) {
+            const CompactStageSpec& r_spec = r_specs[static_cast<size_t>(r_group)];
+            if (r_spec.shape_info.size() < 4) {
+                continue;
+            }
+            for (ssize_t r_entry = 0; r_entry < static_cast<ssize_t>(r_spec.input_pos.size()); ++r_entry) {
+                const auto a_it = a_blocks.find({
+                    r_spec.input_group,
+                    r_spec.input_pos[static_cast<size_t>(r_entry)]
+                });
+                if (a_it == a_blocks.end()) {
+                    continue;
+                }
+                const ssize_t a_block = a_it->second;
+                const auto t2_it = t2_inputs.find({
+                    r_spec.output_group,
+                    r_spec.output_pos[static_cast<size_t>(r_entry)]
+                });
+                if (t2_it == t2_inputs.end()) {
+                    continue;
+                }
+                for (const EntryRef t2_ref : t2_it->second) {
+                    const CompactStageSpec& t2_spec = t2_specs[static_cast<size_t>(t2_ref.first)];
+                    const auto t3_it = t3_inputs.find({
+                        t2_spec.output_group,
+                        t2_spec.output_pos[static_cast<size_t>(t2_ref.second)]
+                    });
+                    if (t3_it == t3_inputs.end()) {
+                        continue;
+                    }
+                    for (const EntryRef t3_ref : t3_it->second) {
+                        const CompactStageSpec& t3_spec = t3_specs[static_cast<size_t>(t3_ref.first)];
+                        const auto out_it = out_inputs.find({
+                            t3_spec.output_group,
+                            t3_spec.output_pos[static_cast<size_t>(t3_ref.second)]
+                        });
+                        if (out_it == out_inputs.end()) {
+                            continue;
+                        }
+                        for (const EntryRef out_ref : out_it->second) {
+                            const CompactStageSpec& out_spec = out_specs[static_cast<size_t>(out_ref.first)];
+                            const auto output_it = output_blocks.find({
+                                out_spec.output_group,
+                                out_spec.output_pos[static_cast<size_t>(out_ref.second)]
+                            });
+                            if (output_it == output_blocks.end()) {
+                                continue;
+                            }
+                            const ssize_t output_block = output_it->second;
+                            if (
+                                a_flat_start[static_cast<size_t>(a_block)]
+                                    != out_flat_start[static_cast<size_t>(output_block)]
+                                || a_flat_size[static_cast<size_t>(a_block)]
+                                    != out_flat_size[static_cast<size_t>(output_block)]
+                            ) {
+                                continue;
+                            }
+                            rows.push_back({
+                                r_group,
+                                r_entry,
+                                t2_ref.first,
+                                t2_ref.second,
+                                t3_ref.first,
+                                t3_ref.second,
+                                out_ref.first,
+                                out_ref.second,
+                                a_flat_start[static_cast<size_t>(a_block)],
+                                r_spec.shape_info[0],
+                                r_spec.shape_info[1],
+                                r_spec.shape_info[2],
+                                r_spec.shape_info[3],
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        py::array_t<long long> py_rows(
+            std::vector<ssize_t>{static_cast<ssize_t>(rows.size()), 13}
+        );
+        auto output = py_rows.mutable_unchecked<2>();
+        for (ssize_t row = 0; row < static_cast<ssize_t>(rows.size()); ++row) {
+            for (ssize_t column = 0; column < 13; ++column) {
+                output(row, column) = rows[static_cast<size_t>(row)][static_cast<size_t>(column)];
+            }
+        }
+        return py_rows;
     }
 
     py::array_t<cdouble> diagonal_from_routes(
@@ -4132,7 +4516,25 @@ public:
             diag[static_cast<size_t>(i)] = diag_arr(i);
             v[static_cast<size_t>(i)] = v0_arr(i);
         }
-        return ::davidson(
+        if (real_stacks) {
+            double real_norm2 = 0.0;
+            double imag_norm2 = 0.0;
+            for (const cdouble value : v) {
+                real_norm2 += value.real() * value.real();
+                imag_norm2 += value.imag() * value.imag();
+            }
+            const bool use_imaginary_component = imag_norm2 > real_norm2;
+            for (cdouble& value : v) {
+                value = cdouble(
+                    use_imaginary_component ? value.imag() : value.real(),
+                    0.0
+                );
+            }
+            for (cdouble& value : diag) {
+                value = cdouble(value.real(), 0.0);
+            }
+        }
+        py::dict result = ::davidson(
             dim,
             diag,
             std::move(v),
@@ -4142,11 +4544,317 @@ public:
             accept_unconverged,
             [this](const std::vector<cdouble>& x) { return this->matvec_vector(x); }
         );
+        if (
+            std::isfinite(max_stack_imag) && max_stack_imag <= 1.0e-13
+            && result.contains("vector")
+        ) {
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> vector =
+                py::cast<py::array_t<cdouble, py::array::c_style | py::array::forcecast>>(
+                    result["vector"]
+                );
+            auto values = vector.mutable_unchecked<1>();
+            ssize_t pivot_index = 0;
+            double pivot_abs = 0.0;
+            for (ssize_t index = 0; index < values.shape(0); ++index) {
+                const double magnitude = std::abs(values(index));
+                if (magnitude > pivot_abs) {
+                    pivot_abs = magnitude;
+                    pivot_index = index;
+                }
+            }
+            if (pivot_abs > 0.0) {
+                const cdouble phase = std::conj(values(pivot_index)) / pivot_abs;
+                double max_imag = 0.0;
+                double max_abs = 0.0;
+                for (ssize_t index = 0; index < values.shape(0); ++index) {
+                    values(index) *= phase;
+                    max_imag = std::max(max_imag, std::abs(values(index).imag()));
+                    max_abs = std::max(max_abs, std::abs(values(index)));
+                }
+                if (max_imag <= 1.0e-11 * std::max(1.0, max_abs)) {
+                    for (ssize_t index = 0; index < values.shape(0); ++index) {
+                        values(index) = cdouble(values(index).real(), 0.0);
+                    }
+                    result["vector"] = vector;
+                    ++real_solution_phase_fixes;
+                }
+            }
+        }
+        return result;
     }
 
 protected:
-    static const cdouble* arena_ptr(
-        const std::vector<cdouble>& arena,
+    static double refresh_real_stage_specs(std::vector<CompactStageSpec>& specs) {
+        double max_imag = 0.0;
+        for (auto& spec : specs) {
+            ssize_t size = 1;
+            for (ssize_t extent : spec.stack_shape) {
+                size *= extent;
+            }
+            spec.real_stack.resize(static_cast<size_t>(size));
+            for (ssize_t index = 0; index < size; ++index) {
+                max_imag = std::max(max_imag, std::abs(spec.stack[index].imag()));
+                spec.real_stack[static_cast<size_t>(index)] = spec.stack[index].real();
+            }
+        }
+        return max_imag;
+    }
+
+    void refresh_real_stacks() {
+        max_stack_imag = std::max({
+            refresh_real_stage_specs(r_specs),
+            refresh_real_stage_specs(t2_specs),
+            refresh_real_stage_specs(t3_specs),
+            refresh_real_stage_specs(out_specs)
+        });
+        real_stacks = std::isfinite(max_stack_imag) && max_stack_imag <= 1.0e-13;
+    }
+
+    const std::vector<cdouble>& matvec_ptr_real(const cdouble* vec) {
+        if (!real_dense_blocks.empty()) {
+            std::fill(real_dense_output.begin(), real_dense_output.end(), 0.0);
+            for (ssize_t index = 0; index < dim; ++index) {
+                real_dense_input[static_cast<size_t>(index)] = vec[index].real();
+            }
+            for (const RealDenseBlock& block : real_dense_blocks) {
+#ifdef __APPLE__
+                cblas_dgemv(
+                    101,
+                    111,
+                    static_cast<int>(block.rows),
+                    static_cast<int>(block.cols),
+                    1.0,
+                    block.data.data(),
+                    static_cast<int>(block.cols),
+                    real_dense_input.data() + block.in_start,
+                    1,
+                    1.0,
+                    real_dense_output.data() + block.out_start,
+                    1
+                );
+#else
+                for (ssize_t row = 0; row < block.rows; ++row) {
+                    double total = 0.0;
+                    for (ssize_t col = 0; col < block.cols; ++col) {
+                        total += block.data[static_cast<size_t>(row * block.cols + col)]
+                            * real_dense_input[static_cast<size_t>(block.in_start + col)];
+                    }
+                    real_dense_output[static_cast<size_t>(block.out_start + row)] += total;
+                }
+#endif
+            }
+            for (ssize_t index = 0; index < dim; ++index) {
+                scratch_out[static_cast<size_t>(index)] = cdouble(
+                    real_dense_output[static_cast<size_t>(index)], 0.0
+                );
+            }
+            return scratch_out;
+        }
+        std::fill(real_a_arena.begin(), real_a_arena.end(), 0.0);
+        std::fill(real_r_arena.begin(), real_r_arena.end(), 0.0);
+        std::fill(real_t2_arena.begin(), real_t2_arena.end(), 0.0);
+        std::fill(real_t3_arena.begin(), real_t3_arena.end(), 0.0);
+        std::fill(real_out_arena.begin(), real_out_arena.end(), 0.0);
+        std::fill(scratch_out.begin(), scratch_out.end(), cdouble(0.0, 0.0));
+        for (ssize_t block = 0; block < static_cast<ssize_t>(a_block_group.size()); ++block) {
+            const ssize_t group = a_block_group[static_cast<size_t>(block)];
+            const ssize_t pos = a_block_pos[static_cast<size_t>(block)];
+            const ssize_t start = a_flat_start[static_cast<size_t>(block)];
+            const ssize_t n = a_flat_size[static_cast<size_t>(block)];
+            const ssize_t base = a_offsets[static_cast<size_t>(group)]
+                + pos * a_sizes[static_cast<size_t>(group)];
+            for (ssize_t index = 0; index < n; ++index) {
+                real_a_arena[static_cast<size_t>(base + index)] = vec[start + index].real();
+            }
+        }
+        apply_r_stage_real();
+        apply_t2_stage_real();
+        apply_t3_stage_real();
+        apply_out_stage_real();
+        for (ssize_t block = 0; block < static_cast<ssize_t>(out_block_group.size()); ++block) {
+            const ssize_t group = out_block_group[static_cast<size_t>(block)];
+            const ssize_t pos = out_block_pos[static_cast<size_t>(block)];
+            const ssize_t start = out_flat_start[static_cast<size_t>(block)];
+            const ssize_t n = out_flat_size[static_cast<size_t>(block)];
+            const ssize_t base = out_offsets[static_cast<size_t>(group)]
+                + pos * out_sizes[static_cast<size_t>(group)];
+            for (ssize_t index = 0; index < n; ++index) {
+                scratch_out[static_cast<size_t>(start + index)] =
+                    cdouble(real_out_arena[static_cast<size_t>(base + index)], 0.0);
+            }
+        }
+        return scratch_out;
+    }
+
+    void materialize_real_dense_blocks() {
+        real_dense_blocks_attempted = true;
+        real_dense_blocks.clear();
+        real_dense_block_elements = 0;
+        if (!real_stacks) {
+            return;
+        }
+        using Position = std::pair<ssize_t, ssize_t>;
+        using EntryRef = std::pair<ssize_t, ssize_t>;
+        auto index_stage_inputs = [](const std::vector<CompactStageSpec>& specs) {
+            std::map<Position, std::vector<EntryRef>> indexed;
+            for (ssize_t group = 0; group < static_cast<ssize_t>(specs.size()); ++group) {
+                const CompactStageSpec& spec = specs[static_cast<size_t>(group)];
+                for (ssize_t entry = 0; entry < static_cast<ssize_t>(spec.input_pos.size()); ++entry) {
+                    indexed[{spec.input_group, spec.input_pos[static_cast<size_t>(entry)]}]
+                        .push_back({group, entry});
+                }
+            }
+            return indexed;
+        };
+        auto block_by_position = [](
+            const std::vector<ssize_t>& groups,
+            const std::vector<ssize_t>& positions
+        ) {
+            std::map<Position, ssize_t> indexed;
+            for (ssize_t block = 0; block < static_cast<ssize_t>(groups.size()); ++block) {
+                indexed[{groups[static_cast<size_t>(block)], positions[static_cast<size_t>(block)]}] = block;
+            }
+            return indexed;
+        };
+        const auto t2_inputs = index_stage_inputs(t2_specs);
+        const auto t3_inputs = index_stage_inputs(t3_specs);
+        const auto out_inputs = index_stage_inputs(out_specs);
+        const auto a_blocks = block_by_position(a_block_group, a_block_pos);
+        const auto output_blocks = block_by_position(out_block_group, out_block_pos);
+        std::map<std::pair<ssize_t, ssize_t>, ssize_t> dense_index;
+        constexpr ssize_t max_elements = 3000000;
+
+        for (ssize_t r_group = 0; r_group < static_cast<ssize_t>(r_specs.size()); ++r_group) {
+            const CompactStageSpec& r_spec = r_specs[static_cast<size_t>(r_group)];
+            for (ssize_t r_entry = 0; r_entry < static_cast<ssize_t>(r_spec.input_pos.size()); ++r_entry) {
+                const auto a_it = a_blocks.find({r_spec.input_group, r_spec.input_pos[static_cast<size_t>(r_entry)]});
+                if (a_it == a_blocks.end()) {
+                    continue;
+                }
+                const ssize_t a_block = a_it->second;
+                const auto t2_it = t2_inputs.find({r_spec.output_group, r_spec.output_pos[static_cast<size_t>(r_entry)]});
+                if (t2_it == t2_inputs.end()) {
+                    continue;
+                }
+                for (const EntryRef t2_ref : t2_it->second) {
+                    const CompactStageSpec& t2_spec = t2_specs[static_cast<size_t>(t2_ref.first)];
+                    const auto t3_it = t3_inputs.find({t2_spec.output_group, t2_spec.output_pos[static_cast<size_t>(t2_ref.second)]});
+                    if (t3_it == t3_inputs.end()) {
+                        continue;
+                    }
+                    for (const EntryRef t3_ref : t3_it->second) {
+                        const CompactStageSpec& t3_spec = t3_specs[static_cast<size_t>(t3_ref.first)];
+                        const auto out_it = out_inputs.find({t3_spec.output_group, t3_spec.output_pos[static_cast<size_t>(t3_ref.second)]});
+                        if (out_it == out_inputs.end()) {
+                            continue;
+                        }
+                        for (const EntryRef out_ref : out_it->second) {
+                            const CompactStageSpec& out_spec = out_specs[static_cast<size_t>(out_ref.first)];
+                            const auto output_it = output_blocks.find({out_spec.output_group, out_spec.output_pos[static_cast<size_t>(out_ref.second)]});
+                            if (output_it == output_blocks.end()) {
+                                continue;
+                            }
+                            if (
+                                r_spec.stack_shape.size() != 4
+                                || t2_spec.stack_shape.size() != 5
+                                || t3_spec.stack_shape.size() != 5
+                                || out_spec.stack_shape.size() != 4
+                                || t2_spec.stack_shape[3] != 1
+                                || t2_spec.stack_shape[4] != 1
+                                || t3_spec.stack_shape[3] != 1
+                                || t3_spec.stack_shape[4] != 1
+                            ) {
+                                real_dense_blocks.clear();
+                                real_dense_block_elements = 0;
+                                return;
+                            }
+                            const ssize_t output_block = output_it->second;
+                            const ssize_t na = r_spec.stack_shape[1];
+                            const ssize_t ni = r_spec.stack_shape[2];
+                            const ssize_t nj = r_spec.stack_shape[3];
+                            const ssize_t nb = t2_spec.stack_shape[2];
+                            const ssize_t nc = t3_spec.stack_shape[2];
+                            const ssize_t nl = out_spec.stack_shape[2];
+                            const ssize_t nk = out_spec.stack_shape[3];
+                            const ssize_t rows = ni * nl;
+                            const ssize_t cols = nj * nk;
+                            if (
+                                rows != out_flat_size[static_cast<size_t>(output_block)]
+                                || cols != a_flat_size[static_cast<size_t>(a_block)]
+                            ) {
+                                real_dense_blocks.clear();
+                                real_dense_block_elements = 0;
+                                return;
+                            }
+                            const auto dense_key = std::make_pair(output_block, a_block);
+                            auto dense_it = dense_index.find(dense_key);
+                            ssize_t block_index;
+                            if (dense_it == dense_index.end()) {
+                                if (real_dense_block_elements + rows * cols > max_elements) {
+                                    real_dense_blocks.clear();
+                                    real_dense_block_elements = 0;
+                                    return;
+                                }
+                                block_index = static_cast<ssize_t>(real_dense_blocks.size());
+                                dense_index[dense_key] = block_index;
+                                RealDenseBlock block;
+                                block.rows = rows;
+                                block.cols = cols;
+                                block.in_start = a_flat_start[static_cast<size_t>(a_block)];
+                                block.out_start = out_flat_start[static_cast<size_t>(output_block)];
+                                block.data.assign(static_cast<size_t>(rows * cols), 0.0);
+                                real_dense_blocks.push_back(std::move(block));
+                                real_dense_block_elements += rows * cols;
+                            } else {
+                                block_index = dense_it->second;
+                            }
+                            RealDenseBlock& block = real_dense_blocks[static_cast<size_t>(block_index)];
+                            const ssize_t e_stride = na * ni * nj;
+                            const ssize_t w1_stride = na * nb;
+                            const ssize_t w2_stride = nb * nc;
+                            const ssize_t f_stride = nc * nl * nk;
+                            const double* e = r_spec.real_stack.data() + r_entry * e_stride;
+                            const double* w1 = t2_spec.real_stack.data() + t2_ref.second * w1_stride;
+                            const double* w2 = t3_spec.real_stack.data() + t3_ref.second * w2_stride;
+                            const double* f = out_spec.real_stack.data() + out_ref.second * f_stride;
+                            std::vector<double> coupling(static_cast<size_t>(na * nc), 0.0);
+                            for (ssize_t a = 0; a < na; ++a) {
+                                for (ssize_t b = 0; b < nb; ++b) {
+                                    const double left = w1[a * nb + b];
+                                    for (ssize_t c = 0; c < nc; ++c) {
+                                        coupling[static_cast<size_t>(a * nc + c)] += left * w2[b * nc + c];
+                                    }
+                                }
+                            }
+                            for (ssize_t i = 0; i < ni; ++i) {
+                                for (ssize_t l = 0; l < nl; ++l) {
+                                    const ssize_t row = i * nl + l;
+                                    for (ssize_t j = 0; j < nj; ++j) {
+                                        for (ssize_t k = 0; k < nk; ++k) {
+                                            double total = 0.0;
+                                            for (ssize_t a = 0; a < na; ++a) {
+                                                const double e_value = e[(a * ni + i) * nj + j];
+                                                for (ssize_t c = 0; c < nc; ++c) {
+                                                    total += e_value
+                                                        * coupling[static_cast<size_t>(a * nc + c)]
+                                                        * f[(c * nl + l) * nk + k];
+                                                }
+                                            }
+                                            block.data[static_cast<size_t>(row * cols + j * nk + k)] += total;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    template<typename Scalar>
+    static const Scalar* arena_ptr(
+        const std::vector<Scalar>& arena,
         const std::vector<ssize_t>& offsets,
         const std::vector<ssize_t>& sizes,
         ssize_t group,
@@ -4157,8 +4865,9 @@ protected:
         return arena.data() + base;
     }
 
-    static cdouble* arena_mut_ptr(
-        std::vector<cdouble>& arena,
+    template<typename Scalar>
+    static Scalar* arena_mut_ptr(
+        std::vector<Scalar>& arena,
         const std::vector<ssize_t>& offsets,
         const std::vector<ssize_t>& sizes,
         ssize_t group,
@@ -4175,6 +4884,267 @@ protected:
             out *= values[static_cast<size_t>(i)];
         }
         return out;
+    }
+
+    static ssize_t real_blas_threshold() {
+        static const ssize_t threshold = []() {
+            const char* value = std::getenv("PYQED_U1_BLAS_THRESHOLD");
+            if (value == nullptr) {
+                return static_cast<ssize_t>(64);
+            }
+            try {
+                return std::max<ssize_t>(0, std::stoll(value));
+            } catch (...) {
+                return static_cast<ssize_t>(64);
+            }
+        }();
+        return threshold;
+    }
+
+    void apply_r_stage_real() {
+        for (const auto& spec : r_specs) {
+            const ssize_t nj = spec.shape_info[0];
+            const ssize_t nk = spec.shape_info[1];
+            const ssize_t nx = spec.shape_info[2];
+            const ssize_t ny = spec.shape_info[3];
+            const ssize_t na = spec.shape_info[4];
+            const ssize_t ni = spec.shape_info[5];
+            const ssize_t batch = spec.stack_shape[0];
+            const ssize_t e_stride = prod_tail(spec.stack_shape, 1, 4);
+            for (ssize_t entry = 0; entry < batch; ++entry) {
+                const double* e = spec.real_stack.data() + entry * e_stride;
+                const double* a = arena_ptr(
+                    real_a_arena, a_offsets, a_sizes, spec.input_group,
+                    spec.input_pos[static_cast<size_t>(entry)]
+                );
+                double* r = arena_mut_ptr(
+                    real_r_arena, r_offsets, r_sizes, spec.output_group,
+                    spec.output_pos[static_cast<size_t>(entry)]
+                );
+#ifdef __APPLE__
+                const ssize_t trailing = nk * nx * ny;
+                if (
+                    ni * trailing * nj >= real_blas_threshold()
+                    && ni <= std::numeric_limits<int>::max()
+                    && nj <= std::numeric_limits<int>::max()
+                    && trailing <= std::numeric_limits<int>::max()
+                ) {
+                    for (ssize_t alpha = 0; alpha < na; ++alpha) {
+                        cblas_dgemm(
+                            101, 111, 111,
+                            static_cast<int>(ni), static_cast<int>(trailing),
+                            static_cast<int>(nj), 1.0,
+                            e + alpha * ni * nj, static_cast<int>(nj),
+                            a, static_cast<int>(trailing), 1.0,
+                            r + alpha * ni * trailing, static_cast<int>(trailing)
+                        );
+                    }
+                    continue;
+                }
+#endif
+                for (ssize_t alpha = 0; alpha < na; ++alpha) {
+                    for (ssize_t i = 0; i < ni; ++i) {
+                        for (ssize_t k = 0; k < nk; ++k) {
+                            for (ssize_t x = 0; x < nx; ++x) {
+                                for (ssize_t y = 0; y < ny; ++y) {
+                                    double total = 0.0;
+                                    for (ssize_t j = 0; j < nj; ++j) {
+                                        total += e[(alpha * ni + i) * nj + j]
+                                            * a[((j * nk + k) * nx + x) * ny + y];
+                                    }
+                                    r[((((alpha * ni + i) * nk + k) * nx + x) * ny + y)] += total;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void apply_t2_stage_real() {
+        for (const auto& spec : t2_specs) {
+            const ssize_t na = spec.shape_info[0];
+            const ssize_t ni = spec.shape_info[1];
+            const ssize_t nk = spec.shape_info[2];
+            const ssize_t nx = spec.shape_info[3];
+            const ssize_t ny = spec.shape_info[4];
+            const ssize_t nb = spec.shape_info[8];
+            const ssize_t nu = spec.shape_info[9];
+            const ssize_t batch = spec.stack_shape[0];
+            const ssize_t w_stride = prod_tail(spec.stack_shape, 1, 5);
+            for (ssize_t entry = 0; entry < batch; ++entry) {
+                const double* r = arena_ptr(
+                    real_r_arena, r_offsets, r_sizes, spec.input_group,
+                    spec.input_pos[static_cast<size_t>(entry)]
+                );
+                const double* w = spec.real_stack.data() + entry * w_stride;
+                double* t2 = arena_mut_ptr(
+                    real_t2_arena, t2_offsets, t2_sizes, spec.output_group,
+                    spec.output_pos[static_cast<size_t>(entry)]
+                );
+#ifdef __APPLE__
+                const ssize_t rows = ni * nk;
+                if (
+                    nx == 1 && ny == 1 && nu == 1
+                    && rows * nb * na >= real_blas_threshold()
+                    && rows <= std::numeric_limits<int>::max()
+                    && nb <= std::numeric_limits<int>::max()
+                    && na <= std::numeric_limits<int>::max()
+                ) {
+                    cblas_dgemm(
+                        101, 112, 111,
+                        static_cast<int>(rows), static_cast<int>(nb),
+                        static_cast<int>(na), 1.0,
+                        r, static_cast<int>(rows),
+                        w, static_cast<int>(nb), 1.0,
+                        t2, static_cast<int>(nb)
+                    );
+                    continue;
+                }
+#endif
+                for (ssize_t i = 0; i < ni; ++i) {
+                    for (ssize_t k = 0; k < nk; ++k) {
+                        for (ssize_t y = 0; y < ny; ++y) {
+                            for (ssize_t b = 0; b < nb; ++b) {
+                                for (ssize_t u = 0; u < nu; ++u) {
+                                    double total = 0.0;
+                                    for (ssize_t alpha = 0; alpha < na; ++alpha) {
+                                        for (ssize_t x = 0; x < nx; ++x) {
+                                            total += r[((((alpha * ni + i) * nk + k) * nx + x) * ny + y)]
+                                                * w[(((alpha * nb + b) * nu + u) * nx + x)];
+                                        }
+                                    }
+                                    t2[((((i * nk + k) * ny + y) * nb + b) * nu + u)] += total;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void apply_t3_stage_real() {
+        for (const auto& spec : t3_specs) {
+            const ssize_t ni = spec.shape_info[0];
+            const ssize_t nk = spec.shape_info[1];
+            const ssize_t ny = spec.shape_info[2];
+            const ssize_t nb = spec.shape_info[3];
+            const ssize_t nu = spec.shape_info[4];
+            const ssize_t nc = spec.shape_info[8];
+            const ssize_t nv = spec.shape_info[9];
+            const ssize_t batch = spec.stack_shape[0];
+            const ssize_t w_stride = prod_tail(spec.stack_shape, 1, 5);
+            for (ssize_t entry = 0; entry < batch; ++entry) {
+                const double* t2 = arena_ptr(
+                    real_t2_arena, t2_offsets, t2_sizes, spec.input_group,
+                    spec.input_pos[static_cast<size_t>(entry)]
+                );
+                const double* w = spec.real_stack.data() + entry * w_stride;
+                double* t3 = arena_mut_ptr(
+                    real_t3_arena, t3_offsets, t3_sizes, spec.output_group,
+                    spec.output_pos[static_cast<size_t>(entry)]
+                );
+#ifdef __APPLE__
+                const ssize_t rows = ni * nk;
+                if (
+                    ny == 1 && nu == 1 && nv == 1
+                    && rows * nc * nb >= real_blas_threshold()
+                    && rows <= std::numeric_limits<int>::max()
+                    && nc <= std::numeric_limits<int>::max()
+                    && nb <= std::numeric_limits<int>::max()
+                ) {
+                    cblas_dgemm(
+                        101, 111, 111,
+                        static_cast<int>(rows), static_cast<int>(nc),
+                        static_cast<int>(nb), 1.0,
+                        t2, static_cast<int>(nb),
+                        w, static_cast<int>(nc), 1.0,
+                        t3, static_cast<int>(nc)
+                    );
+                    continue;
+                }
+#endif
+                for (ssize_t i = 0; i < ni; ++i) {
+                    for (ssize_t k = 0; k < nk; ++k) {
+                        for (ssize_t u = 0; u < nu; ++u) {
+                            for (ssize_t c = 0; c < nc; ++c) {
+                                for (ssize_t v = 0; v < nv; ++v) {
+                                    double total = 0.0;
+                                    for (ssize_t b = 0; b < nb; ++b) {
+                                        for (ssize_t y = 0; y < ny; ++y) {
+                                            total += t2[((((i * nk + k) * ny + y) * nb + b) * nu + u)]
+                                                * w[(((b * nc + c) * nv + v) * ny + y)];
+                                        }
+                                    }
+                                    t3[((((i * nk + k) * nu + u) * nc + c) * nv + v)] += total;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void apply_out_stage_real() {
+        for (const auto& spec : out_specs) {
+            const ssize_t ni = spec.shape_info[0];
+            const ssize_t nk = spec.shape_info[1];
+            const ssize_t nu = spec.shape_info[2];
+            const ssize_t nc = spec.shape_info[3];
+            const ssize_t nv = spec.shape_info[4];
+            const ssize_t nl = spec.shape_info[6];
+            const ssize_t batch = spec.stack_shape[0];
+            const ssize_t f_stride = prod_tail(spec.stack_shape, 1, 4);
+            for (ssize_t entry = 0; entry < batch; ++entry) {
+                const double* t3 = arena_ptr(
+                    real_t3_arena, t3_offsets, t3_sizes, spec.input_group,
+                    spec.input_pos[static_cast<size_t>(entry)]
+                );
+                const double* f = spec.real_stack.data() + entry * f_stride;
+                double* out = arena_mut_ptr(
+                    real_out_arena, out_offsets, out_sizes, spec.output_group,
+                    spec.output_pos[static_cast<size_t>(entry)]
+                );
+#ifdef __APPLE__
+                if (
+                    nu == 1 && nv == 1 && nc == 1
+                    && ni * nl * nk >= real_blas_threshold()
+                    && ni <= std::numeric_limits<int>::max()
+                    && nl <= std::numeric_limits<int>::max()
+                    && nk <= std::numeric_limits<int>::max()
+                ) {
+                    cblas_dgemm(
+                        101, 111, 112,
+                        static_cast<int>(ni), static_cast<int>(nl),
+                        static_cast<int>(nk), 1.0,
+                        t3, static_cast<int>(nk),
+                        f, static_cast<int>(nk), 1.0,
+                        out, static_cast<int>(nl)
+                    );
+                    continue;
+                }
+#endif
+                for (ssize_t i = 0; i < ni; ++i) {
+                    for (ssize_t l = 0; l < nl; ++l) {
+                        for (ssize_t u = 0; u < nu; ++u) {
+                            for (ssize_t v = 0; v < nv; ++v) {
+                                double total = 0.0;
+                                for (ssize_t c = 0; c < nc; ++c) {
+                                    for (ssize_t k = 0; k < nk; ++k) {
+                                        total += t3[((((i * nk + k) * nu + u) * nc + c) * nv + v)]
+                                            * f[((c * nl + l) * nk + k)];
+                                    }
+                                }
+                                out[(((i * nl + l) * nu + u) * nv + v)] += total;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     void apply_r_stage(
@@ -4203,6 +5173,36 @@ protected:
                     r_arena, r_offsets, r_sizes, spec.output_group,
                     spec.output_pos[static_cast<size_t>(entry)]
                 );
+#ifdef __APPLE__
+                const ssize_t trailing = nk * nx * ny;
+                if (
+                    ni * trailing * nj >= 64 &&
+                    ni <= std::numeric_limits<int>::max() &&
+                    nj <= std::numeric_limits<int>::max() &&
+                    trailing <= std::numeric_limits<int>::max()
+                ) {
+                    const cdouble one(1.0, 0.0);
+                    for (ssize_t alpha = 0; alpha < na; ++alpha) {
+                        cblas_zgemm(
+                            101,
+                            111,
+                            111,
+                            static_cast<int>(ni),
+                            static_cast<int>(trailing),
+                            static_cast<int>(nj),
+                            &one,
+                            e + alpha * ni * nj,
+                            static_cast<int>(nj),
+                            a,
+                            static_cast<int>(trailing),
+                            &one,
+                            r + alpha * ni * trailing,
+                            static_cast<int>(trailing)
+                        );
+                    }
+                    continue;
+                }
+#endif
                 for (ssize_t alpha = 0; alpha < na; ++alpha) {
                     for (ssize_t i = 0; i < ni; ++i) {
                         for (ssize_t k = 0; k < nk; ++k) {
@@ -4253,6 +5253,35 @@ protected:
                     t2_arena, t2_offsets, t2_sizes, spec.output_group,
                     spec.output_pos[static_cast<size_t>(entry)]
                 );
+#ifdef __APPLE__
+                const ssize_t rows = ni * nk;
+                if (
+                    nx == 1 && ny == 1 && nu == 1 &&
+                    rows * nb * na >= 64 &&
+                    rows <= std::numeric_limits<int>::max() &&
+                    nb <= std::numeric_limits<int>::max() &&
+                    na <= std::numeric_limits<int>::max()
+                ) {
+                    const cdouble one(1.0, 0.0);
+                    cblas_zgemm(
+                        101,
+                        112,
+                        111,
+                        static_cast<int>(rows),
+                        static_cast<int>(nb),
+                        static_cast<int>(na),
+                        &one,
+                        r,
+                        static_cast<int>(rows),
+                        w,
+                        static_cast<int>(nb),
+                        &one,
+                        t2,
+                        static_cast<int>(nb)
+                    );
+                    continue;
+                }
+#endif
                 for (ssize_t i = 0; i < ni; ++i) {
                     for (ssize_t k = 0; k < nk; ++k) {
                         for (ssize_t y = 0; y < ny; ++y) {
@@ -4307,6 +5336,35 @@ protected:
                     t3_arena, t3_offsets, t3_sizes, spec.output_group,
                     spec.output_pos[static_cast<size_t>(entry)]
                 );
+#ifdef __APPLE__
+                const ssize_t rows = ni * nk;
+                if (
+                    ny == 1 && nu == 1 && nv == 1 &&
+                    rows * nc * nb >= 64 &&
+                    rows <= std::numeric_limits<int>::max() &&
+                    nc <= std::numeric_limits<int>::max() &&
+                    nb <= std::numeric_limits<int>::max()
+                ) {
+                    const cdouble one(1.0, 0.0);
+                    cblas_zgemm(
+                        101,
+                        111,
+                        111,
+                        static_cast<int>(rows),
+                        static_cast<int>(nc),
+                        static_cast<int>(nb),
+                        &one,
+                        t2,
+                        static_cast<int>(nb),
+                        w,
+                        static_cast<int>(nc),
+                        &one,
+                        t3,
+                        static_cast<int>(nc)
+                    );
+                    continue;
+                }
+#endif
                 for (ssize_t i = 0; i < ni; ++i) {
                     for (ssize_t k = 0; k < nk; ++k) {
                         for (ssize_t u = 0; u < nu; ++u) {
@@ -4360,6 +5418,34 @@ protected:
                     out_arena, out_offsets, out_sizes, spec.output_group,
                     spec.output_pos[static_cast<size_t>(entry)]
                 );
+#ifdef __APPLE__
+                if (
+                    nu == 1 && nv == 1 && nc == 1 &&
+                    ni * nl * nk >= 64 &&
+                    ni <= std::numeric_limits<int>::max() &&
+                    nl <= std::numeric_limits<int>::max() &&
+                    nk <= std::numeric_limits<int>::max()
+                ) {
+                    const cdouble one(1.0, 0.0);
+                    cblas_zgemm(
+                        101,
+                        111,
+                        112,
+                        static_cast<int>(ni),
+                        static_cast<int>(nl),
+                        static_cast<int>(nk),
+                        &one,
+                        t3,
+                        static_cast<int>(nk),
+                        f,
+                        static_cast<int>(nk),
+                        &one,
+                        out,
+                        static_cast<int>(nl)
+                    );
+                    continue;
+                }
+#endif
                 for (ssize_t i = 0; i < ni; ++i) {
                     for (ssize_t l = 0; l < nl; ++l) {
                         for (ssize_t u = 0; u < nu; ++u) {
@@ -4512,6 +5598,13 @@ public:
     };
 
     struct ContextualBoundaryBatchPlanRecord {
+        struct TensorGroupRecord {
+            py::object tensor;
+            py::object grouped;
+            ssize_t first_axis = -1;
+            ssize_t second_axis = -1;
+        };
+
         py::dict boundary_cache;
         py::dict env_cache;
         py::dict local_table_cache;
@@ -4531,6 +5624,9 @@ public:
         ssize_t site = 0;
         ssize_t n_sites = 0;
         ssize_t suffix_start = 0;
+        std::unordered_map<ssize_t, TensorGroupRecord> site_a_groups;
+        std::unordered_map<ssize_t, TensorGroupRecord> site_b_groups;
+        std::unordered_map<std::uintptr_t, TensorGroupRecord> operator_groups;
     };
 
     struct ContextualPrebuiltFinalizerRecord {
@@ -4715,6 +5811,7 @@ public:
     long long compact_plan_diagonal_cache_hits = 0;
     long long compact_plan_davidson_calls = 0;
     long long compact_plan_davidson_workspace_reuses = 0;
+    long long compact_plan_real_output_phase_fixes = 0;
     long long grouped_table_installs = 0;
     long long grouped_table_replacements = 0;
     long long grouped_table_matvec_calls = 0;
@@ -5172,6 +6269,8 @@ public:
     long long contextual_wave_unsupported = 0;
     long long contextual_wave_op_hits = 0;
     long long contextual_wave_op_builds = 0;
+    long long contextual_wave_tensor_group_hits = 0;
+    long long contextual_wave_tensor_group_builds = 0;
     long long contextual_wave_prefetch_calls = 0;
     long long contextual_wave_prefetch_entries = 0;
     long long contextual_wave_prefetch_failures = 0;
@@ -5428,6 +6527,24 @@ public:
         for (ssize_t i = 0; i < record.dim; ++i) {
             v[static_cast<size_t>(i)] = v0(i);
         }
+        if (record.plan->real_stacks) {
+            double real_norm2 = 0.0;
+            double imag_norm2 = 0.0;
+            for (const cdouble value : v) {
+                real_norm2 += value.real() * value.real();
+                imag_norm2 += value.imag() * value.imag();
+            }
+            const bool use_imaginary_component = imag_norm2 > real_norm2;
+            for (cdouble& value : v) {
+                value = cdouble(
+                    use_imaginary_component ? value.imag() : value.real(),
+                    0.0
+                );
+            }
+            for (cdouble& value : record.diagonal_cache) {
+                value = cdouble(value.real(), 0.0);
+            }
+        }
         const bool reused = record.davidson_workspace.initialized;
         py::dict out = ::davidson(
             record.dim,
@@ -5442,6 +6559,43 @@ public:
                 return record.plan->matvec_vector(x);
             }
         );
+        if (
+            std::isfinite(record.plan->max_stack_imag)
+            && record.plan->max_stack_imag <= 1.0e-13
+            && out.contains("vector")
+        ) {
+            py::array_t<cdouble, py::array::c_style | py::array::forcecast> vector =
+                py::cast<py::array_t<cdouble, py::array::c_style | py::array::forcecast>>(
+                    out["vector"]
+                );
+            auto values = vector.mutable_unchecked<1>();
+            ssize_t pivot = 0;
+            double pivot_abs = 0.0;
+            for (ssize_t index = 0; index < values.shape(0); ++index) {
+                const double magnitude = std::abs(values(index));
+                if (magnitude > pivot_abs) {
+                    pivot_abs = magnitude;
+                    pivot = index;
+                }
+            }
+            if (pivot_abs > 0.0) {
+                const cdouble phase = std::conj(values(pivot)) / pivot_abs;
+                double max_imag = 0.0;
+                double max_abs = 0.0;
+                for (ssize_t index = 0; index < values.shape(0); ++index) {
+                    values(index) *= phase;
+                    max_imag = std::max(max_imag, std::abs(values(index).imag()));
+                    max_abs = std::max(max_abs, std::abs(values(index)));
+                }
+                if (max_imag <= 1.0e-11 * std::max(1.0, max_abs)) {
+                    for (ssize_t index = 0; index < values.shape(0); ++index) {
+                        values(index) = cdouble(values(index).real(), 0.0);
+                    }
+                    out["vector"] = vector;
+                    ++compact_plan_real_output_phase_fixes;
+                }
+            }
+        }
         ++compact_plan_davidson_calls;
         if (reused) {
             ++compact_plan_davidson_workspace_reuses;
@@ -6514,6 +7668,23 @@ public:
         py::object boundary_batch,
         py::object left_table,
         py::object right_table,
+        py::object source = py::none()
+    );
+
+    py::tuple build_native_p_identity_entries(
+        py::object planned_cls,
+        py::sequence owner_records,
+        py::dict coefficients,
+        py::dict left_boundary_operators,
+        py::dict right_boundary_operators,
+        py::dict left_same_side_operators,
+        py::dict right_same_side_operators,
+        py::object left_identity,
+        py::object right_identity,
+        py::object local_pair_builder,
+        py::object left_table,
+        py::object right_table,
+        ssize_t bond,
         py::object source = py::none()
     );
 
@@ -8655,7 +9826,12 @@ public:
 
     py::dict apply_same_side_route_boundary_parent_advances(
         py::object available_rows_obj,
-        py::object advance_fn
+        py::object advance_fn,
+        py::object side_obj = py::none(),
+        py::object site_a_conj = py::none(),
+        py::object site_b = py::none(),
+        py::object tensor_cls = py::none(),
+        py::object local_operator_fn = py::none()
     ) {
         ++same_side_route_boundary_parent_advance_calls;
         const double start = wall_seconds();
@@ -8675,6 +9851,30 @@ public:
             long long cache_hits = 0;
             long long cache_builds = 0;
             long long none_count = 0;
+            long long native_identity = 0;
+            long long native_local = 0;
+            const bool native_identity_enabled =
+                !side_obj.is_none()
+                && !site_a_conj.is_none()
+                && !site_b.is_none()
+                && !tensor_cls.is_none();
+            const bool is_right = native_identity_enabled
+                && py::str(side_obj).cast<std::string>() == "right";
+            py::dict a_group;
+            py::dict b_group;
+            py::dict local_operator_cache;
+            py::dict local_operator_group_cache;
+            if (native_identity_enabled) {
+                a_group = packed_tensor_group_by_axis(
+                    site_a_conj,
+                    is_right ? 1 : 0
+                );
+                b_group = packed_tensor_group_by_axes(
+                    site_b,
+                    is_right ? 1 : 0,
+                    2
+                );
+            }
             for (ssize_t idx = 0; idx < n_rows; ++idx) {
                 py::sequence row = py::reinterpret_borrow<py::sequence>(
                     available_rows[idx]
@@ -8717,7 +9917,94 @@ public:
                     );
                     ++cache_hits;
                 } else {
-                    advanced = advance_fn(pattern, parent_value);
+                    const bool identity_row =
+                        native_identity_enabled
+                        && py::str(local_piece).cast<std::string>() == "I";
+                    if (identity_row) {
+                        py::tuple payload = is_right
+                            ? packed_right_identity_boundary_advance_payload_grouped(
+                                site_a_conj,
+                                parent_value,
+                                site_b,
+                                a_group,
+                                b_group
+                            )
+                            : packed_left_identity_boundary_advance_payload_grouped(
+                                site_a_conj,
+                                parent_value,
+                                site_b,
+                                a_group,
+                                b_group
+                            );
+                        advanced = packed_tensor_from_payload(
+                            tensor_cls,
+                            payload,
+                            "same_side_route_parent_identity"
+                        );
+                        ++native_identity;
+                    } else if (
+                        native_identity_enabled
+                        && !local_operator_fn.is_none()
+                        && PyCallable_Check(local_operator_fn.ptr())
+                    ) {
+                        py::tuple operator_key = py::make_tuple(
+                            local_piece,
+                            py::tuple(py::getattr(parent_value, "qns").attr("__getitem__")(0))
+                        );
+                        py::object local_operator = py::none();
+                        py::dict w_group;
+                        if (local_operator_cache.contains(operator_key)) {
+                            local_operator = py::reinterpret_borrow<py::object>(
+                                local_operator_cache[operator_key]
+                            );
+                            w_group = py::reinterpret_borrow<py::dict>(
+                                local_operator_group_cache[operator_key]
+                            );
+                        } else {
+                            local_operator = local_operator_fn(
+                                local_piece,
+                                parent_value
+                            );
+                            local_operator_cache[operator_key] = local_operator;
+                            if (!local_operator.is_none()) {
+                                w_group = packed_tensor_group_by_axes(
+                                    local_operator,
+                                    is_right ? 1 : 0,
+                                    2
+                                );
+                                local_operator_group_cache[operator_key] = w_group;
+                            }
+                        }
+                        if (!local_operator.is_none()) {
+                            py::tuple payload = is_right
+                                ? packed_right_boundary_advance_payload_grouped(
+                                    local_operator,
+                                    site_a_conj,
+                                    parent_value,
+                                    site_b,
+                                    a_group,
+                                    w_group,
+                                    b_group
+                                )
+                                : packed_left_boundary_advance_payload_grouped(
+                                    local_operator,
+                                    site_a_conj,
+                                    parent_value,
+                                    site_b,
+                                    a_group,
+                                    w_group,
+                                    b_group
+                                );
+                            advanced = packed_tensor_from_payload(
+                                tensor_cls,
+                                payload,
+                                "same_side_route_parent_local"
+                            );
+                            ++native_local;
+                        }
+                    } else {
+                        advanced = advance_fn(pattern, parent_value);
+                    }
                     advance_cache[advance_key] = advanced;
                     ++cache_builds;
                 }
@@ -8761,6 +10048,8 @@ public:
             out["cache_hits"] = py::int_(cache_hits);
             out["cache_builds"] = py::int_(cache_builds);
             out["none"] = py::int_(none_count);
+            out["native_identity"] = py::int_(native_identity);
+            out["native_local"] = py::int_(native_local);
             out["seconds"] = py::float_(elapsed);
             return out;
         } catch (const py::error_already_set& exc) {
@@ -10928,6 +12217,10 @@ public:
                          "direct_table_schedule_hits",
                          "direct_table_schedule_misses",
                          "direct_table_schedule_stores",
+                         "spatial_scalar_route_accumulations",
+                         "spatial_scalar_batch_calls",
+                         "spatial_scalar_batched_routes",
+                         "spatial_scalar_batched_channels",
                      }) {
                     if (info.contains(py::str(key))) {
                         std::string stat_key =
@@ -11107,6 +12400,10 @@ public:
                      "direct_table_schedule_hits",
                      "direct_table_schedule_misses",
                      "direct_table_schedule_stores",
+                     "spatial_scalar_route_accumulations",
+                     "spatial_scalar_batch_calls",
+                     "spatial_scalar_batched_routes",
+                     "spatial_scalar_batched_channels",
                  }) {
                 if (info.contains(py::str(key))) {
                     std::string stat_key =
@@ -13826,7 +15123,35 @@ public:
 
     py::dict stats() const {
         py::dict out;
+        long long compact_real_stack_records = 0;
+        long long compact_real_matvec_calls = 0;
+        long long compact_complex_matvec_calls = 0;
+        long long compact_real_solution_phase_fixes = 0;
+        double compact_max_stack_imag = 0.0;
+        for (const auto& item : compact_records) {
+            const CppCompactPlan* plan = item.second.plan;
+            if (plan == nullptr) {
+                continue;
+            }
+            compact_real_stack_records += (
+                std::isfinite(plan->max_stack_imag)
+                && plan->max_stack_imag <= 1.0e-13
+            ) ? 1 : 0;
+            compact_real_matvec_calls += plan->real_matvec_calls;
+            compact_complex_matvec_calls += plan->complex_matvec_calls;
+            compact_real_solution_phase_fixes += plan->real_solution_phase_fixes;
+            compact_max_stack_imag = std::max(
+                compact_max_stack_imag,
+                plan->max_stack_imag
+            );
+        }
         out["compact_plan_records"] = static_cast<long long>(compact_records.size());
+        out["compact_plan_real_stack_records"] = compact_real_stack_records;
+        out["compact_plan_real_matvec_calls"] = compact_real_matvec_calls;
+        out["compact_plan_complex_matvec_calls"] = compact_complex_matvec_calls;
+        out["compact_plan_real_solution_phase_fixes"] =
+            compact_real_solution_phase_fixes;
+        out["compact_plan_max_stack_imag"] = compact_max_stack_imag;
         out["compact_plan_installs"] = compact_plan_installs;
         out["compact_plan_replacements"] = compact_plan_replacements;
         out["compact_plan_matvec_calls"] = compact_plan_matvec_calls;
@@ -13835,6 +15160,8 @@ public:
         out["compact_plan_davidson_calls"] = compact_plan_davidson_calls;
         out["compact_plan_davidson_workspace_reuses"] =
             compact_plan_davidson_workspace_reuses;
+        out["compact_plan_real_output_phase_fixes"] =
+            compact_plan_real_output_phase_fixes;
         out["grouped_table_records"] =
             static_cast<long long>(grouped_table_records.size());
         out["grouped_table_installs"] = grouped_table_installs;
@@ -14711,6 +16038,10 @@ public:
         out["contextual_wave_unsupported"] = contextual_wave_unsupported;
         out["contextual_wave_op_hits"] = contextual_wave_op_hits;
         out["contextual_wave_op_builds"] = contextual_wave_op_builds;
+        out["contextual_wave_tensor_group_hits"] =
+            contextual_wave_tensor_group_hits;
+        out["contextual_wave_tensor_group_builds"] =
+            contextual_wave_tensor_group_builds;
         out["contextual_wave_prefetch_calls"] = contextual_wave_prefetch_calls;
         out["contextual_wave_prefetch_entries"] = contextual_wave_prefetch_entries;
         out["contextual_wave_prefetch_failures"] = contextual_wave_prefetch_failures;
@@ -20643,6 +21974,7 @@ public:
     std::vector<DirectTablePayloadSignatureItem> direct_table_execution_signature;
     ssize_t direct_table_execution_plan_builds = 0;
     ssize_t direct_table_execution_plan_hits = 0;
+    ssize_t direct_table_execution_plan_rebinds = 0;
     ssize_t direct_table_execution_plan_misses = 0;
     ssize_t direct_table_execution_plan_steps = 0;
     ssize_t direct_table_execution_plan_same_side_steps = 0;
@@ -21586,6 +22918,36 @@ public:
         return true;
     }
 
+    bool direct_table_family_signature_matches(
+        py::dict direct_family_environments
+    ) const {
+        const ssize_t n = static_cast<ssize_t>(py::len(direct_family_environments));
+        if (
+            direct_table_execution_signature.empty()
+            || static_cast<ssize_t>(direct_table_execution_signature.size()) != n
+        ) {
+            return false;
+        }
+        ssize_t index = 0;
+        for (auto family_item : direct_family_environments) {
+            py::object key = py::reinterpret_borrow<py::object>(
+                family_item.first
+            );
+            Py_hash_t key_hash = PyObject_Hash(key.ptr());
+            if (key_hash == -1) {
+                throw py::error_already_set();
+            }
+            const auto& sig = direct_table_execution_signature[
+                static_cast<size_t>(index)
+            ];
+            if (sig.key_hash != key_hash || !object_equal(sig.key, key)) {
+                return false;
+            }
+            ++index;
+        }
+        return true;
+    }
+
     void rebuild_direct_table_payload_signature(
         py::dict direct_family_environments
     ) {
@@ -21704,6 +23066,84 @@ public:
         return false;
     }
 
+    bool rebind_direct_table_execution_step(
+        py::object entries_obj,
+        size_t& step_index
+    ) {
+        py::object composite = CppRawRoutePlan::composite_entries_payload(entries_obj);
+        if (!composite.is_none()) {
+            py::sequence parts = composite.attr("parts").cast<py::sequence>();
+            const ssize_t n_parts = static_cast<ssize_t>(py::len(parts));
+            for (ssize_t part_index = 0; part_index < n_parts; ++part_index) {
+                py::object part = py::reinterpret_borrow<py::object>(
+                    parts[part_index]
+                );
+                if (!rebind_direct_table_execution_step(part, step_index)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        if (step_index >= direct_table_execution_steps.size()) {
+            return false;
+        }
+        auto& step = direct_table_execution_steps[step_index];
+        DirectTableExecutionStepKind kind;
+        py::object payload;
+        if (CppRawRoutePlan::is_same_side_route_identity_entries(entries_obj)) {
+            kind = DirectTableExecutionStepKind::SameSideIdentity;
+            payload = entries_obj;
+        } else {
+            py::object planned = CppRawRoutePlan::planned_entries_payload(entries_obj);
+            if (!planned.is_none()) {
+                kind = planned_payload_is_table_backed(planned)
+                    ? DirectTableExecutionStepKind::TableBackedPlanned
+                    : DirectTableExecutionStepKind::PlannedDirect;
+                payload = planned;
+            } else {
+                py::object packed = CppRawRoutePlan::packed_entries_payload(entries_obj);
+                if (packed.is_none()) {
+                    return false;
+                }
+                kind = DirectTableExecutionStepKind::PackedDirect;
+                payload = packed;
+            }
+        }
+        if (step.kind != kind) {
+            return false;
+        }
+        step.entries = entries_obj;
+        step.payload = payload;
+        step.entries_ptr = entries_obj.ptr();
+        step.payload_ptr = payload.ptr();
+        ++step_index;
+        return true;
+    }
+
+    bool rebind_direct_table_execution_plan(
+        py::dict direct_family_environments
+    ) {
+        if (!direct_table_family_signature_matches(direct_family_environments)) {
+            return false;
+        }
+        size_t step_index = 0;
+        for (auto family_item : direct_family_environments) {
+            py::object entries_obj = py::reinterpret_borrow<py::object>(
+                family_item.second
+            );
+            if (!rebind_direct_table_execution_step(entries_obj, step_index)) {
+                return false;
+            }
+        }
+        if (step_index != direct_table_execution_steps.size()) {
+            return false;
+        }
+        rebuild_direct_table_payload_signature(direct_family_environments);
+        ++direct_table_execution_plan_rebinds;
+        return true;
+    }
+
     void clear_direct_table_execution_plan() {
         direct_table_execution_steps.clear();
         direct_table_execution_signature.clear();
@@ -21746,6 +23186,12 @@ public:
             && direct_table_payload_signature_matches(direct_family_environments)
         ) {
             ++direct_table_execution_plan_hits;
+            return true;
+        }
+        if (
+            !direct_table_execution_steps.empty()
+            && rebind_direct_table_execution_plan(direct_family_environments)
+        ) {
             return true;
         }
         return rebuild_direct_table_execution_plan(direct_family_environments);
@@ -21924,6 +23370,8 @@ public:
             direct_table_execution_plan_builds;
         out["direct_table_execution_plan_hits"] =
             direct_table_execution_plan_hits;
+        out["direct_table_execution_plan_rebinds"] =
+            direct_table_execution_plan_rebinds;
         out["direct_table_execution_plan_misses"] =
             direct_table_execution_plan_misses;
         out["direct_table_execution_plan_steps"] =
@@ -21950,6 +23398,18 @@ public:
             + ctx.identity_left_stacks.size()
             + ctx.identity_right_stacks.size()
         );
+        out["last_left_stack_builds"] = ctx.left_stack_builds;
+        out["last_right_stack_builds"] = ctx.right_stack_builds;
+        out["last_identity_left_stack_builds"] =
+            ctx.identity_left_stack_builds;
+        out["last_identity_right_stack_builds"] =
+            ctx.identity_right_stack_builds;
+        out["last_left_stack_seconds"] = ctx.left_stack_seconds;
+        out["last_right_stack_seconds"] = ctx.right_stack_seconds;
+        out["last_identity_left_stack_seconds"] =
+            ctx.identity_left_stack_seconds;
+        out["last_identity_right_stack_seconds"] =
+            ctx.identity_right_stack_seconds;
         return out;
     }
 };
@@ -23477,6 +24937,7 @@ public:
     std::unordered_map<RawGroupKey, size_t, RawGroupKeyHash> raw_schedule_group_index;
     std::vector<RawGroup> direct_table_schedule_groups;
     std::vector<ssize_t> direct_table_schedule_group_route_counts;
+    std::vector<size_t> direct_table_schedule_route_groups;
     std::unordered_map<RawGroupKey, size_t, RawGroupKeyHash>
         direct_table_schedule_group_index;
     bool raw_schedule_valid;
@@ -23491,6 +24952,10 @@ public:
     long long direct_table_schedule_hits;
     long long direct_table_schedule_misses;
     long long direct_table_schedule_stores;
+    long long spatial_scalar_route_accumulations;
+    long long spatial_scalar_batch_calls;
+    long long spatial_scalar_batched_routes;
+    long long spatial_scalar_batched_channels;
     ssize_t dim;
     ssize_t n_group_count;
     ssize_t n_group_channel_count;
@@ -23510,6 +24975,7 @@ public:
     mutable std::vector<size_t> dense_flat_csr_active_rows;
     mutable std::vector<size_t> dense_flat_csr_cols;
     mutable std::vector<cdouble> dense_flat_csr_values;
+    mutable std::vector<cdouble> factorized_matvec_tmp;
     mutable long long dense_matvec_batch_rebuilds;
     mutable long long dense_matvec_same_input_batch_count;
     mutable long long dense_matvec_same_output_batch_count;
@@ -23543,6 +25009,10 @@ public:
           direct_table_schedule_hits(0),
           direct_table_schedule_misses(0),
           direct_table_schedule_stores(0),
+          spatial_scalar_route_accumulations(0),
+          spatial_scalar_batch_calls(0),
+          spatial_scalar_batched_routes(0),
+          spatial_scalar_batched_channels(0),
           dim(0),
           n_group_count(0),
           n_group_channel_count(0),
@@ -23693,6 +25163,10 @@ public:
         direct_table_schedule_hits(0),
         direct_table_schedule_misses(0),
         direct_table_schedule_stores(0),
+        spatial_scalar_route_accumulations(0),
+        spatial_scalar_batch_calls(0),
+        spatial_scalar_batched_routes(0),
+        spatial_scalar_batched_channels(0),
         n_group_count(0),
         n_group_channel_count(0),
         dense_element_count(0),
@@ -24016,6 +25490,7 @@ public:
         direct_table_schedule_valid = false;
         direct_table_schedule_groups.clear();
         direct_table_schedule_group_route_counts.clear();
+        direct_table_schedule_route_groups.clear();
         direct_table_schedule_group_index.clear();
         direct_table_schedule_route_count = 0;
         direct_table_schedule_dim = 0;
@@ -24761,7 +26236,8 @@ public:
         const std::array<ssize_t, 8>& dims_entry,
         ssize_t in_start,
         ssize_t out_start,
-        cdouble scale
+        cdouble scale,
+        size_t known_group = std::numeric_limits<size_t>::max()
     ) {
         if (std::abs(scale) <= 0.0) {
             return;
@@ -24789,14 +26265,42 @@ public:
         if (right.shape(1) != nk * ny || right.shape(2) != nl * nv) {
             throw std::runtime_error("direct grouped right tensor shape does not match dims");
         }
-        DenseOwnedBlock& block = direct_dense_block(
-            group_index,
-            dims_entry,
-            in_start,
-            out_start
-        );
+        DenseOwnedBlock& block = known_group == std::numeric_limits<size_t>::max()
+            ? direct_dense_block(group_index, dims_entry, in_start, out_start)
+            : dense_blocks.at(known_group);
         const ssize_t out_size = block.rows;
         const ssize_t in_size = block.cols;
+        if (nu == 1 && nv == 1 && nx == 1 && ny == 1) {
+            const cdouble* left_ptr = left_arr.data();
+            const cdouble* right_ptr = right_arr.data();
+            for (ssize_t channel = 0; channel < channels; ++channel) {
+                const size_t left_channel = static_cast<size_t>(channel * ni * nj);
+                const size_t right_channel = static_cast<size_t>(channel * nk * nl);
+                for (ssize_t i = 0; i < ni; ++i) {
+                    for (ssize_t l = 0; l < nl; ++l) {
+                        const size_t row_offset = static_cast<size_t>(
+                            (i * nl + l) * in_size
+                        );
+                        for (ssize_t j = 0; j < nj; ++j) {
+                            const cdouble scaled_left = scale * left_ptr[
+                                left_channel + static_cast<size_t>(i * nj + j)
+                            ];
+                            const size_t col_offset = static_cast<size_t>(j * nk);
+                            for (ssize_t k = 0; k < nk; ++k) {
+                                block.data[row_offset + col_offset + static_cast<size_t>(k)] +=
+                                    scaled_left * right_ptr[
+                                        right_channel + static_cast<size_t>(k * nl + l)
+                                    ];
+                            }
+                        }
+                    }
+                }
+            }
+            n_group_channel_count += channels;
+            ++route_count;
+            ++spatial_scalar_route_accumulations;
+            return;
+        }
         const GroupIndexMaps& maps = cached_group_index_maps(
             ni,
             nl,
@@ -24825,6 +26329,66 @@ public:
         }
         n_group_channel_count += channels;
         ++route_count;
+    }
+
+    void accumulate_spatial_scalar_batch(
+        size_t group_pos,
+        const std::array<ssize_t, 8>& dims_entry,
+        const std::vector<cdouble>& left_batch,
+        const std::vector<cdouble>& right_batch,
+        ssize_t channels,
+        ssize_t routes
+    ) {
+        if (channels <= 0 || routes <= 0 || group_pos >= dense_blocks.size()) {
+            return;
+        }
+        const ssize_t ni = dims_entry[0];
+        const ssize_t nl = dims_entry[1];
+        const ssize_t nj = dims_entry[4];
+        const ssize_t nk = dims_entry[6];
+        const ssize_t left_size = ni * nj;
+        const ssize_t right_size = nk * nl;
+        if (
+            dims_entry[2] != 1 || dims_entry[3] != 1
+            || dims_entry[5] != 1 || dims_entry[7] != 1
+            || left_size <= 0 || right_size <= 0
+            || static_cast<ssize_t>(left_batch.size()) != channels * left_size
+            || static_cast<ssize_t>(right_batch.size()) != channels * right_size
+        ) {
+            throw std::runtime_error("invalid spatial scalar route batch");
+        }
+        DenseOwnedBlock& block = dense_blocks[group_pos];
+        if (block.rows != ni * nl || block.cols != nj * nk) {
+            throw std::runtime_error("spatial scalar route batch block shape mismatch");
+        }
+        const ssize_t in_size = nj * nk;
+        for (ssize_t channel = 0; channel < channels; ++channel) {
+            const size_t left_offset = static_cast<size_t>(channel * left_size);
+            const size_t right_offset = static_cast<size_t>(channel * right_size);
+            for (ssize_t i = 0; i < ni; ++i) {
+                for (ssize_t l = 0; l < nl; ++l) {
+                    const size_t block_row = static_cast<size_t>(
+                        (i * nl + l) * in_size
+                    );
+                    for (ssize_t j = 0; j < nj; ++j) {
+                        const cdouble value = left_batch[
+                            left_offset + static_cast<size_t>(i * nj + j)
+                        ];
+                        const size_t block_col = static_cast<size_t>(j * nk);
+                        for (ssize_t k = 0; k < nk; ++k) {
+                            block.data[
+                                block_row + block_col + static_cast<size_t>(k)
+                            ] += value * right_batch[
+                                right_offset + static_cast<size_t>(k * nl + l)
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+        ++spatial_scalar_batch_calls;
+        spatial_scalar_batched_routes += routes;
+        spatial_scalar_batched_channels += channels;
     }
 
     void maybe_convert_to_sparse(double sparse_density_threshold) {
@@ -25316,9 +26880,30 @@ public:
     }
 
     struct FastTablePayloadBuilder {
+        struct ScalarBatch {
+            std::array<ssize_t, 8> dims{};
+            std::vector<cdouble> left;
+            std::vector<cdouble> right;
+            ssize_t channels = 0;
+            ssize_t routes = 0;
+        };
+
         CppGroupedRenormalizedTable* table;
         std::unordered_map<RawGroupKey, size_t, RawGroupKeyHash>* group_index;
         std::vector<ssize_t>* group_route_counts = nullptr;
+        std::vector<size_t>* route_group_schedule = nullptr;
+        bool use_route_group_schedule = false;
+        bool enable_scalar_batch = []() {
+            const char* value = std::getenv("PYQED_U1_SCALAR_ROUTE_BATCH");
+            return value == nullptr || (
+                std::string(value) != "0"
+                && std::string(value) != "false"
+                && std::string(value) != "False"
+            );
+        }();
+        size_t route_index = 0;
+        bool route_group_schedule_match = true;
+        std::vector<ScalarBatch> scalar_batches;
         std::vector<int> entries;
         ssize_t stats_components = 0;
         ssize_t stats_identity_components = 0;
@@ -25328,6 +26913,34 @@ public:
         double stats_append_identity_seconds = 0.0;
         double stats_append_direct_seconds = 0.0;
 
+        void flush_scalar_batch(size_t group_pos) {
+            if (group_pos >= scalar_batches.size()) {
+                return;
+            }
+            ScalarBatch& batch = scalar_batches[group_pos];
+            if (batch.channels <= 0) {
+                return;
+            }
+            table->accumulate_spatial_scalar_batch(
+                group_pos,
+                batch.dims,
+                batch.left,
+                batch.right,
+                batch.channels,
+                batch.routes
+            );
+            batch.left.clear();
+            batch.right.clear();
+            batch.channels = 0;
+            batch.routes = 0;
+        }
+
+        void flush_scalar_batches() {
+            for (size_t group_pos = 0; group_pos < scalar_batches.size(); ++group_pos) {
+                flush_scalar_batch(group_pos);
+            }
+        }
+
         void add_entry_unchecked(
             py::array_t<cdouble> left,
             py::array_t<cdouble> right,
@@ -25336,32 +26949,144 @@ public:
             ssize_t out_start,
             cdouble scale = cdouble(1.0, 0.0)
         ) {
-            RawGroupKey key = CppGroupedRenormalizedTable::raw_group_key(
-                dims,
-                in_start,
-                out_start
-            );
-            table->accumulate_raw_stack(
-                *group_index,
-                std::move(left),
-                std::move(right),
-                dims,
-                in_start,
-                out_start,
-                scale
-            );
-            if (group_route_counts != nullptr) {
+            if (std::abs(scale) <= 0.0) {
+                return;
+            }
+            size_t group_pos = std::numeric_limits<size_t>::max();
+            if (
+                use_route_group_schedule
+                && route_group_schedule != nullptr
+                && route_index < route_group_schedule->size()
+            ) {
+                const size_t scheduled_group = (*route_group_schedule)[route_index];
+                if (scheduled_group < table->direct_table_schedule_groups.size()) {
+                    const RawGroup& group =
+                        table->direct_table_schedule_groups[scheduled_group];
+                    if (
+                        group.dims == dims
+                        && group.in_start == in_start
+                        && group.out_start == out_start
+                    ) {
+                        group_pos = scheduled_group;
+                    }
+                }
+            }
+            if (
+                use_route_group_schedule
+                && group_pos == std::numeric_limits<size_t>::max()
+            ) {
+                route_group_schedule_match = false;
+            }
+            if (group_pos == std::numeric_limits<size_t>::max()) {
+                RawGroupKey key = CppGroupedRenormalizedTable::raw_group_key(
+                    dims,
+                    in_start,
+                    out_start
+                );
                 auto found = group_index->find(key);
                 if (found == group_index->end()) {
+                    table->direct_dense_block(
+                        *group_index,
+                        dims,
+                        in_start,
+                        out_start
+                    );
+                    found = group_index->find(key);
+                    if (found == group_index->end()) {
+                        throw std::runtime_error(
+                            "direct table route group was not registered"
+                        );
+                    }
+                }
+                group_pos = found->second;
+                if (!use_route_group_schedule && route_group_schedule != nullptr) {
+                    route_group_schedule->push_back(group_pos);
+                }
+            }
+            const bool spatial_scalar = enable_scalar_batch && (
+                dims[2] == 1 && dims[3] == 1
+                && dims[5] == 1 && dims[7] == 1
+            );
+            if (spatial_scalar) {
+                if (left.ndim() != 3 || right.ndim() != 3) {
                     throw std::runtime_error(
-                        "direct table route count group was not registered"
+                        "direct grouped scalar tensors must be rank-3"
                     );
                 }
-                if (group_route_counts->size() <= found->second) {
-                    group_route_counts->resize(found->second + 1, 0);
+                const ssize_t channels = left.shape(0);
+                const ssize_t left_size = dims[0] * dims[4];
+                const ssize_t right_size = dims[6] * dims[1];
+                if (
+                    right.shape(0) != channels
+                    || left.shape(1) != dims[0]
+                    || left.shape(2) != dims[4]
+                    || right.shape(1) != dims[6]
+                    || right.shape(2) != dims[1]
+                ) {
+                    throw std::runtime_error(
+                        "direct grouped scalar tensor shape mismatch"
+                    );
                 }
-                ++(*group_route_counts)[found->second];
+                if (scalar_batches.size() <= group_pos) {
+                    scalar_batches.resize(group_pos + 1);
+                }
+                ScalarBatch& batch = scalar_batches[group_pos];
+                batch.dims = dims;
+                const cdouble* left_data = left.data();
+                const cdouble* right_data = right.data();
+                const size_t old_left = batch.left.size();
+                const size_t old_right = batch.right.size();
+                batch.left.resize(
+                    old_left + static_cast<size_t>(channels * left_size)
+                );
+                batch.right.resize(
+                    old_right + static_cast<size_t>(channels * right_size)
+                );
+                for (ssize_t index = 0; index < channels * left_size; ++index) {
+                    batch.left[old_left + static_cast<size_t>(index)] =
+                        scale * left_data[index];
+                }
+                std::copy(
+                    right_data,
+                    right_data + channels * right_size,
+                    batch.right.begin() + static_cast<ssize_t>(old_right)
+                );
+                batch.channels += channels;
+                ++batch.routes;
+                table->n_group_channel_count += channels;
+                ++table->route_count;
+                ++table->spatial_scalar_route_accumulations;
+                if (batch.channels >= 32) {
+                    flush_scalar_batch(group_pos);
+                }
+            } else {
+                flush_scalar_batch(group_pos);
+                table->accumulate_raw_stack(
+                    *group_index,
+                    std::move(left),
+                    std::move(right),
+                    dims,
+                    in_start,
+                    out_start,
+                    scale,
+                    group_pos
+                );
             }
+            ++route_index;
+            if (group_route_counts != nullptr) {
+                if (group_route_counts->size() <= group_pos) {
+                    group_route_counts->resize(group_pos + 1, 0);
+                }
+                ++(*group_route_counts)[group_pos];
+            }
+        }
+
+        bool route_schedule_complete() const {
+            return (
+                route_group_schedule_match
+                && route_group_schedule != nullptr
+                && route_index == route_group_schedule->size()
+            );
         }
     };
 
@@ -25534,6 +27259,7 @@ public:
                 }
             }
         }
+        builder.flush_scalar_batches();
         if (!py_family_environments.is_none()) {
             py::dict family_environments = py_family_environments.cast<py::dict>();
             if (py::len(family_environments) > 0) {
@@ -27022,18 +28748,70 @@ public:
             nk,
             ny
         );
-        std::vector<cdouble> tmp(
-            static_cast<size_t>(block.left_rows * block.right_rows),
-            cdouble(0.0, 0.0)
+        const size_t tmp_size = static_cast<size_t>(
+            block.left_rows * block.right_rows
         );
+        if (factorized_matvec_tmp.size() < tmp_size) {
+            factorized_matvec_tmp.resize(tmp_size);
+        }
+        cdouble* tmp = factorized_matvec_tmp.data();
         for (ssize_t channel = 0; channel < block.channels; ++channel) {
-            std::fill(tmp.begin(), tmp.end(), cdouble(0.0, 0.0));
+            std::fill(tmp, tmp + tmp_size, cdouble(0.0, 0.0));
             const cdouble* left =
                 block.left_ptr
                 + static_cast<size_t>(channel * block.left_rows * block.left_cols);
             const cdouble* right =
                 block.right_ptr
                 + static_cast<size_t>(channel * block.right_rows * block.right_cols);
+#ifdef __APPLE__
+            const bool spatial_scalar = (
+                nu == 1 && nv == 1 && nx == 1 && ny == 1
+                && ni <= std::numeric_limits<int>::max()
+                && nl <= std::numeric_limits<int>::max()
+                && nj <= std::numeric_limits<int>::max()
+                && nk <= std::numeric_limits<int>::max()
+                && ni * nj * nk + ni * nk * nl >= 128
+            );
+            if (spatial_scalar) {
+                const cdouble alpha(1.0, 0.0);
+                const cdouble beta0(0.0, 0.0);
+                const cdouble beta1(1.0, 0.0);
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(ni),
+                    static_cast<int>(nk),
+                    static_cast<int>(nj),
+                    &alpha,
+                    left,
+                    static_cast<int>(nj),
+                    x.data() + block.in_start,
+                    static_cast<int>(nk),
+                    &beta0,
+                    tmp,
+                    static_cast<int>(nk)
+                );
+                const cdouble scaled = block.scale;
+                cblas_zgemm(
+                    101,
+                    111,
+                    111,
+                    static_cast<int>(ni),
+                    static_cast<int>(nl),
+                    static_cast<int>(nk),
+                    &scaled,
+                    tmp,
+                    static_cast<int>(nk),
+                    right,
+                    static_cast<int>(nl),
+                    &beta1,
+                    out.data() + block.out_start,
+                    static_cast<int>(nl)
+                );
+                continue;
+            }
+#endif
             for (ssize_t local_col = 0; local_col < block.in_size; ++local_col) {
                 const cdouble xv =
                     x[static_cast<size_t>(block.in_start + local_col)];
@@ -27045,7 +28823,7 @@ public:
                 const ssize_t right_row =
                     maps.col_right_row[static_cast<size_t>(local_col)];
                 for (ssize_t left_row = 0; left_row < block.left_rows; ++left_row) {
-                    tmp[
+                    factorized_matvec_tmp[
                         static_cast<size_t>(
                             left_row * block.right_rows + right_row
                         )
@@ -27062,7 +28840,7 @@ public:
                 const ssize_t right_col =
                     maps.row_right_col[static_cast<size_t>(local_row)];
                 const cdouble* tmp_row =
-                    tmp.data() + static_cast<size_t>(left_row * block.right_rows);
+                    tmp + static_cast<size_t>(left_row * block.right_rows);
                 cdouble total = cdouble(0.0, 0.0);
                 for (ssize_t right_row = 0; right_row < block.right_rows; ++right_row) {
                     total += tmp_row[static_cast<size_t>(right_row)]
@@ -28742,9 +30520,12 @@ py::dict CppPlannedDirectPayloadPlan::refresh_grouped_table(
         CppGroupedRenormalizedTable::FastTablePayloadBuilder builder{
             &table,
             &group_index,
-            &group_route_counts
+            &group_route_counts,
+            &table.direct_table_schedule_route_groups,
+            false
         };
         append_payload(builder);
+        builder.flush_scalar_batches();
 
         table.n_group_count = static_cast<ssize_t>(
             table.sparse_blocks.empty()
@@ -28782,10 +30563,15 @@ py::dict CppPlannedDirectPayloadPlan::refresh_grouped_table(
         CppGroupedRenormalizedTable::FastTablePayloadBuilder builder{
             &table,
             &group_index,
-            &group_route_counts
+            &group_route_counts,
+            &table.direct_table_schedule_route_groups,
+            true
         };
         append_payload(builder);
+        builder.flush_scalar_batches();
         if (
+            builder.route_schedule_complete()
+            &&
             table.storage_kind == "cpp_grouped_renormalized_table_dense"
             && table.sparse_blocks.empty()
             && table.factorized_blocks.empty()
@@ -28830,6 +30616,11 @@ py::dict CppPlannedDirectPayloadPlan::refresh_grouped_table(
         table.direct_table_schedule_refresh_misses();
     out["direct_table_schedule_stores"] =
         table.direct_table_schedule_refresh_stores();
+    out["spatial_scalar_route_accumulations"] =
+        table.spatial_scalar_route_accumulations;
+    out["spatial_scalar_batch_calls"] = table.spatial_scalar_batch_calls;
+    out["spatial_scalar_batched_routes"] = table.spatial_scalar_batched_routes;
+    out["spatial_scalar_batched_channels"] = table.spatial_scalar_batched_channels;
     return out;
 }
 
@@ -29205,6 +30996,11 @@ py::dict CppMovingEnvironment::refresh_grouped_table_record_from_direct_family_r
         table_ref.direct_table_schedule_refresh_misses();
     out["direct_table_schedule_stores"] =
         table_ref.direct_table_schedule_refresh_stores();
+    out["spatial_scalar_route_accumulations"] =
+        table_ref.spatial_scalar_route_accumulations;
+    out["spatial_scalar_batch_calls"] = table_ref.spatial_scalar_batch_calls;
+    out["spatial_scalar_batched_routes"] = table_ref.spatial_scalar_batched_routes;
+    out["spatial_scalar_batched_channels"] = table_ref.spatial_scalar_batched_channels;
     out["created_table"] = py::bool_(create_table);
     out["created_plan"] = py::bool_(create_plan);
     out["table_key"] = py::str(table_key);
@@ -31379,7 +33175,19 @@ static py::tuple contextual_execute_boundary_closure_packed(
     py::sequence site_a_conj,
     py::sequence site_b,
     py::object zero_like_fn = py::none(),
-    py::object local_entries_fn = py::none()
+    py::object local_entries_fn = py::none(),
+    std::unordered_map<
+        ssize_t,
+        CppMovingEnvironment::ContextualBoundaryBatchPlanRecord::TensorGroupRecord
+    >* persistent_a_group_cache = nullptr,
+    std::unordered_map<
+        ssize_t,
+        CppMovingEnvironment::ContextualBoundaryBatchPlanRecord::TensorGroupRecord
+    >* persistent_b_group_cache = nullptr,
+    std::unordered_map<
+        std::uintptr_t,
+        CppMovingEnvironment::ContextualBoundaryBatchPlanRecord::TensorGroupRecord
+    >* persistent_w_group_cache = nullptr
 ) {
     const bool is_right = side == "right";
     const ssize_t n_closure = static_cast<ssize_t>(py::len(closure));
@@ -31398,50 +33206,83 @@ static py::tuple contextual_execute_boundary_closure_packed(
     ssize_t site_skips = 0;
     ssize_t failed_skips = 0;
     ssize_t local_prefetch_entries = 0;
+    ssize_t tensor_group_hits = 0;
+    ssize_t tensor_group_builds = 0;
     const std::string op_source = is_right
         ? "direct_family_site_operator_right"
         : "direct_family_site_operator_left";
     const std::string env_source = is_right
         ? "contextual_native_wave_right_environment"
         : "contextual_native_wave_left_environment";
-    std::unordered_map<ssize_t, py::object> a_group_cache;
-    std::unordered_map<ssize_t, py::object> b_group_cache;
-    std::unordered_map<std::uintptr_t, py::object> w_group_cache;
-    auto site_axis_group = [](
-        std::unordered_map<ssize_t, py::object>& cache,
+    using TensorGroupRecord =
+        CppMovingEnvironment::ContextualBoundaryBatchPlanRecord::TensorGroupRecord;
+    std::unordered_map<ssize_t, TensorGroupRecord> local_a_group_cache;
+    std::unordered_map<ssize_t, TensorGroupRecord> local_b_group_cache;
+    std::unordered_map<std::uintptr_t, TensorGroupRecord> local_w_group_cache;
+    auto& a_group_cache = persistent_a_group_cache == nullptr
+        ? local_a_group_cache
+        : *persistent_a_group_cache;
+    auto& b_group_cache = persistent_b_group_cache == nullptr
+        ? local_b_group_cache
+        : *persistent_b_group_cache;
+    auto& w_group_cache = persistent_w_group_cache == nullptr
+        ? local_w_group_cache
+        : *persistent_w_group_cache;
+    auto site_axis_group = [&tensor_group_hits, &tensor_group_builds](
+        std::unordered_map<ssize_t, TensorGroupRecord>& cache,
         ssize_t site,
         py::object tensor,
         ssize_t axis
     ) -> py::dict {
         auto found = cache.find(site);
-        if (found != cache.end()) {
-            return found->second.cast<py::dict>();
+        if (
+            found != cache.end()
+            && found->second.tensor.ptr() == tensor.ptr()
+            && found->second.first_axis == axis
+            && found->second.second_axis == -1
+        ) {
+            ++tensor_group_hits;
+            return found->second.grouped.cast<py::dict>();
         }
         py::dict grouped = packed_tensor_group_by_axis(tensor, axis);
-        cache.emplace(site, grouped);
+        cache.insert_or_assign(
+            site,
+            TensorGroupRecord{tensor, grouped, axis, -1}
+        );
+        ++tensor_group_builds;
         return grouped;
     };
-    auto site_axes_group = [](
-        std::unordered_map<ssize_t, py::object>& cache,
+    auto site_axes_group = [&tensor_group_hits, &tensor_group_builds](
+        std::unordered_map<ssize_t, TensorGroupRecord>& cache,
         ssize_t site,
         py::object tensor,
         ssize_t first_axis,
         ssize_t second_axis
     ) -> py::dict {
         auto found = cache.find(site);
-        if (found != cache.end()) {
-            return found->second.cast<py::dict>();
+        if (
+            found != cache.end()
+            && found->second.tensor.ptr() == tensor.ptr()
+            && found->second.first_axis == first_axis
+            && found->second.second_axis == second_axis
+        ) {
+            ++tensor_group_hits;
+            return found->second.grouped.cast<py::dict>();
         }
         py::dict grouped = packed_tensor_group_by_axes(
             tensor,
             first_axis,
             second_axis
         );
-        cache.emplace(site, grouped);
+        cache.insert_or_assign(
+            site,
+            TensorGroupRecord{tensor, grouped, first_axis, second_axis}
+        );
+        ++tensor_group_builds;
         return grouped;
     };
-    auto tensor_axes_group = [](
-        std::unordered_map<std::uintptr_t, py::object>& cache,
+    auto tensor_axes_group = [&tensor_group_hits, &tensor_group_builds](
+        std::unordered_map<std::uintptr_t, TensorGroupRecord>& cache,
         py::object tensor,
         ssize_t first_axis,
         ssize_t second_axis
@@ -31451,15 +33292,25 @@ static py::tuple contextual_execute_boundary_closure_packed(
             (static_cast<std::uintptr_t>(first_axis & 0xff) << 8) ^
             static_cast<std::uintptr_t>(second_axis & 0xff);
         auto found = cache.find(key);
-        if (found != cache.end()) {
-            return found->second.cast<py::dict>();
+        if (
+            found != cache.end()
+            && found->second.tensor.ptr() == tensor.ptr()
+            && found->second.first_axis == first_axis
+            && found->second.second_axis == second_axis
+        ) {
+            ++tensor_group_hits;
+            return found->second.grouped.cast<py::dict>();
         }
         py::dict grouped = packed_tensor_group_by_axes(
             tensor,
             first_axis,
             second_axis
         );
-        cache.emplace(key, grouped);
+        cache.insert_or_assign(
+            key,
+            TensorGroupRecord{tensor, grouped, first_axis, second_axis}
+        );
+        ++tensor_group_builds;
         return grouped;
     };
 
@@ -31720,7 +33571,9 @@ static py::tuple contextual_execute_boundary_closure_packed(
         py::int_(site_skips),
         py::int_(failed_skips),
         py::int_(rows),
-        py::int_(local_prefetch_entries)
+        py::int_(local_prefetch_entries),
+        py::int_(tensor_group_hits),
+        py::int_(tensor_group_builds)
     );
 }
 
@@ -32998,18 +34851,14 @@ std::string CppMovingEnvironment::install_contextual_boundary_batch_plan_auto(
     key.reserve(256);
     key += "contextual_boundary_batch_plan|";
     key += side;
-    key += "|rev=" + std::to_string(static_cast<long long>(revision));
     key += "|site=" + std::to_string(static_cast<long long>(site));
     key += "|n=" + std::to_string(static_cast<long long>(n_sites));
     key += "|suffix=" + std::to_string(static_cast<long long>(suffix_start));
-    key += "|tok=" + py_handle_identity(token);
     key += "|bnd=" + py_handle_identity(boundary_cache);
     key += "|env=" + py_handle_identity(env_cache);
     key += "|ltab=" + py_handle_identity(local_table_cache);
     key += "|op=" + py_handle_identity(site_operator_cache);
     key += "|entries=" + py_handle_identity(local_entries_cache);
-    key += "|views=" + py_handle_identity(site_a_conj);
-    key += ":" + py_handle_identity(site_b);
     install_contextual_boundary_batch_plan(
         key,
         side,
@@ -33154,7 +35003,10 @@ py::object CppMovingEnvironment::build_contextual_boundary_batch_from_plan(
                 record.site_a_conj.cast<py::sequence>(),
                 record.site_b.cast<py::sequence>(),
                 record.zero_like_fn,
-                record.local_entries_fn
+                record.local_entries_fn,
+                &record.site_a_groups,
+                &record.site_b_groups,
+                &record.operator_groups
             );
             contextual_boundary_batch_plan_wave_seconds += wall_seconds() - wave_start;
             const long long built = py::cast<long long>(executed[0]);
@@ -33178,6 +35030,8 @@ py::object CppMovingEnvironment::build_contextual_boundary_batch_from_plan(
             contextual_wave_unsupported += unsupported;
             contextual_wave_op_hits += py::cast<long long>(executed[6]);
             contextual_wave_op_builds += py::cast<long long>(executed[7]);
+            contextual_wave_tensor_group_hits += py::cast<long long>(executed[16]);
+            contextual_wave_tensor_group_builds += py::cast<long long>(executed[17]);
             contextual_boundary_batch_plan_wave_calls += 1;
             contextual_boundary_batch_plan_wave_built += built;
             contextual_wave_prefetch_entries += py::cast<long long>(executed[15]);
@@ -34252,6 +36106,237 @@ py::object CppMovingEnvironment::build_planned_direct_family_entries_from_route(
     }
 }
 
+py::tuple CppMovingEnvironment::build_native_p_identity_entries(
+    py::object planned_cls,
+    py::sequence owner_records,
+    py::dict coefficients,
+    py::dict left_boundary_operators,
+    py::dict right_boundary_operators,
+    py::dict left_same_side_operators,
+    py::dict right_same_side_operators,
+    py::object left_identity,
+    py::object right_identity,
+    py::object local_pair_builder,
+    py::object left_table,
+    py::object right_table,
+    ssize_t bond,
+    py::object source
+) {
+    if (planned_cls.is_none() || !PyCallable_Check(planned_cls.ptr())) {
+        throw std::runtime_error("native P planned entry class must be callable");
+    }
+    if (local_pair_builder.is_none() || !PyCallable_Check(local_pair_builder.ptr())) {
+        throw std::runtime_error("native P local pair builder must be callable");
+    }
+
+    py::list coeff_values;
+    py::list left_keys;
+    py::list right_keys;
+    py::list left_values;
+    py::list right_values;
+    py::list consumed;
+    py::dict local_pair_cache;
+    py::dict ownership_counts;
+
+    auto lookup = [](py::dict table, py::handle key) -> py::object {
+        if (!table.contains(key)) {
+            return py::none();
+        }
+        return table[key].cast<py::object>();
+    };
+    auto count_owner = [&](const std::string& name) {
+        py::str key(name);
+        long long value = ownership_counts.contains(key)
+            ? py::cast<long long>(ownership_counts[key])
+            : 0;
+        ownership_counts[key] = py::int_(value + 1);
+    };
+
+    const ssize_t n_records = static_cast<ssize_t>(py::len(owner_records));
+    for (ssize_t idx = 0; idx < n_records; ++idx) {
+        py::sequence row = py::reinterpret_borrow<py::sequence>(owner_records[idx]);
+        py::tuple raw_key = py::reinterpret_borrow<py::tuple>(row[0]);
+        if (py::len(raw_key) != 4 || !coefficients.contains(raw_key)) {
+            continue;
+        }
+        const std::string own_l = row[1].is_none()
+            ? std::string()
+            : py::cast<std::string>(row[1]);
+        const std::string own_r = row[2].is_none()
+            ? std::string()
+            : py::cast<std::string>(row[2]);
+        const bool identity_route =
+            (own_l == "left" && own_r == "left")
+            || (own_l == "right" && own_r == "right")
+            || (own_l == "left" && own_r == "right")
+            || (own_l == "right" && own_r == "left");
+        if (!identity_route) {
+            continue;
+        }
+        const cdouble coeff = py::cast<cdouble>(coefficients[raw_key]);
+        if (std::abs(coeff) <= 1.0e-14) {
+            continue;
+        }
+
+        py::tuple pair_l(2);
+        py::tuple pair_r(2);
+        pair_l[0] = raw_key[0];
+        pair_l[1] = raw_key[1];
+        pair_r[0] = raw_key[2];
+        pair_r[1] = raw_key[3];
+        py::object E = py::none();
+        py::object F = py::none();
+        py::object left_route = py::none();
+        py::object right_route = py::none();
+        if (own_l == "left" && own_r == "left") {
+            E = lookup(left_same_side_operators, raw_key);
+            F = right_identity;
+            left_route = py::make_tuple(
+                "same_side_p", "left", bond,
+                raw_key[0], raw_key[1], raw_key[2], raw_key[3]
+            );
+            right_route = py::make_tuple("identity_env", "right", bond + 1);
+        } else if (own_l == "right" && own_r == "right") {
+            E = left_identity;
+            F = lookup(right_same_side_operators, raw_key);
+            left_route = py::make_tuple("identity_env", "left", bond);
+            right_route = py::make_tuple(
+                "same_side_p", "right", bond + 1,
+                raw_key[0], raw_key[1], raw_key[2], raw_key[3]
+            );
+        } else if (own_l == "left" && own_r == "right") {
+            E = lookup(left_boundary_operators, pair_l);
+            F = lookup(right_boundary_operators, pair_r);
+            left_route = py::make_tuple(
+                "boundary_p", "left", bond, pair_l[0], pair_l[1]
+            );
+            right_route = py::make_tuple(
+                "boundary_p", "right", bond + 1, pair_r[0], pair_r[1]
+            );
+        } else {
+            E = lookup(left_boundary_operators, pair_r);
+            F = lookup(right_boundary_operators, pair_l);
+            left_route = py::make_tuple(
+                "boundary_p", "left", bond, pair_r[0], pair_r[1]
+            );
+            right_route = py::make_tuple(
+                "boundary_p", "right", bond + 1, pair_l[0], pair_l[1]
+            );
+        }
+        if (E.is_none() || F.is_none()) {
+            continue;
+        }
+
+        py::object E_qns = py::getattr(E, "qns").attr("__getitem__")(0);
+        py::object F_qns = py::getattr(F, "qns").attr("__getitem__")(0);
+        py::tuple pair_cache_key = py::make_tuple(
+            py::tuple(E_qns),
+            py::tuple(F_qns)
+        );
+        py::object local_pair;
+        if (local_pair_cache.contains(pair_cache_key)) {
+            local_pair = local_pair_cache[pair_cache_key].cast<py::object>();
+        } else {
+            local_pair = local_pair_builder("I", "I", E, F);
+            local_pair_cache[pair_cache_key] = local_pair;
+        }
+        if (local_pair.is_none()) {
+            continue;
+        }
+        py::sequence local_pair_seq = local_pair.cast<py::sequence>();
+        if (py::len(local_pair_seq) != 2) {
+            continue;
+        }
+        py::object W_left = py::reinterpret_borrow<py::object>(local_pair_seq[0]);
+        py::object W_right = py::reinterpret_borrow<py::object>(local_pair_seq[1]);
+        py::tuple left_key = py::make_tuple(
+            py::make_tuple("planned_p_identity_route", "left", left_route),
+            "I"
+        );
+        py::tuple right_key = py::make_tuple(
+            py::make_tuple("planned_p_identity_route", "right", right_route),
+            "I"
+        );
+        coeff_values.append(py::cast(coeff));
+        left_keys.append(left_key);
+        right_keys.append(right_key);
+        left_values.append(py::make_tuple(E, W_left));
+        right_values.append(py::make_tuple(W_right, F));
+        consumed.append(raw_key);
+        count_owner(own_l + ":" + own_r);
+    }
+
+    const ssize_t n_entries = static_cast<ssize_t>(py::len(coeff_values));
+    if (n_entries == 0) {
+        return py::make_tuple(py::none(), consumed, ownership_counts);
+    }
+    left_table.attr("put_many_packed")(
+        left_keys,
+        left_values,
+        py::arg("family_name") = "P_identity",
+        py::arg("normalized") = true
+    );
+    right_table.attr("put_many_packed")(
+        right_keys,
+        right_values,
+        py::arg("family_name") = "P_identity",
+        py::arg("normalized") = true
+    );
+    py::dict left_ids = py::getattr(left_table, "ids").cast<py::dict>();
+    py::dict right_ids = py::getattr(right_table, "ids").cast<py::dict>();
+    py::list left_local_ids;
+    py::list right_local_ids;
+    py::list left_table_ids;
+    py::list right_table_ids;
+    std::unordered_map<long long, long long> left_local_map;
+    std::unordered_map<long long, long long> right_local_map;
+    for (ssize_t idx = 0; idx < n_entries; ++idx) {
+        const long long left_table_id = py::cast<long long>(left_ids[left_keys[idx]]);
+        const long long right_table_id = py::cast<long long>(right_ids[right_keys[idx]]);
+        auto left_found = left_local_map.find(left_table_id);
+        long long left_local_id;
+        if (left_found == left_local_map.end()) {
+            left_local_id = static_cast<long long>(left_local_map.size());
+            left_local_map.emplace(left_table_id, left_local_id);
+            left_table_ids.append(py::int_(left_table_id));
+        } else {
+            left_local_id = left_found->second;
+        }
+        auto right_found = right_local_map.find(right_table_id);
+        long long right_local_id;
+        if (right_found == right_local_map.end()) {
+            right_local_id = static_cast<long long>(right_local_map.size());
+            right_local_map.emplace(right_table_id, right_local_id);
+            right_table_ids.append(py::int_(right_table_id));
+        } else {
+            right_local_id = right_found->second;
+        }
+        left_local_ids.append(py::int_(left_local_id));
+        right_local_ids.append(py::int_(right_local_id));
+    }
+    py::object source_text = source.is_none()
+        ? py::str("native_contextual_p_identity_local_csr")
+        : source;
+    py::object planned = planned_cls(
+        coeff_values,
+        left_local_ids,
+        right_local_ids,
+        py::tuple(),
+        py::tuple(),
+        py::arg("left_table_ids") = left_table_ids,
+        py::arg("right_table_ids") = right_table_ids,
+        py::arg("left_table") = left_table,
+        py::arg("right_table") = right_table,
+        py::arg("table_backed") = true,
+        py::arg("schedule_key") = py::make_tuple(
+            "native_p_identity", bond,
+            py::len(left_table_ids), py::len(right_table_ids)
+        ),
+        py::arg("source") = source_text
+    );
+    return py::make_tuple(planned, consumed, ownership_counts);
+}
+
 void CppMovingEnvironment::install_contextual_prebuilt_finalizer(
     const std::string& key,
     py::object shared_key_spec,
@@ -35144,7 +37229,10 @@ static py::array_t<cdouble> left_environment_contract_block(
     py::object e_obj,
     py::object a_obj,
     py::object w_obj,
-    py::object b_obj
+    py::object b_obj,
+    py::array_t<cdouble>* accumulator = nullptr,
+    std::vector<cdouble>* tmp_workspace = nullptr,
+    std::vector<cdouble>* stacked_workspace = nullptr
 ) {
     auto e = ensure_cdouble_array(e_obj);
     auto a = ensure_cdouble_array(a_obj);
@@ -35169,7 +37257,77 @@ static py::array_t<cdouble> left_environment_contract_block(
     const ssize_t nb = b.shape(1);
     const ssize_t nu = a.shape(2);
     const ssize_t nv = b.shape(2);
-    py::array_t<cdouble> out = zero_array3(ny, na, nb);
+    const bool add = accumulator != nullptr && static_cast<bool>(*accumulator);
+    py::array_t<cdouble> out = add ? *accumulator : zero_array3(ny, na, nb);
+    if (
+        out.ndim() != 3 || out.shape(0) != ny
+        || out.shape(1) != na || out.shape(2) != nb
+    ) {
+        throw std::runtime_error("left environment accumulator shape mismatch");
+    }
+#ifdef __APPLE__
+    const ssize_t output_width = na * nb;
+    const ssize_t scalar_ops =
+        nx * na * ni * nj + nx * na * nj * nb + ny * nx * output_width;
+    if (
+        nu == 1 && nv == 1 && scalar_ops >= 64
+        && nx <= std::numeric_limits<int>::max()
+        && ny <= std::numeric_limits<int>::max()
+        && ni <= std::numeric_limits<int>::max()
+        && nj <= std::numeric_limits<int>::max()
+        && na <= std::numeric_limits<int>::max()
+        && nb <= std::numeric_limits<int>::max()
+        && output_width <= std::numeric_limits<int>::max()
+    ) {
+        const cdouble alpha(1.0, 0.0);
+        const cdouble beta0(0.0, 0.0);
+        std::vector<cdouble> local_tmp;
+        std::vector<cdouble> local_stacked;
+        std::vector<cdouble>& tmp = tmp_workspace == nullptr ? local_tmp : *tmp_workspace;
+        std::vector<cdouble>& stacked =
+            stacked_workspace == nullptr ? local_stacked : *stacked_workspace;
+        tmp.resize(static_cast<size_t>(na * nj));
+        stacked.resize(static_cast<size_t>(nx * output_width));
+        const cdouble* ep = static_cast<const cdouble*>(e.request().ptr);
+        const cdouble* ap = static_cast<const cdouble*>(a.request().ptr);
+        const cdouble* wp = static_cast<const cdouble*>(w.request().ptr);
+        const cdouble* bp = static_cast<const cdouble*>(b.request().ptr);
+        cdouble* op = static_cast<cdouble*>(out.request().ptr);
+        for (ssize_t x = 0; x < nx; ++x) {
+            cblas_zgemm(
+                101, 113, 111,
+                static_cast<int>(na), static_cast<int>(nj), static_cast<int>(ni),
+                &alpha,
+                ap, static_cast<int>(na),
+                ep + x * ni * nj, static_cast<int>(nj),
+                &beta0,
+                tmp.data(), static_cast<int>(nj)
+            );
+            cblas_zgemm(
+                101, 111, 111,
+                static_cast<int>(na), static_cast<int>(nb), static_cast<int>(nj),
+                &alpha,
+                tmp.data(), static_cast<int>(nj),
+                bp, static_cast<int>(nb),
+                &beta0,
+                stacked.data() + x * output_width, static_cast<int>(nb)
+            );
+        }
+        cblas_zgemm(
+            101, 112, 111,
+            static_cast<int>(ny), static_cast<int>(output_width), static_cast<int>(nx),
+            &alpha,
+            wp, static_cast<int>(ny),
+            stacked.data(), static_cast<int>(output_width),
+            add ? &alpha : &beta0,
+            op, static_cast<int>(output_width)
+        );
+        if (accumulator != nullptr) {
+            *accumulator = out;
+        }
+        return out;
+    }
+#endif
     auto o = out.mutable_unchecked<3>();
     for (ssize_t y = 0; y < ny; ++y) {
         for (ssize_t ia = 0; ia < na; ++ia) {
@@ -35188,9 +37346,12 @@ static py::array_t<cdouble> left_environment_contract_block(
                         }
                     }
                 }
-                o(y, ia, ib) = total;
+                o(y, ia, ib) += total;
             }
         }
+    }
+    if (accumulator != nullptr) {
+        *accumulator = out;
     }
     return out;
 }
@@ -35199,7 +37360,11 @@ static py::array_t<cdouble> right_environment_contract_block(
     py::object a_obj,
     py::object f_obj,
     py::object w_obj,
-    py::object b_obj
+    py::object b_obj,
+    py::array_t<cdouble>* accumulator = nullptr,
+    std::vector<cdouble>* conj_a_workspace = nullptr,
+    std::vector<cdouble>* tmp_workspace = nullptr,
+    std::vector<cdouble>* stacked_workspace = nullptr
 ) {
     auto a = ensure_cdouble_array(a_obj);
     auto f = ensure_cdouble_array(f_obj);
@@ -35224,7 +37389,87 @@ static py::array_t<cdouble> right_environment_contract_block(
     const ssize_t nb = b.shape(0);
     const ssize_t np = a.shape(2);
     const ssize_t nv = b.shape(2);
-    py::array_t<cdouble> out = zero_array3(ny, na, nb);
+    const bool add = accumulator != nullptr && static_cast<bool>(*accumulator);
+    py::array_t<cdouble> out = add ? *accumulator : zero_array3(ny, na, nb);
+    if (
+        out.ndim() != 3 || out.shape(0) != ny
+        || out.shape(1) != na || out.shape(2) != nb
+    ) {
+        throw std::runtime_error("right environment accumulator shape mismatch");
+    }
+#ifdef __APPLE__
+    const ssize_t output_width = na * nb;
+    const ssize_t scalar_ops =
+        nx * na * ni * nj + nx * na * nj * nb + ny * nx * output_width;
+    if (
+        np == 1 && nv == 1 && scalar_ops >= 64
+        && nx <= std::numeric_limits<int>::max()
+        && ny <= std::numeric_limits<int>::max()
+        && ni <= std::numeric_limits<int>::max()
+        && nj <= std::numeric_limits<int>::max()
+        && na <= std::numeric_limits<int>::max()
+        && nb <= std::numeric_limits<int>::max()
+        && output_width <= std::numeric_limits<int>::max()
+    ) {
+        const cdouble alpha(1.0, 0.0);
+        const cdouble beta0(0.0, 0.0);
+        std::vector<cdouble> local_conj_a;
+        std::vector<cdouble> local_tmp;
+        std::vector<cdouble> local_stacked;
+        std::vector<cdouble>& conj_a =
+            conj_a_workspace == nullptr ? local_conj_a : *conj_a_workspace;
+        std::vector<cdouble>& tmp = tmp_workspace == nullptr ? local_tmp : *tmp_workspace;
+        std::vector<cdouble>& stacked =
+            stacked_workspace == nullptr ? local_stacked : *stacked_workspace;
+        conj_a.resize(static_cast<size_t>(na * ni));
+        tmp.resize(static_cast<size_t>(na * nj));
+        stacked.resize(static_cast<size_t>(nx * output_width));
+        const cdouble* ap = static_cast<const cdouble*>(a.request().ptr);
+        const cdouble* fp = static_cast<const cdouble*>(f.request().ptr);
+        const cdouble* wp = static_cast<const cdouble*>(w.request().ptr);
+        const cdouble* bp = static_cast<const cdouble*>(b.request().ptr);
+        cdouble* op = static_cast<cdouble*>(out.request().ptr);
+        for (ssize_t ia = 0; ia < na; ++ia) {
+            for (ssize_t i = 0; i < ni; ++i) {
+                conj_a[static_cast<size_t>(ia * ni + i)] =
+                    std::conj(ap[ia * ni + i]);
+            }
+        }
+        for (ssize_t x = 0; x < nx; ++x) {
+            cblas_zgemm(
+                101, 111, 111,
+                static_cast<int>(na), static_cast<int>(nj), static_cast<int>(ni),
+                &alpha,
+                conj_a.data(), static_cast<int>(ni),
+                fp + x * ni * nj, static_cast<int>(nj),
+                &beta0,
+                tmp.data(), static_cast<int>(nj)
+            );
+            cblas_zgemm(
+                101, 111, 112,
+                static_cast<int>(na), static_cast<int>(nb), static_cast<int>(nj),
+                &alpha,
+                tmp.data(), static_cast<int>(nj),
+                bp, static_cast<int>(nj),
+                &beta0,
+                stacked.data() + x * output_width, static_cast<int>(nb)
+            );
+        }
+        cblas_zgemm(
+            101, 111, 111,
+            static_cast<int>(ny), static_cast<int>(output_width), static_cast<int>(nx),
+            &alpha,
+            wp, static_cast<int>(nx),
+            stacked.data(), static_cast<int>(output_width),
+            add ? &alpha : &beta0,
+            op, static_cast<int>(output_width)
+        );
+        if (accumulator != nullptr) {
+            *accumulator = out;
+        }
+        return out;
+    }
+#endif
     auto o = out.mutable_unchecked<3>();
     for (ssize_t y = 0; y < ny; ++y) {
         for (ssize_t ia = 0; ia < na; ++ia) {
@@ -35243,9 +37488,12 @@ static py::array_t<cdouble> right_environment_contract_block(
                         }
                     }
                 }
-                o(y, ia, ib) = total;
+                o(y, ia, ib) += total;
             }
         }
+    }
+    if (accumulator != nullptr) {
+        *accumulator = out;
     }
     return out;
 }
@@ -36304,6 +38552,11 @@ struct AbelianEnvironmentAdvanceRoute {
     py::object w_key;
     py::object b_key;
     py::object out_key;
+    ssize_t env_index = -1;
+    ssize_t a_index = -1;
+    ssize_t w_index = -1;
+    ssize_t b_index = -1;
+    ssize_t out_index = -1;
 };
 
 struct AbelianTDVPSiteHeffRoute {
@@ -37059,32 +39312,62 @@ public:
         py::dict a_data = py::reinterpret_borrow<py::dict>(A.attr("data"));
         py::dict w_data = py::reinterpret_borrow<py::dict>(W.attr("data"));
         py::dict b_data = py::reinterpret_borrow<py::dict>(B.attr("data"));
-        py::dict out;
+        auto lookup_blocks = [](py::dict data, const py::tuple& keys) {
+            std::vector<py::object> blocks;
+            blocks.reserve(static_cast<size_t>(py::len(keys)));
+            for (ssize_t idx = 0; idx < static_cast<ssize_t>(py::len(keys)); ++idx) {
+                blocks.push_back(dict_get_required(
+                    data,
+                    py::reinterpret_borrow<py::object>(keys[idx])
+                ));
+            }
+            return blocks;
+        };
+        const std::vector<py::object> env_blocks = lookup_blocks(env_data, env_keys_);
+        const std::vector<py::object> a_blocks = lookup_blocks(a_data, a_keys_);
+        const std::vector<py::object> w_blocks = lookup_blocks(w_data, w_keys_);
+        const std::vector<py::object> b_blocks = lookup_blocks(b_data, b_keys_);
+        std::vector<py::array_t<cdouble>> out_blocks(
+            static_cast<size_t>(py::len(out_keys_))
+        );
+        std::vector<bool> out_initialized(out_blocks.size(), false);
+        std::vector<cdouble> workspace0;
+        std::vector<cdouble> workspace1;
+        std::vector<cdouble> workspace2;
         for (const auto& route : routes_) {
-            py::object env_block = dict_get_required(env_data, route.env_key);
-            py::object a_block = dict_get_required(a_data, route.a_key);
-            py::object w_block = dict_get_required(w_data, route.w_key);
-            py::object b_block = dict_get_required(b_data, route.b_key);
-            py::array_t<cdouble> block;
+            const size_t out_index = static_cast<size_t>(route.out_index);
+            py::array_t<cdouble>& output = out_blocks[out_index];
+            py::array_t<cdouble>* accumulator =
+                out_initialized[out_index] ? &output : nullptr;
             if (left_) {
-                block = left_environment_contract_block(
-                    env_block,
-                    a_block,
-                    w_block,
-                    b_block
+                output = left_environment_contract_block(
+                    env_blocks[static_cast<size_t>(route.env_index)],
+                    a_blocks[static_cast<size_t>(route.a_index)],
+                    w_blocks[static_cast<size_t>(route.w_index)],
+                    b_blocks[static_cast<size_t>(route.b_index)],
+                    accumulator,
+                    &workspace0,
+                    &workspace1
                 );
             } else {
-                block = right_environment_contract_block(
-                    a_block,
-                    env_block,
-                    w_block,
-                    b_block
+                output = right_environment_contract_block(
+                    a_blocks[static_cast<size_t>(route.a_index)],
+                    env_blocks[static_cast<size_t>(route.env_index)],
+                    w_blocks[static_cast<size_t>(route.w_index)],
+                    b_blocks[static_cast<size_t>(route.b_index)],
+                    accumulator,
+                    &workspace0,
+                    &workspace1,
+                    &workspace2
                 );
             }
-            add_block_to_output(out, route.out_key, block);
+            out_initialized[out_index] = true;
         }
-        py::tuple key_blocks = dict_items_to_key_block_tuple(out);
-        return py::make_tuple(key_blocks[0], key_blocks[1], qns_, dirs_);
+        py::tuple blocks(static_cast<ssize_t>(out_blocks.size()));
+        for (ssize_t idx = 0; idx < static_cast<ssize_t>(out_blocks.size()); ++idx) {
+            blocks[idx] = out_blocks[static_cast<size_t>(idx)];
+        }
+        return py::make_tuple(out_keys_, blocks, qns_, dirs_);
     }
 
     ssize_t route_count() const {
@@ -37096,6 +39379,44 @@ public:
     }
 
 private:
+    void finalize_routes() {
+        py::dict env_indices;
+        py::dict a_indices;
+        py::dict w_indices;
+        py::dict b_indices;
+        py::dict out_indices;
+        py::list env_keys;
+        py::list a_keys;
+        py::list w_keys;
+        py::list b_keys;
+        py::list out_keys;
+        auto register_key = [](
+            py::dict indices,
+            py::list keys,
+            const py::object& key
+        ) -> ssize_t {
+            if (indices.contains(key)) {
+                return py::cast<ssize_t>(indices[key]);
+            }
+            const ssize_t index = static_cast<ssize_t>(py::len(keys));
+            indices[key] = py::int_(index);
+            keys.append(key);
+            return index;
+        };
+        for (auto& route : routes_) {
+            route.env_index = register_key(env_indices, env_keys, route.env_key);
+            route.a_index = register_key(a_indices, a_keys, route.a_key);
+            route.w_index = register_key(w_indices, w_keys, route.w_key);
+            route.b_index = register_key(b_indices, b_keys, route.b_key);
+            route.out_index = register_key(out_indices, out_keys, route.out_key);
+        }
+        env_keys_ = tuple_from_sequence_object(env_keys);
+        a_keys_ = tuple_from_sequence_object(a_keys);
+        w_keys_ = tuple_from_sequence_object(w_keys);
+        b_keys_ = tuple_from_sequence_object(b_keys);
+        out_keys_ = tuple_from_sequence_object(out_keys);
+    }
+
     void build_left(py::object W, py::object A, py::object E, py::object B) {
         py::dict e_data = py::reinterpret_borrow<py::dict>(E.attr("data"));
         py::dict a_data = py::reinterpret_borrow<py::dict>(A.attr("data"));
@@ -37187,6 +39508,7 @@ private:
                 }
             }
         }
+        finalize_routes();
         py::list dirs;
         dirs.append(get_axis_item(W.attr("dirs"), 1));
         dirs.append(neg_axis_item(A.attr("dirs"), 1));
@@ -37290,6 +39612,7 @@ private:
                 }
             }
         }
+        finalize_routes();
         py::list dirs;
         dirs.append(get_axis_item(W.attr("dirs"), 0));
         dirs.append(neg_axis_item(A.attr("dirs"), 0));
@@ -37304,6 +39627,11 @@ private:
 
     bool left_ = true;
     std::vector<AbelianEnvironmentAdvanceRoute> routes_;
+    py::tuple env_keys_;
+    py::tuple a_keys_;
+    py::tuple w_keys_;
+    py::tuple b_keys_;
+    py::tuple out_keys_;
     py::object qns_ = py::none();
     py::object dirs_ = py::none();
 };
@@ -39946,6 +42274,48 @@ static py::tuple packed_right_identity_boundary_advance_payload_grouped(
     return py::make_tuple(key_blocks[0], key_blocks[1], qns, dirs);
 }
 
+static py::tuple packed_left_identity_boundary_advance_payload_many(
+    py::object A_conj,
+    py::sequence boundaries,
+    py::object B
+) {
+    py::dict a_group = packed_tensor_group_by_axis(A_conj, 0);
+    py::dict b_group = packed_tensor_group_by_axes(B, 0, 2);
+    const ssize_t n = static_cast<ssize_t>(py::len(boundaries));
+    py::tuple payloads(n);
+    for (ssize_t idx = 0; idx < n; ++idx) {
+        payloads[idx] = packed_left_identity_boundary_advance_payload_grouped(
+            A_conj,
+            py::reinterpret_borrow<py::object>(boundaries[idx]),
+            B,
+            a_group,
+            b_group
+        );
+    }
+    return payloads;
+}
+
+static py::tuple packed_right_identity_boundary_advance_payload_many(
+    py::object A_conj,
+    py::sequence boundaries,
+    py::object B
+) {
+    py::dict a_group = packed_tensor_group_by_axis(A_conj, 1);
+    py::dict b_group = packed_tensor_group_by_axes(B, 1, 2);
+    const ssize_t n = static_cast<ssize_t>(py::len(boundaries));
+    py::tuple payloads(n);
+    for (ssize_t idx = 0; idx < n; ++idx) {
+        payloads[idx] = packed_right_identity_boundary_advance_payload_grouped(
+            A_conj,
+            py::reinterpret_borrow<py::object>(boundaries[idx]),
+            B,
+            a_group,
+            b_group
+        );
+    }
+    return payloads;
+}
+
 static py::tuple packed_left_boundary_advance_payload(
     py::object W,
     py::object A_conj,
@@ -40576,6 +42946,133 @@ private:
 
     std::vector<Alias> aliases;
 };
+
+struct SpatialPatternSpanTerm {
+    std::vector<std::string> pattern;
+    cdouble factor = cdouble(0.0, 0.0);
+    ssize_t min_site = 0;
+    ssize_t max_site = -1;
+    bool zero = true;
+};
+
+static SpatialPatternSpanTerm spatial_jw_pattern_span_term(
+    SpatialLocalAliasTable& aliases,
+    const std::vector<std::string>& local_symbols,
+    const std::array<int, 4>& sites,
+    ssize_t n_sites,
+    double cutoff
+) {
+    std::vector<std::vector<std::string>> grouped(
+        static_cast<size_t>(n_sites)
+    );
+    for (size_t idx = 0; idx < local_symbols.size(); ++idx) {
+        const int op_site = sites[idx];
+        if (op_site < 0 || op_site >= n_sites) {
+            throw std::runtime_error("spatial same-side route site out of range");
+        }
+        for (int site = 0; site < op_site; ++site) {
+            grouped[static_cast<size_t>(site)].push_back("JW");
+        }
+        grouped[static_cast<size_t>(op_site)].push_back(local_symbols[idx]);
+    }
+    SpatialPatternSpanTerm out;
+    out.pattern.assign(static_cast<size_t>(n_sites), "I");
+    out.factor = cdouble(1.0, 0.0);
+    out.min_site = n_sites;
+    out.max_site = -1;
+    out.zero = false;
+    for (ssize_t site = 0; site < n_sites; ++site) {
+        const auto& pieces = grouped[static_cast<size_t>(site)];
+        if (pieces.empty()) {
+            continue;
+        }
+        SpatialCanonicalTerm canonical = aliases.canonicalize(pieces, cutoff);
+        if (canonical.zero) {
+            out.zero = true;
+            out.pattern.clear();
+            out.factor = cdouble(0.0, 0.0);
+            return out;
+        }
+        out.pattern[static_cast<size_t>(site)] = canonical.symbol;
+        out.factor *= canonical.factor;
+        if (canonical.symbol != "I") {
+            out.min_site = std::min(out.min_site, site);
+            out.max_site = std::max(out.max_site, site);
+        }
+    }
+    return out;
+}
+
+static py::dict build_spatial_same_side_p_pattern_spans(
+    py::sequence raw_keys,
+    ssize_t n_sites,
+    double cutoff = 1.0e-14
+) {
+    const double start = wall_seconds();
+    if (n_sites <= 0) {
+        throw std::runtime_error(
+            "spatial same-side route requires a positive site count"
+        );
+    }
+    const std::array<std::vector<std::string>, 4> symbol_sets = {{
+        {"cdu", "cu", "cdu", "cu"},
+        {"cdu", "cu", "cdd", "cd"},
+        {"cdd", "cd", "cdu", "cu"},
+        {"cdd", "cd", "cdd", "cd"},
+    }};
+    SpatialLocalAliasTable aliases;
+    py::dict spans;
+    ssize_t term_count = 0;
+    const ssize_t n_keys = static_cast<ssize_t>(py::len(raw_keys));
+    for (ssize_t idx = 0; idx < n_keys; ++idx) {
+        py::tuple raw_key = tuple_from_sequence_object(
+            py::reinterpret_borrow<py::object>(raw_keys[idx])
+        ).cast<py::tuple>();
+        if (py::len(raw_key) != 4) {
+            throw std::runtime_error(
+                "spatial same-side P route key must have length four"
+            );
+        }
+        std::array<int, 4> sites = {{
+            py::cast<int>(raw_key[0]),
+            py::cast<int>(raw_key[1]),
+            py::cast<int>(raw_key[2]),
+            py::cast<int>(raw_key[3]),
+        }};
+        py::list terms;
+        for (const auto& symbols : symbol_sets) {
+            SpatialPatternSpanTerm term = spatial_jw_pattern_span_term(
+                aliases,
+                symbols,
+                sites,
+                n_sites,
+                cutoff
+            );
+            if (term.zero || std::abs(term.factor) <= cutoff) {
+                continue;
+            }
+            py::tuple pattern(term.pattern.size());
+            for (size_t site = 0; site < term.pattern.size(); ++site) {
+                pattern[site] = py::str(term.pattern[site]);
+            }
+            terms.append(py::make_tuple(
+                pattern,
+                py::cast(term.factor),
+                py::int_(term.min_site),
+                py::int_(term.max_site)
+            ));
+            ++term_count;
+        }
+        spans[raw_key] = tuple_from_sequence_object(terms);
+    }
+    py::dict out;
+    out["spans"] = spans;
+    out["local_ops"] = aliases.dynamic_ops();
+    out["keys"] = py::int_(n_keys);
+    out["terms"] = py::int_(term_count);
+    out["seconds"] = py::float_(wall_seconds() - start);
+    return out;
+}
 
 static py::tuple spatial_int_tuple(const std::vector<int>& values) {
     py::tuple out(values.size());
@@ -44165,7 +46662,8 @@ static py::array_t<cdouble> dense_environment_update_left_cpp(
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
-    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B,
+    py::object out_obj = py::none()
 ) {
     if (W.ndim() != 4 || A.ndim() != 3 || E.ndim() != 3 || B.ndim() != 3) {
         throw std::invalid_argument("dense_environment_update_left expects W4,A3,E3,B3");
@@ -44184,7 +46682,19 @@ static py::array_t<cdouble> dense_environment_update_left_cpp(
     const ssize_t ket_l = B.shape(0);
     const ssize_t bra_r = A.shape(2);
     const ssize_t ket_r = B.shape(2);
-    py::array_t<cdouble> out({mpo_r, bra_r, ket_r});
+    py::array_t<cdouble> out;
+    if (!out_obj.is_none()) {
+        out = py::array_t<cdouble, py::array::c_style>::ensure(out_obj);
+    }
+    if (
+        !out
+        || out.ndim() != 3
+        || out.shape(0) != mpo_r
+        || out.shape(1) != bra_r
+        || out.shape(2) != ket_r
+    ) {
+        out = py::array_t<cdouble>({mpo_r, bra_r, ket_r});
+    }
 #ifdef __APPLE__
     const bool dims_fit =
         bra_l <= std::numeric_limits<int>::max()
@@ -44340,7 +46850,8 @@ static py::array_t<cdouble> dense_environment_update_right_cpp(
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> W,
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> A,
     py::array_t<cdouble, py::array::c_style | py::array::forcecast> F,
-    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> B,
+    py::object out_obj = py::none()
 ) {
     if (W.ndim() != 4 || A.ndim() != 3 || F.ndim() != 3 || B.ndim() != 3) {
         throw std::invalid_argument("dense_environment_update_right expects W4,A3,F3,B3");
@@ -44359,7 +46870,19 @@ static py::array_t<cdouble> dense_environment_update_right_cpp(
     const ssize_t ket_l = B.shape(0);
     const ssize_t bra_r = A.shape(2);
     const ssize_t ket_r = B.shape(2);
-    py::array_t<cdouble> out({mpo_l, bra_l, ket_l});
+    py::array_t<cdouble> out;
+    if (!out_obj.is_none()) {
+        out = py::array_t<cdouble, py::array::c_style>::ensure(out_obj);
+    }
+    if (
+        !out
+        || out.ndim() != 3
+        || out.shape(0) != mpo_l
+        || out.shape(1) != bra_l
+        || out.shape(2) != ket_l
+    ) {
+        out = py::array_t<cdouble>({mpo_l, bra_l, ket_l});
+    }
 #ifdef __APPLE__
     const bool dims_fit =
         bra_l <= std::numeric_limits<int>::max()
@@ -44523,6 +47046,453 @@ static py::array_t<cdouble> dense_environment_update_right_cpp(
 
 class CppDenseSweepWorkspace {
 public:
+    py::dict dmrg_half_sweep(
+        py::sequence mps_in,
+        py::sequence mpo_in,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> left_boundary,
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> right_boundary,
+        const std::string& direction,
+        int m_max,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged,
+        const std::string& backend = "blas",
+        bool reuse_static_w = true,
+        bool block_davidson = false,
+        int block_size = 2,
+        py::object left_environments = py::none(),
+        py::object right_environments = py::none(),
+        const std::string& chain_key = ""
+    ) {
+        const double start = wall_seconds();
+        const ssize_t n_sites = py::len(mps_in);
+        if (n_sites < 2 || py::len(mpo_in) != n_sites) {
+            throw std::invalid_argument(
+                "DenseSweepWorkspace DMRG half sweep expects equally sized MPS/MPO chains with at least two sites"
+            );
+        }
+        if (direction != "lr" && direction != "rl") {
+            throw std::invalid_argument("dense DMRG half-sweep direction must be 'lr' or 'rl'");
+        }
+        if (m_max <= 0) {
+            throw std::invalid_argument("dense DMRG half-sweep maximum bond dimension must be positive");
+        }
+
+        using DenseArray = py::array_t<
+            cdouble,
+            py::array::c_style | py::array::forcecast
+        >;
+        std::vector<DenseArray> sites;
+        std::vector<DenseArray> mpo;
+        sites.reserve(static_cast<size_t>(n_sites));
+        mpo.reserve(static_cast<size_t>(n_sites));
+        bool reused_chain = false;
+        if (!chain_key.empty()) {
+            const auto site_it = dmrg_site_chains.find(chain_key);
+            const auto mpo_it = dmrg_mpo_chains.find(chain_key);
+            if (
+                site_it != dmrg_site_chains.end()
+                && mpo_it != dmrg_mpo_chains.end()
+                && static_cast<ssize_t>(site_it->second.size()) == n_sites
+                && static_cast<ssize_t>(mpo_it->second.size()) == n_sites
+            ) {
+                sites = site_it->second;
+                mpo = mpo_it->second;
+                reused_chain = true;
+                ++dmrg_chain_reuses;
+            }
+        }
+        if (!reused_chain) {
+            for (ssize_t site = 0; site < n_sites; ++site) {
+                DenseArray A = DenseArray::ensure(mps_in[site]);
+                DenseArray W = DenseArray::ensure(mpo_in[site]);
+                if (!A || A.ndim() != 3 || !W || W.ndim() != 4) {
+                    throw std::invalid_argument(
+                        "dense DMRG half sweep expects rank-3 site tensors and rank-4 MPO tensors"
+                    );
+                }
+                sites.push_back(std::move(A));
+                mpo.push_back(std::move(W));
+            }
+            if (!chain_key.empty()) {
+                dmrg_mpo_chains[chain_key] = mpo;
+                ++dmrg_chain_installs;
+            }
+        }
+
+        std::vector<DenseArray> left(static_cast<size_t>(n_sites + 1));
+        std::vector<DenseArray> right(static_cast<size_t>(n_sites + 1));
+        std::vector<py::array_t<cdouble>>* left_buffers = nullptr;
+        std::vector<py::array_t<cdouble>>* right_buffers = nullptr;
+        if (!chain_key.empty()) {
+            auto& cached_left = dmrg_left_environment_buffers[chain_key];
+            auto& cached_right = dmrg_right_environment_buffers[chain_key];
+            cached_left.resize(static_cast<size_t>(n_sites + 1));
+            cached_right.resize(static_cast<size_t>(n_sites + 1));
+            left_buffers = &cached_left;
+            right_buffers = &cached_right;
+        }
+        left[0] = left_boundary;
+        right[static_cast<size_t>(n_sites)] = right_boundary;
+        struct DmrgUpdate {
+            ssize_t bond;
+            double energy;
+            double truncation;
+            ssize_t states_kept;
+            double seconds;
+            py::dict profile;
+        };
+        std::vector<DmrgUpdate> update_records;
+        update_records.reserve(static_cast<size_t>(std::max<ssize_t>(0, n_sites - 2)));
+        py::list left_stack;
+        py::list right_stack;
+        double last_energy = 0.0;
+        double last_truncation = 0.0;
+        ssize_t last_kept = 0;
+        ssize_t last_bond = -1;
+        bool reused_environments = false;
+
+        if (direction == "lr") {
+            if (!chain_key.empty()) {
+                const auto env_it = dmrg_right_environment_chains.find(chain_key);
+                if (
+                    env_it != dmrg_right_environment_chains.end()
+                    && static_cast<ssize_t>(env_it->second.size()) == n_sites - 1
+                ) {
+                    for (ssize_t index = 0; index < n_sites - 1; ++index) {
+                        right[static_cast<size_t>(n_sites - index)] =
+                            env_it->second[static_cast<size_t>(index)];
+                    }
+                    reused_environments = true;
+                    ++dmrg_environment_chain_reuses;
+                }
+            }
+            if (!reused_environments && !right_environments.is_none()) {
+                py::sequence stack = py::cast<py::sequence>(right_environments);
+                if (py::len(stack) == n_sites - 1) {
+                    for (ssize_t index = 0; index < n_sites - 1; ++index) {
+                        DenseArray env = DenseArray::ensure(stack[index]);
+                        if (!env || env.ndim() != 3) {
+                            throw std::invalid_argument(
+                                "dense DMRG right environment stack contains a non-rank-3 tensor"
+                            );
+                        }
+                        right[static_cast<size_t>(n_sites - index)] = std::move(env);
+                    }
+                    reused_environments = true;
+                }
+            }
+            if (!reused_environments) {
+                for (ssize_t site = n_sites - 1; site >= 0; --site) {
+                    py::object out_buffer = py::none();
+                    if (right_buffers && (*right_buffers)[static_cast<size_t>(site)]) {
+                        out_buffer = (*right_buffers)[static_cast<size_t>(site)];
+                    }
+                    DenseArray updated = dense_environment_update_right_cpp(
+                        mpo[static_cast<size_t>(site)],
+                        sites[static_cast<size_t>(site)],
+                        right[static_cast<size_t>(site + 1)],
+                        sites[static_cast<size_t>(site)],
+                        out_buffer
+                    );
+                    if (!out_buffer.is_none() && updated.is(out_buffer)) {
+                        ++dmrg_environment_buffer_reuses;
+                    }
+                    right[static_cast<size_t>(site)] = updated;
+                    if (right_buffers) {
+                        (*right_buffers)[static_cast<size_t>(site)] = std::move(updated);
+                    }
+                }
+            }
+            left_stack.append(left[0]);
+            for (ssize_t bond = 0; bond < n_sites - 2; ++bond) {
+                const double local_start = wall_seconds();
+                const std::string key = "dense-bond:" + std::to_string(bond);
+                py::dict solved = block_davidson
+                    ? solve_two_site_block(
+                        key,
+                        left[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond + 1)],
+                        right[static_cast<size_t>(bond + 2)],
+                        sites[static_cast<size_t>(bond)],
+                        sites[static_cast<size_t>(bond + 1)],
+                        tol,
+                        max_iter,
+                        restart_dim,
+                        accept_unconverged,
+                        backend,
+                        reuse_static_w,
+                        std::max(1, block_size)
+                    )
+                    : solve_two_site(
+                        key,
+                        left[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond + 1)],
+                        right[static_cast<size_t>(bond + 2)],
+                        sites[static_cast<size_t>(bond)],
+                        sites[static_cast<size_t>(bond + 1)],
+                        tol,
+                        max_iter,
+                        restart_dim,
+                        accept_unconverged,
+                        backend,
+                        reuse_static_w
+                    );
+                if (!py::cast<bool>(solved["accepted"])) {
+                    throw std::runtime_error(
+                        "native dense DMRG local Davidson did not converge at bond "
+                        + std::to_string(bond)
+                    );
+                }
+                DenseArray vector = DenseArray::ensure(solved["vector"]);
+                auto split = split_dense_two_site(
+                    vector,
+                    sites[static_cast<size_t>(bond)],
+                    sites[static_cast<size_t>(bond + 1)],
+                    m_max,
+                    "right"
+                );
+                sites[static_cast<size_t>(bond)] = std::get<0>(split);
+                sites[static_cast<size_t>(bond + 1)] = std::get<1>(split);
+                last_truncation = std::get<2>(split);
+                last_kept = std::get<3>(split);
+                last_energy = py::cast<double>(solved["energy"]);
+                last_bond = bond;
+                py::object out_buffer = py::none();
+                if (left_buffers && (*left_buffers)[static_cast<size_t>(bond + 1)]) {
+                    out_buffer = (*left_buffers)[static_cast<size_t>(bond + 1)];
+                }
+                DenseArray updated_environment = dense_environment_update_left_cpp(
+                    mpo[static_cast<size_t>(bond)],
+                    sites[static_cast<size_t>(bond)],
+                    left[static_cast<size_t>(bond)],
+                    sites[static_cast<size_t>(bond)],
+                    out_buffer
+                );
+                if (!out_buffer.is_none() && updated_environment.is(out_buffer)) {
+                    ++dmrg_environment_buffer_reuses;
+                }
+                left[static_cast<size_t>(bond + 1)] = updated_environment;
+                if (left_buffers) {
+                    (*left_buffers)[static_cast<size_t>(bond + 1)] =
+                        std::move(updated_environment);
+                }
+                left_stack.append(left[static_cast<size_t>(bond + 1)]);
+                py::dict profile(solved);
+                profile.attr("pop")("vector", py::none());
+                update_records.push_back({
+                    bond,
+                    last_energy,
+                    last_truncation,
+                    last_kept,
+                    wall_seconds() - local_start,
+                    std::move(profile),
+                });
+            }
+            right_stack.append(right_boundary);
+        } else {
+            if (!chain_key.empty()) {
+                const auto env_it = dmrg_left_environment_chains.find(chain_key);
+                if (
+                    env_it != dmrg_left_environment_chains.end()
+                    && static_cast<ssize_t>(env_it->second.size()) == n_sites - 1
+                ) {
+                    for (ssize_t index = 0; index < n_sites - 1; ++index) {
+                        left[static_cast<size_t>(index)] =
+                            env_it->second[static_cast<size_t>(index)];
+                    }
+                    reused_environments = true;
+                    ++dmrg_environment_chain_reuses;
+                }
+            }
+            if (!reused_environments && !left_environments.is_none()) {
+                py::sequence stack = py::cast<py::sequence>(left_environments);
+                if (py::len(stack) == n_sites - 1) {
+                    for (ssize_t index = 0; index < n_sites - 1; ++index) {
+                        DenseArray env = DenseArray::ensure(stack[index]);
+                        if (!env || env.ndim() != 3) {
+                            throw std::invalid_argument(
+                                "dense DMRG left environment stack contains a non-rank-3 tensor"
+                            );
+                        }
+                        left[static_cast<size_t>(index)] = std::move(env);
+                    }
+                    reused_environments = true;
+                }
+            }
+            if (!reused_environments) {
+                for (ssize_t site = 0; site < n_sites; ++site) {
+                    py::object out_buffer = py::none();
+                    if (left_buffers && (*left_buffers)[static_cast<size_t>(site + 1)]) {
+                        out_buffer = (*left_buffers)[static_cast<size_t>(site + 1)];
+                    }
+                    DenseArray updated = dense_environment_update_left_cpp(
+                        mpo[static_cast<size_t>(site)],
+                        sites[static_cast<size_t>(site)],
+                        left[static_cast<size_t>(site)],
+                        sites[static_cast<size_t>(site)],
+                        out_buffer
+                    );
+                    if (!out_buffer.is_none() && updated.is(out_buffer)) {
+                        ++dmrg_environment_buffer_reuses;
+                    }
+                    left[static_cast<size_t>(site + 1)] = updated;
+                    if (left_buffers) {
+                        (*left_buffers)[static_cast<size_t>(site + 1)] = std::move(updated);
+                    }
+                }
+            }
+            right_stack.append(right[static_cast<size_t>(n_sites)]);
+            for (ssize_t bond = n_sites - 2; bond >= 1; --bond) {
+                const double local_start = wall_seconds();
+                const std::string key = "dense-bond:" + std::to_string(bond);
+                py::dict solved = block_davidson
+                    ? solve_two_site_block(
+                        key,
+                        left[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond + 1)],
+                        right[static_cast<size_t>(bond + 2)],
+                        sites[static_cast<size_t>(bond)],
+                        sites[static_cast<size_t>(bond + 1)],
+                        tol,
+                        max_iter,
+                        restart_dim,
+                        accept_unconverged,
+                        backend,
+                        reuse_static_w,
+                        std::max(1, block_size)
+                    )
+                    : solve_two_site(
+                        key,
+                        left[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond)],
+                        mpo[static_cast<size_t>(bond + 1)],
+                        right[static_cast<size_t>(bond + 2)],
+                        sites[static_cast<size_t>(bond)],
+                        sites[static_cast<size_t>(bond + 1)],
+                        tol,
+                        max_iter,
+                        restart_dim,
+                        accept_unconverged,
+                        backend,
+                        reuse_static_w
+                    );
+                if (!py::cast<bool>(solved["accepted"])) {
+                    throw std::runtime_error(
+                        "native dense DMRG local Davidson did not converge at bond "
+                        + std::to_string(bond)
+                    );
+                }
+                DenseArray vector = DenseArray::ensure(solved["vector"]);
+                auto split = split_dense_two_site(
+                    vector,
+                    sites[static_cast<size_t>(bond)],
+                    sites[static_cast<size_t>(bond + 1)],
+                    m_max,
+                    "left"
+                );
+                sites[static_cast<size_t>(bond)] = std::get<0>(split);
+                sites[static_cast<size_t>(bond + 1)] = std::get<1>(split);
+                last_truncation = std::get<2>(split);
+                last_kept = std::get<3>(split);
+                last_energy = py::cast<double>(solved["energy"]);
+                last_bond = bond;
+                py::object out_buffer = py::none();
+                if (right_buffers && (*right_buffers)[static_cast<size_t>(bond + 1)]) {
+                    out_buffer = (*right_buffers)[static_cast<size_t>(bond + 1)];
+                }
+                DenseArray updated_environment = dense_environment_update_right_cpp(
+                    mpo[static_cast<size_t>(bond + 1)],
+                    sites[static_cast<size_t>(bond + 1)],
+                    right[static_cast<size_t>(bond + 2)],
+                    sites[static_cast<size_t>(bond + 1)],
+                    out_buffer
+                );
+                if (!out_buffer.is_none() && updated_environment.is(out_buffer)) {
+                    ++dmrg_environment_buffer_reuses;
+                }
+                right[static_cast<size_t>(bond + 1)] = updated_environment;
+                if (right_buffers) {
+                    (*right_buffers)[static_cast<size_t>(bond + 1)] =
+                        std::move(updated_environment);
+                }
+                right_stack.append(right[static_cast<size_t>(bond + 1)]);
+                py::dict profile(solved);
+                profile.attr("pop")("vector", py::none());
+                update_records.push_back({
+                    bond,
+                    last_energy,
+                    last_truncation,
+                    last_kept,
+                    wall_seconds() - local_start,
+                    std::move(profile),
+                });
+            }
+            left_stack.append(left_boundary);
+        }
+
+        py::list factors;
+        for (auto& site : sites) {
+            factors.append(site);
+        }
+        py::list updates;
+        for (auto& record : update_records) {
+            py::dict row;
+            row["bond"] = py::int_(record.bond);
+            row["energy"] = py::float_(record.energy);
+            row["truncation"] = py::float_(record.truncation);
+            row["states_kept"] = py::int_(record.states_kept);
+            row["seconds"] = py::float_(record.seconds);
+            row["matvec_profile"] = std::move(record.profile);
+            updates.append(std::move(row));
+        }
+        if (!chain_key.empty()) {
+            dmrg_site_chains[chain_key] = sites;
+            std::vector<py::array_t<cdouble>> compact_left;
+            std::vector<py::array_t<cdouble>> compact_right;
+            if (direction == "lr") {
+                compact_left.reserve(static_cast<size_t>(n_sites - 1));
+                for (ssize_t index = 0; index < n_sites - 1; ++index) {
+                    compact_left.push_back(left[static_cast<size_t>(index)]);
+                }
+                compact_right.push_back(right_boundary);
+            } else {
+                compact_left.push_back(left_boundary);
+                compact_right.reserve(static_cast<size_t>(n_sites - 1));
+                for (ssize_t index = 0; index < n_sites - 1; ++index) {
+                    compact_right.push_back(
+                        right[static_cast<size_t>(n_sites - index)]
+                    );
+                }
+            }
+            dmrg_left_environment_chains[chain_key] = std::move(compact_left);
+            dmrg_right_environment_chains[chain_key] = std::move(compact_right);
+        }
+        ++dmrg_half_sweep_calls;
+        dmrg_half_sweep_bonds += std::max<ssize_t>(0, n_sites - 2);
+        dmrg_half_sweep_seconds += wall_seconds() - start;
+        py::dict out;
+        out["accepted"] = py::bool_(true);
+        out["backend"] = py::str("cpp_dense_dmrg_half_sweep");
+        out["direction"] = py::str(direction);
+        out["energy"] = py::float_(last_energy);
+        out["truncation"] = py::float_(last_truncation);
+        out["states_kept"] = py::int_(last_kept);
+        out["last_bond"] = py::int_(last_bond);
+        out["environments_reused"] = py::bool_(reused_environments);
+        out["chain_reused"] = py::bool_(reused_chain);
+        out["factors"] = std::move(factors);
+        out["left_environments"] = std::move(left_stack);
+        out["right_environments"] = std::move(right_stack);
+        out["updates"] = std::move(updates);
+        out["seconds"] = py::float_(wall_seconds() - start);
+        return out;
+    }
+
     void bind(
         const std::string& key,
         py::array_t<cdouble, py::array::c_style | py::array::forcecast> E,
@@ -44877,13 +47847,39 @@ public:
         out["two_site_static_w_reuses"] = py::int_(two_site_static_w_reuses);
         out["matvec_calls"] = py::int_(matvec_calls);
         out["diagonal_calls"] = py::int_(diagonal_calls);
+        out["dmrg_half_sweep_calls"] = py::int_(dmrg_half_sweep_calls);
+        out["dmrg_half_sweep_bonds"] = py::int_(dmrg_half_sweep_bonds);
+        out["dmrg_half_sweep_seconds"] = py::float_(dmrg_half_sweep_seconds);
+        out["dmrg_svd_workspace_growths"] = py::int_(dmrg_svd_workspace.growths);
+        out["dmrg_chain_records"] = py::int_(dmrg_site_chains.size());
+        out["dmrg_chain_installs"] = py::int_(dmrg_chain_installs);
+        out["dmrg_chain_reuses"] = py::int_(dmrg_chain_reuses);
+        out["dmrg_environment_chain_reuses"] =
+            py::int_(dmrg_environment_chain_reuses);
+        out["dmrg_environment_buffer_reuses"] =
+            py::int_(dmrg_environment_buffer_reuses);
         out["last_key"] = py::str(last_key);
         return out;
     }
 
     void clear() {
         records.clear();
+        dmrg_site_chains.clear();
+        dmrg_mpo_chains.clear();
+        dmrg_left_environment_chains.clear();
+        dmrg_right_environment_chains.clear();
+        dmrg_left_environment_buffers.clear();
+        dmrg_right_environment_buffers.clear();
         last_key.clear();
+    }
+
+    void clear_dmrg_chain(const std::string& key) {
+        dmrg_site_chains.erase(key);
+        dmrg_mpo_chains.erase(key);
+        dmrg_left_environment_chains.erase(key);
+        dmrg_right_environment_chains.erase(key);
+        dmrg_left_environment_buffers.erase(key);
+        dmrg_right_environment_buffers.erase(key);
     }
 
     void reset_stats() {
@@ -44902,6 +47898,13 @@ public:
         two_site_evolve_seconds = 0.0;
         matvec_calls = 0;
         diagonal_calls = 0;
+        dmrg_half_sweep_calls = 0;
+        dmrg_half_sweep_bonds = 0;
+        dmrg_half_sweep_seconds = 0.0;
+        dmrg_chain_installs = 0;
+        dmrg_chain_reuses = 0;
+        dmrg_environment_chain_reuses = 0;
+        dmrg_environment_buffer_reuses = 0;
         for (auto& item : records) {
             if (item.second) {
                 item.second->reset_stats();
@@ -44926,7 +47929,246 @@ private:
     double two_site_evolve_seconds = 0.0;
     long long matvec_calls = 0;
     long long diagonal_calls = 0;
+    long long dmrg_half_sweep_calls = 0;
+    long long dmrg_half_sweep_bonds = 0;
+    double dmrg_half_sweep_seconds = 0.0;
+    pyqed::dmrg::ComplexThinSVDWorkspace dmrg_svd_workspace;
+    std::unordered_map<
+        std::string,
+        std::vector<py::array_t<cdouble, py::array::c_style | py::array::forcecast>>
+    > dmrg_site_chains;
+    std::unordered_map<
+        std::string,
+        std::vector<py::array_t<cdouble, py::array::c_style | py::array::forcecast>>
+    > dmrg_mpo_chains;
+    std::unordered_map<std::string, std::vector<py::array_t<cdouble>>>
+        dmrg_left_environment_chains;
+    std::unordered_map<std::string, std::vector<py::array_t<cdouble>>>
+        dmrg_right_environment_chains;
+    std::unordered_map<std::string, std::vector<py::array_t<cdouble>>>
+        dmrg_left_environment_buffers;
+    std::unordered_map<std::string, std::vector<py::array_t<cdouble>>>
+        dmrg_right_environment_buffers;
+    long long dmrg_chain_installs = 0;
+    long long dmrg_chain_reuses = 0;
+    long long dmrg_environment_chain_reuses = 0;
+    long long dmrg_environment_buffer_reuses = 0;
     std::string last_key;
+
+    static void canonicalize_dense_svd_workspace(
+        pyqed::dmrg::ComplexThinSVDWorkspace& workspace,
+        ssize_t rows,
+        ssize_t cols
+    ) {
+        const ssize_t rank = std::min(rows, cols);
+        auto& u = workspace.left;
+        auto& vt = workspace.right;
+        const auto& singular = workspace.singular_values;
+        std::vector<double> values(
+            singular.begin(),
+            singular.begin() + rank
+        );
+        for (const auto& cluster : cluster_descending_values(values)) {
+            const ssize_t start = cluster.first;
+            const ssize_t stop = cluster.second;
+            const ssize_t ncol = stop - start;
+            if (ncol <= 1) {
+                continue;
+            }
+            const double tol = 100.0 * std::numeric_limits<double>::epsilon()
+                * static_cast<double>(std::max<ssize_t>(1, ncol));
+            std::vector<std::vector<cdouble>> basis;
+            basis.reserve(static_cast<size_t>(ncol));
+            for (ssize_t row = 0; row < rows; ++row) {
+                std::vector<cdouble> candidate(static_cast<size_t>(ncol));
+                for (ssize_t col = 0; col < ncol; ++col) {
+                    candidate[static_cast<size_t>(col)] = std::conj(
+                        u[static_cast<size_t>(row + (start + col) * rows)]
+                    );
+                }
+                for (int repeat = 0; repeat < 2; ++repeat) {
+                    for (const auto& vector : basis) {
+                        cdouble projection = 0.0;
+                        for (ssize_t col = 0; col < ncol; ++col) {
+                            projection += std::conj(vector[static_cast<size_t>(col)])
+                                * candidate[static_cast<size_t>(col)];
+                        }
+                        for (ssize_t col = 0; col < ncol; ++col) {
+                            candidate[static_cast<size_t>(col)] -=
+                                vector[static_cast<size_t>(col)] * projection;
+                        }
+                    }
+                }
+                double norm_sq = 0.0;
+                for (const auto& value : candidate) {
+                    norm_sq += std::norm(value);
+                }
+                const double norm = std::sqrt(norm_sq);
+                if (norm <= tol) {
+                    continue;
+                }
+                for (auto& value : candidate) {
+                    value /= norm;
+                }
+                fix_phase_inplace(candidate);
+                basis.push_back(std::move(candidate));
+                if (static_cast<ssize_t>(basis.size()) == ncol) {
+                    break;
+                }
+            }
+            std::vector<cdouble> rotation(
+                static_cast<size_t>(ncol * ncol),
+                cdouble(0.0, 0.0)
+            );
+            if (static_cast<ssize_t>(basis.size()) == ncol) {
+                for (ssize_t col = 0; col < ncol; ++col) {
+                    for (ssize_t row = 0; row < ncol; ++row) {
+                        rotation[static_cast<size_t>(row * ncol + col)] =
+                            basis[static_cast<size_t>(col)][static_cast<size_t>(row)];
+                    }
+                }
+            } else {
+                for (ssize_t col = 0; col < ncol; ++col) {
+                    rotation[static_cast<size_t>(col * ncol + col)] = 1.0;
+                }
+            }
+            std::vector<cdouble> u_old(static_cast<size_t>(rows * ncol));
+            std::vector<cdouble> vt_old(static_cast<size_t>(ncol * cols));
+            for (ssize_t row = 0; row < rows; ++row) {
+                for (ssize_t col = 0; col < ncol; ++col) {
+                    u_old[static_cast<size_t>(row * ncol + col)] =
+                        u[static_cast<size_t>(row + (start + col) * rows)];
+                }
+            }
+            for (ssize_t row = 0; row < ncol; ++row) {
+                for (ssize_t col = 0; col < cols; ++col) {
+                    vt_old[static_cast<size_t>(row * cols + col)] =
+                        vt[static_cast<size_t>(start + row + col * rank)];
+                }
+            }
+            for (ssize_t row = 0; row < rows; ++row) {
+                for (ssize_t col = 0; col < ncol; ++col) {
+                    cdouble total = 0.0;
+                    for (ssize_t inner = 0; inner < ncol; ++inner) {
+                        total += u_old[static_cast<size_t>(row * ncol + inner)]
+                            * rotation[static_cast<size_t>(inner * ncol + col)];
+                    }
+                    u[static_cast<size_t>(row + (start + col) * rows)] = total;
+                }
+            }
+            for (ssize_t row = 0; row < ncol; ++row) {
+                for (ssize_t col = 0; col < cols; ++col) {
+                    cdouble total = 0.0;
+                    for (ssize_t inner = 0; inner < ncol; ++inner) {
+                        total += std::conj(
+                            rotation[static_cast<size_t>(inner * ncol + row)]
+                        ) * vt_old[static_cast<size_t>(inner * cols + col)];
+                    }
+                    vt[static_cast<size_t>(start + row + col * rank)] = total;
+                }
+            }
+        }
+        for (ssize_t col = 0; col < rank; ++col) {
+            ssize_t best = 0;
+            double best_abs = 0.0;
+            for (ssize_t row = 0; row < rows; ++row) {
+                const double magnitude = std::abs(
+                    u[static_cast<size_t>(row + col * rows)]
+                );
+                if (magnitude > best_abs) {
+                    best_abs = magnitude;
+                    best = row;
+                }
+            }
+            if (best_abs <= 0.0) {
+                continue;
+            }
+            const cdouble phase = std::conj(
+                u[static_cast<size_t>(best + col * rows)]
+            ) / best_abs;
+            for (ssize_t row = 0; row < rows; ++row) {
+                u[static_cast<size_t>(row + col * rows)] *= phase;
+            }
+            const cdouble vt_phase = std::conj(phase);
+            for (ssize_t vcol = 0; vcol < cols; ++vcol) {
+                vt[static_cast<size_t>(col + vcol * rank)] *= vt_phase;
+            }
+        }
+    }
+
+    std::tuple<
+        py::array_t<cdouble>,
+        py::array_t<cdouble>,
+        double,
+        ssize_t
+    > split_dense_two_site(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> flat,
+        const py::array_t<cdouble, py::array::c_style | py::array::forcecast>& A,
+        const py::array_t<cdouble, py::array::c_style | py::array::forcecast>& B,
+        int m_max,
+        const std::string& direction
+    ) {
+        const ssize_t chi_l = A.shape(0);
+        const ssize_t d_a = A.shape(1);
+        const ssize_t d_b = B.shape(1);
+        const ssize_t chi_r = B.shape(2);
+        const ssize_t rows = chi_l * d_a;
+        const ssize_t cols = d_b * chi_r;
+        if (flat.size() != rows * cols) {
+            throw std::invalid_argument("dense DMRG split vector has incompatible dimensions");
+        }
+        {
+            py::gil_scoped_release release;
+            pyqed::dmrg::complex_thin_svd(
+                flat.data(),
+                static_cast<size_t>(rows),
+                static_cast<size_t>(cols),
+                dmrg_svd_workspace
+            );
+            canonicalize_dense_svd_workspace(dmrg_svd_workspace, rows, cols);
+        }
+        const ssize_t rank = std::min(rows, cols);
+        const ssize_t keep = std::min<ssize_t>(rank, m_max);
+        double truncation = 0.0;
+        for (ssize_t index = keep; index < rank; ++index) {
+            truncation += dmrg_svd_workspace.singular_values[static_cast<size_t>(index)];
+        }
+        py::array_t<cdouble> left_site({chi_l, d_a, keep});
+        py::array_t<cdouble> right_site({keep, d_b, chi_r});
+        auto left_out = left_site.mutable_unchecked<3>();
+        auto right_out = right_site.mutable_unchecked<3>();
+        for (ssize_t i = 0; i < chi_l; ++i) {
+            for (ssize_t p = 0; p < d_a; ++p) {
+                for (ssize_t k = 0; k < keep; ++k) {
+                    cdouble value = dmrg_svd_workspace.left[
+                        static_cast<size_t>(i * d_a + p + k * rows)
+                    ];
+                    if (direction == "left") {
+                        value *= dmrg_svd_workspace.singular_values[
+                            static_cast<size_t>(k)
+                        ];
+                    }
+                    left_out(i, p, k) = value;
+                }
+            }
+        }
+        for (ssize_t k = 0; k < keep; ++k) {
+            for (ssize_t p = 0; p < d_b; ++p) {
+                for (ssize_t j = 0; j < chi_r; ++j) {
+                    cdouble value = dmrg_svd_workspace.right[
+                        static_cast<size_t>(k + (p * chi_r + j) * rank)
+                    ];
+                    if (direction == "right") {
+                        value *= dmrg_svd_workspace.singular_values[
+                            static_cast<size_t>(k)
+                        ];
+                    }
+                    right_out(k, p, j) = value;
+                }
+            }
+        }
+        return {std::move(left_site), std::move(right_site), truncation, keep};
+    }
 
     CppDenseDavidsonWorkspace& record_for(const std::string& key) {
         auto& ptr = records[key];
@@ -45479,6 +48721,144 @@ public:
         return out;
     }
 
+    py::dict lanczos_expm_apply(
+        py::array_t<cdouble, py::array::c_style | py::array::forcecast> vector,
+        double dt,
+        int krylov_dim,
+        double tol
+    ) const {
+        if (vector.ndim() != 1 || vector.shape(0) != dim_) {
+            throw std::invalid_argument(
+                "vector dimension does not match SU2 factorized-family table"
+            );
+        }
+        if (krylov_dim <= 0 || tol < 0.0) {
+            throw std::invalid_argument("invalid Lanczos controls");
+        }
+        std::vector<cdouble> initial(
+            vector.data(),
+            vector.data() + static_cast<size_t>(dim_)
+        );
+        std::vector<cdouble> evolved = initial;
+        ssize_t actual_dim = 0;
+        {
+            py::gil_scoped_release release;
+            const double initial_norm = norm2(initial);
+            if (initial_norm > tol) {
+                const ssize_t mmax = std::min<ssize_t>(krylov_dim, dim_);
+                std::vector<std::vector<cdouble>> basis(
+                    static_cast<size_t>(mmax),
+                    std::vector<cdouble>(static_cast<size_t>(dim_))
+                );
+                for (ssize_t row = 0; row < dim_; ++row) {
+                    basis[0][static_cast<size_t>(row)] =
+                        initial[static_cast<size_t>(row)] / initial_norm;
+                }
+                std::vector<double> alpha(static_cast<size_t>(mmax), 0.0);
+                std::vector<double> beta(
+                    static_cast<size_t>(std::max<ssize_t>(mmax - 1, 0)),
+                    0.0
+                );
+                double beta_previous = 0.0;
+                for (ssize_t column = 0; column < mmax; ++column) {
+                    std::vector<cdouble> trial = apply_vector(
+                        basis[static_cast<size_t>(column)]
+                    );
+                    if (column > 0) {
+                        axpy(
+                            trial,
+                            cdouble(-beta_previous, 0.0),
+                            basis[static_cast<size_t>(column - 1)]
+                        );
+                    }
+                    const cdouble diagonal = dotc(
+                        basis[static_cast<size_t>(column)],
+                        trial
+                    );
+                    alpha[static_cast<size_t>(column)] = diagonal.real();
+                    axpy(
+                        trial,
+                        -diagonal,
+                        basis[static_cast<size_t>(column)]
+                    );
+                    const double next_beta = norm2(trial);
+                    actual_dim = column + 1;
+                    if (next_beta <= tol || column + 1 == mmax) {
+                        break;
+                    }
+                    beta[static_cast<size_t>(column)] = next_beta;
+                    beta_previous = next_beta;
+                    for (ssize_t row = 0; row < dim_; ++row) {
+                        basis[static_cast<size_t>(column + 1)]
+                            [static_cast<size_t>(row)] =
+                                trial[static_cast<size_t>(row)] / next_beta;
+                    }
+                }
+
+                std::vector<cdouble> tridiagonal(
+                    static_cast<size_t>(actual_dim * actual_dim),
+                    cdouble(0.0, 0.0)
+                );
+                for (ssize_t index = 0; index < actual_dim; ++index) {
+                    tridiagonal[static_cast<size_t>(index * actual_dim + index)] =
+                        cdouble(alpha[static_cast<size_t>(index)], 0.0);
+                    if (index + 1 < actual_dim) {
+                        const cdouble off_diagonal(
+                            beta[static_cast<size_t>(index)], 0.0
+                        );
+                        tridiagonal[
+                            static_cast<size_t>(index * actual_dim + index + 1)
+                        ] = off_diagonal;
+                        tridiagonal[
+                            static_cast<size_t>((index + 1) * actual_dim + index)
+                        ] = off_diagonal;
+                    }
+                }
+                const auto eig = projected_hermitian_eigh_ascending(
+                    tridiagonal,
+                    actual_dim
+                );
+                std::vector<cdouble> coefficients(
+                    static_cast<size_t>(actual_dim),
+                    cdouble(0.0, 0.0)
+                );
+                for (ssize_t row = 0; row < actual_dim; ++row) {
+                    cdouble coefficient(0.0, 0.0);
+                    for (ssize_t eigen = 0; eigen < actual_dim; ++eigen) {
+                        coefficient += eig.vector(row, eigen)
+                            * std::exp(
+                                cdouble(0.0, -dt * eig.values_asc[static_cast<size_t>(eigen)])
+                            )
+                            * std::conj(eig.vector(0, eigen));
+                    }
+                    coefficients[static_cast<size_t>(row)] =
+                        initial_norm * coefficient;
+                }
+                std::fill(
+                    evolved.begin(),
+                    evolved.end(),
+                    cdouble(0.0, 0.0)
+                );
+                for (ssize_t column = 0; column < actual_dim; ++column) {
+                    axpy(
+                        evolved,
+                        coefficients[static_cast<size_t>(column)],
+                        basis[static_cast<size_t>(column)]
+                    );
+                }
+            }
+        }
+        ++lanczos_calls_;
+        py::array_t<cdouble> out(dim_);
+        std::copy(evolved.begin(), evolved.end(), out.mutable_data());
+        py::dict result;
+        result["vector"] = std::move(out);
+        result["krylov_dim"] = py::int_(actual_dim);
+        result["matvec_count"] = py::int_(actual_dim);
+        result["backend"] = py::str("cpp");
+        return result;
+    }
+
     py::dict davidson(
         py::array_t<cdouble, py::array::c_style | py::array::forcecast> diag_array,
         py::array_t<cdouble, py::array::c_style | py::array::forcecast> guess_array,
@@ -45547,6 +48927,7 @@ public:
         out["davidson_calls"] = py::int_(davidson_calls_);
         out["davidson_workspace_reuses"] =
             py::int_(davidson_workspace_reuses_);
+        out["lanczos_calls"] = py::int_(lanczos_calls_);
         return out;
     }
 
@@ -45572,6 +48953,7 @@ protected:
     mutable DavidsonWorkspace davidson_workspace_;
     mutable long long davidson_calls_ = 0;
     mutable long long davidson_workspace_reuses_ = 0;
+    mutable long long lanczos_calls_ = 0;
 
     static ssize_t tuple_int(py::tuple item, ssize_t index) {
         return py::cast<ssize_t>(item[static_cast<size_t>(index)]);
@@ -48641,7 +52023,8 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         py::arg("W"),
         py::arg("A"),
         py::arg("E"),
-        py::arg("B")
+        py::arg("B"),
+        py::arg("out") = py::none()
     );
     m.def(
         "dense_environment_update_right",
@@ -48649,7 +52032,8 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         py::arg("W"),
         py::arg("A"),
         py::arg("F"),
-        py::arg("B")
+        py::arg("B"),
+        py::arg("out") = py::none()
     );
     m.def(
         "pack_rank_coupled_factor_routes",
@@ -48758,6 +52142,27 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         .def("reset_stats", &CppDenseDavidsonWorkspace::reset_stats);
     py::class_<CppDenseSweepWorkspace>(m, "DenseSweepWorkspace")
         .def(py::init<>())
+        .def(
+            "dmrg_half_sweep",
+            &CppDenseSweepWorkspace::dmrg_half_sweep,
+            py::arg("mps"),
+            py::arg("mpo"),
+            py::arg("left_boundary"),
+            py::arg("right_boundary"),
+            py::arg("direction"),
+            py::arg("m_max"),
+            py::arg("tol"),
+            py::arg("max_iter"),
+            py::arg("restart_dim"),
+            py::arg("accept_unconverged"),
+            py::arg("backend") = "blas",
+            py::arg("reuse_static_w") = true,
+            py::arg("block_davidson") = false,
+            py::arg("block_size") = 2,
+            py::arg("left_environments") = py::none(),
+            py::arg("right_environments") = py::none(),
+            py::arg("chain_key") = ""
+        )
         .def(
             "bind",
             &CppDenseSweepWorkspace::bind,
@@ -48895,6 +52300,11 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         .def("diagonal", &CppDenseSweepWorkspace::diagonal, py::arg("key"))
         .def("record_stats", &CppDenseSweepWorkspace::record_stats, py::arg("key"))
         .def("stats", &CppDenseSweepWorkspace::stats)
+        .def(
+            "clear_dmrg_chain",
+            &CppDenseSweepWorkspace::clear_dmrg_chain,
+            py::arg("key")
+        )
         .def("clear", &CppDenseSweepWorkspace::clear)
         .def("reset_stats", &CppDenseSweepWorkspace::reset_stats);
     m.def(
@@ -48911,6 +52321,13 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         py::arg("entries"),
         py::arg("n_sites"),
         py::arg("cutoff") = 1.0e-10
+    );
+    m.def(
+        "build_spatial_same_side_p_pattern_spans",
+        &build_spatial_same_side_p_pattern_spans,
+        py::arg("raw_keys"),
+        py::arg("n_sites"),
+        py::arg("cutoff") = 1.0e-14
     );
     m.def(
         "build_spatial_qchem_family_mpos",
@@ -49318,6 +52735,13 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         py::arg("B")
     );
     m.def(
+        "packed_left_identity_boundary_advance_payload_many",
+        &packed_left_identity_boundary_advance_payload_many,
+        py::arg("A_conj"),
+        py::arg("boundaries"),
+        py::arg("B")
+    );
+    m.def(
         "packed_right_boundary_advance_payload",
         &packed_right_boundary_advance_payload,
         py::arg("W"),
@@ -49330,6 +52754,13 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         &packed_right_identity_boundary_advance_payload,
         py::arg("A_conj"),
         py::arg("F"),
+        py::arg("B")
+    );
+    m.def(
+        "packed_right_identity_boundary_advance_payload_many",
+        &packed_right_identity_boundary_advance_payload_many,
+        py::arg("A_conj"),
+        py::arg("boundaries"),
         py::arg("B")
     );
     m.def(
@@ -49899,6 +53330,7 @@ PYBIND11_MODULE(_cpp_davidson, m) {
              py::arg("f_blocks"), py::arg("out_entries"))
         .def("diagonal_from_routes", &CppCompactPlan::diagonal_from_routes,
              py::arg("routes"))
+        .def("diagonal_routes", &CppCompactPlan::diagonal_routes)
         .def("davidson", &CppCompactPlan::davidson, py::arg("diag"), py::arg("v0"),
              py::arg("tol"), py::arg("max_iter"), py::arg("restart_dim"),
              py::arg("accept_unconverged") = false);
@@ -49936,6 +53368,14 @@ PYBIND11_MODULE(_cpp_davidson, m) {
             py::arg("max_iter"),
             py::arg("restart_dim"),
             py::arg("accept_unconverged") = false
+        )
+        .def(
+            "lanczos_expm_apply",
+            &CppSU2FactorizedFamilyTable::lanczos_expm_apply,
+            py::arg("vector"),
+            py::arg("dt"),
+            py::arg("krylov_dim"),
+            py::arg("tol")
         )
         .def_property_readonly(
             "stats",
@@ -50275,7 +53715,12 @@ PYBIND11_MODULE(_cpp_davidson, m) {
              py::arg("parent_rows"))
         .def("apply_same_side_route_boundary_parent_advances",
              &CppMovingEnvironment::apply_same_side_route_boundary_parent_advances,
-             py::arg("available_rows"), py::arg("advance_fn"))
+             py::arg("available_rows"), py::arg("advance_fn"),
+             py::arg("side") = py::none(),
+             py::arg("site_a_conj") = py::none(),
+             py::arg("site_b") = py::none(),
+             py::arg("tensor_cls") = py::none(),
+             py::arg("local_operator_fn") = py::none())
         .def("prepare_same_side_route_missing_parent_builds",
              &CppMovingEnvironment::prepare_same_side_route_missing_parent_builds,
              py::arg("missing_parent_rows"))
@@ -50690,6 +54135,17 @@ PYBIND11_MODULE(_cpp_davidson, m) {
              py::arg("planned_cls"), py::arg("route_plan"),
              py::arg("boundary_batch"), py::arg("left_table"),
              py::arg("right_table"), py::arg("source") = py::none())
+        .def("build_native_p_identity_entries",
+             &CppMovingEnvironment::build_native_p_identity_entries,
+             py::arg("planned_cls"), py::arg("owner_records"),
+             py::arg("coefficients"), py::arg("left_boundary_operators"),
+             py::arg("right_boundary_operators"),
+             py::arg("left_same_side_operators"),
+             py::arg("right_same_side_operators"),
+             py::arg("left_identity"), py::arg("right_identity"),
+             py::arg("local_pair_builder"), py::arg("left_table"),
+             py::arg("right_table"), py::arg("bond"),
+             py::arg("source") = py::none())
         .def("build_direct_route_plan_from_records",
              &CppMovingEnvironment::build_direct_route_plan_from_records,
              py::arg("plan_cls"), py::arg("family_name"),

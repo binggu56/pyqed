@@ -6,10 +6,10 @@ Created on Wed Feb 11 17:15:58 2026
 @author: Shuoyi Hu, Sha Mo, Bing Gu
 """
 
-from pyqed.mps import MPS, MPO, fDMRG_1site_GS_OBC, two_site_dmrg, dense_to_symmetric,\
-    expect_mps
+from pyqed.mps import MPS, MPO, fDMRG_1site_GS_OBC, two_site_dmrg, dense_to_symmetric
 from pyqed.mps.mps import (
     _abelian_data_factor_list,
+    _expect_factors,
     initial_E,
     contract_from_left,
     svd_symmetric,
@@ -27,6 +27,7 @@ from pyqed.mps.abelian_storage import (
     legacy_tensordot,
     make_identity_mpo_site_from_mps_site,
 )
+from pyqed.lattice.site import richer_sites, sites_compatible
 import numpy as np
 import pickle
 from pathlib import Path
@@ -55,7 +56,6 @@ def _normalize_mps_state(state):
         raise ValueError("cannot normalize a near-zero DMRG state.")
     scale = 1.0 / np.sqrt(norm)
     state.factors[0] = state.factors[0] * scale
-    state.Bs = state.data = state.factors
     return state
 
 
@@ -103,34 +103,21 @@ def _normalized_mps_mpo_expectation(factors, mpo):
 def dmrg_matvec_options(policy="auto"):
     """Return canonical Abelian two-site matvec/local-solver options.
 
-    The low-level Abelian DMRG implementation exposes many experimental knobs.
-    Public callers should normally choose one policy here and pass targeted
-    overrides only when benchmarking.
+    Public policies are ``"auto"``, ``"dense"``, ``"dense-block"``,
+    ``"symmetric"``, and ``"reference"``. Backend implementation names are
+    intentionally kept out of the public policy API. The low-level Abelian
+    implementation exposes additional experimental policies for benchmarking.
     """
 
     policy = str(policy or "auto").strip().lower().replace("_", "-")
     aliases = {
         "default": "auto",
         "safe": "auto",
-        "block2": "packed-cpp-fast",
-        "block2-like": "packed-cpp-fast",
-        "block2-style": "packed-cpp-fast",
-        "packed-block2-style": "packed-cpp-fast",
-        "cpp": "packed-cpp-fast",
-        "c++": "packed-cpp-fast",
-        "block2-cpp": "packed-cpp-fast",
-        "dense-cpp-fast": "generic-cpp",
-        "dense-cpp": "generic-cpp",
-        "generic-dense-cpp": "generic-cpp",
-        "generic-c++": "generic-cpp",
-        "dense-cpp-block": "generic-cpp-block",
-        "generic-block-cpp": "generic-cpp-block",
-        "generic-block-c++": "generic-cpp-block",
         "projector-fast": "packed-projector-fast",
     }
     policy = aliases.get(policy, policy)
     if policy == "auto":
-        return dmrg_matvec_options("packed-cpp-fast")
+        return dmrg_matvec_options("symmetric")
     if policy in {"legacy-auto", "selector-auto"}:
         return {
             "batched_compact_matrix_chain_selector_enabled": True,
@@ -211,18 +198,22 @@ def dmrg_matvec_options(policy="auto"):
                 "moving_environment_cpp_matvec": True,
                 "packed_local_family_flat_direct_matvec": True,
                 "packed_local_family_flat_direct_matvec_backend": "renormalized_table",
-                "generator_table_packed_route_table": "auto",
+                "generator_table_packed_route_table": "raw_cython",
                 "generator_table_precompute_contextual_boundaries": False,
                 "generator_table_exact_component_compression_fast_max_group_size": 1,
             }
         )
         return opts
-    if policy == "packed-cpp-fast":
+    if policy == "symmetric":
         opts = dmrg_matvec_options("packed-compiled-fast")
         opts.update(
             {
                 "moving_environment_cpp_davidson": True,
-                "moving_environment_cpp_accept_unconverged": False,
+                # Davidson non-convergence at its iteration cap is acceptable
+                # only after the residual validation below.  Returning the
+                # candidate lets the compiled owner avoid an unconditional
+                # duplicate Python solve.
+                "moving_environment_cpp_accept_unconverged": True,
                 "moving_environment_cpp_validate_solution": True,
                 "moving_environment_cpp_solution_residual_tol_factor": 25.0,
                 "moving_environment_cpp_solution_residual_abs_tol": 1.0e-9,
@@ -257,10 +248,14 @@ def dmrg_matvec_options(policy="auto"):
                 "generator_table_precompute_contextual_boundaries_min_records": 0,
                 "generator_table_planned_contextual_without_precompute": True,
                 "generator_table_planned_contextual_without_precompute_table_lookup": True,
-                "generator_table_packed_direct_family_entries": False,
-                "generator_table_packed_direct_family_entries_reason": (
-                    "disabled because mixed packed P routes require planned entries"
-                ),
+                "generator_table_packed_direct_family_entries": True,
+                "generator_table_allow_planned_packed_contextual_entries": True,
+                "generator_table_allow_table_backed_planned_contextual_entries": "auto",
+                "generator_table_snapshot_table_backed_planned_entries": False,
+                # The packed route is validated by exact H4/H6 reference tests.
+                # Rebuilding two raw tables and probing random vectors for every
+                # P entry dominated spatial CAS(10,10) environment movement.
+                "generator_table_validate_cpp_boundary_p_raw_table": False,
                 "generator_table_prebuild_same_side_native_p": True,
                 "generator_table_incremental_same_side_pair_prebuild": True,
                 "generator_table_use_disjoint_same_side_native_p": False,
@@ -309,7 +304,7 @@ def dmrg_matvec_options(policy="auto"):
             "packed_local_block_preconditioner_max_block_dim": 64,
             "packed_local_block_preconditioner_max_total_dim": 512,
         }
-    if policy == "generic":
+    if policy == "reference":
         return {
             "direct_operator_selector_enabled": False,
             "generic_chain_selector_enabled": False,
@@ -319,19 +314,20 @@ def dmrg_matvec_options(policy="auto"):
             "native_compact_matrix_chain_selector_enabled": False,
             "batched_action_selector_enabled": False,
         }
-    if policy == "generic-cpp":
-        opts = dmrg_matvec_options("generic")
+    if policy == "dense":
+        opts = dmrg_matvec_options("reference")
         opts.update(
             {
                 "moving_environment_dense_cpp_davidson": True,
                 "moving_environment_dense_cpp_davidson_backend": "blas",
                 "moving_environment_dense_cpp_two_site_solve": True,
+                "moving_environment_dense_cpp_dmrg_sweep": "auto",
                 "moving_environment_dense_cpp_environment_update": False,
             }
         )
         return opts
-    if policy == "generic-cpp-block":
-        opts = dmrg_matvec_options("generic-cpp")
+    if policy == "dense-block":
+        opts = dmrg_matvec_options("dense")
         opts.update(
             {
                 "moving_environment_dense_cpp_block_davidson": True,
@@ -442,8 +438,13 @@ class DMRG:
             Weights for state averaging.
         """
 
+        if not isinstance(H, MPO):
+            raise TypeError("DMRG requires an MPO Hamiltonian.")
+        if not isinstance(init_guess, MPS) and resume_from is None:
+            raise TypeError("DMRG requires an MPS initial guess.")
+
         self.H = H
-        self.L = len(self._factor_list(H))
+        self.L = H.L
         self.D = D
         self.nsweeps = nsweeps
         self.converge_on_full_sweeps = bool(converge_on_full_sweeps)
@@ -467,11 +468,12 @@ class DMRG:
         self.final_expectation = bool(final_expectation)
         self.performance = str(performance or "auto")
         policy_key = self.performance.strip().lower().replace("_", "-")
-        self.resolved_performance = (
-            "generic-cpp"
-            if (not bool(symmetry) and policy_key in {"auto", "default"})
-            else self.performance
-        )
+        if policy_key in {"auto", "default"}:
+            self.resolved_performance = (
+                "symmetric" if bool(symmetry) else "dense"
+            )
+        else:
+            self.resolved_performance = self.performance
         self.abelian_matvec_options = resolve_abelian_matvec_options(
             self.resolved_performance,
             abelian_matvec_options,
@@ -533,10 +535,10 @@ class DMRG:
         return out
 
     @staticmethod
-    def _factor_list(obj):
-        if hasattr(obj, "factors") and not isinstance(obj, (list, tuple)):
-            return obj.factors
-        return obj
+    def _mpo_factors(operator):
+        if not isinstance(operator, MPO):
+            raise TypeError("DMRG operator families must contain MPO objects.")
+        return operator.factors
 
     @staticmethod
     def load_checkpoint(path):
@@ -586,30 +588,43 @@ class DMRG:
             self.resume_payload = self.load_checkpoint(self.resume_from)
             if "mps" not in self.resume_payload:
                 raise ValueError(f"DMRG checkpoint {self.resume_from!r} does not contain an MPS.")
-            self.init_guess = self._copy_factors(self.resume_payload["mps"])
+            checkpoint_labels = ["lv", "rv", "p"] if self.symmetry else ["lv", "p", "rv"]
+            self.init_guess = MPS(
+                self._copy_factors(self.resume_payload["mps"]),
+                labels=checkpoint_labels,
+                sites=self.H.input_sites,
+            )
             resume_history = list(self.resume_payload.get("sweep_history", []))
             resume_sweep_offset = int(self.resume_payload.get("completed_sweeps", len(resume_history)))
 
-        if self.init_guess is None:
-            raise ValueError('Please provide an initial guess.')
+        state_sites = self.init_guess.sites
+        hamiltonian_input_sites = self.H.input_sites
+        hamiltonian_output_sites = self.H.sites
+        if (
+            hamiltonian_input_sites is not None
+            and hamiltonian_output_sites is not None
+            and not sites_compatible(
+                hamiltonian_output_sites, hamiltonian_input_sites
+            )
+        ):
+            raise ValueError("DMRG requires a Hamiltonian with matching input/output sites.")
+        if state_sites is not None and hamiltonian_input_sites is not None:
+            if not sites_compatible(hamiltonian_input_sites, state_sites):
+                raise ValueError(
+                    "The initial MPS sites are incompatible with the Hamiltonian input sites."
+                )
 
-        # Standardize MPS to ['lv', 'p', 'rv']
-        # but currently we are not using the initial guess as MPS objects a lot, but i do think that is the better option. so need to fix initial guess in dmrg.py. remve this TODO when fixed.
-        if isinstance(self.init_guess, MPS):
-            if self.symmetry and hasattr(self.init_guess.factors[0], 'qns'):
-                # U(1) branch uses (L, R, P) ordering before optional data conversion.
-                mps_list = self.init_guess.to_order(['lv', 'rv', 'p']).factors
-            else:
-                mps_list = self.init_guess.to_order(['lv', 'p', 'rv']).factors
+        if self.symmetry and hasattr(self.init_guess.factors[0], 'qns'):
+            # U(1) branch uses (L, R, P) ordering before optional data conversion.
+            mps_list = self.init_guess.to_order(['lv', 'rv', 'p']).factors
         else:
-            # If it's a raw list, we assume it respects the convention. TODO: maybe add auto check and warning and raise error.
-            mps_list = self.init_guess
+            mps_list = self.init_guess.to_order(['lv', 'p', 'rv']).factors
 
-        mpo_list = self._factor_list(self.H)
+        mpo_list = self._mpo_factors(self.H)
         complementary_operator_mpos = None
         if self.complementary_operator_mpos is not None:
             complementary_operator_mpos = {
-                name: self._factor_list(mpo)
+                name: self._mpo_factors(mpo)
                 for name, mpo in self.complementary_operator_mpos.items()
             }
         use_native_site_storage = bool(
@@ -636,7 +651,22 @@ class DMRG:
             # canonical state.  Put dense initial guesses in right-canonical
             # form so the first left-to-right local problem has an identity
             # norm on the right block, matching the non-Abelian sweep contract.
-            mps_list = MPS(mps_list, labels=["lv", "p", "rv"]).right_canonicalize().factors
+            canonical_guess = MPS(
+                mps_list,
+                labels=["lv", "p", "rv"],
+                sites=state_sites or hamiltonian_input_sites,
+            ).right_canonicalize()
+            state_sites = canonical_guess.sites
+            mps_list = canonical_guess.factors
+
+        if hamiltonian_output_sites is None:
+            result_sites = state_sites
+        elif state_sites is not None and sites_compatible(
+            hamiltonian_output_sites, state_sites
+        ):
+            result_sites = richer_sites(hamiltonian_output_sites, state_sites)
+        else:
+            result_sites = hamiltonian_output_sites
 
         if (
             self.symmetry
@@ -665,10 +695,24 @@ class DMRG:
                 for key in ("energy", "truncation"):
                     val = row.get(key)
                     try:
-                        row[key] = float(np.real(np.asarray(val).reshape(-1)[0]))
+                        values = np.real(np.asarray(val)).reshape(-1)
+                        row[key] = (
+                            [float(value) for value in values]
+                            if key == "energy" and self.nstates > 1
+                            else float(values[0])
+                        )
                     except Exception:
                         pass
-                if self.final_expectation and self.nstates == 1 and "mps" in info:
+                needs_post_energy = (
+                    self.final_expectation
+                    and self.nstates == 1
+                    and "mps" in info
+                    and (
+                        not self.converge_on_full_sweeps
+                        or row.get("direction") == "rl"
+                    )
+                )
+                if needs_post_energy:
                     try:
                         local_energy = row.get("energy")
                         post_energy = (
@@ -723,10 +767,44 @@ class DMRG:
                 complementary_operator_generator_entries=self.complementary_operator_generator_entries,
                 site_qn_maps=self.site_qn_maps,
                 recenter_final=self.recenter_final,
-                abelian_matvec_options=self.abelian_matvec_options,
+                abelian_matvec_options={
+                    **self.abelian_matvec_options,
+                    "moving_environment_cpp_owner_sweep_schedule_use_local_convergence": (
+                        not (
+                            self.final_expectation
+                            and self.converge_on_full_sweeps
+                            and self.nstates == 1
+                        )
+                    ),
+                },
                 converge_on_full_sweeps=self.converge_on_full_sweeps,
             )
             e_elec, mps_out, self.gauge, self.converged = res
+            if (
+                self.final_expectation
+                and self.converge_on_full_sweeps
+                and self.nstates == 1
+            ):
+                complete_rows = [
+                    row
+                    for row in self.sweep_history
+                    if row.get("direction") == "rl"
+                    and row.get("post_truncation_energy") is not None
+                ]
+                if complete_rows:
+                    self.converged = bool(
+                        len(complete_rows) >= 2
+                        and abs(
+                            float(complete_rows[-1]["post_truncation_energy"])
+                            - float(complete_rows[-2]["post_truncation_energy"])
+                        )
+                        < self.sweep_tol
+                    )
+                elif not any(
+                    row.get("direction") == "h2-local"
+                    for row in self.sweep_history
+                ):
+                    self.converged = False
             if not self.sweep_history:
                 try:
                     diagnostic_energy = float(np.real(np.asarray(e_elec).reshape(-1)[0]))
@@ -759,11 +837,18 @@ class DMRG:
             center = (self.L - 1) if self.gauge.lower() == "left" else 0
 
             if self.nstates == 1:
-                self.ground_state = MPS(mps_out, labels=labels, center=center)
+                self.ground_state = MPS(
+                    mps_out, labels=labels, center=center, sites=result_sites
+                )
                 self.states = [self.ground_state]
             else:
-                self.states = [MPS(s, labels=labels, center=center) for s in mps_out]
+                self.states = [
+                    MPS(s, labels=labels, center=center, sites=result_sites)
+                    for s in mps_out
+                ]
                 self.ground_state = self.states[0]
+
+            self.sites = self.ground_state.sites
 
             for s in self.states:
                 if self.gauge.lower() == "left": 
@@ -774,7 +859,7 @@ class DMRG:
 
             if self.final_expectation:
                 state_energies = [
-                    _normalized_mps_mpo_expectation(s.factors, mpo_list) + shift
+                    float(np.real(_contract_mps_mpo(s.factors, mpo_list))) + shift
                     for s in self.states
                 ]
             else:
@@ -838,7 +923,7 @@ class DMRG:
 
         psi = self.ground_state
 
-        return [expect_mps(psi, e_op) for e_op in e_ops]
+        return [_expect_factors(psi, e_op) for e_op in e_ops]
 
     def make_rdm1(self):
         """
@@ -938,7 +1023,6 @@ if __name__ == '__main__':
     H = mol.build_H_mpo()
     neel = mol.build_neel_state()
     
-    dmrg = DMRG(H, D=20, nsweeps=8)
-    dmrg.init_guess = neel
+    dmrg = DMRG(H, D=20, nsweeps=8, init_guess=neel)
     dmrg.run()
     

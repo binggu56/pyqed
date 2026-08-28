@@ -17,7 +17,7 @@ import numpy as np
 
 from pyqed.mps.symmetry import Sector
 
-from .mpo import PhysicalLeg
+from .mpo import Leg
 
 
 def _ordered_unique(items):
@@ -155,7 +155,7 @@ class SiteBasis(SymmetryBasis):
     """Physical local basis descriptor."""
 
     def as_physical_leg(self):
-        return PhysicalLeg.from_dims(self.dims, sectors=self.sectors)
+        return Leg.from_dims(self.dims, sectors=self.sectors)
 
 
 @dataclass(frozen=True)

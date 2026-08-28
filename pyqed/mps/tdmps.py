@@ -6,7 +6,7 @@ from pyqed.mps.mps import (
     dense_to_symmetric_mpo,
     expmpo,
     apply_mpo,
-    expect_mps,
+    _expect_factors,
     make_identity_mpo_site_from_mps_site,
     symmetric_to_dense,
 )
@@ -44,6 +44,17 @@ def _normalize_integrator(integrator):
     return aliases[key]
 
 
+def _normalize_projection_setting(projection):
+    if projection is None or projection is False:
+        return projection
+    key = str(projection).lower().replace("_", "-")
+    if key == "su2":
+        raise ValueError(
+            "projection='su2' requires the native qchem TDDMRG driver."
+        )
+    return key
+
+
 class TDMPS:
     def __init__(
         self,
@@ -56,6 +67,7 @@ class TDMPS:
         target_sector=None,
         projection=None,
         tdvp_split_dynamic_block_sparse=False,
+        normalize=True,
     ):
         """
         Time-Dependent MPS Solver (Layout Agnostic).
@@ -67,6 +79,19 @@ class TDMPS:
             bond_dim (int): Max bond dimension.
         """
 
+        if not isinstance(H_mpo, MPO):
+            raise TypeError("TDMPS requires an MPO Hamiltonian.")
+        if interaction_mpo is not None:
+            interaction_operators = (
+                tuple(interaction_mpo)
+                if isinstance(interaction_mpo, (list, tuple))
+                else (interaction_mpo,)
+            )
+            if not interaction_operators or not all(
+                isinstance(operator, MPO) for operator in interaction_operators
+            ):
+                raise TypeError("interaction_mpo must be an MPO or a sequence of MPOs.")
+
         # self.psi0 = psi0
         self.H = H_mpo
         self.interaction_mpo = interaction_mpo
@@ -74,8 +99,9 @@ class TDMPS:
         self.interaction_propagator_builder = interaction_propagator_builder
         self.local_sectors = local_sectors
         self.target_sector = target_sector
-        self.projection = projection
+        self.projection = _normalize_projection_setting(projection)
         self.tdvp_split_dynamic_block_sparse = bool(tdvp_split_dynamic_block_sparse)
+        self.normalize_each_step = bool(normalize)
         # self.dt = dt
         self.bond_dim = self.D = D
         # self.order = order
@@ -123,7 +149,7 @@ class TDMPS:
             and hasattr(ket.factors[0], "qns")
         ):
             identity = [make_identity_mpo_site_from_mps_site(site) for site in ket.factors]
-            return expect_mps(bra.factors, identity, ket.factors)
+            return _expect_factors(bra.factors, identity, ket.factors)
         if bra.factors and hasattr(bra.factors[0], "qns"):
             bra = symmetric_to_dense(bra)
         if ket.factors and hasattr(ket.factors[0], "qns"):
@@ -162,13 +188,13 @@ class TDMPS:
 
     def _compress_normalize(self, psi):
         if psi.factors and hasattr(psi.factors[0], "qns"):
-            norm2_value = psi.norm()
+            norm2_value = psi.norm_squared()
             self._record_pre_normalization_norm2(norm2_value)
-            return psi.normalize()
+            return psi.normalize() if self.normalize_each_step else psi
         psi = psi.compress(self.D)
-        norm2_value = psi.norm()
+        norm2_value = psi.norm_squared()
         self._record_pre_normalization_norm2(norm2_value)
-        return psi.normalize()
+        return psi.normalize() if self.normalize_each_step else psi
 
     def _record_pre_normalization_norm2(self, norm2_value):
         norm2 = float(np.real(norm2_value))
@@ -199,7 +225,7 @@ class TDMPS:
         H_eff = self.H if H_mpo is None else H_mpo
         sector_backend = None
         if self.projection is not None:
-            sector_backend = str(self.projection).lower().replace("_", "-")
+            sector_backend = _normalize_projection_setting(self.projection)
         use_symmetric_tdvp = (
             sector_backend is not None
             and integrator in {"tdvp", "tdvp2"}
@@ -261,7 +287,12 @@ class TDMPS:
                 self._tdvp_engine_cache[cache_key] = engine
             elif use_symmetric_tdvp and affine_meta is not None:
                 engine.update_mpo_source(H_eff)
-            psi, info = engine.step(psi, dt, normalize=True, return_info=True)
+            psi, info = engine.step(
+                psi,
+                dt,
+                normalize=self.normalize_each_step,
+                return_info=True,
+            )
         elif use_symmetric_tdvp:
             engine = SymmetricTDVP(
                 H_eff,
@@ -277,7 +308,12 @@ class TDMPS:
                 projection_backend=sector_backend,
                 canonicalize_each_step=canonicalize_each_step,
             )
-            psi, info = engine.step(psi, dt, normalize=True, return_info=True)
+            psi, info = engine.step(
+                psi,
+                dt,
+                normalize=self.normalize_each_step,
+                return_info=True,
+            )
         elif integrator == "tdvp2":
             psi, info = two_site_tdvp_step(
                 psi,
@@ -291,7 +327,7 @@ class TDMPS:
                 diagonal_fast_path=diagonal_fast_path,
                 sparse_threshold=sparse_threshold,
                 sparse_vectorized=sparse_vectorized,
-                normalize=True,
+                normalize=self.normalize_each_step,
                 return_info=True,
             )
         else:
@@ -303,7 +339,7 @@ class TDMPS:
                 krylov_tol=krylov_tol,
                 krylov_method=krylov_method,
                 diagonal_fast_path=diagonal_fast_path,
-                normalize=True,
+                normalize=self.normalize_each_step,
                 return_info=True,
             )
         self._record_pre_normalization_norm2(info["pre_normalization_norm2"])
@@ -321,7 +357,7 @@ class TDMPS:
             return psi
         sector_backend = None
         if self.projection is not None:
-            sector_backend = str(self.projection).lower().replace("_", "-")
+            sector_backend = _normalize_projection_setting(self.projection)
         if sector_backend not in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}:
             return psi
         projector = SymmetricTDVP(
@@ -359,11 +395,11 @@ class TDMPS:
         return site_qn_maps
 
     def _block_sparse_mpo_factors(self, mpo, psi):
-        factors = self._factor_list(mpo)
+        factors = mpo.factors
         if factors and hasattr(factors[0], "qns"):
             return factors
         site_qn_maps = self._block_sparse_site_qn_maps_for_state(psi)
-        mpo_key = self._mpo_cache_key(mpo) if hasattr(mpo, "factors") else tuple(id(factor) for factor in factors)
+        mpo_key = self._mpo_cache_key(mpo)
         qn_key = tuple(
             tuple((int(idx), repr(qn)) for idx, qn in sorted(q.items()))
             for q in site_qn_maps
@@ -389,19 +425,14 @@ class TDMPS:
 
     def _expectation(self, psi, mpo):
         if psi.factors and hasattr(psi.factors[0], "qns"):
-            return expect_mps(psi.factors, self._block_sparse_mpo_factors(mpo, psi))
-        factors = mpo.factors if hasattr(mpo, "factors") else mpo
-        return expect_mps(psi.factors, factors)
+            return _expect_factors(psi.factors, self._block_sparse_mpo_factors(mpo, psi))
+        return psi.expectation(mpo)
 
     def static_energy(self, psi):
-        norm2 = psi.norm()
+        norm2 = psi.norm_squared()
         if abs(norm2) <= 1.0e-30:
             return np.nan
         return self._expectation(psi, self.H) / norm2
-
-    @staticmethod
-    def _factor_list(mpo):
-        return mpo.factors if hasattr(mpo, "factors") else list(mpo)
 
     @staticmethod
     def _mpo_cache_key(mpo):
@@ -416,8 +447,8 @@ class TDMPS:
         if not active:
             return self.H
 
-        base_factors = self._factor_list(self.H)
-        term_factors = [self._factor_list(term) for _, term in active]
+        base_factors = self.H.factors
+        term_factors = [term.factors for _, term in active]
         nsites = len(base_factors)
         if any(len(factors) != nsites for factors in term_factors):
             raise ValueError("Hamiltonian and interaction MPO lengths must match.")
@@ -465,7 +496,12 @@ class TDMPS:
             coeff * block for coeff, block in zip((coeff for coeff, _ in active), template["term_first"])
         ]
         factors = [np.concatenate(first_blocks, axis=1)] + template["shared"][1:]
-        out = MPO(factors, homogenous=False)
+        out = MPO(
+            factors,
+            homogeneous=False,
+            sites=self.H.sites,
+            input_sites=self.H.input_sites,
+        )
         out._pyqed_affine_mpo = {
             "template_id": id(template),
             "cache_id": cache_key,
@@ -703,7 +739,7 @@ class TDMPS:
                 dynamic_mode = str(tdvp_dynamic_mode).lower().replace("_", "-")
                 if (
                     self.projection is not None
-                    and str(self.projection).lower().replace("_", "-")
+                    and _normalize_projection_setting(self.projection)
                     in {"block", "blocks", "block-sparse", "abelian", "abelian-block"}
                     and dynamic_mode in {"split", "strang", "split-operator"}
                     and not self.tdvp_split_dynamic_block_sparse
@@ -1034,8 +1070,8 @@ class TDMPS:
         )
         diagnostic = self.overlap_diagnostic(
             self.state_overlap(psi_ref, psi_backward),
-            psi_ref.norm(),
-            psi_backward.norm(),
+            psi_ref.norm_squared(),
+            psi_backward.norm_squared(),
         )
         diagnostic.update({"steps": int(steps), "dt": float(dt), "t0": float(t0)})
         self.time_reversal_diagnostic = diagnostic

@@ -98,6 +98,8 @@ def direct_ci_capabilities():
         'blas_provider': 'none',
         'rhf_davidson': False,
         'rhf_multiroot': False,
+        'spin0_multiroot': False,
+        'spin0_initial_guess': False,
         'spin0_native_max_roots': 0,
         'python_rhf': True,
         'python_uhf': True,
@@ -2762,27 +2764,50 @@ def _davidson_spin0_pair_cpp(
     *,
     workers=None,
     nroots=1,
+    guess=None,
     energy_tol=1e-8,
     residual_tol=1e-4,
     max_cycle=100,
     max_subspace=None,
+    spin_penalty=None,
 ):
     davidson_spin0_pair = _cpp_attr("davidson_spin0_pair")
     if (
         davidson_spin0_pair is None
-        or int(nroots) != 1
+        or int(nroots) < 1
         or np.iscomplexobj(h1)
         or np.iscomplexobj(eri_same)
         or np.iscomplexobj(eri_cross)
         or np.iscomplexobj(H_diag)
     ):
         return None
+    if spin_penalty is not None:
+        if len(spin_penalty) != 7:
+            raise ValueError("spin_penalty must contain six operator arrays and a shift.")
+        if any(np.iscomplexobj(value) for value in spin_penalty[:6]):
+            return None
     try:
         n_pair = int(np.asarray(pair_left).shape[0])
         if n_pair <= 0:
             return None
         if max_subspace is None:
             max_subspace = min(n_pair, max(32, 20 * int(nroots)))
+        if guess is None:
+            native_guess = np.empty((n_pair, 0), dtype=np.float64)
+        else:
+            spin0_diag = _spin0_pair_diagonal(
+                np.asarray(H_diag),
+                np.asarray(pair_left),
+                np.asarray(pair_right),
+                np.asarray(pair_left) == np.asarray(pair_right),
+            )
+            native_guess = _build_davidson_guess(
+                spin0_diag,
+                int(nroots),
+                guess=guess,
+                min_vectors=min(n_pair, max(2, int(nroots))),
+            )
+            native_guess = np.ascontiguousarray(native_guess, dtype=np.float64)
         c_dummy = np.empty(n_pair, dtype=np.float64)
         args = (
             np.ascontiguousarray(h1, dtype=np.float64),
@@ -2836,7 +2861,27 @@ def _davidson_spin0_pair_cpp(
             float(residual_tol),
             int(max_cycle),
             int(max_subspace),
+            native_guess,
         )
+        if spin_penalty is not None:
+            (
+                penalty_h1,
+                penalty_same,
+                penalty_cross,
+                penalty_diag,
+                penalty_alpha_cross_diag,
+                penalty_beta_cross_diag,
+                penalty_shift,
+            ) = spin_penalty
+            args += (
+                np.ascontiguousarray(penalty_h1, dtype=np.float64),
+                np.ascontiguousarray(penalty_same, dtype=np.float64),
+                np.ascontiguousarray(penalty_cross, dtype=np.float64),
+                np.ascontiguousarray(penalty_diag, dtype=np.float64),
+                np.ascontiguousarray(penalty_alpha_cross_diag, dtype=np.float64),
+                np.ascontiguousarray(penalty_beta_cross_diag, dtype=np.float64),
+                float(penalty_shift),
+            )
         energies, vecs = davidson_spin0_pair(*args)
         return np.asarray(energies, dtype=np.float64), np.asarray(vecs, dtype=np.float64)
     except Exception:
@@ -4113,6 +4158,9 @@ class CASCI(mcscf.casci.CASCI):
             pairs = self._spin0_symm_pairs(binary)
         nspin0 = len(pairs)
         requested_nstates = int(requested_nstates)
+        spin_penalty_shift = (
+            float(self.shift) if bool(self.spin_purification) else 0.0
+        )
         if requested_nstates > nspin0:
             raise ValueError(
                 f"Requested {requested_nstates} spin0 roots but only "
@@ -4120,7 +4168,12 @@ class CASCI(mcscf.casci.CASCI):
             )
 
         dense_limit = self.direct_spin0_symm_dense_fallback_nconfigs
-        if dense_limit is not None and dense_limit > 0 and nspin0 <= dense_limit:
+        if (
+            not self.spin_purification
+            and dense_limit is not None
+            and dense_limit > 0
+            and nspin0 <= dense_limit
+        ):
             if isinstance(binary, FCIStringBasis):
                 binary = binary.materialize()
                 self.binary = binary
@@ -4133,12 +4186,10 @@ class CASCI(mcscf.casci.CASCI):
             self.direct_ci_diagnostics = {
                 'backend': 'direct_spin0_symm_dense',
                 'converged': True,
+                'spin_penalty_shift': spin_penalty_shift,
             }
             self.converged = True
             return result
-
-        if self.spin_purification:
-            raise ValueError("direct_spin0_symm already targets singlets; do not combine it with fix_spin().")
 
         self.binary = binary
         self.spin0_pair_indices = pairs
@@ -4150,6 +4201,8 @@ class CASCI(mcscf.casci.CASCI):
         spin0_mv_block = None
         spin0_native_solver = None
         det_mv_block = None
+        spin_penalty_operator = None
+        total_H_diag = None
 
         # A restricted active-space ERI tensor is tiny compared with the CI
         # vector and preserves the spin-string factorization.  Expanding
@@ -4211,11 +4264,25 @@ class CASCI(mcscf.casci.CASCI):
             spatial_h1, same_spin_eri, cross_spin_eri, energy_core = self.get_direct_compact_integrals(
                 use_cholesky=use_cholesky
             )
+            if spin_penalty_shift:
+                s2_h1, s2_h2 = build_spin_square_operator(self.ncas)
+                penalty_h1 = np.asarray(s2_h1[0])
+                penalty_same_spin_eri = np.asarray(s2_h2[0, 0])
+                penalty_cross_spin_eri = np.asarray(s2_h2[0, 1])
             h1a, h1b = _normalize_spin_1e_operator(spatial_h1)
             self.hcore = np.asarray([h1a, h1b])
             self.h2e_cas = cross_spin_eri
             self.eri_so = None
             H_diag = _compute_diag_compact(spatial_h1, same_spin_eri, cross_spin_eri, binary)
+            total_H_diag = H_diag
+            if spin_penalty_shift:
+                penalty_H_diag = _compute_diag_compact(
+                    penalty_h1,
+                    penalty_same_spin_eri,
+                    penalty_cross_spin_eri,
+                    binary,
+                )
+                total_H_diag = H_diag + spin_penalty_shift * penalty_H_diag
             spin_string_conn = None
             try:
                 spin_string_conn = build_spin_string_connectivity(binary)
@@ -4238,6 +4305,24 @@ class CASCI(mcscf.casci.CASCI):
                     cross_spin_eri,
                     spin_string_conn.beta_occ,
                 )
+                if spin_penalty_shift:
+                    penalty_alpha_cross_diag = _spin_string_cross_diagonal(
+                        penalty_cross_spin_eri,
+                        spin_string_conn.alpha_occ,
+                    )
+                    penalty_beta_cross_diag = _spin_string_cross_diagonal(
+                        penalty_cross_spin_eri,
+                        spin_string_conn.beta_occ,
+                    )
+                    spin_penalty_operator = (
+                        penalty_h1,
+                        penalty_same_spin_eri,
+                        penalty_cross_spin_eri,
+                        penalty_H_diag,
+                        penalty_alpha_cross_diag,
+                        penalty_beta_cross_diag,
+                        spin_penalty_shift,
+                    )
                 spin_string_workers = _resolve_direct_ci_workers(self, binary.shape[0])
 
                 if use_native_spin0_pair:
@@ -4308,8 +4393,67 @@ class CASCI(mcscf.casci.CASCI):
                                 spin_string_workers,
                             )
 
+                    if spin_penalty_operator is not None:
+                        physical_spin0_mv = spin0_mv
+
+                        def spin_penalty_mv(c_spin0):
+                            return _sigma_compact_spin0_pair(
+                                penalty_h1,
+                                penalty_same_spin_eri,
+                                penalty_cross_spin_eri,
+                                penalty_H_diag,
+                                c_spin0,
+                                left,
+                                right,
+                                spin_string_conn.alpha_occ,
+                                spin_string_conn.beta_occ,
+                                spin_string_conn.I_A,
+                                spin_string_conn.J_A,
+                                spin_string_conn.p_A,
+                                spin_string_conn.q_A,
+                                spin_string_conn.phase_A,
+                                spin_string_conn.I_B,
+                                spin_string_conn.J_B,
+                                spin_string_conn.p_B,
+                                spin_string_conn.q_B,
+                                spin_string_conn.phase_B,
+                                spin_string_conn.I_AA,
+                                spin_string_conn.J_AA,
+                                spin_string_conn.p_AA,
+                                spin_string_conn.q_AA,
+                                spin_string_conn.r_AA,
+                                spin_string_conn.s_AA,
+                                spin_string_conn.phase_AA,
+                                spin_string_conn.I_BB,
+                                spin_string_conn.J_BB,
+                                spin_string_conn.p_BB,
+                                spin_string_conn.q_BB,
+                                spin_string_conn.r_BB,
+                                spin_string_conn.s_BB,
+                                spin_string_conn.phase_BB,
+                                spin_string_conn.alpha_offsets,
+                                spin_string_conn.beta_offsets,
+                                spin_string_conn.alpha_order,
+                                spin_string_conn.beta_order,
+                                penalty_alpha_cross_diag,
+                                penalty_beta_cross_diag,
+                                spin_string_conn.alpha_ordered_I,
+                                spin_string_conn.alpha_ordered_J,
+                                spin_string_conn.alpha_ordered_phase,
+                                spin_string_conn.beta_ordered_I,
+                                spin_string_conn.beta_ordered_J,
+                                spin_string_conn.beta_ordered_phase,
+                                spin_string_workers,
+                            )
+
+                        def spin0_mv(c_spin0):
+                            return (
+                                physical_spin0_mv(c_spin0)
+                                + spin_penalty_shift * spin_penalty_mv(c_spin0)
+                            )
+
                     def spin0_native_solver(
-                        nroots, energy_tol, residual_tol, max_cycle, max_subspace
+                        nroots, energy_tol, residual_tol, max_cycle, max_subspace, guess
                     ):
                         return _davidson_spin0_pair_cpp(
                             spatial_h1, same_spin_eri, cross_spin_eri, H_diag,
@@ -4343,10 +4487,12 @@ class CASCI(mcscf.casci.CASCI):
                             spin_string_conn.beta_ordered_phase,
                             workers=spin_string_workers,
                             nroots=nroots,
+                            guess=guess,
                             energy_tol=energy_tol,
                             residual_tol=residual_tol,
                             max_cycle=max_cycle,
                             max_subspace=max_subspace,
+                            spin_penalty=spin_penalty_operator,
                         )
                 else:
                     def det_mv(c_det):
@@ -4402,7 +4548,84 @@ class CASCI(mcscf.casci.CASCI):
                         conn.I_AB, conn.J_AB, conn.p_AB, conn.q_AB, conn.r_AB, conn.s_AB, conn.phase_AB,
                     )
 
-        spin0_diag = _spin0_pair_diagonal(H_diag, left, right, same)
+        if spin_penalty_operator is not None and spin0_mv is None:
+            physical_det_mv = det_mv
+            if spin_string_conn is not None:
+                def spin_penalty_det_mv(c_det):
+                    return _sigma_compact_spin_string(
+                        penalty_h1,
+                        penalty_same_spin_eri,
+                        penalty_cross_spin_eri,
+                        penalty_H_diag,
+                        c_det,
+                        spin_string_conn.alpha_occ,
+                        spin_string_conn.beta_occ,
+                        spin_string_conn.I_A,
+                        spin_string_conn.J_A,
+                        spin_string_conn.p_A,
+                        spin_string_conn.q_A,
+                        spin_string_conn.phase_A,
+                        spin_string_conn.I_B,
+                        spin_string_conn.J_B,
+                        spin_string_conn.p_B,
+                        spin_string_conn.q_B,
+                        spin_string_conn.phase_B,
+                        spin_string_conn.I_AA,
+                        spin_string_conn.J_AA,
+                        spin_string_conn.p_AA,
+                        spin_string_conn.q_AA,
+                        spin_string_conn.r_AA,
+                        spin_string_conn.s_AA,
+                        spin_string_conn.phase_AA,
+                        spin_string_conn.I_BB,
+                        spin_string_conn.J_BB,
+                        spin_string_conn.p_BB,
+                        spin_string_conn.q_BB,
+                        spin_string_conn.r_BB,
+                        spin_string_conn.s_BB,
+                        spin_string_conn.phase_BB,
+                        spin_string_conn.alpha_offsets,
+                        spin_string_conn.beta_offsets,
+                        spin_string_conn.alpha_order,
+                        spin_string_conn.beta_order,
+                        penalty_alpha_cross_diag,
+                        penalty_beta_cross_diag,
+                        spin_string_conn.alpha_ordered_I,
+                        spin_string_conn.alpha_ordered_J,
+                        spin_string_conn.alpha_ordered_phase,
+                        spin_string_conn.beta_ordered_I,
+                        spin_string_conn.beta_ordered_J,
+                        spin_string_conn.beta_ordered_phase,
+                        spin_string_workers,
+                    )
+            else:
+                def spin_penalty_det_mv(c_det):
+                    return _sigma_compact_conn_numba(
+                        penalty_h1,
+                        penalty_same_spin_eri,
+                        penalty_cross_spin_eri,
+                        penalty_H_diag,
+                        c_det,
+                        binary,
+                        conn.I_A, conn.J_A, conn.p_A, conn.q_A, conn.phase_A,
+                        conn.I_B, conn.J_B, conn.p_B, conn.q_B, conn.phase_B,
+                        conn.I_AA, conn.J_AA, conn.p_AA, conn.q_AA,
+                        conn.r_AA, conn.s_AA, conn.phase_AA,
+                        conn.I_BB, conn.J_BB, conn.p_BB, conn.q_BB,
+                        conn.r_BB, conn.s_BB, conn.phase_BB,
+                        conn.I_AB, conn.J_AB, conn.p_AB, conn.q_AB,
+                        conn.r_AB, conn.s_AB, conn.phase_AB,
+                    )
+
+            def det_mv(c_det):
+                return (
+                    physical_det_mv(c_det)
+                    + spin_penalty_shift * spin_penalty_det_mv(c_det)
+                )
+
+        if total_H_diag is None:
+            total_H_diag = H_diag
+        spin0_diag = _spin0_pair_diagonal(total_H_diag, left, right, same)
 
         if spin0_mv is None:
             def spin0_mv(c_spin0):
@@ -4439,8 +4662,6 @@ class CASCI(mcscf.casci.CASCI):
         if (
             spin0_native_solver is not None
             and bool(getattr(self, "direct_spin0_native_davidson", False))
-            and requested_nstates == 1
-            and guess is None
         ):
             native_diagnostics['attempted'] = True
             native_result = spin0_native_solver(
@@ -4449,11 +4670,14 @@ class CASCI(mcscf.casci.CASCI):
                 davidson_residual_tol,
                 self.direct_ci_max_cycle,
                 self.direct_ci_max_subspace,
+                guess,
             )
             if native_result is not None:
                 native_diagnostics.update({
                     'used': True,
                     'converged': True,
+                    'nroots': int(requested_nstates),
+                    'used_initial_guess': guess is not None,
                 })
             else:
                 native_diagnostics['fallback_reason'] = 'native spin0 Davidson failed; using Python Davidson'
@@ -4461,10 +4685,6 @@ class CASCI(mcscf.casci.CASCI):
             native_diagnostics['fallback_reason'] = 'native spin0 workspace is unavailable'
         elif not bool(getattr(self, "direct_spin0_native_davidson", False)):
             native_diagnostics['fallback_reason'] = 'native spin0 Davidson disabled by solver setting'
-        elif requested_nstates != 1:
-            native_diagnostics['fallback_reason'] = 'native spin0 Davidson currently supports one root'
-        else:
-            native_diagnostics['fallback_reason'] = 'native spin0 Davidson does not accept an initial guess'
         self.direct_ci_native_diagnostics = native_diagnostics
         self.direct_ci_fallback_reason = native_diagnostics.get('fallback_reason')
         if native_result is None:
@@ -4490,6 +4710,14 @@ class CASCI(mcscf.casci.CASCI):
         else:
             energies, vecs_spin0 = native_result
             self.direct_ci_diagnostics = native_diagnostics
+        self.direct_ci_diagnostics['spin_penalty_shift'] = spin_penalty_shift
+        self.direct_ci_diagnostics['spin_penalty_application'] = (
+            'separate_native_operator'
+            if spin_penalty_operator is not None and native_result is not None
+            else 'separate_operator'
+            if spin_penalty_operator is not None
+            else 'none'
+        )
         self.converged = True
         self.solver_backend = backend
         vecs_det = np.column_stack(
@@ -4570,6 +4798,8 @@ class CASCI(mcscf.casci.CASCI):
         if method_key in direct_spin0_methods:
             if uhf_reference:
                 raise NotImplementedError("direct_spin0_symm currently supports restricted references only.")
+            if self.multiplicity not in (None, 1):
+                raise ValueError("direct_spin0_symm targets singlets and requires multiplicity=1.")
 
             ncore = self.ncore
             ncas = self.ncas
@@ -4583,12 +4813,16 @@ class CASCI(mcscf.casci.CASCI):
                 binary = self.binary
             binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
             requested_nstates = int(requested_nstates)
+            solve_nstates = requested_nstates
             E, X = self._direct_spin0_symm_solve(
                 binary,
-                requested_nstates,
+                solve_nstates,
                 ci0=ci0,
                 use_cholesky=use_cholesky,
             )
+            self.direct_ci_diagnostics["requested_nstates"] = requested_nstates
+            self.direct_ci_diagnostics["solved_nstates"] = solve_nstates
+            self.direct_ci_diagnostics["multiplicity_selected"] = False
 
         elif method_key == 'ci':
             self.solver_backend = 'ci'
@@ -5105,12 +5339,17 @@ class CASCI(mcscf.casci.CASCI):
                 "'direct_spin0_symm', or 'jw'.".format(method)
             )
 
-        E, X = self._apply_multiplicity_selection(
-            E,
-            X,
-            requested_nstates,
-            spin_selection_tol=spin_selection_tol,
-        )
+        if method_key in direct_spin0_methods:
+            order = np.argsort(E)[:requested_nstates]
+            E = np.asarray(E)[order]
+            X = np.asarray(X)[:, order]
+        else:
+            E, X = self._apply_multiplicity_selection(
+                E,
+                X,
+                requested_nstates,
+                spin_selection_tol=spin_selection_tol,
+            )
 
         # nuclear repulsion energy is included in Ecore
         self.e_tot = E + self.e_core
@@ -5291,6 +5530,42 @@ class CASCI(mcscf.casci.CASCI):
         else: #active space DM
 
             return make_rdm2(ci, self.binary, sc1, sc2)
+
+    def make_state_average_rdms(self, weights, with_core=False):
+        """Build weighted multiroot 1- and 2-RDMs in one link traversal."""
+        weights = np.asarray(weights, dtype=float)
+        if weights.ndim != 1 or weights.size != len(self.ci):
+            raise ValueError("weights must contain one entry per CI root.")
+        active_dm1, active_dm2 = mcscf.casci.make_state_average_rdms(
+            self.ci,
+            weights,
+            self.binary,
+        )
+        if not with_core or self.ncore == 0:
+            return active_dm1, active_dm2
+
+        ncore = self.ncore
+        ncas = self.ncas
+        nocc = ncore + ncas
+        weight_sum = float(np.sum(weights))
+        dtype = np.result_type(active_dm1, active_dm2, float)
+        dm1 = np.zeros((nocc, nocc), dtype=dtype)
+        dm2 = np.zeros((nocc, nocc, nocc, nocc), dtype=dtype)
+        dm1[:ncore, :ncore] = 2.0 * weight_sum * np.eye(ncore)
+        dm1[ncore:, ncore:] = active_dm1
+
+        identity = np.eye(ncore)
+        dm2[:ncore, :ncore, :ncore, :ncore] = weight_sum * (
+            4.0 * contract('ij, kl -> ijkl', identity, identity)
+            - 2.0 * contract('ps, rq -> pqrs', identity, identity)
+        )
+        for core in range(ncore):
+            dm2[core, core, ncore:, ncore:] = 2.0 * active_dm1
+            dm2[ncore:, ncore:, core, core] = 2.0 * active_dm1
+            dm2[core, ncore:, core, ncore:] = -active_dm1
+            dm2[ncore:, core, ncore:, core] = -active_dm1
+        dm2[ncore:, ncore:, ncore:, ncore:] = active_dm2
+        return dm1, dm2
 
 
     def contract_with_rdm2(self, h2e, state_id=0):

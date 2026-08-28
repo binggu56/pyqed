@@ -87,8 +87,8 @@ class _NormalComplementaryPrimitiveOperator:
             self._component_cache[key] = None
             return None
         if (
-            self.phys_out_leg.dim(q_out) == 1
-            and self.phys_in_leg.dim(q_in) == 1
+            self.phys_out_leg.sector_dim(q_out) == 1
+            and self.phys_in_leg.sector_dim(q_in) == 1
         ):
             block = np.asarray([[coefficient]], dtype=float)
         else:
@@ -110,6 +110,7 @@ def build_su2_normal_complementary_mpo(
     moving_environment,
     *,
     fully_reduced=False,
+    materialize_reduced_terms=True,
 ):
     """Build lightweight MPO views over the persistent C++ NC route arenas."""
 
@@ -133,6 +134,29 @@ def build_su2_normal_complementary_mpo(
             plan["right_channel_quantum_numbers"],
             dtype=np.int64,
         )
+        if fully_reduced and not materialize_reduced_terms:
+            factors.append(
+                RankCoupledMPO(
+                    dense_blocks={},
+                    phys_out_leg=phys_leg,
+                    phys_in_leg=phys_leg,
+                    left_channel_irreps=tuple(
+                        SU2Irrep(int(two_j)) for two_j in left_qn[:, 1]
+                    ),
+                    right_channel_irreps=tuple(
+                        SU2Irrep(int(two_j)) for two_j in right_qn[:, 1]
+                    ),
+                    left_channel_charges=tuple(int(x) for x in left_qn[:, 0]),
+                    right_channel_charges=tuple(int(x) for x in right_qn[:, 0]),
+                    reduced_terms=(),
+                    symbolic_transitions=(),
+                    normal_complementary_site=site,
+                    normal_complementary_plan=plan,
+                    normal_complementary_owner=moving_environment,
+                    normal_complementary_fully_reduced=True,
+                )
+            )
+            continue
         source = np.asarray(plan["source"], dtype=np.int64)
         target = np.asarray(plan["target"], dtype=np.int64)
         operator_ids = np.asarray(plan["operator"], dtype=np.int64)
@@ -379,6 +403,7 @@ def build_su2_normal_complementary_mpo(
                                         if selected.size == 0:
                                             continue
                                         routes = {}
+                                        route_transitions = {}
                                         for transition in selected:
                                             key = (
                                                 int(source[transition]),
@@ -387,35 +412,50 @@ def build_su2_normal_complementary_mpo(
                                             routes[key] = routes.get(key, 0.0) + float(
                                                 coefficients[transition]
                                             )
-                                        reduced_terms.append(
-                                            RankCoupledChannelTerm(
-                                                reduced_operator=_NormalComplementaryPrimitiveOperator(
-                                                    primitives[:, :, operator_id, :],
-                                                    operator_id,
-                                                    phys_leg,
-                                                    right_parity=right_parity,
-                                                ),
-                                                visible_virtual_block=SparseVirtualBlock.from_entries(
-                                                    (
-                                                        int(plan["left_channels"]),
-                                                        int(plan["right_channels"]),
-                                                    ),
-                                                    routes,
-                                                    dtype=float,
-                                                ),
-                                                use_cg_coupling=True,
-                                                left_component_orientation=left_orientation,
-                                                right_component_orientation=right_orientation,
-                                                orient_virtual_coupling=orient_virtual_coupling,
-                                                dual_right_coupling=dual_right_coupling,
-                                                phase_from_charged_scalar_source=(
-                                                    scalar_source_phase
-                                                ),
-                                                phase_to_charged_pair_target=(
-                                                    pair_target_phase
-                                                ),
+                                            route_transitions.setdefault(key, []).append(
+                                                int(transition)
                                             )
+                                        virtual_block = SparseVirtualBlock.from_entries(
+                                            (
+                                                int(plan["left_channels"]),
+                                                int(plan["right_channels"]),
+                                            ),
+                                            routes,
+                                            dtype=float,
+                                            retain_zeros=True,
                                         )
+                                        term = RankCoupledChannelTerm(
+                                            reduced_operator=_NormalComplementaryPrimitiveOperator(
+                                                primitives[:, :, operator_id, :],
+                                                operator_id,
+                                                phys_leg,
+                                                right_parity=right_parity,
+                                            ),
+                                            visible_virtual_block=virtual_block,
+                                            use_cg_coupling=True,
+                                            left_component_orientation=left_orientation,
+                                            right_component_orientation=right_orientation,
+                                            orient_virtual_coupling=orient_virtual_coupling,
+                                            dual_right_coupling=dual_right_coupling,
+                                            phase_from_charged_scalar_source=(
+                                                scalar_source_phase
+                                            ),
+                                            phase_to_charged_pair_target=(
+                                                pair_target_phase
+                                            ),
+                                        )
+                                        object.__setattr__(
+                                            term,
+                                            "_normal_complementary_route_transitions",
+                                            tuple(
+                                                tuple(route_transitions[(int(row), int(col))])
+                                                for row, col in zip(
+                                                    virtual_block.rows,
+                                                    virtual_block.cols,
+                                                )
+                                            ),
+                                        )
+                                        reduced_terms.append(term)
         factors.append(
             RankCoupledMPO(
                 dense_blocks={},
@@ -437,6 +477,93 @@ def build_su2_normal_complementary_mpo(
                 normal_complementary_fully_reduced=bool(fully_reduced),
             )
         )
+    return factors
+
+
+def refresh_su2_normal_complementary_mpo(moving_environment, factors):
+    """Refresh all NC integral coefficients without replacing MPO core objects."""
+
+    factors = tuple(factors)
+    n_sites = int(moving_environment.system_stats["n_sites"])
+    if len(factors) != n_sites:
+        raise ValueError("The NC MPO refresh requires one factor per active orbital.")
+    topology_keys = (
+        "source",
+        "target",
+        "operator",
+        "first_index",
+        "second_index",
+        "family_mask",
+    )
+    numeric_plan_keys = (
+        "coefficient",
+        "component_transition",
+        "component_source",
+        "component_target",
+        "component_local_two_m",
+        "component_coefficient",
+        "family_transition_counts",
+    )
+    for site, factor in enumerate(factors):
+        if (
+            getattr(factor, "normal_complementary_owner", None)
+            is not moving_environment
+            or int(getattr(factor, "normal_complementary_site", -1)) != site
+        ):
+            raise ValueError("The installed MPO is not owned by this NC environment.")
+        installed_plan = factor.normal_complementary_plan
+        refreshed_plan = moving_environment.normal_complementary_plan(site)
+        for key in topology_keys:
+            if not np.array_equal(installed_plan[key], refreshed_plan[key]):
+                raise ValueError("An NC numeric refresh changed the MPO transition topology.")
+
+        coefficients = np.asarray(refreshed_plan["coefficient"], dtype=float)
+        primitives = moving_environment.normal_complementary_primitives(site)
+        primitive_nonzero = np.any(primitives != 0.0, axis=3)
+        if not np.array_equal(
+            installed_plan.get("_primitive_nonzero"),
+            primitive_nonzero,
+        ):
+            installed_plan.pop("_boundary_action_cache", None)
+        installed_plan["_primitive_nonzero"] = primitive_nonzero
+        for key in numeric_plan_keys:
+            value = refreshed_plan[key]
+            installed_plan[key] = value.copy() if hasattr(value, "copy") else value
+
+        for term in factor.reduced_terms:
+            route_transitions = getattr(
+                term,
+                "_normal_complementary_route_transitions",
+                None,
+            )
+            if route_transitions is None:
+                raise ValueError("An NC term is missing its numeric refresh map.")
+            block = term.visible_virtual_block
+            if len(route_transitions) != block.values.size:
+                raise ValueError("An NC term refresh map has an invalid size.")
+            block.values[...] = np.asarray(
+                [
+                    np.sum(coefficients[np.asarray(indices, dtype=np.int64)])
+                    for indices in route_transitions
+                ],
+                dtype=block.values.dtype,
+            )
+            operator = term.reduced_operator
+            operator.values[...] = primitives[:, :, operator.operator_id, :]
+            operator._component_cache.clear()
+
+        factor._reduced_block_cache.clear()
+        factor._block_cache.clear()
+        object.__setattr__(factor, "_reduced_action_cache", None)
+    if not moving_environment.refresh_contextual_cores(factors):
+        for factor in factors:
+            contextual_cache = getattr(
+                factor,
+                "_contextual_angular_core_cache",
+                None,
+            )
+            if contextual_cache is not None:
+                contextual_cache.clear()
     return factors
 
 
@@ -1134,6 +1261,7 @@ class SpatialReducedHamiltonianBuilder:
     spin: int = 0
     ecore: float = 0.0
     orb_sym: tuple | None = None
+    reuse: ReducedSpatialHamiltonian | None = None
 
     @property
     def h_spatial(self):
@@ -1169,15 +1297,51 @@ class SpatialReducedHamiltonianBuilder:
         if h_spatial.shape[0] < 2:
             raise NotImplementedError("Reduced spatial Hamiltonian MPO currently requires at least two active orbitals.")
         eri_spatial = self.eri_spatial
-        moving_environment = _build_su2_moving_environment(
-            h_spatial,
-            eri_spatial,
-            n_elec=0 if self.n_elec is None else self.n_elec,
-            spin=self.spin,
-            ecore=self.ecore,
-            orb_sym=self.orb_sym,
-            cutoff=self.cutoff,
+        effective_eri = (
+            np.zeros((h_spatial.shape[0],) * 4, dtype=float)
+            if eri_spatial is None
+            else eri_spatial
         )
+        moving_environment = None
+        reused_factors = None
+        reused_runtime = False
+        reusable = self.reuse
+        if (
+            reusable is not None
+            and reusable.moving_environment is not None
+            and int(reusable.n_sites) == int(h_spatial.shape[0])
+            and reusable.n_elec == self.n_elec
+            and int(reusable.spin) == int(self.spin)
+            and reusable.orb_sym == self.orb_sym
+            and bool(
+                reusable.info.get("spatial_site_basis")
+                == "fully_reduced_su2"
+            ) == bool(self.fully_reduced)
+        ):
+            candidate = reusable.moving_environment
+            try:
+                candidate.update_integrals(
+                    np.ascontiguousarray(h_spatial, dtype=float),
+                    np.ascontiguousarray(effective_eri, dtype=float),
+                    float(self.ecore),
+                )
+                reused_factors = list(reusable.factors)
+                refresh_su2_normal_complementary_mpo(candidate, reused_factors)
+                moving_environment = candidate
+                reused_runtime = True
+            except (AttributeError, TypeError, ValueError):
+                moving_environment = None
+                reused_factors = None
+        if moving_environment is None:
+            moving_environment = _build_su2_moving_environment(
+                h_spatial,
+                eri_spatial,
+                n_elec=0 if self.n_elec is None else self.n_elec,
+                spin=self.spin,
+                ecore=self.ecore,
+                orb_sym=self.orb_sym,
+                cutoff=self.cutoff,
+            )
         complementary = build_spatial_complementary_operator_families(
             h_spatial,
             eri_spatial,
@@ -1202,9 +1366,14 @@ class SpatialReducedHamiltonianBuilder:
             and self.n_elec is not None
         )
         if production_normal_complementary:
-            factors = build_su2_normal_complementary_mpo(
-                moving_environment,
-                fully_reduced=self.fully_reduced,
+            factors = (
+                reused_factors
+                if reused_factors is not None
+                else build_su2_normal_complementary_mpo(
+                    moving_environment,
+                    fully_reduced=self.fully_reduced,
+                    materialize_reduced_terms=not self.fully_reduced,
+                )
             )
             has_integrals = bool(
                 eri_spatial is not None
@@ -1330,6 +1499,10 @@ class SpatialReducedHamiltonianBuilder:
                 )
             ),
             "normal_complementary_production": production_normal_complementary,
+            "su2_runtime_reused": bool(reused_runtime),
+            "python_reduced_terms_materialized": bool(
+                not (production_normal_complementary and self.fully_reduced)
+            ),
             "includes_core_energy": production_normal_complementary,
             "two_body_representation": "+".join(
                 part
@@ -1398,6 +1571,7 @@ def build_spatial_reduced_hamiltonian_mpo(
     spin=0,
     ecore=0.0,
     orb_sym=None,
+    reuse=None,
 ):
     """
     Build a qchem spatial Hamiltonian MPO using reduced SU(2) channels.
@@ -1435,4 +1609,5 @@ def build_spatial_reduced_hamiltonian_mpo(
         spin=spin,
         ecore=ecore,
         orb_sym=None if orb_sym is None else tuple(orb_sym),
+        reuse=reuse,
     ).build()

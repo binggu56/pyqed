@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from pyqed.lattice.site import Leg
 from pyqed.mps.su2 import SU2Irrep
 from pyqed.mps.symmetry import Sector
 
@@ -63,11 +64,11 @@ class SparseVirtualBlock:
         return cls(arr.shape, rows, cols, values)
 
     @classmethod
-    def from_entries(cls, shape, entries, *, dtype=float):
+    def from_entries(cls, shape, entries, *, dtype=float, retain_zeros=False):
         items = [
             ((int(row), int(col)), np.asarray(value, dtype=dtype))
             for (row, col), value in entries.items()
-            if np.any(np.asarray(value) != 0)
+            if retain_zeros or np.any(np.asarray(value) != 0)
         ]
         if items:
             rows = np.fromiter((key[0] for key, _ in items), dtype=np.int64)
@@ -159,66 +160,6 @@ def iter_virtual_routes(block):
 
 
 @dataclass(frozen=True)
-class PhysicalLeg:
-    """
-    Ordered physical-leg sector metadata for an MPO core.
-    """
-
-    sectors: tuple[Sector, ...]
-    dims: dict[Sector, int]
-
-    def __post_init__(self):
-        sectors = tuple(self.sectors)
-        dims = {sector: int(dim) for sector, dim in dict(self.dims).items()}
-        if not sectors:
-            raise ValueError("PhysicalLeg requires at least one sector.")
-        for sector in sectors:
-            if sector not in dims:
-                raise ValueError(f"Missing physical dimension for sector {sector!r}.")
-            if dims[sector] <= 0:
-                raise ValueError(f"Physical dimension for sector {sector!r} must be positive.")
-        object.__setattr__(self, "sectors", sectors)
-        object.__setattr__(self, "dims", dims)
-
-    @property
-    def total_dim(self):
-        return sum(self.dims[sector] for sector in self.sectors)
-
-    def dim(self, sector):
-        return self.dims[sector]
-
-    def slices(self):
-        offset = 0
-        out = {}
-        for sector in self.sectors:
-            if sector in out:
-                continue
-            dim = self.dims[sector]
-            out[sector] = slice(offset, offset + dim)
-            offset += dim
-        return out
-
-    @classmethod
-    def from_slices(cls, sector_slices):
-        return cls(
-            sectors=tuple(sector_slices.keys()),
-            dims={
-                sector: int(slice_.stop - slice_.start)
-                for sector, slice_ in sector_slices.items()
-            },
-        )
-
-    @classmethod
-    def from_dims(cls, sector_dims, sectors=None):
-        if sectors is None:
-            sectors = tuple(sector_dims.keys())
-        return cls(
-            sectors=tuple(sectors),
-            dims={sector: int(sector_dims[sector]) for sector in sectors},
-        )
-
-
-@dataclass(frozen=True)
 class SiteOperator:
     """
     Symmetry-aware local physical operator blocks.
@@ -233,14 +174,14 @@ class SiteOperator:
     """
 
     blocks: dict[tuple[Sector, Sector], np.ndarray]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
 
     def __post_init__(self):
-        if not isinstance(self.phys_out_leg, PhysicalLeg):
-            raise TypeError("SiteOperator phys_out_leg must be a PhysicalLeg.")
-        if not isinstance(self.phys_in_leg, PhysicalLeg):
-            raise TypeError("SiteOperator phys_in_leg must be a PhysicalLeg.")
+        if not isinstance(self.phys_out_leg, Leg):
+            raise TypeError("SiteOperator phys_out_leg must be a Leg.")
+        if not isinstance(self.phys_in_leg, Leg):
+            raise TypeError("SiteOperator phys_in_leg must be a Leg.")
         blocks = {
             (q_out, q_in): np.asarray(block)
             for (q_out, q_in), block in self.blocks.items()
@@ -256,15 +197,15 @@ class SiteOperator:
                 raise ValueError(f"Undeclared output sector {q_out!r} in site operator.")
             if q_in not in self.phys_in_leg.sectors:
                 raise ValueError(f"Undeclared input sector {q_in!r} in site operator.")
-            if int(block.shape[0]) != self.phys_out_leg.dim(q_out):
+            if int(block.shape[0]) != self.phys_out_leg.sector_dim(q_out):
                 raise ValueError(
                     f"Site-operator block {(q_out, q_in)!r} output dimension {block.shape[0]} "
-                    f"does not match declared sector dimension {self.phys_out_leg.dim(q_out)}."
+                    f"does not match declared sector dimension {self.phys_out_leg.sector_dim(q_out)}."
                 )
-            if int(block.shape[1]) != self.phys_in_leg.dim(q_in):
+            if int(block.shape[1]) != self.phys_in_leg.sector_dim(q_in):
                 raise ValueError(
                     f"Site-operator block {(q_out, q_in)!r} input dimension {block.shape[1]} "
-                    f"does not match declared sector dimension {self.phys_in_leg.dim(q_in)}."
+                    f"does not match declared sector dimension {self.phys_in_leg.sector_dim(q_in)}."
                 )
         object.__setattr__(self, "blocks", blocks)
 
@@ -308,18 +249,18 @@ class SiteOperator:
             )
         if phys_out_leg is None:
             if phys_out_dims is not None:
-                phys_out_leg = PhysicalLeg.from_dims(phys_out_dims)
+                phys_out_leg = Leg.from_dims(phys_out_dims)
             elif phys_out_slices is not None:
-                phys_out_leg = PhysicalLeg.from_slices(phys_out_slices)
+                phys_out_leg = Leg.from_slices(phys_out_slices)
             else:
                 raise ValueError(
                     "from_dense requires phys_out_leg, phys_out_dims, or phys_out_slices."
                 )
         if phys_in_leg is None:
             if phys_in_dims is not None:
-                phys_in_leg = PhysicalLeg.from_dims(phys_in_dims)
+                phys_in_leg = Leg.from_dims(phys_in_dims)
             elif phys_in_slices is not None:
-                phys_in_leg = PhysicalLeg.from_slices(phys_in_slices)
+                phys_in_leg = Leg.from_slices(phys_in_slices)
             else:
                 phys_in_leg = phys_out_leg
         if phys_out_slices is None:
@@ -342,7 +283,7 @@ class SiteOperator:
             q_out = next(iter(phys_out_leg.sectors))
             q_in = next(iter(phys_in_leg.sectors))
             blocks[(q_out, q_in)] = np.zeros(
-                (phys_out_leg.dim(q_out), phys_in_leg.dim(q_in)),
+                (phys_out_leg.sector_dim(q_out), phys_in_leg.sector_dim(q_in)),
                 dtype=dense.dtype,
             )
 
@@ -368,17 +309,17 @@ class MPO:
     """
 
     blocks: dict[tuple[Sector, Sector], np.ndarray]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     symbolic_transitions: tuple = ()
 
     def __post_init__(self):
         phys_out_leg = self.phys_out_leg
         phys_in_leg = self.phys_in_leg
-        if not isinstance(phys_out_leg, PhysicalLeg):
-            raise TypeError("MPO phys_out_leg must be a PhysicalLeg.")
-        if not isinstance(phys_in_leg, PhysicalLeg):
-            raise TypeError("MPO phys_in_leg must be a PhysicalLeg.")
+        if not isinstance(phys_out_leg, Leg):
+            raise TypeError("MPO phys_out_leg must be a Leg.")
+        if not isinstance(phys_in_leg, Leg):
+            raise TypeError("MPO phys_in_leg must be a Leg.")
         blocks = {
             (q_out, q_in): np.asarray(block)
             for (q_out, q_in), block in self.blocks.items()
@@ -404,15 +345,15 @@ class MPO:
                 raise ValueError(
                     f"MPO block uses undeclared input sector {q_in!r}."
                 )
-            if int(block.shape[2]) != phys_out_leg.dim(q_out):
+            if int(block.shape[2]) != phys_out_leg.sector_dim(q_out):
                 raise ValueError(
                     f"MPO block {key!r} output dimension {block.shape[2]} does not match "
-                    f"declared sector dimension {phys_out_leg.dim(q_out)}."
+                    f"declared sector dimension {phys_out_leg.sector_dim(q_out)}."
                 )
-            if int(block.shape[3]) != phys_in_leg.dim(q_in):
+            if int(block.shape[3]) != phys_in_leg.sector_dim(q_in):
                 raise ValueError(
                     f"MPO block {key!r} input dimension {block.shape[3]} does not match "
-                    f"declared sector dimension {phys_in_leg.dim(q_in)}."
+                    f"declared sector dimension {phys_in_leg.sector_dim(q_in)}."
                 )
             if left_dim is None:
                 left_dim = int(block.shape[0])
@@ -486,16 +427,16 @@ class MPO:
             )
         if phys_out_leg is None:
             if phys_out_dims is not None:
-                phys_out_leg = PhysicalLeg.from_dims(phys_out_dims)
+                phys_out_leg = Leg.from_dims(phys_out_dims)
             elif phys_out_slices is not None:
-                phys_out_leg = PhysicalLeg.from_slices(phys_out_slices)
+                phys_out_leg = Leg.from_slices(phys_out_slices)
             else:
                 raise ValueError("from_dense requires phys_out_leg, phys_out_dims, or phys_out_slices.")
         if phys_in_leg is None:
             if phys_in_dims is not None:
-                phys_in_leg = PhysicalLeg.from_dims(phys_in_dims)
+                phys_in_leg = Leg.from_dims(phys_in_dims)
             elif phys_in_slices is not None:
-                phys_in_leg = PhysicalLeg.from_slices(phys_in_slices)
+                phys_in_leg = Leg.from_slices(phys_in_slices)
             else:
                 phys_in_leg = phys_out_leg
         if phys_out_slices is None:
@@ -694,8 +635,8 @@ class IrreducibleMPO:
     directly instead of storing all expanded ``(p_out, p_in)`` arrays up front.
     """
 
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     scalar_blocks: dict[tuple[Sector, Sector], np.ndarray] | None = None
     reduced_terms: tuple[IrreducibleChannelTerm, ...] = ()
     symbolic_transitions: tuple = ()
@@ -707,10 +648,10 @@ class IrreducibleMPO:
     )
 
     def __post_init__(self):
-        if not isinstance(self.phys_out_leg, PhysicalLeg):
-            raise TypeError("IrreducibleMPO phys_out_leg must be a PhysicalLeg.")
-        if not isinstance(self.phys_in_leg, PhysicalLeg):
-            raise TypeError("IrreducibleMPO phys_in_leg must be a PhysicalLeg.")
+        if not isinstance(self.phys_out_leg, Leg):
+            raise TypeError("IrreducibleMPO phys_out_leg must be a Leg.")
+        if not isinstance(self.phys_in_leg, Leg):
+            raise TypeError("IrreducibleMPO phys_in_leg must be a Leg.")
         scalar_blocks = {
             key: np.asarray(block)
             for key, block in dict(self.scalar_blocks or {}).items()
@@ -730,11 +671,11 @@ class IrreducibleMPO:
                 raise ValueError(
                     f"IrreducibleMPO scalar block {key!r} must be rank-4, got {block.shape!r}."
                 )
-            if int(block.shape[2]) != self.phys_out_leg.dim(q_out):
+            if int(block.shape[2]) != self.phys_out_leg.sector_dim(q_out):
                 raise ValueError(
                     f"Scalar block {key!r} output dimension {block.shape[2]} does not match declared dimension."
                 )
-            if int(block.shape[3]) != self.phys_in_leg.dim(q_in):
+            if int(block.shape[3]) != self.phys_in_leg.sector_dim(q_in):
                 raise ValueError(
                     f"Scalar block {key!r} input dimension {block.shape[3]} does not match declared dimension."
                 )
@@ -893,8 +834,8 @@ class RankCoupledMPO:
     """
 
     dense_blocks: dict[tuple[Sector, Sector], np.ndarray]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     left_channel_irreps: tuple[SU2Irrep, ...]
     right_channel_irreps: tuple[SU2Irrep, ...]
     left_channel_charges: tuple[int, ...] | None = None
@@ -952,10 +893,10 @@ class RankCoupledMPO:
     )
 
     def __post_init__(self):
-        if not isinstance(self.phys_out_leg, PhysicalLeg):
-            raise TypeError("RankCoupledMPO phys_out_leg must be a PhysicalLeg.")
-        if not isinstance(self.phys_in_leg, PhysicalLeg):
-            raise TypeError("RankCoupledMPO phys_in_leg must be a PhysicalLeg.")
+        if not isinstance(self.phys_out_leg, Leg):
+            raise TypeError("RankCoupledMPO phys_out_leg must be a Leg.")
+        if not isinstance(self.phys_in_leg, Leg):
+            raise TypeError("RankCoupledMPO phys_in_leg must be a Leg.")
         left_channel_irreps = tuple(self.left_channel_irreps)
         right_channel_irreps = tuple(self.right_channel_irreps)
         left_channel_charges = (
@@ -980,8 +921,15 @@ class RankCoupledMPO:
             for key, block in dict(self.dense_blocks).items()
         }
         reduced_terms = tuple(self.reduced_terms)
-        if not dense_blocks and not reduced_terms:
-            raise ValueError("RankCoupledMPO requires dense blocks and/or reduced terms.")
+        native_normal_complementary = bool(
+            self.normal_complementary_plan is not None
+            and self.normal_complementary_owner is not None
+        )
+        if not dense_blocks and not reduced_terms and not native_normal_complementary:
+            raise ValueError(
+                "RankCoupledMPO requires dense blocks, reduced terms, or a "
+                "native normal/complementary plan."
+            )
 
         for key, block in dense_blocks.items():
             if len(key) != 2:
@@ -998,11 +946,11 @@ class RankCoupledMPO:
                     f"RankCoupledMPO block {key!r} visible shape {block.shape[:2]!r} does not match "
                     f"declared virtual channel counts {(len(left_channel_irreps), len(right_channel_irreps))!r}."
                 )
-            if int(block.shape[2]) != self.phys_out_leg.dim(q_out):
+            if int(block.shape[2]) != self.phys_out_leg.sector_dim(q_out):
                 raise ValueError(
                     f"RankCoupledMPO block {key!r} output dimension {block.shape[2]} does not match declared dimension."
                 )
-            if int(block.shape[3]) != self.phys_in_leg.dim(q_in):
+            if int(block.shape[3]) != self.phys_in_leg.sector_dim(q_in):
                 raise ValueError(
                     f"RankCoupledMPO block {key!r} input dimension {block.shape[3]} does not match declared dimension."
                 )
@@ -1044,7 +992,11 @@ class RankCoupledMPO:
         )
         dtypes = [block.dtype for block in dense_blocks.values()]
         dtypes.extend(term.dtype for term in reduced_terms)
-        object.__setattr__(self, "_dtype_cache", np.dtype(np.result_type(*dtypes)))
+        object.__setattr__(
+            self,
+            "_dtype_cache",
+            np.dtype(np.result_type(*dtypes) if dtypes else np.float64),
+        )
         # The reduced action list is static MPO metadata.  Build it once with
         # the MPO core so qchem sweeps do not repeatedly pay this bookkeeping
         # cost while advancing rank-coupled environments.
@@ -1216,8 +1168,8 @@ class RankCoupledMPO:
                     (
                         self.left_channel_irreps[i].dim,
                         self.right_channel_irreps[j].dim,
-                        self.phys_out_leg.dim(phys_out),
-                        self.phys_in_leg.dim(phys_in),
+                        self.phys_out_leg.sector_dim(phys_out),
+                        self.phys_in_leg.sector_dim(phys_in),
                     ),
                     dtype=self.dtype,
                 )
@@ -1238,7 +1190,7 @@ class RankCoupledMPO:
         left_slices = self._left_slices()
         right_slices = self._right_slices()
         total = np.zeros(
-            (self.left_dim, self.right_dim, self.phys_out_leg.dim(phys_out), self.phys_in_leg.dim(phys_in)),
+            (self.left_dim, self.right_dim, self.phys_out_leg.sector_dim(phys_out), self.phys_in_leg.sector_dim(phys_in)),
             dtype=self.dtype,
         )
         has_data = False
@@ -1861,8 +1813,8 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
     for key in set(left_core.dense_blocks) | set(right_core.dense_blocks):
         q_out, q_in = key
         shape = block_shape + (
-            left_core.phys_out_leg.dim(q_out),
-            left_core.phys_in_leg.dim(q_in),
+            left_core.phys_out_leg.sector_dim(q_out),
+            left_core.phys_in_leg.sector_dim(q_in),
         )
         pieces = []
         left_block = left_core.dense_blocks.get(key)
@@ -1979,3 +1931,58 @@ def sum_mpo_chains(*chains, phys_leg=None, cutoff=0.0):
             for site, (left_core, right_core) in enumerate(zip(out, chain))
         ]
     return out
+
+
+def scale_mpo_chain(chain, coefficient, *, site=0):
+    """Return an MPO chain multiplied by one scalar coefficient."""
+    chain = list(chain)
+    if not chain:
+        return []
+    site = int(site)
+    if site < 0:
+        site += len(chain)
+    if site < 0 or site >= len(chain):
+        raise IndexError("MPO scaling site is out of range.")
+
+    core = as_rank_coupled_mpo(chain[site])
+    coefficient = np.asarray(coefficient).reshape(()).item()
+    dense_blocks = {
+        key: SparseVirtualBlock(
+            block.shape,
+            block.rows,
+            block.cols,
+            np.asarray(block.values) * coefficient,
+        )
+        for key, block in core.dense_blocks.items()
+    }
+    reduced_terms = tuple(
+        RankCoupledChannelTerm(
+            reduced_operator=term.reduced_operator,
+            visible_virtual_block=SparseVirtualBlock(
+                term.visible_virtual_block.shape,
+                term.visible_virtual_block.rows,
+                term.visible_virtual_block.cols,
+                np.asarray(term.visible_virtual_block.values) * coefficient,
+            ),
+            use_cg_coupling=term.use_cg_coupling,
+            left_component_orientation=term.left_component_orientation,
+            right_component_orientation=term.right_component_orientation,
+            orient_virtual_coupling=term.orient_virtual_coupling,
+            dual_right_coupling=term.dual_right_coupling,
+            phase_from_charged_scalar_source=term.phase_from_charged_scalar_source,
+            phase_to_charged_pair_target=term.phase_to_charged_pair_target,
+        )
+        for term in core.reduced_terms
+    )
+    chain[site] = RankCoupledMPO(
+        dense_blocks=dense_blocks,
+        phys_out_leg=core.phys_out_leg,
+        phys_in_leg=core.phys_in_leg,
+        left_channel_irreps=core.left_channel_irreps,
+        right_channel_irreps=core.right_channel_irreps,
+        left_channel_charges=core.left_channel_charges,
+        right_channel_charges=core.right_channel_charges,
+        reduced_terms=reduced_terms,
+        symbolic_transitions=core.symbolic_transitions,
+    )
+    return chain

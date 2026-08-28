@@ -90,8 +90,6 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     eri = getattr(mf, '_eri', None)
     if eri is None:
         eri = getattr(mf.mol, 'eri', None)
-    if eri is None:
-        raise ValueError("Mean-field object does not provide AO ERIs for CI.")
 
 
     # elif isinstance(mf, scf.uhf.UHF):
@@ -158,6 +156,8 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
         else:
             raise ValueError(f"Unsupported MO ERI shape for CI: {eri_mo.shape}")
     else:
+        if eri is None:
+            raise ValueError("Mean-field object does not provide AO ERIs or an MO ERI transform for CI.")
         eri_aa = _transform_spatial_eri_to_mo(eri, Ca, Ca, Ca, Ca)
         eri_aa -= eri_aa.swapaxes(1, 3)
 

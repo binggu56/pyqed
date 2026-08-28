@@ -7,7 +7,144 @@ Created on Mon Dec  1 23:03:15 2025
 """
 
 import numpy as np
-from opt_einsum import contract
+from opt_einsum import contract, contract_expression
+
+
+class OrbitalContractionPlan:
+    """Compiled fixed-shape contractions for a CASSCF orbital subproblem."""
+
+    def __init__(self, h1e, eri, u_shape, dm1_shape, dm2_shape):
+        self.h1e = h1e
+        u_shape = tuple(u_shape)
+        dm1_shape = tuple(dm1_shape)
+        dm2_shape = tuple(dm2_shape)
+        optimize = "auto"
+
+        self._one_energy = contract_expression(
+            "pq,pa,qb,ab->",
+            h1e,
+            u_shape,
+            u_shape,
+            dm1_shape,
+            constants=[0],
+            optimize=optimize,
+        )
+
+        self.factorized = np.ndim(eri) == 3
+        if self.factorized:
+            pair_shape = (eri.shape[0], u_shape[1], u_shape[1])
+            self._transform_pairs = contract_expression(
+                "Ppq,pa,qb->Pab",
+                eri,
+                u_shape,
+                u_shape,
+                constants=[0],
+                optimize=optimize,
+            )
+            self._two_energy = contract_expression(
+                "Pab,Pcd,abcd->",
+                pair_shape,
+                pair_shape,
+                dm2_shape,
+                optimize=optimize,
+            )
+            self._left = contract_expression(
+                "Pcd,abcd->Pab", pair_shape, dm2_shape, optimize=optimize
+            )
+            self._right = contract_expression(
+                "Pab,abcd->Pcd", pair_shape, dm2_shape, optimize=optimize
+            )
+            self._two_gradient = (
+                contract_expression(
+                    "Ppq,qb,Pab->pa",
+                    eri,
+                    u_shape,
+                    pair_shape,
+                    constants=[0],
+                    optimize=optimize,
+                ),
+                contract_expression(
+                    "Ppq,pa,Pab->qb",
+                    eri,
+                    u_shape,
+                    pair_shape,
+                    constants=[0],
+                    optimize=optimize,
+                ),
+                contract_expression(
+                    "Prs,sd,Pcd->rc",
+                    eri,
+                    u_shape,
+                    pair_shape,
+                    constants=[0],
+                    optimize=optimize,
+                ),
+                contract_expression(
+                    "Prs,rc,Pcd->sd",
+                    eri,
+                    u_shape,
+                    pair_shape,
+                    constants=[0],
+                    optimize=optimize,
+                ),
+            )
+        elif np.ndim(eri) == 4:
+            self._two_energy = contract_expression(
+                "pqrs,pa,qb,rc,sd,abcd->",
+                eri,
+                u_shape,
+                u_shape,
+                u_shape,
+                u_shape,
+                dm2_shape,
+                constants=[0],
+                optimize=optimize,
+            )
+            self._two_gradient = tuple(
+                contract_expression(
+                    subscripts,
+                    eri,
+                    u_shape,
+                    u_shape,
+                    u_shape,
+                    dm2_shape,
+                    constants=[0],
+                    optimize=optimize,
+                )
+                for subscripts in (
+                    "pqrs,qb,rc,sd,abcd->pa",
+                    "pqrs,pa,rc,sd,abcd->qb",
+                    "pqrs,pa,qb,sd,abcd->rc",
+                    "pqrs,pa,qb,rc,abcd->sd",
+                )
+            )
+        else:
+            raise ValueError("eri must be a rank-3 pair factor or rank-4 tensor")
+
+    def energy(self, U, _h1e, _eri, dm1, dm2):
+        e = self._one_energy(U, U, dm1)
+        if self.factorized:
+            transformed = self._transform_pairs(U, U)
+            e += 0.5 * self._two_energy(transformed, transformed, dm2)
+        else:
+            e += 0.5 * self._two_energy(U, U, U, U, dm2)
+        return e
+
+    def gradient(self, U, _h1e, _eri, dm1, dm2):
+        g = self.h1e @ U @ dm1.T + self.h1e.T @ U @ dm1
+        if self.factorized:
+            transformed = self._transform_pairs(U, U)
+            left = self._left(transformed, dm2)
+            right = self._right(transformed, dm2)
+            g += 0.5 * (
+                self._two_gradient[0](U, left)
+                + self._two_gradient[1](U, left)
+                + self._two_gradient[2](U, right)
+                + self._two_gradient[3](U, right)
+            )
+        else:
+            g += 0.5 * sum(expr(U, U, U, dm2) for expr in self._two_gradient)
+        return g
 
 
 def _factorized_two_electron_energy(U, pair_factors, dm2):
@@ -56,7 +193,8 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
              rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG',
              history_size=7, max_iterations=200, max_step_norm=None,
              newton_shift=1e-4, newton_max_cycle=6,
-             newton_max_subspace=12, newton_tol=1e-4):
+             newton_max_subspace=12, newton_tol=1e-4,
+             gradient_fn=None):
     """
     Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
 
@@ -98,6 +236,9 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         Hard cap on the norm of the tangent-space step ``tau * direction``.
         This is useful when the non-monotone line search accepts a descent
         step that is still too aggressive for the outer CASSCF macroiteration.
+    gradient_fn : callable or None, optional
+        Euclidean gradient callable with the same arguments as ``f``.  The
+        module-level orbital gradient is used by default.
 
     Returns
     -------
@@ -122,10 +263,11 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
     # Start from a projected point so the optimizer can be called with slightly
     # noisy guesses without violating the manifold constraint.
+    gradient_eval = gradient if gradient_fn is None else gradient_fn
     X = project(X0)
     C = f(X, *args)
     Q = 1.0
-    G = gradient(X, *args)
+    G = gradient_eval(X, *args)
     df = grad(X, G)
     direction = -df
     v = C
@@ -181,7 +323,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         Qnew = eta * Q + 1.0
         v = trial_value
         Cnew = (eta * Q * C + v) / Qnew
-        Gnew = gradient(Xnew, *args)
+        Gnew = gradient_eval(Xnew, *args)
         df_new = grad(Xnew, Gnew)
 
         transported_grad = transport(Xnew, df)

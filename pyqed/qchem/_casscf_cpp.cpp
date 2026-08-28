@@ -192,6 +192,22 @@ PyObject* vector_to_int8_array(const std::vector<npy_int8>& values) {
     return obj;
 }
 
+PyObject* vector_to_double_array(const std::vector<double>& values) {
+    npy_intp dims[1] = {static_cast<npy_intp>(values.size())};
+    PyObject* obj = PyArray_SimpleNew(1, dims, NPY_DOUBLE);
+    if (obj == nullptr) {
+        return nullptr;
+    }
+    if (!values.empty()) {
+        std::memcpy(
+            PyArray_DATA(reinterpret_cast<PyArrayObject*>(obj)),
+            values.data(),
+            values.size() * sizeof(double)
+        );
+    }
+    return obj;
+}
+
 PyObject* build_link_tuple(
     const std::vector<npy_int32>& i,
     const std::vector<npy_int32>& j,
@@ -403,6 +419,363 @@ PyObject* orbital_hessian_action_from_integrals(PyObject*, PyObject* args) {
 
     Py_DECREF(dfock_obj);
     return grad_obj;
+}
+
+struct FactorHessianWorkspace {
+    PyArrayObject* h1 = nullptr;
+    PyArrayObject* pair = nullptr;
+    PyArrayObject* dm1 = nullptr;
+    PyArrayObject* dm2 = nullptr;
+    PyArrayObject* pair_matrix = nullptr;
+    PyArrayObject* contracted_base = nullptr;
+    npy_intp nmo = 0;
+    npy_intp nocc = 0;
+    npy_intp naux = 0;
+    npy_intp factor_width = 0;
+    std::vector<double> d_by_p;
+    std::vector<double> right_response;
+    std::vector<double> d_occ_aux;
+    std::vector<double> contracted_response;
+    std::vector<double> dh1;
+    std::vector<double> dfock_occ;
+
+    ~FactorHessianWorkspace() {
+        Py_XDECREF(h1);
+        Py_XDECREF(pair);
+        Py_XDECREF(dm1);
+        Py_XDECREF(dm2);
+        Py_XDECREF(pair_matrix);
+        Py_XDECREF(contracted_base);
+    }
+
+    bool initialize(
+        PyObject* h1_obj,
+        PyObject* pair_obj,
+        PyObject* dm1_obj,
+        PyObject* dm2_obj,
+        PyObject* pair_matrix_obj,
+        PyObject* contracted_base_obj
+    ) {
+#ifndef PYQED_HAVE_CBLAS
+        PyErr_SetString(
+            PyExc_RuntimeError,
+            "The native factor-Hessian workspace requires CBLAS."
+        );
+        return false;
+#else
+        ArrayRef h1_ref(h1_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        ArrayRef pair_ref(pair_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        ArrayRef dm1_ref(dm1_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        ArrayRef dm2_ref(dm2_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        ArrayRef pair_matrix_ref(pair_matrix_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        ArrayRef contracted_ref(contracted_base_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        if (!h1_ref || !pair_ref || !dm1_ref || !dm2_ref ||
+            !pair_matrix_ref || !contracted_ref) {
+            return false;
+        }
+        if (
+            PyArray_NDIM(h1_ref.obj) != 2 ||
+            PyArray_NDIM(pair_ref.obj) != 3 ||
+            PyArray_NDIM(dm1_ref.obj) != 2 ||
+            PyArray_NDIM(dm2_ref.obj) != 4 ||
+            PyArray_NDIM(pair_matrix_ref.obj) != 2 ||
+            PyArray_NDIM(contracted_ref.obj) != 3
+        ) {
+            PyErr_SetString(
+                PyExc_ValueError,
+                "factor-Hessian inputs must have ranks 2, 3, 2, 4, 2, and 3."
+            );
+            return false;
+        }
+
+        nmo = PyArray_DIM(h1_ref.obj, 0);
+        naux = PyArray_DIM(pair_ref.obj, 0);
+        nocc = PyArray_DIM(dm1_ref.obj, 0);
+        if (nmo <= 0 || nocc <= 0 || naux <= 0 || nocc > nmo) {
+            PyErr_SetString(PyExc_ValueError, "factor-Hessian dimensions must be positive and nocc <= nmo.");
+            return false;
+        }
+        factor_width = naux * nocc;
+        const npy_intp nocc2 = nocc * nocc;
+        if (
+            PyArray_DIM(h1_ref.obj, 1) != nmo ||
+            PyArray_DIM(pair_ref.obj, 1) != nmo ||
+            PyArray_DIM(pair_ref.obj, 2) != nmo ||
+            PyArray_DIM(dm1_ref.obj, 1) != nocc ||
+            PyArray_DIM(pair_matrix_ref.obj, 0) != nmo ||
+            PyArray_DIM(pair_matrix_ref.obj, 1) != factor_width ||
+            PyArray_DIM(contracted_ref.obj, 0) != naux ||
+            PyArray_DIM(contracted_ref.obj, 1) != nocc ||
+            PyArray_DIM(contracted_ref.obj, 2) != nocc
+        ) {
+            PyErr_SetString(PyExc_ValueError, "factor-Hessian matrix dimensions are inconsistent.");
+            return false;
+        }
+        for (int axis = 0; axis < 4; ++axis) {
+            if (PyArray_DIM(dm2_ref.obj, axis) != nocc) {
+                PyErr_SetString(PyExc_ValueError, "dm2 must have shape (nocc, nocc, nocc, nocc).");
+                return false;
+            }
+        }
+        const npy_intp int_max = static_cast<npy_intp>(std::numeric_limits<int>::max());
+        if (
+            nmo > int_max || nocc > int_max || naux > int_max ||
+            factor_width > int_max || nocc2 > int_max || naux * nmo > int_max
+        ) {
+            PyErr_SetString(PyExc_OverflowError, "factor-Hessian dimensions exceed the CBLAS integer range.");
+            return false;
+        }
+
+        Py_INCREF(h1_ref.obj);
+        Py_INCREF(pair_ref.obj);
+        Py_INCREF(dm1_ref.obj);
+        Py_INCREF(dm2_ref.obj);
+        Py_INCREF(pair_matrix_ref.obj);
+        Py_INCREF(contracted_ref.obj);
+        h1 = h1_ref.obj;
+        pair = pair_ref.obj;
+        dm1 = dm1_ref.obj;
+        dm2 = dm2_ref.obj;
+        pair_matrix = pair_matrix_ref.obj;
+        contracted_base = contracted_ref.obj;
+
+        try {
+            d_by_p.resize(static_cast<std::size_t>(nmo * factor_width));
+            right_response.resize(static_cast<std::size_t>(naux * nmo * nocc));
+            d_occ_aux.resize(static_cast<std::size_t>(naux * nocc2));
+            contracted_response.resize(static_cast<std::size_t>(naux * nocc2));
+            dh1.resize(static_cast<std::size_t>(nmo * nmo));
+            dfock_occ.resize(static_cast<std::size_t>(nmo * nocc));
+        } catch (...) {
+            PyErr_SetString(PyExc_MemoryError, "Failed to allocate factor-Hessian workspace buffers.");
+            return false;
+        }
+        return true;
+#endif
+    }
+
+    bool apply_one(const double* kappa, double* gradient) {
+#ifndef PYQED_HAVE_CBLAS
+        (void)kappa;
+        (void)gradient;
+        return false;
+#else
+        constexpr int row_major = 101;
+        constexpr int no_trans = 111;
+        constexpr int trans = 112;
+        const int n = static_cast<int>(nmo);
+        const int o = static_cast<int>(nocc);
+        const int a = static_cast<int>(naux);
+        const int width = static_cast<int>(factor_width);
+        const int o2 = static_cast<int>(nocc * nocc);
+        const double* h1_data = static_cast<const double*>(PyArray_DATA(h1));
+        const double* pair_data = static_cast<const double*>(PyArray_DATA(pair));
+        const double* dm1_data = static_cast<const double*>(PyArray_DATA(dm1));
+        const double* dm2_data = static_cast<const double*>(PyArray_DATA(dm2));
+        const double* pair_matrix_data = static_cast<const double*>(PyArray_DATA(pair_matrix));
+        const double* contracted_data = static_cast<const double*>(PyArray_DATA(contracted_base));
+
+        cblas_dgemm(
+            row_major, trans, no_trans,
+            n, width, n,
+            1.0, kappa, n,
+            pair_matrix_data, width,
+            0.0, d_by_p.data(), width
+        );
+        cblas_dgemm(
+            row_major, no_trans, no_trans,
+            a * n, o, n,
+            1.0, pair_data, n,
+            kappa, n,
+            0.0, right_response.data(), o
+        );
+
+        for (npy_intp p = 0; p < nmo; ++p) {
+            double* d_row = d_by_p.data() + p * factor_width;
+            for (npy_intp aux = 0; aux < naux; ++aux) {
+                const double* right = right_response.data() + (aux * nmo + p) * nocc;
+                double* target = d_row + aux * nocc;
+                for (npy_intp r = 0; r < nocc; ++r) {
+                    target[r] += right[r];
+                }
+            }
+        }
+        for (npy_intp aux = 0; aux < naux; ++aux) {
+            double* target = d_occ_aux.data() + aux * nocc * nocc;
+            for (npy_intp s = 0; s < nocc; ++s) {
+                const double* source = d_by_p.data() + s * factor_width + aux * nocc;
+                std::copy(source, source + nocc, target + s * nocc);
+            }
+        }
+
+        cblas_dgemm(
+            row_major, no_trans, trans,
+            a, o2, o2,
+            1.0, d_occ_aux.data(), o2,
+            dm2_data, o2,
+            0.0, contracted_response.data(), o2
+        );
+        cblas_dgemm(
+            row_major, no_trans, no_trans,
+            n, n, n,
+            1.0, h1_data, n,
+            kappa, n,
+            0.0, dh1.data(), n
+        );
+        cblas_dgemm(
+            row_major, no_trans, no_trans,
+            n, n, n,
+            -1.0, kappa, n,
+            h1_data, n,
+            1.0, dh1.data(), n
+        );
+        cblas_dgemm(
+            row_major, no_trans, no_trans,
+            n, o, o,
+            1.0, dh1.data(), n,
+            dm1_data, o,
+            0.0, dfock_occ.data(), o
+        );
+        cblas_dgemm(
+            row_major, no_trans, no_trans,
+            n, o, width,
+            1.0, d_by_p.data(), width,
+            contracted_data, o,
+            1.0, dfock_occ.data(), o
+        );
+        cblas_dgemm(
+            row_major, no_trans, no_trans,
+            n, o, width,
+            1.0, pair_matrix_data, width,
+            contracted_response.data(), o,
+            1.0, dfock_occ.data(), o
+        );
+
+        for (npy_intp p = 0; p < nmo; ++p) {
+            for (npy_intp q = 0; q < nmo; ++q) {
+                const double fpq = q < nocc ? dfock_occ[p * nocc + q] : 0.0;
+                const double fqp = p < nocc ? dfock_occ[q * nocc + p] : 0.0;
+                gradient[p * nmo + q] = 2.0 * (fpq - fqp);
+            }
+        }
+        return true;
+#endif
+    }
+};
+
+constexpr const char* factor_hessian_workspace_capsule_name =
+    "pyqed.qchem._casscf_cpp.FactorHessianWorkspace";
+
+void destroy_factor_hessian_workspace(PyObject* capsule) {
+    void* pointer = PyCapsule_GetPointer(capsule, factor_hessian_workspace_capsule_name);
+    if (pointer == nullptr) {
+        PyErr_Clear();
+        return;
+    }
+    delete static_cast<FactorHessianWorkspace*>(pointer);
+}
+
+PyObject* create_factor_hessian_workspace(PyObject*, PyObject* args) {
+    PyObject* h1_obj = nullptr;
+    PyObject* pair_obj = nullptr;
+    PyObject* dm1_obj = nullptr;
+    PyObject* dm2_obj = nullptr;
+    PyObject* pair_matrix_obj = nullptr;
+    PyObject* contracted_base_obj = nullptr;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOOO",
+            &h1_obj,
+            &pair_obj,
+            &dm1_obj,
+            &dm2_obj,
+            &pair_matrix_obj,
+            &contracted_base_obj
+        )) {
+        return nullptr;
+    }
+    auto* workspace = new (std::nothrow) FactorHessianWorkspace();
+    if (workspace == nullptr) {
+        return PyErr_NoMemory();
+    }
+    if (!workspace->initialize(
+            h1_obj,
+            pair_obj,
+            dm1_obj,
+            dm2_obj,
+            pair_matrix_obj,
+            contracted_base_obj
+        )) {
+        delete workspace;
+        return nullptr;
+    }
+    return PyCapsule_New(
+        workspace,
+        factor_hessian_workspace_capsule_name,
+        destroy_factor_hessian_workspace
+    );
+}
+
+PyObject* apply_factor_hessian_workspace(PyObject*, PyObject* args) {
+    PyObject* capsule = nullptr;
+    PyObject* kappas_obj = nullptr;
+    if (!PyArg_ParseTuple(args, "OO", &capsule, &kappas_obj)) {
+        return nullptr;
+    }
+    auto* workspace = static_cast<FactorHessianWorkspace*>(
+        PyCapsule_GetPointer(capsule, factor_hessian_workspace_capsule_name)
+    );
+    if (workspace == nullptr) {
+        return nullptr;
+    }
+    ArrayRef kappas(kappas_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!kappas) {
+        return nullptr;
+    }
+    const int ndim = PyArray_NDIM(kappas.obj);
+    if (ndim != 2 && ndim != 3) {
+        PyErr_SetString(PyExc_ValueError, "kappas must have shape (nmo, nmo) or (nvec, nmo, nmo).");
+        return nullptr;
+    }
+    const npy_intp nvec = ndim == 2 ? 1 : PyArray_DIM(kappas.obj, 0);
+    const int row_axis = ndim == 2 ? 0 : 1;
+    if (
+        PyArray_DIM(kappas.obj, row_axis) != workspace->nmo ||
+        PyArray_DIM(kappas.obj, row_axis + 1) != workspace->nmo
+    ) {
+        PyErr_SetString(PyExc_ValueError, "kappa dimensions do not match the factor-Hessian workspace.");
+        return nullptr;
+    }
+    npy_intp dims[3] = {nvec, workspace->nmo, workspace->nmo};
+    PyObject* result = ndim == 2
+        ? PyArray_SimpleNew(2, dims + 1, NPY_DOUBLE)
+        : PyArray_SimpleNew(3, dims, NPY_DOUBLE);
+    if (result == nullptr) {
+        return nullptr;
+    }
+    const double* kappa_data = static_cast<const double*>(PyArray_DATA(kappas.obj));
+    double* gradient_data = static_cast<double*>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject*>(result))
+    );
+    const npy_intp matrix_size = workspace->nmo * workspace->nmo;
+    bool ok = true;
+    Py_BEGIN_ALLOW_THREADS
+    for (npy_intp vector = 0; vector < nvec; ++vector) {
+        if (!workspace->apply_one(
+                kappa_data + vector * matrix_size,
+                gradient_data + vector * matrix_size
+            )) {
+            ok = false;
+            break;
+        }
+    }
+    Py_END_ALLOW_THREADS
+    if (!ok) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_RuntimeError, "Native factor-Hessian workspace application failed.");
+        return nullptr;
+    }
+    return result;
 }
 
 bool validate_ci_inputs(PyArrayObject* binary, PyArrayObject* h1, PyArrayObject* h2) {
@@ -2498,11 +2871,36 @@ struct Spin0PairSigmaWorkspace {
 
     static constexpr double inv_sqrt2 = 0.70710678118654752440084436210484903928;
 
-    bool initialize(PyObject* args, int requested_workers) {
-        h1.reset(PyTuple_GET_ITEM(args, 0), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
-        eri_same.reset(PyTuple_GET_ITEM(args, 1), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
-        eri_cross.reset(PyTuple_GET_ITEM(args, 2), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
-        hdiag.reset(PyTuple_GET_ITEM(args, 3), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    bool initialize(
+        PyObject* args,
+        int requested_workers,
+        PyObject* operator_h1 = nullptr,
+        PyObject* operator_eri_same = nullptr,
+        PyObject* operator_eri_cross = nullptr,
+        PyObject* operator_hdiag = nullptr,
+        PyObject* operator_alpha_cross_diag = nullptr,
+        PyObject* operator_beta_cross_diag = nullptr
+    ) {
+        h1.reset(
+            operator_h1 == nullptr ? PyTuple_GET_ITEM(args, 0) : operator_h1,
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
+        eri_same.reset(
+            operator_eri_same == nullptr ? PyTuple_GET_ITEM(args, 1) : operator_eri_same,
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
+        eri_cross.reset(
+            operator_eri_cross == nullptr ? PyTuple_GET_ITEM(args, 2) : operator_eri_cross,
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
+        hdiag.reset(
+            operator_hdiag == nullptr ? PyTuple_GET_ITEM(args, 3) : operator_hdiag,
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
         c_pair.reset(PyTuple_GET_ITEM(args, 4), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
         pair_left.reset(PyTuple_GET_ITEM(args, 5), NPY_INTP, NPY_ARRAY_IN_ARRAY);
         pair_right.reset(PyTuple_GET_ITEM(args, 6), NPY_INTP, NPY_ARRAY_IN_ARRAY);
@@ -2536,8 +2934,20 @@ struct Spin0PairSigmaWorkspace {
         beta_offsets.reset(PyTuple_GET_ITEM(args, 34), NPY_INTP, NPY_ARRAY_IN_ARRAY);
         alpha_order.reset(PyTuple_GET_ITEM(args, 35), NPY_INTP, NPY_ARRAY_IN_ARRAY);
         beta_order.reset(PyTuple_GET_ITEM(args, 36), NPY_INTP, NPY_ARRAY_IN_ARRAY);
-        alpha_cross_diag.reset(PyTuple_GET_ITEM(args, 37), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
-        beta_cross_diag.reset(PyTuple_GET_ITEM(args, 38), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+        alpha_cross_diag.reset(
+            operator_alpha_cross_diag == nullptr
+                ? PyTuple_GET_ITEM(args, 37)
+                : operator_alpha_cross_diag,
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
+        beta_cross_diag.reset(
+            operator_beta_cross_diag == nullptr
+                ? PyTuple_GET_ITEM(args, 38)
+                : operator_beta_cross_diag,
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
         ordered_alpha_i.reset(PyTuple_GET_ITEM(args, 39), NPY_INT32, NPY_ARRAY_IN_ARRAY);
         ordered_alpha_j.reset(PyTuple_GET_ITEM(args, 40), NPY_INT32, NPY_ARRAY_IN_ARRAY);
         ordered_alpha_phase.reset(PyTuple_GET_ITEM(args, 41), NPY_INT8, NPY_ARRAY_IN_ARRAY);
@@ -2820,6 +3230,36 @@ bool Spin0PairSigmaWorkspace::initialize_blas_pair() {
     use_blas_pair = false;
     if (!use_reduced_cross || n_alpha != n_beta || n <= 0) {
         return true;
+    }
+
+    // The packed spin-free factorization assumes both
+    // same = cross - exchange and Coulomb permutation symmetry within each
+    // orbital pair.  The S^2 cross-spin block violates the latter, so a spin
+    // penalty must use the general pair kernel.
+    for (npy_intp p = 0; p < n; ++p) {
+        for (npy_intp q = 0; q < n; ++q) {
+            for (npy_intp r = 0; r < n; ++r) {
+                for (npy_intp s = 0; s < n; ++s) {
+                    const double expected =
+                        cross[idx4(n, p, q, r, s)] -
+                        cross[idx4(n, p, s, r, q)];
+                    const double actual = same[idx4(n, p, q, r, s)];
+                    const double pq_swap = cross[idx4(n, q, p, r, s)];
+                    const double rs_swap = cross[idx4(n, p, q, s, r)];
+                    const double value = cross[idx4(n, p, q, r, s)];
+                    const double scale =
+                        1.0 + std::abs(expected) + std::abs(actual) +
+                        std::abs(value) + std::abs(pq_swap) + std::abs(rs_swap);
+                    if (
+                        std::abs(actual - expected) > 1.0e-12 * scale ||
+                        std::abs(value - pq_swap) > 1.0e-12 * scale ||
+                        std::abs(value - rs_swap) > 1.0e-12 * scale
+                    ) {
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
     n_orbital_pair = n * (n + 1) / 2;
@@ -3928,44 +4368,6 @@ void projected_matrix_vt_av(
     }
 }
 
-void column_major_linear_combination(
-    const std::vector<double>& M,
-    std::size_t n,
-    int m,
-    const std::vector<double>& coeff,
-    double* out
-) {
-#ifdef PYQED_HAVE_CBLAS
-    constexpr int col_major = 102;
-    constexpr int no_trans = 111;
-    if (native_blas_dims(n, m)) {
-        cblas_dgemv(
-            col_major,
-            no_trans,
-            static_cast<int>(n),
-            m,
-            1.0,
-            M.data(),
-            static_cast<int>(n),
-            coeff.data(),
-            1,
-            0.0,
-            out,
-            1
-        );
-        return;
-    }
-#endif
-    std::fill(out, out + n, 0.0);
-    for (int col = 0; col < m; ++col) {
-        const double c = coeff[static_cast<std::size_t>(col)];
-        const double* mcol = M.data() + static_cast<std::size_t>(col) * n;
-        for (std::size_t k = 0; k < n; ++k) {
-            out[k] += c * mcol[k];
-        }
-    }
-}
-
 void project_out_subspace(
     const std::vector<double>& V,
     std::size_t n,
@@ -4083,8 +4485,11 @@ void build_restart_block(
 
 PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     const Py_ssize_t nargs = PyTuple_Size(args);
-    if (nargs != 51) {
-        PyErr_SetString(PyExc_TypeError, "davidson_spin0_pair expects 51 positional arguments.");
+    if (nargs != 52 && nargs != 59) {
+        PyErr_SetString(
+            PyExc_TypeError,
+            "davidson_spin0_pair expects 52 arguments, or 59 with a separate spin penalty."
+        );
         return nullptr;
     }
 
@@ -4098,8 +4503,8 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
         return nullptr;
     }
     const int nroots = static_cast<int>(parsed_nroots);
-    if (nroots != 1) {
-        PyErr_SetString(PyExc_NotImplementedError, "native spin0 Davidson currently supports one root.");
+    if (nroots < 1) {
+        PyErr_SetString(PyExc_ValueError, "native spin0 Davidson requires at least one root.");
         return nullptr;
     }
     const double energy_tol = PyFloat_AsDouble(PyTuple_GET_ITEM(args, 47));
@@ -4125,14 +4530,16 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     ArrayRef c_dummy(PyTuple_GET_ITEM(args, 4), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
     ArrayRef pair_left(PyTuple_GET_ITEM(args, 5), NPY_INTP, NPY_ARRAY_IN_ARRAY);
     ArrayRef pair_right(PyTuple_GET_ITEM(args, 6), NPY_INTP, NPY_ARRAY_IN_ARRAY);
-    if (!hdiag || !c_dummy || !pair_left || !pair_right) {
+    ArrayRef guess(PyTuple_GET_ITEM(args, 51), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!hdiag || !c_dummy || !pair_left || !pair_right || !guess) {
         return nullptr;
     }
     if (
         PyArray_NDIM(hdiag.obj) != 1 ||
         PyArray_NDIM(c_dummy.obj) != 1 ||
         PyArray_NDIM(pair_left.obj) != 1 ||
-        PyArray_NDIM(pair_right.obj) != 1
+        PyArray_NDIM(pair_right.obj) != 1 ||
+        PyArray_NDIM(guess.obj) != 2
     ) {
         PyErr_SetString(PyExc_ValueError, "native spin0 Davidson received invalid diagonal or pair arrays.");
         return nullptr;
@@ -4142,21 +4549,76 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     if (
         n_pair < 1 ||
         PyArray_DIM(c_dummy.obj, 0) != n_pair ||
-        PyArray_DIM(pair_right.obj, 0) != n_pair
+        PyArray_DIM(pair_right.obj, 0) != n_pair ||
+        PyArray_DIM(guess.obj, 0) != n_pair
     ) {
         PyErr_SetString(PyExc_ValueError, "native spin0 Davidson pair dimensions are inconsistent.");
+        return nullptr;
+    }
+    if (nroots > n_pair) {
+        PyErr_SetString(PyExc_ValueError, "native spin0 Davidson requested more roots than pair configurations.");
         return nullptr;
     }
     const double* diag = static_cast<const double*>(PyArray_DATA(hdiag.obj));
     const npy_intp* left = static_cast<const npy_intp*>(PyArray_DATA(pair_left.obj));
     const npy_intp* right = static_cast<const npy_intp*>(PyArray_DATA(pair_right.obj));
+    const bool use_spin_penalty = nargs == 59;
+    const double spin_penalty_shift = use_spin_penalty
+        ? PyFloat_AsDouble(PyTuple_GET_ITEM(args, 58))
+        : 0.0;
+    if (PyErr_Occurred()) {
+        return nullptr;
+    }
+    ArrayRef spin_penalty_hdiag;
+    const double* spin_penalty_diag = nullptr;
+    if (use_spin_penalty) {
+        spin_penalty_hdiag.reset(
+            PyTuple_GET_ITEM(args, 55),
+            NPY_DOUBLE,
+            NPY_ARRAY_IN_ARRAY
+        );
+        if (
+            !spin_penalty_hdiag ||
+            PyArray_NDIM(spin_penalty_hdiag.obj) != 1 ||
+            PyArray_DIM(spin_penalty_hdiag.obj, 0) != n_det
+        ) {
+            PyErr_SetString(
+                PyExc_ValueError,
+                "native spin0 Davidson received an incompatible spin-penalty diagonal."
+            );
+            return nullptr;
+        }
+        spin_penalty_diag = static_cast<const double*>(
+            PyArray_DATA(spin_penalty_hdiag.obj)
+        );
+    }
+
+    const int supplied_guess_cols = static_cast<int>(PyArray_DIM(guess.obj, 1));
+    if (supplied_guess_cols > 0 && supplied_guess_cols < nroots) {
+        PyErr_SetString(PyExc_ValueError, "native spin0 Davidson guess has fewer columns than requested roots.");
+        return nullptr;
+    }
+    const int minimum_capacity = std::min<int>(
+        static_cast<int>(n_pair),
+        std::max(2, 2 * nroots)
+    );
+    const int capacity = static_cast<int>(std::min<npy_intp>(
+        n_pair,
+        std::max(max_subspace, minimum_capacity)
+    ));
+    const int initial_cols = supplied_guess_cols > 0
+        ? std::min(capacity, supplied_guess_cols)
+        : std::min<int>(static_cast<int>(n_pair), std::max(2, nroots));
+    const int thick_keep_target = std::min(
+        capacity,
+        std::max(nroots + 1, 2 * nroots + 2)
+    );
+    const int restart_capacity = std::min(capacity, thick_keep_target + nroots);
 
     std::vector<double> spin0_diag;
     std::vector<npy_intp> guess_order;
     try {
         spin0_diag.assign(static_cast<std::size_t>(n_pair), 0.0);
-        guess_order.resize(static_cast<std::size_t>(n_pair));
-        std::iota(guess_order.begin(), guess_order.end(), 0);
         for (npy_intp pair = 0; pair < n_pair; ++pair) {
             const npy_intp ldet = left[pair];
             const npy_intp rdet = right[pair];
@@ -4166,24 +4628,33 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
             }
             spin0_diag[static_cast<std::size_t>(pair)] =
                 (ldet == rdet) ? diag[ldet] : 0.5 * (diag[ldet] + diag[rdet]);
-        }
-        const int initial_cols = static_cast<int>(std::min<npy_intp>(n_pair, 2));
-        std::partial_sort(
-            guess_order.begin(),
-            guess_order.begin() + initial_cols,
-            guess_order.end(),
-            [&](npy_intp lhs, npy_intp rhs) {
-                return spin0_diag[static_cast<std::size_t>(lhs)] <
-                    spin0_diag[static_cast<std::size_t>(rhs)];
+            if (use_spin_penalty) {
+                const double penalty_diagonal = (ldet == rdet)
+                    ? spin_penalty_diag[ldet]
+                    : 0.5 * (spin_penalty_diag[ldet] + spin_penalty_diag[rdet]);
+                spin0_diag[static_cast<std::size_t>(pair)] +=
+                    spin_penalty_shift * penalty_diagonal;
             }
-        );
+        }
+        if (supplied_guess_cols == 0) {
+            guess_order.resize(static_cast<std::size_t>(n_pair));
+            std::iota(guess_order.begin(), guess_order.end(), 0);
+            std::partial_sort(
+                guess_order.begin(),
+                guess_order.begin() + initial_cols,
+                guess_order.end(),
+                [&](npy_intp lhs, npy_intp rhs) {
+                    return spin0_diag[static_cast<std::size_t>(lhs)] <
+                        spin0_diag[static_cast<std::size_t>(rhs)];
+                }
+            );
+        }
     } catch (...) {
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate native spin0 Davidson work arrays.");
         return nullptr;
     }
 
     const std::size_t n = static_cast<std::size_t>(n_pair);
-    const int capacity = static_cast<int>(std::min<npy_intp>(n_pair, max_subspace));
     std::vector<double> V;
     std::vector<double> AV;
     std::vector<double> T;
@@ -4194,6 +4665,7 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     std::vector<double> aritz;
     std::vector<double> resid;
     std::vector<double> corr;
+    std::vector<double> corrections;
     std::vector<double> root_coeff;
     std::vector<double> overlap;
     std::vector<double> restart_V;
@@ -4205,15 +4677,22 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
         AV.assign(n * static_cast<std::size_t>(capacity), 0.0);
         T.assign(static_cast<std::size_t>(capacity) * static_cast<std::size_t>(capacity), 0.0);
         T_col.assign(static_cast<std::size_t>(capacity) * static_cast<std::size_t>(capacity), 0.0);
-        ritz.assign(n, 0.0);
-        aritz.assign(n, 0.0);
-        resid.assign(n, 0.0);
+        ritz.assign(n * static_cast<std::size_t>(nroots), 0.0);
+        aritz.assign(n * static_cast<std::size_t>(nroots), 0.0);
+        resid.assign(n * static_cast<std::size_t>(nroots), 0.0);
         corr.assign(n, 0.0);
-        root_coeff.assign(static_cast<std::size_t>(capacity), 0.0);
+        corrections.assign(n * static_cast<std::size_t>(nroots), 0.0);
+        root_coeff.assign(
+            static_cast<std::size_t>(capacity) * static_cast<std::size_t>(restart_capacity),
+            0.0
+        );
         overlap.assign(static_cast<std::size_t>(capacity), 0.0);
-        restart_V.assign(n * static_cast<std::size_t>(capacity), 0.0);
-        restart_AV.assign(n * static_cast<std::size_t>(capacity), 0.0);
-        restart_coeff.assign(static_cast<std::size_t>(capacity) * static_cast<std::size_t>(capacity), 0.0);
+        restart_V.assign(n * static_cast<std::size_t>(restart_capacity), 0.0);
+        restart_AV.assign(n * static_cast<std::size_t>(restart_capacity), 0.0);
+        restart_coeff.assign(
+            static_cast<std::size_t>(capacity) * static_cast<std::size_t>(restart_capacity),
+            0.0
+        );
         root_order.resize(static_cast<std::size_t>(capacity));
     } catch (...) {
         PyErr_SetString(PyExc_MemoryError, "Failed to allocate native spin0 Davidson subspace.");
@@ -4224,21 +4703,74 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     if (!sigma_workspace.initialize(args, workers)) {
         return nullptr;
     }
+    Spin0PairSigmaWorkspace spin_penalty_workspace;
+    std::vector<double> spin_penalty_sigma;
+    if (
+        use_spin_penalty &&
+        !spin_penalty_workspace.initialize(
+            args,
+            1,
+            PyTuple_GET_ITEM(args, 52),
+            PyTuple_GET_ITEM(args, 53),
+            PyTuple_GET_ITEM(args, 54),
+            PyTuple_GET_ITEM(args, 55),
+            PyTuple_GET_ITEM(args, 56),
+            PyTuple_GET_ITEM(args, 57)
+        )
+    ) {
+        return nullptr;
+    }
+    if (use_spin_penalty) {
+        try {
+            spin_penalty_sigma.assign(n, 0.0);
+        } catch (...) {
+            PyErr_SetString(
+                PyExc_MemoryError,
+                "Failed to allocate the native spin-penalty sigma buffer."
+            );
+            return nullptr;
+        }
+    }
     auto sigma_matvec = [&](const double* input, double* output) -> bool {
-        return sigma_workspace.apply(input, output);
+        if (!sigma_workspace.apply(input, output)) {
+            return false;
+        }
+        if (use_spin_penalty) {
+            if (!spin_penalty_workspace.apply(input, spin_penalty_sigma.data())) {
+                return false;
+            }
+            for (std::size_t row = 0; row < n; ++row) {
+                output[row] += spin_penalty_shift * spin_penalty_sigma[row];
+            }
+        }
+        return true;
     };
 
-    int m = static_cast<int>(std::min<npy_intp>(n_pair, 2));
+    int m = initial_cols;
+    const double* guess_data = static_cast<const double*>(PyArray_DATA(guess.obj));
     for (int col = 0; col < m; ++col) {
-        V[static_cast<std::size_t>(col) * n + static_cast<std::size_t>(guess_order[static_cast<std::size_t>(col)])] = 1.0;
+        if (supplied_guess_cols > 0) {
+            for (std::size_t row = 0; row < n; ++row) {
+                V[static_cast<std::size_t>(col) * n + row] =
+                    guess_data[row * static_cast<std::size_t>(supplied_guess_cols) +
+                               static_cast<std::size_t>(col)];
+            }
+        } else {
+            V[static_cast<std::size_t>(col) * n +
+              static_cast<std::size_t>(guess_order[static_cast<std::size_t>(col)])] = 1.0;
+        }
         if (!sigma_matvec(V.data() + static_cast<std::size_t>(col) * n, AV.data() + static_cast<std::size_t>(col) * n)) {
             return nullptr;
         }
     }
 
-    double theta = 0.0;
-    double previous_theta = std::numeric_limits<double>::infinity();
-    double resid_norm = std::numeric_limits<double>::infinity();
+    std::vector<double> theta(
+        static_cast<std::size_t>(nroots),
+        std::numeric_limits<double>::infinity()
+    );
+    std::vector<double> previous_theta = theta;
+    std::vector<double> resid_norm(static_cast<std::size_t>(nroots), 0.0);
+    bool converged = false;
     for (int cycle = 0; cycle < max_cycle; ++cycle) {
         projected_matrix_vt_av(V, AV, n, m, T, T_col);
         if (!jacobi_eigh_small(
@@ -4261,88 +4793,151 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
                     evals[static_cast<std::size_t>(rhs)];
             }
         );
-        const int root_col = root_order[0];
-        theta = evals[static_cast<std::size_t>(root_col)];
-
-        for (int col = 0; col < m; ++col) {
-            root_coeff[static_cast<std::size_t>(col)] =
-                evecs[static_cast<std::size_t>(col) * static_cast<std::size_t>(m) + static_cast<std::size_t>(root_col)];
+        for (int root = 0; root < nroots; ++root) {
+            theta[static_cast<std::size_t>(root)] =
+                evals[static_cast<std::size_t>(root_order[static_cast<std::size_t>(root)])];
         }
-        column_major_linear_combination(V, n, m, root_coeff, ritz.data());
-        column_major_linear_combination(AV, n, m, root_coeff, aritz.data());
+        build_restart_block(V, n, m, nroots, evecs, root_order, root_coeff, ritz);
+        build_restart_block(AV, n, m, nroots, evecs, root_order, root_coeff, aritz);
 
-        resid_norm = 0.0;
-        for (std::size_t k = 0; k < n; ++k) {
-            resid[k] = aritz[k] - theta * ritz[k];
-            resid_norm += resid[k] * resid[k];
+        bool all_converged = cycle > 0;
+        bool residuals_converged = true;
+        for (int root = 0; root < nroots; ++root) {
+            const std::size_t offset = static_cast<std::size_t>(root) * n;
+            double norm_sq = 0.0;
+            for (std::size_t k = 0; k < n; ++k) {
+                resid[offset + k] = aritz[offset + k] -
+                    theta[static_cast<std::size_t>(root)] * ritz[offset + k];
+                norm_sq += resid[offset + k] * resid[offset + k];
+            }
+            resid_norm[static_cast<std::size_t>(root)] = std::sqrt(norm_sq);
+            residuals_converged = residuals_converged &&
+                resid_norm[static_cast<std::size_t>(root)] < residual_tol;
+            all_converged = all_converged &&
+                std::fabs(theta[static_cast<std::size_t>(root)] -
+                          previous_theta[static_cast<std::size_t>(root)]) < energy_tol &&
+                resid_norm[static_cast<std::size_t>(root)] < residual_tol;
         }
-        resid_norm = std::sqrt(resid_norm);
-        const bool energy_converged =
-            std::isfinite(previous_theta) && std::fabs(theta - previous_theta) < energy_tol;
-        if (energy_converged && resid_norm < residual_tol) {
+        if (all_converged || residuals_converged) {
+            converged = true;
             break;
         }
         previous_theta = theta;
 
-        for (std::size_t k = 0; k < n; ++k) {
-            double denom = theta - spin0_diag[k];
-            if (std::fabs(denom) <= 1e-12) {
-                denom = denom >= 0.0 ? 1e-12 : -1e-12;
+        int accepted = 0;
+        for (int root = 0; root < nroots; ++root) {
+            if (accepted >= capacity - nroots) {
+                break;
             }
-            corr[k] = resid[k] / denom;
-        }
-        project_out_subspace(V, n, m, corr, overlap);
-        double corr_norm = 0.0;
-        for (double value : corr) {
-            corr_norm += value * value;
-        }
-        corr_norm = std::sqrt(corr_norm);
-        if (corr_norm <= 1e-12) {
-            break;
-        }
-        for (double& value : corr) {
-            value /= corr_norm;
+            if (resid_norm[static_cast<std::size_t>(root)] < residual_tol) {
+                continue;
+            }
+            const std::size_t offset = static_cast<std::size_t>(root) * n;
+            for (std::size_t k = 0; k < n; ++k) {
+                double denominator = theta[static_cast<std::size_t>(root)] - spin0_diag[k];
+                if (std::fabs(denominator) <= 1e-12) {
+                    denominator = denominator >= 0.0 ? 1e-12 : -1e-12;
+                }
+                corr[k] = resid[offset + k] / denominator;
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                project_out_subspace(V, n, m, corr, overlap);
+                for (int previous = 0; previous < accepted; ++previous) {
+                    const double* prior = corrections.data() + static_cast<std::size_t>(previous) * n;
+                    double dot = 0.0;
+                    for (std::size_t k = 0; k < n; ++k) {
+                        dot += prior[k] * corr[k];
+                    }
+                    for (std::size_t k = 0; k < n; ++k) {
+                        corr[k] -= dot * prior[k];
+                    }
+                }
+            }
+            double norm_sq = 0.0;
+            for (double value : corr) {
+                norm_sq += value * value;
+            }
+            const double norm = std::sqrt(norm_sq);
+            if (norm <= 1e-12) {
+                continue;
+            }
+            double* target = corrections.data() + static_cast<std::size_t>(accepted) * n;
+            for (std::size_t k = 0; k < n; ++k) {
+                target[k] = corr[k] / norm;
+            }
+            ++accepted;
         }
 
-        if (m + 1 > capacity) {
-            int keep = std::min(m, 4);
-            keep = std::min(keep, std::max(1, capacity - 1));
+        if (accepted == 0) {
+            break;
+        }
+        if (m + accepted > capacity) {
+            int keep = std::min(m, thick_keep_target);
+            keep = std::min(keep, capacity - accepted);
             build_restart_block(V, n, m, keep, evecs, root_order, restart_coeff, restart_V);
             build_restart_block(AV, n, m, keep, evecs, root_order, restart_coeff, restart_AV);
-            std::copy(corr.begin(), corr.end(), restart_V.begin() + static_cast<std::size_t>(keep) * n);
-            if (!sigma_matvec(
-                    restart_V.data() + static_cast<std::size_t>(keep) * n,
-                    restart_AV.data() + static_cast<std::size_t>(keep) * n
-                )) {
-                return nullptr;
+            for (int col = 0; col < accepted; ++col) {
+                std::copy(
+                    corrections.begin() + static_cast<std::ptrdiff_t>(col) * static_cast<std::ptrdiff_t>(n),
+                    corrections.begin() + static_cast<std::ptrdiff_t>(col + 1) * static_cast<std::ptrdiff_t>(n),
+                    restart_V.begin() + static_cast<std::ptrdiff_t>(keep + col) * static_cast<std::ptrdiff_t>(n)
+                );
+                if (!sigma_matvec(
+                        restart_V.data() + static_cast<std::size_t>(keep + col) * n,
+                        restart_AV.data() + static_cast<std::size_t>(keep + col) * n
+                    )) {
+                    return nullptr;
+                }
             }
-            const std::size_t restart_size = static_cast<std::size_t>(keep + 1) * n;
+            const std::size_t restart_size = static_cast<std::size_t>(keep + accepted) * n;
             std::copy(restart_V.begin(), restart_V.begin() + static_cast<std::ptrdiff_t>(restart_size), V.begin());
             std::copy(restart_AV.begin(), restart_AV.begin() + static_cast<std::ptrdiff_t>(restart_size), AV.begin());
-            m = keep + 1;
+            m = keep + accepted;
         } else {
-            std::copy(corr.begin(), corr.end(), V.begin() + static_cast<std::size_t>(m) * n);
-            if (!sigma_matvec(V.data() + static_cast<std::size_t>(m) * n, AV.data() + static_cast<std::size_t>(m) * n)) {
-                return nullptr;
+            for (int col = 0; col < accepted; ++col) {
+                std::copy(
+                    corrections.begin() + static_cast<std::ptrdiff_t>(col) * static_cast<std::ptrdiff_t>(n),
+                    corrections.begin() + static_cast<std::ptrdiff_t>(col + 1) * static_cast<std::ptrdiff_t>(n),
+                    V.begin() + static_cast<std::ptrdiff_t>(m + col) * static_cast<std::ptrdiff_t>(n)
+                );
+                if (!sigma_matvec(
+                        V.data() + static_cast<std::size_t>(m + col) * n,
+                        AV.data() + static_cast<std::size_t>(m + col) * n
+                    )) {
+                    return nullptr;
+                }
             }
-            ++m;
+            m += accepted;
         }
     }
 
-    npy_intp energy_dims[1] = {1};
+    if (!converged) {
+        PyErr_SetString(PyExc_RuntimeError, "native spin0 Davidson did not converge within max_cycle iterations.");
+        return nullptr;
+    }
+
+    npy_intp energy_dims[1] = {nroots};
     PyObject* energies_obj = PyArray_SimpleNew(1, energy_dims, NPY_DOUBLE);
     if (energies_obj == nullptr) {
         return nullptr;
     }
-    *static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(energies_obj))) = theta;
+    std::memcpy(
+        PyArray_DATA(reinterpret_cast<PyArrayObject*>(energies_obj)),
+        theta.data(),
+        static_cast<std::size_t>(nroots) * sizeof(double)
+    );
 
-    npy_intp vec_dims[2] = {n_pair, 1};
-    PyObject* vecs_obj = PyArray_SimpleNew(2, vec_dims, NPY_DOUBLE);
+    npy_intp vec_dims[2] = {n_pair, nroots};
+    PyObject* vecs_obj = PyArray_EMPTY(2, vec_dims, NPY_DOUBLE, 1);
     if (vecs_obj == nullptr) {
         Py_DECREF(energies_obj);
         return nullptr;
     }
-    std::memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject*>(vecs_obj)), ritz.data(), n * sizeof(double));
+    std::memcpy(
+        PyArray_DATA(reinterpret_cast<PyArrayObject*>(vecs_obj)),
+        ritz.data(),
+        n * static_cast<std::size_t>(nroots) * sizeof(double)
+    );
     PyObject* result = PyTuple_New(2);
     if (result == nullptr) {
         Py_DECREF(energies_obj);
@@ -5168,6 +5763,326 @@ PyObject* scatter_opposite_spin_rdm2(PyObject*, PyObject* args) {
     Py_RETURN_NONE;
 }
 
+PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
+    if (PyTuple_Size(args) != 27) {
+        PyErr_SetString(
+            PyExc_TypeError,
+            "state_average_spin_rdms expects nmo, CI roots, weights, and four link groups."
+        );
+        return nullptr;
+    }
+    const long parsed_nmo = PyLong_AsLong(PyTuple_GET_ITEM(args, 0));
+    if (PyErr_Occurred()) {
+        return nullptr;
+    }
+    if (parsed_nmo <= 0) {
+        PyErr_SetString(PyExc_ValueError, "nmo must be positive.");
+        return nullptr;
+    }
+    const npy_intp nmo = static_cast<npy_intp>(parsed_nmo);
+    ArrayRef ci(PyTuple_GET_ITEM(args, 1), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef weights(PyTuple_GET_ITEM(args, 2), NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+
+    ArrayRef a1_p(PyTuple_GET_ITEM(args, 3), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a1_q(PyTuple_GET_ITEM(args, 4), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a1_bra(PyTuple_GET_ITEM(args, 5), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a1_ket(PyTuple_GET_ITEM(args, 6), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a1_phase(PyTuple_GET_ITEM(args, 7), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+
+    ArrayRef a2_p(PyTuple_GET_ITEM(args, 8), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a2_q(PyTuple_GET_ITEM(args, 9), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a2_r(PyTuple_GET_ITEM(args, 10), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a2_s(PyTuple_GET_ITEM(args, 11), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a2_bra(PyTuple_GET_ITEM(args, 12), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a2_ket(PyTuple_GET_ITEM(args, 13), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef a2_phase(PyTuple_GET_ITEM(args, 14), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+
+    ArrayRef b1_p(PyTuple_GET_ITEM(args, 15), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b1_q(PyTuple_GET_ITEM(args, 16), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b1_bra(PyTuple_GET_ITEM(args, 17), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b1_ket(PyTuple_GET_ITEM(args, 18), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b1_phase(PyTuple_GET_ITEM(args, 19), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+
+    ArrayRef b2_p(PyTuple_GET_ITEM(args, 20), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b2_q(PyTuple_GET_ITEM(args, 21), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b2_r(PyTuple_GET_ITEM(args, 22), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b2_s(PyTuple_GET_ITEM(args, 23), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b2_bra(PyTuple_GET_ITEM(args, 24), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b2_ket(PyTuple_GET_ITEM(args, 25), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+    ArrayRef b2_phase(PyTuple_GET_ITEM(args, 26), NPY_INTP, NPY_ARRAY_IN_ARRAY);
+
+    if (!ci || !weights ||
+        !a1_p || !a1_q || !a1_bra || !a1_ket || !a1_phase ||
+        !a2_p || !a2_q || !a2_r || !a2_s || !a2_bra || !a2_ket || !a2_phase ||
+        !b1_p || !b1_q || !b1_bra || !b1_ket || !b1_phase ||
+        !b2_p || !b2_q || !b2_r || !b2_s || !b2_bra || !b2_ket || !b2_phase) {
+        return nullptr;
+    }
+    auto validate_seven = [](PyArrayObject* a, PyArrayObject* b, PyArrayObject* c,
+                             PyArrayObject* d, PyArrayObject* e, PyArrayObject* f,
+                             PyArrayObject* g, const char* name) {
+        if (PyArray_NDIM(a) != 1 || PyArray_NDIM(b) != 1 ||
+            PyArray_NDIM(c) != 1 || PyArray_NDIM(d) != 1 ||
+            PyArray_NDIM(e) != 1 || PyArray_NDIM(f) != 1 ||
+            PyArray_NDIM(g) != 1) {
+            PyErr_Format(PyExc_ValueError, "%s link arrays must be 1D.", name);
+            return false;
+        }
+        const npy_intp size = PyArray_DIM(a, 0);
+        if (PyArray_DIM(b, 0) != size || PyArray_DIM(c, 0) != size ||
+            PyArray_DIM(d, 0) != size || PyArray_DIM(e, 0) != size ||
+            PyArray_DIM(f, 0) != size || PyArray_DIM(g, 0) != size) {
+            PyErr_Format(PyExc_ValueError, "%s link arrays must have matching lengths.", name);
+            return false;
+        }
+        return true;
+    };
+    if (
+        PyArray_NDIM(ci.obj) != 3 || PyArray_NDIM(weights.obj) != 1 ||
+        !validate_1d_same_length(
+            a1_p.obj, a1_q.obj, a1_bra.obj, a1_ket.obj, a1_phase.obj, "alpha one-body"
+        ) ||
+        !validate_seven(
+            a2_p.obj, a2_q.obj, a2_r.obj, a2_s.obj, a2_bra.obj, a2_ket.obj,
+            a2_phase.obj, "alpha two-body"
+        ) ||
+        !validate_1d_same_length(
+            b1_p.obj, b1_q.obj, b1_bra.obj, b1_ket.obj, b1_phase.obj, "beta one-body"
+        ) ||
+        !validate_seven(
+            b2_p.obj, b2_q.obj, b2_r.obj, b2_s.obj, b2_bra.obj, b2_ket.obj,
+            b2_phase.obj, "beta two-body"
+        )
+    ) {
+        return nullptr;
+    }
+
+    const npy_intp nroot = PyArray_DIM(ci.obj, 0);
+    const npy_intp nalpha = PyArray_DIM(ci.obj, 1);
+    const npy_intp nbeta = PyArray_DIM(ci.obj, 2);
+    if (nroot <= 0 || nalpha <= 0 || nbeta <= 0 || PyArray_DIM(weights.obj, 0) != nroot) {
+        PyErr_SetString(PyExc_ValueError, "CI roots and weights have inconsistent dimensions.");
+        return nullptr;
+    }
+    auto link_range_ok = [nmo](
+        const npy_intp* orbital_a,
+        const npy_intp* orbital_b,
+        const npy_intp* bra,
+        const npy_intp* ket,
+        npy_intp nlink,
+        npy_intp nstring
+    ) {
+        for (npy_intp link = 0; link < nlink; ++link) {
+            if (orbital_a[link] < 0 || orbital_a[link] >= nmo ||
+                orbital_b[link] < 0 || orbital_b[link] >= nmo ||
+                bra[link] < 0 || bra[link] >= nstring ||
+                ket[link] < 0 || ket[link] >= nstring) {
+                return false;
+            }
+        }
+        return true;
+    };
+    auto two_link_range_ok = [nmo](
+        const npy_intp* p,
+        const npy_intp* q,
+        const npy_intp* r,
+        const npy_intp* s,
+        const npy_intp* bra,
+        const npy_intp* ket,
+        npy_intp nlink,
+        npy_intp nstring
+    ) {
+        for (npy_intp link = 0; link < nlink; ++link) {
+            if (p[link] < 0 || p[link] >= nmo || q[link] < 0 || q[link] >= nmo ||
+                r[link] < 0 || r[link] >= nmo || s[link] < 0 || s[link] >= nmo ||
+                bra[link] < 0 || bra[link] >= nstring ||
+                ket[link] < 0 || ket[link] >= nstring) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const npy_intp na1 = PyArray_DIM(a1_p.obj, 0);
+    const npy_intp na2 = PyArray_DIM(a2_p.obj, 0);
+    const npy_intp nb1 = PyArray_DIM(b1_p.obj, 0);
+    const npy_intp nb2 = PyArray_DIM(b2_p.obj, 0);
+    const auto* a1p = static_cast<const npy_intp*>(PyArray_DATA(a1_p.obj));
+    const auto* a1q = static_cast<const npy_intp*>(PyArray_DATA(a1_q.obj));
+    const auto* a1bra = static_cast<const npy_intp*>(PyArray_DATA(a1_bra.obj));
+    const auto* a1ket = static_cast<const npy_intp*>(PyArray_DATA(a1_ket.obj));
+    const auto* a1phase = static_cast<const npy_intp*>(PyArray_DATA(a1_phase.obj));
+    const auto* a2p = static_cast<const npy_intp*>(PyArray_DATA(a2_p.obj));
+    const auto* a2q = static_cast<const npy_intp*>(PyArray_DATA(a2_q.obj));
+    const auto* a2r = static_cast<const npy_intp*>(PyArray_DATA(a2_r.obj));
+    const auto* a2s = static_cast<const npy_intp*>(PyArray_DATA(a2_s.obj));
+    const auto* a2bra = static_cast<const npy_intp*>(PyArray_DATA(a2_bra.obj));
+    const auto* a2ket = static_cast<const npy_intp*>(PyArray_DATA(a2_ket.obj));
+    const auto* a2phase = static_cast<const npy_intp*>(PyArray_DATA(a2_phase.obj));
+    const auto* b1p = static_cast<const npy_intp*>(PyArray_DATA(b1_p.obj));
+    const auto* b1q = static_cast<const npy_intp*>(PyArray_DATA(b1_q.obj));
+    const auto* b1bra = static_cast<const npy_intp*>(PyArray_DATA(b1_bra.obj));
+    const auto* b1ket = static_cast<const npy_intp*>(PyArray_DATA(b1_ket.obj));
+    const auto* b1phase = static_cast<const npy_intp*>(PyArray_DATA(b1_phase.obj));
+    const auto* b2p = static_cast<const npy_intp*>(PyArray_DATA(b2_p.obj));
+    const auto* b2q = static_cast<const npy_intp*>(PyArray_DATA(b2_q.obj));
+    const auto* b2r = static_cast<const npy_intp*>(PyArray_DATA(b2_r.obj));
+    const auto* b2s = static_cast<const npy_intp*>(PyArray_DATA(b2_s.obj));
+    const auto* b2bra = static_cast<const npy_intp*>(PyArray_DATA(b2_bra.obj));
+    const auto* b2ket = static_cast<const npy_intp*>(PyArray_DATA(b2_ket.obj));
+    const auto* b2phase = static_cast<const npy_intp*>(PyArray_DATA(b2_phase.obj));
+    if (
+        !link_range_ok(a1p, a1q, a1bra, a1ket, na1, nalpha) ||
+        !two_link_range_ok(a2p, a2q, a2r, a2s, a2bra, a2ket, na2, nalpha) ||
+        !link_range_ok(b1p, b1q, b1bra, b1ket, nb1, nbeta) ||
+        !two_link_range_ok(b2p, b2q, b2r, b2s, b2bra, b2ket, nb2, nbeta)
+    ) {
+        PyErr_SetString(PyExc_ValueError, "state-average RDM link index out of range.");
+        return nullptr;
+    }
+
+    npy_intp dm1_dims[2] = {nmo, nmo};
+    npy_intp dm2_dims[4] = {nmo, nmo, nmo, nmo};
+    PyObject* dm1_result = PyArray_ZEROS(2, dm1_dims, NPY_DOUBLE, 0);
+    PyObject* dm2_result = PyArray_ZEROS(4, dm2_dims, NPY_DOUBLE, 0);
+    if (dm1_result == nullptr || dm2_result == nullptr) {
+        Py_XDECREF(dm1_result);
+        Py_XDECREF(dm2_result);
+        return nullptr;
+    }
+    const double* coeff = static_cast<const double*>(PyArray_DATA(ci.obj));
+    const double* root_weights = static_cast<const double*>(PyArray_DATA(weights.obj));
+    double* d1 = static_cast<double*>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject*>(dm1_result))
+    );
+    double* d2 = static_cast<double*>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject*>(dm2_result))
+    );
+    const npy_intp ndet = nalpha * nbeta;
+    std::vector<double> alpha_overlap;
+    std::vector<double> beta_overlap;
+    std::vector<double> coeff_by_det;
+    std::vector<double> weighted_coeff_by_det;
+    try {
+        alpha_overlap.assign(static_cast<std::size_t>(nalpha * nalpha), 0.0);
+        beta_overlap.assign(static_cast<std::size_t>(nbeta * nbeta), 0.0);
+        coeff_by_det.resize(static_cast<std::size_t>(ndet * nroot));
+        weighted_coeff_by_det.resize(static_cast<std::size_t>(ndet * nroot));
+    } catch (...) {
+        Py_DECREF(dm1_result);
+        Py_DECREF(dm2_result);
+        return PyErr_NoMemory();
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+#ifdef PYQED_HAVE_CBLAS
+    constexpr int row_major = 101;
+    constexpr int no_trans = 111;
+    constexpr int trans = 112;
+    for (npy_intp root = 0; root < nroot; ++root) {
+        const double* croot = coeff + root * ndet;
+        const double beta = root == 0 ? 0.0 : 1.0;
+        cblas_dgemm(
+            row_major, no_trans, trans,
+            static_cast<int>(nalpha), static_cast<int>(nalpha), static_cast<int>(nbeta),
+            root_weights[root], croot, static_cast<int>(nbeta),
+            croot, static_cast<int>(nbeta), beta,
+            alpha_overlap.data(), static_cast<int>(nalpha)
+        );
+        cblas_dgemm(
+            row_major, trans, no_trans,
+            static_cast<int>(nbeta), static_cast<int>(nbeta), static_cast<int>(nalpha),
+            root_weights[root], croot, static_cast<int>(nbeta),
+            croot, static_cast<int>(nbeta), beta,
+            beta_overlap.data(), static_cast<int>(nbeta)
+        );
+    }
+#else
+    for (npy_intp root = 0; root < nroot; ++root) {
+        const double* croot = coeff + root * ndet;
+        const double weight = root_weights[root];
+        for (npy_intp bra = 0; bra < nalpha; ++bra) {
+            for (npy_intp ket = 0; ket < nalpha; ++ket) {
+                double value = 0.0;
+                for (npy_intp beta = 0; beta < nbeta; ++beta) {
+                    value += croot[bra * nbeta + beta] * croot[ket * nbeta + beta];
+                }
+                alpha_overlap[bra * nalpha + ket] += weight * value;
+            }
+        }
+        for (npy_intp bra = 0; bra < nbeta; ++bra) {
+            for (npy_intp ket = 0; ket < nbeta; ++ket) {
+                double value = 0.0;
+                for (npy_intp alpha = 0; alpha < nalpha; ++alpha) {
+                    value += croot[alpha * nbeta + bra] * croot[alpha * nbeta + ket];
+                }
+                beta_overlap[bra * nbeta + ket] += weight * value;
+            }
+        }
+    }
+#endif
+    for (npy_intp det = 0; det < ndet; ++det) {
+        double* plain_row = coeff_by_det.data() + det * nroot;
+        double* weighted_row = weighted_coeff_by_det.data() + det * nroot;
+        for (npy_intp root = 0; root < nroot; ++root) {
+            const double value = coeff[root * ndet + det];
+            plain_row[root] = value;
+            weighted_row[root] = root_weights[root] * value;
+        }
+    }
+
+    for (npy_intp link = 0; link < na1; ++link) {
+        d1[idx2(nmo, a1p[link], a1q[link])] +=
+            static_cast<double>(a1phase[link]) *
+            alpha_overlap[a1bra[link] * nalpha + a1ket[link]];
+    }
+    for (npy_intp link = 0; link < nb1; ++link) {
+        d1[idx2(nmo, b1p[link], b1q[link])] +=
+            static_cast<double>(b1phase[link]) *
+            beta_overlap[b1bra[link] * nbeta + b1ket[link]];
+    }
+    for (npy_intp link = 0; link < na2; ++link) {
+        d2[idx4(nmo, a2p[link], a2q[link], a2r[link], a2s[link])] +=
+            static_cast<double>(a2phase[link]) *
+            alpha_overlap[a2bra[link] * nalpha + a2ket[link]];
+    }
+    for (npy_intp link = 0; link < nb2; ++link) {
+        d2[idx4(nmo, b2p[link], b2q[link], b2r[link], b2s[link])] +=
+            static_cast<double>(b2phase[link]) *
+            beta_overlap[b2bra[link] * nbeta + b2ket[link]];
+    }
+
+    for (npy_intp la = 0; la < na1; ++la) {
+        const npy_intp bra_alpha = a1bra[la];
+        const npy_intp ket_alpha = a1ket[la];
+        const double alpha_phase = static_cast<double>(a1phase[la]);
+        for (npy_intp lb = 0; lb < nb1; ++lb) {
+            const npy_intp bra_det = bra_alpha * nbeta + b1bra[lb];
+            const npy_intp ket_det = ket_alpha * nbeta + b1ket[lb];
+            const double* bra_coeff = weighted_coeff_by_det.data() + bra_det * nroot;
+            const double* ket_coeff = coeff_by_det.data() + ket_det * nroot;
+            double value = 0.0;
+            for (npy_intp root = 0; root < nroot; ++root) {
+                value += bra_coeff[root] * ket_coeff[root];
+            }
+            value *= alpha_phase * static_cast<double>(b1phase[lb]);
+            d2[idx4(nmo, a1p[la], a1q[la], b1p[lb], b1q[lb])] += value;
+            d2[idx4(nmo, b1p[lb], b1q[lb], a1p[la], a1q[la])] += value;
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    PyObject* result = PyTuple_New(2);
+    if (result == nullptr) {
+        Py_DECREF(dm1_result);
+        Py_DECREF(dm2_result);
+        return nullptr;
+    }
+    PyTuple_SET_ITEM(result, 0, dm1_result);
+    PyTuple_SET_ITEM(result, 1, dm2_result);
+    return result;
+}
+
 struct SpinFreeLink {
     npy_intp bra;
     npy_intp ket;
@@ -5273,6 +6188,518 @@ int caspt2_external_class_id(
         return 7;  // Sr
     }
     return -1;
+}
+
+struct CASPT2Words {
+    std::uint64_t word[3];
+};
+
+inline int caspt2_word_popcount(const CASPT2Words& bits) {
+    return __builtin_popcountll(bits.word[0]) +
+           __builtin_popcountll(bits.word[1]) +
+           __builtin_popcountll(bits.word[2]);
+}
+
+inline bool caspt2_word_test(const CASPT2Words& bits, int index) {
+    return (bits.word[index / 64] >> static_cast<unsigned>(index % 64)) & 1ULL;
+}
+
+inline int caspt2_word_phase_below(const CASPT2Words& bits, int index) {
+    int count = 0;
+    const int target_word = index / 64;
+    for (int word = 0; word < target_word; ++word) {
+        count += __builtin_popcountll(bits.word[word]);
+    }
+    const int offset = index % 64;
+    if (offset) {
+        count += __builtin_popcountll(
+            bits.word[target_word] & ((1ULL << static_cast<unsigned>(offset)) - 1ULL)
+        );
+    }
+    return (count & 1) ? -1 : 1;
+}
+
+inline int caspt2_word_annihilate(CASPT2Words& bits, int index) {
+    if (!caspt2_word_test(bits, index)) {
+        return 0;
+    }
+    const int phase = caspt2_word_phase_below(bits, index);
+    bits.word[index / 64] &= ~(1ULL << static_cast<unsigned>(index % 64));
+    return phase;
+}
+
+inline int caspt2_word_create(CASPT2Words& bits, int index) {
+    if (caspt2_word_test(bits, index)) {
+        return 0;
+    }
+    const int phase = caspt2_word_phase_below(bits, index);
+    bits.word[index / 64] |= 1ULL << static_cast<unsigned>(index % 64);
+    return phase;
+}
+
+inline bool caspt2_words_equal(const CASPT2Words& left, const CASPT2Words& right) {
+    return left.word[0] == right.word[0] &&
+           left.word[1] == right.word[1] &&
+           left.word[2] == right.word[2];
+}
+
+struct CASPT2WordsHash {
+    std::size_t operator()(const CASPT2Words& bits) const noexcept {
+        std::size_t value = static_cast<std::size_t>(bits.word[0]);
+        value ^= static_cast<std::size_t>(bits.word[1]) +
+                 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
+        value ^= static_cast<std::size_t>(bits.word[2]) +
+                 0x9e3779b97f4a7c15ULL + (value << 6) + (value >> 2);
+        return value;
+    }
+};
+
+struct CASPT2WordsEqual {
+    bool operator()(const CASPT2Words& left, const CASPT2Words& right) const noexcept {
+        return caspt2_words_equal(left, right);
+    }
+};
+
+double caspt2_connected_element_words(
+    const CASPT2Words& bra,
+    const CASPT2Words& ket,
+    const double* h1,
+    const double* eri,
+    const double* factors,
+    int naux,
+    int nmo,
+    std::unordered_map<std::uint64_t, double>* factor_cache
+) {
+    CASPT2Words holes{};
+    CASPT2Words particles{};
+    CASPT2Words common{};
+    for (int word = 0; word < 3; ++word) {
+        holes.word[word] = ket.word[word] & ~bra.word[word];
+        particles.word[word] = bra.word[word] & ~ket.word[word];
+        common.word[word] = bra.word[word] & ket.word[word];
+    }
+    const int rank = caspt2_word_popcount(holes);
+    if (rank < 1 || rank > 2 || caspt2_word_popcount(particles) != rank) {
+        return 0.0;
+    }
+
+    int hole_indices[2] = {-1, -1};
+    int particle_indices[2] = {-1, -1};
+    int nholes = 0;
+    int nparticles = 0;
+    for (int word = 0; word < 3; ++word) {
+        std::uint64_t hole_word = holes.word[word];
+        while (hole_word) {
+            hole_indices[nholes++] = 64 * word + __builtin_ctzll(hole_word);
+            hole_word &= hole_word - 1;
+        }
+        std::uint64_t particle_word = particles.word[word];
+        while (particle_word) {
+            particle_indices[nparticles++] =
+                64 * word + __builtin_ctzll(particle_word);
+            particle_word &= particle_word - 1;
+        }
+    }
+    double value = 0.0;
+    if (rank == 1) {
+        const int q = hole_indices[0];
+        const int p = particle_indices[0];
+        CASPT2Words bits = ket;
+        const int phase1 = caspt2_word_annihilate(bits, q);
+        const int phase2 = caspt2_word_create(bits, p);
+        if (phase1 && phase2 && caspt2_words_equal(bits, bra) && p / nmo == q / nmo) {
+            value += static_cast<double>(phase1 * phase2) * h1[(p % nmo) * nmo + (q % nmo)];
+        }
+    }
+
+    auto accumulate_pair = [&](int q, int s, int missing0, int missing1) {
+        CASPT2Words bits2 = ket;
+        const int phase1 = caspt2_word_annihilate(bits2, q);
+        const int phase2 = caspt2_word_annihilate(bits2, s);
+        if (!phase1 || !phase2) {
+            return;
+        }
+        const int missing[2] = {missing0, missing1};
+        for (int order = 0; order < 2; ++order) {
+            const int p = missing[order];
+            const int r = missing[1 - order];
+            if (p / nmo != q / nmo || r / nmo != s / nmo) {
+                continue;
+            }
+            CASPT2Words bits4 = bits2;
+            const int phase3 = caspt2_word_create(bits4, r);
+            const int phase4 = caspt2_word_create(bits4, p);
+            if (!phase3 || !phase4 || !caspt2_words_equal(bits4, bra)) {
+                continue;
+            }
+            const int pp = p % nmo;
+            const int qq = q % nmo;
+            const int rr = r % nmo;
+            const int ss = s % nmo;
+            double integral = 0.0;
+            if (eri) {
+                const npy_intp index =
+                    ((pp * nmo + qq) * nmo + rr) * nmo + ss;
+                integral = eri[index];
+            } else {
+                const npy_intp pq = std::min(pp, qq) * nmo + std::max(pp, qq);
+                const npy_intp rs = std::min(rr, ss) * nmo + std::max(rr, ss);
+                const npy_intp stride = static_cast<npy_intp>(nmo) * nmo;
+                const npy_intp left = std::min(pq, rs);
+                const npy_intp right = std::max(pq, rs);
+                const std::uint64_t key =
+                    static_cast<std::uint64_t>(left) * stride + right;
+                auto cached = factor_cache->find(key);
+                if (cached != factor_cache->end()) {
+                    integral = cached->second;
+                } else {
+                    for (int auxiliary = 0; auxiliary < naux; ++auxiliary) {
+                        const double* factor = factors + auxiliary * stride;
+                        integral += factor[pq] * factor[rs];
+                    }
+                    factor_cache->emplace(key, integral);
+                }
+            }
+            value += 0.5 * static_cast<double>(phase1 * phase2 * phase3 * phase4) * integral;
+        }
+    };
+
+    if (rank == 1) {
+        const int q = hole_indices[0];
+        const int p = particle_indices[0];
+        for (int word = 0; word < 3; ++word) {
+            std::uint64_t common_word = common.word[word];
+            while (common_word) {
+                const int s = 64 * word + __builtin_ctzll(common_word);
+                accumulate_pair(q, s, p, s);
+                accumulate_pair(s, q, p, s);
+                common_word &= common_word - 1;
+            }
+        }
+    } else {
+        accumulate_pair(
+            hole_indices[0],
+            hole_indices[1],
+            particle_indices[0],
+            particle_indices[1]
+        );
+        accumulate_pair(
+            hole_indices[1],
+            hole_indices[0],
+            particle_indices[0],
+            particle_indices[1]
+        );
+    }
+    return value;
+}
+
+PyObject* caspt2_direct_couplings_words(PyObject*, PyObject* args) {
+    PyObject* rows_obj = nullptr;
+    PyObject* refs_obj = nullptr;
+    PyObject* ci_obj = nullptr;
+    PyObject* h1_obj = nullptr;
+    PyObject* eri_obj = nullptr;
+    PyObject* offsets_obj = Py_None;
+    PyObject* indices_obj = Py_None;
+    PyObject* groups_obj = Py_None;
+    Py_ssize_t nmo_arg = 0;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOOOOn|OOO",
+            &rows_obj,
+            &refs_obj,
+            &ci_obj,
+            &h1_obj,
+            &eri_obj,
+            &nmo_arg,
+            &offsets_obj,
+            &indices_obj,
+            &groups_obj)) {
+        return nullptr;
+    }
+    ArrayRef rows(rows_obj, NPY_UINT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef refs(refs_obj, NPY_UINT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef ci(ci_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef h1(h1_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef eri(eri_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!rows || !refs || !ci || !h1 || !eri) {
+        return nullptr;
+    }
+    if (PyArray_NDIM(rows.obj) != 2 || PyArray_DIM(rows.obj, 1) != 3 ||
+        PyArray_NDIM(refs.obj) != 2 || PyArray_DIM(refs.obj, 1) != 3) {
+        PyErr_SetString(PyExc_ValueError, "CASPT2 word determinants must have shape (n, 3).");
+        return nullptr;
+    }
+    const npy_intp nrows = PyArray_DIM(rows.obj, 0);
+    const npy_intp nrefs = PyArray_DIM(refs.obj, 0);
+    if (PyArray_NDIM(ci.obj) != 1 || PyArray_DIM(ci.obj, 0) != nrefs) {
+        PyErr_SetString(PyExc_ValueError, "CASPT2 reference coefficients have the wrong shape.");
+        return nullptr;
+    }
+    npy_intp output_dim[1] = {nrows};
+    PyObject* output_obj = PyArray_SimpleNew(1, output_dim, NPY_DOUBLE);
+    if (!output_obj) {
+        return nullptr;
+    }
+    const auto* row_data = static_cast<const std::uint64_t*>(PyArray_DATA(rows.obj));
+    const auto* ref_data = static_cast<const std::uint64_t*>(PyArray_DATA(refs.obj));
+    const auto* ci_data = static_cast<const double*>(PyArray_DATA(ci.obj));
+    const auto* h1_data = static_cast<const double*>(PyArray_DATA(h1.obj));
+    const auto* integral_data = static_cast<const double*>(PyArray_DATA(eri.obj));
+    const bool factorized = PyArray_NDIM(eri.obj) == 3;
+    if (!factorized && PyArray_NDIM(eri.obj) != 4) {
+        Py_DECREF(output_obj);
+        PyErr_SetString(PyExc_ValueError, "CASPT2 integrals must be a four-index tensor or three-index pair factors.");
+        return nullptr;
+    }
+    const int naux = factorized ? static_cast<int>(PyArray_DIM(eri.obj, 0)) : 0;
+    const double* eri_data = factorized ? nullptr : integral_data;
+    const double* factor_data = factorized ? integral_data : nullptr;
+    auto* output = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(output_obj)));
+    const int nmo = static_cast<int>(nmo_arg);
+    PyArrayObject* offsets_array = nullptr;
+    PyArrayObject* indices_array = nullptr;
+    PyArrayObject* groups_array = nullptr;
+    if (offsets_obj != Py_None || indices_obj != Py_None || groups_obj != Py_None) {
+        if (offsets_obj == Py_None || indices_obj == Py_None) {
+            Py_DECREF(output_obj);
+            PyErr_SetString(PyExc_ValueError, "CASPT2 candidate offsets and indices must be supplied together.");
+            return nullptr;
+        }
+        offsets_array = reinterpret_cast<PyArrayObject*>(
+            PyArray_FROM_OTF(offsets_obj, NPY_INTP, NPY_ARRAY_IN_ARRAY)
+        );
+        indices_array = reinterpret_cast<PyArrayObject*>(
+            PyArray_FROM_OTF(indices_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY)
+        );
+        if (groups_obj != Py_None) {
+            groups_array = reinterpret_cast<PyArrayObject*>(
+                PyArray_FROM_OTF(groups_obj, NPY_INT32, NPY_ARRAY_IN_ARRAY)
+            );
+        }
+        if (!offsets_array || !indices_array ||
+            PyArray_NDIM(offsets_array) != 1 ||
+            PyArray_NDIM(indices_array) != 1 ||
+            (groups_obj != Py_None &&
+             (!groups_array || PyArray_NDIM(groups_array) != 1 ||
+              PyArray_DIM(groups_array, 0) != nrows)) ||
+            (groups_obj == Py_None && PyArray_DIM(offsets_array, 0) != nrows + 1)) {
+            Py_XDECREF(offsets_array);
+            Py_XDECREF(indices_array);
+            Py_XDECREF(groups_array);
+            Py_DECREF(output_obj);
+            PyErr_SetString(PyExc_ValueError, "CASPT2 candidate CSR arrays have inconsistent shapes.");
+            return nullptr;
+        }
+        const auto* offsets = static_cast<const npy_intp*>(PyArray_DATA(offsets_array));
+        const auto* indices = static_cast<const std::int32_t*>(PyArray_DATA(indices_array));
+        const npy_intp ncandidates = PyArray_DIM(indices_array, 0);
+        const npy_intp ngroups = PyArray_DIM(offsets_array, 0) - 1;
+        if (ngroups < 0 || offsets[0] != 0 || offsets[ngroups] != ncandidates) {
+            Py_DECREF(offsets_array);
+            Py_DECREF(indices_array);
+            Py_XDECREF(groups_array);
+            Py_DECREF(output_obj);
+            PyErr_SetString(PyExc_ValueError, "CASPT2 candidate CSR offsets do not span the index array.");
+            return nullptr;
+        }
+        for (npy_intp group = 0; group < ngroups; ++group) {
+            if (offsets[group] > offsets[group + 1]) {
+                Py_DECREF(offsets_array);
+                Py_DECREF(indices_array);
+                Py_XDECREF(groups_array);
+                Py_DECREF(output_obj);
+                PyErr_SetString(PyExc_ValueError, "CASPT2 candidate CSR offsets must be monotone.");
+                return nullptr;
+            }
+        }
+        if (groups_array) {
+            const auto* groups = static_cast<const std::int32_t*>(PyArray_DATA(groups_array));
+            for (npy_intp row = 0; row < nrows; ++row) {
+                if (groups[row] < 0 || groups[row] >= ngroups) {
+                    Py_DECREF(offsets_array);
+                    Py_DECREF(indices_array);
+                    Py_DECREF(groups_array);
+                    Py_DECREF(output_obj);
+                    PyErr_SetString(PyExc_ValueError, "CASPT2 candidate group index is out of range.");
+                    return nullptr;
+                }
+            }
+        }
+        for (npy_intp candidate = 0; candidate < ncandidates; ++candidate) {
+            if (indices[candidate] < 0 || indices[candidate] >= nrefs) {
+                Py_DECREF(offsets_array);
+                Py_DECREF(indices_array);
+                Py_XDECREF(groups_array);
+                Py_DECREF(output_obj);
+                PyErr_SetString(PyExc_ValueError, "CASPT2 candidate reference index is out of range.");
+                return nullptr;
+            }
+        }
+    }
+    const auto* offsets_data = offsets_array
+        ? static_cast<const npy_intp*>(PyArray_DATA(offsets_array))
+        : nullptr;
+    const auto* indices_data = indices_array
+        ? static_cast<const std::int32_t*>(PyArray_DATA(indices_array))
+        : nullptr;
+    const auto* groups_data = groups_array
+        ? static_cast<const std::int32_t*>(PyArray_DATA(groups_array))
+        : nullptr;
+
+    Py_BEGIN_ALLOW_THREADS
+    #ifdef _OPENMP
+    #pragma omp parallel
+    #endif
+    {
+    std::unordered_map<std::uint64_t, double> factor_cache;
+    if (factorized) {
+        factor_cache.reserve(4096);
+    }
+    #ifdef _OPENMP
+    #pragma omp for schedule(dynamic, 32)
+    #endif
+    for (npy_intp row = 0; row < nrows; ++row) {
+        CASPT2Words bra{{row_data[3 * row], row_data[3 * row + 1], row_data[3 * row + 2]}};
+        double coupling = 0.0;
+        const npy_intp group = groups_data ? groups_data[row] : row;
+        const npy_intp candidate_start = offsets_data ? offsets_data[group] : 0;
+        const npy_intp candidate_stop = offsets_data ? offsets_data[group + 1] : nrefs;
+        for (npy_intp candidate = candidate_start; candidate < candidate_stop; ++candidate) {
+            const npy_intp ref = indices_data ? indices_data[candidate] : candidate;
+            if (ci_data[ref] == 0.0) {
+                continue;
+            }
+            CASPT2Words ket{{ref_data[3 * ref], ref_data[3 * ref + 1], ref_data[3 * ref + 2]}};
+            coupling += ci_data[ref] * caspt2_connected_element_words(
+                bra,
+                ket,
+                h1_data,
+                eri_data,
+                factor_data,
+                naux,
+                nmo,
+                &factor_cache
+            );
+        }
+        output[row] = coupling;
+    }
+    }
+    Py_END_ALLOW_THREADS
+    Py_XDECREF(offsets_array);
+    Py_XDECREF(indices_array);
+    Py_XDECREF(groups_array);
+    return output_obj;
+}
+
+PyObject* caspt2_direct_fock_words(PyObject*, PyObject* args) {
+    PyObject* rows_obj = nullptr;
+    PyObject* fock_obj = nullptr;
+    Py_ssize_t ncore_arg = 0;
+    Py_ssize_t ncas_arg = 0;
+    Py_ssize_t nmo_arg = 0;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOnnn",
+            &rows_obj,
+            &fock_obj,
+            &ncore_arg,
+            &ncas_arg,
+            &nmo_arg)) {
+        return nullptr;
+    }
+    ArrayRef rows(rows_obj, NPY_UINT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef fock(fock_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!rows || !fock) {
+        return nullptr;
+    }
+    const npy_intp nrows = PyArray_DIM(rows.obj, 0);
+    const int ncore = static_cast<int>(ncore_arg);
+    const int ncas = static_cast<int>(ncas_arg);
+    const int nmo = static_cast<int>(nmo_arg);
+    if (PyArray_NDIM(rows.obj) != 2 || PyArray_DIM(rows.obj, 1) != 3 ||
+        PyArray_NDIM(fock.obj) != 2 || PyArray_DIM(fock.obj, 0) != nmo ||
+        PyArray_DIM(fock.obj, 1) != nmo || ncore < 0 || ncas < 0 ||
+        ncore + ncas > nmo || 2 * nmo > 192) {
+        PyErr_SetString(PyExc_ValueError, "Invalid direct CASPT2 Fock arguments.");
+        return nullptr;
+    }
+    npy_intp dimensions[2] = {nrows, nrows};
+    PyObject* output_obj = PyArray_ZEROS(2, dimensions, NPY_DOUBLE, 0);
+    if (!output_obj) {
+        return nullptr;
+    }
+    const auto* row_data = static_cast<const std::uint64_t*>(PyArray_DATA(rows.obj));
+    const auto* fock_data = static_cast<const double*>(PyArray_DATA(fock.obj));
+    auto* output = static_cast<double*>(
+        PyArray_DATA(reinterpret_cast<PyArrayObject*>(output_obj))
+    );
+    std::unordered_map<CASPT2Words, npy_intp, CASPT2WordsHash, CASPT2WordsEqual> index;
+    index.reserve(static_cast<std::size_t>(nrows));
+    for (npy_intp row = 0; row < nrows; ++row) {
+        index.emplace(
+            CASPT2Words{{row_data[3 * row], row_data[3 * row + 1], row_data[3 * row + 2]}},
+            row
+        );
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    for (npy_intp ket_index = 0; ket_index < nrows; ++ket_index) {
+        const CASPT2Words ket{{
+            row_data[3 * ket_index],
+            row_data[3 * ket_index + 1],
+            row_data[3 * ket_index + 2]
+        }};
+        double diagonal = 0.0;
+        for (int word = 0; word < 3; ++word) {
+            std::uint64_t occupied = ket.word[word];
+            while (occupied) {
+                const int spinorb = 64 * word + __builtin_ctzll(occupied);
+                if (spinorb < 2 * nmo) {
+                    diagonal += fock_data[(spinorb % nmo) * nmo + spinorb % nmo];
+                }
+                occupied &= occupied - 1;
+            }
+        }
+        output[ket_index * nrows + ket_index] = diagonal;
+        for (int spin = 0; spin < 2; ++spin) {
+            const int offset = spin * nmo;
+            for (int q = ncore; q < ncore + ncas; ++q) {
+                CASPT2Words bits1 = ket;
+                const int phase1 = caspt2_word_annihilate(bits1, offset + q);
+                if (!phase1) {
+                    continue;
+                }
+                for (int p = ncore; p < ncore + ncas; ++p) {
+                    if (p == q || fock_data[p * nmo + q] == 0.0) {
+                        continue;
+                    }
+                    CASPT2Words bra = bits1;
+                    const int phase2 = caspt2_word_create(bra, offset + p);
+                    if (!phase2) {
+                        continue;
+                    }
+                    const auto found = index.find(bra);
+                    if (found != index.end()) {
+                        output[found->second * nrows + ket_index] +=
+                            static_cast<double>(phase1 * phase2) *
+                            fock_data[p * nmo + q];
+                    }
+                }
+            }
+        }
+    }
+    for (npy_intp row = 0; row < nrows; ++row) {
+        for (npy_intp column = row + 1; column < nrows; ++column) {
+            const double value = 0.5 * (
+                output[row * nrows + column] + output[column * nrows + row]
+            );
+            output[row * nrows + column] = value;
+            output[column * nrows + row] = value;
+        }
+    }
+    Py_END_ALLOW_THREADS
+    return output_obj;
 }
 
 PyObject* caspt2_external_space(PyObject*, PyObject* args) {
@@ -5423,6 +6850,127 @@ PyObject* caspt2_external_space(PyObject*, PyObject* args) {
     PyTuple_SET_ITEM(result, 0, det_obj);
     PyTuple_SET_ITEM(result, 1, rank_obj);
     PyTuple_SET_ITEM(result, 2, class_obj);
+    return result;
+}
+
+PyObject* caspt2_one_body_coo(PyObject*, PyObject* args) {
+    PyObject* determinants_obj = nullptr;
+    PyObject* matrix_a_obj = nullptr;
+    PyObject* matrix_b_obj = nullptr;
+    if (!PyArg_ParseTuple(
+            args,
+            "OOO",
+            &determinants_obj,
+            &matrix_a_obj,
+            &matrix_b_obj
+        )) {
+        return nullptr;
+    }
+
+    ArrayRef determinants(determinants_obj, NPY_UINT64, NPY_ARRAY_IN_ARRAY);
+    ArrayRef matrix_a(matrix_a_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef matrix_b(matrix_b_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    if (!determinants || !matrix_a || !matrix_b) {
+        return nullptr;
+    }
+    if (
+        PyArray_NDIM(determinants.obj) != 1 ||
+        PyArray_NDIM(matrix_a.obj) != 2 ||
+        PyArray_NDIM(matrix_b.obj) != 2
+    ) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "caspt2_one_body_coo expects determinants(n), matrix_a(nmo,nmo), and matrix_b(nmo,nmo)."
+        );
+        return nullptr;
+    }
+    const npy_intp size = PyArray_DIM(determinants.obj, 0);
+    const npy_intp nmo = PyArray_DIM(matrix_a.obj, 0);
+    if (
+        nmo <= 0 || 2 * nmo >= 63 ||
+        PyArray_DIM(matrix_a.obj, 1) != nmo ||
+        PyArray_DIM(matrix_b.obj, 0) != nmo ||
+        PyArray_DIM(matrix_b.obj, 1) != nmo ||
+        size > static_cast<npy_intp>(std::numeric_limits<npy_int32>::max())
+    ) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "caspt2_one_body_coo received inconsistent dimensions or an unsupported determinant encoding."
+        );
+        return nullptr;
+    }
+
+    const auto* det_data = static_cast<const std::uint64_t*>(PyArray_DATA(determinants.obj));
+    const auto* matrix_a_data = static_cast<const double*>(PyArray_DATA(matrix_a.obj));
+    const auto* matrix_b_data = static_cast<const double*>(PyArray_DATA(matrix_b.obj));
+    std::unordered_map<std::uint64_t, npy_int32> index;
+    index.reserve(static_cast<std::size_t>(size) * 2 + 1);
+    for (npy_intp idx = 0; idx < size; ++idx) {
+        index.emplace(det_data[idx], static_cast<npy_int32>(idx));
+    }
+
+    std::vector<npy_int32> rows;
+    std::vector<npy_int32> columns;
+    std::vector<double> values;
+    const std::size_t reserve = static_cast<std::size_t>(size) * 32;
+    rows.reserve(reserve);
+    columns.reserve(reserve);
+    values.reserve(reserve);
+
+    Py_BEGIN_ALLOW_THREADS
+    for (npy_intp ket_idx = 0; ket_idx < size; ++ket_idx) {
+        const std::uint64_t det = det_data[ket_idx];
+        std::uint64_t occupied = det;
+        while (occupied != 0ULL) {
+            const npy_intp q_spinorb = single_bit_index(occupied);
+            occupied &= occupied - 1ULL;
+            const npy_intp spin = q_spinorb / nmo;
+            const npy_intp q = q_spinorb % nmo;
+            const double* matrix = spin == 0 ? matrix_a_data : matrix_b_data;
+            std::uint64_t removed = 0ULL;
+            int phase1 = 0;
+            if (!annihilate_bit(det, q_spinorb, removed, phase1)) {
+                continue;
+            }
+            for (npy_intp p = 0; p < nmo; ++p) {
+                const double value = matrix[idx2(nmo, p, q)];
+                if (value == 0.0) {
+                    continue;
+                }
+                std::uint64_t bra = 0ULL;
+                int phase2 = 0;
+                if (!create_bit(removed, spin * nmo + p, bra, phase2)) {
+                    continue;
+                }
+                const auto found = index.find(bra);
+                if (found == index.end()) {
+                    continue;
+                }
+                rows.push_back(found->second);
+                columns.push_back(static_cast<npy_int32>(ket_idx));
+                values.push_back(static_cast<double>(phase1 * phase2) * value);
+            }
+        }
+    }
+    Py_END_ALLOW_THREADS
+
+    PyObject* result = PyTuple_New(3);
+    if (result == nullptr) {
+        return nullptr;
+    }
+    PyObject* row_obj = vector_to_int32_array(rows);
+    PyObject* column_obj = vector_to_int32_array(columns);
+    PyObject* value_obj = vector_to_double_array(values);
+    if (row_obj == nullptr || column_obj == nullptr || value_obj == nullptr) {
+        Py_XDECREF(row_obj);
+        Py_XDECREF(column_obj);
+        Py_XDECREF(value_obj);
+        Py_DECREF(result);
+        return nullptr;
+    }
+    PyTuple_SET_ITEM(result, 0, row_obj);
+    PyTuple_SET_ITEM(result, 1, column_obj);
+    PyTuple_SET_ITEM(result, 2, value_obj);
     return result;
 }
 
@@ -7420,12 +8968,16 @@ PyObject* native_capabilities(PyObject*, PyObject*) {
     const char* blas_provider = "none";
 #endif
     return Py_BuildValue(
-        "{s:O,s:s,s:O,s:O,s:i}",
+        "{s:O,s:s,s:O,s:O,s:O,s:O,s:O,s:O,s:i}",
         "cblas", have_cblas ? Py_True : Py_False,
         "blas_provider", blas_provider,
         "rhf_davidson", have_cblas ? Py_True : Py_False,
         "rhf_multiroot", have_cblas ? Py_True : Py_False,
-        "spin0_native_max_roots", 1
+        "spin0_multiroot", Py_True,
+        "spin0_initial_guess", Py_True,
+        "factor_hessian_workspace", have_cblas ? Py_True : Py_False,
+        "state_average_rdms", Py_True,
+        "spin0_native_max_roots", std::numeric_limits<int>::max()
     );
 }
 
@@ -7434,16 +8986,22 @@ PyMethodDef methods[] = {
     {"native_capabilities", native_capabilities, METH_NOARGS, "Return compiled native CAS capability metadata."},
     {"ci_hamiltonian", ci_hamiltonian, METH_VARARGS, "Build the dense Slater-Condon CI Hamiltonian."},
     {"orbital_hessian_action_from_integrals", orbital_hessian_action_from_integrals, METH_VARARGS, "Apply the dense orbital Hessian action without materializing derivative ERIs."},
+    {"create_factor_hessian_workspace", create_factor_hessian_workspace, METH_VARARGS, "Create a persistent native factorized orbital-Hessian workspace."},
+    {"apply_factor_hessian_workspace", apply_factor_hessian_workspace, METH_VARARGS, "Apply a native factorized orbital-Hessian workspace to one or more rotations."},
     {"scatter_opposite_spin_rdm2", scatter_opposite_spin_rdm2, METH_VARARGS, "Accumulate opposite-spin spin-string RDM2 contractions in place."},
+    {"state_average_spin_rdms", state_average_spin_rdms, METH_VARARGS, "Build weighted multiroot spin-traced active-space 1- and 2-RDMs."},
     {"sigma_compact_spin_string", sigma_compact_spin_string, METH_VARARGS, "Apply the RHF spin-string compact direct-CI sigma kernel."},
     {"sigma_compact_spin0_pair", sigma_compact_spin0_pair, METH_VARARGS, "Apply the spin-adapted pair-space RHF direct-CI sigma kernel."},
     {"create_spin0_pair_workspace", create_spin0_pair_workspace, METH_VARARGS, "Create a persistent packed-BLAS restricted direct-CI workspace."},
     {"apply_spin0_pair_workspace_det", apply_spin0_pair_workspace_det, METH_VARARGS, "Apply a packed-BLAS workspace to a determinant-space CI vector."},
-    {"davidson_spin0_pair", davidson_spin0_pair, METH_VARARGS, "Solve one-root spin0-pair direct CI with a native Davidson loop."},
+    {"davidson_spin0_pair", davidson_spin0_pair, METH_VARARGS, "Solve low spin0-pair direct-CI roots with a native block Davidson loop."},
     {"davidson_rhf_workspace", davidson_rhf_workspace, METH_VARARGS, "Solve low restricted direct-CI roots in a persistent packed-BLAS workspace."},
     {"sigma_values_conn", sigma_values_conn, METH_VARARGS, "Apply precomputed connection-value direct-CI sigma to one or more CI vectors."},
     {"caspt2_external_space", caspt2_external_space, METH_VARARGS, "Generate and classify the experimental CASPT2 external determinant space."},
+    {"caspt2_direct_couplings_words", caspt2_direct_couplings_words, METH_VARARGS, "Build direct CASPT2 couplings for three-word determinants."},
+    {"caspt2_direct_fock_words", caspt2_direct_fock_words, METH_VARARGS, "Build a direct CASPT2 local Fock block for three-word determinants."},
     {"caspt2_external_kernel", caspt2_external_kernel, METH_VARARGS, "Evaluate experimental CASPT2 external determinant couplings and diagonal denominators."},
+    {"caspt2_one_body_coo", caspt2_one_body_coo, METH_VARARGS, "Build COO entries for a CASPT2 determinant-space one-body operator."},
     {"caspt2_strong_contract", caspt2_strong_contract, METH_VARARGS, "Reduce CASPT2 determinant couplings into strongly contracted class energies."},
     {"caspt2_en_coupled_contract", caspt2_en_coupled_contract, METH_VARARGS, "Build the coupled strong-contracted EN CASPT2 metric and denominator matrix."},
     {"caspt2_solve_contracted", caspt2_solve_contracted, METH_VARARGS, "Solve a dense real-shifted contracted CASPT2 linear system."},

@@ -1,14 +1,17 @@
 """
 Convenience re-exports for :mod:`pyqed.mps`.
 
-This package contains both legacy MPS/DMRG code and newer symmetry-adapted
-non-Abelian prototypes.  Some of the legacy modules depend on optional heavy
+The root namespace exposes the dense :class:`MPS` and :class:`MPO`.  Reduced
+non-Abelian owners use the explicit names :class:`NonabelianMPS` and
+:class:`NonabelianMPO`.  Some modules depend on optional heavy
 dependencies (notably SciPy).  To make ``import pyqed.mps.nonabelian`` usable in
 minimal environments (and in CI jobs that only exercise SU(2) code), we guard
 those imports here.
 """
 
 from __future__ import annotations
+
+from pyqed.lattice import Leg, Site  # noqa: F401
 
 # Lightweight symmetry utilities are safe to export.
 from .su2 import (  # noqa: F401
@@ -49,9 +52,9 @@ from .cmps import (  # noqa: F401
 # Non-Abelian prototype exports (kept available even without SciPy).
 from .nonabelian import (  # noqa: F401
     NonabelianTensor,
-    PhysicalLeg,
     SiteOperator,
-    MPO,
+    MPS as NonabelianMPS,
+    MPO as NonabelianMPO,
     AutoMPO,
     identity_operator,
     compose_site_operators,
@@ -125,10 +128,26 @@ from .nonabelian import (  # noqa: F401
     Driver,
 )
 
-# Legacy exports: available only when optional deps exist.
+# Dense finite-chain exports: available only when optional deps exist.
 try:  # pragma: no cover
-    from .mps import *  # noqa: F401,F403
-    from .mpo import sop_to_mpo  # noqa: F401
+    from .mps import (  # noqa: F401
+        MPS,
+        MPO,
+        SpinHalfFermionOperators,
+        apply_mpo,
+        compress_symmetric_mps,
+        compress_symmetric_mpo,
+        dense_to_symmetric,
+        dense_to_symmetric_mpo,
+        expmpo,
+        fDMRG_1site_GS_OBC,
+        fock_state,
+        gaussian_state,
+        symmetric_mpo_to_dense,
+        symmetric_to_dense,
+        two_site_dmrg,
+    )
+    from .mpo import nearest_neighbor_mpo, sop_to_mpo  # noqa: F401
     from .dmrg import (  # noqa: F401
         DMRG,
         dmrg_matvec_options,
@@ -147,8 +166,7 @@ try:  # pragma: no cover
 except (ModuleNotFoundError, ImportError, OSError, TimeoutError):
     pass
 
-# Keep the public uniform-MPS name pinned to the NumPy-only implementation even
-# when legacy wildcard exports are available.
+# Keep the public uniform-MPS name pinned to the NumPy-only implementation.
 from .umps import UniformCanonicalForm, UniformMPS, UMPS  # noqa: F401,E402
 from .idmrg import (  # noqa: F401,E402
     InfiniteDMRG,

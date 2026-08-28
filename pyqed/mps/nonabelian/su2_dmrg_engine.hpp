@@ -153,6 +153,14 @@ public:
     std::size_t stored_integral_elements() const noexcept;
     std::size_t stored_family_terms() const noexcept;
     std::size_t memory_bytes() const noexcept;
+    void update_h1(const double* h1, std::size_t n_values);
+    void update_integrals(
+        const double* h1,
+        std::size_t n_h1_values,
+        const double* eri,
+        std::size_t n_eri_values,
+        double ecore
+    );
     void family_partition_counts(
         std::int32_t family_id,
         bool left,
@@ -251,6 +259,20 @@ struct PackedSiteTensor {
 
 struct BoundaryBufferHandle {
     std::shared_ptr<std::vector<double>> values;
+};
+
+struct ComplexPackedArena {
+    std::shared_ptr<std::vector<Complex>> owned_values;
+    std::vector<std::int64_t> offsets;
+    std::vector<std::int64_t> labels;
+    std::vector<std::int64_t> shape_offsets;
+    std::vector<std::int64_t> shapes;
+    std::uint64_t topology_revision = 0;
+    std::uint64_t numeric_revision = 0;
+};
+
+struct ComplexBoundaryBufferHandle {
+    std::shared_ptr<std::vector<Complex>> values;
 };
 
 struct NormalComplementaryBoundaryRoute {
@@ -363,6 +385,15 @@ std::size_t boundary_buffer_size(
     const BoundaryBufferHandle* handle
 ) noexcept;
 void release_boundary_buffer(BoundaryBufferHandle* handle) noexcept;
+const Complex* complex_boundary_buffer_data(
+    const ComplexBoundaryBufferHandle* handle
+) noexcept;
+std::size_t complex_boundary_buffer_size(
+    const ComplexBoundaryBufferHandle* handle
+) noexcept;
+void release_complex_boundary_buffer(
+    ComplexBoundaryBufferHandle* handle
+) noexcept;
 
 struct LocalBlock {
     const Complex* values = nullptr;
@@ -713,8 +744,10 @@ struct ContextualBoundaryDecomposition {
     std::int64_t cols = 0;
     std::int64_t rank = 0;
     bool zero = false;
+    bool pivot_basis = false;
     std::size_t component_offset = 0;
     std::size_t matrix_offset = 0;
+    std::size_t pivot_offset = 0;
 };
 
 struct ContextualDecompositionWorkspace {
@@ -722,6 +755,7 @@ struct ContextualDecompositionWorkspace {
     std::vector<std::uint8_t> ready;
     std::vector<double> component_values;
     std::vector<double> matrix_values;
+    std::vector<std::uint16_t> pivot_components;
     std::vector<double> square_scratch;
     std::vector<double> residual_scratch;
 
@@ -731,6 +765,7 @@ struct ContextualDecompositionWorkspace {
         std::fill(ready.begin(), ready.end(), std::uint8_t{0});
         component_values.clear();
         matrix_values.clear();
+        pivot_components.clear();
     }
 
     ContextualBoundaryDecomposition* cached(
@@ -762,6 +797,7 @@ struct ContextualDecompositionWorkspace {
         std::fill(ready.begin(), ready.end(), std::uint8_t{0});
         component_values.clear();
         matrix_values.clear();
+        pivot_components.clear();
     }
 
     void release() noexcept {
@@ -769,6 +805,7 @@ struct ContextualDecompositionWorkspace {
         std::vector<std::uint8_t>().swap(ready);
         std::vector<double>().swap(component_values);
         std::vector<double>().swap(matrix_values);
+        std::vector<std::uint16_t>().swap(pivot_components);
         std::vector<double>().swap(square_scratch);
         std::vector<double>().swap(residual_scratch);
     }
@@ -821,11 +858,25 @@ struct ContextualDecomposedScaleRecipe {
 static_assert(sizeof(ContextualDecomposedScaleRecipe) == 8);
 
 using ContextualActionFragmentKey = std::array<std::int64_t, 22>;
+using ContextualRouteSkeletonKey = std::array<std::int64_t, 16>;
 using ContextualCompactBoundaryIdentity = std::array<std::int32_t, 5>;
 
 struct ContextualActionFragmentKeyHash {
     std::size_t operator()(
         const ContextualActionFragmentKey& key
+    ) const noexcept {
+        std::size_t result = 1469598103934665603ULL;
+        for (const std::int64_t value : key) {
+            result ^= std::hash<std::int64_t>{}(value);
+            result *= 1099511628211ULL;
+        }
+        return result;
+    }
+};
+
+struct ContextualRouteSkeletonKeyHash {
+    std::size_t operator()(
+        const ContextualRouteSkeletonKey& key
     ) const noexcept {
         std::size_t result = 1469598103934665603ULL;
         for (const std::int64_t value : key) {
@@ -891,6 +942,7 @@ struct ContextualDecomposedActionPlan {
     std::vector<std::uint16_t> right_pivot_components;
     std::vector<ContextualDecomposedScaleRecipe> scale_recipes;
     std::vector<double> scale_cores;
+    std::vector<double> invariant_scales;
     std::array<std::uint64_t, 6> family_counts{};
     std::uint64_t unlabeled_count = 0;
     bool ready = false;
@@ -907,7 +959,9 @@ struct ContextualDecomposedActionPlan {
             ) * sizeof(std::uint16_t) +
             scale_recipes.capacity()
                 * sizeof(ContextualDecomposedScaleRecipe) +
-            scale_cores.capacity() * sizeof(double);
+            (
+                scale_cores.capacity() + invariant_scales.capacity()
+            ) * sizeof(double);
     }
 };
 
@@ -1531,6 +1585,23 @@ struct OwnedSplitSiteExport {
     std::uint64_t numeric_revision = 0;
 };
 
+struct SpatialNPDMResult {
+    std::vector<double> rdm1;
+    std::vector<double> rdm2;
+    double norm = 0.0;
+    std::size_t max_reduced_bond_dimension = 0;
+    std::size_t max_component_bond_dimension = 0;
+    std::size_t max_operator_channels = 0;
+    std::int32_t max_operator_two_j = 0;
+    std::uint64_t string_contractions = 0;
+    bool spin_rotation_reduction = false;
+    bool magnetic_component_expansion = false;
+    double setup_seconds = 0.0;
+    double environment_seconds = 0.0;
+    double rdm1_seconds = 0.0;
+    double rdm2_seconds = 0.0;
+};
+
 using HalfSweepBondExecutor = bool (*)(
     void* context,
     std::int64_t bond
@@ -1624,6 +1695,50 @@ public:
         bool accumulate_output = false,
         bool finalize_update = true,
         const NormalComplementaryBoundaryAction* compiled_action = nullptr
+    );
+    bool advance_boundary_complex(
+        const std::string& side,
+        std::int64_t parent_bond,
+        std::int64_t child_bond,
+        bool left,
+        const std::int64_t* routes,
+        std::size_t n_routes,
+        const Complex* bra_values,
+        std::size_t n_bra_values,
+        const std::int64_t* bra_offsets,
+        std::size_t n_bra_offsets,
+        const std::int64_t* bra_shape_offsets,
+        std::size_t n_bra_shape_offsets,
+        const std::int64_t* bra_shapes,
+        std::size_t n_bra_shapes,
+        const Complex* ket_values,
+        std::size_t n_ket_values,
+        const std::int64_t* ket_offsets,
+        std::size_t n_ket_offsets,
+        const std::int64_t* ket_shape_offsets,
+        std::size_t n_ket_shape_offsets,
+        const std::int64_t* ket_shapes,
+        std::size_t n_ket_shapes,
+        const Complex* mpo_values,
+        std::size_t n_mpo_values,
+        const std::int64_t* mpo_offsets,
+        std::size_t n_mpo_offsets,
+        const std::int64_t* mpo_shape_offsets,
+        std::size_t n_mpo_shape_offsets,
+        const std::int64_t* mpo_shapes,
+        std::size_t n_mpo_shapes,
+        const std::int64_t* output_offsets,
+        std::size_t n_output_offsets,
+        const std::int64_t* output_shape_offsets,
+        std::size_t n_output_shape_offsets,
+        const std::int64_t* output_shapes,
+        std::size_t n_output_shapes,
+        const std::int64_t* output_labels,
+        std::size_t n_output_labels,
+        std::uint64_t topology_revision,
+        std::uint64_t numeric_revision,
+        const double* route_coefficients,
+        bool metric_boundary
     );
     bool advance_normal_complementary_boundary(
         const std::string& side,
@@ -1781,6 +1896,7 @@ public:
         bool left,
         bool dual_right_basis
     ) const;
+    void refresh_normal_complementary_numerics();
     std::size_t boundary_value_count(
         const std::string& side,
         std::int64_t bond
@@ -1808,6 +1924,11 @@ public:
     BoundaryBufferHandle* retain_metric_boundary_buffer(
         const std::string& side,
         std::int64_t bond
+    ) const;
+    ComplexBoundaryBufferHandle* retain_complex_boundary_buffer(
+        const std::string& side,
+        std::int64_t bond,
+        bool metric_boundary
     ) const;
 
     bool install_local_operator(
@@ -2293,6 +2414,10 @@ public:
         bool accept_unconverged
     );
     std::vector<OwnedSplitSiteExport> export_owned_split_sites() const;
+    SpatialNPDMResult spatial_npdm(bool spin_rotation_reduction) const;
+    SpatialNPDMResult spatial_npdm_component_reference(
+        bool spin_rotation_reduction
+    ) const;
     void release_workspaces();
     std::size_t execute_half_sweep(
         HalfSweepBondExecutor executor,
@@ -2382,6 +2507,9 @@ public:
     std::size_t contextual_core_cache_bytes() const noexcept;
     std::uint64_t contextual_core_cache_hits() const noexcept;
     std::uint64_t contextual_core_reuse_hits() const noexcept;
+    std::size_t contextual_route_skeleton_count() const noexcept;
+    std::size_t contextual_route_skeleton_bytes() const noexcept;
+    std::uint64_t contextual_route_skeleton_hits() const noexcept;
     double contextual_route_match_seconds() const noexcept;
     double contextual_route_activation_seconds() const noexcept;
     double contextual_core_build_seconds() const noexcept;
@@ -2504,6 +2632,8 @@ public:
     double reduced_contextual_fallback_boundary_norm() const noexcept;
     double reduced_contextual_build_seconds() const noexcept;
     double reduced_contextual_numeric_refresh_seconds() const noexcept;
+    double reduced_contextual_boundary_refresh_seconds() const noexcept;
+    double reduced_contextual_scale_refresh_seconds() const noexcept;
     double reduced_contextual_execution_refresh_seconds() const noexcept;
     double reduced_contextual_diagonal_seconds() const noexcept;
     double reduced_contextual_matvec_seconds() const noexcept;
@@ -3014,6 +3144,9 @@ private:
     const System* system_ = nullptr;
     std::unordered_map<std::string, PackedArena> boundaries_;
     std::unordered_map<std::string, PackedArena> metric_boundaries_;
+    std::unordered_map<std::string, ComplexPackedArena> complex_boundaries_;
+    std::unordered_map<std::string, ComplexPackedArena>
+        complex_metric_boundaries_;
     std::unordered_map<std::int64_t, PackedArena> split_sites_;
     std::vector<std::vector<double>> state_average_center_values_;
     std::vector<double> state_average_weights_;
@@ -3132,9 +3265,9 @@ private:
     std::size_t contextual_action_fragment_bytes_ = 0;
     std::uint64_t contextual_action_fragment_hits_ = 0;
     std::unordered_map<
-        ContextualActionFragmentKey,
+        ContextualRouteSkeletonKey,
         ContextualRouteSkeleton,
-        ContextualActionFragmentKeyHash
+        ContextualRouteSkeletonKeyHash
     > contextual_route_skeletons_;
     std::size_t contextual_route_skeleton_bytes_ = 0;
     std::uint64_t contextual_route_skeleton_hits_ = 0;
@@ -3166,7 +3299,6 @@ private:
     ContextualDecompositionWorkspace right_decomposition_workspace_;
     std::vector<ComplementaryLocalAction> complementary_local_actions_;
     std::vector<ComplementaryLocalTerm> complementary_local_terms_;
-    std::vector<double> refreshed_complementary_scales_;
     std::vector<double> complementary_panel_scratch_;
     std::vector<double> reduced_contextual_diagonal_;
     std::uint64_t reduced_contextual_fallbacks_ = 0;
@@ -3179,6 +3311,8 @@ private:
     std::int64_t peak_reduced_contextual_boundary_rank_ = 0;
     double reduced_contextual_build_seconds_ = 0.0;
     double reduced_contextual_numeric_refresh_seconds_ = 0.0;
+    double reduced_contextual_boundary_refresh_seconds_ = 0.0;
+    double reduced_contextual_scale_refresh_seconds_ = 0.0;
     double reduced_contextual_execution_refresh_seconds_ = 0.0;
     double reduced_contextual_diagonal_seconds_ = 0.0;
     double reduced_contextual_matvec_seconds_ = 0.0;

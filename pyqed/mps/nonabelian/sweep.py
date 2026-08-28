@@ -292,7 +292,7 @@ def _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors):
         MPO,
         IrreducibleMPO,
         RankCoupledMPO,
-        PhysicalLeg,
+        Leg,
         as_rank_coupled_mpo,
     )
 
@@ -302,7 +302,7 @@ def _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors):
             phys_leg = factor.phys_out_leg
         else:
             physical_slices = _tensor_dense_layout(site)["sector_slices"][1]
-            phys_leg = PhysicalLeg.from_slices(physical_slices)
+            phys_leg = Leg.from_slices(physical_slices)
         identity = MPO.from_site_operator(identity_operator(phys_leg))
         if (site.metadata or {}).get("physical_basis") == "fully_reduced_su2":
             identity = as_rank_coupled_mpo(identity)
@@ -330,8 +330,10 @@ class MovingEnvironment:
         complementary_operator_families=None,
         materialize_complementary_family_operator_tables=True,
         su2_moving_environment=None,
+        su2_boundary_environment=None,
         renormalized_operator_cache_max_size=256,
     ):
+        self.mpo_factors = tuple(mpo_factors)
         self.hamiltonian_stack = RenormalizedBlockStack(
             namespace="hamiltonian",
             complementary_operator_families=complementary_operator_families,
@@ -339,11 +341,13 @@ class MovingEnvironment:
                 materialize_complementary_family_operator_tables
             ),
             su2_moving_environment=su2_moving_environment,
+            su2_boundary_environment=su2_boundary_environment,
         )
         self.su2_moving_environment = su2_moving_environment
         self.norm_stack = RenormalizedBlockStack(
             namespace="norm",
             su2_moving_environment=su2_moving_environment,
+            su2_boundary_environment=su2_boundary_environment,
         )
         self.target_stack = (
             RenormalizedBlockStack(namespace="target")
@@ -357,10 +361,13 @@ class MovingEnvironment:
         self.renormalized_operator_cache = RenormalizedOperatorStack(
             max_size=renormalized_operator_cache_max_size,
         )
-        self.valid_boundary_side = None
+        self.hamiltonian_valid_boundary_side = None
+        self.norm_valid_boundary_side = None
         self.environment_rebuilds = 0
         self.boundary_side_reuses = 0
         self.boundary_side_rebuilds = 0
+        self.norm_boundary_side_reuses = 0
+        self.hamiltonian_numeric_refreshes = 0
         self.completed_sweeps = 0
         self.last_reused_prebuilt_side = None
         self.cursor_calls = 0
@@ -392,23 +399,52 @@ class MovingEnvironment:
         Return the valid prebuilt side to reuse for the requested sweep.
         """
 
+        hamiltonian_side, norm_side = self.reuse_sides_for(direction)
+        return hamiltonian_side if hamiltonian_side == norm_side else None
+
+    def reuse_sides_for(self, direction):
+        """Return independently reusable Hamiltonian and norm boundary sides."""
+
         needed = self.needed_prebuilt_side(direction)
-        if self.valid_boundary_side == needed:
+        hamiltonian_side = None
+        norm_side = None
+        if self.hamiltonian_valid_boundary_side == needed:
             self.boundary_side_reuses += 1
             self.last_reused_prebuilt_side = needed
-            return needed
-        self.environment_rebuilds += 1
-        self.boundary_side_rebuilds += 1
-        self.last_reused_prebuilt_side = None
-        return None
+            hamiltonian_side = needed
+        else:
+            self.environment_rebuilds += 1
+            self.boundary_side_rebuilds += 1
+            self.last_reused_prebuilt_side = None
+        if self.norm_valid_boundary_side == needed:
+            self.norm_boundary_side_reuses += 1
+            norm_side = needed
+        return hamiltonian_side, norm_side
 
     def finish_sweep(self, direction):
         """
         Mark the side advanced by a completed sweep as reusable.
         """
 
-        self.valid_boundary_side = self.produced_boundary_side(direction)
+        produced = self.produced_boundary_side(direction)
+        self.hamiltonian_valid_boundary_side = produced
+        self.norm_valid_boundary_side = produced
         self.completed_sweeps += 1
+
+    def refresh_hamiltonian(self):
+        """Invalidate field-dependent numerics while retaining norm boundaries."""
+
+        self.hamiltonian_stack.entries.clear()
+        complementary = self.hamiltonian_stack.complementary_operator_stack
+        if complementary is not None:
+            complementary.entries.clear()
+        self.renormalized_operator_cache.entries.clear()
+        operator_engine = self.hamiltonian_stack.su2_operator_engine
+        if operator_engine is not None:
+            operator_engine.release_numeric()
+        self.hamiltonian_valid_boundary_side = None
+        self.hamiltonian_numeric_refreshes += 1
+        return self
 
     def begin_half_sweep(self, direction, n_sites, sites=None):
         """Start one C++ moving-environment accounting interval."""
@@ -658,11 +694,22 @@ class MovingEnvironment:
         comp_stats = h_stats.get("complementary_operator_stack") or {}
         return {
             "completed_sweeps": int(self.completed_sweeps),
-            "valid_boundary_side": self.valid_boundary_side,
+            "valid_boundary_side": (
+                self.hamiltonian_valid_boundary_side
+                if self.hamiltonian_valid_boundary_side
+                == self.norm_valid_boundary_side
+                else None
+            ),
+            "hamiltonian_valid_boundary_side": self.hamiltonian_valid_boundary_side,
+            "norm_valid_boundary_side": self.norm_valid_boundary_side,
             "last_reused_prebuilt_side": self.last_reused_prebuilt_side,
             "environment_rebuilds": int(self.environment_rebuilds),
             "boundary_side_reuses": int(self.boundary_side_reuses),
             "boundary_side_rebuilds": int(self.boundary_side_rebuilds),
+            "norm_boundary_side_reuses": int(self.norm_boundary_side_reuses),
+            "hamiltonian_numeric_refreshes": int(
+                self.hamiltonian_numeric_refreshes
+            ),
             "cursor_backend": (
                 "su2_moving_environment"
                 if self.su2_moving_environment is not None
@@ -683,6 +730,11 @@ class MovingEnvironment:
                 if self.su2_moving_environment is None
                 else self.su2_moving_environment.stats
             ),
+            "su2_boundary_environment": (
+                None
+                if self.hamiltonian_stack.su2_boundary_environment is None
+                else self.hamiltonian_stack.su2_boundary_environment.stats
+            ),
         }
 
 
@@ -692,6 +744,8 @@ def sweep_once(
     direction="lr",
     solver=None,
     local_operator=None,
+    local_solver=None,
+    post_split=None,
     mpo_factors=None,
     root_target_mpo_factors=None,
     local_solver_kwargs=None,
@@ -721,6 +775,8 @@ def sweep_once(
     complementary_operator_families=None,
     identity_mpo_factors=None,
     reuse_prebuilt_boundary_side=None,
+    reuse_prebuilt_norm_boundary_side=None,
+    input_is_canonical=False,
     require_block_sparse_renormalized_operator_table=False,
     require_symbolic_renormalized_operators=False,
     bond_cursor=None,
@@ -843,6 +899,10 @@ def sweep_once(
         raise ValueError("sweep_once expects a sequence of rank-3 NonabelianTensor site tensors.")
     if solver is not None and local_operator is not None:
         raise ValueError("Specify only one of solver or local_operator for sweep_once.")
+    if local_solver is not None and mpo_factors is None and local_operator is None:
+        raise ValueError("local_solver requires mpo_factors or local_operator.")
+    if post_split is not None and local_solver is None:
+        raise ValueError("post_split requires local_solver.")
     if solver is not None and mpo_factors is not None:
         raise ValueError("Specify mpo_factors only when using the built-in local-operator path.")
     if local_operator is not None and mpo_factors is not None:
@@ -853,6 +913,8 @@ def sweep_once(
         raise ValueError("root_target_mpo_factors must match the number of site tensors.")
 
     direction = _normalize_direction(direction)
+    if reuse_prebuilt_norm_boundary_side is None:
+        reuse_prebuilt_norm_boundary_side = reuse_prebuilt_boundary_side
     absorb = "right" if direction == "lr" else "left"
     expected_bonds = tuple(
         range(len(sites) - 1)
@@ -915,7 +977,7 @@ def sweep_once(
         else [site.copy() for site in sites]
     )
     if mpo_factors is not None and not cpp_state_already_owned:
-        if reuse_prebuilt_boundary_side is None:
+        if reuse_prebuilt_boundary_side is None and not input_is_canonical:
             canonical_center = min(1, len(updated_sites) - 1) if direction == "lr" else max(0, len(updated_sites) - 2)
             updated_sites = mixed_canonicalize_sites(
                 updated_sites,
@@ -1042,6 +1104,8 @@ def sweep_once(
         lifecycle_owner is not None
         and solver is None
         and local_operator is None
+        and local_solver is None
+        and post_split is None
         and mpo_factors is not None
         and root_sites is None
         and root_target_mpo_factors is None
@@ -1318,7 +1382,7 @@ def sweep_once(
                 identity_mpo_factors,
                 renormalized_blocks=norm_renormalized_block_stack,
                 sweep_direction=direction,
-                reuse_prebuilt_boundary_side=reuse_prebuilt_boundary_side,
+                reuse_prebuilt_boundary_side=reuse_prebuilt_norm_boundary_side,
             ).start_sweep(direction)
             if profile:
                 timing["environment_build_norm"] += time.perf_counter() - sub_t0
@@ -1692,6 +1756,54 @@ def sweep_once(
                     merged_root_target_operator,
                 )
 
+        bond_local_solver = None
+        if local_solver is not None:
+            def bond_local_solver(
+                merged,
+                operator_spec,
+                *,
+                norm_operator=None,
+                canonical_norm=False,
+                profile=False,
+                bond=bond,
+                direction=direction,
+                local_solver=local_solver,
+                **kwargs,
+            ):
+                return local_solver(
+                    bond,
+                    direction,
+                    merged,
+                    operator_spec,
+                    norm_operator=norm_operator,
+                    canonical_norm=canonical_norm,
+                    profile=profile,
+                    **kwargs,
+                )
+
+        bond_post_split = None
+        if post_split is not None:
+            def bond_post_split(
+                left,
+                right,
+                operator_spec,
+                *,
+                norm_operator=None,
+                canonical_norm=False,
+                bond=bond,
+                direction=direction,
+                post_split=post_split,
+            ):
+                return post_split(
+                    bond,
+                    direction,
+                    left,
+                    right,
+                    operator_spec,
+                    norm_operator=norm_operator,
+                    canonical_norm=canonical_norm,
+                )
+
         t0 = time.perf_counter() if profile else None
         if (
             use_root_environment_path
@@ -1720,6 +1832,8 @@ def sweep_once(
                 merged_two_site=merged_two_site,
                 solver=merged_solver,
                 local_operator=merged_local_operator,
+                local_solver=bond_local_solver,
+                post_split=bond_post_split,
                 local_solver_kwargs=bond_local_solver_kwargs,
                 bond_coupling=bond_coupling,
                 max_bond=max_bond,
