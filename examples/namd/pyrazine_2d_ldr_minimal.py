@@ -2,9 +2,9 @@
 """Self-contained ab initio 2D pyrazine CASCI -> overlap-LDR dynamics.
 
 CASCI(4e,4o)/STO-3G energies and wavefunction overlaps are evaluated at every
-DVR point. An RHF Hessian supplies the normal modes nearest the standard
-pyrazine 6a tuning (597 cm^-1) and 10a coupling (952 cm^-1) coordinates. The
-3x3 grid is a smoke test, not a converged dynamics calculation.
+DVR point. Two bundled modes from the native RHF/STO-3G Hessian avoid repeating
+that expensive fixed calculation. The 3x3 grid is a smoke test, not a
+converged dynamics calculation.
 """
 
 import matplotlib.pyplot as plt
@@ -12,6 +12,7 @@ import numpy as np
 
 from pyqed.dvr import DVR, SineDVR
 from pyqed.ldr import LDR
+from pyqed.models.pyrazine_abinitio import pyrazine_sto3g_rhf_modes
 from pyqed.qchem import Molecule
 from pyqed.units import au2fs
 
@@ -33,9 +34,7 @@ H  0.000000 -3.897929  2.197070
 mol = Molecule(GEOMETRY, unit="bohr", basis="sto-3g")
 mol.build(eri="dense")
 mf = mol.RHF().run()
-hessian = mf.Hessian()
-hessian.run(workers=6)
-omega, modes = hessian.normal_modes((597.0, 952.0), dimensionless=True)
+omega, modes = pyrazine_sto3g_rhf_modes()
 mc = mol.casci(4, 4, nstates=6, mf=mf).run(nstates=6)
 
 axes = [SineDVR(-2.5, 2.5, 3, mass=1 / w) for w in omega]
