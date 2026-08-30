@@ -901,15 +901,18 @@ class RankCoupledMPO:
         compare=False,
         repr=False,
     )
+    normal_complementary_force_contextual_routes: bool = field(
+        default=False,
+        compare=False,
+        repr=False,
+    )
     _reduced_block_cache: dict[tuple[Sector, Sector], dict[tuple[int, int], np.ndarray]] = field(
         default_factory=dict,
         init=False,
         repr=False,
         compare=False,
     )
-    _environment_reduced_block_cache: dict[
-        tuple[Sector, ...], dict[tuple[int, int], np.ndarray]
-    ] = field(
+    _environment_reduced_block_cache: dict[tuple, dict] = field(
         default_factory=dict,
         init=False,
         repr=False,

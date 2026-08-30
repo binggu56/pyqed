@@ -35,7 +35,8 @@ from pyqed.mps.nonabelian.environment import (
     AdjacentPairTransitionPlan,
     BlockSparseEnvironmentChain,
     LocalTransitionPlan,
-    _environment_reduced_rank_coupled_block,
+    _left_reduced_rank_coupled_block,
+    _right_reduced_rank_coupled_block,
     _factorize_left_two_site_dense_term,
     _factorize_right_two_site_dense_term,
     contract_chain_expectation,
@@ -54,7 +55,9 @@ from pyqed.mps.nonabelian.states import (
     build_random_reduced_spatial_mps,
     spatial_target_sector,
 )
-from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
+from pyqed.mps.nonabelian.sweep import (
+    _identity_mpo_factors_for_sites_and_mpo,
+)
 from pyqed.mps.nonabelian.tensor import NonabelianTensor
 from pyqed.tn.effective_operator import resolve_workers
 
@@ -453,6 +456,13 @@ class NonAbelianFrontierLETTA:
 
     ``D`` counts reduced multiplets per reachable virtual sector, not the
     magnetic-state dimension.
+
+    The reduced-tensor layer follows the Wigner--Eckart/non-Abelian tensor
+    network formulation of A. Weichselbaum, Phys. Rev. B 86, 245124 (2012),
+    https://doi.org/10.1103/PhysRevB.86.245124. This is a PyQED adaptation to
+    the project-specific LETTA graph-tied ansatz, not a reproduction of that
+    paper's MPS/NRG algorithms. It currently supports fully reduced
+    spatial-orbital SU(2) states and scalar rank-coupled Hamiltonians.
     """
 
     def __init__(
@@ -491,9 +501,9 @@ class NonAbelianFrontierLETTA:
                 for factor in factors
             )
         ):
-            # Production SU(2)-DMRG keeps only the compact C++ NC owner.  LETTA
+            # Production SU(2)-DMRG keeps only the compact C++ NC owner. LETTA
             # also needs arbitrary bra/ket transition elements, so request the
-            # exact explicit reduced carrier without changing the DMRG object.
+            # exact integral-backed reduced carrier without changing DMRG.
             materializer = getattr(mpo, "materialize_transition_factors", None)
             if materializer is None:
                 raise TypeError(
@@ -501,8 +511,20 @@ class NonAbelianFrontierLETTA:
                     "materialize_transition_factors() method for LETTA."
                 )
             factors = tuple(materializer())
+            for factor in factors:
+                object.__setattr__(
+                    factor,
+                    "normal_complementary_force_contextual_routes",
+                    True,
+                )
             materialized_transition_view = True
         self._native_hamiltonian_owner = native_owner
+        self._su2_moving_environment = (
+            getattr(mpo, "moving_environment", None) or native_owner
+        )
+        self._complementary_operators = getattr(
+            mpo, "complementary_operators", None
+        )
         self._materialized_transition_view = materialized_transition_view
         self.mpo = tuple(factors)
         self._component_mpo = None
@@ -665,7 +687,12 @@ class NonAbelianFrontierLETTA:
 
         duplicate = type(self).__new__(type(self))
         memo[id(self)] = duplicate
-        shared = {"hamiltonian", "_native_hamiltonian_owner"}
+        shared = {
+            "hamiltonian",
+            "_native_hamiltonian_owner",
+            "_su2_moving_environment",
+            "_complementary_operators",
+        }
         for name, value in self.__dict__.items():
             if name == "_solver_executor":
                 continue
@@ -843,6 +870,216 @@ class NonAbelianFrontierLETTA:
     @property
     def max_frontier_width(self):
         return max(len(frontier) for frontier in self.frontiers)
+
+    @property
+    def supports_conditional_canonical_gauge(self):
+        """Whether every internal frontier is one nearest-neighbor condition."""
+        return bool(
+            self.tie == "physical"
+            and all(
+                self.parent_sets[bond] == (bond + 1,)
+                and self.frontiers[bond + 1] == (bond + 1,)
+                for bond in range(self.nsites - 1)
+            )
+        )
+
+    @staticmethod
+    def _conditional_right_weight(q_left, q_right, physical_dim):
+        if int(physical_dim) != 1:
+            return 1.0
+        left_dim = max(int(getattr(q_left.irrep, "dim", 1)), 1)
+        right_dim = max(int(getattr(q_right.irrep, "dim", 1)), 1)
+        return float(right_dim / left_dim)
+
+    def canonicalize_conditional_bond(
+        self,
+        bond,
+        *,
+        direction="lr",
+        rcond=1.0e-12,
+    ):
+        """Move one exact reduced gauge conditioned on the crossing sector.
+
+        The gauge remains inside the LETTA ansatz when the bond frontier
+        contains only the next physical-sector label, as in an NN tie graph.
+        Rank-deficient conditional blocks are left unchanged.
+        """
+        bond = int(bond)
+        if bond < 0 or bond >= self.nsites - 1:
+            raise IndexError(f"bond {bond} is outside a chain of length {self.nsites}.")
+        direction = str(direction).lower().replace("-", "_")
+        if direction not in {"lr", "rl"}:
+            raise ValueError("direction must be 'lr' or 'rl'.")
+        if not self.supports_conditional_canonical_gauge:
+            raise ValueError(
+                "conditional canonical gauge requires a physical nearest-neighbor "
+                "tie frontier at every internal bond."
+            )
+        rcond = float(rcond)
+        if not np.isfinite(rcond) or rcond < 0.0:
+            raise ValueError("rcond must be finite and nonnegative.")
+
+        left_tensor = self.tensors[bond]
+        right_tensor = self.tensors[bond + 1]
+        updates = []
+        for condition_index, shared_sector in enumerate(
+            self.tie_domains[bond + 1]
+        ):
+            middle_sectors = sorted(
+                {
+                    key[2]
+                    for key in left_tensor
+                    if key[3] == (condition_index,)
+                }.intersection(
+                    {
+                        key[0]
+                        for key in right_tensor
+                        if key[1] == shared_sector
+                    }
+                )
+            )
+            for middle_sector in middle_sectors:
+                left_keys = [
+                    key
+                    for key in self._tensor_keys[bond]
+                    if key[2] == middle_sector
+                    and key[3] == (condition_index,)
+                ]
+                right_keys = [
+                    key
+                    for key in self._tensor_keys[bond + 1]
+                    if key[0] == middle_sector and key[1] == shared_sector
+                ]
+                if not left_keys or not right_keys:
+                    continue
+                dimension = int(np.asarray(left_tensor[left_keys[0]]).shape[2])
+                left_matrix = np.concatenate(
+                    [
+                        np.asarray(left_tensor[key]).reshape(-1, dimension)
+                        for key in left_keys
+                    ],
+                    axis=0,
+                )
+                right_records = []
+                right_parts = []
+                for key in right_keys:
+                    block = np.asarray(right_tensor[key])
+                    weight = self._conditional_right_weight(
+                        middle_sector,
+                        key[2],
+                        block.shape[1],
+                    )
+                    scale = np.sqrt(weight)
+                    matrix = block.reshape(dimension, -1)
+                    right_records.append((key, matrix.shape[1], scale))
+                    right_parts.append(scale * matrix)
+                right_matrix = np.concatenate(right_parts, axis=1)
+
+                source = left_matrix if direction == "lr" else right_matrix.T
+                if min(source.shape) < dimension:
+                    updates.append(
+                        {
+                            "bond": bond,
+                            "condition": condition_index,
+                            "sector": middle_sector,
+                            "direction": direction,
+                            "applied": False,
+                            "message": "insufficient conditional support",
+                        }
+                    )
+                    continue
+                singular = np.linalg.svd(source, compute_uv=False)
+                scale = max(float(np.max(singular, initial=0.0)), 1.0)
+                rank = int(np.count_nonzero(singular > rcond * scale))
+                if rank < dimension:
+                    updates.append(
+                        {
+                            "bond": bond,
+                            "condition": condition_index,
+                            "sector": middle_sector,
+                            "direction": direction,
+                            "applied": False,
+                            "message": "rank-deficient conditional support",
+                        }
+                    )
+                    continue
+
+                orthogonal, transfer = np.linalg.qr(source, mode="reduced")
+                if direction == "lr":
+                    offset = 0
+                    for key in left_keys:
+                        block = np.asarray(left_tensor[key])
+                        rows = block.shape[0] * block.shape[1]
+                        left_tensor[key] = orthogonal[offset : offset + rows].reshape(
+                            block.shape
+                        )
+                        offset += rows
+                    for key in right_keys:
+                        block = np.asarray(right_tensor[key])
+                        right_tensor[key] = np.einsum(
+                            "ab,bpr->apr", transfer, block, optimize=True
+                        )
+                    error = float(
+                        np.linalg.norm(
+                            orthogonal.conj().T @ orthogonal
+                            - np.eye(dimension, dtype=orthogonal.dtype)
+                        )
+                    )
+                else:
+                    left_transfer = transfer.T
+                    for key in left_keys:
+                        block = np.asarray(left_tensor[key])
+                        left_tensor[key] = np.einsum(
+                            "lpa,ab->lpb", block, left_transfer, optimize=True
+                        )
+                    canonical_right = orthogonal.T
+                    offset = 0
+                    for key, width, right_scale in right_records:
+                        block = np.asarray(right_tensor[key])
+                        right_tensor[key] = (
+                            canonical_right[:, offset : offset + width] / right_scale
+                        ).reshape(block.shape)
+                        offset += width
+                    error = float(
+                        np.linalg.norm(
+                            canonical_right @ canonical_right.conj().T
+                            - np.eye(dimension, dtype=canonical_right.dtype)
+                        )
+                    )
+                updates.append(
+                    {
+                        "bond": bond,
+                        "condition": condition_index,
+                        "sector": middle_sector,
+                        "direction": direction,
+                        "applied": True,
+                        "rank": rank,
+                        "dimension": dimension,
+                        "canonical_error": error,
+                        "message": "canonicalized",
+                    }
+                )
+        return tuple(updates)
+
+    def canonicalize_conditional_center(self, center, *, rcond=1.0e-12):
+        """Build a conditioned mixed-canonical gauge around one site."""
+        center = int(center)
+        if center < 0 or center >= self.nsites:
+            raise IndexError(f"center {center} is outside a chain of length {self.nsites}.")
+        updates = []
+        for bond in range(center):
+            updates.extend(
+                self.canonicalize_conditional_bond(
+                    bond, direction="lr", rcond=rcond
+                )
+            )
+        for bond in reversed(range(center, self.nsites - 1)):
+            updates.extend(
+                self.canonicalize_conditional_bond(
+                    bond, direction="rl", rcond=rcond
+                )
+            )
+        return tuple(updates)
 
     @property
     def frontier_states(self):
@@ -1540,26 +1777,23 @@ class NonAbelianFrontierLETTA:
         """Embed tied one-site parameters into a packed two-site tensor."""
         current = self._pack_site(site)
         dtype = np.result_type(current.dtype, complex)
+        routes = self._wigner_eckart_route_plan(site)
+        if len(routes.basis) != current.size:
+            raise RuntimeError(
+                "Cached Wigner--Eckart basis does not match the local parameter space."
+            )
         columns = []
-        unit = np.zeros(current.size, dtype=dtype)
-        try:
-            for index in range(current.size):
-                unit[index] = 1.0
-                self._set_site_vector(site, unit)
-                varied = self.materialize_site(site)
-                if site == bond:
-                    left, right = varied, sites[bond + 1]
-                else:
-                    left, right = sites[bond], varied
-                if isinstance(layout, _ChannelResolvedPairSpace):
-                    packed = layout.pack_sites(left, right)
-                else:
-                    pair = merge_mps_sites(left, right)
-                    packed, _ = pack_two_site_state(pair, layout=layout)
-                columns.append(np.asarray(packed, dtype=dtype))
-                unit[index] = 0.0
-        finally:
-            self._set_site_vector(site, current)
+        for varied in routes.basis:
+            if site == bond:
+                left, right = varied, sites[bond + 1]
+            else:
+                left, right = sites[bond], varied
+            if isinstance(layout, _ChannelResolvedPairSpace):
+                packed = layout.pack_sites(left, right)
+            else:
+                pair = merge_mps_sites(left, right)
+                packed, _ = pack_two_site_state(pair, layout=layout)
+            columns.append(np.asarray(packed, dtype=dtype))
         if not columns:
             return current, np.zeros((0, 0), dtype=dtype)
         return current, np.column_stack(columns)
@@ -2050,7 +2284,7 @@ class NonAbelianFrontierLETTA:
                 left_key = (q_lb, q_lk, q_p1b, q_p1k, q_mb, q_mk)
                 left_reduced = left_cache.get(left_key)
                 if left_reduced is None:
-                    left_reduced = _environment_reduced_rank_coupled_block(
+                    left_reduced = _left_reduced_rank_coupled_block(
                         w1, *left_key
                     ) or {}
                     left_cache[left_key] = left_reduced
@@ -2059,7 +2293,7 @@ class NonAbelianFrontierLETTA:
                 right_key = (q_mb, q_mk, q_p2b, q_p2k, q_rb, q_rk)
                 right_reduced = right_cache.get(right_key)
                 if right_reduced is None:
-                    right_reduced = _environment_reduced_rank_coupled_block(
+                    right_reduced = _right_reduced_rank_coupled_block(
                         w2, *right_key
                     ) or {}
                     right_cache[right_key] = right_reduced
@@ -2685,7 +2919,7 @@ class NonAbelianFrontierLETTA:
         davidson_tol=1.0e-10,
         davidson_maxiter=80,
         davidson_max_space=32,
-        dense_dim=128,
+        dense_dim=0,
         growth_truncation_tol=0.05,
         bond_growth=1,
         sites=None,
@@ -3201,6 +3435,9 @@ class NonAbelianFrontierLETTA:
         checkpoint=None,
         checkpoint_every=1,
         reset_history=True,
+        gauge=None,
+        gauge_rcond=1.0e-12,
+        reuse_environments=True,
         **kwargs,
     ):
         """Optimize by complete left/right reduced SU(2) cycles."""
@@ -3228,6 +3465,16 @@ class NonAbelianFrontierLETTA:
                 "SU2LETTA solver must be 'auto', 'projected', "
                 "'wigner_eckart', or 'polarization'."
             )
+        if gauge is not None:
+            gauge = str(gauge).lower().replace("-", "_")
+        if gauge not in {None, "conditional"}:
+            raise ValueError("SU2LETTA gauge must be None or 'conditional'.")
+        conditional_gauge = bool(
+            algorithm == "two_site"
+            and gauge == "conditional"
+            and self.supports_conditional_canonical_gauge
+        )
+        reuse_environments = bool(reuse_environments)
         # Construction and checkpoint restore leave ``self.energy`` consistent
         # with the current tensors.  Recomputing it here is especially costly
         # for a cold rank-coupled qchem MPO and merely repeats the same full
@@ -3274,29 +3521,43 @@ class NonAbelianFrontierLETTA:
         self.converged = False
         streak = 0
         for sweep in range(nsweeps):
+            cycle_started = time.perf_counter()
             updates = []
+            gauge_updates = []
             for direction, bonds in (
                 ("lr", range(self.nsites - 1)),
                 ("rl", range(self.nsites - 2, -1, -1)),
             ):
                 bonds = tuple(bonds)
+                if conditional_gauge:
+                    center = 0 if direction == "lr" else self.nsites - 1
+                    gauge_updates.extend(
+                        self.canonicalize_conditional_center(
+                            center, rcond=gauge_rcond
+                        )
+                    )
                 materialized = self.materialize()
                 identity = _identity_mpo_factors_for_sites_and_mpo(
                     materialized, self.mpo
                 )
                 if algorithm == "two_site":
                     local_solvers = {}
-                    h_sweep = BlockSparseEnvironmentChain.build(
-                        materialized,
-                        self.mpo,
-                        sweep_direction=direction,
-                    ).start_sweep(direction)
-                    n_sweep = BlockSparseEnvironmentChain.build(
-                        materialized,
-                        identity,
-                        sweep_direction=direction,
-                    ).start_sweep(direction)
-                    uses_moving_environments = True
+                    if reuse_environments:
+                        h_sweep = BlockSparseEnvironmentChain.build(
+                            materialized,
+                            self.mpo,
+                            sweep_direction=direction,
+                        ).start_sweep(direction)
+                        n_sweep = BlockSparseEnvironmentChain.build(
+                            materialized,
+                            identity,
+                            sweep_direction=direction,
+                        ).start_sweep(direction)
+                        uses_moving_environments = True
+                    else:
+                        h_sweep = None
+                        n_sweep = None
+                        uses_moving_environments = False
                 else:
                     local_solvers = {}
                     for bond in bonds:
@@ -3343,6 +3604,27 @@ class NonAbelianFrontierLETTA:
                             n_sweep=n_sweep,
                             **kwargs,
                         )
+                        if conditional_gauge:
+                            local_gauge_updates = self.canonicalize_conditional_bond(
+                                bond,
+                                direction=direction,
+                                rcond=gauge_rcond,
+                            )
+                            gauge_updates.extend(local_gauge_updates)
+                            update["conditional_gauge"] = {
+                                "applied": int(
+                                    sum(
+                                        bool(item.get("applied", False))
+                                        for item in local_gauge_updates
+                                    )
+                                ),
+                                "skipped": int(
+                                    sum(
+                                        not bool(item.get("applied", False))
+                                        for item in local_gauge_updates
+                                    )
+                                ),
+                            }
                         materialized[bond] = self.materialize_site(bond)
                         materialized[bond + 1] = self.materialize_site(bond + 1)
                     else:
@@ -3410,6 +3692,26 @@ class NonAbelianFrontierLETTA:
                 "algorithm": algorithm,
                 "norm": float(self.norm()),
                 "storage_nbytes": int(self.storage_nbytes),
+                "gauge": "conditional" if conditional_gauge else None,
+                "conditional_gauge_supported": bool(
+                    self.supports_conditional_canonical_gauge
+                ),
+                "conditional_gauge_applied": int(
+                    sum(
+                        bool(item.get("applied", False))
+                        for item in gauge_updates
+                    )
+                ),
+                "conditional_gauge_skipped": int(
+                    sum(
+                        not bool(item.get("applied", False))
+                        for item in gauge_updates
+                    )
+                ),
+                "environment_reuse": bool(
+                    algorithm == "two_site" and reuse_environments
+                ),
+                "elapsed_s": float(time.perf_counter() - cycle_started),
             }
             self.history.append(record)
             if verbose:

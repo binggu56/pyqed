@@ -4821,7 +4821,18 @@ def build_contextual_channel_compiled_terms(
             "prepare_active_bond_complementary_actions",
             None,
         )
-        if direct_action_builder is not None:
+        if direct_action_builder is not None and not bool(
+            getattr(
+                W1,
+                "normal_complementary_force_contextual_routes",
+                False,
+            )
+            or getattr(
+                W2,
+                "normal_complementary_force_contextual_routes",
+                False,
+            )
+        ):
             for table in (left_boundary, right_boundary):
                 labels, boundary_topology_revision = _packed_boundary_labels(
                     table
@@ -5278,9 +5289,8 @@ def build_contextual_channel_compiled_terms(
                     out_indices.append(int(out_idx))
                     left_indices.append(int(lid))
                     right_indices.append(int(rid))
-    if not in_indices:
-        return None
-
+    # An empty route table is a valid zero operator in the requested reduced
+    # sector, not a failed contextual compilation.
     def make_factor_table(
         side,
         representation,

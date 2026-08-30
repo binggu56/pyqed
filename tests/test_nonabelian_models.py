@@ -41,7 +41,7 @@ from pyqed.mps.nonabelian import (
     spatial_target_sector,
     as_rank_coupled_mpo,
 )
-from pyqed.mps.su2 import SpatialOrbitalSite, SU2Irrep
+from pyqed.mps.su2 import SpatialOrbitalSite, SpinChargeSector, SU2Irrep
 from pyqed.mps.nonabelian.coupling import ordered_two_m_values
 from pyqed.mps.nonabelian.states import _fuse_spatial_sectors
 from pyqed.mps.nonabelian import models as nonabelian_models
@@ -428,6 +428,94 @@ def test_fully_reduced_two_site_exchange_eri_matrix_matches_exact_reduced_cg_ref
                 )
                 actual = _contract_chain_transition(bra_state, mpo, ket_state)
                 assert actual == pytest.approx(expected, abs=1.0e-12)
+
+
+def test_cpp_contextual_right_core_matches_reduced_reference_orientation():
+    try:
+        from pyqed.mps.nonabelian._su2_kernel import SU2MovingEnvironment
+    except ImportError:
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    from pyqed.mps.nonabelian.environment import (
+        _component_basis_norm,
+        _right_reduced_rank_coupled_block,
+    )
+    from pyqed.qchem.dmrg.backends.reduced import (
+        build_su2_normal_complementary_mpo,
+    )
+
+    rng = np.random.default_rng(20260727)
+    nsites = 4
+    one_body = rng.normal(scale=0.03, size=(nsites, nsites))
+    one_body = 0.5 * (one_body + one_body.T)
+    cholesky = rng.normal(scale=0.02, size=(nsites, nsites, 4))
+    cholesky = 0.5 * (cholesky + cholesky.swapaxes(0, 1))
+    eri = np.einsum("pqL,rsL->pqrs", cholesky, cholesky)
+    owner = SU2MovingEnvironment(
+        one_body,
+        eri,
+        4,
+        two_s=0,
+        cutoff=1.0e-12,
+        include_half=True,
+    )
+    mpo = build_su2_normal_complementary_mpo(owner, fully_reduced=True)
+    for factor in mpo:
+        object.__setattr__(factor, "normal_complementary_right_dual", True)
+
+    factor = mpo[-1]
+    physical = {sector.charge: sector for sector in factor.phys_in_leg.sectors}
+    inner_bra = SpinChargeSector(0, SU2Irrep(1))
+    inner_ket = SpinChargeSector(0, SU2Irrep(1))
+    outer_bra = SpinChargeSector(0, SU2Irrep(0))
+    outer_ket = SpinChargeSector(0, SU2Irrep(0))
+    sectors = (
+        inner_bra,
+        inner_ket,
+        physical[1],
+        physical[1],
+        outer_bra,
+        outer_ket,
+    )
+    reference = _right_reduced_rank_coupled_block(factor, *sectors)
+    connected_reference = {}
+    for (source, target), block in reference.items():
+        source_irrep = factor.left_channel_irreps[source]
+        weights = np.asarray(
+            [
+                _component_basis_norm(
+                    inner_bra,
+                    inner_ket,
+                    source_irrep,
+                    two_m,
+                )
+                for two_m in ordered_two_m_values(source_irrep)
+            ]
+        )
+        connected_reference[(source, target)] = (
+            np.asarray(block) * weights[:, None, None, None]
+        )
+
+    actual = owner.contextual_core(
+        nsites - 1,
+        1,
+        1,
+        outer_bra.irrep.two_j,
+        outer_ket.irrep.two_j,
+        physical[1].irrep.two_j,
+        physical[1].irrep.two_j,
+        inner_bra.irrep.two_j,
+        inner_ket.irrep.two_j,
+        False,
+        True,
+    )
+    assert actual.keys() == connected_reference.keys()
+    for key, expected in connected_reference.items():
+        np.testing.assert_allclose(
+            actual[key],
+            expected,
+            rtol=1.0e-12,
+            atol=1.0e-12,
+        )
 
 
 def test_fully_reduced_scalar_pair_hopping_survives_rank_coupled_embedding():

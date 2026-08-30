@@ -1238,8 +1238,11 @@ class ReducedSpatialHamiltonian:
             eri=eri,
             cutoff=float(self.cutoff),
             fully_reduced=bool(self.fully_reduced),
+            # Transition factors are operator data, independent of the target
+            # state. Keep this rebuild on the explicit reduced compiler rather
+            # than creating a second sector-specific native C++ owner.
             nelec=None,
-            spin=int(self.spin),
+            spin=0,
             ecore=0.0,
             orb_sym=self.orb_sym,
         ).build()

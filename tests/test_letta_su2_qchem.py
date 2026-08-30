@@ -141,6 +141,76 @@ def test_su2_letta_neutral_ties_embed_reduced_mps_exactly():
     np.testing.assert_allclose(state.expectation(), base_energy, atol=2.0e-12)
 
 
+def test_su2_letta_conditional_canonical_gauge_preserves_state():
+    h1e = np.array(
+        [
+            [-0.8, -0.2, 0.0, 0.0],
+            [-0.2, -0.3, -0.15, 0.0],
+            [0.0, -0.15, 0.2, -0.1],
+            [0.0, 0.0, -0.1, 0.7],
+        ]
+    )
+    state = SU2LETTA.from_integrals(
+        h1e,
+        nelec=4,
+        spin=0,
+        graph=[(0, 1), (1, 2), (2, 3)],
+        D=1,
+        seed=9,
+    )
+    before = _dense_vector_from_reduced_spatial_mps(state.materialize())
+    energy_before = state.energy
+    updates = state.canonicalize_conditional_center(0)
+    after = _dense_vector_from_reduced_spatial_mps(state.materialize())
+
+    assert state.supports_conditional_canonical_gauge
+    assert any(update["applied"] for update in updates)
+    assert max(
+        update.get("canonical_error", 0.0)
+        for update in updates
+        if update["applied"]
+    ) < 2.0e-12
+    np.testing.assert_allclose(after, before, atol=2.0e-12)
+    np.testing.assert_allclose(state.expectation(), energy_before, atol=2.0e-12)
+
+
+def test_su2_letta_conditional_moving_environment_matches_rebuild_path():
+    h1e = np.array(
+        [
+            [-0.8, -0.2, 0.0, 0.0],
+            [-0.2, -0.3, -0.15, 0.0],
+            [0.0, -0.15, 0.2, -0.1],
+            [0.0, 0.0, -0.1, 0.7],
+        ]
+    )
+    initial = SU2LETTA.from_integrals(
+        h1e,
+        nelec=4,
+        spin=0,
+        graph=[(0, 1), (1, 2), (2, 3)],
+        D=1,
+        seed=9,
+    )
+    rebuilt = copy.deepcopy(initial)
+    moving = copy.deepcopy(initial)
+    options = {
+        "nsweeps": 1,
+        "algorithm": "two_site",
+        "tol": 0.0,
+        "gauge": "conditional",
+        "widest_pair_warmup": False,
+        "retraction_relax_sweeps": 0,
+    }
+    rebuilt.run(reuse_environments=False, **options)
+    moving.run(reuse_environments=True, **options)
+
+    np.testing.assert_allclose(moving.energy, rebuilt.energy, atol=2.0e-11)
+    assert moving.history[0]["gauge"] == "conditional"
+    assert moving.history[0]["environment_reuse"]
+    assert moving.history[0]["conditional_gauge_applied"] > 0
+    assert all(update["matrix_free"] for update in moving.history[0]["updates"])
+
+
 def test_qchem_su2_letta_sweep_reaches_two_orbital_one_body_reference():
     h1e = np.array([[-1.0, -0.2], [-0.2, 0.5]])
     state = LETTA.from_integrals(
@@ -373,6 +443,29 @@ def test_native_two_site_su2_letta_reaches_hubbard_dimer_and_reports_truncation(
     assert update["local_residual"] < 1.0e-10
     assert update["truncation_error"] < 1.0e-12
     assert update["fixed_reduced_bond_dim"] == 1
+
+
+def test_native_two_site_su2_letta_accepts_an_empty_triplet_operator():
+    h1e = np.array([[0.0, -1.0], [-1.0, 0.0]])
+    eri = np.zeros((2, 2, 2, 2))
+    eri[0, 0, 0, 0] = 4.0
+    eri[1, 1, 1, 1] = 4.0
+    state = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=2,
+        spin=2,
+        graph=[(0, 1)],
+        D=1,
+        seed=3,
+    )
+
+    state.run(nsweeps=1, algorithm="two_site", tol=0.0)
+
+    np.testing.assert_allclose(state.energy, 0.0, atol=2.0e-12)
+    assert state.target_sector.irrep.two_j == 2
+    assert all(update["accepted"] for update in state.history[0]["updates"])
+    assert state.history[0]["max_local_residual"] == 0.0
 
 
 def test_channel_resolved_d2_pair_kernel_is_exact_and_matrix_free():

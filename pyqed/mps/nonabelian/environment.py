@@ -1969,8 +1969,22 @@ def _left_reduced_rank_coupled_block(
     q_rb,
     q_rk,
 ):
+    cache_key = (
+        "left",
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+        bool(getattr(W, "normal_complementary_right_dual", False)),
+        id(getattr(W, "normal_complementary_plan", None)),
+    )
+    cache = W._environment_reduced_block_cache
+    if cache_key in cache:
+        return cache[cache_key]
     if getattr(W, "normal_complementary_plan", None) is None:
-        return _reference_left_reduced_rank_coupled_block(
+        reduced = _reference_left_reduced_rank_coupled_block(
             W,
             q_lb,
             q_lk,
@@ -1979,15 +1993,18 @@ def _left_reduced_rank_coupled_block(
             q_rb,
             q_rk,
         )
-    return _normal_complementary_left_reduced_rank_coupled_block(
-        W,
-        q_lb,
-        q_lk,
-        q_pb,
-        q_pk,
-        q_rb,
-        q_rk,
-    )
+    else:
+        reduced = _normal_complementary_left_reduced_rank_coupled_block(
+            W,
+            q_lb,
+            q_lk,
+            q_pb,
+            q_pk,
+            q_rb,
+            q_rk,
+        )
+    cache[cache_key] = reduced
+    return reduced
 
 
 def _normal_complementary_left_reduced_rank_coupled_block(
@@ -2275,15 +2292,9 @@ def _environment_reduced_rank_coupled_block(
     W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk
 ):
     """Return the cached direction-independent block used by SU(2)-LETTA."""
-    key = (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk)
-    cache = W._environment_reduced_block_cache
-    cached = cache.get(key)
-    if cached is None:
-        cached = _left_reduced_rank_coupled_block(
-            W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk
-        )
-        cache[key] = cached
-    return cached
+    return _left_reduced_rank_coupled_block(
+        W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk
+    )
 
 
 def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
@@ -2297,6 +2308,20 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
             q_rb,
             q_rk,
         )
+    cache_key = (
+        "right",
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+        bool(getattr(W, "normal_complementary_right_dual", False)),
+        id(getattr(W, "normal_complementary_plan", None)),
+    )
+    cache = W._environment_reduced_block_cache
+    if cache_key in cache:
+        return cache[cache_key]
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -2377,6 +2402,7 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     if relaxed_scalar_transfer:
         for key, block in _rank_coupled_reduced_terms_block(W, q_pb, q_pk).items():
             reduced[key] = reduced.get(key, 0) + block
+        cache[cache_key] = reduced
         return reduced
 
     for term in W.reduced_terms:
@@ -2572,6 +2598,7 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             )
                 if np.any(block):
                     reduced[(left_idx, right_idx)] = block
+    cache[cache_key] = reduced
     return reduced
 
 
@@ -3129,11 +3156,18 @@ def _contract_rank_coupled_boundary_cpp(
     packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
     if packed_parent is None:
         return None
+    # LETTA often carries numerically real data in complex arrays. Keep it on
+    # the real boundary store unless a material imaginary component is present.
     complex_update = bool(
-        np.iscomplexobj(packed_parent.block_pool.data)
-        or np.dtype(_mpo_dtype(W)).kind == "c"
-        or any(np.iscomplexobj(block) for block in A.data.values())
-        or any(np.iscomplexobj(block) for block in B.data.values())
+        _real64_contiguous_or_none(packed_parent.block_pool.data) is None
+        or any(
+            _real64_contiguous_or_none(block) is None
+            for block in A.data.values()
+        )
+        or any(
+            _real64_contiguous_or_none(block) is None
+            for block in B.data.values()
+        )
     )
     if complex_update and not hasattr(moving_environment, "advance_boundary_complex"):
         return None
@@ -3281,12 +3315,12 @@ def _contract_rank_coupled_boundary_cpp(
                         raw_reduced = (
                             _right_reduced_rank_coupled_block(
                                 W,
-                                q_boundary_bra,
-                                q_boundary_ket,
-                                q_phys_bra,
-                                q_phys_ket,
                                 q_next_bra,
                                 q_next_ket,
+                                q_phys_bra,
+                                q_phys_ket,
+                                q_boundary_bra,
+                                q_boundary_ket,
                             )
                             if reduced_physical
                             else W.reduced_block(q_phys_bra, q_phys_ket)
