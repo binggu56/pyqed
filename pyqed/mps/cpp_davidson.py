@@ -36,10 +36,15 @@ abelian_left_environment_advance_data = None
 abelian_right_environment_advance_data = None
 abelian_tdvp_site_heff_data = None
 abelian_tdvp_bond_heff_data = None
+abelian_dmrg3s_left_expansion_data = None
+abelian_dmrg3s_right_expansion_data = None
 AbelianTDVPSiteHeffPlan = None
 AbelianTDVPBondHeffPlan = None
 AbelianEnvironmentAdvancePlan = None
 BlockTable = None
+PackedGroupedAction = None
+build_packed_advance_routes = None
+build_packed_hole_routes = None
 RenormalizedTable = None
 SparseRenormalizedTable = None
 GroupedRenormalizedTable = None
@@ -266,10 +271,15 @@ def _initialize():
     global abelian_right_environment_advance_data
     global abelian_tdvp_site_heff_data
     global abelian_tdvp_bond_heff_data
+    global abelian_dmrg3s_left_expansion_data
+    global abelian_dmrg3s_right_expansion_data
     global AbelianTDVPSiteHeffPlan
     global AbelianTDVPBondHeffPlan
     global AbelianEnvironmentAdvancePlan
     global BlockTable
+    global PackedGroupedAction
+    global build_packed_advance_routes
+    global build_packed_hole_routes
     global RenormalizedTable
     global SparseRenormalizedTable
     global GroupedRenormalizedTable
@@ -415,6 +425,16 @@ def _initialize():
         "abelian_tdvp_bond_heff_data",
         None,
     )
+    abelian_dmrg3s_left_expansion_data = getattr(
+        module,
+        "abelian_dmrg3s_left_expansion_data",
+        None,
+    )
+    abelian_dmrg3s_right_expansion_data = getattr(
+        module,
+        "abelian_dmrg3s_right_expansion_data",
+        None,
+    )
     AbelianTDVPSiteHeffPlan = getattr(
         module,
         "AbelianTDVPSiteHeffPlan",
@@ -431,6 +451,11 @@ def _initialize():
         None,
     )
     BlockTable = getattr(module, "BlockTable", None)
+    PackedGroupedAction = getattr(module, "PackedGroupedAction", None)
+    build_packed_advance_routes = getattr(
+        module, "build_packed_advance_routes", None
+    )
+    build_packed_hole_routes = getattr(module, "build_packed_hole_routes", None)
     RenormalizedTable = getattr(module, "RenormalizedTable", BlockTable)
     SparseRenormalizedTable = getattr(module, "SparseRenormalizedTable", None)
     GroupedRenormalizedTable = getattr(module, "GroupedRenormalizedTable", None)

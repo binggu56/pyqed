@@ -3,7 +3,7 @@
 The dense LETTA engine stores pair tensors as ``(left, site_i, site_j, right)``.
 For Abelian calculations the allowed entries are not arbitrary sparsity: they
 are block matrices between prefix-charge sectors.  This module records that
-structure with :class:`pyqed.narg.irrep_tensor.IrrepTensor` so symmetry support
+structure with :class:`pyqed.symmetry.IrrepTensor` so symmetry support
 can be shared by masks, diagnostics, and later block-native local solves.
 """
 
@@ -13,7 +13,14 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
+from pyqed.symmetry import (
+    Irrep,
+    Leg,
+    IrrepTensor,
+    OpIrrep,
+    ProductSymmetry,
+    U1Symmetry,
+)
 
 
 def _as_charge(value) -> tuple[int, ...]:
@@ -162,13 +169,13 @@ class Layout:
         return _product_u1_symmetry(len(self.target))
 
     @property
-    def bond_sites(self) -> list[IrrepSite]:
+    def bond_legs(self) -> list[Leg]:
         sym = self.symmetry
-        return [IrrepSite(sym, _sector_dims(labels)) for labels in self.bond_qns]
+        return [Leg(_sector_dims(labels), symmetry=sym) for labels in self.bond_qns]
 
     @property
-    def target_site(self) -> IrrepSite:
-        return IrrepSite(self.symmetry, {Irrep(self.target): 1})
+    def target_leg(self) -> Leg:
+        return Leg({Irrep(self.target): 1}, symmetry=self.symmetry)
 
     def local_masks(self) -> list[np.ndarray]:
         masks = []
@@ -267,8 +274,8 @@ class Layout:
     def _internal_operator_grid(self, tensor_index: int, tensor: np.ndarray) -> dict[tuple[int, int], IrrepTensor]:
         left_labels = self.bond_qns[tensor_index]
         right_labels = self.bond_qns[tensor_index + 1]
-        left_site = self.bond_sites[tensor_index]
-        right_site = self.bond_sites[tensor_index + 1]
+        left_leg = self.bond_legs[tensor_index]
+        right_leg = self.bond_legs[tensor_index + 1]
         left_pos = _sector_positions(left_labels)
         right_pos = _sector_positions(right_labels)
         out = {}
@@ -285,16 +292,16 @@ class Layout:
                         ket = Irrep(q_left)
                         block = blocks.setdefault(
                             (bra, ket),
-                            np.zeros((right_site.sector_dim(bra), left_site.sector_dim(ket)), dtype=tensor.dtype),
+                            np.zeros((right_leg.sector_dim(bra), left_leg.sector_dim(ket)), dtype=tensor.dtype),
                         )
                         block[right_pos[right], left_pos[left]] = tensor[left, si, sj, right]
-                out[(si, sj)] = IrrepTensor(right_site, left_site, op, blocks)
+                out[(si, sj)] = IrrepTensor(right_leg, left_leg, op, blocks)
         return out
 
     def _final_operator_grid(self, tensor_index: int, tensor: np.ndarray) -> dict[tuple[int, int], IrrepTensor]:
         left_labels = self.bond_qns[tensor_index]
-        left_site = self.bond_sites[tensor_index]
-        right_site = self.target_site
+        left_leg = self.bond_legs[tensor_index]
+        right_leg = self.target_leg
         left_pos = _sector_positions(left_labels)
         out = {}
         for si, q_i in enumerate(self.local_qns[-2]):
@@ -308,10 +315,10 @@ class Layout:
                     ket = Irrep(q_left)
                     block = blocks.setdefault(
                         (bra, ket),
-                        np.zeros((1, left_site.sector_dim(ket)), dtype=tensor.dtype),
+                        np.zeros((1, left_leg.sector_dim(ket)), dtype=tensor.dtype),
                     )
                     block[0, left_pos[left]] = tensor[left, si, sj, 0]
-                out[(si, sj)] = IrrepTensor(right_site, left_site, op, blocks)
+                out[(si, sj)] = IrrepTensor(right_leg, left_leg, op, blocks)
         return out
 
     def structural_support_size(self, tensor_index: int) -> int:
@@ -388,18 +395,18 @@ class XLayout:
         return _product_u1_symmetry(len(self.target))
 
     @property
-    def prefix_sites(self) -> list[IrrepSite]:
+    def prefix_legs(self) -> list[Leg]:
         sym = self.symmetry
-        return [IrrepSite(sym, _sector_dims(labels)) for labels in self.prefix_qns]
+        return [Leg(_sector_dims(labels), symmetry=sym) for labels in self.prefix_qns]
 
     @property
-    def view_sites(self) -> list[IrrepSite]:
+    def view_legs(self) -> list[Leg]:
         sym = self.symmetry
-        return [IrrepSite(sym, _sector_dims(labels)) for labels in self.view_qns]
+        return [Leg(_sector_dims(labels), symmetry=sym) for labels in self.view_qns]
 
     @property
-    def target_site(self) -> IrrepSite:
-        return IrrepSite(self.symmetry, {Irrep(self.target): 1})
+    def target_leg(self) -> Leg:
+        return Leg({Irrep(self.target): 1}, symmetry=self.symmetry)
 
     @classmethod
     def from_local_charges(
@@ -484,8 +491,8 @@ class XLayout:
 
     def w_shapes(self) -> list[tuple[int, ...]]:
         return [
-            (len(view_site), len(view_site), len(local_site))
-            for view_site, local_site in zip(self.view_qns, self.local_qns[1:])
+            (len(view_leg), len(view_leg), len(local_site))
+            for view_leg, local_site in zip(self.view_qns, self.local_qns[1:])
         ]
 
     def tensor_masks(self) -> list[np.ndarray]:
@@ -519,10 +526,10 @@ class XLayout:
 
     def w_masks(self) -> list[np.ndarray]:
         masks = []
-        for view_site, local_site in zip(self.view_qns, self.local_qns[1:]):
-            mask = np.zeros((len(view_site), len(view_site), len(local_site)), dtype=bool)
-            for u, q_u in enumerate(view_site):
-                for v, q_v in enumerate(view_site):
+        for view_leg, local_site in zip(self.view_qns, self.local_qns[1:]):
+            mask = np.zeros((len(view_leg), len(view_leg), len(local_site)), dtype=bool)
+            for u, q_u in enumerate(view_leg):
+                for v, q_v in enumerate(view_leg):
                     if q_u != q_v:
                         continue
                     for s, q_s in enumerate(local_site):
@@ -568,7 +575,7 @@ class XLayout:
         expected = self.w_shapes()[shared_index]
         if tensor.shape != expected:
             raise ValueError(f"W shape {tensor.shape} does not match Abelian XLETTA shape {expected}.")
-        view_site = self.view_sites[shared_index]
+        view_leg = self.view_legs[shared_index]
         labels = self.view_qns[shared_index]
         positions = _sector_positions(labels)
         zero = tuple(0 for _ in self.target)
@@ -584,10 +591,10 @@ class XLayout:
                     irrep = Irrep(q_s)
                     block = blocks.setdefault(
                         (irrep, irrep),
-                        np.zeros((view_site.sector_dim(irrep), view_site.sector_dim(irrep)), dtype=tensor.dtype),
+                        np.zeros((view_leg.sector_dim(irrep), view_leg.sector_dim(irrep)), dtype=tensor.dtype),
                     )
                     block[positions[u], positions[v]] = tensor[u, v, s]
-            out[(s,)] = IrrepTensor(view_site, view_site, OpIrrep(zero), blocks)
+            out[(s,)] = IrrepTensor(view_leg, view_leg, OpIrrep(zero), blocks)
         return out
 
     def local_tensor_blocks(self, tensor_index: int) -> tuple[AbelianXLETTALocalBlock, ...]:
@@ -659,8 +666,8 @@ class XLayout:
         raise ValueError("kind must be 'tensor' or 'w'.")
 
     def _first_tensor_operator_grid(self, tensor: np.ndarray) -> dict[tuple[int, ...], IrrepTensor]:
-        left_site = self.prefix_sites[0]
-        right_site = self.prefix_sites[1]
+        left_leg = self.prefix_legs[0]
+        right_leg = self.prefix_legs[1]
         right_labels = self.prefix_qns[1]
         right_pos = _sector_positions(right_labels)
         out = {}
@@ -677,17 +684,17 @@ class XLayout:
                         ket = Irrep(q_left)
                         block = blocks.setdefault(
                             (bra, ket),
-                            np.zeros((right_site.sector_dim(bra), left_site.sector_dim(ket)), dtype=tensor.dtype),
+                            np.zeros((right_leg.sector_dim(bra), left_leg.sector_dim(ket)), dtype=tensor.dtype),
                         )
                         block[right_pos[right], 0] = tensor[s0, right, u]
-                out[(s0, u)] = IrrepTensor(right_site, left_site, op, blocks)
+                out[(s0, u)] = IrrepTensor(right_leg, left_leg, op, blocks)
         return out
 
     def _internal_tensor_operator_grid(self, tensor_index: int, tensor: np.ndarray) -> dict[tuple[int, ...], IrrepTensor]:
         left_labels = self.prefix_qns[tensor_index]
         right_labels = self.prefix_qns[tensor_index + 1]
-        left_site = self.prefix_sites[tensor_index]
-        right_site = self.prefix_sites[tensor_index + 1]
+        left_leg = self.prefix_legs[tensor_index]
+        right_leg = self.prefix_legs[tensor_index + 1]
         left_pos = _sector_positions(left_labels)
         right_pos = _sector_positions(right_labels)
         out = {}
@@ -704,16 +711,16 @@ class XLayout:
                         ket = Irrep(q_left)
                         block = blocks.setdefault(
                             (bra, ket),
-                            np.zeros((right_site.sector_dim(bra), left_site.sector_dim(ket)), dtype=tensor.dtype),
+                            np.zeros((right_leg.sector_dim(bra), left_leg.sector_dim(ket)), dtype=tensor.dtype),
                         )
                         block[right_pos[right], left_pos[left]] = tensor[left, v, u, right]
-                out[(v, u)] = IrrepTensor(right_site, left_site, op, blocks)
+                out[(v, u)] = IrrepTensor(right_leg, left_leg, op, blocks)
         return out
 
     def _final_tensor_operator_grid(self, tensor: np.ndarray) -> dict[tuple[int, ...], IrrepTensor]:
         left_labels = self.prefix_qns[-1]
-        left_site = self.prefix_sites[-1]
-        right_site = self.target_site
+        left_leg = self.prefix_legs[-1]
+        right_leg = self.target_leg
         left_pos = _sector_positions(left_labels)
         out = {}
         for v, q_v in enumerate(self.view_qns[-1]):
@@ -725,10 +732,10 @@ class XLayout:
                 ket = Irrep(q_left)
                 block = blocks.setdefault(
                     (bra, ket),
-                    np.zeros((1, left_site.sector_dim(ket)), dtype=tensor.dtype),
+                    np.zeros((1, left_leg.sector_dim(ket)), dtype=tensor.dtype),
                 )
                 block[0, left_pos[left]] = tensor[left, v]
-            out[(v,)] = IrrepTensor(right_site, left_site, OpIrrep(q_v), blocks)
+            out[(v,)] = IrrepTensor(right_leg, left_leg, OpIrrep(q_v), blocks)
         return out
 
     def _tensor_block_coords(self, tensor_index: int, physical: tuple[int, ...], bra: Irrep, ket: Irrep) -> np.ndarray:

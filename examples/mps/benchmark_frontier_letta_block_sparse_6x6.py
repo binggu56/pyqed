@@ -23,7 +23,6 @@ from examples.mps.scan_frontier_letta_vs_mps_j2_4x4 import (
 )
 from examples.mps.scan_frontier_letta_vs_mps_j2_8x4 import _optimize_mps
 from pyqed.letta import frontier_tied_letta_from_mps
-from pyqed.mps import MPO
 
 
 HERE = Path(__file__).resolve().parent
@@ -73,8 +72,7 @@ def run_benchmark(
     )
     hamiltonian = heisenberg_local_hamiltonian(nsites, weighted_bonds)
     parent_sets = parent_sets_from_edges(nsites, nearest)
-    local_mpo = hamiltonian.to_mpo().compress()
-    mpo = MPO(list(local_mpo.tensors))
+    mpo = hamiltonian.to_mpo().compress()
 
     output = Path(output)
     snapshot = (

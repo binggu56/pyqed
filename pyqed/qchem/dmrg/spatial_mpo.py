@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.tn import MPO as TensorMPO
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class SpatialCarrierMPO:
 
     @property
     def tensor_mpo(self):
-        return TensorMPO(self.factors, homogenous=False)
+        return TensorMPO(self.factors, homogeneous=False)
 
 
 def build_spatial_block2_carrier_mpo(n_sites, *, local_dim=4):

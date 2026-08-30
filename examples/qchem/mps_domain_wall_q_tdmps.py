@@ -25,11 +25,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSet
-from pyqed.mps.autompo.light_automatic_mpo import Mpo as AutoMPO
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.mps import MPS, MPO
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSet
+from pyqed.operator_mpo.model_mpo import ModelMPO as ModelMPO
+from pyqed.operator_mpo.model import Model
+from pyqed.mps.mps import MPS
+from pyqed.tn import MPO
 from pyqed.mps.tdmps import TDMPS
 
 
@@ -143,7 +144,7 @@ def build_q_hamiltonian_mpo(n_electrons=20, qmax=10, t=1.0, v=0.0):
             terms.append(v * Op("P1", n - 1))
 
     model = Model(basis=basis, ham_terms=terms)
-    auto_mpo = AutoMPO(model, algo="qr")
+    auto_mpo = ModelMPO(model, algo="qr")
 
     factors = []
     for w in auto_mpo.matrices:
@@ -177,7 +178,7 @@ def measure_q_and_entropy(psi, q_diag):
     psi_c = psi.copy().right_canonicalize()
     q_expect = np.real_if_close(psi_c.site_expectation_value(q_diag)).astype(float)
 
-    if psi_c.Ss is None:
+    if psi_c.singular_values is None:
         smax = 0.0
     else:
         ent = psi_c.entanglement_entropy()

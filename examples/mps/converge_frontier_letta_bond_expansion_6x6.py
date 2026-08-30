@@ -162,8 +162,8 @@ def converge(
                 "source_snapshot": str(source_snapshot.resolve()),
                 "symmetry": "none",
                 "solver": "whitened exact local S=I frame",
-                "frontier_canonicalization": True,
-                "frontier_gauge_weighting": "uniform",
+                "gauge": "frontier",
+                "gauge_weight": "uniform",
                 "maximum_additional_directional_passes": int(
                     maximum_additional_passes
                 ),
@@ -200,8 +200,8 @@ def converge(
             eig_tol=1.0e-10,
             maxiter=1600,
             max_subspace=96,
-            frontier_canonicalization=True,
-            frontier_gauge_weighting="uniform",
+            gauge="frontier",
+            gauge_weight="uniform",
             verbose=True,
         )
         pass_seconds = perf_counter() - pass_start

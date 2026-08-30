@@ -1,0 +1,88 @@
+{
+  "schema": "unordered-trotter-fixed-q-spacing-v1",
+  "thermodynamic_limit": true,
+  "fixed_physical_wavevector": 3.141592653589793,
+  "rows": [
+    {
+      "energy": 1.1712420262497625,
+      "kinetic": 0.5855831492341692,
+      "interaction": 0.5856588770155933,
+      "density": 0.999870684596814,
+      "site_density": 0.999870684596814,
+      "contact": 0.5856588770155933,
+      "layers": 3,
+      "bond_dim": 8,
+      "period": 2,
+      "string_order": null,
+      "parameters": [
+        0.0002593687052021716,
+        0.06017173938166379,
+        0.08429937585178993,
+        -1.4066020254297606e-05,
+        -0.1422621075727166
+      ],
+      "success": true,
+      "converged_restarts": 1,
+      "total_restarts": 1,
+      "nit": 52,
+      "nfev": 492,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+      "spacing": 1.0,
+      "wavevector": 3.141592653589793
+    },
+    {
+      "energy": 1.4164858850823805,
+      "kinetic": 0.7081863482468611,
+      "interaction": 0.7082995368355194,
+      "density": 0.9998401903009764,
+      "site_density": 0.4999200951504882,
+      "contact": 0.7082995368355194,
+      "layers": 3,
+      "bond_dim": 8,
+      "period": 4,
+      "string_order": null,
+      "parameters": [
+        8.71625459644878e-05,
+        -0.020335725874371813,
+        0.04916245080763923,
+        -7.564996584273232e-05,
+        -0.08401030923111248
+      ],
+      "success": true,
+      "converged_restarts": 1,
+      "total_restarts": 1,
+      "nit": 58,
+      "nfev": 474,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+      "spacing": 0.5,
+      "wavevector": 3.141592653589793
+    },
+    {
+      "energy": 1.6326233259471354,
+      "kinetic": 0.8162338967535241,
+      "interaction": 0.8163894291936113,
+      "density": 0.9998094835899864,
+      "site_density": 0.2499523708974966,
+      "contact": 0.8163894291936113,
+      "layers": 3,
+      "bond_dim": 8,
+      "period": 8,
+      "string_order": null,
+      "parameters": [
+        6.247424280069407e-05,
+        -0.040728255507841794,
+        0.0388290540931178,
+        -4.085479265372989e-05,
+        -0.06874443575451661
+      ],
+      "success": true,
+      "converged_restarts": 1,
+      "total_restarts": 1,
+      "nit": 30,
+      "nfev": 336,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+      "spacing": 0.25,
+      "wavevector": 3.141592653589793
+    }
+  ]
+}

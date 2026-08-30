@@ -310,7 +310,7 @@ def test_spatial_block2_carrier_uses_family_sweep_energy_for_qchem():
         noise=0.0,
     )
 
-    assert solver.e_tot == pytest.approx(-2.1754111431673824, abs=1.0e-8)
+    assert solver.energy == pytest.approx(-2.1754111431673824, abs=1.0e-8)
     assert low.e_tot == pytest.approx(low.sweep_history[-1]["energy"], abs=1.0e-12)
     info = solver._active_integral_build_info
     assert info["representation"] == "spatial_block2_table_carrier_mpo"
@@ -398,7 +398,7 @@ def test_spatial_block2_carrier_fused_compact_chain_projects_plan():
         },
     )
 
-    assert solver.e_tot == pytest.approx(-2.1754111431673824, abs=1.0e-8)
+    assert solver.energy == pytest.approx(-2.1754111431673824, abs=1.0e-8)
 
     family_profiles = []
     compact_profiles = []
@@ -476,7 +476,7 @@ def test_spatial_block2_carrier_grouped_matvec_backends_match_qchem(backend):
         },
     )
 
-    assert solver.e_tot == pytest.approx(-2.1754111431673824, abs=1.0e-8)
+    assert solver.energy == pytest.approx(-2.1754111431673824, abs=1.0e-8)
 
     family_profile = None
     moving_profile = None
@@ -558,7 +558,7 @@ def test_spatial_moving_environment_matches_old_local_operator_energy():
                 "packed_local_family_flat_direct_matvec_backend": "renormalized_table",
             },
         )
-        return solver.e_tot, low
+        return solver.energy, low
 
     old_energy, old_low = _run(False)
     moving_energy, moving_low = _run(True)
@@ -620,7 +620,7 @@ def test_spatial_moving_environment_cpp_davidson_matches_python():
                 "moving_environment_cpp_davidson": bool(use_cpp),
             },
         )
-        return solver.e_tot, low
+        return solver.energy, low
 
     python_energy, _python_low = _run(False)
     cpp_energy, cpp_low = _run(True)
@@ -681,7 +681,7 @@ def test_spatial_moving_environment_cpp_matvec_matches_cython_matvec():
                 "moving_environment_cpp_davidson": False,
             },
         )
-        return solver.e_tot, low
+        return solver.energy, low
 
     cython_energy, _cython_low = _run(False)
     cpp_energy, cpp_low = _run(True)
@@ -5180,7 +5180,7 @@ def test_fully_reduced_spatial_reduced_hamiltonian_builds_one_body_only():
         h1,
         eri=None,
         fully_reduced=True,
-        n_elec=2,
+        nelec=2,
         spin=0,
         ecore=-1.2,
         orb_sym=(1, 1),

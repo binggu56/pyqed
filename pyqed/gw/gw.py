@@ -183,10 +183,18 @@ def _build_spatial_eri_mo(gw, mo_coeff):
             optimize=True,
         )
 
-    if gw._ao2mofn is None:
-        raise ValueError("GW dense ERI build requires native dense AO ERIs or factorized ERIs.")
+    ao2mofn = gw._ao2mofn
+    if ao2mofn is None:
+        try:
+            from pyscf import ao2mo
+        except ImportError as exc:
+            raise ValueError(
+                "GW dense ERI build requires native dense AO ERIs, factorized "
+                "ERIs, an AO2MO callback, or PySCF."
+            ) from exc
+        ao2mofn = ao2mo.kernel
     nmo = mo_coeff.shape[1]
-    return gw._ao2mofn(
+    return ao2mofn(
         gw._scf.mol,
         (mo_coeff, mo_coeff, mo_coeff, mo_coeff),
         compact=False,

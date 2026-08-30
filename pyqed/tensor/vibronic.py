@@ -546,7 +546,7 @@ class MatrixProductState(object):
 
 
 class MPS:
-    def __init__(self, Bs, Ss, homogenous=True, bc='open', form="B"):
+    def __init__(self, Bs, Ss, homogeneous=True, bc='open', form="B"):
         """
         class for matrix product states.
 
@@ -561,7 +561,7 @@ class MPS:
 
         """
         assert bc in ['finite', 'infinite']
-        self.Bs = Bs
+        self.tensors = Bs
         self.Ss = Ss
         self.bc = bc
         self.L = len(Bs)
@@ -570,7 +570,7 @@ class MPS:
 
         self.data = self.factors = Bs
         # self.nsites = self.L = len(mps)
-        if homogenous:
+        if homogeneous:
             self.dim = Bs[0].shape[1]
         else:
             self.dims = [B.shape[1] for B in Bs] # physical dims of each site
@@ -578,11 +578,11 @@ class MPS:
         self._mpo = None
         
     def copy(self):
-        return MPS([B.copy() for B in self.Bs], [S.copy() for S in self.Ss], self.bc)
+        return MPS([B.copy() for B in self.tensors], [S.copy() for S in self.Ss], self.bc)
 
     def get_chi(self):
         """Return bond dimensions."""
-        return [self.Bs[i].shape[2] for i in range(self.nbonds)]
+        return [self.tensors[i].shape[2] for i in range(self.nbonds)]
     
     # def decompose(self, chi_max):
     #     pass
@@ -614,7 +614,7 @@ class MPS:
 
         The returned array has legs ``vL, i, vR`` (as one of the Bs).
         """
-        return np.tensordot(np.diag(self.Ss[i]), self.Bs[i], [1, 0])  # vL [vL'], [vL] i vR
+        return np.tensordot(np.diag(self.Ss[i]), self.tensors[i], [1, 0])  # vL [vL'], [vL] i vR
 
     def get_theta2(self, i):
         """Calculate effective two-site wave function on sites i,j=(i+1) in mixed canonical form.
@@ -622,7 +622,7 @@ class MPS:
         The returned array has legs ``vL, i, j, vR``.
         """
         j = (i + 1) % self.L
-        return np.tensordot(self.get_theta1(i), self.Bs[j], [2, 0])  # vL i [vR], [vL] j vR
+        return np.tensordot(self.get_theta1(i), self.tensors[j], [2, 0])  # vL i [vR], [vL] j vR
     
     def site_expectation_value(self, op):
         """Calculate expectation values of a local operator at each site."""
@@ -652,12 +652,12 @@ class MPS:
             warnings.warn("Skip calculating correlation_length() for large chi: could take long")
             return -1.
         assert self.bc == 'infinite'  # works only in the infinite case
-        B = self.Bs[0]  # vL i vR
+        B = self.tensors[0]  # vL i vR
         chi = B.shape[0]
         T = np.tensordot(B, np.conj(B), axes=(1, 1))  # vL [i] vR, vL* [i*] vR*
         T = np.transpose(T, [0, 2, 1, 3])  # vL vL* vR vR*
         for i in range(1, self.L):
-            B = self.Bs[i]
+            B = self.tensors[i]
             T = np.tensordot(T, B, axes=(2, 0))  # vL vL* [vR] vR*, [vL] i vR
             T = np.tensordot(T, np.conj(B), axes=([2, 3], [0, 1]))
             # vL vL* [vR*] [i] vR, [vL*] [i*] vR*
@@ -682,11 +682,11 @@ class MPS:
         C = np.tensordot(theta.conj(), C, axes=([0, 1], [1, 0]))  # [vL*] [i*] vR*, [i] [vL] vR
         for k in range(i + 1, j):
             k = k % self.L
-            B = self.Bs[k]  # vL k vR
+            B = self.tensors[k]  # vL k vR
             C = np.tensordot(C, B, axes=(1, 0)) # vR* [vR], [vL] k vR
             C = np.tensordot(B.conj(), C, axes=([0, 1], [0, 1])) # [vL*] [k*] vR*, [vR*] [k] vR
         j = j % self.L
-        B = self.Bs[j]  # vL k vR
+        B = self.tensors[j]  # vL k vR
         C = np.tensordot(C, B, axes=(1, 0)) # vR* [vR], [vL] j vR
         C = np.tensordot(op_j, C, axes=(1, 1))  # j [j*], vR* [j] vR
         C = np.tensordot(B.conj(), C, axes=([0, 1, 2], [1, 0, 2])) # [vL*] [j*] [vR*], [j] [vR*] [vR]

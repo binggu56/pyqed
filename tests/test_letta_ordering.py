@@ -5,13 +5,14 @@ import pytest
 
 from pyqed.letta import (
     FrontierTiedLETTA,
-    LocalHamiltonian,
-    LocalTerm,
+    frontier_order_profile,
     heisenberg_block_frontier_profile,
     heisenberg_frontier_profile,
     optimize_heisenberg_block_order,
     optimize_heisenberg_order,
+    optimize_frontier_order,
 )
+from pyqed.tn import LocalHamiltonian, LocalTerm
 from pyqed.letta.ordering import (
     heuristic_heisenberg_block_order,
     heuristic_heisenberg_order,
@@ -250,3 +251,39 @@ def test_ordering_rejects_nonpermutation_and_large_exact_problem():
         heisenberg_frontier_profile(3, (), (), (0, 0, 2))
     with pytest.raises(ValueError, match="limited"):
         optimize_heisenberg_order(21, (), ())
+
+
+def test_generic_weighted_order_reduces_or_preserves_frontier_objective():
+    ties = ((0, 1), (0, 2), (0, 3), (3, 4), (3, 5))
+    interactions = tuple((*edge, 1.0) for edge in ties)
+    identity = tuple(range(6))
+    optimized = optimize_frontier_order(
+        6,
+        ties,
+        interaction_edges=interactions,
+        effective_dims=(2, 2, 3, 2, 2, 2),
+    )
+    original_profile = frontier_order_profile(
+        6,
+        ties,
+        identity,
+        interaction_edges=interactions,
+        effective_dims=(2, 2, 3, 2, 2, 2),
+    )
+    optimized_profile = frontier_order_profile(
+        6,
+        ties,
+        optimized,
+        interaction_edges=interactions,
+        effective_dims=(2, 2, 3, 2, 2, 2),
+    )
+
+    original = (
+        max(row["score"] for row in original_profile),
+        sum(row["score"] for row in original_profile),
+    )
+    improved = (
+        max(row["score"] for row in optimized_profile),
+        sum(row["score"] for row in optimized_profile),
+    )
+    assert improved <= original

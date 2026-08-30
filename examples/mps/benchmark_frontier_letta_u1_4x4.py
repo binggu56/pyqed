@@ -27,7 +27,6 @@ from pyqed.letta import (
 from pyqed.mps import (
     DMRG,
     MPS,
-    MPO,
     dense_to_symmetric,
     dense_to_symmetric_mpo,
     symmetric_to_dense,
@@ -79,11 +78,11 @@ def _dense_mps_run(mpo, initial_cores, *, bond_dim, sweeps, tolerance):
         performance="generic",
     ).run()
     seconds = perf_counter() - start
-    cores = solver.ground_state.to_order(["lv", "p", "rv"]).factors
+    cores = solver.state.to_order(["lv", "p", "rv"]).factors
     return solver, {
         "symmetry": "none",
         "optimizer": "two_site_dmrg",
-        "energy": float(solver.e_tot),
+        "energy": float(solver.energy),
         "seconds": float(seconds),
         "parameters": int(sum(np.asarray(core).size for core in cores)),
         "directional_passes": len(_directional_history(solver)),
@@ -127,18 +126,18 @@ def _u1_mps_run(dense_mpo, initial_cores, *, bond_dim, sweeps, tolerance):
     block_parameters = int(
         sum(
             np.asarray(block).size
-            for tensor in solver.ground_state.factors
+            for tensor in solver.state.factors
             for block in tensor.data.values()
         )
     )
     dense_state = symmetric_to_dense(
-        solver.ground_state,
+        solver.state,
         site_qn_maps=site_qn_maps,
     ).to_order(["lv", "p", "rv"])
-    labels = solver.ground_state.labels
+    labels = solver.state.labels
     left_axis = labels.index("lv")
     right_axis = labels.index("rv")
-    factors = solver.ground_state.factors
+    factors = solver.state.factors
     bond_qns = [
         tuple(tuple(int(value) for value in charge) for charge in factors[0].qns[left_axis])
     ]
@@ -155,7 +154,7 @@ def _u1_mps_run(dense_mpo, initial_cores, *, bond_dim, sweeps, tolerance):
     return solver, dense_state, layout, {
         "symmetry": "U1_fixed_Sz",
         "optimizer": "two_site_dmrg",
-        "energy": float(solver.e_tot),
+        "energy": float(solver.energy),
         "seconds": float(seconds),
         "symmetry_parameters": block_parameters,
         "dense_equivalent_parameters": int(
@@ -211,7 +210,7 @@ def benchmark(*, bond_dim=4, mps_sweeps=20, letta_sweeps=40, tie_noise=1.0e-3, s
     weighted = tuple((left, right, 1.0) for left, right in nearest)
     weighted += tuple((left, right, 0.5) for left, right in diagonals)
     hamiltonian = heisenberg_local_hamiltonian(nsites, weighted)
-    dense_mpo = MPO(list(hamiltonian.to_mpo().compress().tensors))
+    dense_mpo = hamiltonian.to_mpo().compress()
     parents = parent_sets_from_edges(nsites, nearest)
     product = _neel_cores(nsites)
 

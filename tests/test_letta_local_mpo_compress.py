@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from pyqed.letta.local_terms import LocalHamiltonian, LocalMPO, LocalTerm
+from pyqed.tn import LocalHamiltonian, LocalTerm
+from pyqed.tn import MPO
 
 
 def _random_hermitian(rng, dimension):
@@ -23,9 +24,11 @@ def test_compress_preserves_random_complex_heterogeneous_hamiltonian(seed):
 
     mpo = hamiltonian.to_mpo()
     compressed = mpo.compress()
+    minimized = hamiltonian.to_mpo(minimize=True)
     vector = rng.normal(size=hamiltonian.shape[0])
     vector = vector + 1.0j * rng.normal(size=hamiltonian.shape[0])
 
+    assert mpo.factors is mpo.tensors
     np.testing.assert_allclose(
         compressed.to_dense(),
         mpo.to_dense(),
@@ -39,6 +42,8 @@ def test_compress_preserves_random_complex_heterogeneous_hamiltonian(seed):
         atol=3.0e-13,
     )
     assert max(compressed.bond_dims) < max(mpo.bond_dims)
+    assert minimized.bond_dims == compressed.bond_dims
+    np.testing.assert_allclose(minimized.to_dense(), compressed.to_dense(), atol=2.0e-13)
     assert compressed.dims == dims
     assert all(not tensor.flags.writeable for tensor in compressed.tensors)
 
@@ -51,7 +56,7 @@ def test_compress_removes_explicit_zero_channels_for_heterogeneous_dims():
     first[0, 0] = (0.4 + 0.3j) * np.eye(2)
     middle[0, 0] = np.eye(3)
     last[0, 0] = np.eye(2)
-    mpo = LocalMPO(dims, (first, middle, last))
+    mpo = MPO((first, middle, last))
 
     compressed = mpo.compress(rtol=0.0)
 

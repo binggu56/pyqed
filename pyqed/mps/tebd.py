@@ -7,7 +7,7 @@ Created on Wed Feb 11 13:21:30 2026
 """
 
 import numpy as np
-from pyqed.mps import DMRG
+from pyqed.mps.dmrg import DMRG
 
 class TEBD(DMRG):
 

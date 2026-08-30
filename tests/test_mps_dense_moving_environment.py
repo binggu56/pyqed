@@ -36,7 +36,7 @@ def test_dense_dmrg_uses_moving_environment_with_old_path_parity():
         },
     ).run()
 
-    assert np.allclose(moved.e_tot, direct.e_tot, atol=1.0e-12)
+    assert np.allclose(moved.energy, direct.energy, atol=1.0e-12)
 
     profile = moved.sweep_history[-1]["environment_profile"]["moving_environment"]
     assert profile["dense_local_operator_builds"] >= 1
@@ -433,7 +433,7 @@ def test_dense_dmrg_can_use_cpp_davidson_workspace_when_enabled():
         },
     ).run()
 
-    assert np.allclose(moved.e_tot, reference.e_tot, atol=1.0e-12)
+    assert np.allclose(moved.energy, reference.energy, atol=1.0e-12)
     profile = moved.sweep_history[-1]["updates"][-1]["matvec_profile"]
     assert profile["dominant_path"] in {
         "dense_cpp_davidson_blas",
@@ -496,7 +496,7 @@ def test_dense_dmrg_can_use_fused_cpp_two_site_solve_when_enabled():
         },
     ).run()
 
-    assert np.allclose(moved.e_tot, reference.e_tot, atol=1.0e-12)
+    assert np.allclose(moved.energy, reference.energy, atol=1.0e-12)
     profile = moved.sweep_history[-1]["updates"][-1]["matvec_profile"]
     assert profile["local_solver"]["kind"] == "cpp_dense_davidson"
     assert profile["local_solver"]["two_site_solver"]
@@ -540,7 +540,7 @@ def test_dense_dmrg_can_use_fused_cpp_block_davidson_when_enabled():
         },
     ).run()
 
-    assert np.allclose(moved.e_tot, reference.e_tot, atol=1.0e-12)
+    assert np.allclose(moved.energy, reference.energy, atol=1.0e-12)
     profile = moved.sweep_history[-1]["updates"][-1]["matvec_profile"]
     assert profile["local_solver"]["kind"] == "cpp_dense_block_davidson"
     assert profile["local_solver"]["two_site_solver"]
@@ -573,9 +573,9 @@ def test_dense_dmrg_accepts_mpo_wrapper_when_final_gauge_is_left():
         },
     ).run()
 
-    assert np.isfinite(dmrg.e_tot)
+    assert np.isfinite(dmrg.energy)
     assert dmrg.gauge.lower() == "left"
-    assert dmrg.ground_state.center == len(hamiltonian.factors) - 1
+    assert dmrg.state.center == len(hamiltonian.factors) - 1
 
 
 def test_dense_dmrg_generic_cpp_policy_uses_fused_local_solve():
@@ -597,7 +597,7 @@ def test_dense_dmrg_generic_cpp_policy_uses_fused_local_solve():
         "moving_environment"
     ]
     last_profile = dmrg.sweep_history[-1]["updates"][-1]["matvec_profile"]
-    assert np.isfinite(dmrg.e_tot)
+    assert np.isfinite(dmrg.energy)
     assert last_profile["local_solver"]["kind"] == "cpp_dense_davidson"
     assert last_profile["local_solver"]["two_site_solver"]
     assert moving_profile["dense_cpp_sweep_workspace_two_site_solve_calls"] >= 1

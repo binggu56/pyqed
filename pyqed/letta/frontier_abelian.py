@@ -14,6 +14,8 @@ from dataclasses import dataclass, replace
 
 import numpy as np
 
+from pyqed.lattice.site import Site
+
 from .abelian import _add_charges, _as_charge, _sub_charges
 from .core import _lowest_generalized_eigenpair, _lowest_hermitian_eigenpair
 from .cp_tying import _validated_parent_sets
@@ -23,7 +25,13 @@ from .frontier_tying import (
     FrontierTiedLETTA,
 )
 from .matrix_free import lowest_generalized_davidson
+from .physical_blocks import (
+    MatrixFreePhysicalBlockOperator,
+    PhysicalBlockGeneralizedProblem,
+    PhysicalBlockLayout,
+)
 from .initialization import _validated_mps_tensors
+from .tt_frontier import TTMPOFrontier
 
 
 def _charge_counts(local_qns, *, initial):
@@ -241,6 +249,31 @@ class FrontierAbelianLayout:
         return layout
 
     @classmethod
+    def from_sites(
+        cls,
+        sites,
+        *,
+        target,
+        bond_dims,
+        left_boundary=None,
+        bond_qns=None,
+    ):
+        """Build a layout from canonical sites carrying Abelian charges."""
+        sites = tuple(sites)
+        if not sites or any(not isinstance(site, Site) for site in sites):
+            raise TypeError("sites must contain canonical Site objects.")
+        missing = tuple(index for index, site in enumerate(sites) if site.charges is None)
+        if missing:
+            raise ValueError(f"sites {missing} do not define Abelian charges.")
+        return cls.from_local_charges(
+            tuple(site.charges for site in sites),
+            target=target,
+            bond_dims=bond_dims,
+            left_boundary=left_boundary,
+            bond_qns=bond_qns,
+        )
+
+    @classmethod
     def spin_half(
         cls,
         nsites,
@@ -336,29 +369,189 @@ class FrontierAbelianLayout:
         result._validate_charge_paths()
         return result
 
+    def with_reduced_bonds(self, labels_by_cut):
+        """Return a layout with selected charge degeneracies at internal cuts."""
+        bonds = list(self.bond_qns)
+        for cut, labels in labels_by_cut.items():
+            cut = int(cut)
+            if cut <= 0 or cut >= self.nsites:
+                raise ValueError("cut must be an internal virtual bond.")
+            labels = tuple(_as_charge(label) for label in labels)
+            if not labels:
+                raise ValueError("a reduced virtual bond must remain nonempty.")
+            available = Counter(bonds[cut])
+            requested = Counter(labels)
+            if any(requested[label] > available[label] for label in requested):
+                raise ValueError(
+                    "reduced bond labels must be a sub-multiset of the old labels."
+                )
+            bonds[cut] = labels
+        return type(self)(self.local_qns, tuple(bonds), self.target)
+
+
+def exact_block_factor_layout(
+    base_layout: FrontierAbelianLayout,
+    blocks,
+    physical_sites,
+) -> FrontierAbelianLayout:
+    r"""Allocate exact charge-resolved ranks inside logically fused blocks.
+
+    Block-boundary sectors are retained from ``base_layout``.  Every internal
+    cut receives the full conditional matrix rank, sector by sector.  Neutral
+    tied-parent axes contribute degeneracy when they occur on only one side
+    of a cut, so the factorization remains exact for a fused tensor carrying
+    microscopic boundary ties.
+    """
+    if not isinstance(base_layout, FrontierAbelianLayout):
+        raise TypeError("base_layout must be a FrontierAbelianLayout.")
+    blocks = tuple(tuple(int(site) for site in block) for block in blocks)
+    if not blocks or any(not block for block in blocks):
+        raise ValueError("blocks must contain nonempty site groups.")
+    if tuple(site for block in blocks for site in block) != tuple(
+        range(base_layout.nsites)
+    ):
+        raise ValueError(
+            "blocks must partition the chain into consecutive ordered groups."
+        )
+    physical_sites = tuple(
+        tuple(int(index) for index in sites) for sites in physical_sites
+    )
+    if len(physical_sites) != base_layout.nsites:
+        raise ValueError("physical_sites must contain one entry per tensor.")
+    for site, sites in enumerate(physical_sites):
+        if not sites or sites[0] != site:
+            raise ValueError("each tensor must own its leading physical site.")
+        if any(index < 0 or index >= base_layout.nsites for index in sites):
+            raise ValueError("physical_sites contains an invalid site index.")
+
+    dims = base_layout.dims
+    bond_qns = list(base_layout.bond_qns)
+
+    def configurations(sites):
+        sites = tuple(sorted(sites))
+        shape = tuple(dims[site] for site in sites)
+        return sites, (tuple(np.ndindex(*shape)) if shape else ((),))
+
+    for block in blocks:
+        start = block[0]
+        stop = block[-1] + 1
+        if block != tuple(range(start, stop)):
+            raise ValueError("every block must be consecutive in chain order.")
+        left_boundary = base_layout.bond_qns[start]
+        right_boundary = base_layout.bond_qns[stop]
+        for cut in range(start + 1, stop):
+            left_tensors = tuple(range(start, cut))
+            right_tensors = tuple(range(cut, stop))
+            left_variables = {
+                variable
+                for site in left_tensors
+                for variable in physical_sites[site]
+            }
+            right_variables = {
+                variable
+                for site in right_tensors
+                for variable in physical_sites[site]
+            }
+            overlap_sites, overlap_configs = configurations(
+                left_variables & right_variables
+            )
+            left_sites, left_configs = configurations(
+                left_variables - right_variables
+            )
+            right_sites, right_configs = configurations(
+                right_variables - left_variables
+            )
+
+            required = Counter()
+            for overlap_config in overlap_configs:
+                overlap_values = dict(zip(overlap_sites, overlap_config))
+                rows = Counter()
+                for boundary_charge in left_boundary:
+                    for configuration in left_configs:
+                        values = dict(overlap_values)
+                        values.update(zip(left_sites, configuration))
+                        middle_charge = boundary_charge
+                        for site in left_tensors:
+                            middle_charge = _add_charges(
+                                middle_charge,
+                                base_layout.local_qns[site][values[site]],
+                            )
+                        rows[middle_charge] += 1
+
+                columns = Counter()
+                for boundary_charge in right_boundary:
+                    for configuration in right_configs:
+                        values = dict(overlap_values)
+                        values.update(zip(right_sites, configuration))
+                        middle_charge = boundary_charge
+                        for site in right_tensors:
+                            middle_charge = _sub_charges(
+                                middle_charge,
+                                base_layout.local_qns[site][values[site]],
+                            )
+                        columns[middle_charge] += 1
+
+                for charge in rows.keys() & columns.keys():
+                    required[charge] = max(
+                        required[charge],
+                        min(rows[charge], columns[charge]),
+                    )
+            labels = tuple(
+                charge
+                for charge in sorted(required)
+                for _ in range(required[charge])
+            )
+            if not labels:
+                raise ValueError(
+                    f"block {block} has no charge-compatible path at cut {cut}."
+                )
+            bond_qns[cut] = labels
+
+    result = FrontierAbelianLayout(
+        base_layout.local_qns,
+        tuple(bond_qns),
+        base_layout.target,
+    )
+    result._validate_charge_paths()
+    return result
+
 
 class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
     r"""Graph-tied frontier LETTA restricted to a fixed Abelian charge sector.
 
-    The contractor remains dense in charge labels for now, while tensors and
-    every local eigensolve are projected onto symmetry-compatible entries.
-    This already removes forbidden variational parameters and prevents local
-    optimization from leaking out of the requested total-charge sector.
+    Tensors and every local eigensolve are projected onto symmetry-compatible
+    entries.  Termwise TT Hamiltonians also receive the local charges and keep
+    their operator-Schmidt factors homogeneous in charge transfer.  The TT
+    bond cores themselves remain dense inside the surviving sectors.
     """
+
+    _has_charge_resolved_two_site_split = True
+    _has_charge_resolved_block_split = True
 
     def __init__(
         self,
         hamiltonian,
-        dims,
         parent_sets,
-        *,
+        *legacy_parent_sets,
         abelian_layout: FrontierAbelianLayout,
         **kwargs,
     ):
         if not isinstance(abelian_layout, FrontierAbelianLayout):
             raise TypeError("abelian_layout must be a FrontierAbelianLayout.")
-        if tuple(int(dim) for dim in dims) != abelian_layout.dims:
-            raise ValueError("abelian_layout local dimensions do not match dims.")
+        if len(legacy_parent_sets) > 1:
+            raise TypeError(
+                "AbelianFrontierTiedLETTA accepts (hamiltonian, parent_sets); "
+                "the temporary legacy form is (hamiltonian, dims, parent_sets)."
+            )
+        if legacy_parent_sets:
+            legacy_dims = tuple(int(dim) for dim in parent_sets)
+            parent_sets = legacy_parent_sets[0]
+            if legacy_dims != hamiltonian.dims:
+                raise ValueError("hamiltonian dims are inconsistent with legacy dims.")
+        if hamiltonian.dims != abelian_layout.dims:
+            raise ValueError(
+                "abelian_layout local dimensions do not match the Hamiltonian sites."
+            )
         self.abelian_layout = abelian_layout
         if "bond_dims" not in kwargs:
             if "bond_dim" in kwargs:
@@ -372,15 +565,15 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
                     )
             else:
                 kwargs["bond_dims"] = abelian_layout.bond_dims
-        super().__init__(hamiltonian, dims, parent_sets, **kwargs)
+        super().__init__(hamiltonian, parent_sets, **kwargs)
         if tuple(self._bond_dims()) != abelian_layout.bond_dims:
             raise ValueError(
                 "abelian_layout bond dimensions do not match the frontier state."
             )
-        self.local_masks = abelian_layout.local_masks(self.physical_sites)
+
+    def _project_initial_tensors(self):
+        self.local_masks = self.abelian_layout.local_masks(self.physical_groups)
         self._apply_local_masks()
-        self.balance_gauges()
-        self.energy = self.expectation()
 
     @property
     def nparameters(self):
@@ -402,33 +595,114 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
         for site, mask in enumerate(self.local_masks):
             self.tensors[site] = np.where(mask, self.tensors[site], 0)
 
+    def _null_bond_basis(self, cut, left, right, *, rtol, atol):
+        labels = self.abelian_layout.bond_qns[cut]
+        columns = []
+        new_labels = []
+        sector_dimensions = []
+        sources = []
+        discarded_numerator = 0.0
+        discarded_denominator = 0.0
+        for charge in dict.fromkeys(labels):
+            indices = np.asarray(
+                [index for index, label in enumerate(labels) if label == charge],
+                dtype=np.intp,
+            )
+            left_block = self._hermitian_part(left[np.ix_(indices, indices)])
+            right_block = self._hermitian_part(right[np.ix_(indices, indices)])
+            left_basis, left_rank, left_discarded = self._gram_support(
+                left_block,
+                rtol=rtol,
+                atol=atol,
+            )
+            right_basis, right_rank, right_discarded = self._gram_support(
+                right_block,
+                rtol=rtol,
+                atol=atol,
+            )
+            if left_rank <= right_rank:
+                sector_basis = left_basis
+                source = "left"
+                discarded = left_discarded
+                gram = left_block
+            else:
+                sector_basis = right_basis
+                source = "right"
+                discarded = right_discarded
+                gram = right_block
+            rank = int(sector_basis.shape[1])
+            sector_dimensions.append((charge, len(indices), rank))
+            if rank:
+                embedded = np.zeros(
+                    (len(labels), rank),
+                    dtype=np.result_type(left, right, sector_basis),
+                )
+                embedded[indices] = sector_basis
+                columns.append(embedded)
+                new_labels.extend((charge,) * rank)
+            sources.append(source)
+            weight = max(float(np.trace(gram).real), 0.0)
+            discarded_numerator += discarded * weight
+            discarded_denominator += weight
+        if not columns:
+            basis = np.zeros((len(labels), 0), dtype=np.result_type(left, right))
+        else:
+            basis = np.concatenate(columns, axis=1)
+        source = sources[0] if len(set(sources)) == 1 else "mixed"
+        relative_discarded = (
+            discarded_numerator / discarded_denominator
+            if discarded_denominator > np.finfo(float).tiny
+            else 0.0
+        )
+        return (
+            basis,
+            source,
+            tuple(sector_dimensions),
+            float(relative_discarded),
+            tuple(new_labels),
+        )
+
+    def _set_reduced_bond_layouts(self, labels_by_cut):
+        if not labels_by_cut:
+            return
+        self.abelian_layout = self.abelian_layout.with_reduced_bonds(labels_by_cut)
+        self.local_masks = self.abelian_layout.local_masks(self.physical_groups)
+        self._apply_local_masks()
+
     def copy(self):
         result = type(self)(
             self.hamiltonian,
-            self.dims,
             self.parent_sets,
             abelian_layout=self.abelian_layout,
             bond_dim=self.bond_dim,
             bond_dims=self._bond_dims(),
             tensors=[tensor.copy() for tensor in self.tensors],
             frontier_backend=self.frontier_backend,
+            chunk_size=self.chunk_size,
+            chunk_memory=self.chunk_memory,
+            chunk_span=self.chunk_span,
+            workers=self.workers,
             path_optimizer=self.path_optimizer,
-            tt_max_rank=self.tt_options["max_rank"],
-            tt_rtol=self.tt_options["rtol"],
-            tt_atol=self.tt_options["atol"],
-            tt_transfer_max_rank=self.tt_options["transfer_max_rank"],
-            tt_transfer_rtol=self.tt_options["transfer_rtol"],
-            tt_transfer_atol=self.tt_options["transfer_atol"],
+            max_rank=self.tt_options["max_rank"],
+            rtol=self.tt_options["rtol"],
+            atol=self.tt_options["atol"],
+            transfer_max_rank=self.tt_options["transfer_max_rank"],
+            transfer_rtol=self.tt_options["transfer_rtol"],
+            transfer_atol=self.tt_options["transfer_atol"],
             tt_absorption=self.tt_options["absorption"],
             tt_norm_backend=self.tt_norm_backend,
             tt_hermitize=self.tt_hermitize,
+            tt_channels=self.tt_channels,
+            tt_gauge=self.tt_gauge,
+            compute_dtype=self.compute_dtype,
+            device=self.device,
         )
         result.tensors = [tensor.copy() for tensor in self.tensors]
         result.history = list(self.history)
         result.energy = result.expectation()
         result.converged = self.converged
         result.rng.bit_generator.state = deepcopy(self.rng.bit_generator.state)
-        return result
+        return self._copy_public_settings_to(result)
 
     def _automatic_expansion_labels(self, cut, count):
         """Choose charge labels connected to both neighboring fixed layouts."""
@@ -476,6 +750,140 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
             degeneracies[charge] += 1
         return tuple(labels)
 
+    def _prepare_amen_directions(self, cut, direction, directions):
+        """Project AMEn columns into their appended Abelian bond sectors."""
+        cut = int(cut)
+        directions = np.asarray(directions)
+        old_dimension = self._bond_dims()[cut]
+        labels = self.abelian_layout.bond_qns[cut]
+        new_masks = self.abelian_layout.local_masks(self.physical_groups)
+        if direction == "right":
+            tensor = self.tensors[cut - 1]
+            axes = (0, *range(2, tensor.ndim), 1)
+            old = tensor.transpose(axes).reshape(-1, old_dimension)
+            mask = new_masks[cut - 1].transpose(axes).reshape(-1, len(labels))
+            result = np.zeros_like(directions)
+            for offset in range(directions.shape[1]):
+                channel = old_dimension + offset
+                support = mask[:, channel]
+                same = [
+                    index
+                    for index, charge in enumerate(labels[:old_dimension])
+                    if charge == labels[channel]
+                ]
+                supported = np.flatnonzero(support)
+                occupied = old[np.ix_(supported, same)]
+                source = directions[supported, offset : offset + 1]
+                embedded = self._orthogonal_enrichment(
+                    occupied,
+                    source,
+                    1,
+                    rng=self.rng,
+                )
+                if embedded.shape[1]:
+                    result[supported, offset] = embedded[:, 0]
+            return result
+
+        tensor = self.tensors[cut]
+        old = tensor.reshape(old_dimension, -1)
+        mask = new_masks[cut].reshape(len(labels), -1)
+        result = np.zeros_like(directions)
+        for offset in range(directions.shape[0]):
+            channel = old_dimension + offset
+            support = mask[channel]
+            same = [
+                index
+                for index, charge in enumerate(labels[:old_dimension])
+                if charge == labels[channel]
+            ]
+            supported = np.flatnonzero(support)
+            occupied = old[np.ix_(same, supported)].T
+            source = directions[offset : offset + 1, supported].T
+            embedded = self._orthogonal_enrichment(
+                occupied,
+                source,
+                1,
+                rng=self.rng,
+            )
+            if embedded.shape[1]:
+                result[offset, supported] = embedded[:, 0]
+        return result
+
+    def _amen_compression_labels(self, cut, target_dimension):
+        """Restore the pre-expansion U(1) sector multiplicities at a cut."""
+        labels = self.abelian_layout.bond_qns[int(cut)]
+        target_dimension = int(target_dimension)
+        if target_dimension < 1 or target_dimension > len(labels):
+            raise ValueError("invalid AMEn compression dimension.")
+        # Symmetry expansion appends labels, so this prefix is exactly the
+        # sector layout that existed before the temporary saturated growth.
+        return tuple(labels[:target_dimension])
+
+    def _prepare_saturated_amen_directions(self, cut, direction, directions):
+        temporary_labels = self._automatic_expansion_labels(
+            cut,
+            directions.shape[1] if direction == "right" else directions.shape[0],
+        )
+        return np.asarray(directions), temporary_labels
+
+    def _set_amen_compressed_bond_layout(self, cut, labels):
+        labels = tuple(labels)
+        self.abelian_layout = self.abelian_layout.with_reduced_bonds(
+            {int(cut): labels}
+        )
+        self.local_masks = self.abelian_layout.local_masks(self.physical_groups)
+        self._apply_local_masks()
+
+    def _expand_saturated_amen_bond(
+        self,
+        cut,
+        *,
+        direction,
+        directions,
+        scale,
+        source_norm,
+        temporary_labels=None,
+    ):
+        """Open a temporary U(1) bond retained through the neighboring solve."""
+        cut = int(cut)
+        temporary_labels = tuple(temporary_labels or ())
+        count = (
+            directions.shape[1]
+            if direction == "right"
+            else directions.shape[0]
+        )
+        if len(temporary_labels) != count:
+            raise ValueError("temporary U(1) labels do not match AMEn directions.")
+        return self.expand_bond(
+            cut,
+            self._bond_dims()[cut] + count,
+            new_charge_labels=temporary_labels,
+            direction=direction,
+            strategy="amen",
+            scale=scale,
+            _directions=directions,
+            _source_norm=source_norm,
+            _evaluate=False,
+            _reset_history=False,
+        )
+
+    def _bond_gauge_blocks(self, cut):
+        """Restrict virtual gauges to independent conserved-charge sectors."""
+        labels = self.abelian_layout.bond_qns[int(cut)]
+        return tuple(
+            np.asarray(
+                [index for index, label in enumerate(labels) if label == charge],
+                dtype=np.intp,
+            )
+            for charge in sorted(set(labels))
+        )
+
+    def _apply_bond_gauge_constraints(self):
+        self._apply_local_masks()
+
+    def _local_action_mask(self, site):
+        return self.local_masks[int(site)]
+
     def expand_bond(
         self,
         cut,
@@ -486,6 +894,10 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
         strategy="residual",
         scale=1.0e-3,
         seed=None,
+        _directions=None,
+        _source_norm=None,
+        _evaluate=True,
+        _reset_history=True,
     ):
         """Expand one cut while appending symmetry-compatible charge labels.
 
@@ -513,18 +925,27 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
                     "new_charge_labels must contain one label per added channel."
                 )
         new_layout = self.abelian_layout.with_expanded_bond(cut, labels)
-        record = super().expand_bond(
-            cut,
-            new_dimension,
-            direction=direction,
-            strategy=strategy,
-            scale=scale,
-            seed=seed,
-        )
+        old_layout = self.abelian_layout
         self.abelian_layout = new_layout
-        self.local_masks = new_layout.local_masks(self.physical_sites)
+        try:
+            record = super().expand_bond(
+                cut,
+                new_dimension,
+                direction=direction,
+                strategy=strategy,
+                scale=scale,
+                seed=seed,
+                _directions=_directions,
+                _source_norm=_source_norm,
+                _evaluate=_evaluate,
+                _reset_history=_reset_history,
+            )
+        except Exception:
+            self.abelian_layout = old_layout
+            raise
+        self.local_masks = new_layout.local_masks(self.physical_groups)
         self._apply_local_masks()
-        energy_after = self.expectation()
+        energy_after = self.expectation() if _evaluate else record.energy
         normalized_direction = str(direction).lower().replace("_", "-")
         expands_right = normalized_direction in {
             "right",
@@ -556,15 +977,692 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
             "frontier gauge or disable virtual canonicalization."
         )
 
-    def natural_gradient_step(self, **kwargs):
-        raise NotImplementedError(
-            "the unrestricted block natural gradient can leave the Abelian "
-            "support; symmetry-projected natural gradients are not implemented."
-        )
+    def _natural_gradient_support_indices(self, site):
+        """Restrict simultaneous relaxation to the exact Abelian support."""
+        return self._support_indices(site)
 
     def _support_indices(self, site):
         site = self._validated_site(site)
         return np.flatnonzero(self.local_masks[site].reshape(-1))
+
+    def _pair_action_mask(self, site, plan):
+        """Exact U(1) support from the two owned spins and outer bond charges."""
+        site = int(site)
+        following = site + 1
+        union_sites = tuple(plan.union_sites)
+        site_axis = union_sites.index(site)
+        following_axis = union_sites.index(following)
+        left_qns = self.abelian_layout.bond_qns[site]
+        right_qns = self.abelian_layout.bond_qns[following + 1]
+        site_qns = self.abelian_layout.local_qns[site]
+        following_qns = self.abelian_layout.local_qns[following]
+        mask = np.zeros(plan.merged_shape, dtype=bool)
+        physical_shape = plan.merged_shape[2:]
+        for configuration in np.ndindex(*physical_shape):
+            owned_charge = _add_charges(
+                site_qns[configuration[site_axis]],
+                following_qns[configuration[following_axis]],
+            )
+            for left, q_left in enumerate(left_qns):
+                q_right_required = _add_charges(q_left, owned_charge)
+                for right, q_right in enumerate(right_qns):
+                    if q_right == q_right_required:
+                        mask[(left, right, *configuration)] = True
+        return mask
+
+    def pair_local_packed_action_block_problem(self, site, *, environment=None):
+        """Build compact charge-sector pair routes from exact frontier blocks."""
+        site = int(site)
+        plan = self._pair_plan(site)
+        environment = self._resolved_pair_environment(site, environment)
+        materialized = super().pair_local_block_problem(
+            site,
+            environment=environment,
+        )
+        layout = materialized.layout
+        flat_mask = self._pair_action_mask(site, plan).reshape(-1)
+        block_masks = layout.as_blocks(flat_mask)
+        native_dtype = np.dtype(np.result_type(
+            self.tensors[site].dtype,
+            self.tensors[site + 1].dtype,
+            self.hamiltonian.dtype,
+        ))
+        compute_dtype = (
+            native_dtype
+            if self.compute_dtype is None
+            else np.dtype(self.compute_dtype)
+        )
+        if native_dtype.kind == "c" and compute_dtype.kind != "c":
+            compute_dtype = np.dtype(
+                np.complex64
+                if compute_dtype.itemsize <= 4
+                else np.complex128
+            )
+        routes = []
+        diagonal_blocks = {}
+        stored_elements = 0
+        for (row, column), block in materialized.hamiltonian.blocks.items():
+            row_local = np.flatnonzero(block_masks[row])
+            column_local = np.flatnonzero(block_masks[column])
+            if row_local.size == 0 or column_local.size == 0:
+                continue
+            packed = np.asarray(block)[np.ix_(row_local, column_local)]
+            if not np.any(packed):
+                continue
+            row_indices = layout.block_indices[row][row_local]
+            column_indices = layout.block_indices[column][column_local]
+            routes.append(
+                (
+                    row_indices,
+                    column_indices,
+                    np.asarray(packed, dtype=compute_dtype),
+                )
+            )
+            stored_elements += packed.size
+            if row == column:
+                diagonal_blocks[row] = np.asarray(block).copy()
+
+        size = layout.size
+        xp = getattr(plan.hamiltonian_engine, "_xp", np)
+        device = getattr(plan.hamiltonian_engine, "device", "cpu")
+        device_routes = tuple(
+            (
+                xp.asarray(rows),
+                xp.asarray(columns),
+                xp.asarray(block, dtype=compute_dtype),
+            )
+            for rows, columns, block in routes
+        )
+
+        def apply_routes(vector):
+            vector = np.asarray(vector)
+            if vector.size != size:
+                raise ValueError(f"vector must contain {size} entries.")
+            action_dtype = np.result_type(vector.dtype, compute_dtype)
+            result = xp.zeros(size, dtype=action_dtype)
+            flat = xp.asarray(vector.reshape(-1), dtype=action_dtype)
+            for rows, columns, block in device_routes:
+                result[rows] += block @ flat[columns]
+            return xp.asnumpy(result) if device == "cuda" else np.asarray(result)
+
+        def action(vector):
+            return apply_routes(vector)
+
+        def actions(vectors):
+            vectors = np.asarray(vectors)
+            if vectors.ndim != 2 or vectors.shape[1] != size:
+                raise ValueError(f"vectors must have shape (batch, {size}).")
+            action_dtype = np.result_type(vectors.dtype, compute_dtype)
+            result = xp.zeros(
+                vectors.shape,
+                dtype=action_dtype,
+            )
+            device_vectors = xp.asarray(vectors, dtype=action_dtype)
+            for rows, columns, block in device_routes:
+                result[:, rows] += device_vectors[:, columns] @ block.T
+            return xp.asnumpy(result) if device == "cuda" else np.asarray(result)
+
+        action.many = actions
+        action.backend = f"packed-u1-pair-blocks-{device}"
+        action.packed_route_count = len(routes)
+        action.packed_stored_elements = int(stored_elements)
+        if compute_dtype != native_dtype:
+            reference = super().pair_local_action_block_problem(
+                site,
+                environment=environment,
+            )
+            action.verify = reference.hamiltonian.verification_matvec
+        operator = MatrixFreePhysicalBlockOperator(
+            layout,
+            materialized.hamiltonian.connected_pairs,
+            action,
+            dtype=compute_dtype,
+        )
+        operator._stored_elements = int(stored_elements)
+        operator.diagonal_blocks = diagonal_blocks
+        operator.backend = action.backend
+        return PhysicalBlockGeneralizedProblem(
+            layout,
+            materialized.metric,
+            operator,
+        )
+
+    def _split_merged_pair_tensor(
+        self,
+        site,
+        merged,
+        union_sites,
+        *,
+        middle_dimension=None,
+        middle_labels=None,
+    ):
+        """Split a merged pair independently in each middle-bond charge sector."""
+        site = int(site)
+        following = site + 1
+        left_sites = self.physical_groups[site]
+        right_sites = self.physical_groups[following]
+        union_sites = tuple(int(index) for index in union_sites)
+        expected_union = (site,) + tuple(
+            sorted((set(left_sites) | set(right_sites)) - {site})
+        )
+        if union_sites != expected_union:
+            raise ValueError("union_sites are inconsistent with the adjacent pair.")
+
+        merged = np.asarray(merged)
+        expected_shape = (
+            self.tensors[site].shape[0],
+            self.tensors[following].shape[1],
+            *(self.dims[index] for index in union_sites),
+        )
+        if merged.shape != expected_shape:
+            raise ValueError(f"merged tensor shape must be {expected_shape}.")
+
+        overlap = tuple(sorted(set(left_sites) & set(right_sites)))
+        left_only = tuple(index for index in left_sites if index not in overlap)
+        right_only = tuple(index for index in right_sites if index not in overlap)
+        overlap_shape = tuple(self.dims[index] for index in overlap)
+        left_shape = tuple(self.dims[index] for index in left_only)
+        right_shape = tuple(self.dims[index] for index in right_only)
+        left_dimension = merged.shape[0]
+        right_dimension = merged.shape[1]
+        current_labels = self.abelian_layout.bond_qns[following]
+        middle_labels = (
+            current_labels
+            if middle_labels is None
+            else tuple(middle_labels)
+        )
+        if middle_dimension is None:
+            middle_dimension = len(middle_labels)
+        middle_dimension = int(middle_dimension)
+        if middle_dimension != len(middle_labels):
+            raise ValueError(
+                "middle_dimension must match the retained charge labels."
+            )
+        if middle_dimension < 1:
+            raise ValueError("middle_dimension must be positive.")
+        target_layout = (
+            self.abelian_layout
+            if middle_labels == current_labels
+            else self.abelian_layout.with_reduced_bonds(
+                {following: middle_labels}
+            )
+        )
+        target_masks = target_layout.local_masks(self.physical_groups)
+        channels = {}
+        for channel, charge in enumerate(middle_labels):
+            channels.setdefault(charge, []).append(channel)
+
+        left_result = np.zeros(
+            (left_dimension, middle_dimension, *self.tensors[site].shape[2:]),
+            dtype=merged.dtype,
+        )
+        right_result = np.zeros(
+            (middle_dimension, right_dimension, *self.tensors[following].shape[2:]),
+            dtype=merged.dtype,
+        )
+        total_weight = 0.0
+        retained_weight = 0.0
+        conditional_ranks = []
+        overlap_configurations = (
+            np.ndindex(*overlap_shape) if overlap_shape else [()]
+        )
+        for overlap_configuration in overlap_configurations:
+            overlap_values = dict(zip(overlap, overlap_configuration))
+            left_configurations = (
+                tuple(np.ndindex(*left_shape)) if left_shape else ((),)
+            )
+            right_configurations = (
+                tuple(np.ndindex(*right_shape)) if right_shape else ((),)
+            )
+            block = np.empty(
+                (left_dimension, *left_shape, right_dimension, *right_shape),
+                dtype=merged.dtype,
+            )
+            for left_configuration in left_configurations:
+                for right_configuration in right_configurations:
+                    values = dict(overlap_values)
+                    values.update(zip(left_only, left_configuration))
+                    values.update(zip(right_only, right_configuration))
+                    union_configuration = tuple(
+                        values[index] for index in union_sites
+                    )
+                    block[
+                        (
+                            slice(None),
+                            *left_configuration,
+                            slice(None),
+                            *right_configuration,
+                        )
+                    ] = merged[
+                        (slice(None), slice(None), *union_configuration)
+                    ]
+            matrix = block.reshape(
+                left_dimension * int(np.prod(left_shape, dtype=int)),
+                right_dimension * int(np.prod(right_shape, dtype=int)),
+            )
+            total_weight += float(np.linalg.norm(matrix) ** 2)
+
+            row_groups = {charge: [] for charge in channels}
+            row_records = []
+            for left_virtual, q_left in enumerate(
+                self.abelian_layout.bond_qns[site]
+            ):
+                for left_configuration in left_configurations:
+                    values = dict(overlap_values)
+                    values.update(zip(left_only, left_configuration))
+                    q_middle = _add_charges(
+                        q_left,
+                        self.abelian_layout.local_qns[site][values[site]],
+                    )
+                    row = np.ravel_multi_index(
+                        (left_virtual, *left_configuration),
+                        (left_dimension, *left_shape),
+                    )
+                    row_records.append(
+                        (row, left_virtual, left_configuration, q_middle)
+                    )
+                    if q_middle in row_groups:
+                        row_groups[q_middle].append(row)
+
+            column_groups = {charge: [] for charge in channels}
+            column_records = []
+            for right_virtual, q_right in enumerate(
+                self.abelian_layout.bond_qns[following + 1]
+            ):
+                for right_configuration in right_configurations:
+                    values = dict(overlap_values)
+                    values.update(zip(right_only, right_configuration))
+                    q_middle = _sub_charges(
+                        q_right,
+                        self.abelian_layout.local_qns[following][
+                            values[following]
+                        ],
+                    )
+                    column = np.ravel_multi_index(
+                        (right_virtual, *right_configuration),
+                        (right_dimension, *right_shape),
+                    )
+                    column_records.append(
+                        (
+                            column,
+                            right_virtual,
+                            right_configuration,
+                            q_middle,
+                        )
+                    )
+                    if q_middle in column_groups:
+                        column_groups[q_middle].append(column)
+
+            row_lookup = {
+                row: (left_virtual, configuration)
+                for row, left_virtual, configuration, _charge in row_records
+            }
+            column_lookup = {
+                column: (right_virtual, configuration)
+                for column, right_virtual, configuration, _charge in column_records
+            }
+            for charge, sector_channels in channels.items():
+                rows = row_groups[charge]
+                columns = column_groups[charge]
+                if not rows or not columns:
+                    conditional_ranks.append(0)
+                    continue
+                sector = matrix[np.ix_(rows, columns)]
+                left_vectors, singular_values, right_vectors = np.linalg.svd(
+                    sector,
+                    full_matrices=False,
+                )
+                scale = max(
+                    float(singular_values[0]) if singular_values.size else 0.0,
+                    np.finfo(float).tiny,
+                )
+                numerical_rank = int(
+                    np.count_nonzero(
+                        singular_values
+                        > 256.0 * np.finfo(float).eps * scale
+                    )
+                )
+                conditional_ranks.append(numerical_rank)
+                retained = min(len(sector_channels), singular_values.size)
+                retained_weight += float(
+                    np.sum(singular_values[:retained] ** 2)
+                )
+                square_root = np.sqrt(singular_values[:retained])
+                for local_channel, channel in enumerate(
+                    sector_channels[:retained]
+                ):
+                    for sector_row, row in enumerate(rows):
+                        left_virtual, left_configuration = row_lookup[row]
+                        values = dict(overlap_values)
+                        values.update(zip(left_only, left_configuration))
+                        physical = tuple(values[index] for index in left_sites)
+                        left_result[
+                            (left_virtual, channel, *physical)
+                        ] = (
+                            left_vectors[sector_row, local_channel]
+                            * square_root[local_channel]
+                        )
+                    for sector_column, column in enumerate(columns):
+                        right_virtual, right_configuration = column_lookup[column]
+                        values = dict(overlap_values)
+                        values.update(zip(right_only, right_configuration))
+                        physical = tuple(values[index] for index in right_sites)
+                        right_result[
+                            (channel, right_virtual, *physical)
+                        ] = (
+                            square_root[local_channel]
+                            * right_vectors[local_channel, sector_column]
+                        )
+
+        left_result = np.where(target_masks[site], left_result, 0)
+        right_result = np.where(
+            target_masks[following],
+            right_result,
+            0,
+        )
+        discarded_weight = max(0.0, total_weight - retained_weight)
+        relative_error = np.sqrt(
+            discarded_weight / max(total_weight, np.finfo(float).tiny)
+        )
+        return (
+            left_result,
+            right_result,
+            overlap,
+            tuple(conditional_ranks),
+            float(relative_error),
+        )
+
+    def _split_merged_block_tensor(self, start, stop, merged, union_sites):
+        """Split a merged block successively in every U(1) bond sector."""
+        start = int(start)
+        stop = int(stop)
+        sites = tuple(range(start, stop))
+        if len(sites) < 2:
+            raise ValueError("a merged block must contain at least two sites.")
+        expected_union = (start,) + tuple(
+            sorted(
+                {
+                    physical_site
+                    for site in sites
+                    for physical_site in self.physical_groups[site]
+                }
+                - {start}
+            )
+        )
+        union_sites = tuple(int(index) for index in union_sites)
+        if union_sites != expected_union:
+            raise ValueError("union_sites are inconsistent with the block.")
+        current = np.asarray(merged)
+        expected_shape = (
+            self.tensors[start].shape[0],
+            self.tensors[stop - 1].shape[1],
+            *(self.dims[index] for index in union_sites),
+        )
+        if current.shape != expected_shape:
+            raise ValueError(f"merged tensor shape must be {expected_shape}.")
+
+        factors = []
+        current_sites = union_sites
+        conditional_ranks = []
+        discarded_weight = 0.0
+        reference_weight = max(
+            float(np.linalg.norm(current) ** 2),
+            np.finfo(float).tiny,
+        )
+        right_boundary_labels = self.abelian_layout.bond_qns[stop]
+        for site in sites[:-1]:
+            following = site + 1
+            left_sites = self.physical_groups[site]
+            right_sites = (following,) + tuple(
+                sorted(
+                    {
+                        physical_site
+                        for right_site in range(following, stop)
+                        for physical_site in self.physical_groups[right_site]
+                    }
+                    - {following}
+                )
+            )
+            expected_current = (site,) + tuple(
+                sorted((set(left_sites) | set(right_sites)) - {site})
+            )
+            if current_sites != expected_current:
+                raise ValueError(
+                    "the merged block has an inconsistent physical-label order."
+                )
+
+            overlap = tuple(sorted(set(left_sites) & set(right_sites)))
+            left_only = tuple(
+                index for index in left_sites if index not in overlap
+            )
+            right_only = tuple(
+                index for index in right_sites if index not in overlap
+            )
+            overlap_shape = tuple(self.dims[index] for index in overlap)
+            left_shape = tuple(self.dims[index] for index in left_only)
+            right_shape = tuple(self.dims[index] for index in right_only)
+            left_dimension = current.shape[0]
+            right_dimension = current.shape[1]
+            middle_labels = self.abelian_layout.bond_qns[following]
+            channels = {}
+            for channel, charge in enumerate(middle_labels):
+                channels.setdefault(charge, []).append(channel)
+
+            left_result = np.zeros_like(
+                self.tensors[site],
+                dtype=current.dtype,
+            )
+            remainder = np.zeros(
+                (
+                    len(middle_labels),
+                    right_dimension,
+                    *(self.dims[index] for index in right_sites),
+                ),
+                dtype=current.dtype,
+            )
+            overlap_configurations = (
+                np.ndindex(*overlap_shape) if overlap_shape else [()]
+            )
+            for overlap_configuration in overlap_configurations:
+                overlap_values = dict(zip(overlap, overlap_configuration))
+                left_configurations = (
+                    tuple(np.ndindex(*left_shape)) if left_shape else ((),)
+                )
+                right_configurations = (
+                    tuple(np.ndindex(*right_shape)) if right_shape else ((),)
+                )
+                block = np.empty(
+                    (
+                        left_dimension,
+                        *left_shape,
+                        right_dimension,
+                        *right_shape,
+                    ),
+                    dtype=current.dtype,
+                )
+                for left_configuration in left_configurations:
+                    for right_configuration in right_configurations:
+                        values = dict(overlap_values)
+                        values.update(zip(left_only, left_configuration))
+                        values.update(zip(right_only, right_configuration))
+                        block[
+                            (
+                                slice(None),
+                                *left_configuration,
+                                slice(None),
+                                *right_configuration,
+                            )
+                        ] = current[
+                            (
+                                slice(None),
+                                slice(None),
+                                *(values[index] for index in current_sites),
+                            )
+                        ]
+                matrix = block.reshape(
+                    left_dimension * int(np.prod(left_shape, dtype=int)),
+                    right_dimension * int(np.prod(right_shape, dtype=int)),
+                )
+
+                row_groups = {charge: [] for charge in channels}
+                row_records = []
+                for left_virtual, q_left in enumerate(
+                    self.abelian_layout.bond_qns[site]
+                ):
+                    for configuration in left_configurations:
+                        values = dict(overlap_values)
+                        values.update(zip(left_only, configuration))
+                        q_middle = _add_charges(
+                            q_left,
+                            self.abelian_layout.local_qns[site][values[site]],
+                        )
+                        row = np.ravel_multi_index(
+                            (left_virtual, *configuration),
+                            (left_dimension, *left_shape),
+                        )
+                        row_records.append(
+                            (row, left_virtual, configuration)
+                        )
+                        if q_middle in row_groups:
+                            row_groups[q_middle].append(row)
+
+                column_groups = {charge: [] for charge in channels}
+                column_records = []
+                for right_virtual, q_right in enumerate(
+                    right_boundary_labels
+                ):
+                    for configuration in right_configurations:
+                        values = dict(overlap_values)
+                        values.update(zip(right_only, configuration))
+                        q_middle = q_right
+                        for owned_site in range(following, stop):
+                            q_middle = _sub_charges(
+                                q_middle,
+                                self.abelian_layout.local_qns[owned_site][
+                                    values[owned_site]
+                                ],
+                            )
+                        column = np.ravel_multi_index(
+                            (right_virtual, *configuration),
+                            (right_dimension, *right_shape),
+                        )
+                        column_records.append(
+                            (column, right_virtual, configuration)
+                        )
+                        if q_middle in column_groups:
+                            column_groups[q_middle].append(column)
+
+                row_lookup = {
+                    row: (left_virtual, configuration)
+                    for row, left_virtual, configuration in row_records
+                }
+                column_lookup = {
+                    column: (right_virtual, configuration)
+                    for column, right_virtual, configuration in column_records
+                }
+                for charge, sector_channels in channels.items():
+                    rows = row_groups[charge]
+                    columns = column_groups[charge]
+                    if not rows or not columns:
+                        conditional_ranks.append(0)
+                        continue
+                    sector = matrix[np.ix_(rows, columns)]
+                    left_vectors, singular_values, right_vectors = np.linalg.svd(
+                        sector,
+                        full_matrices=False,
+                    )
+                    scale = max(
+                        float(singular_values[0])
+                        if singular_values.size
+                        else 0.0,
+                        np.finfo(float).tiny,
+                    )
+                    numerical_rank = int(
+                        np.count_nonzero(
+                            singular_values
+                            > 256.0 * np.finfo(float).eps * scale
+                        )
+                    )
+                    conditional_ranks.append(numerical_rank)
+                    retained = min(
+                        len(sector_channels),
+                        singular_values.size,
+                    )
+                    discarded_weight += float(
+                        np.sum(singular_values[retained:] ** 2)
+                    )
+                    square_root = np.sqrt(singular_values[:retained])
+                    for local_channel, channel in enumerate(
+                        sector_channels[:retained]
+                    ):
+                        for sector_row, row in enumerate(rows):
+                            left_virtual, configuration = row_lookup[row]
+                            values = dict(overlap_values)
+                            values.update(zip(left_only, configuration))
+                            physical = tuple(
+                                values[index] for index in left_sites
+                            )
+                            left_result[
+                                (left_virtual, channel, *physical)
+                            ] = (
+                                left_vectors[sector_row, local_channel]
+                                * square_root[local_channel]
+                            )
+                        for sector_column, column in enumerate(columns):
+                            right_virtual, configuration = column_lookup[column]
+                            values = dict(overlap_values)
+                            values.update(zip(right_only, configuration))
+                            physical = tuple(
+                                values[index] for index in right_sites
+                            )
+                            remainder[
+                                (channel, right_virtual, *physical)
+                            ] = (
+                                square_root[local_channel]
+                                * right_vectors[local_channel, sector_column]
+                            )
+
+            left_result = np.where(
+                self.local_masks[site],
+                left_result,
+                0,
+            )
+            factors.append(left_result)
+            current = remainder
+            current_sites = right_sites
+
+        final_site = stop - 1
+        if current_sites != self.physical_groups[final_site]:
+            raise ValueError("final block factor has inconsistent physical labels.")
+        final = np.where(self.local_masks[final_site], current, 0)
+        factors.append(final)
+        relative_error = np.sqrt(discarded_weight / reference_weight)
+        return (
+            tuple(factors),
+            tuple(conditional_ranks),
+            float(relative_error),
+        )
+
+    def _pair_factor_support_indices(self, site, variable):
+        tensor_site = int(site) if variable == "left" else int(site) + 1
+        return np.flatnonzero(self.local_masks[tensor_site].reshape(-1))
+
+    def optimize_two_sites(self, site, *, split_strategy="svd", **kwargs):
+        """Optimize and retract a pair inside the exact Abelian support."""
+        normalized = str(split_strategy).lower().replace("-", "_")
+        if normalized in {"environment", "metric", "als"}:
+            normalized = "variational"
+        if normalized in {"auto", "adaptive"}:
+            normalized = "hybrid"
+        if normalized not in {"svd", "variational", "hybrid"}:
+            raise ValueError(
+                "split_strategy must be 'svd', 'variational', or 'hybrid'."
+            )
+        return super().optimize_two_sites(
+            site,
+            split_strategy=normalized,
+            **kwargs,
+        )
 
     @staticmethod
     def _embed_support(vector, indices, size, *, dtype):
@@ -583,19 +1681,30 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
         eig_tol=1.0e-10,
         maxiter=None,
         max_subspace=32,
+        preconditioner="auto",
+        block_size=1,
         energy_before=None,
         environment=None,
     ):
         """Minimize one tensor strictly inside its Abelian support."""
         site = self._validated_site(site)
         solver = str(solver).lower().replace("-", "_")
+        solver_record = solver
         if solver in {"block", "physical_block", "physical_blocks"}:
             solver = "block_sparse"
-        if solver in {"canonical", "identity_metric", "local_canonical", "s_identity"}:
+        if solver in {
+            "canonical",
+            "identity_metric",
+            "local_canonical",
+            "metric_orthonormal",
+            "orthonormal_metric",
+            "s_identity",
+        }:
             solver = "whitened"
         if solver not in {"auto", "direct", "whitened", "matrix_free", "block_sparse"}:
             raise ValueError(
-                "solver must be 'auto', 'direct', 'whitened', "
+                "solver must be 'auto', 'direct', 'metric_orthonormal' "
+                "(alias 'whitened'), "
                 "'matrix_free', or 'block_sparse'."
             )
         if not self.norm_contraction_is_exact:
@@ -605,6 +1714,12 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
         metric_tol = float(metric_tol)
         if not np.isfinite(metric_tol) or metric_tol < 0.0:
             raise ValueError("metric_tol must be finite and nonnegative.")
+        if block_sparse_max_elements is not None:
+            block_sparse_max_elements = int(block_sparse_max_elements)
+            if block_sparse_max_elements < 1:
+                raise ValueError(
+                    "block_sparse_max_elements must be positive or None."
+                )
         old_tensor = self.tensors[site].copy()
         support = self._support_indices(site)
         if support.size == 0:
@@ -619,10 +1734,13 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
             selected_solver = (
                 "direct"
                 if support.size < int(matrix_free_threshold)
-                and self.frontier_backend != "tensor_train"
+                and not self.uses_tensor_train_frontier
                 else "matrix_free"
             )
-        if selected_solver in {"direct", "whitened", "block_sparse"} and self.frontier_backend == "tensor_train":
+        if (
+            selected_solver in {"direct", "whitened", "block_sparse"}
+            and self.uses_tensor_train_frontier
+        ):
             if selected_solver == "block_sparse":
                 selected_solver = "matrix_free"
             else:
@@ -646,6 +1764,11 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
         solver_metric_is_identity = False
         solver_metric_identity_error = float("nan")
         solver_coordinate_residual_norm = float("nan")
+        reported_solver = (
+            "metric_orthonormal"
+            if solver_record in {"metric_orthonormal", "orthonormal_metric"}
+            else selected_solver
+        )
         full_size = old_tensor.size
 
         def embed(vector):
@@ -705,52 +1828,120 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
                 )
                 solver_converged = True
             else:
-                if selected_solver == "block_sparse":
-                    problem = self.local_block_problem(site, environment=environment)
+                if selected_solver == "matrix_free":
+                    layout = PhysicalBlockLayout(old_tensor.shape)
+                    conditional_metric_elements = (
+                        layout.nblocks * layout.virtual_size**2
+                    )
+                    use_conditional_metric = (
+                        block_sparse_max_elements is None
+                        or conditional_metric_elements
+                        <= block_sparse_max_elements
+                    )
+                    if use_conditional_metric:
+                        problem = self.local_action_block_problem(
+                            site,
+                            environment=environment,
+                        )
+                        energy_after, vector, diagnostics = problem.solve(
+                            old_tensor.reshape(-1),
+                            tol=eig_tol,
+                            metric_tol=metric_tol,
+                            maxiter=maxiter,
+                            max_subspace=max_subspace,
+                            random_seed=site,
+                            dense_component_max_size=0,
+                            recycle_spaces=self._davidson_recycle,
+                            recycle_prefix=("abelian-action", site),
+                            executor=self._solver_executor,
+                            preconditioner=preconditioner,
+                            block_size=block_size,
+                        )
+                    else:
+                        def hamiltonian_action(trial):
+                            return self.hamiltonian_action(
+                                site, trial, environment=environment
+                            )
 
-                    def hamiltonian_action(trial):
-                        return problem.hamiltonian @ trial
+                        def metric_action(trial):
+                            return self.metric_action(
+                                site, trial, environment=environment
+                            )
 
-                    def metric_action(trial):
-                        return problem.metric @ trial
+                        def projected(action, trial):
+                            return action(embed(trial))[support]
 
-                    physical_blocks = len(problem.metric.blocks)
-                    hamiltonian_blocks = len(problem.hamiltonian.blocks)
-                    stored_operator_elements = problem.stored_elements
+                        energy_after, reduced_vector, diagnostics = (
+                            lowest_generalized_davidson(
+                                lambda trial: projected(
+                                    hamiltonian_action, trial
+                                ),
+                                lambda trial: projected(metric_action, trial),
+                                old_tensor.reshape(-1)[support],
+                                tol=eig_tol,
+                                metric_tol=metric_tol,
+                                maxiter=maxiter,
+                                max_subspace=max_subspace,
+                                random_seed=site,
+                                preconditioner=(
+                                    preconditioner
+                                    if callable(preconditioner)
+                                    else None
+                                ),
+                                block_size=block_size,
+                            )
+                        )
+                        vector = embed(reduced_vector)
+                    metric_rank = diagnostics.projected_rank
+                    hamiltonian_matvecs = diagnostics.hamiltonian_matvecs
+                    metric_matvecs = diagnostics.metric_matvecs
+                    iterations = diagnostics.iterations
+                    residual_norm = diagnostics.residual_norm
+                    solver_converged = diagnostics.converged
+                    message = diagnostics.message
+                    if use_conditional_metric:
+                        message = f"{message}; Abelian conditional blocks"
+                        physical_blocks = diagnostics.metric_blocks
+                        hamiltonian_blocks = diagnostics.hamiltonian_blocks
+                        block_component_sizes = diagnostics.component_sizes
+                        stored_operator_elements = diagnostics.stored_elements
+                        solver_metric_is_identity = True
+                    else:
+                        message = (
+                            f"{message}; Abelian support projected; conditional "
+                            "metric exceeds the storage cap"
+                        )
+                    if not diagnostics.converged:
+                        raise ValueError(diagnostics.message)
                 else:
-                    def hamiltonian_action(trial):
-                        return self.hamiltonian_action(
-                            site, trial, environment=environment
-                        )
-
-                    def metric_action(trial):
-                        return self.metric_action(
-                            site, trial, environment=environment
-                        )
-
-                def projected(action, trial):
-                    return action(embed(trial))[support]
-
-                energy_after, reduced_vector, diagnostics = lowest_generalized_davidson(
-                    lambda trial: projected(hamiltonian_action, trial),
-                    lambda trial: projected(metric_action, trial),
-                    old_tensor.reshape(-1)[support],
-                    tol=eig_tol,
-                    metric_tol=metric_tol,
-                    maxiter=maxiter,
-                    max_subspace=max_subspace,
-                    random_seed=site,
-                )
-                vector = embed(reduced_vector)
-                metric_rank = diagnostics.projected_rank
-                hamiltonian_matvecs = diagnostics.hamiltonian_matvecs
-                metric_matvecs = diagnostics.metric_matvecs
-                iterations = diagnostics.iterations
-                residual_norm = diagnostics.residual_norm
-                solver_converged = diagnostics.converged
-                message = f"{diagnostics.message}; Abelian support projected"
-                if not diagnostics.converged:
-                    raise ValueError(diagnostics.message)
+                    problem = self.local_block_problem(site, environment=environment)
+                    energy_after, vector, diagnostics = problem.solve(
+                        old_tensor.reshape(-1),
+                        tol=eig_tol,
+                        metric_tol=metric_tol,
+                        maxiter=maxiter,
+                        max_subspace=max_subspace,
+                        random_seed=site,
+                        recycle_spaces=self._davidson_recycle,
+                        recycle_prefix=("abelian-block", site),
+                        executor=self._solver_executor,
+                        preconditioner=preconditioner,
+                        block_size=block_size,
+                    )
+                    metric_rank = diagnostics.projected_rank
+                    hamiltonian_matvecs = diagnostics.hamiltonian_matvecs
+                    metric_matvecs = diagnostics.metric_matvecs
+                    iterations = diagnostics.iterations
+                    residual_norm = diagnostics.residual_norm
+                    solver_converged = diagnostics.converged
+                    physical_blocks = diagnostics.metric_blocks
+                    hamiltonian_blocks = diagnostics.hamiltonian_blocks
+                    block_component_sizes = diagnostics.component_sizes
+                    stored_operator_elements = diagnostics.stored_elements
+                    solver_metric_is_identity = True
+                    message = f"{diagnostics.message}; Abelian conditional blocks"
+                    if not diagnostics.converged:
+                        raise ValueError(diagnostics.message)
 
             tolerance = 256.0 * np.finfo(float).eps * max(1.0, abs(energy_before))
             candidate = np.real_if_close(vector.reshape(old_tensor.shape))
@@ -793,7 +1984,7 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
             raw_dim=old_tensor.size,
             metric_rank=metric_rank,
             metric_rank_is_projected=(selected_solver in {"matrix_free", "block_sparse"}),
-            solver=selected_solver,
+            solver=reported_solver,
             solver_converged=solver_converged,
             message=message,
             hamiltonian_matvecs=hamiltonian_matvecs,
@@ -820,7 +2011,7 @@ class AbelianFrontierTiedLETTA(FrontierTiedLETTA):
         weighting="uniform",
     ):
         """Balance frontier Grams with gauges block diagonal in charge."""
-        if self.frontier_backend == "tensor_train":
+        if isinstance(self._norm_frontier, TTMPOFrontier):
             raise NotImplementedError(
                 "sector-preserving frontier gauges require exact dense norm messages."
             )
@@ -1062,7 +2253,6 @@ def abelian_frontier_tied_letta_from_mps(
         tensors.append(tensor)
     return AbelianFrontierTiedLETTA(
         hamiltonian,
-        dims,
         parent_sets,
         abelian_layout=abelian_layout,
         bond_dims=abelian_layout.bond_dims,
@@ -1076,4 +2266,5 @@ __all__ = [
     "AbelianFrontierTiedLETTA",
     "FrontierAbelianLayout",
     "abelian_frontier_tied_letta_from_mps",
+    "exact_block_factor_layout",
 ]

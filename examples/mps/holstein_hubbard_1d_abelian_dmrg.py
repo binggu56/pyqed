@@ -658,8 +658,8 @@ def run_one_active(args, active: int, *, initial_factors=None) -> tuple[dict, li
     )
     dmrg.run()
     dmrg_time = perf_counter() - start
-    letta_layout = letta_layout_from_abelian_mps(dmrg.ground_state, site_qn_maps, target_qn)
-    dense_mps = symmetric_to_dense(dmrg.ground_state, site_qn_maps=site_qn_maps)
+    letta_layout = letta_layout_from_abelian_mps(dmrg.state, site_qn_maps, target_qn)
+    dense_mps = symmetric_to_dense(dmrg.state, site_qn_maps=site_qn_maps)
     dmrg_energy = _normalized_mps_mpo_expectation(dense_mps.factors, dense_mpo)
 
     operators = spinful_hh_site_operators(

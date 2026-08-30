@@ -305,8 +305,8 @@ def continue_run(
             eig_tol=1.0e-10,
             maxiter=1600,
             max_subspace=96,
-            frontier_canonicalization=True,
-            frontier_gauge_weighting="uniform",
+            gauge="frontier",
+            gauge_weight="uniform",
             verbose=True,
         )
         previous_energy = energy_before_cycle
@@ -366,7 +366,7 @@ def continue_run(
                 "tied_edge": list(tied_edge),
                 "bond_dims": list(state.bond_dims),
                 "solver": "whitened exact local S=I frame",
-                "frontier_canonicalization": "uniform",
+                "gauge": "frontier",
                 "maximum_additional_directional_passes": maximum_passes,
                 "checkpoint_interval": "one full left-right cycle (two passes)",
                 "source_absolute_directional_sweeps": 1,

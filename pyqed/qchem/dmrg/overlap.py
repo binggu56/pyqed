@@ -6,11 +6,12 @@ import numpy as np
 from tensorly.decomposition import tensor_train_matrix
 
 from pyqed.mps.decompose import tt_to_tensor, compress as compress_mps_factors
-from pyqed.mps.mps import MPO, product_MPO, symmetric_to_dense
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSimpleElectron
-from pyqed.mps.autompo.light_automatic_mpo import Mpo
-from pyqed.mps.autompo.model import Model
+from pyqed.mps.mps import product_MPO, symmetric_to_dense
+from pyqed.tn import MPO
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSimpleElectron
+from pyqed.operator_mpo.model_mpo import ModelMPO
+from pyqed.operator_mpo.model import Model
 from pyqed.qchem.mcscf.casci import (
     _as_state_ci_matrix,
     _factorized_ci_overlap,
@@ -108,11 +109,11 @@ def _get_spin_chain_term_robust(op_str_list, orbital_indices, spin, factor):
 
 
 def _dmrg_states(solver):
-    if not hasattr(solver, "dmrg") or solver.dmrg.ground_state is None:
+    if not hasattr(solver, "dmrg") or solver.dmrg.state is None:
         raise ValueError("Run DMRG first to generate a state.")
     if hasattr(solver.dmrg, "states") and solver.dmrg.states is not None:
         return list(solver.dmrg.states)
-    return [solver.dmrg.ground_state]
+    return [solver.dmrg.state]
 
 
 def _normalize_state_ids(state_ids, nstates):
@@ -124,13 +125,13 @@ def _normalize_state_ids(state_ids, nstates):
 
 
 def _state_to_dense_tensor(state):
-    dense_state = symmetric_to_dense(state) if hasattr(state.Bs[0], "qns") else state
+    dense_state = symmetric_to_dense(state) if hasattr(state.tensors[0], "qns") else state
     std_state = dense_state if dense_state.labels == ["lv", "p", "rv"] else dense_state.to_order(["lv", "p", "rv"])
     return np.asarray(tt_to_tensor(std_state.factors))
 
 
 def _state_to_dense_mps(state):
-    dense_state = symmetric_to_dense(state) if hasattr(state.Bs[0], "qns") else state
+    dense_state = symmetric_to_dense(state) if hasattr(state.tensors[0], "qns") else state
     return dense_state if dense_state.labels == ["lv", "p", "rv"] else dense_state.to_order(["lv", "p", "rv"])
 
 
@@ -307,7 +308,7 @@ def _build_orbital_generator_mpo(kappa_spatial, cutoff=1e-12):
         return _identity_mpo(2 * ncas)
     basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
     model = Model(basis=basis_sites, ham_terms=terms)
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
     return MPO([w.transpose(0, 3, 1, 2) for w in mpo.matrices])
 
 
@@ -320,7 +321,7 @@ def _single_spin_shear_mpo(nsites, src, dst, alpha):
     term = _get_spin_chain_term_robust([r"a^\dagger", "a"], [src // 2, dst // 2], spin, alpha)
     basis_sites = [BasisSimpleElectron(i) for i in range(nsites)]
     model = Model(basis=basis_sites, ham_terms=[term])
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
     return _identity_mpo(nsites, dtype=np.result_type(alpha, complex)) + MPO(
         [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
     )

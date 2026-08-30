@@ -1,0 +1,300 @@
+{
+  "status": "running",
+  "model": {
+    "nrows": 6,
+    "ncols": 6,
+    "nsites": 36,
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "site_order": "row-wise snake",
+    "tie_graph": "all nearest-neighbor J1 bonds",
+    "tie_edges": 60,
+    "j2_diagonal_edges": 50,
+    "full_hilbert_dimension": 68719476736
+  },
+  "protocol": {
+    "source_result": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_two_site_whitened_stage2_converged_6x6.json",
+    "source_snapshot": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_two_site_whitened_stage2_converged_6x6.npz",
+    "source_absolute_one_site_directional_passes": 0,
+    "graph": "fixed all-nearest-neighbour J1 ties",
+    "ranks": "fixed",
+    "symmetry": "none",
+    "frontier_backend": "identity_block",
+    "sweep": "complete left-to-right/right-to-left cycles",
+    "solver": "residual-verified merged solve with dense certification",
+    "pair_operator_backend": "dense",
+    "factor_solver": "dense",
+    "metric_support": "regularized",
+    "metric_tol": 1e-12,
+    "eig_tol": 1e-10,
+    "maxiter": 1600,
+    "max_subspace": 96,
+    "merged_dense_fallback_dim": 2048,
+    "outer_cycles": 3,
+    "split_metric_sweeps": 6,
+    "split_variational_sweeps": 8,
+    "split_energy_tol": 1e-12,
+    "verify_pair_energies": false,
+    "endpoint_verification": true,
+    "maximum_cycles": 50,
+    "stopping_gain_per_site": 1e-07,
+    "required_consecutive_cycles": 2,
+    "convergence_requires": "accepted LR and RL endpoints, every merged root verified and lowest-root certified, and consecutive full-cycle gains below the threshold",
+    "safe_resume": true
+  },
+  "protocol_fingerprint": "695ddf2c550afd917cee8409845779dff26cac492d52a549aafb9687c1373acd",
+  "source": {
+    "energy": -16.85820134853144,
+    "energy_per_site": -0.46828337079254,
+    "parameters": 4008,
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ]
+  },
+  "cycles": [
+    {
+      "cycle": 1,
+      "directional_sweeps": [
+        0,
+        1
+      ],
+      "energy_before": -16.85820134853144,
+      "energy": -16.858222991519046,
+      "energy_per_site": -0.4682839719866402,
+      "energy_gain": 2.164298760476413e-05,
+      "energy_gain_per_site": 6.01194100132337e-07,
+      "seconds": 178.36489658401115,
+      "endpoint_energies": [
+        -16.858214844725186,
+        -16.858222971441556
+      ],
+      "endpoint_gains": [
+        1.3496193744799712e-05,
+        8.126716370071563e-06
+      ],
+      "endpoints_accepted": true,
+      "low_gain_streak": 0,
+      "pair_updates": 70,
+      "accepted_pair_updates": 70,
+      "verified_merged_roots": 70,
+      "certified_lowest_roots": 70,
+      "dense_certifications": 70,
+      "uncertified_sites": [],
+      "maximum_metric_dual_relative_residual": 8.899467218171861e-08,
+      "maximum_discarded_support_residual": 2.7882011138010967e-08,
+      "outer_cycle_histogram": {
+        "1": 11,
+        "2": 36,
+        "3": 23
+      }
+    },
+    {
+      "cycle": 2,
+      "directional_sweeps": [
+        2,
+        3
+      ],
+      "energy_before": -16.858222991519046,
+      "energy": -16.858235252172253,
+      "energy_per_site": -0.46828431256034037,
+      "energy_gain": 1.2260653207363248e-05,
+      "energy_gain_per_site": 3.4057370020453465e-07,
+      "seconds": 171.51514558296185,
+      "endpoint_energies": [
+        -16.85822918981917,
+        -16.85823527901447
+      ],
+      "endpoint_gains": [
+        6.198300123827494e-06,
+        6.089195299097128e-06
+      ],
+      "endpoints_accepted": true,
+      "low_gain_streak": 0,
+      "pair_updates": 70,
+      "accepted_pair_updates": 70,
+      "verified_merged_roots": 70,
+      "certified_lowest_roots": 70,
+      "dense_certifications": 70,
+      "uncertified_sites": [],
+      "maximum_metric_dual_relative_residual": 8.923765389627468e-08,
+      "maximum_discarded_support_residual": 2.7875940842548273e-08,
+      "outer_cycle_histogram": {
+        "1": 14,
+        "2": 34,
+        "3": 22
+      }
+    },
+    {
+      "cycle": 3,
+      "directional_sweeps": [
+        4,
+        5
+      ],
+      "energy_before": -16.858235252172253,
+      "energy": -16.85824604068017,
+      "energy_per_site": -0.4682846122411159,
+      "energy_gain": 1.0788507918135792e-05,
+      "energy_gain_per_site": 2.99680775503772e-07,
+      "seconds": 168.1535858749994,
+      "endpoint_energies": [
+        -16.85824065283197,
+        -16.858246017724
+      ],
+      "endpoint_gains": [
+        5.400659716769951e-06,
+        5.364892029291468e-06
+      ],
+      "endpoints_accepted": true,
+      "low_gain_streak": 0,
+      "pair_updates": 70,
+      "accepted_pair_updates": 70,
+      "verified_merged_roots": 70,
+      "certified_lowest_roots": 70,
+      "dense_certifications": 70,
+      "uncertified_sites": [],
+      "maximum_metric_dual_relative_residual": 8.98330112573041e-08,
+      "maximum_discarded_support_residual": 2.7866416061170827e-08,
+      "outer_cycle_histogram": {
+        "1": 13,
+        "2": 39,
+        "3": 18
+      }
+    },
+    {
+      "cycle": 4,
+      "directional_sweeps": [
+        6,
+        7
+      ],
+      "energy_before": -16.85824604068017,
+      "energy": -16.858256520509727,
+      "energy_per_site": -0.4682849033474924,
+      "energy_gain": 1.0479829555265496e-05,
+      "energy_gain_per_site": 2.9110637653515266e-07,
+      "seconds": 167.24232962500537,
+      "endpoint_energies": [
+        -16.858251176237488,
+        -16.85825646917436
+      ],
+      "endpoint_gains": [
+        5.135557316293671e-06,
+        5.292936872791643e-06
+      ],
+      "endpoints_accepted": true,
+      "low_gain_streak": 0,
+      "pair_updates": 70,
+      "accepted_pair_updates": 70,
+      "verified_merged_roots": 70,
+      "certified_lowest_roots": 70,
+      "dense_certifications": 70,
+      "uncertified_sites": [],
+      "maximum_metric_dual_relative_residual": 9.048510334863352e-08,
+      "maximum_discarded_support_residual": 2.785505197791249e-08,
+      "outer_cycle_histogram": {
+        "1": 13,
+        "2": 37,
+        "3": 20
+      }
+    }
+  ],
+  "result": {
+    "converged": false,
+    "stop_reason": "maximum full cycles reached",
+    "cycles_completed": 4,
+    "directional_passes_completed": 8,
+    "energy": -16.858256520509727,
+    "energy_per_site": -0.4682849033474924,
+    "energy_gain_from_source": 5.517197828552867e-05,
+    "energy_gain_per_site_from_source": 1.5325549523757963e-06,
+    "dense_mps_d32_energy": -16.916170041284797,
+    "energy_above_dense_mps_d32": 0.05791352077507028,
+    "energy_above_dense_mps_d32_per_site": 0.001608708910418619,
+    "parameters": 4008,
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ],
+    "snapshot": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_two_site_final_converged_6x6.npz"
+  },
+  "timing_seconds": {
+    "total": 691.3563854169915,
+    "cycles": [
+      178.36489658401115,
+      171.51514558296185,
+      168.1535858749994,
+      167.24232962500537
+    ]
+  }
+}

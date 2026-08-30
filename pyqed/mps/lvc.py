@@ -30,7 +30,7 @@ from pyqed.mps.decompose import decompose, compress
 
 from pyqed import gwp, discretize, pauli, sigmaz
 
-from pyqed.mps.mps import Site
+from pyqed.lattice import Site
 
 
 

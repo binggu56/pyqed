@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import time
+import weakref
 
 import numpy as np
 
@@ -17,6 +18,7 @@ from .local_operator import (
     apply_transition_tensor,
     compile_packed_transitions,
     diagonal_from_factorized_terms,
+    build_identity_mpo_local_actions,
     identity_mpo_transitions,
     transitions_are_identity_operator,
 )
@@ -69,13 +71,22 @@ class RenormalizedLocalOperatorTableBuilder:
         Return the local table representation selected for this operator.
 
         :returns: One of ``"identity"``, ``"transition"``,
-            ``"factorized"``, ``"rank_coupled_factorized"``, or
+            ``"factorized"``, ``"rank_coupled_factorized"``,
+            ``"rank_coupled_contextual"``, or
             ``"rank_coupled_complementary"``.
         """
 
         from .environment import _FACTORIZED_PACKED_LOCAL_DIM, _is_identity_mpo_core
 
         if self.operator.rank_coupled:
+            if (
+                getattr(self.operator.basis, "channel_resolved", False)
+                and all(
+                    int(entry.shape[1]) == 1 and int(entry.shape[2]) == 1
+                    for entry in self.operator.basis
+                )
+            ):
+                return "rank_coupled_contextual"
             if self.operator.complementary_operator_families is not None:
                 return "rank_coupled_complementary"
             return "rank_coupled_factorized"
@@ -131,12 +142,37 @@ class RenormalizedLocalOperatorTableBuilder:
         t0 = time.perf_counter()
         representation = self.representation()
         timing["local_table_representation"] = time.perf_counter() - t0
+        from .environment import _is_identity_mpo_core
+
+        identity_mpo = (
+            (
+                _is_identity_mpo_core(self.operator.mpo_left)
+                or bool(
+                    getattr(
+                        self.operator.mpo_left,
+                        "fully_reduced_identity",
+                        False,
+                    )
+                )
+            )
+            and (
+                _is_identity_mpo_core(self.operator.mpo_right)
+                or bool(
+                    getattr(
+                        self.operator.mpo_right,
+                        "fully_reduced_identity",
+                        False,
+                    )
+                )
+            )
+        )
         require_symbolic_payloads = representation in {
             "transition",
             "factorized",
             "rank_coupled_factorized",
+            "rank_coupled_contextual",
             "rank_coupled_complementary",
-        }
+        } and not identity_mpo
         t0 = time.perf_counter()
         require_eager_factor_tables = representation == "factorized"
         self.operator.ensure_side_operator_tables(
@@ -183,7 +219,7 @@ class RenormalizedLocalOperatorTableBuilder:
             actions.metadata["renormalized_operator_build_timing"][
                 "local_table_put"
             ] = time.perf_counter() - t0
-        actions.local_operator_table = table
+        actions.local_operator_table = weakref.proxy(table)
         self.operator._attach_table_metadata(table)
         return table
 
@@ -204,6 +240,10 @@ class EffectiveBlockOperator:
     :param rank_coupled: Whether the MPO/environment path is rank-coupled.
     :param left_entry: Optional persisted left boundary-stack entry.
     :param right_entry: Optional persisted right boundary-stack entry.
+    :param su2_operator_engine: Persistent owner for packed SU(2) factors,
+        structural schedules, and local-action plans.
+    :param su2_moving_environment: Persistent C++ sweep owner for decoded
+        factor routes and reusable numerical workspaces.
     :param name: Optional local operator name.
     """
 
@@ -220,6 +260,8 @@ class EffectiveBlockOperator:
     right_entry: object | None = None
     local_operator_table: object | None = None
     complementary_operator_families: object | None = None
+    su2_operator_engine: object | None = None
+    su2_moving_environment: object | None = None
     name: str | None = None
 
     def boundary_metadata(self):
@@ -291,8 +333,13 @@ class EffectiveBlockOperator:
                 actions.metadata["complementary_boundary_payloads"] = (
                     self.complementary_boundary_payload_metadata()
                 )
-        actions.local_operator_table = table
-        self.local_operator_table = table
+        table_proxy = (
+            table
+            if type(table) in weakref.ProxyTypes
+            else weakref.proxy(table)
+        )
+        actions.local_operator_table = table_proxy
+        self.local_operator_table = table_proxy
         return table
 
     def complementary_operator_family_metadata(self):
@@ -757,15 +804,27 @@ class EffectiveBlockOperator:
             grouped = None
             if str(representation).startswith("rank_coupled_") and base_record is not None:
                 try:
-                    from .su2_qchem_plan import pack_rank_coupled_factor_table_from_boundary
+                    engine = self.su2_operator_engine
+                    if engine is not None:
+                        packed_table = engine.factor_table(
+                            getattr(base_record, "packed_table", None),
+                            W,
+                            side=side,
+                            bond=getattr(entry, "bond", 0),
+                            representation=representation,
+                        )
+                    else:
+                        from .su2_qchem_plan import (
+                            pack_rank_coupled_factor_table_from_boundary,
+                        )
 
-                    packed_table = pack_rank_coupled_factor_table_from_boundary(
-                        getattr(base_record, "packed_table", None),
-                        W,
-                        side=side,
-                        bond=getattr(entry, "bond", 0),
-                        representation=representation,
-                    )
+                        packed_table = pack_rank_coupled_factor_table_from_boundary(
+                            getattr(base_record, "packed_table", None),
+                            W,
+                            side=side,
+                            bond=getattr(entry, "bond", 0),
+                            representation=representation,
+                        )
                 except Exception:
                     packed_table = None
             if packed_table is None:
@@ -918,7 +977,11 @@ class EffectiveBlockOperator:
         :returns: ``None``.
         """
 
-        if representation in {"rank_coupled_factorized", "rank_coupled_complementary"}:
+        if representation in {
+            "rank_coupled_factorized",
+            "rank_coupled_contextual",
+            "rank_coupled_complementary",
+        }:
             side_representation = "rank_coupled_by_ket"
         elif representation == "factorized":
             side_representation = "array_by_ket"
@@ -941,14 +1004,14 @@ class EffectiveBlockOperator:
             source=source,
         )
         if representation in {"rank_coupled_factorized", "rank_coupled_complementary"}:
-            self._factor_side_table(
+            self._factor_side_table_record(
                 "left",
                 "rank_coupled_left_factor_by_ket",
                 require_existing=require_factor_tables,
                 require_symbolic_payloads=require_symbolic_payloads,
                 source=source,
             )
-            self._factor_side_table(
+            self._factor_side_table_record(
                 "right",
                 "rank_coupled_right_factor_by_ket",
                 require_existing=require_factor_tables,
@@ -956,14 +1019,14 @@ class EffectiveBlockOperator:
                 source=source,
             )
         elif representation == "factorized":
-            self._factor_side_table(
+            self._factor_side_table_record(
                 "left",
                 "left_factor_by_ket",
                 require_existing=require_factor_tables,
                 require_symbolic_payloads=require_symbolic_payloads,
                 source=source,
             )
-            self._factor_side_table(
+            self._factor_side_table_record(
                 "right",
                 "right_factor_by_ket",
                 require_existing=require_factor_tables,
@@ -1136,7 +1199,11 @@ class EffectiveBlockOperator:
 
         require_prepared_tables = representation is not None
         if self.rank_coupled:
-            if representation == "rank_coupled_complementary":
+            if (
+                representation
+                in {"rank_coupled_complementary", "rank_coupled_contextual"}
+                and self.complementary_operator_families is not None
+            ):
                 tensor_apply, reduced_apply, packed_apply, diag, identity_like = self._rank_coupled_complementary_local_actions(
                     require_prepared_tables=require_prepared_tables,
                     require_symbolic_payloads=require_symbolic_payloads,
@@ -1147,10 +1214,9 @@ class EffectiveBlockOperator:
                     require_symbolic_payloads=require_symbolic_payloads,
                 )
         elif _is_identity_mpo_core(self.mpo_left) and _is_identity_mpo_core(self.mpo_right):
-            tensor_apply, reduced_apply, packed_apply, identity_like = self._identity_local_actions(
+            tensor_apply, reduced_apply, packed_apply, diag, identity_like = self._identity_local_actions(
                 out_dtype=self.output_dtype(),
             )
-            diag = self.diagonal()
         else:
             tensor_apply, reduced_apply, packed_apply, identity_like = self._standard_local_actions(
                 out_dtype=self.output_dtype(),
@@ -1351,25 +1417,16 @@ class EffectiveBlockOperator:
             identity_like)``.
         """
 
-        out_entries, transitions = identity_mpo_transitions(
+        tensor_apply, reduced_apply, packed_apply, diag, identity_like = (
+            build_identity_mpo_local_actions(
             self.left_block,
             self.right_block,
             self.basis,
             base_dtype=out_dtype,
         )
-        compiled_transitions = compile_packed_transitions(transitions, self.basis)
-
-        def tensor_apply(two_site):
-            return compiled_transitions.apply_tensor(two_site, base_dtype=out_dtype)
-
-        def reduced_apply(state):
-            return compiled_transitions.apply_reduced(state, base_dtype=out_dtype)
-
-        packed_apply = compiled_transitions.packed_matvec(base_dtype=out_dtype)
+        )
         self._annotate_symbolic_payload_source(packed_apply)
-
-        identity_like = transitions_are_identity_operator(self.basis, transitions)
-        return tensor_apply, reduced_apply, packed_apply, identity_like
+        return tensor_apply, reduced_apply, packed_apply, diag, identity_like
 
     def _rank_coupled_local_actions(
         self,
@@ -1418,6 +1475,100 @@ class EffectiveBlockOperator:
             if right_boundary_record is None
             else right_boundary_record.grouped_by_ket
         )
+        if (
+            getattr(self.basis, "channel_resolved", False)
+            and all(
+                int(entry.shape[1]) == 1 and int(entry.shape[2]) == 1
+                for entry in self.basis
+            )
+        ):
+            from .su2_qchem_plan import (
+                build_contextual_channel_compiled_terms,
+                pack_rank_coupled_boundary_table_from_block_map,
+            )
+
+            left_packed = getattr(left_boundary_record, "packed_table", None)
+            right_packed = getattr(right_boundary_record, "packed_table", None)
+            if left_packed is None:
+                left_packed = pack_rank_coupled_boundary_table_from_block_map(
+                    self.left_block,
+                    side="left",
+                    bond=int(getattr(self.left_entry, "bond", 0)),
+                )
+            if right_packed is None:
+                right_packed = pack_rank_coupled_boundary_table_from_block_map(
+                    self.right_block,
+                    side="right",
+                    bond=int(getattr(self.right_entry, "bond", 0)),
+                )
+            compiled = build_contextual_channel_compiled_terms(
+                self.basis,
+                self.mpo_left,
+                self.mpo_right,
+                left_packed,
+                right_packed,
+                bond=int(getattr(self.left_entry, "bond", 0)),
+                moving_environment=self.su2_moving_environment,
+            )
+            if compiled is None:
+                raise RuntimeError(
+                    "Could not compile contextual SU(2) channel routes."
+                )
+            packed_apply = compiled.packed_matvec(
+                base_dtype=out_dtype,
+                backend="su2-contextual-cpp",
+                out_entries=self.basis.out_entries,
+                block_matrices=compiled,
+            )
+            qchem_stats = dict(compiled.plan.stats)
+            qchem_stats["contextual_channel_resolved"] = True
+            packed_apply.su2_qchem_sweep_plan = qchem_stats
+            compiled.su2_qchem_sweep_plan = qchem_stats
+            timing["contextual_cpp_routes"] = time.perf_counter() - t0
+            packed_apply.renormalized_operator_build_timing = timing
+            self._annotate_symbolic_payload_source(packed_apply, compiled)
+            if self.complementary_operator_families is not None:
+                compiled.complementary_operator_families = (
+                    self.complementary_operator_families
+                )
+                self._annotate_complementary_payload_source(
+                    packed_apply,
+                    compiled,
+                )
+
+            def tensor_apply(two_site):
+                packed, _ = pack_two_site_state(
+                    two_site,
+                    layout=self.basis,
+                )
+                return unpack_two_site_state(
+                    packed_apply(packed),
+                    two_site,
+                    layout=self.basis,
+                )
+
+            def reduced_apply(state):
+                return state.layout.from_packed(
+                    packed_apply(state.to_packed(dtype=out_dtype))
+                )
+
+            return (
+                tensor_apply,
+                reduced_apply,
+                packed_apply,
+                (
+                    None
+                    if bool(
+                        getattr(
+                            compiled,
+                            "cpp_deferred_diagonal",
+                            False,
+                        )
+                    )
+                    else np.asarray(compiled.diagonal(), dtype=float)
+                ),
+                False,
+            )
         left_factor_record = (
             self._factor_side_table_record(
                 "left",
@@ -1472,17 +1623,36 @@ class EffectiveBlockOperator:
                 qchem_plan_key = (
                     "su2_qchem_sweep_plan",
                     int(getattr(left_factor_record, "owner_bond", 0)),
-                    id(left_packed),
-                    id(right_packed),
-                    id(left_boundary_packed),
-                    id(right_boundary_packed),
+                    int(getattr(left_packed, "revision", 0)),
+                    int(getattr(right_packed, "revision", 0)),
+                    int(getattr(left_boundary_packed, "revision", 0)),
+                    int(getattr(right_boundary_packed, "revision", 0)),
                 )
                 qchem_plan = None
                 qchem_plan_cache_hit = False
-                plan_getter = getattr(left_factor_record, "get_qchem_sweep_plan", None)
-                if plan_getter is not None:
-                    qchem_plan = plan_getter(qchem_plan_key)
-                    qchem_plan_cache_hit = qchem_plan is not None
+                engine = self.su2_operator_engine
+                if engine is not None:
+                    before_hits = int(engine.stats.get("plan_hits", 0))
+                    qchem_plan = engine.sweep_plan(
+                        bond=getattr(left_factor_record, "owner_bond", 0),
+                        left_factor_table=left_packed,
+                        right_factor_table=right_packed,
+                        left_boundary_table=left_boundary_packed,
+                        right_boundary_table=right_boundary_packed,
+                        su2_moving_environment=self.su2_moving_environment,
+                    )
+                    qchem_plan_cache_hit = (
+                        int(engine.stats.get("plan_hits", 0)) > before_hits
+                    )
+                else:
+                    plan_getter = getattr(
+                        left_factor_record,
+                        "get_qchem_sweep_plan",
+                        None,
+                    )
+                    if plan_getter is not None:
+                        qchem_plan = plan_getter(qchem_plan_key)
+                        qchem_plan_cache_hit = qchem_plan is not None
                 if qchem_plan is None:
                     qchem_plan = SU2QChemSweepPlan(
                         bond=getattr(left_factor_record, "owner_bond", 0),
@@ -1490,10 +1660,16 @@ class EffectiveBlockOperator:
                         right_factor_table=right_packed,
                         left_boundary_table=left_boundary_packed,
                         right_boundary_table=right_boundary_packed,
+                        su2_moving_environment=self.su2_moving_environment,
                     )
-                    plan_putter = getattr(left_factor_record, "put_qchem_sweep_plan", None)
-                    if plan_putter is not None:
-                        plan_putter(qchem_plan_key, qchem_plan)
+                    if engine is None:
+                        plan_putter = getattr(
+                            left_factor_record,
+                            "put_qchem_sweep_plan",
+                            None,
+                        )
+                        if plan_putter is not None:
+                            plan_putter(qchem_plan_key, qchem_plan)
                 qchem_direct_parent_blocks = _su2_qchem_direct_parent_blocks_enabled()
                 qchem_compiled_terms = qchem_plan.compile_factorized_terms(
                     self.basis,
@@ -1510,31 +1686,52 @@ class EffectiveBlockOperator:
                     )
                 )
                 qchem_plan_stats["plan_cache_owner"] = {
-                    "side": str(getattr(left_factor_record, "owner_side", "")),
-                    "bond": int(getattr(left_factor_record, "owner_bond", 0)),
-                    "cache_size": int(
-                        len(getattr(left_factor_record, "qchem_sweep_plan_cache", {}))
+                    "kind": (
+                        "su2_operator_engine"
+                        if engine is not None
+                        else "boundary_entry"
                     ),
-                    "cache_hits": int(
-                        getattr(
-                            left_factor_record,
-                            "qchem_sweep_plan_cache_stats",
-                            {},
-                        ).get("hits", 0)
-                    ),
-                    "cache_misses": int(
-                        getattr(
-                            left_factor_record,
-                            "qchem_sweep_plan_cache_stats",
-                            {},
-                        ).get("misses", 0)
-                    ),
-                    "cache_puts": int(
-                        getattr(
-                            left_factor_record,
-                            "qchem_sweep_plan_cache_stats",
-                            {},
-                        ).get("puts", 0)
+                    **(
+                        dict(engine.stats)
+                        if engine is not None
+                        else {
+                            "side": str(
+                                getattr(left_factor_record, "owner_side", "")
+                            ),
+                            "bond": int(
+                                getattr(left_factor_record, "owner_bond", 0)
+                            ),
+                            "cache_size": int(
+                                len(
+                                    getattr(
+                                        left_factor_record,
+                                        "qchem_sweep_plan_cache",
+                                        {},
+                                    )
+                                )
+                            ),
+                            "cache_hits": int(
+                                getattr(
+                                    left_factor_record,
+                                    "qchem_sweep_plan_cache_stats",
+                                    {},
+                                ).get("hits", 0)
+                            ),
+                            "cache_misses": int(
+                                getattr(
+                                    left_factor_record,
+                                    "qchem_sweep_plan_cache_stats",
+                                    {},
+                                ).get("misses", 0)
+                            ),
+                            "cache_puts": int(
+                                getattr(
+                                    left_factor_record,
+                                    "qchem_sweep_plan_cache_stats",
+                                    {},
+                                ).get("puts", 0)
+                            ),
+                        }
                     ),
                 }
                 if qchem_compiled_terms is not None:
@@ -1547,7 +1744,7 @@ class EffectiveBlockOperator:
                 }
                 qchem_schedule = None
                 qchem_compiled_terms = None
-        timing["native_factor_schedule"] = time.perf_counter() - t0
+        timing["cpp_factor_schedule"] = time.perf_counter() - t0
         t0 = time.perf_counter()
         if qchem_compiled_terms is None:
             if left_blocks is None and left_boundary_record is not None:
@@ -1598,11 +1795,15 @@ class EffectiveBlockOperator:
 
         t0 = time.perf_counter()
         if factorized_terms is None:
-            diag = np.zeros(self.basis.size, dtype=float)
-            for entry in self.basis:
-                block = compiled_factorized_terms.block_matrix_for(entry)
-                if block is not None:
-                    diag[entry.slice] = np.real(np.diag(block))
+            diagonal_provider = getattr(compiled_factorized_terms, "diagonal", None)
+            if diagonal_provider is not None:
+                diag = np.asarray(diagonal_provider(), dtype=float)
+            else:
+                diag = np.zeros(self.basis.size, dtype=float)
+                for entry in self.basis:
+                    block = compiled_factorized_terms.block_matrix_for(entry)
+                    if block is not None:
+                        diag[entry.slice] = np.real(np.diag(block))
         else:
             diag = self.diagonal(
                 factorized_terms=factorized_terms,
@@ -1662,12 +1863,15 @@ class EffectiveBlockOperator:
                 compiled_terms,
             )
             compiled_terms.complementary_direct_orthonormal_projection_available = True
-            compiled_terms.prefer_direct_orthonormal_projection = bool(
+            compiled_terms.explicit_direct_orthonormal_projection = bool(
                 getattr(
                     self.complementary_operator_families,
                     "prefer_direct_orthonormal_projection",
                     False,
                 )
+            )
+            compiled_terms.prefer_direct_orthonormal_projection = bool(
+                compiled_terms.explicit_direct_orthonormal_projection
             )
             compiled_terms.prefer_direct_component_transform = bool(
                 getattr(
@@ -1710,7 +1914,13 @@ class EffectiveBlockOperator:
                     "qchem_packed_entry_kernel_provider",
                     False,
                 )
-            ) and not qchem_direct_parent_blocks:
+            ) and not qchem_direct_parent_blocks and not bool(
+                getattr(
+                    self.complementary_operator_families,
+                    "prefer_direct_orthonormal_projection",
+                    False,
+                )
+            ):
                 compiled_terms.complementary_direct_orthonormal_projection_available = False
                 compiled_terms.prefer_direct_orthonormal_projection = False
                 compiled_terms.prefer_direct_component_transform = False

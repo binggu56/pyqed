@@ -27,7 +27,7 @@ from examples.mps.scan_frontier_letta_vs_mps_j2_4x4 import (
     _validated_seeds,
 )
 from pyqed.letta import frontier_tied_letta_from_mps
-from pyqed.mps import DMRG, MPO
+from pyqed.mps import DMRG
 from pyqed.mps.dmrg import _normalized_mps_mpo_expectation
 
 
@@ -117,10 +117,10 @@ def _optimize_mps(
     ).run()
     seconds = perf_counter() - start
     rows = _directional_history(solver)
-    energy = float(solver.e_tot)
+    energy = float(solver.energy)
     truncations = _truncation_history(rows)
     stored_parameters = int(
-        sum(np.asarray(factor).size for factor in solver.ground_state.factors)
+        sum(np.asarray(factor).size for factor in solver.state.factors)
     )
     record = {
         "optimizer": "two_site_dmrg",
@@ -149,7 +149,7 @@ def _optimize_mps(
             default=None,
         ),
     }
-    return solver.ground_state.copy(), record
+    return solver.state.copy(), record
 
 
 def _lower_energy_mps_candidate(mpo, candidates):
@@ -215,7 +215,7 @@ def _optimize_letta(
     pass_limit,
     tolerance,
     frontier_gauge,
-    frontier_gauge_weighting,
+    gauge_weight,
     warm_mps_seconds,
 ):
     nsites = len(hamiltonian.dims)
@@ -251,8 +251,8 @@ def _optimize_letta(
         nsweeps=int(pass_limit),
         tol=float(tolerance),
         solver="direct",
-        frontier_canonicalization=bool(frontier_gauge),
-        frontier_gauge_weighting=frontier_gauge_weighting,
+        gauge="frontier" if frontier_gauge else None,
+        gauge_weight=gauge_weight,
     )
     seconds = perf_counter() - start
     energy = float(state.energy)
@@ -293,8 +293,8 @@ def _optimize_letta(
         ),
         "directional_pass_energies": [float(row["energy"]) for row in state.history],
         "frontier_gauge": bool(frontier_gauge),
-        "frontier_gauge_weighting": (
-            frontier_gauge_weighting if frontier_gauge else None
+        "gauge_weight": (
+            gauge_weight if frontier_gauge else None
         ),
         "frontier_peak_elements": int(state.peak_frontier_elements),
         "cached_environment_elements": int(state.cached_environment_elements),
@@ -424,7 +424,7 @@ def run_scan(
     tolerance=1.0e-9,
     tie_noise=1.0e-3,
     frontier_gauge=True,
-    frontier_gauge_weighting="uniform",
+    gauge_weight="uniform",
     checkpoint_path=None,
     optimize_letta=True,
 ):
@@ -463,8 +463,8 @@ def run_scan(
         "tolerance": float(tolerance),
         "tie_noise": float(tie_noise),
         "frontier_gauge": bool(frontier_gauge),
-        "frontier_gauge_weighting": (
-            frontier_gauge_weighting if frontier_gauge else None
+        "gauge_weight": (
+            gauge_weight if frontier_gauge else None
         ),
         "full_state_vectors_constructed": False,
         "sparse_full_hamiltonian_constructed": False,
@@ -502,7 +502,7 @@ def run_scan(
         weighted_bonds += tuple((i, j, ratio) for i, j in diagonals)
         hamiltonian = heisenberg_local_hamiltonian(nsites, weighted_bonds)
         local_mpo = hamiltonian.to_mpo().compress()
-        mpo = MPO(list(local_mpo.tensors))
+        mpo = local_mpo
         print(
             f"ratio={ratio:.3f} mpo_D={max(local_mpo.bond_dims)}",
             flush=True,
@@ -600,7 +600,7 @@ def run_scan(
                     pass_limit=letta_passes,
                     tolerance=tolerance,
                     frontier_gauge=frontier_gauge,
-                    frontier_gauge_weighting=frontier_gauge_weighting,
+                    gauge_weight=gauge_weight,
                     warm_mps_seconds=mps_records[bond_dim]["optimization_seconds"],
                 )
                 previous_letta[(seed, bond_dim)] = state
@@ -823,7 +823,7 @@ def main():
     parser.add_argument("--no-frontier-gauge", action="store_true")
     parser.add_argument("--skip-letta", action="store_true")
     parser.add_argument(
-        "--frontier-gauge-weighting",
+        "--gauge-weight",
         choices=("uniform", "probability"),
         default="uniform",
     )
@@ -858,7 +858,7 @@ def main():
             tolerance=args.tolerance,
             tie_noise=args.tie_noise,
             frontier_gauge=not args.no_frontier_gauge,
-            frontier_gauge_weighting=args.frontier_gauge_weighting,
+            gauge_weight=args.gauge_weight,
             checkpoint_path=args.output,
             optimize_letta=not args.skip_letta,
         )

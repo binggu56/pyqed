@@ -57,6 +57,8 @@ to its current documentation, examples, and tests.
    periodic_gw_bse
    tddft_ehrenfest
    mps
+   su2_letta
+   peps
    dvr
    geometric_quantum_dynamics
    pyqed.floquet

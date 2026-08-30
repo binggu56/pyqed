@@ -59,6 +59,23 @@ extern "C" void cblas_zgemm(
     const int ldc
 );
 
+extern "C" void cblas_dgemm(
+    const int order,
+    const int trans_a,
+    const int trans_b,
+    const int m,
+    const int n,
+    const int k,
+    const double alpha,
+    const double* a,
+    const int lda,
+    const double* b,
+    const int ldb,
+    const double beta,
+    double* c,
+    const int ldc
+);
+
 extern "C" void zgesvd_(
     char* jobu,
     char* jobvt,
@@ -155,6 +172,790 @@ struct SparseBlock {
     ssize_t out_start;
 };
 
+class CppPackedGroupedAction {
+public:
+    struct RealGroup {
+        std::vector<ssize_t> columns;
+        std::vector<double> matrix;
+    };
+
+    struct ComplexGroup {
+        std::vector<ssize_t> columns;
+        std::vector<cdouble> matrix;
+    };
+
+    CppPackedGroupedAction(
+        py::array_t<long long, py::array::c_style | py::array::forcecast> indices,
+        py::list columns,
+        py::list matrices,
+        bool complex_values
+    ) : complex_values_(complex_values) {
+        auto index_info = indices.request();
+        if (index_info.ndim != 2 || index_info.shape[0] < 1 || index_info.shape[1] < 1) {
+            throw std::invalid_argument("indices must have shape (blocks, width)");
+        }
+        nblocks_ = index_info.shape[0];
+        width_ = index_info.shape[1];
+        size_ = nblocks_ * width_;
+        if (static_cast<ssize_t>(columns.size()) != nblocks_
+            || static_cast<ssize_t>(matrices.size()) != nblocks_) {
+            throw std::invalid_argument("columns and matrices must contain one group per output block");
+        }
+        const auto* index_data = static_cast<const long long*>(index_info.ptr);
+        indices_.assign(index_data, index_data + size_);
+        std::vector<ssize_t> sorted = indices_;
+        std::sort(sorted.begin(), sorted.end());
+        for (ssize_t i = 0; i < size_; ++i) {
+            if (sorted[static_cast<size_t>(i)] != i) {
+                throw std::invalid_argument("indices must partition the flattened vector");
+            }
+        }
+
+        if (complex_values_) {
+            complex_groups_.resize(static_cast<size_t>(nblocks_));
+        } else {
+            real_groups_.resize(static_cast<size_t>(nblocks_));
+        }
+        for (ssize_t row = 0; row < nblocks_; ++row) {
+            py::array_t<long long, py::array::c_style | py::array::forcecast> route_columns(
+                columns[static_cast<size_t>(row)]
+            );
+            auto column_info = route_columns.request();
+            if (column_info.ndim != 1) {
+                throw std::invalid_argument("each route-column array must be one-dimensional");
+            }
+            const ssize_t routes = column_info.shape[0];
+            const auto* column_data = static_cast<const long long*>(column_info.ptr);
+            std::vector<ssize_t> copied_columns(static_cast<size_t>(routes));
+            for (ssize_t route = 0; route < routes; ++route) {
+                const long long column = column_data[route];
+                if (column < 0 || column >= nblocks_) {
+                    throw std::invalid_argument("route column is out of range");
+                }
+                copied_columns[static_cast<size_t>(route)] = static_cast<ssize_t>(column);
+            }
+            const ssize_t packed_width = routes * width_;
+            if (complex_values_) {
+                py::array_t<cdouble, py::array::c_style | py::array::forcecast> value(
+                    matrices[static_cast<size_t>(row)]
+                );
+                auto value_info = value.request();
+                if (value_info.ndim != 2 || value_info.shape[0] != width_
+                    || value_info.shape[1] != packed_width) {
+                    throw std::invalid_argument("group matrix has an invalid shape");
+                }
+                auto& group = complex_groups_[static_cast<size_t>(row)];
+                group.columns = std::move(copied_columns);
+                const auto* data = static_cast<const cdouble*>(value_info.ptr);
+                group.matrix.assign(data, data + width_ * packed_width);
+            } else {
+                py::array_t<double, py::array::c_style | py::array::forcecast> value(
+                    matrices[static_cast<size_t>(row)]
+                );
+                auto value_info = value.request();
+                if (value_info.ndim != 2 || value_info.shape[0] != width_
+                    || value_info.shape[1] != packed_width) {
+                    throw std::invalid_argument("group matrix has an invalid shape");
+                }
+                auto& group = real_groups_[static_cast<size_t>(row)];
+                group.columns = std::move(copied_columns);
+                const auto* data = static_cast<const double*>(value_info.ptr);
+                group.matrix.assign(data, data + width_ * packed_width);
+            }
+        }
+    }
+
+    py::array matvecs(py::array vectors) const {
+        return complex_values_ ? matvecs_typed<cdouble>(vectors) : matvecs_typed<double>(vectors);
+    }
+
+    py::array diagonal() const {
+        return complex_values_ ? diagonal_typed<cdouble>() : diagonal_typed<double>();
+    }
+
+    std::string backend() const {
+#ifdef __APPLE__
+        return "cpp-grouped-gemm";
+#else
+        return "cpp-grouped-loop";
+#endif
+    }
+
+private:
+    template <typename Scalar>
+    const std::vector<Scalar>& matrix_for(ssize_t row) const;
+
+    template <typename Scalar>
+    const std::vector<ssize_t>& columns_for(ssize_t row) const;
+
+    template <typename Scalar>
+    py::array matvecs_typed(py::array vectors) const {
+        py::array_t<Scalar, py::array::c_style | py::array::forcecast> input(vectors);
+        auto input_info = input.request();
+        if (input_info.ndim != 2 || input_info.shape[1] != size_) {
+            throw std::invalid_argument("vectors must have shape (batch, size)");
+        }
+        const ssize_t batch = input_info.shape[0];
+        py::array_t<Scalar> output({batch, size_});
+        const auto* x = static_cast<const Scalar*>(input_info.ptr);
+        auto* y = output.mutable_data();
+        std::fill(y, y + batch * size_, Scalar(0));
+        {
+            py::gil_scoped_release release;
+            for (ssize_t row = 0; row < nblocks_; ++row) {
+                const auto& route_columns = columns_for<Scalar>(row);
+                const auto& matrix = matrix_for<Scalar>(row);
+                const ssize_t routes = static_cast<ssize_t>(route_columns.size());
+                const ssize_t inner = routes * width_;
+                if (inner == 0) {
+                    continue;
+                }
+                std::vector<Scalar> gathered(static_cast<size_t>(inner * batch));
+                for (ssize_t route = 0; route < routes; ++route) {
+                    const ssize_t column = route_columns[static_cast<size_t>(route)];
+                    for (ssize_t physical = 0; physical < width_; ++physical) {
+                        const ssize_t source = indices_[static_cast<size_t>(column * width_ + physical)];
+                        const ssize_t packed_row = route * width_ + physical;
+                        for (ssize_t vector = 0; vector < batch; ++vector) {
+                            gathered[static_cast<size_t>(packed_row * batch + vector)] =
+                                x[static_cast<size_t>(vector * size_ + source)];
+                        }
+                    }
+                }
+                std::vector<Scalar> contracted(static_cast<size_t>(width_ * batch), Scalar(0));
+                grouped_multiply(matrix, gathered, contracted, width_, batch, inner);
+                for (ssize_t physical = 0; physical < width_; ++physical) {
+                    const ssize_t target = indices_[static_cast<size_t>(row * width_ + physical)];
+                    for (ssize_t vector = 0; vector < batch; ++vector) {
+                        y[static_cast<size_t>(vector * size_ + target)] =
+                            contracted[static_cast<size_t>(physical * batch + vector)];
+                    }
+                }
+            }
+        }
+        return output;
+    }
+
+    template <typename Scalar>
+    py::array diagonal_typed() const {
+        py::array_t<Scalar> output(size_);
+        auto* diagonal = output.mutable_data();
+        std::fill(diagonal, diagonal + size_, Scalar(0));
+        for (ssize_t row = 0; row < nblocks_; ++row) {
+            const auto& route_columns = columns_for<Scalar>(row);
+            const auto& matrix = matrix_for<Scalar>(row);
+            for (ssize_t route = 0; route < static_cast<ssize_t>(route_columns.size()); ++route) {
+                if (route_columns[static_cast<size_t>(route)] != row) {
+                    continue;
+                }
+                const ssize_t inner = static_cast<ssize_t>(route_columns.size()) * width_;
+                for (ssize_t physical = 0; physical < width_; ++physical) {
+                    diagonal[indices_[static_cast<size_t>(row * width_ + physical)]] =
+                        matrix[static_cast<size_t>(physical * inner + route * width_ + physical)];
+                }
+                break;
+            }
+        }
+        return output;
+    }
+
+    static void grouped_multiply(
+        const std::vector<double>& matrix,
+        const std::vector<double>& gathered,
+        std::vector<double>& output,
+        ssize_t rows,
+        ssize_t columns,
+        ssize_t inner
+    ) {
+#ifdef __APPLE__
+        cblas_dgemm(101, 111, 111, static_cast<int>(rows), static_cast<int>(columns),
+                    static_cast<int>(inner), 1.0, matrix.data(), static_cast<int>(inner),
+                    gathered.data(), static_cast<int>(columns), 0.0, output.data(),
+                    static_cast<int>(columns));
+#else
+        multiply_loop(matrix, gathered, output, rows, columns, inner);
+#endif
+    }
+
+    static void grouped_multiply(
+        const std::vector<cdouble>& matrix,
+        const std::vector<cdouble>& gathered,
+        std::vector<cdouble>& output,
+        ssize_t rows,
+        ssize_t columns,
+        ssize_t inner
+    ) {
+#ifdef __APPLE__
+        const cdouble one(1.0, 0.0);
+        const cdouble zero(0.0, 0.0);
+        cblas_zgemm(101, 111, 111, static_cast<int>(rows), static_cast<int>(columns),
+                    static_cast<int>(inner), &one, matrix.data(), static_cast<int>(inner),
+                    gathered.data(), static_cast<int>(columns), &zero, output.data(),
+                    static_cast<int>(columns));
+#else
+        multiply_loop(matrix, gathered, output, rows, columns, inner);
+#endif
+    }
+
+    template <typename Scalar>
+    static void multiply_loop(
+        const std::vector<Scalar>& matrix,
+        const std::vector<Scalar>& gathered,
+        std::vector<Scalar>& output,
+        ssize_t rows,
+        ssize_t columns,
+        ssize_t inner
+    ) {
+        for (ssize_t row = 0; row < rows; ++row) {
+            for (ssize_t column = 0; column < columns; ++column) {
+                Scalar total = Scalar(0);
+                for (ssize_t shared = 0; shared < inner; ++shared) {
+                    total += matrix[static_cast<size_t>(row * inner + shared)]
+                        * gathered[static_cast<size_t>(shared * columns + column)];
+                }
+                output[static_cast<size_t>(row * columns + column)] = total;
+            }
+        }
+    }
+
+    bool complex_values_ = false;
+    ssize_t nblocks_ = 0;
+    ssize_t width_ = 0;
+    ssize_t size_ = 0;
+    std::vector<ssize_t> indices_;
+    std::vector<RealGroup> real_groups_;
+    std::vector<ComplexGroup> complex_groups_;
+};
+
+template <>
+inline const std::vector<double>& CppPackedGroupedAction::matrix_for<double>(ssize_t row) const {
+    return real_groups_[static_cast<size_t>(row)].matrix;
+}
+
+template <>
+inline const std::vector<cdouble>& CppPackedGroupedAction::matrix_for<cdouble>(ssize_t row) const {
+    return complex_groups_[static_cast<size_t>(row)].matrix;
+}
+
+template <>
+inline const std::vector<ssize_t>& CppPackedGroupedAction::columns_for<double>(ssize_t row) const {
+    return real_groups_[static_cast<size_t>(row)].columns;
+}
+
+template <>
+inline const std::vector<ssize_t>& CppPackedGroupedAction::columns_for<cdouble>(ssize_t row) const {
+    return complex_groups_[static_cast<size_t>(row)].columns;
+}
+
+static py::tuple packed_route_arrays(
+    const std::vector<int32_t>& first,
+    const std::vector<int32_t>& second,
+    const std::vector<int32_t>& third,
+    const std::vector<int32_t>& fourth,
+    const std::vector<cdouble>& values
+) {
+    const ssize_t size = static_cast<ssize_t>(first.size());
+    py::array_t<int32_t> out_first(size);
+    py::array_t<int32_t> out_second(size);
+    py::array_t<int32_t> out_third(size);
+    py::array_t<int32_t> out_fourth(size);
+    py::array_t<cdouble> out_values(size);
+    if (size) {
+        std::memcpy(out_first.mutable_data(), first.data(), sizeof(int32_t) * size);
+        std::memcpy(out_second.mutable_data(), second.data(), sizeof(int32_t) * size);
+        std::memcpy(out_third.mutable_data(), third.data(), sizeof(int32_t) * size);
+        std::memcpy(out_fourth.mutable_data(), fourth.data(), sizeof(int32_t) * size);
+        std::memcpy(out_values.mutable_data(), values.data(), sizeof(cdouble) * size);
+    }
+    return py::make_tuple(out_first, out_second, out_third, out_fourth, out_values);
+}
+
+static int32_t packed_index32(long long value) {
+    if (value < 0 || value > std::numeric_limits<int32_t>::max()) {
+        throw std::overflow_error("packed route index exceeds int32 capacity");
+    }
+    return static_cast<int32_t>(value);
+}
+
+static py::tuple packed_bound_route_arrays(
+    const std::vector<int32_t>& bra,
+    const std::vector<int32_t>& ket,
+    const std::vector<cdouble>& weights,
+    bool real_output
+) {
+    const ssize_t size = static_cast<ssize_t>(bra.size());
+    py::array_t<int32_t> out_bra(size);
+    py::array_t<int32_t> out_ket(size);
+    if (size) {
+        std::memcpy(out_bra.mutable_data(), bra.data(), sizeof(int32_t) * size);
+        std::memcpy(out_ket.mutable_data(), ket.data(), sizeof(int32_t) * size);
+    }
+    if (real_output) {
+        py::array_t<double> out_weights(size);
+        for (ssize_t index = 0; index < size; ++index) {
+            out_weights.mutable_data()[index] = std::real(weights[index]);
+        }
+        return py::make_tuple(out_bra, out_ket, out_weights);
+    }
+    py::array_t<cdouble> out_weights(size);
+    if (size) {
+        std::memcpy(
+            out_weights.mutable_data(), weights.data(), sizeof(cdouble) * size
+        );
+    }
+    return py::make_tuple(out_bra, out_ket, out_weights);
+}
+
+static long long packed_key_append(long long key, long long dimension, long long value) {
+    return key * dimension + value;
+}
+
+static py::object build_packed_advance_routes(
+    bool left_direction,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> source_bra_bond,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> source_ket_bond,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> source_sites,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> source_bra_physical,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> source_ket_physical,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_flat,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_left,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_right,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> local_sites,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_physical,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> overlap_sites,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> target_sites,
+    py::array_t<unsigned char, py::array::c_style | py::array::forcecast> target_paired,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> physical_dims,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> target_pair_lookup,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> target_shape,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> target_inverse,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> operator_matrix,
+    py::object source_values_obj = py::none(),
+    py::object tensor_values_obj = py::none(),
+    long long target_size = 0,
+    bool real_output = false
+) {
+    const auto bra_bond = source_bra_bond.unchecked<1>();
+    const auto ket_bond = source_ket_bond.unchecked<1>();
+    const auto source_site = source_sites.unchecked<1>();
+    const auto source_bra = source_bra_physical.unchecked<2>();
+    const auto source_ket = source_ket_physical.unchecked<2>();
+    const auto entry_flat = tensor_flat.unchecked<1>();
+    const auto entry_left = tensor_left.unchecked<1>();
+    const auto entry_right = tensor_right.unchecked<1>();
+    const auto local_site = local_sites.unchecked<1>();
+    const auto entry_physical = tensor_physical.unchecked<2>();
+    const auto overlap = overlap_sites.unchecked<1>();
+    const auto target_site = target_sites.unchecked<1>();
+    const auto paired = target_paired.unchecked<1>();
+    const auto dims = physical_dims.unchecked<1>();
+    const auto pair_lookup = target_pair_lookup.unchecked<2>();
+    const auto out_shape = target_shape.unchecked<1>();
+    const auto inverse = target_inverse.unchecked<1>();
+    const auto op = operator_matrix.unchecked<2>();
+    const ssize_t nsource = bra_bond.shape(0);
+    const ssize_t nentries = entry_flat.shape(0);
+    if (ket_bond.shape(0) != nsource || source_bra.shape(0) != nsource
+        || source_ket.shape(0) != nsource || source_bra.shape(1) != source_site.shape(0)
+        || source_ket.shape(1) != source_site.shape(0)) {
+        throw std::invalid_argument("source coordinate arrays have incompatible shapes");
+    }
+    if (entry_left.shape(0) != nentries || entry_right.shape(0) != nentries
+        || entry_physical.shape(0) != nentries
+        || entry_physical.shape(1) != local_site.shape(0)) {
+        throw std::invalid_argument("tensor-support arrays have incompatible shapes");
+    }
+    if (paired.shape(0) != target_site.shape(0)) {
+        throw std::invalid_argument("target_paired must match target_sites");
+    }
+    const bool contract = !source_values_obj.is_none() || !tensor_values_obj.is_none();
+    if (contract && (source_values_obj.is_none() || tensor_values_obj.is_none())) {
+        throw std::invalid_argument(
+            "source_values and tensor_values must be supplied together"
+        );
+    }
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> source_values;
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> tensor_values;
+    py::object contracted_output = py::none();
+    double* real_target = nullptr;
+    cdouble* complex_target = nullptr;
+    const cdouble* source_data = nullptr;
+    const cdouble* tensor_data = nullptr;
+    if (contract) {
+        source_values = py::array_t<cdouble, py::array::c_style | py::array::forcecast>::ensure(
+            source_values_obj
+        );
+        tensor_values = py::array_t<cdouble, py::array::c_style | py::array::forcecast>::ensure(
+            tensor_values_obj
+        );
+        if (!source_values || !tensor_values || source_values.ndim() != 1
+            || tensor_values.ndim() != 1 || source_values.shape(0) != nsource
+            || target_size < 0) {
+            throw std::invalid_argument("packed contraction values have invalid shapes");
+        }
+        source_data = source_values.data();
+        tensor_data = tensor_values.data();
+        if (real_output) {
+            py::array_t<double> output(target_size);
+            std::fill(output.mutable_data(), output.mutable_data() + target_size, 0.0);
+            real_target = output.mutable_data();
+            contracted_output = std::move(output);
+        } else {
+            py::array_t<cdouble> output(target_size);
+            std::fill(
+                output.mutable_data(), output.mutable_data() + target_size, cdouble(0.0, 0.0)
+            );
+            complex_target = output.mutable_data();
+            contracted_output = std::move(output);
+        }
+    }
+
+    std::unordered_map<long long, ssize_t> source_column;
+    std::unordered_map<long long, ssize_t> local_column;
+    for (ssize_t column = 0; column < source_site.shape(0); ++column) {
+        source_column[source_site(column)] = column;
+    }
+    for (ssize_t column = 0; column < local_site.shape(0); ++column) {
+        local_column[local_site(column)] = column;
+    }
+    std::unordered_map<long long, std::vector<ssize_t>> groups;
+    for (ssize_t entry = 0; entry < nentries; ++entry) {
+        long long key = left_direction ? entry_left(entry) : entry_right(entry);
+        for (ssize_t item = 0; item < overlap.shape(0); ++item) {
+            const long long site = overlap(item);
+            const ssize_t column = local_column.at(site);
+            key = packed_key_append(key, dims(site), entry_physical(entry, column));
+        }
+        groups[key].push_back(entry);
+    }
+
+    std::vector<int32_t> source_indices;
+    std::vector<int32_t> target_indices;
+    std::vector<int32_t> bra_indices;
+    std::vector<int32_t> ket_indices;
+    std::vector<cdouble> coefficients;
+    {
+        py::gil_scoped_release release;
+        for (ssize_t source = 0; source < nsource; ++source) {
+            long long bra_key = bra_bond(source);
+            long long ket_key = ket_bond(source);
+            for (ssize_t item = 0; item < overlap.shape(0); ++item) {
+                const long long site = overlap(item);
+                const ssize_t column = source_column.at(site);
+                bra_key = packed_key_append(bra_key, dims(site), source_bra(source, column));
+                ket_key = packed_key_append(ket_key, dims(site), source_ket(source, column));
+            }
+            const auto bra_group = groups.find(bra_key);
+            const auto ket_group = groups.find(ket_key);
+            if (bra_group == groups.end() || ket_group == groups.end()) {
+                continue;
+            }
+            for (const ssize_t bra_entry : bra_group->second) {
+                for (const ssize_t ket_entry : ket_group->second) {
+                    const cdouble coefficient = op(
+                        entry_physical(bra_entry, 0), entry_physical(ket_entry, 0)
+                    );
+                    if (coefficient == cdouble(0.0, 0.0)) {
+                        continue;
+                    }
+                    const long long bra_target_bond = left_direction
+                        ? entry_right(bra_entry) : entry_left(bra_entry);
+                    const long long ket_target_bond = left_direction
+                        ? entry_right(ket_entry) : entry_left(ket_entry);
+                    const long long pair = pair_lookup(bra_target_bond, ket_target_bond);
+                    if (pair < 0) {
+                        continue;
+                    }
+                    long long logical = pair;
+                    ssize_t shape_axis = 1;
+                    bool compatible = true;
+                    for (ssize_t item = 0; item < target_site.shape(0); ++item) {
+                        const long long site = target_site(item);
+                        long long bra_value;
+                        long long ket_value;
+                        const auto local = local_column.find(site);
+                        if (local != local_column.end()) {
+                            bra_value = entry_physical(bra_entry, local->second);
+                            ket_value = entry_physical(ket_entry, local->second);
+                        } else {
+                            const ssize_t column = source_column.at(site);
+                            bra_value = source_bra(source, column);
+                            ket_value = source_ket(source, column);
+                        }
+                        logical = packed_key_append(logical, out_shape(shape_axis++), bra_value);
+                        if (paired(item)) {
+                            logical = packed_key_append(logical, out_shape(shape_axis++), ket_value);
+                        } else if (bra_value != ket_value) {
+                            compatible = false;
+                            break;
+                        }
+                    }
+                    if (!compatible || logical < 0 || logical >= inverse.shape(0)) {
+                        continue;
+                    }
+                    const long long packed = inverse(logical);
+                    if (packed < 0) {
+                        continue;
+                    }
+                    if (contract) {
+                        if (packed >= target_size) {
+                            throw std::out_of_range("packed target exceeds target_size");
+                        }
+                        const cdouble value = source_data[source]
+                            * std::conj(tensor_data[entry_flat(bra_entry)])
+                            * tensor_data[entry_flat(ket_entry)] * coefficient;
+                        if (real_output) {
+                            real_target[packed] += std::real(value);
+                        } else {
+                            complex_target[packed] += value;
+                        }
+                    } else {
+                        source_indices.push_back(packed_index32(source));
+                        target_indices.push_back(packed_index32(packed));
+                        bra_indices.push_back(entry_flat(bra_entry));
+                        ket_indices.push_back(entry_flat(ket_entry));
+                        coefficients.push_back(coefficient);
+                    }
+                }
+            }
+        }
+    }
+    if (contract) {
+        return contracted_output;
+    }
+    return packed_route_arrays(
+        source_indices, target_indices, bra_indices, ket_indices, coefficients
+    );
+}
+
+static py::object build_packed_hole_routes(
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> left_bra_bond,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> left_ket_bond,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> left_sites,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> left_bra_physical,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> left_ket_physical,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> right_bra_bond,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> right_ket_bond,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> right_sites,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> right_bra_physical,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> right_ket_physical,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_flat,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_left,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_right,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> local_sites,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> tensor_physical,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> common_sites,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> constrained_sites,
+    py::array_t<long long, py::array::c_style | py::array::forcecast> physical_dims,
+    long long right_bond_dimension,
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> operator_matrix,
+    py::object left_values_obj = py::none(),
+    py::object right_values_obj = py::none(),
+    bool real_output = false,
+    py::object dense_output_obj = py::none()
+) {
+    const auto lbb = left_bra_bond.unchecked<1>();
+    const auto lkb = left_ket_bond.unchecked<1>();
+    const auto lsites = left_sites.unchecked<1>();
+    const auto lbp = left_bra_physical.unchecked<2>();
+    const auto lkp = left_ket_physical.unchecked<2>();
+    const auto rbb = right_bra_bond.unchecked<1>();
+    const auto rkb = right_ket_bond.unchecked<1>();
+    const auto rsites = right_sites.unchecked<1>();
+    const auto rbp = right_bra_physical.unchecked<2>();
+    const auto rkp = right_ket_physical.unchecked<2>();
+    const auto entry_flat = tensor_flat.unchecked<1>();
+    const auto entry_left = tensor_left.unchecked<1>();
+    const auto entry_right = tensor_right.unchecked<1>();
+    const auto local = local_sites.unchecked<1>();
+    const auto entry_physical = tensor_physical.unchecked<2>();
+    const auto common = common_sites.unchecked<1>();
+    const auto constrained = constrained_sites.unchecked<1>();
+    const auto dims = physical_dims.unchecked<1>();
+    const auto op = operator_matrix.unchecked<2>();
+    const ssize_t nleft = lbb.shape(0);
+    const ssize_t nright = rbb.shape(0);
+    const ssize_t nentries = entry_flat.shape(0);
+    const bool bind = !left_values_obj.is_none() || !right_values_obj.is_none();
+    if (bind && (left_values_obj.is_none() || right_values_obj.is_none())) {
+        throw std::invalid_argument("left_values and right_values must be supplied together");
+    }
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> left_values;
+    py::array_t<cdouble, py::array::c_style | py::array::forcecast> right_values;
+    const cdouble* left_data = nullptr;
+    const cdouble* right_data = nullptr;
+    const bool dense = !dense_output_obj.is_none();
+    py::array_t<double, py::array::c_style> real_dense;
+    py::array_t<cdouble, py::array::c_style> complex_dense;
+    double* real_dense_data = nullptr;
+    cdouble* complex_dense_data = nullptr;
+    ssize_t dense_size = 0;
+    if (bind) {
+        left_values = py::array_t<cdouble, py::array::c_style | py::array::forcecast>::ensure(
+            left_values_obj
+        );
+        right_values = py::array_t<cdouble, py::array::c_style | py::array::forcecast>::ensure(
+            right_values_obj
+        );
+        if (!left_values || !right_values || left_values.ndim() != 1
+            || right_values.ndim() != 1 || left_values.shape(0) != nleft
+            || right_values.shape(0) != nright) {
+            throw std::invalid_argument("packed bound-message values have invalid shapes");
+        }
+        left_data = left_values.data();
+        right_data = right_values.data();
+    }
+    if (dense) {
+        if (!bind) {
+            throw std::invalid_argument("dense_output requires bound messages");
+        }
+        if (real_output) {
+            real_dense = py::array_t<double, py::array::c_style>::ensure(
+                dense_output_obj
+            );
+            if (!real_dense || real_dense.ndim() != 2
+                || real_dense.shape(0) != real_dense.shape(1)) {
+                throw std::invalid_argument("real dense_output must be a square matrix");
+            }
+            dense_size = real_dense.shape(0);
+            real_dense_data = real_dense.mutable_data();
+        } else {
+            complex_dense = py::array_t<cdouble, py::array::c_style>::ensure(
+                dense_output_obj
+            );
+            if (!complex_dense || complex_dense.ndim() != 2
+                || complex_dense.shape(0) != complex_dense.shape(1)) {
+                throw std::invalid_argument("complex dense_output must be a square matrix");
+            }
+            dense_size = complex_dense.shape(0);
+            complex_dense_data = complex_dense.mutable_data();
+        }
+    }
+    std::unordered_map<long long, ssize_t> left_column;
+    std::unordered_map<long long, ssize_t> right_column;
+    std::unordered_map<long long, ssize_t> local_column;
+    for (ssize_t i = 0; i < lsites.shape(0); ++i) left_column[lsites(i)] = i;
+    for (ssize_t i = 0; i < rsites.shape(0); ++i) right_column[rsites(i)] = i;
+    for (ssize_t i = 0; i < local.shape(0); ++i) local_column[local(i)] = i;
+    std::unordered_map<long long, std::vector<ssize_t>> right_groups;
+    for (ssize_t index = 0; index < nright; ++index) {
+        long long key = 0;
+        for (ssize_t item = 0; item < common.shape(0); ++item) {
+            const long long site = common(item);
+            const ssize_t column = right_column.at(site);
+            key = packed_key_append(key, dims(site), rbp(index, column));
+            key = packed_key_append(key, dims(site), rkp(index, column));
+        }
+        right_groups[key].push_back(index);
+    }
+    std::unordered_map<long long, std::vector<ssize_t>> tensor_groups;
+    for (ssize_t entry = 0; entry < nentries; ++entry) {
+        long long key = packed_key_append(entry_left(entry), right_bond_dimension, entry_right(entry));
+        for (ssize_t item = 0; item < constrained.shape(0); ++item) {
+            const long long site = constrained(item);
+            key = packed_key_append(key, dims(site), entry_physical(entry, local_column.at(site)));
+        }
+        tensor_groups[key].push_back(entry);
+    }
+
+    std::vector<int32_t> left_indices;
+    std::vector<int32_t> right_indices;
+    std::vector<int32_t> bra_indices;
+    std::vector<int32_t> ket_indices;
+    std::vector<cdouble> coefficients;
+    {
+        py::gil_scoped_release release;
+        for (ssize_t left = 0; left < nleft; ++left) {
+            long long common_key = 0;
+            for (ssize_t item = 0; item < common.shape(0); ++item) {
+                const long long site = common(item);
+                const ssize_t column = left_column.at(site);
+                common_key = packed_key_append(common_key, dims(site), lbp(left, column));
+                common_key = packed_key_append(common_key, dims(site), lkp(left, column));
+            }
+            const auto right_group = right_groups.find(common_key);
+            if (right_group == right_groups.end()) continue;
+            for (const ssize_t right : right_group->second) {
+                long long bra_key = packed_key_append(lbb(left), right_bond_dimension, rbb(right));
+                long long ket_key = packed_key_append(lkb(left), right_bond_dimension, rkb(right));
+                bool compatible = true;
+                for (ssize_t item = 0; item < constrained.shape(0); ++item) {
+                    const long long site = constrained(item);
+                    long long bra_value = -1;
+                    long long ket_value = -1;
+                    const auto lc = left_column.find(site);
+                    if (lc != left_column.end()) {
+                        bra_value = lbp(left, lc->second);
+                        ket_value = lkp(left, lc->second);
+                    }
+                    const auto rc = right_column.find(site);
+                    if (rc != right_column.end()) {
+                        const long long right_bra = rbp(right, rc->second);
+                        const long long right_ket = rkp(right, rc->second);
+                        if (bra_value >= 0 && (bra_value != right_bra || ket_value != right_ket)) {
+                            compatible = false;
+                            break;
+                        }
+                        bra_value = right_bra;
+                        ket_value = right_ket;
+                    }
+                    bra_key = packed_key_append(bra_key, dims(site), bra_value);
+                    ket_key = packed_key_append(ket_key, dims(site), ket_value);
+                }
+                if (!compatible) continue;
+                const auto bra_group = tensor_groups.find(bra_key);
+                const auto ket_group = tensor_groups.find(ket_key);
+                if (bra_group == tensor_groups.end() || ket_group == tensor_groups.end()) continue;
+                for (const ssize_t bra_entry : bra_group->second) {
+                    for (const ssize_t ket_entry : ket_group->second) {
+                        const cdouble coefficient = op(
+                            entry_physical(bra_entry, 0), entry_physical(ket_entry, 0)
+                        );
+                        if (coefficient == cdouble(0.0, 0.0)) continue;
+                        if (dense) {
+                            const int32_t bra = entry_flat(bra_entry);
+                            const int32_t ket = entry_flat(ket_entry);
+                            if (bra < 0 || ket < 0 || bra >= dense_size || ket >= dense_size) {
+                                throw std::out_of_range("local route exceeds dense_output");
+                            }
+                            const cdouble weight =
+                                left_data[left] * right_data[right] * coefficient;
+                            if (real_output) {
+                                real_dense_data[bra * dense_size + ket] += std::real(weight);
+                            } else {
+                                complex_dense_data[bra * dense_size + ket] += weight;
+                            }
+                        } else if (bind) {
+                            bra_indices.push_back(entry_flat(bra_entry));
+                            ket_indices.push_back(entry_flat(ket_entry));
+                            coefficients.push_back(
+                                left_data[left] * right_data[right] * coefficient
+                            );
+                        } else {
+                            left_indices.push_back(packed_index32(left));
+                            right_indices.push_back(packed_index32(right));
+                            bra_indices.push_back(entry_flat(bra_entry));
+                            ket_indices.push_back(entry_flat(ket_entry));
+                            coefficients.push_back(coefficient);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (dense) {
+        return dense_output_obj;
+    }
+    if (bind) {
+        return packed_bound_route_arrays(
+            bra_indices, ket_indices, coefficients, real_output
+        );
+    }
+    return packed_route_arrays(
+        left_indices, right_indices, bra_indices, ket_indices, coefficients
+    );
+}
+
 static double norm2(const std::vector<cdouble>& v) {
     double s = 0.0;
     for (const auto& x : v) {
@@ -244,47 +1045,51 @@ static py::tuple lapack_svd(py::object matrix_obj) {
     int info = 0;
     int lwork = -1;
     cdouble work_query;
-    zgesvd_(
-        &jobu,
-        &jobvt,
-        &m_arg,
-        &n_arg,
-        a.data(),
-        &lda_arg,
-        s.data(),
-        u.data(),
-        &ldu_arg,
-        vt.data(),
-        &ldvt_arg,
-        &work_query,
-        &lwork,
-        rwork.data(),
-        &info
-    );
-    if (info != 0) {
-        throw std::runtime_error("zgesvd workspace query failed");
-    }
-    lwork = std::max(1, static_cast<int>(std::real(work_query)));
-    std::vector<cdouble> work(static_cast<size_t>(lwork));
-    zgesvd_(
-        &jobu,
-        &jobvt,
-        &m_arg,
-        &n_arg,
-        a.data(),
-        &lda_arg,
-        s.data(),
-        u.data(),
-        &ldu_arg,
-        vt.data(),
-        &ldvt_arg,
-        work.data(),
-        &lwork,
-        rwork.data(),
-        &info
-    );
-    if (info != 0) {
-        throw std::runtime_error("zgesvd failed to converge");
+    std::vector<cdouble> work;
+    {
+        py::gil_scoped_release release;
+        zgesvd_(
+            &jobu,
+            &jobvt,
+            &m_arg,
+            &n_arg,
+            a.data(),
+            &lda_arg,
+            s.data(),
+            u.data(),
+            &ldu_arg,
+            vt.data(),
+            &ldvt_arg,
+            &work_query,
+            &lwork,
+            rwork.data(),
+            &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("zgesvd workspace query failed");
+        }
+        lwork = std::max(1, static_cast<int>(std::real(work_query)));
+        work.resize(static_cast<size_t>(lwork));
+        zgesvd_(
+            &jobu,
+            &jobvt,
+            &m_arg,
+            &n_arg,
+            a.data(),
+            &lda_arg,
+            s.data(),
+            u.data(),
+            &ldu_arg,
+            vt.data(),
+            &ldvt_arg,
+            work.data(),
+            &lwork,
+            rwork.data(),
+            &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("zgesvd failed to converge");
+        }
     }
     auto u_view = u_out.mutable_unchecked<2>();
     auto s_view = s_out.mutable_unchecked<1>();
@@ -344,33 +1149,37 @@ static py::tuple lapack_qr(py::object matrix_obj) {
     int info = 0;
     int lwork = -1;
     cdouble work_query;
-    zgeqrf_(
-        &m_arg,
-        &n_arg,
-        a.data(),
-        &lda_arg,
-        tau.data(),
-        &work_query,
-        &lwork,
-        &info
-    );
-    if (info != 0) {
-        throw std::runtime_error("zgeqrf workspace query failed with info=" + std::to_string(info));
-    }
-    lwork = std::max(1, static_cast<int>(std::real(work_query)));
-    std::vector<cdouble> work(static_cast<size_t>(lwork));
-    zgeqrf_(
-        &m_arg,
-        &n_arg,
-        a.data(),
-        &lda_arg,
-        tau.data(),
-        work.data(),
-        &lwork,
-        &info
-    );
-    if (info != 0) {
-        throw std::runtime_error("zgeqrf failed with info=" + std::to_string(info));
+    std::vector<cdouble> work;
+    {
+        py::gil_scoped_release release;
+        zgeqrf_(
+            &m_arg,
+            &n_arg,
+            a.data(),
+            &lda_arg,
+            tau.data(),
+            &work_query,
+            &lwork,
+            &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("zgeqrf workspace query failed with info=" + std::to_string(info));
+        }
+        lwork = std::max(1, static_cast<int>(std::real(work_query)));
+        work.resize(static_cast<size_t>(lwork));
+        zgeqrf_(
+            &m_arg,
+            &n_arg,
+            a.data(),
+            &lda_arg,
+            tau.data(),
+            work.data(),
+            &lwork,
+            &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("zgeqrf failed with info=" + std::to_string(info));
+        }
     }
 
     auto r = r_out.mutable_unchecked<2>();
@@ -386,35 +1195,38 @@ static py::tuple lapack_qr(py::object matrix_obj) {
     int q_n = k;
     int q_k = k;
     lwork = -1;
-    zungqr_(
-        &q_m,
-        &q_n,
-        &q_k,
-        a.data(),
-        &lda_arg,
-        tau.data(),
-        &work_query,
-        &lwork,
-        &info
-    );
-    if (info != 0) {
-        throw std::runtime_error("zungqr workspace query failed with info=" + std::to_string(info));
-    }
-    lwork = std::max(1, static_cast<int>(std::real(work_query)));
-    work.assign(static_cast<size_t>(lwork), cdouble(0.0, 0.0));
-    zungqr_(
-        &q_m,
-        &q_n,
-        &q_k,
-        a.data(),
-        &lda_arg,
-        tau.data(),
-        work.data(),
-        &lwork,
-        &info
-    );
-    if (info != 0) {
-        throw std::runtime_error("zungqr failed with info=" + std::to_string(info));
+    {
+        py::gil_scoped_release release;
+        zungqr_(
+            &q_m,
+            &q_n,
+            &q_k,
+            a.data(),
+            &lda_arg,
+            tau.data(),
+            &work_query,
+            &lwork,
+            &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("zungqr workspace query failed with info=" + std::to_string(info));
+        }
+        lwork = std::max(1, static_cast<int>(std::real(work_query)));
+        work.assign(static_cast<size_t>(lwork), cdouble(0.0, 0.0));
+        zungqr_(
+            &q_m,
+            &q_n,
+            &q_k,
+            a.data(),
+            &lda_arg,
+            tau.data(),
+            work.data(),
+            &lwork,
+            &info
+        );
+        if (info != 0) {
+            throw std::runtime_error("zungqr failed with info=" + std::to_string(info));
+        }
     }
 
     auto q = q_out.mutable_unchecked<2>();
@@ -2371,6 +3183,19 @@ static py::dict davidson(
                 imag_max = std::max(imag_max, std::abs(z.imag()));
             }
         }
+#ifdef __APPLE__
+        {
+            std::vector<cdouble> projected(
+                workspace.T_dense.begin(),
+                workspace.T_dense.begin() + m * m
+            );
+            auto eig = projected_hermitian_eigh_ascending(projected, m);
+            best_energy = eig.values_asc[0];
+            for (ssize_t i = 0; i < m; ++i) {
+                workspace.coeff[static_cast<size_t>(i)] = eig.vector(i, 0);
+            }
+        }
+#else
         if (imag_max < 1.0e-12) {
             std::vector<double> T_real(static_cast<size_t>(m * m), 0.0);
             for (ssize_t i = 0; i < m * m; ++i) {
@@ -2396,6 +3221,7 @@ static py::dict davidson(
                 );
             }
         }
+#endif
         double cn = 0.0;
         for (ssize_t i = 0; i < m; ++i) {
             cn += std::norm(workspace.coeff[static_cast<size_t>(i)]);
@@ -2669,7 +3495,11 @@ static py::dict block_davidson(
         }
         ProjectedHermitianEigenResult projected;
         try {
-            projected = projected_hermitian_eigh_ascending(workspace.T_dense, m);
+            std::vector<cdouble> projected_matrix(
+                workspace.T_dense.begin(),
+                workspace.T_dense.begin() + static_cast<ptrdiff_t>(m * m)
+            );
+            projected = projected_hermitian_eigh_ascending(projected_matrix, m);
         } catch (const std::exception&) {
             double imag_max = 0.0;
             for (ssize_t i = 0; i < m * m; ++i) {
@@ -13643,6 +14473,8 @@ public:
         py::object last_bond = py::none();
         double eold = initial_energy;
         double elast = initial_energy;
+        double previous_lr_energy = std::numeric_limits<double>::quiet_NaN();
+        double previous_rl_energy = std::numeric_limits<double>::quiet_NaN();
         bool converged = false;
         ssize_t ran_halves = 0;
         std::string last_direction;
@@ -13704,14 +14536,24 @@ public:
                     after_step
                 );
                 append_schedule_half(half, entry.sweep_index, entry.direction);
+                double* previous_direction_energy = nullptr;
+                if (entry.direction == "lr") {
+                    previous_direction_energy = &previous_lr_energy;
+                } else if (entry.direction == "rl") {
+                    previous_direction_energy = &previous_rl_energy;
+                }
                 if (
+                    previous_direction_energy != nullptr &&
                     std::isfinite(elast) &&
-                    std::isfinite(eold) &&
-                    std::abs(elast - eold) < conv
+                    std::isfinite(*previous_direction_energy) &&
+                    std::abs(elast - *previous_direction_energy) < conv
                 ) {
                     converged = true;
                     ++owner_sweep_schedule_plan_converged;
                     break;
+                }
+                if (previous_direction_energy != nullptr) {
+                    *previous_direction_energy = elast;
                 }
                 eold = elast;
             }
@@ -34160,9 +35002,9 @@ py::object CppMovingEnvironment::build_planned_direct_family_entries_from_route(
             right_schedule_ids
         );
         py::object planned = planned_cls(
-            route_plan.attr("coeffs"),
-            route_plan.attr("left_ids"),
-            route_plan.attr("right_ids"),
+            route_plan.attr("pair_coeffs"),
+            route_plan.attr("pair_left_ids"),
+            route_plan.attr("pair_right_ids"),
             left_values,
             right_values,
             py::arg("left_table_ids") = left_table_ids,
@@ -35077,6 +35919,153 @@ static py::array_t<cdouble> right_identity_boundary_contract_block(
     return out;
 }
 
+#ifdef __APPLE__
+static py::array_t<cdouble> environment_contract_block_gemm_unique_physical(
+    const py::array_t<cdouble>& env,
+    const py::array_t<cdouble>& a,
+    const py::array_t<cdouble>& w,
+    const py::array_t<cdouble>& b,
+    bool left
+) {
+    const ssize_t nx = env.shape(0);
+    const ssize_t ni = env.shape(1);
+    const ssize_t nj = env.shape(2);
+    const ssize_t ny = left ? w.shape(1) : w.shape(0);
+    const ssize_t na = left ? a.shape(1) : a.shape(0);
+    const ssize_t nb = left ? b.shape(1) : b.shape(0);
+    const ssize_t ni_nb = ni * nb;
+    const ssize_t ny_nb = ny * nb;
+    const std::array<ssize_t, 10> dims = {
+        nx, ni, nj, ny, na, nb, nx * ni, ni_nb, ny_nb, na * ny
+    };
+    if (std::any_of(dims.begin(), dims.end(), [](ssize_t value) {
+            return value < 0 || value > std::numeric_limits<int>::max();
+        })) {
+        throw std::runtime_error("environment GEMM dimensions exceed BLAS integer range");
+    }
+
+    py::array_t<cdouble> out = zero_array3(ny, na, nb);
+    std::vector<cdouble> env_b(
+        static_cast<size_t>(nx * ni * nb),
+        cdouble(0.0, 0.0)
+    );
+    std::vector<cdouble> channel_sum(
+        static_cast<size_t>(ny * ni * nb),
+        cdouble(0.0, 0.0)
+    );
+    std::vector<cdouble> channel_wide(
+        static_cast<size_t>(ni * ny * nb),
+        cdouble(0.0, 0.0)
+    );
+    std::vector<cdouble> output_wide(
+        static_cast<size_t>(na * ny * nb),
+        cdouble(0.0, 0.0)
+    );
+    std::vector<cdouble> a_conj;
+    if (!left) {
+        a_conj.resize(static_cast<size_t>(na * ni));
+    }
+
+    const cdouble alpha(1.0, 0.0);
+    const cdouble beta0(0.0, 0.0);
+    const cdouble* env_ptr = env.data();
+    const cdouble* a_ptr = a.data();
+    const cdouble* w_ptr = w.data();
+    const cdouble* b_ptr = b.data();
+    cdouble* out_ptr = out.mutable_data();
+    {
+        py::gil_scoped_release release;
+        if (!left) {
+            for (ssize_t ia = 0; ia < na; ++ia) {
+                for (ssize_t i = 0; i < ni; ++i) {
+                    a_conj[static_cast<size_t>(ia * ni + i)] =
+                        std::conj(a_ptr[static_cast<size_t>(ia * ni + i)]);
+                }
+            }
+        }
+
+        // Contract all incoming MPO channels with B in one multiplication.
+        // env is viewed as (nx * ni, nj), and the result as (nx, ni * nb).
+        cblas_zgemm(
+            101,
+            111,
+            left ? 111 : 112,
+            static_cast<int>(nx * ni),
+            static_cast<int>(nb),
+            static_cast<int>(nj),
+            &alpha,
+            env_ptr,
+            static_cast<int>(nj),
+            b_ptr,
+            left ? static_cast<int>(nb) : static_cast<int>(nj),
+            &beta0,
+            env_b.data(),
+            static_cast<int>(nb)
+        );
+
+        // Sum the incoming MPO channels for every outgoing channel.  Unique
+        // physical sectors make W an ordinary (nx, ny) or (ny, nx) matrix.
+        cblas_zgemm(
+            101,
+            left ? 112 : 111,
+            111,
+            static_cast<int>(ny),
+            static_cast<int>(ni_nb),
+            static_cast<int>(nx),
+            &alpha,
+            w_ptr,
+            left ? static_cast<int>(ny) : static_cast<int>(nx),
+            env_b.data(),
+            static_cast<int>(ni_nb),
+            &beta0,
+            channel_sum.data(),
+            static_cast<int>(ni_nb)
+        );
+
+        // Present all outgoing channels as columns so A is applied once to
+        // the whole shape group rather than once per MPO channel.
+        for (ssize_t y = 0; y < ny; ++y) {
+            for (ssize_t i = 0; i < ni; ++i) {
+                for (ssize_t ib = 0; ib < nb; ++ib) {
+                    channel_wide[static_cast<size_t>(
+                        i * ny_nb + y * nb + ib
+                    )] = channel_sum[static_cast<size_t>(
+                        (y * ni + i) * nb + ib
+                    )];
+                }
+            }
+        }
+        cblas_zgemm(
+            101,
+            left ? 113 : 111,
+            111,
+            static_cast<int>(na),
+            static_cast<int>(ny_nb),
+            static_cast<int>(ni),
+            &alpha,
+            left ? a_ptr : a_conj.data(),
+            left ? static_cast<int>(na) : static_cast<int>(ni),
+            channel_wide.data(),
+            static_cast<int>(ny_nb),
+            &beta0,
+            output_wide.data(),
+            static_cast<int>(ny_nb)
+        );
+        for (ssize_t y = 0; y < ny; ++y) {
+            for (ssize_t ia = 0; ia < na; ++ia) {
+                for (ssize_t ib = 0; ib < nb; ++ib) {
+                    out_ptr[static_cast<size_t>((y * na + ia) * nb + ib)] =
+                        output_wide[static_cast<size_t>(
+                            ia * ny_nb + y * nb + ib
+                        )];
+                }
+            }
+        }
+    }
+    return out;
+}
+#endif
+
 static py::array_t<cdouble> left_environment_contract_block(
     py::object e_obj,
     py::object a_obj,
@@ -35106,6 +36095,21 @@ static py::array_t<cdouble> left_environment_contract_block(
     const ssize_t nb = b.shape(1);
     const ssize_t nu = a.shape(2);
     const ssize_t nv = b.shape(2);
+#ifdef __APPLE__
+    const long double gemm_work =
+        static_cast<long double>(nx) * ni * nj * nb
+        + static_cast<long double>(ny) * nx * ni * nb
+        + static_cast<long double>(na) * ni * ny * nb;
+    if (nu == 1 && nv == 1 && gemm_work >= 4096.0L) {
+        return environment_contract_block_gemm_unique_physical(
+            e,
+            a,
+            w,
+            b,
+            true
+        );
+    }
+#endif
     py::array_t<cdouble> out = zero_array3(ny, na, nb);
     auto o = out.mutable_unchecked<3>();
     for (ssize_t y = 0; y < ny; ++y) {
@@ -35161,6 +36165,21 @@ static py::array_t<cdouble> right_environment_contract_block(
     const ssize_t nb = b.shape(0);
     const ssize_t np = a.shape(2);
     const ssize_t nv = b.shape(2);
+#ifdef __APPLE__
+    const long double gemm_work =
+        static_cast<long double>(nx) * ni * nj * nb
+        + static_cast<long double>(ny) * nx * ni * nb
+        + static_cast<long double>(na) * ni * ny * nb;
+    if (np == 1 && nv == 1 && gemm_work >= 4096.0L) {
+        return environment_contract_block_gemm_unique_physical(
+            f,
+            a,
+            w,
+            b,
+            false
+        );
+    }
+#endif
     py::array_t<cdouble> out = zero_array3(ny, na, nb);
     auto o = out.mutable_unchecked<3>();
     for (ssize_t y = 0; y < ny; ++y) {
@@ -35392,6 +36411,656 @@ static py::tuple dict_items_to_key_block_tuple(py::dict out) {
         blocks.append(py::reinterpret_borrow<py::object>(item.second));
     }
     return py::make_tuple(tuple_from_sequence_object(keys), tuple_from_sequence_object(blocks));
+}
+
+struct DMRG3SExpansionRoute {
+    py::object fused_sector;
+    py::object pair_key;
+    py::object out_key;
+    py::array_t<cdouble> environment;
+    py::array_t<cdouble> site;
+    py::array_t<cdouble> mpo;
+};
+
+static void register_dmrg3s_fused_pair(
+    py::dict pair_dims,
+    const py::object& fused_sector,
+    const py::object& pair_key,
+    ssize_t width
+) {
+    py::dict sector_dims;
+    if (pair_dims.contains(fused_sector)) {
+        sector_dims = py::reinterpret_borrow<py::dict>(pair_dims[fused_sector]);
+    } else {
+        sector_dims = py::dict();
+        pair_dims[fused_sector] = sector_dims;
+    }
+    if (sector_dims.contains(pair_key)) {
+        if (py::cast<ssize_t>(sector_dims[pair_key]) != width) {
+            throw std::runtime_error("inconsistent DMRG3S fused-pair dimension");
+        }
+    } else {
+        sector_dims[pair_key] = width;
+    }
+}
+
+static py::tuple dmrg3s_fused_pair_offsets(py::dict pair_dims) {
+    py::dict offsets;
+    py::dict totals;
+    for (auto sector_item : pair_dims) {
+        py::object sector = py::reinterpret_borrow<py::object>(sector_item.first);
+        py::dict sector_dims = py::reinterpret_borrow<py::dict>(sector_item.second);
+        py::dict sector_offsets;
+        ssize_t offset = 0;
+        for (auto pair_item : sector_dims) {
+            py::object pair = py::reinterpret_borrow<py::object>(pair_item.first);
+            sector_offsets[pair] = offset;
+            offset += py::cast<ssize_t>(pair_item.second);
+        }
+        offsets[sector] = sector_offsets;
+        totals[sector] = offset;
+    }
+    return py::make_tuple(offsets, totals);
+}
+
+static uint64_t dmrg3s_splitmix64(uint64_t value) {
+    value += 0x9e3779b97f4a7c15ULL;
+    value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+    value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+    return value ^ (value >> 31U);
+}
+
+static py::tuple dmrg3s_sketch_maps(
+    py::dict totals,
+    ssize_t requested_rank,
+    uint64_t seed
+) {
+    py::dict widths;
+    py::dict buckets;
+    py::dict signs;
+    ssize_t sector_index = 0;
+    for (auto item : totals) {
+        py::object sector = py::reinterpret_borrow<py::object>(item.first);
+        const ssize_t total = py::cast<ssize_t>(item.second);
+        const ssize_t width = requested_rank > 0
+            ? std::min(total, requested_rank)
+            : total;
+        widths[sector] = width;
+        if (requested_rank <= 0 || width == total) {
+            ++sector_index;
+            continue;
+        }
+        py::array_t<int64_t> sector_buckets(total);
+        py::array_t<double> sector_signs(total);
+        auto bucket = sector_buckets.mutable_unchecked<1>();
+        auto sign = sector_signs.mutable_unchecked<1>();
+        const uint64_t sector_seed = dmrg3s_splitmix64(
+            seed ^ (static_cast<uint64_t>(sector_index) + 1ULL)
+        );
+        for (ssize_t fused = 0; fused < total; ++fused) {
+            const uint64_t hash = dmrg3s_splitmix64(
+                sector_seed ^ static_cast<uint64_t>(fused)
+            );
+            bucket(fused) = static_cast<int64_t>(
+                hash % static_cast<uint64_t>(width)
+            );
+            sign(fused) = (hash >> 63U) ? -1.0 : 1.0;
+        }
+        buckets[sector] = sector_buckets;
+        signs[sector] = sector_signs;
+        ++sector_index;
+    }
+    return py::make_tuple(widths, buckets, signs);
+}
+
+#ifdef __APPLE__
+static void dmrg3s_left_sketch_route_gemm(
+    const DMRG3SExpansionRoute& route,
+    py::array_t<cdouble>& out,
+    ssize_t pair_offset,
+    const int64_t* buckets,
+    const double* signs
+) {
+    const ssize_t nml = route.environment.shape(0);
+    const ssize_t nlb = route.environment.shape(1);
+    const ssize_t nlk = route.environment.shape(2);
+    const ssize_t nold = route.site.shape(1);
+    const ssize_t nmr = route.mpo.shape(1);
+    const ssize_t rank = out.shape(1);
+    const std::array<ssize_t, 6> dims = {nml, nlb, nlk, nold, nmr, rank};
+    if (std::any_of(dims.begin(), dims.end(), [](ssize_t value) {
+            return value < 0 || value > std::numeric_limits<int>::max();
+        })) {
+        throw std::runtime_error("DMRG3S left sketch exceeds BLAS integer range");
+    }
+    std::vector<cdouble> partial(static_cast<size_t>(nlb * nold));
+    std::vector<cdouble> projected(static_cast<size_t>(nold * rank));
+    const cdouble alpha(1.0, 0.0);
+    const cdouble beta0(0.0, 0.0);
+    const cdouble beta1(1.0, 0.0);
+    const cdouble* ep = route.environment.data();
+    const cdouble* ap = route.site.data();
+    const cdouble* wp = route.mpo.data();
+    cdouble* op = out.mutable_data();
+    {
+        py::gil_scoped_release release;
+        for (ssize_t ml = 0; ml < nml; ++ml) {
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(nlb),
+                static_cast<int>(nold),
+                static_cast<int>(nlk),
+                &alpha,
+                ep + static_cast<size_t>(ml * nlb * nlk),
+                static_cast<int>(nlk),
+                ap,
+                static_cast<int>(nold),
+                &beta0,
+                partial.data(),
+                static_cast<int>(nold)
+            );
+            std::fill(projected.begin(), projected.end(), cdouble(0.0, 0.0));
+            for (ssize_t old = 0; old < nold; ++old) {
+                for (ssize_t mr = 0; mr < nmr; ++mr) {
+                    const ssize_t fused = pair_offset + old * nmr + mr;
+                    projected[static_cast<size_t>(
+                        old * rank + static_cast<ssize_t>(buckets[fused])
+                    )] += signs[fused] * wp[static_cast<size_t>(ml * nmr + mr)];
+                }
+            }
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(nlb),
+                static_cast<int>(rank),
+                static_cast<int>(nold),
+                &alpha,
+                partial.data(),
+                static_cast<int>(nold),
+                projected.data(),
+                static_cast<int>(rank),
+                &beta1,
+                op,
+                static_cast<int>(rank)
+            );
+        }
+    }
+}
+
+static void dmrg3s_right_sketch_route_gemm(
+    const DMRG3SExpansionRoute& route,
+    py::array_t<cdouble>& out,
+    ssize_t pair_offset,
+    const int64_t* buckets,
+    const double* signs
+) {
+    const ssize_t nmr = route.environment.shape(0);
+    const ssize_t nright = route.environment.shape(1);
+    const ssize_t nold_right = route.environment.shape(2);
+    const ssize_t nold_left = route.site.shape(0);
+    const ssize_t nml = route.mpo.shape(0);
+    const ssize_t rank = out.shape(0);
+    const std::array<ssize_t, 6> dims = {
+        nmr, nright, nold_right, nold_left, nml, rank
+    };
+    if (std::any_of(dims.begin(), dims.end(), [](ssize_t value) {
+            return value < 0 || value > std::numeric_limits<int>::max();
+        })) {
+        throw std::runtime_error("DMRG3S right sketch exceeds BLAS integer range");
+    }
+    std::vector<cdouble> partial(static_cast<size_t>(nold_left * nright));
+    std::vector<cdouble> projected(static_cast<size_t>(rank * nold_left));
+    const cdouble alpha(1.0, 0.0);
+    const cdouble beta0(0.0, 0.0);
+    const cdouble beta1(1.0, 0.0);
+    const cdouble* fp = route.environment.data();
+    const cdouble* ap = route.site.data();
+    const cdouble* wp = route.mpo.data();
+    cdouble* op = out.mutable_data();
+    {
+        py::gil_scoped_release release;
+        for (ssize_t mr = 0; mr < nmr; ++mr) {
+            cblas_zgemm(
+                101,
+                111,
+                112,
+                static_cast<int>(nold_left),
+                static_cast<int>(nright),
+                static_cast<int>(nold_right),
+                &alpha,
+                ap,
+                static_cast<int>(nold_right),
+                fp + static_cast<size_t>(mr * nright * nold_right),
+                static_cast<int>(nold_right),
+                &beta0,
+                partial.data(),
+                static_cast<int>(nright)
+            );
+            std::fill(projected.begin(), projected.end(), cdouble(0.0, 0.0));
+            for (ssize_t old = 0; old < nold_left; ++old) {
+                for (ssize_t ml = 0; ml < nml; ++ml) {
+                    const ssize_t fused = pair_offset + old * nml + ml;
+                    projected[static_cast<size_t>(
+                        static_cast<ssize_t>(buckets[fused]) * nold_left + old
+                    )] += signs[fused] * wp[static_cast<size_t>(ml * nmr + mr)];
+                }
+            }
+            cblas_zgemm(
+                101,
+                111,
+                111,
+                static_cast<int>(rank),
+                static_cast<int>(nright),
+                static_cast<int>(nold_left),
+                &alpha,
+                projected.data(),
+                static_cast<int>(nold_left),
+                partial.data(),
+                static_cast<int>(nright),
+                &beta1,
+                op,
+                static_cast<int>(nright)
+            );
+        }
+    }
+}
+#endif
+
+static py::dict abelian_dmrg3s_left_expansion_data(
+    py::object site,
+    py::object W,
+    py::object E,
+    ssize_t sketch_rank = 0,
+    uint64_t sketch_seed = 0
+) {
+    py::dict site_data = py::reinterpret_borrow<py::dict>(site.attr("data"));
+    py::dict w_data = py::reinterpret_borrow<py::dict>(W.attr("data"));
+    py::dict e_data = py::reinterpret_borrow<py::dict>(E.attr("data"));
+    py::dict site_by_left;
+    py::dict w_by_left_phys_in;
+    for (auto item : site_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        py::sequence seq = key.cast<py::sequence>();
+        append_group(site_by_left, py::reinterpret_borrow<py::object>(seq[0]), key);
+    }
+    for (auto item : w_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        py::sequence seq = key.cast<py::sequence>();
+        append_group(
+            w_by_left_phys_in,
+            py::make_tuple(
+                py::reinterpret_borrow<py::object>(seq[0]),
+                py::reinterpret_borrow<py::object>(seq[3])
+            ),
+            key
+        );
+    }
+
+    std::vector<DMRG3SExpansionRoute> routes;
+    py::dict pair_dims;
+    for (auto e_item : e_data) {
+        py::object e_key = py::reinterpret_borrow<py::object>(e_item.first);
+        py::sequence e_seq = e_key.cast<py::sequence>();
+        py::object site_group_key = py::reinterpret_borrow<py::object>(e_seq[2]);
+        if (!site_by_left.contains(site_group_key)) {
+            continue;
+        }
+        py::sequence site_group = py::reinterpret_borrow<py::sequence>(
+            site_by_left[site_group_key]
+        );
+        for (ssize_t ai = 0; ai < static_cast<ssize_t>(py::len(site_group)); ++ai) {
+            py::object a_key = py::reinterpret_borrow<py::object>(site_group[ai]);
+            py::sequence a_seq = a_key.cast<py::sequence>();
+            py::object w_group_key = py::make_tuple(
+                py::reinterpret_borrow<py::object>(e_seq[0]),
+                py::reinterpret_borrow<py::object>(a_seq[2])
+            );
+            if (!w_by_left_phys_in.contains(w_group_key)) {
+                continue;
+            }
+            auto a_block = ensure_cdouble_array(
+                py::reinterpret_borrow<py::object>(site_data[a_key])
+            );
+            py::sequence w_group = py::reinterpret_borrow<py::sequence>(
+                w_by_left_phys_in[w_group_key]
+            );
+            for (ssize_t wi = 0; wi < static_cast<ssize_t>(py::len(w_group)); ++wi) {
+                py::object w_key = py::reinterpret_borrow<py::object>(w_group[wi]);
+                py::sequence w_seq = w_key.cast<py::sequence>();
+                auto w_block = ensure_cdouble_array(
+                    py::reinterpret_borrow<py::object>(w_data[w_key])
+                );
+                py::object q_old = py::reinterpret_borrow<py::object>(a_seq[1]);
+                py::object q_mpo = py::reinterpret_borrow<py::object>(w_seq[1]);
+                py::object q_new = py_number_subtract(q_old, q_mpo);
+                py::object pair_key = py::make_tuple(q_old, q_mpo);
+                register_dmrg3s_fused_pair(
+                    pair_dims,
+                    q_new,
+                    pair_key,
+                    a_block.shape(1) * w_block.shape(1)
+                );
+                routes.push_back(DMRG3SExpansionRoute{
+                    q_new,
+                    pair_key,
+                    py::make_tuple(
+                        py::reinterpret_borrow<py::object>(e_seq[1]),
+                        q_new,
+                        py::reinterpret_borrow<py::object>(w_seq[2])
+                    ),
+                    ensure_cdouble_array(py::reinterpret_borrow<py::object>(e_item.second)),
+                    a_block,
+                    std::move(w_block)
+                });
+            }
+        }
+    }
+
+    py::tuple offset_payload = dmrg3s_fused_pair_offsets(pair_dims);
+    py::dict offsets = py::reinterpret_borrow<py::dict>(offset_payload[0]);
+    py::dict totals = py::reinterpret_borrow<py::dict>(offset_payload[1]);
+    py::tuple sketch_payload = dmrg3s_sketch_maps(
+        totals,
+        sketch_rank,
+        sketch_seed
+    );
+    py::dict sketch_widths = py::reinterpret_borrow<py::dict>(sketch_payload[0]);
+    py::dict sketch_buckets = py::reinterpret_borrow<py::dict>(sketch_payload[1]);
+    py::dict sketch_signs = py::reinterpret_borrow<py::dict>(sketch_payload[2]);
+    py::dict out;
+    const cdouble zero = cdouble(0.0, 0.0);
+    for (const auto& route : routes) {
+        auto e = route.environment.unchecked<3>();
+        auto a = route.site.unchecked<3>();
+        auto w = route.mpo.unchecked<4>();
+        if (route.environment.shape(2) != route.site.shape(0) ||
+            route.environment.shape(0) != route.mpo.shape(0) ||
+            route.site.shape(2) != route.mpo.shape(3)) {
+            throw std::runtime_error("DMRG3S left expansion route shape mismatch");
+        }
+        const ssize_t total = py::cast<ssize_t>(totals[route.fused_sector]);
+        const ssize_t output_width = py::cast<ssize_t>(
+            sketch_widths[route.fused_sector]
+        );
+        const bool sketched = output_width < total;
+        py::array_t<int64_t> buckets;
+        py::array_t<double> signs;
+        if (sketched) {
+            buckets = py::array_t<int64_t>::ensure(
+                sketch_buckets[route.fused_sector]
+            );
+            signs = py::array_t<double>::ensure(
+                sketch_signs[route.fused_sector]
+            );
+        }
+        py::array_t<cdouble> block;
+        if (out.contains(route.out_key)) {
+            block = ensure_cdouble_array(out[route.out_key]);
+        } else {
+            block = zero_array3(
+                route.environment.shape(1),
+                output_width,
+                route.mpo.shape(2)
+            );
+            out[route.out_key] = block;
+        }
+        py::dict sector_offsets = py::reinterpret_borrow<py::dict>(
+            offsets[route.fused_sector]
+        );
+        const ssize_t pair_offset = py::cast<ssize_t>(sector_offsets[route.pair_key]);
+        const int64_t* bucket_ptr = sketched ? buckets.data() : nullptr;
+        const double* sign_ptr = sketched ? signs.data() : nullptr;
+#ifdef __APPLE__
+        const long double sketch_work =
+            static_cast<long double>(route.environment.shape(0))
+            * route.environment.shape(1)
+            * route.environment.shape(2)
+            * route.site.shape(1);
+        if (sketched && route.site.shape(2) == 1
+            && route.mpo.shape(2) == 1 && route.mpo.shape(3) == 1
+            && sketch_work >= 4096.0L) {
+            dmrg3s_left_sketch_route_gemm(
+                route,
+                block,
+                pair_offset,
+                bucket_ptr,
+                sign_ptr
+            );
+            continue;
+        }
+#endif
+        auto result = block.mutable_unchecked<3>();
+        for (ssize_t ml = 0; ml < route.environment.shape(0); ++ml) {
+            for (ssize_t lk = 0; lk < route.environment.shape(2); ++lk) {
+                for (ssize_t lb = 0; lb < route.environment.shape(1); ++lb) {
+                    const cdouble e_value = e(ml, lb, lk);
+                    if (e_value == zero) {
+                        continue;
+                    }
+                    for (ssize_t old = 0; old < route.site.shape(1); ++old) {
+                        for (ssize_t pin = 0; pin < route.site.shape(2); ++pin) {
+                            const cdouble ea = e_value * a(lk, old, pin);
+                            if (ea == zero) {
+                                continue;
+                            }
+                            for (ssize_t mr = 0; mr < route.mpo.shape(1); ++mr) {
+                                const ssize_t fused = pair_offset + old * route.mpo.shape(1) + mr;
+                                const ssize_t target = sketched
+                                    ? static_cast<ssize_t>(bucket_ptr[fused])
+                                    : fused;
+                                const double scale = sketched ? sign_ptr[fused] : 1.0;
+                                for (ssize_t pout = 0; pout < route.mpo.shape(2); ++pout) {
+                                    result(lb, target, pout) +=
+                                        scale * ea * w(ml, mr, pout, pin);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
+}
+
+static py::dict abelian_dmrg3s_right_expansion_data(
+    py::object site,
+    py::object W,
+    py::object F,
+    ssize_t sketch_rank = 0,
+    uint64_t sketch_seed = 0
+) {
+    py::dict site_data = py::reinterpret_borrow<py::dict>(site.attr("data"));
+    py::dict w_data = py::reinterpret_borrow<py::dict>(W.attr("data"));
+    py::dict f_data = py::reinterpret_borrow<py::dict>(F.attr("data"));
+    py::dict site_by_right;
+    py::dict w_by_right_phys_in;
+    for (auto item : site_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        py::sequence seq = key.cast<py::sequence>();
+        append_group(site_by_right, py::reinterpret_borrow<py::object>(seq[1]), key);
+    }
+    for (auto item : w_data) {
+        py::object key = py::reinterpret_borrow<py::object>(item.first);
+        py::sequence seq = key.cast<py::sequence>();
+        append_group(
+            w_by_right_phys_in,
+            py::make_tuple(
+                py::reinterpret_borrow<py::object>(seq[1]),
+                py::reinterpret_borrow<py::object>(seq[3])
+            ),
+            key
+        );
+    }
+
+    std::vector<DMRG3SExpansionRoute> routes;
+    py::dict pair_dims;
+    for (auto f_item : f_data) {
+        py::object f_key = py::reinterpret_borrow<py::object>(f_item.first);
+        py::sequence f_seq = f_key.cast<py::sequence>();
+        py::object site_group_key = py::reinterpret_borrow<py::object>(f_seq[2]);
+        if (!site_by_right.contains(site_group_key)) {
+            continue;
+        }
+        py::sequence site_group = py::reinterpret_borrow<py::sequence>(
+            site_by_right[site_group_key]
+        );
+        for (ssize_t ai = 0; ai < static_cast<ssize_t>(py::len(site_group)); ++ai) {
+            py::object a_key = py::reinterpret_borrow<py::object>(site_group[ai]);
+            py::sequence a_seq = a_key.cast<py::sequence>();
+            py::object w_group_key = py::make_tuple(
+                py::reinterpret_borrow<py::object>(f_seq[0]),
+                py::reinterpret_borrow<py::object>(a_seq[2])
+            );
+            if (!w_by_right_phys_in.contains(w_group_key)) {
+                continue;
+            }
+            auto a_block = ensure_cdouble_array(
+                py::reinterpret_borrow<py::object>(site_data[a_key])
+            );
+            py::sequence w_group = py::reinterpret_borrow<py::sequence>(
+                w_by_right_phys_in[w_group_key]
+            );
+            for (ssize_t wi = 0; wi < static_cast<ssize_t>(py::len(w_group)); ++wi) {
+                py::object w_key = py::reinterpret_borrow<py::object>(w_group[wi]);
+                py::sequence w_seq = w_key.cast<py::sequence>();
+                auto w_block = ensure_cdouble_array(
+                    py::reinterpret_borrow<py::object>(w_data[w_key])
+                );
+                py::object q_old = py::reinterpret_borrow<py::object>(a_seq[0]);
+                py::object q_mpo = py::reinterpret_borrow<py::object>(w_seq[0]);
+                py::object q_new = py_number_subtract(q_old, q_mpo);
+                py::object pair_key = py::make_tuple(q_old, q_mpo);
+                register_dmrg3s_fused_pair(
+                    pair_dims,
+                    q_new,
+                    pair_key,
+                    a_block.shape(0) * w_block.shape(0)
+                );
+                routes.push_back(DMRG3SExpansionRoute{
+                    q_new,
+                    pair_key,
+                    py::make_tuple(
+                        q_new,
+                        py::reinterpret_borrow<py::object>(f_seq[1]),
+                        py::reinterpret_borrow<py::object>(w_seq[2])
+                    ),
+                    ensure_cdouble_array(py::reinterpret_borrow<py::object>(f_item.second)),
+                    a_block,
+                    std::move(w_block)
+                });
+            }
+        }
+    }
+
+    py::tuple offset_payload = dmrg3s_fused_pair_offsets(pair_dims);
+    py::dict offsets = py::reinterpret_borrow<py::dict>(offset_payload[0]);
+    py::dict totals = py::reinterpret_borrow<py::dict>(offset_payload[1]);
+    py::tuple sketch_payload = dmrg3s_sketch_maps(
+        totals,
+        sketch_rank,
+        sketch_seed
+    );
+    py::dict sketch_widths = py::reinterpret_borrow<py::dict>(sketch_payload[0]);
+    py::dict sketch_buckets = py::reinterpret_borrow<py::dict>(sketch_payload[1]);
+    py::dict sketch_signs = py::reinterpret_borrow<py::dict>(sketch_payload[2]);
+    py::dict out;
+    const cdouble zero = cdouble(0.0, 0.0);
+    for (const auto& route : routes) {
+        auto f = route.environment.unchecked<3>();
+        auto a = route.site.unchecked<3>();
+        auto w = route.mpo.unchecked<4>();
+        if (route.site.shape(1) != route.environment.shape(2) ||
+            route.environment.shape(0) != route.mpo.shape(1) ||
+            route.site.shape(2) != route.mpo.shape(3)) {
+            throw std::runtime_error("DMRG3S right expansion route shape mismatch");
+        }
+        const ssize_t total = py::cast<ssize_t>(totals[route.fused_sector]);
+        const ssize_t output_width = py::cast<ssize_t>(
+            sketch_widths[route.fused_sector]
+        );
+        const bool sketched = output_width < total;
+        py::array_t<int64_t> buckets;
+        py::array_t<double> signs;
+        if (sketched) {
+            buckets = py::array_t<int64_t>::ensure(
+                sketch_buckets[route.fused_sector]
+            );
+            signs = py::array_t<double>::ensure(
+                sketch_signs[route.fused_sector]
+            );
+        }
+        py::array_t<cdouble> block;
+        if (out.contains(route.out_key)) {
+            block = ensure_cdouble_array(out[route.out_key]);
+        } else {
+            block = zero_array3(
+                output_width,
+                route.environment.shape(1),
+                route.mpo.shape(2)
+            );
+            out[route.out_key] = block;
+        }
+        py::dict sector_offsets = py::reinterpret_borrow<py::dict>(
+            offsets[route.fused_sector]
+        );
+        const ssize_t pair_offset = py::cast<ssize_t>(sector_offsets[route.pair_key]);
+        const int64_t* bucket_ptr = sketched ? buckets.data() : nullptr;
+        const double* sign_ptr = sketched ? signs.data() : nullptr;
+#ifdef __APPLE__
+        const long double sketch_work =
+            static_cast<long double>(route.environment.shape(0))
+            * route.environment.shape(1)
+            * route.environment.shape(2)
+            * route.site.shape(0);
+        if (sketched && route.site.shape(2) == 1
+            && route.mpo.shape(2) == 1 && route.mpo.shape(3) == 1
+            && sketch_work >= 4096.0L) {
+            dmrg3s_right_sketch_route_gemm(
+                route,
+                block,
+                pair_offset,
+                bucket_ptr,
+                sign_ptr
+            );
+            continue;
+        }
+#endif
+        auto result = block.mutable_unchecked<3>();
+        for (ssize_t mr = 0; mr < route.environment.shape(0); ++mr) {
+            for (ssize_t old_right = 0; old_right < route.environment.shape(2); ++old_right) {
+                for (ssize_t right = 0; right < route.environment.shape(1); ++right) {
+                    const cdouble f_value = f(mr, right, old_right);
+                    if (f_value == zero) {
+                        continue;
+                    }
+                    for (ssize_t old_left = 0; old_left < route.site.shape(0); ++old_left) {
+                        for (ssize_t pin = 0; pin < route.site.shape(2); ++pin) {
+                            const cdouble af = a(old_left, old_right, pin) * f_value;
+                            if (af == zero) {
+                                continue;
+                            }
+                            for (ssize_t ml = 0; ml < route.mpo.shape(0); ++ml) {
+                                const ssize_t fused = pair_offset + old_left * route.mpo.shape(0) + ml;
+                                const ssize_t target = sketched
+                                    ? static_cast<ssize_t>(bucket_ptr[fused])
+                                    : fused;
+                                const double scale = sketched ? sign_ptr[fused] : 1.0;
+                                for (ssize_t pout = 0; pout < route.mpo.shape(2); ++pout) {
+                                    result(target, right, pout) +=
+                                        scale * af * w(ml, mr, pout, pin);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return out;
 }
 
 static py::object neg_axis_item(const py::object& items, ssize_t axis) {
@@ -35812,6 +37481,25 @@ struct AbelianTDVPSiteHeffRoute {
     py::object out_key;
 };
 
+struct FlatAbelianTDVPSiteHeffRoute {
+    py::array_t<cdouble> e;
+    py::array_t<cdouble> w;
+    py::array_t<cdouble> f;
+    const cdouble* ep = nullptr;
+    const cdouble* wp = nullptr;
+    const cdouble* fp = nullptr;
+    ssize_t input_offset = 0;
+    ssize_t output_offset = 0;
+    ssize_t n_mpo_left = 0;
+    ssize_t n_left_bra = 0;
+    ssize_t n_left_ket = 0;
+    ssize_t n_right_ket = 0;
+    ssize_t n_phys_in = 0;
+    ssize_t n_mpo_right = 0;
+    ssize_t n_phys_out = 0;
+    ssize_t n_right_bra = 0;
+};
+
 struct AbelianTDVPBondHeffRoute {
     py::object e_key;
     py::object center_key;
@@ -35896,6 +37584,220 @@ public:
             qns_,
             dirs_
         );
+    }
+
+    py::dict davidson(
+        py::object theta,
+        py::object E,
+        py::object W,
+        py::object F,
+        py::sequence layout,
+        double tol,
+        int max_iter,
+        int restart_dim,
+        bool accept_unconverged
+    ) {
+        py::dict theta_data = py::reinterpret_borrow<py::dict>(theta.attr("data"));
+        py::dict e_data = py::reinterpret_borrow<py::dict>(E.attr("data"));
+        py::dict w_data = py::reinterpret_borrow<py::dict>(W.attr("data"));
+        py::dict f_data = py::reinterpret_borrow<py::dict>(F.attr("data"));
+        py::dict flat_blocks;
+        ssize_t dim = 0;
+        std::vector<cdouble> initial;
+
+        for (ssize_t i = 0; i < static_cast<ssize_t>(py::len(layout)); ++i) {
+            py::sequence entry = py::reinterpret_borrow<py::sequence>(layout[i]);
+            if (py::len(entry) != 2) {
+                throw std::runtime_error("Abelian site layout entries must be (key, shape) pairs");
+            }
+            py::object key = py::reinterpret_borrow<py::object>(entry[0]);
+            py::sequence shape = py::reinterpret_borrow<py::sequence>(entry[1]);
+            if (py::len(shape) != 3) {
+                throw std::runtime_error("Abelian site Davidson requires rank-three blocks");
+            }
+            const ssize_t d0 = py::cast<ssize_t>(shape[0]);
+            const ssize_t d1 = py::cast<ssize_t>(shape[1]);
+            const ssize_t d2 = py::cast<ssize_t>(shape[2]);
+            auto block = ensure_cdouble_array(dict_get_required(theta_data, key));
+            if (block.ndim() != 3 || block.shape(0) != d0 || block.shape(1) != d1 ||
+                block.shape(2) != d2) {
+                throw std::runtime_error("Abelian site Davidson layout/block shape mismatch");
+            }
+            flat_blocks[key] = py::make_tuple(dim, d0, d1, d2);
+            py::buffer_info info = block.request();
+            const cdouble* data = static_cast<const cdouble*>(info.ptr);
+            const ssize_t block_size = d0 * d1 * d2;
+            initial.insert(initial.end(), data, data + block_size);
+            dim += block_size;
+        }
+        if (dim <= 0) {
+            throw std::runtime_error("cannot solve an empty Abelian site layout");
+        }
+
+        std::vector<FlatAbelianTDVPSiteHeffRoute> flat_routes;
+        flat_routes.reserve(routes_.size());
+        for (const auto& route : routes_) {
+            if (!flat_blocks.contains(route.theta_key) || !flat_blocks.contains(route.out_key)) {
+                continue;
+            }
+            py::sequence input = py::reinterpret_borrow<py::sequence>(flat_blocks[route.theta_key]);
+            py::sequence output = py::reinterpret_borrow<py::sequence>(flat_blocks[route.out_key]);
+            FlatAbelianTDVPSiteHeffRoute flat;
+            flat.e = ensure_cdouble_array(dict_get_required(e_data, route.e_key));
+            flat.w = ensure_cdouble_array(dict_get_required(w_data, route.w_key));
+            flat.f = ensure_cdouble_array(dict_get_required(f_data, route.f_key));
+            if (flat.e.ndim() != 3 || flat.w.ndim() != 4 || flat.f.ndim() != 3) {
+                throw std::runtime_error("Abelian site Davidson environment rank mismatch");
+            }
+            flat.input_offset = py::cast<ssize_t>(input[0]);
+            flat.output_offset = py::cast<ssize_t>(output[0]);
+            flat.n_mpo_left = flat.e.shape(0);
+            flat.n_left_bra = flat.e.shape(1);
+            flat.n_left_ket = flat.e.shape(2);
+            flat.n_right_ket = py::cast<ssize_t>(input[2]);
+            flat.n_phys_in = py::cast<ssize_t>(input[3]);
+            flat.n_mpo_right = flat.w.shape(1);
+            flat.n_phys_out = flat.w.shape(2);
+            flat.n_right_bra = flat.f.shape(1);
+            if (py::cast<ssize_t>(input[1]) != flat.n_left_ket ||
+                flat.w.shape(0) != flat.n_mpo_left ||
+                flat.w.shape(3) != flat.n_phys_in ||
+                flat.f.shape(0) != flat.n_mpo_right ||
+                flat.f.shape(2) != flat.n_right_ket ||
+                py::cast<ssize_t>(output[1]) != flat.n_left_bra ||
+                py::cast<ssize_t>(output[2]) != flat.n_right_bra ||
+                py::cast<ssize_t>(output[3]) != flat.n_phys_out) {
+                throw std::runtime_error("Abelian site Davidson route shape mismatch");
+            }
+            flat.ep = static_cast<const cdouble*>(flat.e.request().ptr);
+            flat.wp = static_cast<const cdouble*>(flat.w.request().ptr);
+            flat.fp = static_cast<const cdouble*>(flat.f.request().ptr);
+            flat_routes.push_back(std::move(flat));
+        }
+        std::vector<cdouble> diag(static_cast<size_t>(dim), cdouble(0.0, 0.0));
+        for (const auto& route : flat_routes) {
+            if (route.input_offset != route.output_offset ||
+                route.n_left_ket != route.n_left_bra ||
+                route.n_right_ket != route.n_right_bra ||
+                route.n_phys_in != route.n_phys_out) {
+                continue;
+            }
+            for (ssize_t left = 0; left < route.n_left_ket; ++left) {
+                for (ssize_t right = 0; right < route.n_right_ket; ++right) {
+                    for (ssize_t phys = 0; phys < route.n_phys_in; ++phys) {
+                        cdouble value = 0.0;
+                        for (ssize_t mpo_left = 0; mpo_left < route.n_mpo_left; ++mpo_left) {
+                            const cdouble e_val = route.ep[
+                                (mpo_left * route.n_left_bra + left) * route.n_left_ket + left
+                            ];
+                            if (e_val == cdouble(0.0, 0.0)) {
+                                continue;
+                            }
+                            for (ssize_t mpo_right = 0; mpo_right < route.n_mpo_right; ++mpo_right) {
+                                const cdouble w_val = route.wp[
+                                    ((mpo_left * route.n_mpo_right + mpo_right) * route.n_phys_out + phys)
+                                        * route.n_phys_in
+                                    + phys
+                                ];
+                                const cdouble f_val = route.fp[
+                                    (mpo_right * route.n_right_bra + right) * route.n_right_ket + right
+                                ];
+                                value += e_val * w_val * f_val;
+                            }
+                        }
+                        diag[static_cast<size_t>(
+                            route.input_offset
+                            + (left * route.n_right_ket + right) * route.n_phys_in
+                            + phys
+                        )] += value;
+                    }
+                }
+            }
+        }
+
+        const auto matvec = [&flat_routes, dim](const std::vector<cdouble>& vector) {
+            std::vector<cdouble> out(static_cast<size_t>(dim), cdouble(0.0, 0.0));
+            const cdouble zero = cdouble(0.0, 0.0);
+            for (const auto& route : flat_routes) {
+                for (ssize_t mpo_left = 0; mpo_left < route.n_mpo_left; ++mpo_left) {
+                    for (ssize_t left_ket = 0; left_ket < route.n_left_ket; ++left_ket) {
+                        for (ssize_t left_bra = 0; left_bra < route.n_left_bra; ++left_bra) {
+                            const cdouble e_val = route.ep[
+                                (mpo_left * route.n_left_bra + left_bra) * route.n_left_ket + left_ket
+                            ];
+                            if (e_val == zero) {
+                                continue;
+                            }
+                            for (ssize_t right_ket = 0; right_ket < route.n_right_ket; ++right_ket) {
+                                for (ssize_t phys_in = 0; phys_in < route.n_phys_in; ++phys_in) {
+                                    const cdouble theta_val = vector[static_cast<size_t>(
+                                        route.input_offset
+                                        + (left_ket * route.n_right_ket + right_ket) * route.n_phys_in
+                                        + phys_in
+                                    )];
+                                    if (theta_val == zero) {
+                                        continue;
+                                    }
+                                    const cdouble etheta = e_val * theta_val;
+                                    for (ssize_t mpo_right = 0; mpo_right < route.n_mpo_right; ++mpo_right) {
+                                        for (ssize_t right_bra = 0; right_bra < route.n_right_bra; ++right_bra) {
+                                            const cdouble f_val = route.fp[
+                                                (mpo_right * route.n_right_bra + right_bra)
+                                                    * route.n_right_ket
+                                                + right_ket
+                                            ];
+                                            if (f_val == zero) {
+                                                continue;
+                                            }
+                                            const cdouble ethetaf = etheta * f_val;
+                                            const cdouble* w_base = route.wp
+                                                + ((mpo_left * route.n_mpo_right + mpo_right)
+                                                       * route.n_phys_out)
+                                                    * route.n_phys_in
+                                                + phys_in;
+                                            cdouble* out_row = out.data()
+                                                + route.output_offset
+                                                + (left_bra * route.n_right_bra + right_bra)
+                                                    * route.n_phys_out;
+                                            for (ssize_t phys_out = 0; phys_out < route.n_phys_out; ++phys_out) {
+                                                const cdouble w_val = w_base[phys_out * route.n_phys_in];
+                                                if (w_val != zero) {
+                                                    out_row[phys_out] += ethetaf * w_val;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return out;
+        };
+
+        const ssize_t requested_basis = static_cast<ssize_t>(
+            restart_dim > 0 ? restart_dim : std::max(1, max_iter)
+        );
+        const bool workspace_reused = davidson_workspace_.initialized &&
+            davidson_workspace_.dim == dim &&
+            davidson_workspace_.max_basis >= requested_basis;
+        py::dict result = ::davidson(
+            dim,
+            diag,
+            std::move(initial),
+            tol,
+            max_iter,
+            restart_dim,
+            accept_unconverged,
+            davidson_workspace_,
+            matvec
+        );
+        result["backend"] = "cpp-u1-site-davidson";
+        result["dimension"] = dim;
+        result["routes"] = static_cast<ssize_t>(flat_routes.size());
+        result["workspace_reused"] = workspace_reused;
+        return result;
     }
 
     ssize_t route_count() const {
@@ -36010,6 +37912,7 @@ private:
     std::vector<AbelianTDVPSiteHeffRoute> routes_;
     py::object qns_ = py::none();
     py::object dirs_ = py::none();
+    DavidsonWorkspace davidson_workspace_;
 };
 
 class CppAbelianTDVPBondHeffPlan {
@@ -43178,6 +45081,77 @@ private:
 
 PYBIND11_MODULE(_cpp_davidson, m) {
     m.doc() = "Optional C++ packed Davidson kernels for PyQED MPS.";
+    py::class_<CppPackedGroupedAction>(m, "PackedGroupedAction")
+        .def(
+            py::init<
+                py::array_t<long long, py::array::c_style | py::array::forcecast>,
+                py::list,
+                py::list,
+                bool
+            >(),
+            py::arg("indices"),
+            py::arg("columns"),
+            py::arg("matrices"),
+            py::arg("complex_values") = false
+        )
+        .def("matvecs", &CppPackedGroupedAction::matvecs, py::arg("vectors"))
+        .def("diagonal", &CppPackedGroupedAction::diagonal)
+        .def_property_readonly("backend", &CppPackedGroupedAction::backend);
+    m.def(
+        "build_packed_advance_routes",
+        &build_packed_advance_routes,
+        py::arg("left_direction"),
+        py::arg("source_bra_bond"),
+        py::arg("source_ket_bond"),
+        py::arg("source_sites"),
+        py::arg("source_bra_physical"),
+        py::arg("source_ket_physical"),
+        py::arg("tensor_flat"),
+        py::arg("tensor_left"),
+        py::arg("tensor_right"),
+        py::arg("local_sites"),
+        py::arg("tensor_physical"),
+        py::arg("overlap_sites"),
+        py::arg("target_sites"),
+        py::arg("target_paired"),
+        py::arg("physical_dims"),
+        py::arg("target_pair_lookup"),
+        py::arg("target_shape"),
+        py::arg("target_inverse"),
+        py::arg("operator_matrix"),
+        py::arg("source_values") = py::none(),
+        py::arg("tensor_values") = py::none(),
+        py::arg("target_size") = 0,
+        py::arg("real_output") = false
+    );
+    m.def(
+        "build_packed_hole_routes",
+        &build_packed_hole_routes,
+        py::arg("left_bra_bond"),
+        py::arg("left_ket_bond"),
+        py::arg("left_sites"),
+        py::arg("left_bra_physical"),
+        py::arg("left_ket_physical"),
+        py::arg("right_bra_bond"),
+        py::arg("right_ket_bond"),
+        py::arg("right_sites"),
+        py::arg("right_bra_physical"),
+        py::arg("right_ket_physical"),
+        py::arg("tensor_flat"),
+        py::arg("tensor_left"),
+        py::arg("tensor_right"),
+        py::arg("local_sites"),
+        py::arg("tensor_physical"),
+        py::arg("common_sites"),
+        py::arg("constrained_sites"),
+        py::arg("physical_dims"),
+        py::arg("right_bond_dimension"),
+        py::arg("operator_matrix"),
+        py::arg("left_values") = py::none(),
+        py::arg("right_values") = py::none(),
+        py::arg("real_output") = false,
+        py::arg("dense_output") = py::none()
+    );
     m.def(
         "lapack_svd",
         &lapack_svd,
@@ -43612,6 +45586,24 @@ PYBIND11_MODULE(_cpp_davidson, m) {
         py::arg("E"),
         py::arg("F")
     );
+    m.def(
+        "abelian_dmrg3s_left_expansion_data",
+        &abelian_dmrg3s_left_expansion_data,
+        py::arg("site"),
+        py::arg("W"),
+        py::arg("E"),
+        py::arg("sketch_rank") = 0,
+        py::arg("sketch_seed") = 0
+    );
+    m.def(
+        "abelian_dmrg3s_right_expansion_data",
+        &abelian_dmrg3s_right_expansion_data,
+        py::arg("site"),
+        py::arg("W"),
+        py::arg("F"),
+        py::arg("sketch_rank") = 0,
+        py::arg("sketch_seed") = 0
+    );
     py::class_<CppAbelianTDVPSiteHeffPlan>(m, "AbelianTDVPSiteHeffPlan")
         .def_static(
             "from_tensors",
@@ -43628,6 +45620,19 @@ PYBIND11_MODULE(_cpp_davidson, m) {
             py::arg("E"),
             py::arg("W"),
             py::arg("F")
+        )
+        .def(
+            "davidson",
+            &CppAbelianTDVPSiteHeffPlan::davidson,
+            py::arg("theta"),
+            py::arg("E"),
+            py::arg("W"),
+            py::arg("F"),
+            py::arg("layout"),
+            py::arg("tol") = 1.0e-8,
+            py::arg("max_iter") = 30,
+            py::arg("restart_dim") = 12,
+            py::arg("accept_unconverged") = true
         )
         .def("route_count", &CppAbelianTDVPSiteHeffPlan::route_count);
     py::class_<CppAbelianTDVPBondHeffPlan>(m, "AbelianTDVPBondHeffPlan")

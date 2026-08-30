@@ -5,6 +5,181 @@ from __future__ import annotations
 import numpy as np
 
 
+def _generic_frontier_log_score(
+    nsites,
+    mask,
+    tie_neighbors,
+    interaction_edges,
+    log_effective_dims,
+):
+    full = (1 << nsites) - 1
+    if mask in {0, full}:
+        return -np.inf, 0.0
+    right_mask = full ^ mask
+    frontier = tuple(
+        site
+        for site in range(nsites)
+        if right_mask & (1 << site) and tie_neighbors[site] & mask
+    )
+    crossing_weight = sum(
+        abs(weight)
+        for left, right, weight in interaction_edges
+        if bool(mask & (1 << left)) != bool(mask & (1 << right))
+    )
+    log_frontier = sum(log_effective_dims[site] for site in frontier)
+    return 2.0 * log_frontier + np.log1p(crossing_weight), crossing_weight
+
+
+def optimize_frontier_order(
+    nsites,
+    tie_edges,
+    *,
+    interaction_edges=(),
+    effective_dims=2,
+    max_exact_sites=20,
+    beam_width=64,
+):
+    """Optimize a general LETTA order using weighted active-frontier cost.
+
+    ``effective_dims[i]`` is the cost carried when site ``i`` is exposed on a
+    frontier. It may be the physical dimension or a smaller symmetry-resolved
+    effective dimension. ``interaction_edges`` contains ``(i, j, weight)``
+    entries and estimates the Hamiltonian channel work crossing each cut.
+    Exact subset dynamic programming is used for modest graphs and a
+    deterministic beam search for larger ones.
+    """
+
+    nsites = int(nsites)
+    if nsites < 1:
+        raise ValueError("nsites must be positive.")
+    ties = _validated_edges(nsites, tie_edges, weighted=False)
+    interactions = _validated_edges(nsites, interaction_edges, weighted=True)
+    if np.isscalar(effective_dims):
+        effective_dims = (float(effective_dims),) * nsites
+    else:
+        effective_dims = tuple(float(value) for value in effective_dims)
+    if len(effective_dims) != nsites or any(
+        not np.isfinite(value) or value < 1.0 for value in effective_dims
+    ):
+        raise ValueError(
+            "effective_dims must contain one finite value >= 1 per site."
+        )
+    log_dims = tuple(float(np.log(value)) for value in effective_dims)
+    neighbors = [0] * nsites
+    for left, right, _weight in ties:
+        neighbors[left] |= 1 << right
+        neighbors[right] |= 1 << left
+    full = (1 << nsites) - 1
+
+    if nsites <= int(max_exact_sites):
+        scores = np.zeros(full + 1, dtype=float)
+        for mask in range(1, full):
+            log_score, _weight = _generic_frontier_log_score(
+                nsites,
+                mask,
+                neighbors,
+                interactions,
+                log_dims,
+            )
+            scores[mask] = float(np.exp(min(log_score, 700.0)))
+        return _optimize_order_from_scores(nsites, scores)
+
+    beam_width = int(beam_width)
+    if beam_width < 1:
+        raise ValueError("beam_width must be positive.")
+    beam = ((0, -np.inf, -np.inf, 0.0, ()),)
+    for _depth in range(nsites):
+        candidates = {}
+        for mask, peak, total, weight, order in beam:
+            remaining = full ^ mask
+            while remaining:
+                bit = remaining & -remaining
+                site = bit.bit_length() - 1
+                new_mask = mask | bit
+                log_score, crossing = _generic_frontier_log_score(
+                    nsites,
+                    new_mask,
+                    neighbors,
+                    interactions,
+                    log_dims,
+                )
+                candidate = (
+                    new_mask,
+                    max(peak, log_score),
+                    float(np.logaddexp(total, log_score)),
+                    weight + crossing,
+                    order + (site,),
+                )
+                incumbent = candidates.get(new_mask)
+                if incumbent is None or candidate[1:] < incumbent[1:]:
+                    candidates[new_mask] = candidate
+                remaining -= bit
+        beam = tuple(
+            sorted(
+                candidates.values(),
+                key=lambda entry: (entry[1], entry[2], entry[3], entry[4]),
+            )[:beam_width]
+        )
+    return beam[0][4]
+
+
+def frontier_order_profile(
+    nsites,
+    tie_edges,
+    order,
+    *,
+    interaction_edges=(),
+    effective_dims=2,
+):
+    """Return the generic weighted frontier cost along an explicit order."""
+    nsites = int(nsites)
+    order = tuple(int(site) for site in order)
+    if sorted(order) != list(range(nsites)):
+        raise ValueError("order must be a permutation of all sites.")
+    ties = _validated_edges(nsites, tie_edges, weighted=False)
+    interactions = _validated_edges(nsites, interaction_edges, weighted=True)
+    if np.isscalar(effective_dims):
+        effective_dims = (float(effective_dims),) * nsites
+    else:
+        effective_dims = tuple(float(value) for value in effective_dims)
+    if len(effective_dims) != nsites or any(value < 1.0 for value in effective_dims):
+        raise ValueError("effective_dims must contain one value >= 1 per site.")
+    log_dims = tuple(float(np.log(value)) for value in effective_dims)
+    neighbors = [0] * nsites
+    for left, right, _weight in ties:
+        neighbors[left] |= 1 << right
+        neighbors[right] |= 1 << left
+    full = (1 << nsites) - 1
+    mask = 0
+    profile = []
+    for cut, site in enumerate(order[:-1], start=1):
+        mask |= 1 << site
+        right_mask = full ^ mask
+        frontier = tuple(
+            future
+            for future in range(nsites)
+            if right_mask & (1 << future) and neighbors[future] & mask
+        )
+        log_score, crossing = _generic_frontier_log_score(
+            nsites,
+            mask,
+            neighbors,
+            interactions,
+            log_dims,
+        )
+        profile.append(
+            {
+                "cut": cut,
+                "frontier_sites": frontier,
+                "frontier_width": len(frontier),
+                "crossing_weight": crossing,
+                "log_score": log_score,
+                "score": float(np.exp(min(log_score, 700.0))),
+            }
+        )
+    return tuple(profile)
+
+
 def _validated_edges(nsites, edges, *, weighted):
     result = []
     for edge in edges:
@@ -121,15 +296,14 @@ def _heisenberg_block_cut_diagnostic(
     frontier_width = len(frontier)
     base = float(local_dim**frontier_width)
     block_factor = (
-        1
-        + local_dim ** len(idle_paired)
+        local_dim ** len(idle_paired)
         + 3 * crossing
         + 2 * (local_dim - 1) * crossing_on_frontier
     )
     return {
         "frontier_sites": frontier,
         "frontier_width": frontier_width,
-        "mpo_channels": 2 + 3 * crossing,
+        "mpo_channels": 1 + 3 * crossing,
         "idle_paired_sites": idle_paired,
         "crossing_bonds": crossing,
         "crossing_bonds_on_tied_frontier": crossing_on_frontier,
@@ -246,12 +420,12 @@ def _heisenberg_block_cut_tables(
 
         frontier_width = len(frontier)
         base = float(local_dim**frontier_width)
-        # The raw Heisenberg automaton has idle/done channels and three
-        # channels per crossing bond.  In each spin-vector triplet, exactly
-        # two suffix operators are off-diagonal in the computational basis.
+        # Reachability pruning retains one of the idle/done channels plus
+        # three channels per crossing bond.  In each spin-vector triplet,
+        # exactly two suffix operators are off-diagonal in the computational
+        # basis.
         block_factor = (
-            1
-            + local_dim ** len(idle_paired)
+            local_dim ** len(idle_paired)
             + 3 * crossing
             + 2 * (local_dim - 1) * crossing_on_frontier
         )
@@ -259,7 +433,7 @@ def _heisenberg_block_cut_tables(
         diagnostics[mask] = {
             "frontier_sites": frontier,
             "frontier_width": frontier_width,
-            "mpo_channels": 2 + 3 * crossing,
+            "mpo_channels": 1 + 3 * crossing,
             "idle_paired_sites": idle_paired,
             "crossing_bonds": crossing,
             "crossing_bonds_on_tied_frontier": crossing_on_frontier,
@@ -653,4 +827,6 @@ __all__ = [
     "heisenberg_frontier_profile",
     "optimize_heisenberg_block_order",
     "optimize_heisenberg_order",
+    "optimize_frontier_order",
+    "frontier_order_profile",
 ]

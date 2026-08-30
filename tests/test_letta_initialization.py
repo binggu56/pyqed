@@ -2,11 +2,12 @@ import numpy as np
 import pytest
 
 from pyqed.letta import (
-    LocalHamiltonian,
-    LocalTerm,
+    ConditionalFrontierLETTA,
+    conditional_frontier_letta_from_mps,
     frontier_tensors_from_mps,
     frontier_tied_letta_from_mps,
 )
+from pyqed.tn import LocalHamiltonian, LocalTerm
 
 
 def _mps_vector(tensors):
@@ -103,6 +104,40 @@ def test_factory_preserves_normalized_mps_state():
         atol=3.0e-13,
     )
     assert state.bond_dim == 5
+
+
+def test_conditional_factory_preserves_mps_with_neutral_ties():
+    dims = (2, 2, 2, 2)
+    ranks = (1, 2, 3, 2, 1)
+    parents = ((1, 2, 3), (2, 3), (3,), ())
+    mps = _random_mps(dims, ranks, seed=18, complex_values=True)
+    local_z = np.diag([0.4, -0.4])
+    hamiltonian = LocalHamiltonian(dims, (LocalTerm((1,), local_z),))
+
+    state = conditional_frontier_letta_from_mps(
+        hamiltonian,
+        parents,
+        mps,
+        seed=2,
+    )
+
+    expected = _mps_vector(mps)
+    expected /= np.linalg.norm(expected)
+    assert isinstance(state, ConditionalFrontierLETTA)
+    assert state.chi == tuple(tensor.shape[2] for tensor in mps)
+    np.testing.assert_allclose(
+        state.state_vector(normalize=True),
+        expected,
+        rtol=3.0e-13,
+        atol=3.0e-13,
+    )
+    with pytest.raises(ValueError, match="requires chi"):
+        conditional_frontier_letta_from_mps(
+            hamiltonian,
+            parents,
+            mps,
+            chi=2,
+        )
 
 
 def test_tie_noise_is_reproducible_centered_and_tie_only():

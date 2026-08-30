@@ -21,16 +21,16 @@ from scipy.linalg import eigh
 from pyqed.mps.fermion import SpinHalfFermionChain
 from pyqed.qchem import Molecule, build_atom_from_coords
 
-from pyqed.narg.irrep_tensor import (
+from pyqed.symmetry import (
     Irrep,
-    IrrepSite,
+    Leg,
     IrrepTensor,
     OpIrrep,
     ProductSymmetry,
     SU2Symmetry,
     U1Symmetry,
     spin_label,
-    u1_su2_site_from_spin,
+    u1_su2_leg_from_spin,
 )
 
 
@@ -182,13 +182,13 @@ def local_su2_branches() -> tuple[LocalIrrepBranch, ...]:
     )
 
 
-def local_su2_site() -> IrrepSite:
+def local_su2_leg() -> Leg:
     """One spatial orbital as U(1)xSU(2) irreps.
 
     Dims are multiplicity dimensions.  The spin multiplet dimension ``2S+1`` is
     carried by SU(2) representation theory, not by this degeneracy index.
     """
-    return u1_su2_site_from_spin([
+    return u1_su2_leg_from_spin([
         (0, 0, 1),
         (1, "1/2", 1),
         (2, 0, 1),
@@ -321,8 +321,8 @@ def su2_product_symmetry() -> ProductSymmetry:
     return ProductSymmetry((U1Symmetry("Ne"), SU2Symmetry("SU2")), name="U1xSU2")
 
 
-def csf_irrep_site(nsites: int, m2: int | None = 0) -> tuple[IrrepSite, dict[Irrep, np.ndarray]]:
-    """Build an IrrepSite and CSF basis columns for every sector with this M."""
+def csf_leg(nsites: int, m2: int | None = 0) -> tuple[Leg, dict[Irrep, np.ndarray]]:
+    """Build an Leg and CSF basis columns for every sector with this M."""
     sectors: dict[Irrep, list[np.ndarray]] = {}
     for mp in build_site_csf_multiplets(nsites):
         selected_m2 = mp.j2 if m2 is None else m2
@@ -334,17 +334,17 @@ def csf_irrep_site(nsites: int, m2: int | None = 0) -> tuple[IrrepSite, dict[Irr
 
     dims = {irrep: len(cols) for irrep, cols in sectors.items()}
     bases = {irrep: np.column_stack(cols) for irrep, cols in sectors.items()}
-    return IrrepSite(su2_product_symmetry(), dims), bases
+    return Leg(dims, symmetry=su2_product_symmetry()), bases
 
 
-def scalar_hamiltonian_irrep_tensor(H, site: IrrepSite, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
+def scalar_hamiltonian_irrep_tensor(H, leg: Leg, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
     """Represent a scalar Hamiltonian as an IrrepTensor over CSF sectors."""
     H = asarray(H)
     blocks = {}
     for irrep, basis in bases.items():
         block = basis.conj().T @ H @ basis
         blocks[(irrep, irrep)] = 0.5 * (block + block.conj().T)
-    return IrrepTensor(site, site, OpIrrep((0, 0)), blocks)
+    return IrrepTensor(leg, leg, OpIrrep((0, 0)), blocks)
 
 
 def spin_adapted_operator_matrix(op, nsites: int, bra, ket):
@@ -364,7 +364,7 @@ def spin_adapted_operator_matrix(op, nsites: int, bra, ket):
 
 def spin_adapted_operator_tensor(op, nsites: int, op_irrep: OpIrrep, m2: int | None = 0) -> IrrepTensor:
     """Wrap a projected CSF operator as an IrrepTensor."""
-    site, bases = csf_irrep_site(nsites, m2=m2)
+    site, bases = csf_leg(nsites, m2=m2)
     dense_op = asarray(op)
     blocks = {}
     for bra_irrep, bra_basis in bases.items():
@@ -436,7 +436,7 @@ def su2_irrep_tensor_roots(h1e, eri, nelec: int, j2: int, nroots: int = 8, m2: i
     """Same roots, but through an IrrepTensor scalar Hamiltonian block."""
     nsites = h1e.shape[0]
     model = full_jw_model(h1e, eri, nelec)
-    site, bases = csf_irrep_site(nsites, m2=m2)
+    site, bases = csf_leg(nsites, m2=m2)
     Ht = scalar_hamiltonian_irrep_tensor(model.H, site, bases)
     irrep = Irrep((nelec, j2))
     block = Ht.block(irrep, irrep)
@@ -499,7 +499,7 @@ def validate(natom: int, span: float = 4.0, nroots: int = 6):
 
 
 def main():
-    site = local_su2_site()
+    site = local_su2_leg()
     print("Local SU2 site:")
     for irrep, dim in site.dims.items():
         nelec, j2 = irrep.charge

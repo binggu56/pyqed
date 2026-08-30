@@ -1,233 +1,248 @@
-"""
-Convenience re-exports for :mod:`pyqed.mps`.
+"""Matrix-product-state algorithms over the canonical :mod:`pyqed.tn` types.
 
-This package contains both legacy MPS/DMRG code and newer symmetry-adapted
-non-Abelian prototypes.  Some of the legacy modules depend on optional heavy
-dependencies (notably SciPy).  To make ``import pyqed.mps.nonabelian`` usable in
-minimal environments (and in CI jobs that only exercise SU(2) code), we guard
-those imports here.
+The package root is intentionally a small, explicit, lazily loaded façade.
+Backend-specific representations live in their own namespaces, notably
+``pyqed.mps.nonabelian``.
 """
 
 from __future__ import annotations
 
-# Lightweight symmetry utilities are safe to export.
-from .su2 import (  # noqa: F401
-    SU2Irrep,
-    SpinChargeSector,
-    SpatialOrbitalSite,
-    SpinOrbitalSite,
-    fuse_irreps,
-    fuse_charge_spin_sectors,
-)
-from .symmetry import (  # noqa: F401
-    Sector,
-    AbelianSector,
-    QN,
-    SymmetryManager,
-    is_sector_like,
-    zero_like_sector,
-)
-from .umps import UniformCanonicalForm, UniformMPS, UMPS  # noqa: F401
-from .idmrg import (  # noqa: F401
-    InfiniteDMRG,
-    NearestNeighborTerms,
-    factorize_nearest_neighbor_hamiltonian,
-    idmrg_nearest_neighbor,
-    iDMRG,
-    iDMRGBlock,
-    iDMRGStep,
-)
-from .cmps import (  # noqa: F401
-    CMPS,
-    ContinuousMPS,
-    canonical_parameter_size,
-    pack_canonical_parameters,
-    skew_pairs,
-    unpack_canonical_parameters,
-)
+from importlib import import_module
 
-# Non-Abelian prototype exports (kept available even without SciPy).
-from .nonabelian import (  # noqa: F401
-    NonabelianTensor,
-    PhysicalLeg,
-    SiteOperator,
-    MPO,
-    AutoMPO,
-    identity_operator,
-    compose_site_operators,
-    physical_leg_from_spatial_orbital,
-    spatial_identity,
-    spatial_number,
-    spatial_number_up,
-    spatial_number_down,
-    spatial_double_occupancy,
-    spatial_spin_square,
-    spatial_projector,
-    spatial_parity,
-    spatial_annihilate_up,
-    spatial_create_up,
-    spatial_annihilate_down,
-    spatial_create_down,
-    add_spatial_one_body_terms,
-    build_spatial_one_body_reduced_mpo,
-    add_spatial_spinfree_eri_terms,
-    build_spatial_spinfree_eri_mpo,
-    add_spatial_density_terms,
-    build_spatial_density_mpo,
-    add_spatial_hubbard_terms,
-    build_hubbard_mpo,
-    build_spatial_hubbard_mpo,
-    spatial_target_sector,
-    half_filled_singlet_sector,
-    build_random_spatial_mps,
-    build_product_spatial_mps,
-    FusionLeg,
-    FusionEdge,
-    FusionPipe,
-    FusionPipeEntry,
-    CouplingChannel,
-    ReducedBondSpace,
-    two_m_values,
-    clebsch_gordan,
-    clebsch_gordan_tensor,
-    couple_two_sectors_matrix,
-    enumerate_sector_couplings,
-    fuse_charge_spin_sector_sequence,
-    normalize_coupling_scheme,
-    reduced_bond_space,
-    recoupling_matrix,
-    tensordot,
-    merge_mps_sites,
-    combine_legs,
-    split_legs,
-    recouple_fused_leg,
-    svd_two_site,
-    left_canonical_error,
-    right_canonical_error,
-    left_canonicalize_sites,
-    right_canonicalize_sites,
-    mixed_canonicalize_sites,
-    LocalOperator,
-    TwoSiteEffectiveH,
-    pack_two_site_state,
-    unpack_two_site_state,
-    solve_local_two_site,
-    DenseEnvironmentChain,
-    DenseEnvironmentSweep,
-    BlockSparseEnvironmentChain,
-    BlockSparseEnvironmentSweep,
-    build_dense_bond_operator,
-    build_block_sparse_bond_operator,
-    two_site_update,
-    sweep_once,
-    run_sweeps,
-    SweepDriver,
-    Driver,
-)
+from pyqed.tn import MPO
 
-# Legacy exports: available only when optional deps exist.
-try:  # pragma: no cover
-    from .mps import *  # noqa: F401,F403
-    from .dmrg import (  # noqa: F401
-        DMRG,
-        dmrg_matvec_options,
-        resolve_abelian_matvec_options,
-    )
-    from .tdmps import TDMPS  # noqa: F401
-    from .tdvp import (  # noqa: F401
-        SymmetricTDVP,
-        block_sparse_one_site_tdvp_step,
-        one_site_tdvp_step,
-        spatial_fermion_number_sz_sectors,
-        two_site_tdvp_step,
-    )
-    from .first_quantization import Chain, FiniteDimLocalBasis  # noqa: F401
-except (ModuleNotFoundError, ImportError, OSError, TimeoutError):
-    pass
 
-# Keep the public uniform-MPS name pinned to the NumPy-only implementation even
-# when legacy wildcard exports are available.
-from .umps import UniformCanonicalForm, UniformMPS, UMPS  # noqa: F401,E402
-from .idmrg import (  # noqa: F401,E402
-    InfiniteDMRG,
-    NearestNeighborTerms,
-    factorize_nearest_neighbor_hamiltonian,
-    idmrg_nearest_neighbor,
-    iDMRG,
-    iDMRGBlock,
-    iDMRGStep,
-)
-from .cmps import (  # noqa: F401,E402
-    CMPS,
-    ContinuousMPS,
-    canonical_parameter_size,
-    fit_exponential_kernel_nonlinear,
-    fit_exponential_kernel_prony,
-    pack_canonical_parameters,
-    skew_pairs,
-    softened_yukawa_kernel,
-    unpack_canonical_parameters,
-)
-from .cletta import (  # noqa: F401,E402
-    apply_cletta_bra_insertion,
-    apply_cletta_ket_insertion,
-    apply_cletta_memory_hierarchy,
-    apply_cletta_multimode_bra_insertion,
-    apply_cletta_multimode_ket_insertion,
-    apply_cletta_multimode_memory_hierarchy,
-    apply_cletta_multimode_memory_hierarchy_adjoint,
-    cletta_bra_insertion_matrix,
-    cletta_ket_insertion_matrix,
-    cletta_memory_fock_keys,
-    cletta_memory_hierarchy_generator,
-    cletta_memory_matrices,
-    cletta_multimode_bra_insertion_matrix,
-    cletta_multimode_hierarchy_generator,
-    cletta_multimode_hierarchy_sparse_generator,
-    cletta_multimode_ket_insertion_matrix,
-    cletta_multimode_memory_matrices,
-    cletta_multifield_memory_matrices,
-    hierarchy_blocks_to_matrix,
-    matrix_to_hierarchy_blocks,
-)
-from .cylinder import (  # noqa: F401,E402
-    commuting_cylinder_parameter_size,
-    cylinder_density_mode_correlation,
-    cylinder_fixed_density_observables,
-    cylinder_static_structure_factor,
-    optimize_cylinder_cletta,
-    optimize_cylinder_cmps,
-    pack_commuting_cylinder_parameters,
-    softened_yukawa_cylinder_fourier,
-    unpack_commuting_cylinder_parameters,
-)
-from .luttinger import (  # noqa: F401,E402
-    ExponentialLuttingerModel,
-    GaussianLuttingerCLETTA,
-    cmps_luttinger_energy_shift_density,
-    cmps_luttinger_parameter,
-    cmps_luttinger_spectra,
-    optimize_luttinger_cletta,
-)
-from .pip_pairing import (  # noqa: F401,E402
-    ContinuumPipPairingModel,
-    ThermodynamicPipBCS,
-    ThermodynamicPipCLETTA,
-    ExactOnePairPipState,
-    OneScalePipCLETTA,
-    TwoPairPipCLETTA,
-    TwoPairPipD3CLETTA,
-)
-from .bose_gas_2d import (  # noqa: F401,E402
-    D2M1HierarchicalCLETTA2D,
-    D2M1NestedCLETTA2D,
-    DiluteBoseGas2D,
-    GaussianPotentialBoseGas2D,
-    HierarchicalShellContraction,
-    RankOneDensityTransferChannel2D,
-    fixed_density_gns_nested_hletta_state,
-    fixed_density_nested_hletta_state,
-    optimize_condensate_gns_hletta_fixed_density,
-    optimize_condensate_nested_hletta_fixed_density,
-    optimize_nested_hletta_fixed_density,
-)
+_EXPORTS = {
+    # Finite dense MPS and conversions.
+    "MPS": ("pyqed.mps.mps", "MPS"),
+    "dense_to_symmetric": ("pyqed.mps.mps", "dense_to_symmetric"),
+    "dense_to_symmetric_mpo": ("pyqed.mps.mps", "dense_to_symmetric_mpo"),
+    "expect_mps": ("pyqed.mps.mps", "expect_mps"),
+    "fDMRG_1site_GS_OBC": ("pyqed.mps.mps", "fDMRG_1site_GS_OBC"),
+    "symmetric_to_dense": ("pyqed.mps.mps", "symmetric_to_dense"),
+    "two_site_dmrg": ("pyqed.mps.mps", "two_site_dmrg"),
+    "one_site_dmrg3s": ("pyqed.mps._dmrg3s", "one_site_dmrg3s"),
+    # Ground-state and time-evolution algorithms.
+    "DMRG": ("pyqed.mps.dmrg", "DMRG"),
+    "resolve_abelian_matvec_options": (
+        "pyqed.mps.dmrg",
+        "resolve_abelian_matvec_options",
+    ),
+    "TDMPS": ("pyqed.mps.tdmps", "TDMPS"),
+    "TEBD": ("pyqed.mps.tebd", "TEBD"),
+    "tebd": ("pyqed.mps.tebd", "tebd"),
+    "SymmetricTDVP": ("pyqed.mps.tdvp", "SymmetricTDVP"),
+    "block_sparse_one_site_tdvp_step": (
+        "pyqed.mps.tdvp",
+        "block_sparse_one_site_tdvp_step",
+    ),
+    "block_sparse_two_site_tdvp_step": (
+        "pyqed.mps.tdvp",
+        "block_sparse_two_site_tdvp_step",
+    ),
+    "one_site_tdvp_step": ("pyqed.mps.tdvp", "one_site_tdvp_step"),
+    "two_site_tdvp_step": ("pyqed.mps.tdvp", "two_site_tdvp_step"),
+    # Purification-based finite-temperature states.
+    "PurifiedMPS": ("pyqed.mps.thermal", "PurifiedMPS"),
+    "infinite_temperature_mps": (
+        "pyqed.mps.thermal",
+        "infinite_temperature_mps",
+    ),
+    "lift_physical_mpo": ("pyqed.mps.thermal", "lift_physical_mpo"),
+    # Infinite, uniform, and continuous states.
+    "UMPS": ("pyqed.mps.umps", "UMPS"),
+    "UniformMPS": ("pyqed.mps.umps", "UniformMPS"),
+    "InfiniteDMRG": ("pyqed.mps.idmrg", "InfiniteDMRG"),
+    "iDMRG": ("pyqed.mps.idmrg", "iDMRG"),
+    "factorize_nearest_neighbor_hamiltonian": (
+        "pyqed.mps.idmrg",
+        "factorize_nearest_neighbor_hamiltonian",
+    ),
+    "idmrg_nearest_neighbor": ("pyqed.mps.idmrg", "idmrg_nearest_neighbor"),
+    "CMPS": ("pyqed.mps.cmps", "CMPS"),
+    "ContinuousMPS": ("pyqed.mps.cmps", "ContinuousMPS"),
+    "canonical_parameter_size": (
+        "pyqed.mps.cmps",
+        "canonical_parameter_size",
+    ),
+    "fit_exponential_kernel_nonlinear": (
+        "pyqed.mps.cmps",
+        "fit_exponential_kernel_nonlinear",
+    ),
+    "fit_exponential_kernel_prony": (
+        "pyqed.mps.cmps",
+        "fit_exponential_kernel_prony",
+    ),
+    "pack_canonical_parameters": (
+        "pyqed.mps.cmps",
+        "pack_canonical_parameters",
+    ),
+    "softened_yukawa_kernel": ("pyqed.mps.cmps", "softened_yukawa_kernel"),
+    "unpack_canonical_parameters": (
+        "pyqed.mps.cmps",
+        "unpack_canonical_parameters",
+    ),
+    # CLETTA/continuum helpers retained as explicit algorithms.
+    "apply_cletta_bra_insertion": (
+        "pyqed.mps.cletta",
+        "apply_cletta_bra_insertion",
+    ),
+    "apply_cletta_ket_insertion": (
+        "pyqed.mps.cletta",
+        "apply_cletta_ket_insertion",
+    ),
+    "apply_cletta_memory_hierarchy": (
+        "pyqed.mps.cletta",
+        "apply_cletta_memory_hierarchy",
+    ),
+    "apply_cletta_multimode_bra_insertion": (
+        "pyqed.mps.cletta",
+        "apply_cletta_multimode_bra_insertion",
+    ),
+    "apply_cletta_multimode_ket_insertion": (
+        "pyqed.mps.cletta",
+        "apply_cletta_multimode_ket_insertion",
+    ),
+    "apply_cletta_multimode_memory_hierarchy": (
+        "pyqed.mps.cletta",
+        "apply_cletta_multimode_memory_hierarchy",
+    ),
+    "apply_cletta_multimode_memory_hierarchy_adjoint": (
+        "pyqed.mps.cletta",
+        "apply_cletta_multimode_memory_hierarchy_adjoint",
+    ),
+    "cletta_bra_insertion_matrix": (
+        "pyqed.mps.cletta",
+        "cletta_bra_insertion_matrix",
+    ),
+    "cletta_ket_insertion_matrix": (
+        "pyqed.mps.cletta",
+        "cletta_ket_insertion_matrix",
+    ),
+    "cletta_memory_fock_keys": (
+        "pyqed.mps.cletta",
+        "cletta_memory_fock_keys",
+    ),
+    "cletta_memory_hierarchy_generator": (
+        "pyqed.mps.cletta",
+        "cletta_memory_hierarchy_generator",
+    ),
+    "cletta_memory_matrices": (
+        "pyqed.mps.cletta",
+        "cletta_memory_matrices",
+    ),
+    "cletta_multifield_memory_matrices": (
+        "pyqed.mps.cletta",
+        "cletta_multifield_memory_matrices",
+    ),
+    "cletta_multimode_bra_insertion_matrix": (
+        "pyqed.mps.cletta",
+        "cletta_multimode_bra_insertion_matrix",
+    ),
+    "cletta_multimode_hierarchy_generator": (
+        "pyqed.mps.cletta",
+        "cletta_multimode_hierarchy_generator",
+    ),
+    "cletta_multimode_hierarchy_sparse_generator": (
+        "pyqed.mps.cletta",
+        "cletta_multimode_hierarchy_sparse_generator",
+    ),
+    "cletta_multimode_ket_insertion_matrix": (
+        "pyqed.mps.cletta",
+        "cletta_multimode_ket_insertion_matrix",
+    ),
+    "cletta_multimode_memory_matrices": (
+        "pyqed.mps.cletta",
+        "cletta_multimode_memory_matrices",
+    ),
+    "hierarchy_blocks_to_matrix": (
+        "pyqed.mps.cletta",
+        "hierarchy_blocks_to_matrix",
+    ),
+    "commuting_cylinder_parameter_size": (
+        "pyqed.mps.cylinder",
+        "commuting_cylinder_parameter_size",
+    ),
+    "cylinder_density_mode_correlation": (
+        "pyqed.mps.cylinder",
+        "cylinder_density_mode_correlation",
+    ),
+    "cylinder_fixed_density_observables": (
+        "pyqed.mps.cylinder",
+        "cylinder_fixed_density_observables",
+    ),
+    "cylinder_static_structure_factor": (
+        "pyqed.mps.cylinder",
+        "cylinder_static_structure_factor",
+    ),
+    "optimize_cylinder_cletta": (
+        "pyqed.mps.cylinder",
+        "optimize_cylinder_cletta",
+    ),
+    "optimize_cylinder_cmps": (
+        "pyqed.mps.cylinder",
+        "optimize_cylinder_cmps",
+    ),
+    "pack_commuting_cylinder_parameters": (
+        "pyqed.mps.cylinder",
+        "pack_commuting_cylinder_parameters",
+    ),
+    "softened_yukawa_cylinder_fourier": (
+        "pyqed.mps.cylinder",
+        "softened_yukawa_cylinder_fourier",
+    ),
+    "unpack_commuting_cylinder_parameters": (
+        "pyqed.mps.cylinder",
+        "unpack_commuting_cylinder_parameters",
+    ),
+    "ExponentialLuttingerModel": (
+        "pyqed.mps.luttinger",
+        "ExponentialLuttingerModel",
+    ),
+    "GaussianLuttingerCLETTA": (
+        "pyqed.mps.luttinger",
+        "GaussianLuttingerCLETTA",
+    ),
+    "cmps_luttinger_energy_shift_density": (
+        "pyqed.mps.luttinger",
+        "cmps_luttinger_energy_shift_density",
+    ),
+    "cmps_luttinger_parameter": (
+        "pyqed.mps.luttinger",
+        "cmps_luttinger_parameter",
+    ),
+    "cmps_luttinger_spectra": (
+        "pyqed.mps.luttinger",
+        "cmps_luttinger_spectra",
+    ),
+    "optimize_luttinger_cletta": (
+        "pyqed.mps.luttinger",
+        "optimize_luttinger_cletta",
+    ),
+}
+
+_MODULE_EXPORTS = {
+    "cpp_davidson": "pyqed.mps.cpp_davidson",
+    "packed_cython": "pyqed.mps.packed_cython",
+    "tdvp_cpp": "pyqed.mps.tdvp_cpp",
+}
+
+
+def __getattr__(name):
+    if name in _MODULE_EXPORTS:
+        value = import_module(_MODULE_EXPORTS[name])
+    else:
+        try:
+            module_name, attribute = _EXPORTS[name]
+        except KeyError as error:
+            raise AttributeError(name) from error
+        value = getattr(import_module(module_name), attribute)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(__all__)
+
+
+__all__ = sorted({"MPO", *_EXPORTS, *_MODULE_EXPORTS})

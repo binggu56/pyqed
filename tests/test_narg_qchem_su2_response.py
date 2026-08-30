@@ -4,7 +4,7 @@ from scipy.linalg import eigh
 from types import SimpleNamespace
 
 from pyqed import Molecule
-from pyqed.narg.irrep_tensor import Irrep
+from pyqed.symmetry import Irrep
 from pyqed.narg.qchem import NARGSCF
 from pyqed.narg.qchem.su2 import NARG
 from pyqed.narg.qchem.su2_two_site import build_two_site_su2_narg, truncate_to_D
@@ -626,7 +626,7 @@ def test_recursive_two_site_perturbation_keeps_final_offdiagonal_couplings():
 
 
 def test_direct_reduced_full_hamiltonian_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor, OpIrrep
+    from pyqed.symmetry import IrrepTensor, OpIrrep
     from pyqed.narg.qchem.su2_three_site import direct_reduced_full_hamiltonian_tensor
 
     nsites = 3
@@ -684,7 +684,7 @@ def test_direct_reduced_full_hamiltonian_tangent_adjoint_matches_forward_pairing
 
 
 def test_grown_hamiltonian_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
 
     nsites = 4
     nelec = 4
@@ -753,7 +753,7 @@ def test_grown_hamiltonian_tangent_adjoint_matches_forward_pairing():
 
 
 def test_reduced_product_tensor_block_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
     from pyqed.narg.qchem.su2_three_site import (
         local_reduced_operator,
@@ -796,7 +796,7 @@ def test_reduced_product_tensor_block_adjoint_matches_forward_pairing():
             size=value.shape
         )
     product_adjoint = ReducedSU2Tensor(
-        IrrepTensor(product.site, product.site, product.op, adj_blocks)
+        IrrepTensor(product.leg, product.leg, product.op, adj_blocks)
     )
 
     got = reduced_product_tensor_block_adjoint(
@@ -814,7 +814,7 @@ def test_reduced_product_tensor_block_adjoint_matches_forward_pairing():
 
 
 def test_coupled_reduced_product_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor, coupled_reduced_product
 
     nsites = 3
@@ -848,7 +848,7 @@ def test_coupled_reduced_product_adjoint_matches_forward_pairing():
             size=value.shape
         )
     product_adjoint = ReducedSU2Tensor(
-        IrrepTensor(product.site, product.site, product.op, adj_blocks)
+        IrrepTensor(product.leg, product.leg, product.op, adj_blocks)
     )
 
     left_adj, right_adj = coupled_reduced_product_adjoint(
@@ -868,7 +868,7 @@ def test_coupled_reduced_product_adjoint_matches_forward_pairing():
 
 
 def test_grown_coupling_operators_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -909,7 +909,7 @@ def test_grown_coupling_operators_tangent_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         grown_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     got = _grown_coupling_operators_tangent_adjoint(
@@ -926,7 +926,7 @@ def test_grown_coupling_operators_tangent_adjoint_matches_forward_pairing():
 
 
 def test_new_site_weighted_packages_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -977,7 +977,7 @@ def test_new_site_weighted_packages_tangent_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         package_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     op_adj, dh1_adj, deri_adj = _new_site_weighted_packages_tangent_adjoint(
@@ -999,7 +999,7 @@ def test_new_site_weighted_packages_tangent_adjoint_matches_forward_pairing():
 
 
 def test_new_site_weighted_packages_bilinear_adjoint_x_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1064,7 +1064,7 @@ def test_new_site_weighted_packages_bilinear_adjoint_x_matches_forward_pairing()
                 size=value.shape
             )
         package_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     (
@@ -1099,7 +1099,7 @@ def test_new_site_weighted_packages_bilinear_adjoint_x_matches_forward_pairing()
 
 
 def test_grown_reduced_v1_packages_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1148,7 +1148,7 @@ def test_grown_reduced_v1_packages_tangent_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         package_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     op_adj, dh1_adj, deri_adj = _grown_reduced_v1_packages_tangent_adjoint(
@@ -1170,7 +1170,7 @@ def test_grown_reduced_v1_packages_tangent_adjoint_matches_forward_pairing():
 
 
 def test_grown_reduced_v1_packages_bilinear_adjoint_x_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1231,7 +1231,7 @@ def test_grown_reduced_v1_packages_bilinear_adjoint_x_matches_forward_pairing():
                 size=value.shape
             )
         package_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     (
@@ -1267,7 +1267,7 @@ def test_grown_reduced_v1_packages_bilinear_adjoint_x_matches_forward_pairing():
 
 
 def test_component_v1_packages_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1314,7 +1314,7 @@ def test_component_v1_packages_tangent_adjoint_matches_forward_pairing():
                 size=block_value.shape
             )
         package_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     op_adj, dh1_adj, deri_adj = _component_v1_packages_tangent_adjoint(
@@ -1336,7 +1336,7 @@ def test_component_v1_packages_tangent_adjoint_matches_forward_pairing():
 
 
 def test_weighted_packages_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1386,7 +1386,7 @@ def test_weighted_packages_tangent_adjoint_matches_forward_pairing():
                 size=block_value.shape
             )
         package_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     op_adj, dh1_adj, deri_adj = _weighted_packages_tangent_adjoint(
@@ -1421,7 +1421,7 @@ def test_composite_tangent_adjoint_matches_forward_pairing(
     adjoint_builder,
     args,
 ):
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 3
@@ -1456,7 +1456,7 @@ def test_composite_tangent_adjoint_matches_forward_pairing(
             size=value.shape
         )
     tangent_adjoint = ReducedSU2Tensor(
-        IrrepTensor(tangent.site, tangent.site, tangent.op, adj_blocks)
+        IrrepTensor(tangent.leg, tangent.leg, tangent.op, adj_blocks)
     )
     got = adjoint_builder(operators, doperators, tangent_adjoint, *args)
 
@@ -1467,7 +1467,7 @@ def test_composite_tangent_adjoint_matches_forward_pairing(
 
 
 def test_rotate_reduced_tensors_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1505,7 +1505,7 @@ def test_rotate_reduced_tensors_tangent_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         rotated_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     tensor_adjoint, transform_adjoint = rotate_reduced_tensors_tangent_adjoint(
@@ -1522,7 +1522,7 @@ def test_rotate_reduced_tensors_tangent_adjoint_matches_forward_pairing():
 
 
 def test_rotate_reduced_tensors_bilinear_adjoint_x_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1632,7 +1632,7 @@ def test_rotate_reduced_tensors_bilinear_adjoint_x_matches_forward_pairing():
                 size=value.shape
             )
         rotated_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     (
@@ -1658,7 +1658,7 @@ def test_rotate_reduced_tensors_bilinear_adjoint_x_matches_forward_pairing():
 
 
 def test_pre_rotation_tensors_and_tangents_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1694,7 +1694,7 @@ def test_pre_rotation_tensors_and_tangents_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         tensor_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     narg = solver.chain.blocks[3].truncated.source
@@ -1719,7 +1719,7 @@ def test_pre_rotation_tensors_and_tangents_adjoint_matches_forward_pairing():
 
 
 def test_pre_rotation_tensors_and_bilinears_adjoint_x_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1799,7 +1799,7 @@ def test_pre_rotation_tensors_and_bilinears_adjoint_x_matches_forward_pairing():
                 size=value.shape
             )
         tensor_x_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
     tensor_xy_adjoint = {}
     for key, tensor in xytensors.items():
@@ -1809,7 +1809,7 @@ def test_pre_rotation_tensors_and_bilinears_adjoint_x_matches_forward_pairing():
                 size=value.shape
             )
         tensor_xy_adjoint[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     (
@@ -1850,7 +1850,7 @@ def test_pre_rotation_tensors_and_bilinears_adjoint_x_matches_forward_pairing():
 
 
 def test_recursive_growth_step_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1896,7 +1896,7 @@ def test_recursive_growth_step_tangent_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         next_op_adj[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     h_adj, op_adj, dh1_adj, deri_adj = _recursive_growth_step_tangent_adjoint(
@@ -1926,7 +1926,7 @@ def test_recursive_growth_step_tangent_adjoint_matches_forward_pairing():
 
 
 def test_seed_two_site_tangent_adjoint_matches_forward_pairing():
-    from pyqed.narg.irrep_tensor import IrrepTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.narg.qchem.su2_reduced_tensor import ReducedSU2Tensor
 
     nsites = 4
@@ -1971,7 +1971,7 @@ def test_seed_two_site_tangent_adjoint_matches_forward_pairing():
                 size=block.shape
             )
         op_adj[key] = ReducedSU2Tensor(
-            IrrepTensor(tensor.site, tensor.site, tensor.op, blocks)
+            IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks)
         )
 
     dh1_adj, deri_adj = _seed_two_site_tangent_adjoint(

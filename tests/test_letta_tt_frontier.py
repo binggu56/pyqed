@@ -2,13 +2,16 @@ import numpy as np
 import pytest
 
 from pyqed.letta import FrontierTiedLETTA
-from pyqed.letta.local_terms import LocalMPO
 from pyqed.letta.mpo_frontier import MPOFrontier
 from pyqed.letta.tt_frontier import (
+    TermwiseBlockMPOFrontier,
     TermwiseTTMPOFrontier,
     TTFrontier,
     TTMPOFrontier,
+    _term_product_mpos,
 )
+from pyqed.lattice import Site
+from pyqed.tn import Hamiltonian, LocalTerm, MPO
 from tests.test_letta_frontier_tying import _states
 from tests.test_letta_mpo_frontier import _identity_mpo
 
@@ -16,7 +19,7 @@ from tests.test_letta_mpo_frontier import _identity_mpo
 def _engines(state, mpo, *, paired_sites=None, **tt_options):
     arguments = (
         state.dims,
-        state.physical_sites,
+        state.physical_groups,
         [tensor.shape for tensor in state.tensors],
         mpo.tensors,
     )
@@ -55,6 +58,38 @@ def test_dense_tt_svd_round_trip_and_rounding_diagnostics():
     tolerance_truncated = TTFrontier.from_dense(array, labels, rtol=0.25)
     assert np.linalg.norm(tolerance_truncated.to_dense() - array) <= tolerance
     assert tolerance_truncated.last_round.discarded_weight > 0.0
+
+
+def test_charge_resolved_operator_schmidt_keeps_u1_transfers_homogeneous():
+    sx = 0.5 * np.array([[0.0, 1.0], [1.0, 0.0]])
+    sy = 0.5 * np.array([[0.0, -1.0j], [1.0j, 0.0]])
+    sz = 0.5 * np.diag([1.0, -1.0])
+    exchange = np.kron(sx, sx) + np.kron(sy, sy) + np.kron(sz, sz)
+    qns = (((1,), (-1,)),) * 2
+    components = _term_product_mpos(
+        (2, 2),
+        LocalTerm((0, 1), exchange),
+        local_qns=qns,
+    )
+
+    assert len(components) == 3
+    np.testing.assert_allclose(
+        sum(component.to_dense() for component in components),
+        exchange,
+        atol=3.0e-15,
+    )
+    for component in components:
+        transfers = []
+        for site in range(2):
+            operator = component.tensors[site][0, 0]
+            local = {
+                tuple(qns[site][bra][axis] - qns[site][ket][axis]
+                      for axis in range(len(qns[site][bra])))
+                for bra, ket in zip(*np.nonzero(np.abs(operator) > 1.0e-14))
+            }
+            assert len(local) == 1
+            transfers.append(next(iter(local)))
+        assert tuple(a + b for a, b in zip(*transfers)) == (0,)
 
 
 def test_labelled_tt_factor_operations_preserve_values_and_order():
@@ -98,7 +133,7 @@ def test_structured_hole_adjoint_is_exact_for_truncated_complex_messages():
     mpo_tensors[1] = np.array(
         [[1.0 + 0.2j, 0.7 - 0.4j], [-0.3 + 0.6j, 0.2 - 0.1j]]
     )[None, None]
-    mpo = LocalMPO(state.dims, mpo_tensors)
+    mpo = MPO(mpo_tensors, sites=state.sites)
     exact, tt = _engines(state, mpo, max_rank=2)
     site = 1
     rng = np.random.default_rng(923)
@@ -178,6 +213,111 @@ def test_structured_identity_and_generic_mpo_messages_match_dense_frontiers():
         assert diagnostics.peak_local_factor_elements > 0
         assert diagnostics.peak_product_storage_elements > 0
         assert all(not item.used_dense_frontier for item in diagnostics.advances)
+
+
+def test_identity_block_hamiltonian_can_use_an_exact_boundary_tt_norm():
+    reference, _dense = _states(seed=61)
+    hybrid = FrontierTiedLETTA(
+        reference.hamiltonian,
+        reference.dims,
+        reference.parent_sets,
+        bond_dim=reference.bond_dim,
+        tensors=reference.tensors,
+        frontier_backend="identity_block",
+        tt_norm_backend="tensor_train",
+    )
+    exact = FrontierTiedLETTA(
+        reference.hamiltonian,
+        reference.dims,
+        reference.parent_sets,
+        bond_dim=reference.bond_dim,
+        tensors=hybrid.tensors,
+        frontier_backend="identity_block",
+    )
+    exact.tensors = [tensor.copy() for tensor in hybrid.tensors]
+
+    assert hybrid.uses_tensor_train_frontier
+    assert hybrid.norm_contraction_is_exact
+    assert hybrid.hamiltonian_contraction_is_exact
+    np.testing.assert_allclose(hybrid.norm(), exact.norm(), atol=8.0e-13)
+    np.testing.assert_allclose(
+        hybrid.expectation(), exact.expectation(), atol=8.0e-13
+    )
+    site = 1
+    probe = np.linspace(-0.4, 0.7, hybrid.tensors[site].size)
+    np.testing.assert_allclose(
+        hybrid.metric_action(site, probe),
+        exact.metric_action(site, probe),
+        atol=1.0e-12,
+    )
+
+
+def test_termwise_tt_streams_analytical_diagonal_strings_without_materializing_terms():
+    identity = np.eye(2)
+    flip = np.array([[0.0, 1.0], [1.0, 0.0]])
+    parity = np.diag([1.0, -1.0])
+    site = Site(
+        2,
+        operators={"I": identity, "X": flip, "Z": parity},
+    )
+    hamiltonian = Hamiltonian((site,) * 4)
+    hamiltonian.add_product(
+        0.7,
+        (0, "X"),
+        (1, "Z"),
+        (2, "Z"),
+        (3, "X"),
+    )
+    state = FrontierTiedLETTA(
+        hamiltonian,
+        (2, 2, 2, 2),
+        ((1, 3), (2,), (3,), ()),
+        bond_dim=2,
+        seed=91,
+        frontier_backend="tensor_train",
+    )
+
+    assert hamiltonian._materialized_terms is None
+    assert len(state._hamiltonian_frontier._engines) == 1
+    assert state._hamiltonian_frontier._engines[0].paired_sites == {0, 3}
+    np.testing.assert_allclose(
+        state.expectation(),
+        hamiltonian.expectation(state.state_vector()),
+        atol=8.0e-13,
+    )
+    assert hamiltonian._materialized_terms is None
+
+    streamed = FrontierTiedLETTA(
+        hamiltonian,
+        (2, 2, 2, 2),
+        ((1, 3), (2,), (3,), ()),
+        bond_dim=2,
+        tensors=state.tensors,
+        frontier_backend="termwise",
+    )
+    assert isinstance(
+        streamed._hamiltonian_frontier,
+        TermwiseBlockMPOFrontier,
+    )
+    assert streamed.requires_matrix_free_solver
+    np.testing.assert_allclose(streamed.energy, state.energy, atol=8.0e-13)
+    probe = np.linspace(-0.3, 0.8, streamed.tensors[1].size)
+    np.testing.assert_allclose(
+        streamed.hamiltonian_action(1, probe),
+        state.hamiltonian_action(1, probe),
+        atol=1.0e-12,
+    )
+    energy_before = streamed.energy
+    streamed.run(
+        nsweeps=1,
+        tol=0.0,
+        solver="matrix_free",
+        maxiter=20,
+        environment_cache="recompute",
+    )
+    assert streamed.energy <= energy_before + 2.0e-12
+    assert streamed.history[0]["environment_cache"] == "recompute"
+    assert hamiltonian._materialized_terms is None
 
 
 def test_rank_limited_scalar_converges_to_exact_norm_and_energy():
@@ -285,6 +425,52 @@ def test_frontier_tied_letta_tensor_train_backend_matches_exact_actions():
     assert tt.tt_diagnostics is not None
 
 
+def test_term_grouped_tt_channels_are_exact_and_reduce_engine_count():
+    exact, _dense = _states(seed=229)
+    component = FrontierTiedLETTA(
+        exact.hamiltonian,
+        exact.dims,
+        exact.parent_sets,
+        bond_dim=exact.bond_dim,
+        tensors=[tensor.copy() for tensor in exact.tensors],
+        frontier_backend="tensor_train",
+        tt_channels="component",
+    )
+    grouped = FrontierTiedLETTA(
+        exact.hamiltonian,
+        exact.dims,
+        exact.parent_sets,
+        bond_dim=exact.bond_dim,
+        tensors=[tensor.copy() for tensor in exact.tensors],
+        frontier_backend="tensor_train",
+        tt_channels="term",
+    )
+
+    assert grouped.tt_channels == "term"
+    assert len(grouped._hamiltonian_frontier._engines) < len(
+        component._hamiltonian_frontier._engines
+    )
+    np.testing.assert_allclose(grouped.expectation(), exact.expectation(), atol=1e-12)
+    probe = np.linspace(-0.4, 0.7, grouped.tensors[1].size)
+    np.testing.assert_allclose(
+        grouped.hamiltonian_action(1, probe),
+        exact.hamiltonian_action(1, probe),
+        atol=2e-12,
+    )
+
+
+def test_tt_frontier_direct_sum_addition_is_exact():
+    rng = np.random.default_rng(230)
+    left_dense = rng.normal(size=(2, 3, 2))
+    right_dense = rng.normal(size=(2, 3, 2))
+    left = TTFrontier.from_dense(left_dense, labels=("a", "b", "c"))
+    right = TTFrontier.from_dense(right_dense, labels=("a", "b", "c"))
+
+    combined = left.add(right)
+
+    np.testing.assert_allclose(combined.to_dense(), left_dense + right_dense, atol=1e-13)
+
+
 def test_tensor_train_backend_tracks_approximation_and_matrix_free_guards():
     exact, _dense = _states(seed=31)
     tt = FrontierTiedLETTA(
@@ -294,8 +480,8 @@ def test_tensor_train_backend_tracks_approximation_and_matrix_free_guards():
         bond_dim=exact.bond_dim,
         tensors=[tensor.copy() for tensor in exact.tensors],
         frontier_backend="tensor_train",
-        tt_max_rank=3,
-        tt_transfer_max_rank=4,
+        max_rank=3,
+        transfer_max_rank=4,
     )
     copied = tt.copy()
 
@@ -325,8 +511,8 @@ def test_tensor_train_backend_tracks_approximation_and_matrix_free_guards():
         tensors=[tensor.copy() for tensor in exact.tensors],
         frontier_backend="tensor_train",
         tt_norm_backend="tensor_train",
-        tt_max_rank=3,
-        tt_transfer_max_rank=4,
+        max_rank=3,
+        transfer_max_rank=4,
     )
     assert not all_tt.norm_contraction_is_exact
     with pytest.raises(NotImplementedError, match="frontier canonicalization"):
@@ -341,8 +527,8 @@ def test_tensor_train_backend_tracks_approximation_and_matrix_free_guards():
         bond_dim=exact.bond_dim,
         tensors=[tensor.copy() for tensor in exact.tensors],
         frontier_backend="tensor_train",
-        tt_max_rank=2,
-        tt_transfer_max_rank=3,
+        max_rank=2,
+        transfer_max_rank=3,
         tt_hermitize=False,
     )
     assert not nonhermitian.hamiltonian_action_is_hermitian
@@ -359,8 +545,8 @@ def test_integrated_truncated_tt_hamiltonian_action_is_hermitized():
         bond_dim=exact.bond_dim,
         tensors=[tensor.copy() for tensor in exact.tensors],
         frontier_backend="tensor_train",
-        tt_max_rank=2,
-        tt_transfer_max_rank=3,
+        max_rank=2,
+        transfer_max_rank=3,
         tt_hermitize=True,
     )
     site = 1
@@ -411,8 +597,8 @@ def test_truncated_tt_sweep_globally_checks_proposals_and_reports_fresh_energy(s
         bond_dim=exact.bond_dim,
         tensors=[tensor.copy() for tensor in exact.tensors],
         frontier_backend="tensor_train",
-        tt_max_rank=1,
-        tt_transfer_max_rank=2,
+        max_rank=1,
+        transfer_max_rank=2,
         tt_hermitize=True,
     )
     initial = tt.energy

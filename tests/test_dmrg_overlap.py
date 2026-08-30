@@ -79,6 +79,7 @@ def test_dmrg_unitary_overlap_matches_exact_bridge_for_active_rotation():
     dmrg_rot = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build(mo_coeff=mo_rot)
     dmrg_rot.run(nstates=1, nsweeps=8, symmetry_list=["charge", "sz"])
 
+    np.testing.assert_allclose(dmrg_rot.mo_coeff, mo_rot, atol=0.0)
     via_unitary = dmrg_ref.overlap_unitary(dmrg_rot)
     via_explicit = dmrg_ref.overlap_unitary(dmrg_rot, orbital_transform=rotation)
 

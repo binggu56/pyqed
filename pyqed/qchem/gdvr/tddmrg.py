@@ -18,12 +18,12 @@ from pyqed.qchem.dmrg.dmrg import (
 )
 from pyqed.qchem.dmrg.overlap import _unitary_rotation_mpo
 from pyqed.mps.abelian_storage import make_abelian_site_tensor
-from pyqed.mps.autompo.automatic_mpo_helper import construct_symbolic_mpo, _terms_to_table
-from pyqed.mps.autompo.basis import BasisSimpleElectron
-from pyqed.mps.autompo.model import Model
+from pyqed.operator_mpo.compiler import construct_symbolic_mpo, _terms_to_table
+from pyqed.operator_mpo.basis import BasisSimpleElectron
+from pyqed.operator_mpo.model import Model
 from pyqed.mps.decompose import decompose
 from pyqed.mps.mps import MPS
-from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.tn import MPO as TensorMPO
 from pyqed.mps.symmetry import AbelianSector, BlockTensor, zero_like_sector
 from pyqed.mps.tdvp import TDVPEngine, one_site_tdvp_step, two_site_tdvp_step
 from pyqed.qchem.dmrg.spatial_terms import (
@@ -406,7 +406,7 @@ def _build_spatial_abelian_mpo_from_symbolic_terms(
             cutoff=cutoff,
         )
         factors.append(tensor)
-    return TensorMPO(factors, homogenous=False), len(terms)
+    return TensorMPO(factors, homogeneous=False), len(terms)
 
 
 def build_gdvr_spatial_hamiltonian_mpo(mol, *, cutoff=1.0e-12, symbolic_algo="qr"):
@@ -560,11 +560,11 @@ def _dense_mpo_for_product(mpo):
     if factors and hasattr(factors[0], "qns"):
         return TensorMPO(
             [_mpo_site_to_dense_factor(site) for site in factors],
-            homogenous=False,
+            homogeneous=False,
         )
     if isinstance(mpo, TensorMPO):
         return mpo
-    return TensorMPO(factors, homogenous=False)
+    return TensorMPO(factors, homogeneous=False)
 
 
 def acceleration_mpo(hamiltonian_mpo, dipole_mpo, *, chi_max=None):
@@ -588,7 +588,7 @@ def build_gdvr_spatial_z_phase_mpo(mol, field_z, dt):
         # mu_z = -z_i n_i, so H_int = -E_z mu_z = E_z z_i n_i.
         phase = np.exp(-1j * float(dt) * float(field_z) * float(zi) * occupation)
         factors.append(np.diag(phase).reshape(1, 1, 4, 4))
-    return TensorMPO(factors, homogenous=False)
+    return TensorMPO(factors, homogeneous=False)
 
 
 class GDVRSpatialLocalPhase:
@@ -688,7 +688,7 @@ def _dense_matrix_to_mpo(matrix, dims):
         cores.append(
             factor.reshape(factor.shape[0], dim, dim, factor.shape[2]).transpose(0, 3, 1, 2)
         )
-    return TensorMPO(cores, homogenous=False)
+    return TensorMPO(cores, homogeneous=False)
 
 
 def _spatial_occupation_phase_values(value):
@@ -1189,7 +1189,7 @@ def build_gdvr_spatial_pair_density_phase_mpo(nsites, left_site, right_site, pha
             for channel in range(rank):
                 core[channel, channel] = identity
             factors.append(core)
-    return TensorMPO(factors, homogenous=False)
+    return TensorMPO(factors, homogeneous=False)
 
 
 def _gdvr_m1_density_matrix(mol):
@@ -1329,7 +1329,7 @@ def _build_gdvr_spatial_density_channel_hamiltonian_mpo(
         elif site == nsites - 1:
             core = core[:, -1:]
         factors.append(core)
-    return TensorMPO(factors, homogenous=False)
+    return TensorMPO(factors, homogeneous=False)
 
 
 def build_gdvr_spatial_exponential_density_hamiltonian_mpo(nsites, coeffs, lambdas):
@@ -1533,7 +1533,7 @@ def build_gdvr_spatial_factorized_density_phase_mpo(
         "max_mpo_bond": int(max(core.shape[1] for core in mpo_factors[:-1]) if len(mpo_factors) > 1 else 1),
         "full_kernel_rel_error": residual_norm / kernel_norm if kernel_norm > 0.0 else residual_norm,
     }
-    return TensorMPO(mpo_factors, homogenous=False), info
+    return TensorMPO(mpo_factors, homogeneous=False), info
 
 
 class GDVRSpatialDensityPhase:
@@ -2329,7 +2329,7 @@ def build_gdvr_spatial_density_phase_mpo(
         for local_state in range(4):
             core[:, :, local_state, local_state] = factor[:, local_state, :]
         mpo_factors.append(core)
-    return TensorMPO(mpo_factors, homogenous=False)
+    return TensorMPO(mpo_factors, homogeneous=False)
 
 
 def _symmetrize_chemist_eri(eri):
@@ -2565,7 +2565,7 @@ class TDDMRG(BaseTDDMRG):
         if hasattr(cap, "factors"):
             if kwargs:
                 raise ValueError("Do not pass CAP keyword settings with a CAP MPO.")
-            self._cap_mpo = TensorMPO([np.asarray(w).copy() for w in cap.factors], homogenous=False)
+            self._cap_mpo = TensorMPO([np.asarray(w).copy() for w in cap.factors], homogeneous=False)
             self.cap_settings = {"source": "mpo"}
             return self
 
@@ -2750,9 +2750,9 @@ class TDDMRG(BaseTDDMRG):
         if hamiltonian.factors and hasattr(hamiltonian.factors[0], "qns"):
             hamiltonian = TensorMPO(
                 [_mpo_site_to_dense_factor(site) for site in hamiltonian.factors],
-                homogenous=False,
+                homogeneous=False,
             )
-        absorber = TensorMPO([np.asarray(w).copy() for w in self._cap_mpo.factors], homogenous=False)
+        absorber = TensorMPO([np.asarray(w).copy() for w in self._cap_mpo.factors], homogeneous=False)
         return hamiltonian + absorber
 
     def build_interaction_unitary_mpo(self, dt, time=0.0, field=None, order=4, scale=0):
@@ -2793,12 +2793,12 @@ class TDDMRG(BaseTDDMRG):
         if axis is None:
             out = []
             for mpo in self._interaction_mpo_cache:
-                copied = type(mpo)([w.copy() for w in mpo.factors], homogenous=False)
+                copied = type(mpo)([w.copy() for w in mpo.factors], homogeneous=False)
                 copied._pyqed_cache_key = getattr(mpo, "_pyqed_cache_key", None)
                 out.append(copied)
             return out
         mpo = self._interaction_mpo_cache[axis_idx]
-        copied = type(mpo)([w.copy() for w in mpo.factors], homogenous=False)
+        copied = type(mpo)([w.copy() for w in mpo.factors], homogeneous=False)
         copied._pyqed_cache_key = getattr(mpo, "_pyqed_cache_key", None)
         return copied
 

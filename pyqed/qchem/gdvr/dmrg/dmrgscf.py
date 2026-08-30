@@ -98,12 +98,12 @@ def extract_rdms_for_helper(solver, n_spatial, sym_mgr=None, verbose=False):
     Build spatial 1-RDM P[p,q] and a 'diagonal 2-RDM' D[p,q] needed by your AO Newton helper.
     Uses full make_rdm1() to capture exact off-diagonal hopping terms.
     """
-    state = solver.ground_state
+    state = solver.state
     
     # Get 1-RDM
-    if sym_mgr is not None and hasattr(state.Bs[0], 'qns'):
+    if sym_mgr is not None and hasattr(state.tensors[0], 'qns'):
         P_spin = state.make_rdm1(sym_mgr=sym_mgr)
-    elif hasattr(state.Bs[0], 'qns'):
+    elif hasattr(state.tensors[0], 'qns'):
         from pyqed.mps.mps import symmetric_to_dense
         dense_state = symmetric_to_dense(state)
         P_spin = dense_state.make_rdm1()

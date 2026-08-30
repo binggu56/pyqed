@@ -90,8 +90,6 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
     eri = getattr(mf, '_eri', None)
     if eri is None:
         eri = getattr(mf.mol, 'eri', None)
-    if eri is None:
-        raise ValueError("Mean-field object does not provide AO ERIs for CI.")
 
 
     # elif isinstance(mf, scf.uhf.UHF):
@@ -158,6 +156,8 @@ def get_SO_matrix(mf, SF=False, H1=None, H2=None):
         else:
             raise ValueError(f"Unsupported MO ERI shape for CI: {eri_mo.shape}")
     else:
+        if eri is None:
+            raise ValueError("Mean-field object does not provide AO ERIs or an MO ERI transform for CI.")
         eri_aa = _transform_spatial_eri_to_mo(eri, Ca, Ca, Ca, Ca)
         eri_aa -= eri_aa.swapaxes(1, 3)
 
@@ -207,6 +207,140 @@ def SpinOuterProduct(A, B, stack=False):
         return np.array([ΛA,ΛB])
     else:
         return ΛA, ΛB
+
+
+class FCIStringBasis:
+    """Rectangular alpha/beta determinant product without determinant expansion."""
+
+    def __init__(self, alpha_occ, beta_occ):
+        self.alpha_occ = np.ascontiguousarray(alpha_occ, dtype=np.int8)
+        self.beta_occ = np.ascontiguousarray(beta_occ, dtype=np.int8)
+        if self.alpha_occ.ndim != 2 or self.beta_occ.ndim != 2:
+            raise ValueError("Spin-string occupations must be two-dimensional.")
+        if self.alpha_occ.shape[1] != self.beta_occ.shape[1]:
+            raise ValueError("Alpha and beta strings must use the same orbitals.")
+        self.nalpha = int(self.alpha_occ.shape[0])
+        self.nbeta = int(self.beta_occ.shape[0])
+        self.norb = int(self.alpha_occ.shape[1])
+        self.alpha_strings = self._pack_strings(self.alpha_occ)
+        if np.array_equal(self.alpha_occ, self.beta_occ):
+            self.beta_occ = self.alpha_occ
+            self.beta_strings = self.alpha_strings
+        else:
+            self.beta_strings = self._pack_strings(self.beta_occ)
+
+    @staticmethod
+    def _pack_strings(occupations):
+        norb = occupations.shape[1]
+        if norb > 64:
+            return None
+        weights = np.left_shift(np.uint64(1), np.arange(norb, dtype=np.uint64))
+        return np.asarray(occupations, dtype=np.uint64) @ weights
+
+    @property
+    def shape(self):
+        return (self.nalpha * self.nbeta, 2, self.norb)
+
+    @property
+    def ndim(self):
+        return 3
+
+    @property
+    def dtype(self):
+        return np.dtype(np.int8)
+
+    @property
+    def size(self):
+        return self.shape[0] * self.shape[1] * self.shape[2]
+
+    @property
+    def nbytes(self):
+        occupation_bytes = self.alpha_occ.nbytes + (
+            0 if self.beta_occ is self.alpha_occ else self.beta_occ.nbytes
+        )
+        string_bytes = 0 if self.alpha_strings is None else self.alpha_strings.nbytes
+        if self.beta_strings is not self.alpha_strings and self.beta_strings is not None:
+            string_bytes += self.beta_strings.nbytes
+        return occupation_bytes + string_bytes
+
+    def __len__(self):
+        return self.shape[0]
+
+    def materialize(self):
+        out = np.empty(self.shape, dtype=np.int8)
+        product = out.reshape(self.nalpha, self.nbeta, 2, self.norb)
+        product[:, :, 0, :] = self.alpha_occ[:, None, :]
+        product[:, :, 1, :] = self.beta_occ[None, :, :]
+        return out
+
+    def copy(self):
+        return FCIStringBasis(self.alpha_occ.copy(), self.beta_occ.copy())
+
+    def determinant_occupations(self, indices):
+        indices = np.asarray(indices, dtype=np.intp)
+        alpha_index = indices // self.nbeta
+        beta_index = indices - alpha_index * self.nbeta
+        out = np.empty(indices.shape + (2, self.norb), dtype=np.int8)
+        out[..., 0, :] = self.alpha_occ[alpha_index]
+        out[..., 1, :] = self.beta_occ[beta_index]
+        return out
+
+    def __array__(self, dtype=None, copy=None):
+        out = self.materialize()
+        if dtype is not None:
+            out = out.astype(dtype, copy=False)
+        if copy:
+            out = out.copy()
+        return out
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            determinant_key = key[0]
+            remainder = key[1:]
+        else:
+            determinant_key = key
+            remainder = ()
+        scalar = isinstance(determinant_key, (int, np.integer))
+        if scalar:
+            index = int(determinant_key)
+            if index < 0:
+                index += self.shape[0]
+            selected = self.determinant_occupations(index)
+        else:
+            indices = np.arange(self.shape[0], dtype=np.intp)[determinant_key]
+            selected = self.determinant_occupations(indices)
+        if remainder:
+            if scalar:
+                return selected[remainder]
+            return selected[(slice(None),) + remainder]
+        return selected
+
+
+def get_fci_string_basis(mo_occ):
+    """Build separate alpha/beta occupation strings for an FCI product basis."""
+    occupations = np.asarray(mo_occ, dtype=np.int8)
+    nelec = np.sum(occupations, axis=1, dtype=np.intp)
+    norb = occupations.shape[1]
+    alpha_indices = np.asarray(
+        list(combinations(np.arange(norb, dtype=np.intp), int(nelec[0]))),
+        dtype=np.intp,
+    )
+    if nelec[0] == nelec[1]:
+        beta_indices = alpha_indices
+    else:
+        beta_indices = np.asarray(
+            list(combinations(np.arange(norb, dtype=np.intp), int(nelec[1]))),
+            dtype=np.intp,
+        )
+    alpha = np.zeros((alpha_indices.shape[0], norb), dtype=np.int8)
+    beta = np.zeros((beta_indices.shape[0], norb), dtype=np.int8)
+    if alpha_indices.shape[1] > 0:
+        alpha[np.arange(alpha_indices.shape[0])[:, None], alpha_indices] = 1
+    if beta_indices is alpha_indices:
+        beta = alpha
+    elif beta_indices.shape[1] > 0:
+        beta[np.arange(beta_indices.shape[0])[:, None], beta_indices] = 1
+    return FCIStringBasis(alpha, beta)
 
 
 def get_fci_combos(mf=None, mo_occ=None):

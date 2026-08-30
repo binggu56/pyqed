@@ -14,13 +14,14 @@ from pyqed.mps.su2 import SU2Irrep
 
 from .contraction import normalize_site_tensor_layout
 from .mpo import (
-    PhysicalLeg,
+    Leg,
     SiteOperator,
     MPO,
     IrreducibleChannelTerm,
     IrreducibleMPO,
     RankCoupledChannelTerm,
     RankCoupledMPO,
+    SparseVirtualBlock,
 )
 from .tensor import NonabelianTensor
 
@@ -29,11 +30,11 @@ def identity_operator(phys_leg, *, dtype=float):
     """
     Build the identity operator in the sector basis of one site.
     """
-    if not isinstance(phys_leg, PhysicalLeg):
-        raise TypeError("identity_operator expects a PhysicalLeg.")
+    if not isinstance(phys_leg, Leg):
+        raise TypeError("identity_operator expects a Leg.")
     blocks = {}
     for sector in phys_leg.sectors:
-        dim = phys_leg.dim(sector)
+        dim = phys_leg.sector_dim(sector)
         blocks[(sector, sector)] = np.eye(dim, dtype=dtype)
     return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
 
@@ -67,12 +68,12 @@ def _parity_operator(phys_leg, *, dtype=float):
         charge = getattr(sector, "charge", None)
         if charge is None:
             raise ValueError(
-                "Cannot infer fermionic parity for a PhysicalLeg whose sectors have no charge."
+                "Cannot infer fermionic parity for a Leg whose sectors have no charge."
             )
         weights[sector] = float((-1) ** int(charge))
     blocks = {}
     for sector in phys_leg.sectors:
-        dim = phys_leg.dim(sector)
+        dim = phys_leg.sector_dim(sector)
         blocks[(sector, sector)] = np.asarray(weights[sector], dtype=dtype) * np.eye(
             dim, dtype=dtype
         )
@@ -86,7 +87,7 @@ def _site_physical_leg_from_tensor(site):
     dims = {}
     for key, block in site.data.items():
         dims.setdefault(key[1], int(block.shape[1]))
-    return PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+    return Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
 
 
 def _validate_site_operator(site_operator, phys_leg, *, label):
@@ -112,11 +113,11 @@ def _validate_reduced_operator(reduced_operator, phys_leg, *, label):
 def _accumulate_site_operator(blocks, operator, row, col, *, coeff=1.0, d_left, d_right, dtype):
     coeff = np.asarray(coeff, dtype=dtype)
     for key, block in operator.blocks.items():
-        arr = blocks.get(key)
-        if arr is None:
-            arr = np.zeros((d_left, d_right) + block.shape, dtype=dtype)
-            blocks[key] = arr
-        arr[row, col] += coeff * np.asarray(block, dtype=dtype)
+        routes = blocks.setdefault(key, {})
+        route = (int(row), int(col))
+        value = coeff * np.asarray(block, dtype=dtype)
+        previous = routes.get(route)
+        routes[route] = value if previous is None else previous + value
 
 
 def _dense_signature(array, *, tol=1.0e-14):
@@ -129,7 +130,7 @@ def _dense_signature(array, *, tol=1.0e-14):
 def _leg_signature(leg):
     return (
         tuple(leg.sectors),
-        tuple((sector, int(leg.dim(sector))) for sector in leg.sectors),
+        tuple((sector, int(leg.sector_dim(sector))) for sector in leg.sectors),
     )
 
 
@@ -199,6 +200,22 @@ def _reduced_operator_signature(operator):
                     blocks.append((component, q_out, q_in, None))
                 else:
                     blocks.append((component, q_out, q_in, _dense_signature(block)))
+    magnetic_blocks = getattr(operator, "magnetic_component_blocks", None)
+    magnetic_signature = ()
+    if magnetic_blocks is not None:
+        magnetic_signature = tuple(
+            (
+                int(component),
+                q_out,
+                q_in,
+                _dense_signature(block),
+            )
+            for component, by_sector in sorted(magnetic_blocks.items())
+            for (q_out, q_in), block in sorted(
+                by_sector.items(),
+                key=lambda item: (repr(item[0][0]), repr(item[0][1])),
+            )
+        )
     rank_irrep = (
         operator.rank_irrep
         if hasattr(operator, "rank_irrep")
@@ -213,6 +230,7 @@ def _reduced_operator_signature(operator):
         _leg_signature(phys_out_leg),
         _leg_signature(phys_in_leg),
         tuple(blocks),
+        magnetic_signature,
     )
 
 
@@ -288,8 +306,8 @@ class AutoMPO:
         site_legs = tuple(site_legs)
         if len(site_legs) < 2:
             raise ValueError("AutoMPO requires at least two sites.")
-        if any(not isinstance(leg, PhysicalLeg) for leg in site_legs):
-            raise TypeError("AutoMPO expects PhysicalLeg entries.")
+        if any(not isinstance(leg, Leg) for leg in site_legs):
+            raise TypeError("AutoMPO expects Leg entries.")
         self.site_legs = site_legs
         self.nsites = len(site_legs)
         self._terms = []
@@ -888,11 +906,11 @@ class AutoMPO:
             if family is None:
                 return ()
             if isinstance(family, str):
-                return (family,) if family.startswith("__prefix_") else ()
+                return (family,)
             return tuple(
                 str(item)
                 for item in family
-                if item is not None and str(item).startswith("__prefix_")
+                if item is not None
             )
 
         def add_dense_transition(
@@ -1359,13 +1377,16 @@ class AutoMPO:
                     key = (
                         _reduced_operator_signature(record["operator"]),
                         bool(record["use_cg_coupling"]),
+                        tuple(record["family"]),
                     )
                     item = reduced_blocks.get(key)
-                    block = None if item is None else item[0]
-                    if block is None:
-                        block = np.zeros((d_left, d_right), dtype=dtype)
-                        reduced_blocks[key] = (block, record["operator"])
-                    block[left, right] += np.asarray(record["coeff"], dtype=dtype)
+                    routes = None if item is None else item[0]
+                    if routes is None:
+                        routes = {}
+                        reduced_blocks[key] = (routes, record["operator"])
+                    route = (int(left), int(right))
+                    coeff = np.asarray(record["coeff"], dtype=dtype)
+                    routes[route] = routes.get(route, 0) + coeff
 
             symbolic_transitions = []
             for record in transition_records[site]:
@@ -1381,14 +1402,28 @@ class AutoMPO:
                 )
             symbolic_transitions = tuple(symbolic_transitions)
 
+            sparse_visible_blocks = {
+                key: SparseVirtualBlock.from_entries(
+                    (d_left, d_right) + tuple(next(iter(routes.values())).shape),
+                    routes,
+                    dtype=dtype,
+                )
+                for key, routes in visible_blocks.items()
+                if any(np.any(value != 0) for value in routes.values())
+            }
             rank_coupled_terms = [
                 RankCoupledChannelTerm(
                     reduced_operator=operator,
-                    visible_virtual_block=block,
+                    visible_virtual_block=SparseVirtualBlock.from_entries(
+                        (d_left, d_right),
+                        routes,
+                        dtype=dtype,
+                    ),
                     use_cg_coupling=use_cg_coupling,
+                    family=family,
                 )
-                for (_signature, use_cg_coupling), (block, operator) in reduced_blocks.items()
-                if np.any(block)
+                for (_signature, use_cg_coupling, family), (routes, operator) in reduced_blocks.items()
+                if any(value != 0 for value in routes.values())
             ]
 
             left_irreps = class_irreps[site]
@@ -1399,7 +1434,7 @@ class AutoMPO:
             if needs_rank_coupled_core:
                 mpo.append(
                     RankCoupledMPO(
-                        dense_blocks=visible_blocks,
+                        dense_blocks=sparse_visible_blocks,
                         left_channel_irreps=left_irreps,
                         right_channel_irreps=right_irreps,
                         left_channel_charges=class_charges[site],
@@ -1413,7 +1448,10 @@ class AutoMPO:
             else:
                 mpo.append(
                     MPO(
-                        blocks=visible_blocks,
+                        blocks={
+                            key: np.asarray(block)
+                            for key, block in sparse_visible_blocks.items()
+                        },
                         phys_out_leg=phys_leg,
                         phys_in_leg=phys_leg,
                         symbolic_transitions=symbolic_transitions,

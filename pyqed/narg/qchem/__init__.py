@@ -12,6 +12,7 @@ from pyqed.narg.hamiltonian import (
 )
 
 from .letta import LETTA
+from pyqed.letta import SU2LETTA
 from .orbopt import NARGOpt, NARGSCF
 
 
@@ -450,6 +451,7 @@ def __getattr__(name):
 __all__ = [
     "NARG",
     "LETTA",
+    "SU2LETTA",
     "NARGOpt",
     "NARGSCF",
     "BareNARG",

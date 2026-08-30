@@ -45,12 +45,12 @@ from pyqed.qchem.mcscf.casci import (
     transform_eri_factors_to_mo_pair,
 )
 from pyqed.mps import DMRG as TensorDMRG, MPS, dense_to_symmetric_mpo
-from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.tn import MPO as TensorMPO
 from pyqed.mps.decompose import compress
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSet, BasisSimpleElectron
-from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.operator_mpo.model import Model
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSet, BasisSimpleElectron
+from pyqed.operator_mpo.model_mpo import ModelMPO
 try:
     import pyqed.mps.symmetry as sym_module
     from pyqed.mps.symmetry import BlockTensor, tensordot, QN, SymmetryManager as BaseSymmetryManager
@@ -555,7 +555,7 @@ def _group_spin_orbital_mpo_pairs(tensor_mpo):
         pair = pair.transpose(0, 3, 1, 4, 2, 5).reshape(up.shape[0], down.shape[1], 4, 4)
         pair = pair[:, :, product_for_spatial, :][:, :, :, product_for_spatial]
         grouped.append(pair)
-    return TensorMPO(grouped, homogenous=False)
+    return TensorMPO(grouped, homogeneous=False)
 
 
 def _build_grouped_spatial_s2_tensor_mpo(ncas, *, cutoff=1e-10):
@@ -593,9 +593,9 @@ def _build_tensor_mpo_from_symbolic_terms(basis_sites, term_map, *, cutoff=1e-14
     """Build a dense MPO from symbolic terms and wrap it in the high-level MPO class."""
     terms = _materialize_symbolic_terms(term_map, tol=cutoff)
     model = Model(basis=basis_sites, ham_terms=terms)
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
     factors = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
-    return TensorMPO(factors, homogenous=False), len(terms)
+    return TensorMPO(factors, homogeneous=False), len(terms)
 
 
 def _build_one_body_tensor_mpo(basis_sites, spatial_matrix, *, cutoff=1e-14):
@@ -630,7 +630,7 @@ def _compress_tensor_mpo(tensor_mpo, chi_max=None):
     for B, (d_up, d_down) in zip(compressed_factors, phys_dims):
         B_transposed = B.transpose(0, 2, 1)
         final_factors.append(B_transposed.reshape(B_transposed.shape[0], B_transposed.shape[1], d_up, d_down))
-    return TensorMPO(final_factors, homogenous=False)
+    return TensorMPO(final_factors, homogeneous=False)
 
 
 def _maybe_compress_tensor_mpo(tensor_mpo, *, chi_max=None, trigger_bond=None):
@@ -1406,9 +1406,9 @@ class DMRG(CASCI):
             return guess.copy()
 
         if isinstance(guess, str) and guess.lower() == 'previous':
-            if hasattr(self, 'dmrg') and self.dmrg is not None and self.dmrg.ground_state is not None:
+            if hasattr(self, 'dmrg') and self.dmrg is not None and self.dmrg.state is not None:
                 self._log("  Reusing previous DMRG state as initial guess.")
-                return self.dmrg.ground_state.copy()
+                return self.dmrg.state.copy()
             self._log("  [Warning] previous initial guess requested, but no prior DMRG state exists. Falling back to CID.")
             guess = 'cid'
 
@@ -1429,7 +1429,7 @@ class DMRG(CASCI):
         raise TypeError(f"Unsupported initial guess type: {type(guess)}")
 
     def fix_nelec(self, shift):
-        """
+        r"""
         fix the number of electrons by energy penalty
 
         .. math::
@@ -1473,7 +1473,7 @@ class DMRG(CASCI):
     #     return self
 
     def fix_spin(self, s=None, ss=0, shift=0.2):
-        """
+        r"""
         Bias the DMRG optimization toward spin-pure states with a linear ``S^2`` penalty.
 
         .. math::
@@ -1878,7 +1878,7 @@ class DMRG(CASCI):
         _type_
             _description_
         """
-        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.state is None:
             return 0.0
 
         if self.site == "spatial":
@@ -1889,14 +1889,14 @@ class DMRG(CASCI):
             if s2_mpo is None:
                 s2_mpo = _build_grouped_spatial_s2_tensor_mpo(self.ncas)
                 self._s2_mpo_cache[s2_cache_key] = s2_mpo
-            states_to_eval = self.dmrg.states if getattr(self.dmrg, "states", None) is not None else [self.dmrg.ground_state]
+            states_to_eval = self.dmrg.states if getattr(self.dmrg, "states", None) is not None else [self.dmrg.state]
             s2_vals = []
             for state in states_to_eval:
                 state_for_eval = state
-                if hasattr(state.Bs[0], 'qns'):
+                if hasattr(state.tensors[0], 'qns'):
                     from pyqed.mps.mps import symmetric_to_dense
                     state_for_eval = symmetric_to_dense(state)
-                s2 = mps_lib.expect_mps(state_for_eval.Bs, s2_mpo.factors, state_for_eval.Bs)
+                s2 = mps_lib.expect_mps(state_for_eval.tensors, s2_mpo.factors, state_for_eval.tensors)
                 norm = state_for_eval.norm()
                 s2_vals.append(float(np.real(s2 / norm)))
             return np.array(s2_vals) if self.nstates > 1 else s2_vals[0]
@@ -1912,7 +1912,7 @@ class DMRG(CASCI):
             basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
             s2_terms = _materialize_symbolic_terms(s2_term_map)
             model = Model(basis=basis_sites, ham_terms=s2_terms)
-            mpo = Mpo(model, algo="qr")
+            mpo = ModelMPO(model, algo="qr")
             mpo_dense = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
             self._s2_mpo_cache[s2_cache_key] = mpo_dense
         
@@ -1920,15 +1920,15 @@ class DMRG(CASCI):
         if (hasattr(self.dmrg, 'states') and self.dmrg.states is not None):
             states_to_eval = self.dmrg.states
         else:
-            states_to_eval = [self.dmrg.ground_state]
+            states_to_eval = [self.dmrg.state]
         s2_vals = []
         
         for state in states_to_eval:
-            if hasattr(state.Bs[0], 'qns'):
+            if hasattr(state.tensors[0], 'qns'):
                 dense_state = mps_lib.symmetric_to_dense(state)
-                psi_for_eval = dense_state.Bs
+                psi_for_eval = dense_state.tensors
             else:
-                psi_for_eval = state.Bs
+                psi_for_eval = state.tensors
                 
             s2 = mps_lib.expect_mps(psi_for_eval, mpo_dense, psi_for_eval)
             s2_vals.append(float(np.real(s2)))
@@ -2141,7 +2141,9 @@ class DMRG(CASCI):
                     or getattr(self, "h2e", None) is None
                 ):
                     self.build(mo_coeff=mo_coeff, build_mpo=False)
-                from pyqed.qchem.dmrg.nonabelian import run_spatial_qchem_dmrg
+                from pyqed.qchem.dmrg.backends.nonabelian import (
+                    run_spatial_qchem_dmrg,
+                )
 
                 t0 = time.time()
                 self._log(f"  [Symmetry] Enabled: {self.sym_mgr.sym_types}")
@@ -2157,7 +2159,9 @@ class DMRG(CASCI):
                     **kwargs,
                 )
                 self.dmrg = dmrg
-                e_dmrg_total = np.asarray(dmrg.e_tot, dtype=float) + self.e_core
+                e_dmrg_total = np.asarray(dmrg.e_tot, dtype=float)
+                if not dmrg.includes_core_energy:
+                    e_dmrg_total = e_dmrg_total + self.e_core
                 if nstates == 1:
                     e_dmrg_total = float(e_dmrg_total)
                 self.e_tot = e_dmrg_total
@@ -2255,10 +2259,10 @@ class DMRG(CASCI):
                 verbose=self.verbose,
             )
             dmrg.run()
-            current_guess = dmrg.ground_state.copy()
+            current_guess = dmrg.state.copy()
         self.dmrg = dmrg
         # Report
-        e_dmrg_total = dmrg.e_tot + self.e_core
+        e_dmrg_total = dmrg.energy + self.e_core
         if self.spin_purification:
             compute_s2 = True
         s2_val = self.calc_spin_square() if compute_s2 else None
@@ -2294,7 +2298,7 @@ class DMRG(CASCI):
         Post-run analysis: Checks conservation of all active symmetries 
         (Charge, Sz, etc.) by calculating expectation values via 1-RDMs.
         """
-        if self.dmrg.ground_state is None:
+        if self.dmrg.state is None:
             print("  [Error] No ground state found. Run DMRG first.")
             return
         print("\n" + "="*60)
@@ -2360,11 +2364,11 @@ class DMRG(CASCI):
             print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
     def _get_state_for_rdm(self, state_id):
-        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
             return self.dmrg.states[state_id]
-        return self.dmrg.ground_state
+        return self.dmrg.state
 
     def _get_spatial_ops_for_rdm(self):
         if self._spatial_operator_cache is None:
@@ -2374,7 +2378,7 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm1(self, state_id=0, spatial=False, with_core=False):
         """1-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state.tensors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             state = symmetric_to_dense(state)
         psi = _mps_to_dense_vector(state)
@@ -2416,7 +2420,7 @@ class DMRG(CASCI):
     def _make_spatial_site_rdm2(self, state_id=0, spatial=False, with_core=False, idx_pairs=None):
         """2-RDM for the d=4 spatial-site backend."""
         state = self._get_state_for_rdm(state_id)
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state.tensors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             state = symmetric_to_dense(state)
         psi = _mps_to_dense_vector(state)
@@ -2484,7 +2488,7 @@ class DMRG(CASCI):
         return g_out
 
     def make_rdm1(self, state_id=0, spatial=False, with_core=False):
-        """
+        r"""
         Calculates the 1-RDM. 
         If spatial=True, spin-traces to the spatial MO basis.
         If with_core=True, re-embeds the frozen core electrons on the diagonal.
@@ -2506,15 +2510,15 @@ class DMRG(CASCI):
         if self.site == "spatial":
             return self._make_spatial_site_rdm1(state_id, spatial=spatial, with_core=with_core)
 
-        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
             state = self.dmrg.states[state_id]
         else:
-            state = self.dmrg.ground_state
+            state = self.dmrg.state
         
         # Get Spin-Orbital RDM
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state.tensors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
             dense_state.dim = 2 
@@ -2575,15 +2579,15 @@ class DMRG(CASCI):
                 idx_pairs=idx_pairs,
             )
 
-        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
             state = self.dmrg.states[state_id]
         else:
-            state = self.dmrg.ground_state
+            state = self.dmrg.state
         
         # Get Spin-Orbital RDM
-        if hasattr(state.Bs[0], 'qns'):
+        if hasattr(state.tensors[0], 'qns'):
             from pyqed.mps.mps import symmetric_to_dense
             dense_state = symmetric_to_dense(state)
             dense_state.dim = 2 
@@ -2676,12 +2680,12 @@ class DMRG(CASCI):
         ValueError
             If the DMRG solver has not been run and no ground state is available.
         """
-        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
         return self.dmrg.make_local_site_rdm(idx=idx)
 
     def make_diagonal_rdm2(self, idx_pairs=None):
-        """
+        r"""
         Calculate the diagonal blocks of the 2-site reduced density matrix.
 
         Extracts the two-site quantum state :math:`\rho_{ij}` needed to compute 
@@ -2707,7 +2711,7 @@ class DMRG(CASCI):
         ValueError
             If the DMRG solver has not been run and no ground state is available.
         """
-        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+        if not hasattr(self, 'dmrg') or self.dmrg.state is None:
             raise ValueError("Run DMRG first to generate a ground state.")
         return self.dmrg.make_diagonal_rdm2(idx_pairs=idx_pairs)
 

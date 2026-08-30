@@ -157,7 +157,6 @@ def frontier_tied_letta_from_mps(
     dims = tuple(tensor.shape[1] for tensor in mps_tensors)
     return FrontierTiedLETTA(
         hamiltonian,
-        dims,
         parent_sets,
         bond_dim=target_bond_dim,
         tensors=tensors,
@@ -166,4 +165,149 @@ def frontier_tied_letta_from_mps(
     )
 
 
-__all__ = ["frontier_tensors_from_mps", "frontier_tied_letta_from_mps"]
+def conditional_factors_from_mps(
+    mps_tensors,
+    parent_sets,
+    *,
+    chi=None,
+    parent_group_size=1,
+):
+    r"""Lift OBC MPS cores exactly into neutral conditional-tie factors.
+
+    The first factor at a tied site stores the MPS core and every following
+    factor is an identity transfer, independent of its tied physical value.
+    Thus the represented state is exactly the input MPS while exposing the
+    conditional factors for subsequent optimization.  ``chi`` defaults to
+    the right MPS bond dimension at every site and may only be enlarged.
+    """
+    mps_tensors = _validated_mps_tensors(mps_tensors)
+    dims = tuple(tensor.shape[1] for tensor in mps_tensors)
+    parent_sets = _validated_parent_sets(dims, parent_sets)
+    parent_group_size = int(parent_group_size)
+    if parent_group_size < 1:
+        raise ValueError("parent_group_size must be positive.")
+    required = tuple(tensor.shape[2] for tensor in mps_tensors)
+    if chi is None:
+        ranks = required
+    elif np.isscalar(chi):
+        ranks = (int(chi),) * len(mps_tensors)
+    else:
+        ranks = tuple(int(value) for value in chi)
+        if len(ranks) != len(mps_tensors):
+            raise ValueError("chi must be scalar or contain one rank per site.")
+    if any(rank < need for rank, need in zip(ranks, required)):
+        raise ValueError(
+            "an exact neutral MPS lift requires chi at least as large as each "
+            "right MPS bond."
+        )
+
+    dtype = np.result_type(*(tensor.dtype for tensor in mps_tensors))
+    factors = []
+    for core, parents, rank in zip(mps_tensors, parent_sets, ranks):
+        left_dim, local_dim, right_dim = core.shape
+        if not parents:
+            factors.append([np.asarray(core, dtype=dtype).copy()])
+            continue
+
+        site_factors = []
+        first = np.zeros((left_dim, local_dim, rank), dtype=dtype)
+        first[:, :, :right_dim] = core
+        site_factors.append(first)
+        parent_groups = tuple(
+            tuple(parents[start : start + parent_group_size])
+            for start in range(0, len(parents), parent_group_size)
+        )
+        for parent_group in parent_groups[:-1]:
+            control = np.zeros(
+                (
+                    rank,
+                    local_dim,
+                    *(dims[parent] for parent in parent_group),
+                    rank,
+                ),
+                dtype=dtype,
+            )
+            diagonal = np.arange(rank)
+            index = (diagonal,) + (slice(None),) * (control.ndim - 2) + (diagonal,)
+            control[index] = 1
+            site_factors.append(control)
+        last_group = parent_groups[-1]
+        last = np.zeros(
+            (
+                rank,
+                local_dim,
+                *(dims[parent] for parent in last_group),
+                right_dim,
+            ),
+            dtype=dtype,
+        )
+        diagonal = np.arange(right_dim)
+        index = (diagonal,) + (slice(None),) * (last.ndim - 2) + (diagonal,)
+        last[index] = 1
+        site_factors.append(last)
+        factors.append(site_factors)
+    return tuple(tuple(site) for site in factors), tuple(ranks)
+
+
+def conditional_frontier_letta_from_mps(
+    hamiltonian,
+    parent_sets,
+    mps_tensors,
+    *,
+    chi=None,
+    parent_group_size=1,
+    abelian_layout=None,
+    seed=None,
+    **kwargs,
+):
+    """Construct an exact conditional-factor frontier LETTA from an MPS."""
+    from .conditional_frontier import (
+        ConditionalFrontierLETTA,
+        U1ConditionalFrontierLETTA,
+    )
+    from .frontier_abelian import FrontierAbelianLayout
+
+    if "factors" in kwargs or "bond_dims" in kwargs or "bond_dim" in kwargs:
+        raise TypeError(
+            "factors and bond dimensions are determined by the input MPS."
+        )
+    mps_tensors = _validated_mps_tensors(mps_tensors)
+    factors, ranks = conditional_factors_from_mps(
+        mps_tensors,
+        parent_sets,
+        chi=chi,
+        parent_group_size=parent_group_size,
+    )
+    bonds = (mps_tensors[0].shape[0],) + tuple(
+        tensor.shape[2] for tensor in mps_tensors
+    )
+    constructor = (
+        ConditionalFrontierLETTA
+        if abelian_layout is None
+        else U1ConditionalFrontierLETTA
+    )
+    if abelian_layout is not None and not isinstance(
+        abelian_layout, FrontierAbelianLayout
+    ):
+        raise TypeError("abelian_layout must be a FrontierAbelianLayout.")
+    if abelian_layout is not None and abelian_layout.bond_dims != bonds:
+        raise ValueError("abelian_layout bond dimensions do not match the MPS cores.")
+    options = dict(
+        chi=ranks,
+        factors=factors,
+        bond_dims=bonds,
+        parent_group_size=parent_group_size,
+        seed=seed,
+        **kwargs,
+    )
+    if abelian_layout is not None:
+        options["abelian_layout"] = abelian_layout
+    return constructor(hamiltonian, parent_sets, **options)
+
+
+__all__ = [
+    "conditional_factors_from_mps",
+    "conditional_frontier_letta_from_mps",
+    "frontier_tensors_from_mps",
+    "frontier_tied_letta_from_mps",
+]

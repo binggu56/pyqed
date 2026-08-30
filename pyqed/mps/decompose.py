@@ -237,11 +237,11 @@ def tt_to_tensor(factors):
     return tl.reshape(full_tensor, full_shape)
 
 def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
-    """
-    
-    Compress MPS by reducing the bond dimension.
-    
-    States are renormalized to ensure norm.
+    """Compress an MPS by reducing its bond dimensions.
+
+    ``renormalize=True`` retains the historical behavior of normalizing the
+    retained singular values during the sweep.  Set it to ``False`` when the
+    overall scale carries information, such as after applying an MPO.
 
     Parameters
     ----------
@@ -261,7 +261,11 @@ def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
 
     """
 
-    # d = B_list[0].shape[0]
+    if not isinstance(chi_max, (int, np.integer)) or int(chi_max) <= 0:
+        raise ValueError("chi_max must be a positive integer.")
+    chi_max = int(chi_max)
+
+    B_list = list(B_list)
     L = len(B_list)
     s_list  = [None] * L
     # for p in [0,1]:
@@ -295,18 +299,27 @@ def compress(B_list, chi_max, renormalize=True, return_singular_values=False):
         # Z=Z.T # d2*chi3, chi2
 
         # W = np.dot(C,Z.T.conj())
-        chi2 = np.min([np.sum(Y>10.**(-8)), chi_max])
+        relative_cutoff = 10.0**(-8) * Y[0] if len(Y) else 0.0
+        numerical_rank = int(np.sum(Y > relative_cutoff))
+        # Retain a one-dimensional zero bond for the zero state instead of
+        # producing empty tensors and dividing by zero.
+        chi2 = min(max(1, numerical_rank), chi_max, len(Y))
 
         # Obtain the new values for B and l #
-        invsq = np.sqrt(sum(Y[:chi2]**2))
+        retained = Y[:chi2].copy()
+        retained_norm = np.linalg.norm(retained)
+        if renormalize and retained_norm > 0.0:
+            retained /= retained_norm
 
-        s_list[i2] = Y[:chi2]/invsq
+        s_list[i2] = retained
 
         # B_list[i1] = np.reshape(W[:,:chi2],(chi1, d1, chi2))/invsq
 
         B_list[i1] = np.reshape(X[:,:chi2],(chi1, d1, chi2))
 
-        B_list[i2] = np.reshape(np.diag(s_list[i2])@Z[:chi2,:],(chi2, d2, chi3))
+        B_list[i2] = np.reshape(
+            np.diag(retained) @ Z[:chi2, :], (chi2, d2, chi3)
+        )
 
     if return_singular_values:
         return B_list, s_list

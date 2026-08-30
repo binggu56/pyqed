@@ -18,7 +18,8 @@ from decompose import decompose, compress
 
 from pyqed import gwp, discretize, pauli, sigmaz, interval
 
-from pyqed.mps.mps import MPS, MPO, apply_mpo
+from pyqed.mps.mps import MPS, apply_mpo
+from pyqed.tn import MPO
 from pyqed.mps.decompose import compress, tt_to_tensor
 
 

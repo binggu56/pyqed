@@ -5,8 +5,6 @@ from pyqed.letta import (
     AbelianFrontierTiedLETTA,
     FrontierAbelianLayout,
     FrontierTiedLETTA,
-    LocalHamiltonian,
-    LocalTerm,
     TieSignal,
     TieSignalBatch,
     adaptive_tie_graph_step,
@@ -16,6 +14,7 @@ from pyqed.letta import (
     state_with_tie_graph_proposal,
     tie_frontier_cost,
 )
+from pyqed.tn import LocalHamiltonian, LocalTerm
 
 
 def _two_site_state(seed=3):

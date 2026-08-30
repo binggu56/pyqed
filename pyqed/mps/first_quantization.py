@@ -4,18 +4,19 @@
 Generic 1D first-quantized finite-dimensional lattice model helpers.
 
 This module provides a reusable class for constructing 1D Hamiltonians in
-sum-of-product form, then converting to MPO via AutoMPO.
+sum-of-product form, then converting to MPO via ModelMPO.
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSet
-from pyqed.mps.autompo.light_automatic_mpo import Mpo as AutoMPO
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.mps import MPS, MPO, _mpo_to_dense_operator
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSet
+from pyqed.operator_mpo.model_mpo import ModelMPO as ModelMPO
+from pyqed.operator_mpo.model import Model
+from pyqed.mps.mps import MPS, _mpo_to_dense_operator
+from pyqed.tn import MPO
 
 
 class FiniteDimLocalBasis(BasisSet):
@@ -162,13 +163,13 @@ class Chain:
         return self
 
     def build_model(self):
-        """Build and return the underlying AutoMPO symbolic model."""
+        """Build and return the underlying ModelMPO symbolic model."""
         return Model(basis=self.basis, ham_terms=self.terms)
 
     def build_mpo(self, algo="qr"):
         """Build MPO from current terms."""
         model = self.build_model()
-        auto_mpo = AutoMPO(model, algo=algo)
+        auto_mpo = ModelMPO(model, algo=algo)
         factors = []
         for w in auto_mpo.matrices:
             arr = np.asarray(w)

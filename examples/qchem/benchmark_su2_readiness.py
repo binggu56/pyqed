@@ -190,7 +190,7 @@ def _family_kernel_diagnostics(history):
 def _mps_expectation_energy(qcdmrg):
     """Evaluate the final non-Abelian MPS energy from the Hamiltonian MPO."""
 
-    state = qcdmrg.dmrg.ground_state
+    state = qcdmrg.dmrg.state
     numerator = contract_chain_expectation(state.sites, qcdmrg.H)
     denominator = contract_chain_expectation(
         state.sites,
@@ -218,16 +218,10 @@ def run_case(
     system,
     *,
     basis="sto-3g",
-    driver="gbasis",
     bond_dim=16,
     nsweeps=4,
     energy_tol=1.0e-7,
     max_dense_dim=4096,
-    local_basis_policy="block2_like",
-    orthonormalized_operator_dim=512,
-    family_kernel_backend=None,
-    family_dense_threshold=None,
-    family_dense_max_total_elements=None,
     conv_tol=-1.0,
 ):
     """Run one SU(2) readiness case and return a structured result."""
@@ -236,7 +230,11 @@ def run_case(
         raise ValueError(f"Unknown readiness preset {system!r}; choose one of {sorted(PRESETS)}.")
     case = PRESETS[system]
     mol = Molecule(atom=case["atom"], unit=case["unit"], basis=basis, spin=case["spin"])
-    mol.build(driver=driver)
+    mol.build(
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
     mf = RHF(mol).run()
 
     qcdmrg = DMRG(
@@ -255,20 +253,9 @@ def run_case(
     run_kwargs = {
         "nsweeps": int(nsweeps),
         "conv_tol": float(conv_tol),
-        "local_basis_policy": local_basis_policy,
-        "orthonormalized_operator_dim": int(orthonormalized_operator_dim),
-        "max_bond_mode": "per_sector",
         "mixer_zero_block_noise_scale": 0.0,
         "profile": True,
     }
-    if family_kernel_backend is not None:
-        run_kwargs["family_kernel_backend"] = family_kernel_backend
-    if family_dense_threshold is not None:
-        run_kwargs["family_dense_threshold"] = int(family_dense_threshold)
-    if family_dense_max_total_elements is not None:
-        run_kwargs["family_dense_max_total_elements"] = int(
-            family_dense_max_total_elements
-        )
     qcdmrg.run(**run_kwargs)
     elapsed = time.perf_counter() - t0
 
@@ -278,7 +265,7 @@ def run_case(
     energy_error = abs(dmrg_energy - exact_energy)
     mps_energy_error = abs(mps_energy - exact_energy)
 
-    state = qcdmrg.dmrg.ground_state
+    state = qcdmrg.dmrg.state
     center = _infer_canonical_center(history, len(state.sites))
     left_err, right_err = mixed_canonical_errors(state.sites, center)
     target = qcdmrg.dmrg.target_sector
@@ -375,16 +362,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", choices=sorted(PRESETS), action="append")
     parser.add_argument("--basis", default="sto-3g")
-    parser.add_argument("--driver", default="gbasis")
     parser.add_argument("--D", type=int, default=16)
     parser.add_argument("--nsweeps", type=int, default=4)
     parser.add_argument("--energy-tol", type=float, default=1.0e-7)
     parser.add_argument("--max-dense-dim", type=int, default=4096)
-    parser.add_argument("--local-basis-policy", default="block2_like")
-    parser.add_argument("--orthonormalized-operator-dim", type=int, default=512)
-    parser.add_argument("--family-kernel-backend", choices=["auto", "dense", "factor"], default=None)
-    parser.add_argument("--family-dense-threshold", type=int, default=None)
-    parser.add_argument("--family-dense-max-total-elements", type=int, default=None)
     parser.add_argument("--conv-tol", type=float, default=-1.0)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
@@ -394,16 +375,10 @@ def main():
         run_case(
             system,
             basis=args.basis,
-            driver=args.driver,
             bond_dim=args.D,
             nsweeps=args.nsweeps,
             energy_tol=args.energy_tol,
             max_dense_dim=args.max_dense_dim,
-            local_basis_policy=args.local_basis_policy,
-            orthonormalized_operator_dim=args.orthonormalized_operator_dim,
-            family_kernel_backend=args.family_kernel_backend,
-            family_dense_threshold=args.family_dense_threshold,
-            family_dense_max_total_elements=args.family_dense_max_total_elements,
             conv_tol=args.conv_tol,
         )
         for system in systems

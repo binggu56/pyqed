@@ -80,6 +80,36 @@ def test_nnn_letta_conditional_gauge_preserves_state_and_whitens_shared_pairs():
             np.testing.assert_allclose(block.conj().T @ block, np.eye(2), atol=1.0e-12)
 
 
+def test_nnn_letta_adaptive_compression_preserves_state_and_tapers_bonds():
+    ansatz = NNNLETTA((2,) * 6, bond_dim=8, seed=23)
+    before = ansatz.state_vector()
+
+    reports = ansatz.compress_conditional_bonds(direction="rl")
+
+    np.testing.assert_allclose(ansatz.state_vector(), before, atol=2.0e-12)
+    assert tuple(tensor.shape[-1] for tensor in ansatz.tensors[:-1]) == (2, 4, 2)
+    assert all(report["relative_discarded_weight"] < 1.0e-24 for report in reports)
+
+
+def test_nnn_letta_compression_tracks_physical_pair_dependent_ranks_with_masks():
+    rng = np.random.default_rng(29)
+    left = rng.normal(size=(1, 2, 2, 2, 2))
+    right = rng.normal(size=(2, 2, 2, 2, 1))
+    left[:, :, 0, 0, 1] = 0.0
+    right[1, 0, 0, :, :] = 0.0
+    ansatz = NNNLETTA((2, 2, 2, 2), tensors=[left, right])
+    before = ansatz.state_vector()
+
+    report = ansatz.compress_conditional_bond(0, direction="balanced")
+
+    np.testing.assert_allclose(ansatz.state_vector(), before, atol=2.0e-12)
+    assert report["sector_ranks"] == (1, 2, 2, 2)
+    assert report["new_dim"] == 2
+    assert ansatz.local_masks is not None
+    assert not ansatz.local_masks[0][:, :, 0, 0, 1].any()
+    assert not ansatz.local_masks[1][1, 0, 0, :, :].any()
+
+
 def test_nnn_letta_from_mps_embeds_state_and_product_expectations():
     rng = np.random.default_rng(13)
     factors = [
@@ -159,6 +189,35 @@ def test_nnn_letta_mpo_sweep_lowers_energy():
     assert np.isfinite(ansatz.energy)
     assert ansatz.energy <= initial + 1.0e-10
     assert ansatz.history
+    assert all(
+        update["identity_metric"]
+        for sweep in ansatz.history
+        for update in sweep["updates"]
+    )
+
+
+def test_nnn_letta_identity_adaptive_sweep_matches_generalized_fixed_bonds():
+    dims = (2, 2, 2, 2, 2)
+    _dense, mpo = _tfim_mpo(len(dims), g=0.7)
+    generalized = NNNLETTA(dims, bond_dim=2, seed=31)
+    identity = NNNLETTA(dims, bond_dim=2, seed=31)
+
+    generalized.run(
+        mpo,
+        nsweeps=2,
+        tol=0.0,
+        gauge="conditional",
+        identity_metric=False,
+        adapt_bonds=False,
+    )
+    identity.run(mpo, nsweeps=2, tol=0.0, gauge="conditional")
+
+    np.testing.assert_allclose(identity.energy, generalized.energy, atol=2.0e-11)
+    assert all(
+        update["identity_metric"]
+        for sweep in identity.history
+        for update in sweep["updates"]
+    )
 
 
 def test_nnn_letta_matrix_free_mpo_sweep_lowers_energy():

@@ -134,7 +134,11 @@ class DMRGSCF(QCDMRG):
         tr_max = kwargs.pop("macro_trust_max", 1.0)
         tr_dn = kwargs.pop("macro_trust_shrink", 0.5)
         tr_up = kwargs.pop("macro_trust_grow", 1.5)
-        warm = kwargs.pop("warm_start_dmrg", True)
+        symmetry_labels = tuple(getattr(self, "symmetry", ()) or ())
+        default_warm_start = not (
+            int(nstates or self.nstates) > 1 and "su2" in symmetry_labels
+        )
+        warm = kwargs.pop("warm_start_dmrg", default_warm_start)
         sw_tol = kwargs.pop("sweep_tol", kwargs.pop("conv_tol", self.dmrg_conv_tol))
         ldense = kwargs.pop("local_dense_max_dim", 0)
 
@@ -293,13 +297,6 @@ class DMRGSCF(QCDMRG):
         kwargs.setdefault("local_dense_max_dim", ldense)
 
         mc.run(nstates=self.nstates, weights=self.weights, mo_coeff=C0, **kwargs)
-        if require_conv and not bool(getattr(getattr(mc, "dmrg", None), "converged", False)):
-            raise RuntimeError(
-                "Initial DMRGSCF active-space DMRG did not converge. "
-                "Increase nsweeps or D, loosen dmrg_conv_tol/conv_tol, or pass "
-                "require_conv=False for debugging."
-            )
-
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo(C0)
         eri = mf.get_eri_mo(C0)

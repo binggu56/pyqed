@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
+
+from pyqed.lattice import Block, Site
 
 
 def _validate_dims(dims):
@@ -187,37 +189,14 @@ class State:
 SequentialNARGState = State
 
 
-@dataclass
-class Site:
-    idx: int
-    dim: int = 1
-    data: Any = None
-
-
-@dataclass
-class Block:
-    h: Any = None
-    qn: Any = None
-    tensor: Any = None
-    data: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class Step:
-    site: Site
-    block: Block
-    tensor: Any = None
-    qn: Any = None
-    meta: dict[str, Any] = field(default_factory=dict)
-
-
 class NARGBase:
     """Shared control flow for sequential NARG growth.
 
     Subclasses provide the model-specific physics in ``grow_one`` and,
     optionally, ``before_site``.  The base class owns the common one-site vs
     two-site loop and how adjacent one-site tensors are grouped into a
-    two-site NARG factor.
+    two-site NARG factor.  Growth hooks consume canonical physical
+    :class:`~pyqed.lattice.Site` objects and return the updated :class:`Block`.
     """
 
     def __init__(
@@ -227,15 +206,19 @@ class NARGBase:
         growth_sites=1,
         two_site_dim=None,
         two_site_max_dim=None,
-        site_dim=1,
+        sites,
         two_site_mode="sequential",
     ):
         self.D = int(D)
         if self.D < 1:
             raise ValueError("D must be positive.")
-        self.site_dim = int(site_dim)
-        if self.site_dim < 1:
-            raise ValueError("site_dim must be positive.")
+        if isinstance(sites, Site):
+            self.sites = sites
+        else:
+            sites = tuple(sites)
+            if not sites or any(not isinstance(site, Site) for site in sites):
+                raise TypeError("sites must be a canonical Site or a nonempty sequence of Sites.")
+            self.sites = sites
         if isinstance(growth_sites, str):
             if growth_sites != "auto":
                 raise ValueError("growth_sites must be 1, 2, 3, 4, or 'auto'.")
@@ -259,6 +242,14 @@ class NARGBase:
             raise ValueError("two_site_mode must be 'sequential', 'supersite', or 'rolling'.")
         self.two_site_mode = mode
 
+    def _site(self, index: int) -> Site:
+        if isinstance(self.sites, Site):
+            return self.sites
+        try:
+            return self.sites[int(index)]
+        except IndexError as error:
+            raise IndexError(f"no physical site is defined at index {index}.") from error
+
     def full_dim(self, block: Block, site: Site) -> int:
         h = block.h
         if h is None or not hasattr(h, "shape"):
@@ -270,7 +261,13 @@ class NARGBase:
             return self.full_dim(block, site) if self.two_site_dim is None else self.two_site_dim
         return self.D
 
-    def choose_growth_sites(self, block: Block, site: Site, remaining_sites: int) -> int:
+    def choose_growth_sites(
+        self,
+        block: Block,
+        site: Site,
+        index: int,
+        remaining_sites: int,
+    ) -> int:
         if remaining_sites < 2:
             return 1
         if self.growth_sites != "auto":
@@ -279,25 +276,32 @@ class NARGBase:
         max_dim = self.two_site_max_dim if self.two_site_max_dim is not None else self.D * int(site.dim)
         return 2 if intermediate <= max_dim else 1
 
-    def before_site(self, block: Block, site: Site) -> Block:
+    def before_site(self, block: Block, site: Site, index: int) -> Block:
         return block
 
-    def grow_one(self, block: Block, site: Site, keep: int) -> Step:
+    def grow_one(self, block: Block, site: Site, index: int, keep: int) -> Block:
         raise NotImplementedError
 
-    def grow_two(self, block: Block, first: Site, second: Site, keep: int) -> Step:
+    def grow_two(
+        self,
+        block: Block,
+        first: Site,
+        second: Site,
+        index: int,
+        keep: int,
+    ) -> Block:
         raise NotImplementedError("This backend does not implement two-site growth.")
 
-    def fuse_steps(self, steps: list[Step]):
-        if len(steps) == 1:
-            return steps[0].tensor
-        return fuse_growth_sites([step.tensor for step in steps])
+    def fuse_blocks(self, blocks: list[Block]):
+        if len(blocks) == 1:
+            return blocks[0].factor
+        return fuse_growth_sites([block.factor for block in blocks])
 
-    def step_meta(self, start: Block, steps: list[Step]) -> dict[str, Any]:
+    def growth_data(self, start: Block, blocks: list[Block]) -> dict[str, Any]:
         return {
             "row_qn": start.qn,
-            "right_qn_by_next": steps[-1].qn,
-            "growth_sites": len(steps),
+            "right_qn_by_next": blocks[-1].branch_qn,
+            "growth_sites": len(blocks),
         }
 
     def grow_range(self, block: Block, first_site: int, last_site: int):
@@ -305,43 +309,53 @@ class NARGBase:
         last_site = int(last_site)
         while site_id <= last_site:
             start = block
-            first = Site(site_id, dim=self.site_dim)
-            pair_size = self.choose_growth_sites(block, first, last_site - site_id + 1)
+            first = self._site(site_id)
+            pair_size = self.choose_growth_sites(
+                block,
+                first,
+                site_id,
+                last_site - site_id + 1,
+            )
             if pair_size == 2 and self.two_site_mode in {"supersite", "rolling"}:
-                second = Site(site_id + 1, dim=self.site_dim)
-                start = self.before_site(block, first)
-                step = self.grow_two(start, first, second, self.D)
-                block = step.block
-                yield Step(
-                    site=first,
-                    block=block,
-                    tensor=step.tensor,
-                    qn=step.qn,
-                    meta={**self.step_meta(start, [step]), **step.meta, "growth_sites": 2},
+                second = self._site(site_id + 1)
+                start = self.before_site(block, first, site_id)
+                block = self.grow_two(start, first, second, site_id, self.D)
+                data = {
+                    **self.growth_data(start, [block]),
+                    **block.data,
+                    "index": site_id,
+                    "growth_sites": 2,
+                }
+                block = replace(
+                    block,
+                    data=data,
                 )
+                yield block
                 site_id += 2
                 continue
 
-            steps = []
+            grown_blocks = []
             for offset in range(pair_size):
-                site = Site(site_id + offset, dim=self.site_dim)
-                block = self.before_site(block, site)
+                index = site_id + offset
+                site = self._site(index)
+                block = self.before_site(block, site, index)
                 keep = self.keep_dim(block, site, offset, pair_size)
-                step = self.grow_one(block, site, keep)
-                block = step.block
-                steps.append(step)
-            meta = self.step_meta(start, steps)
-            if len(steps) == 1:
-                meta.update(steps[0].meta)
-            elif any(step.meta for step in steps):
-                meta["substep_meta"] = [dict(step.meta) for step in steps]
-            yield Step(
-                site=steps[0].site,
-                block=block,
-                tensor=self.fuse_steps(steps),
-                qn=steps[-1].qn,
-                meta=meta,
+                block = self.grow_one(block, site, index, keep)
+                grown_blocks.append(block)
+            data = {
+                **self.growth_data(start, grown_blocks),
+                "index": site_id,
+            }
+            if len(grown_blocks) == 1:
+                data.update(grown_blocks[0].data)
+            elif any(grown.data for grown in grown_blocks):
+                data["substep_meta"] = [dict(grown.data) for grown in grown_blocks]
+            block = replace(
+                block,
+                factor=self.fuse_blocks(grown_blocks),
+                data=data,
             )
+            yield block
             site_id += pair_size
 
 
@@ -349,9 +363,7 @@ __all__ = [
     "Block",
     "NARGBase",
     "SequentialNARGState",
-    "Site",
     "State",
-    "Step",
     "fuse_growth_sites",
     "fuse_two_sites",
     "narg_state_vector",

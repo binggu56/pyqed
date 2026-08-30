@@ -21,6 +21,7 @@ except ImportError:  # pragma: no cover - used when imported as examples.mps.*
     from examples.mps.hubbard_2d_ed import hubbard_2d_hamiltonian, square_lattice_bonds
 from pyqed.letta import LETTA, NNNLETTA
 from pyqed.letta.abelian import Layout
+from pyqed.lattice import Site, SpinHalfFermionSite
 from pyqed.mps import MPO, MPS, dense_to_symmetric_mpo, symmetric_to_dense
 from pyqed.mps.abelian_storage import make_abelian_site_tensor
 from pyqed.mps.dmrg import DMRG, _normalized_mps_mpo_expectation, dmrg_matvec_options
@@ -31,6 +32,7 @@ from pyqed.qchem.dmrg.dmrg import (
     _build_spin_orbital_dense_hamiltonian_tensor_mpo,
     _group_spin_orbital_mpo_pairs,
 )
+from pyqed.tn import Hamiltonian
 
 
 LOCAL_QNS = (
@@ -163,6 +165,8 @@ def hubbard_2d_dense_mpo(
         "nsites": len(dense_mpo),
         "spatial_sites": nsites,
         "site_grouping": grouping,
+        "periodic_x": bool(periodic_x),
+        "periodic_y": bool(periodic_y),
         "order": [int(site) for site in order],
         "fused_blocks": None if fused_blocks is None else [[int(site) for site in block] for block in fused_blocks],
         "bonds": [(int(i), int(j)) for i, j in bonds],
@@ -171,6 +175,90 @@ def hubbard_2d_dense_mpo(
         "spin_purification_terms": int(spin_terms),
     }
     return dense_mpo, info
+
+
+def hubbard_2d_local_hamiltonian(
+    lx: int,
+    ly: int,
+    *,
+    hopping: float,
+    hubbard_u: float,
+    mu: float = 0.0,
+    ordering: str = "snake",
+    periodic_x: bool = False,
+    periodic_y: bool = False,
+) -> tuple[Hamiltonian, dict]:
+    """Build the spinful Hubbard model as analytical Jordan--Wigner strings.
+
+    The returned ``bonds`` are the physical hopping edges in Hamiltonian site
+    order.  They are the appropriate graph ties; intermediate ``JW`` factors
+    are algebraic string supports, not additional physical correlations.
+    """
+    nsites = int(lx) * int(ly)
+    bonds, order = ordered_lattice_bonds(
+        lx,
+        ly,
+        ordering=ordering,
+        periodic_x=periodic_x,
+        periodic_y=periodic_y,
+    )
+    base = SpinHalfFermionSite()
+    operators = dict(base.operators)
+    operators.update(
+        {
+            "CduJW": operators["Cdu"] @ operators["JW"],
+            "CddJW": operators["Cdd"] @ operators["JW"],
+            "JWCu": operators["JW"] @ operators["Cu"],
+            "JWCd": operators["JW"] @ operators["Cd"],
+        }
+    )
+    site = Site(
+        labels=base.labels,
+        operators=operators,
+        charges=base.charges,
+        charge_labels=base.charge_labels,
+        parities=base.parities,
+        statistics=base.statistics,
+        name=base.name,
+    )
+    hamiltonian = Hamiltonian((site,) * nsites)
+    for orbital in range(nsites):
+        if hubbard_u:
+            hamiltonian.add_product(float(hubbard_u), (orbital, "NuNd"))
+        if mu:
+            hamiltonian.add_product(-float(mu), (orbital, "N"))
+
+    for endpoint_a, endpoint_b in bonds:
+        left, right = sorted((int(endpoint_a), int(endpoint_b)))
+        string = tuple((middle, "JW") for middle in range(left + 1, right))
+        hamiltonian.add_product(
+            -float(hopping),
+            (left, "CduJW"),
+            *string,
+            (right, "Cu"),
+        )
+        hamiltonian.add_product(
+            -float(hopping),
+            (left, "JWCu"),
+            *string,
+            (right, "Cdu"),
+        )
+        hamiltonian.add_product(
+            -float(hopping),
+            (left, "CddJW"),
+            *string,
+            (right, "Cd"),
+        )
+        hamiltonian.add_product(
+            -float(hopping),
+            (left, "JWCd"),
+            *string,
+            (right, "Cdd"),
+        )
+    return hamiltonian, {
+        "order": [int(value) for value in order],
+        "bonds": [tuple(sorted((int(left), int(right)))) for left, right in bonds],
+    }
 
 
 def site_qn_maps(nsites: int):
@@ -445,6 +533,73 @@ def ed_ground_energy(
     return np.asarray(evals, dtype=float), info
 
 
+def ed_phase_gaps(
+    lx: int,
+    ly: int,
+    *,
+    nup: int,
+    ndown: int,
+    hopping: float,
+    hubbard_u: float,
+    mu: float,
+    periodic_x: bool,
+    periodic_y: bool,
+    ground_energy: float | None = None,
+) -> dict[str, float | dict[str, int]]:
+    """Return finite-cluster charge and spin-sector gaps from exact diagonalization."""
+    nsites = int(lx) * int(ly)
+
+    def sector_energy(up: int, down: int) -> float:
+        values, _info = ed_ground_energy(
+            lx,
+            ly,
+            nup=up,
+            ndown=down,
+            hopping=hopping,
+            hubbard_u=hubbard_u,
+            mu=mu,
+            periodic_x=periodic_x,
+            periodic_y=periodic_y,
+            nroots=1,
+        )
+        return float(values[0])
+
+    e0 = sector_energy(nup, ndown) if ground_energy is None else float(ground_energy)
+    addition_sectors = [
+        (up, down)
+        for up, down in ((nup + 1, ndown), (nup, ndown + 1))
+        if up <= nsites and down <= nsites
+    ]
+    removal_sectors = [
+        (up, down)
+        for up, down in ((nup - 1, ndown), (nup, ndown - 1))
+        if up >= 0 and down >= 0
+    ]
+    spin_sectors = [
+        (up, down)
+        for up, down in ((nup + 1, ndown - 1), (nup - 1, ndown + 1))
+        if 0 <= up <= nsites and 0 <= down <= nsites
+    ]
+    if not addition_sectors or not removal_sectors:
+        raise ValueError("the charge gap requires both N+1 and N-1 sectors.")
+    if not spin_sectors:
+        raise ValueError("the spin gap requires a neighboring fixed-particle spin sector.")
+
+    addition = min((sector_energy(*sector), sector) for sector in addition_sectors)
+    removal = min((sector_energy(*sector), sector) for sector in removal_sectors)
+    spin = min((sector_energy(*sector), sector) for sector in spin_sectors)
+    return {
+        "charge_gap": float(addition[0] + removal[0] - 2.0 * e0),
+        "spin_gap": float(spin[0] - e0),
+        "addition_energy": float(addition[0]),
+        "removal_energy": float(removal[0]),
+        "spin_sector_energy": float(spin[0]),
+        "addition_sector": {"nup": int(addition[1][0]), "ndown": int(addition[1][1])},
+        "removal_sector": {"nup": int(removal[1][0]), "ndown": int(removal[1][1])},
+        "spin_sector": {"nup": int(spin[1][0]), "ndown": int(spin[1][1])},
+    }
+
+
 def _standard_dense_factors(factors_or_mps) -> list[np.ndarray]:
     if isinstance(factors_or_mps, MPS):
         return [np.asarray(tensor) for tensor in factors_or_mps.to_order(["lv", "p", "rv"]).factors]
@@ -469,30 +624,69 @@ def dense_mps_product_expectation(factors_or_mps, operators: list[np.ndarray]) -
     return env.reshape(-1)[0] / norm
 
 
-def dense_mps_correlation_matrix(factors_or_mps, op_a: np.ndarray, op_b: np.ndarray | None = None) -> np.ndarray:
-    factors = _standard_dense_factors(factors_or_mps)
-    op_a = np.asarray(op_a, dtype=complex)
-    op_b = op_a if op_b is None else np.asarray(op_b, dtype=complex)
-    identities = [np.eye(factor.shape[1], dtype=complex) for factor in factors]
-    corr = np.empty((len(factors), len(factors)), dtype=complex)
-    for i in range(len(factors)):
-        for j in range(len(factors)):
-            operators = list(identities)
-            if i == j:
-                operators[i] = op_a @ op_b
-            else:
-                operators[i] = op_a
-                operators[j] = op_b
-            corr[i, j] = dense_mps_product_expectation(factors, operators)
-    return corr
-
-
-def distance_average(correlation: np.ndarray) -> list[float]:
+def lattice_distance_average(
+    correlation: np.ndarray,
+    coords: list[tuple[int, int]],
+    *,
+    lx: int,
+    ly: int,
+    periodic_x: bool = False,
+    periodic_y: bool = False,
+) -> list[float]:
+    """Average a site correlation by Manhattan distance on the lattice."""
     correlation = np.asarray(correlation)
-    return [
-        float(np.real(np.mean([correlation[i, i + r] for i in range(correlation.shape[0] - r)])))
-        for r in range(correlation.shape[0])
-    ]
+    groups: dict[int, list[complex]] = {}
+    for i, (xi, yi) in enumerate(coords):
+        for j, (xj, yj) in enumerate(coords):
+            dx = abs(int(xi) - int(xj))
+            dy = abs(int(yi) - int(yj))
+            if periodic_x:
+                dx = min(dx, int(lx) - dx)
+            if periodic_y:
+                dy = min(dy, int(ly) - dy)
+            groups.setdefault(dx + dy, []).append(correlation[i, j])
+    return [float(np.real(np.mean(groups[distance]))) for distance in sorted(groups)]
+
+
+def _structure_factor_at(
+    correlation: np.ndarray,
+    coords: list[tuple[int, int]],
+    qx: float,
+    qy: float,
+) -> float:
+    """Return the conventional structure factor ``sum_ij C_ij/N``."""
+    phase = np.asarray(
+        [np.exp(-1.0j * (float(qx) * x + float(qy) * y)) for x, y in coords],
+        dtype=complex,
+    )
+    value = np.vdot(phase, np.asarray(correlation) @ phase) / len(coords)
+    return float(np.real_if_close(value).real)
+
+
+def _structure_factor_grid(
+    correlation: np.ndarray,
+    coords: list[tuple[int, int]],
+    *,
+    lx: int,
+    ly: int,
+) -> tuple[list[dict[str, float]], dict[str, float]]:
+    """Evaluate a correlation matrix on the rectangular reciprocal grid."""
+    values = []
+    for my in range(int(ly)):
+        ky = my if my <= int(ly) // 2 else my - int(ly)
+        qy = 2.0 * np.pi * ky / int(ly)
+        for mx in range(int(lx)):
+            kx = mx if mx <= int(lx) // 2 else mx - int(lx)
+            qx = 2.0 * np.pi * kx / int(lx)
+            values.append(
+                {
+                    "qx_over_pi": float(qx / np.pi),
+                    "qy_over_pi": float(qy / np.pi),
+                    "value": _structure_factor_at(correlation, coords, qx, qy),
+                }
+            )
+    peak = max(values, key=lambda row: row["value"])
+    return values, dict(peak)
 
 
 def _expanded_abelian_leg_labels(tensor, leg: int) -> list[tuple[int, ...]]:
@@ -658,21 +852,111 @@ def _site_correlation(factors_or_letta, op_a, op_b, embeddings, dims, *, is_lett
     return corr
 
 
+def _fermion_sequence_product_operators(
+    sequence: list[tuple[int, np.ndarray]],
+    *,
+    nsites: int,
+    parity: np.ndarray,
+    embeddings: list[tuple[int, int | None]],
+    dims: list[int],
+) -> list[np.ndarray]:
+    """Map an ordered fermion-operator sequence to Jordan-Wigner site factors."""
+    primitive = [np.eye(4, dtype=complex) for _ in range(int(nsites))]
+    parity = np.asarray(parity, dtype=complex)
+    for site, local_operator in sequence:
+        site = int(site)
+        if not 0 <= site < int(nsites):
+            raise IndexError(f"fermion operator site {site} is outside a {nsites}-site state.")
+        for left in range(site):
+            primitive[left] = primitive[left] @ parity
+        primitive[site] = primitive[site] @ np.asarray(local_operator, dtype=complex)
+
+    grouped = [np.eye(dim, dtype=complex) for dim in dims]
+    for primitive_site, (mps_site, leg) in enumerate(embeddings):
+        grouped[mps_site] = grouped[mps_site] @ _embed_rung_operator(
+            primitive[primitive_site],
+            leg,
+            dims[mps_site],
+        )
+    return grouped
+
+
+def _singlet_pair_terms(
+    bond: tuple[int, int],
+    operators: dict[str, np.ndarray],
+    *,
+    creation: bool,
+) -> list[tuple[float, list[tuple[int, np.ndarray]]]]:
+    i, j = sorted((int(bond[0]), int(bond[1])))
+    scale = 1.0 / np.sqrt(2.0)
+    annihilation = [
+        (scale, [(i, operators["Cu"]), (j, operators["Cd"])]),
+        (-scale, [(i, operators["Cd"]), (j, operators["Cu"])]),
+    ]
+    if not creation:
+        return annihilation
+    return [
+        (
+            coefficient,
+            [(site, operator.T.conj()) for site, operator in reversed(sequence)],
+        )
+        for coefficient, sequence in annihilation
+    ]
+
+
+def _bond_singlet_pair_correlation(
+    factors_or_letta,
+    operators: dict[str, np.ndarray],
+    bonds: list[tuple[int, int]],
+    embeddings: list[tuple[int, int | None]],
+    dims: list[int],
+    *,
+    is_letta: bool = False,
+) -> np.ndarray:
+    """Return ``<Delta_b^dagger Delta_b'>`` for nearest-neighbor singlet pairs."""
+    creation_terms = [
+        _singlet_pair_terms(bond, operators, creation=True) for bond in bonds
+    ]
+    annihilation_terms = [
+        _singlet_pair_terms(bond, operators, creation=False) for bond in bonds
+    ]
+    corr = np.empty((len(bonds), len(bonds)), dtype=complex)
+    for left, left_terms in enumerate(creation_terms):
+        for right, right_terms in enumerate(annihilation_terms):
+            value = 0.0j
+            for left_coefficient, left_sequence in left_terms:
+                for right_coefficient, right_sequence in right_terms:
+                    product = _fermion_sequence_product_operators(
+                        left_sequence + right_sequence,
+                        nsites=len(embeddings),
+                        parity=operators["JW"],
+                        embeddings=embeddings,
+                        dims=dims,
+                    )
+                    value += left_coefficient * right_coefficient * _expect_product(
+                        factors_or_letta,
+                        product,
+                        is_letta=is_letta,
+                    )
+            corr[left, right] = value
+    return corr
+
+
 def _metrics_from_state(
     factors_or_letta,
     operators: dict[str, np.ndarray],
     *,
     lx: int,
     mpo_info: dict,
-    filling: float,
     is_letta: bool = False,
 ) -> dict:
     ntot = operators["Ntot"]
+    sx = operators["Sx"]
+    sy = operators["Sy"]
     sz = operators["Sz"]
     doublon = operators["NuNd"]
     pair_cre = operators["PairCre"]
     pair_ann = operators["PairAnn"]
-    dcharge = ntot - float(filling) * np.eye(4, dtype=complex)
     order = [int(site) for site in mpo_info["order"]]
     coords = _coords_for_order(lx, order)
     stagger = np.asarray([(-1) ** (x + y) for x, y in coords], dtype=float)
@@ -684,8 +968,10 @@ def _metrics_from_state(
         density = _site_expectations(state, ntot, embeddings, dims, is_letta=True)
         spin_z = _site_expectations(state, sz, embeddings, dims, is_letta=True)
         doublons = _site_expectations(state, doublon, embeddings, dims, is_letta=True)
-        charge_corr = _site_correlation(state, dcharge, dcharge, embeddings, dims, is_letta=True)
-        spin_corr = _site_correlation(state, sz, sz, embeddings, dims, is_letta=True)
+        density_corr = _site_correlation(state, ntot, ntot, embeddings, dims, is_letta=True)
+        spin_x_corr = _site_correlation(state, sx, sx, embeddings, dims, is_letta=True)
+        spin_y_corr = _site_correlation(state, sy, sy, embeddings, dims, is_letta=True)
+        spin_z_corr = _site_correlation(state, sz, sz, embeddings, dims, is_letta=True)
         pair_corr = _site_correlation(state, pair_cre, pair_ann, embeddings, dims, is_letta=True)
     else:
         factors = _standard_dense_factors(factors_or_letta)
@@ -693,21 +979,140 @@ def _metrics_from_state(
         density = _site_expectations(factors, ntot, embeddings, dims)
         spin_z = _site_expectations(factors, sz, embeddings, dims)
         doublons = _site_expectations(factors, doublon, embeddings, dims)
-        charge_corr = _site_correlation(factors, dcharge, dcharge, embeddings, dims)
-        spin_corr = _site_correlation(factors, sz, sz, embeddings, dims)
+        density_corr = _site_correlation(factors, ntot, ntot, embeddings, dims)
+        spin_x_corr = _site_correlation(factors, sx, sx, embeddings, dims)
+        spin_y_corr = _site_correlation(factors, sy, sy, embeddings, dims)
+        spin_z_corr = _site_correlation(factors, sz, sz, embeddings, dims)
         pair_corr = _site_correlation(factors, pair_cre, pair_ann, embeddings, dims)
 
     nsites = int(len(density))
+    # Subtract measured one-point functions. This matters at open boundaries
+    # and away from half filling; subtracting the requested filling is not a
+    # connected charge correlation when the density is spatially nonuniform.
+    charge_corr = density_corr - np.outer(density, density)
+    spin_z_connected = spin_z_corr - np.outer(spin_z, spin_z)
+    spin_dot_corr = spin_x_corr + spin_y_corr + spin_z_connected
+    staggered_spin_density = float(abs(np.sum(stagger * spin_z.real) / nsites))
+    charge_grid, charge_peak = _structure_factor_grid(
+        charge_corr,
+        coords,
+        lx=int(lx),
+        ly=int(mpo_info["spatial_sites"]) // int(lx),
+    )
+    spin_grid, spin_peak = _structure_factor_grid(
+        spin_dot_corr,
+        coords,
+        lx=int(lx),
+        ly=int(mpo_info["spatial_sites"]) // int(lx),
+    )
+    pair_grid, pair_peak = _structure_factor_grid(
+        pair_corr,
+        coords,
+        lx=int(lx),
+        ly=int(mpo_info["spatial_sites"]) // int(lx),
+    )
+    charge_pi_pi = _structure_factor_at(charge_corr, coords, np.pi, np.pi)
+    spin_zz_pi_pi = _structure_factor_at(spin_z_connected, coords, np.pi, np.pi)
+    spin_dot_pi_pi = _structure_factor_at(spin_dot_corr, coords, np.pi, np.pi)
+    pair_q0 = _structure_factor_at(pair_corr, coords, 0.0, 0.0)
+    bonds = [(int(i), int(j)) for i, j in mpo_info["bonds"]]
+    nn_spin = float(np.real(np.mean([spin_dot_corr[i, j] for i, j in bonds])))
+    bond_pair_corr = _bond_singlet_pair_correlation(
+        factors_or_letta,
+        operators,
+        bonds,
+        embeddings,
+        dims,
+        is_letta=is_letta,
+    )
+    bond_orientations = [
+        "x" if coords[i][1] == coords[j][1] else "y" for i, j in bonds
+    ]
+    d_wave_weights = np.asarray(
+        [1.0 if orientation == "x" else -1.0 for orientation in bond_orientations]
+    )
+    extended_s_weights = np.ones(len(bonds), dtype=float)
+    bond_pair_offsite = np.asarray(bond_pair_corr).copy()
+    np.fill_diagonal(bond_pair_offsite, 0.0)
+
+    def pair_structure(weights, correlation) -> float:
+        value = np.vdot(weights, np.asarray(correlation) @ weights) / len(bonds)
+        return float(np.real_if_close(value).real)
+
+    staggered_spin_corr = np.asarray(spin_dot_corr) * np.outer(stagger, stagger)
+    distance_kwargs = {
+        "lx": int(lx),
+        "ly": int(mpo_info["spatial_sites"]) // int(lx),
+        "periodic_x": bool(mpo_info.get("periodic_x", False)),
+        "periodic_y": bool(mpo_info.get("periodic_y", False)),
+    }
     return {
         "density": [float(np.real(value)) for value in density],
         "spin_z": [float(np.real(value)) for value in spin_z],
+        "mean_density": float(np.real(np.mean(density))),
         "avg_doublon": float(np.real(np.mean(doublons))),
-        "cdw_order": float(abs(np.sum(stagger * (density.real - float(filling))) / nsites)),
-        "af_order": float(abs(np.sum(stagger * spin_z.real) / nsites)),
-        "charge_structure_pi_pi": float(np.real(np.einsum("i,ij,j->", stagger, charge_corr, stagger) / (nsites * nsites))),
-        "spin_structure_pi_pi": float(np.real(np.einsum("i,ij,j->", stagger, spin_corr, stagger) / (nsites * nsites))),
-        "pair_pair_edge": float(np.real(pair_corr[0, -1])),
-        "pair_pair_by_mps_distance": distance_average(pair_corr),
+        "avg_local_moment": float(np.real(np.mean(density - 2.0 * doublons))),
+        "avg_charge_fluctuation": float(np.real(np.trace(charge_corr) / nsites)),
+        "staggered_charge_density": float(
+            abs(np.sum(stagger * (density.real - np.mean(density.real))) / nsites)
+        ),
+        # This is reported only as a symmetry-breaking one-point diagnostic.
+        # It is normally zero in a fixed-Sz finite state and is not AF order.
+        "staggered_spin_density": staggered_spin_density,
+        "charge_structure_factor_pi_pi": charge_pi_pi,
+        "charge_order_parameter_sq_pi_pi": charge_pi_pi / nsites,
+        "spin_structure_factor_pi_pi_zz": spin_zz_pi_pi,
+        "spin_structure_factor_pi_pi_dot": spin_dot_pi_pi,
+        "spin_order_parameter_sq_pi_pi": spin_dot_pi_pi / nsites,
+        "nearest_neighbor_spin_dot": nn_spin,
+        "charge_structure_grid": charge_grid,
+        "charge_structure_peak": charge_peak,
+        "spin_structure_grid": spin_grid,
+        "spin_structure_peak": spin_peak,
+        "onsite_pair_structure_grid": pair_grid,
+        "onsite_pair_structure_peak": pair_peak,
+        "onsite_pair_structure_q0": pair_q0,
+        "bond_singlet_pairs": [
+            {
+                "sites": [int(i), int(j)],
+                "orientation": orientation,
+            }
+            for (i, j), orientation in zip(bonds, bond_orientations)
+        ],
+        "d_wave_pair_structure_per_bond": pair_structure(
+            d_wave_weights,
+            bond_pair_corr,
+        ),
+        "d_wave_pair_offsite_per_bond": pair_structure(
+            d_wave_weights,
+            bond_pair_offsite,
+        ),
+        "extended_s_pair_structure_per_bond": pair_structure(
+            extended_s_weights,
+            bond_pair_corr,
+        ),
+        "extended_s_pair_offsite_per_bond": pair_structure(
+            extended_s_weights,
+            bond_pair_offsite,
+        ),
+        "bond_pair_hermiticity_error": float(
+            np.max(np.abs(bond_pair_corr - bond_pair_corr.T.conj()))
+        ),
+        "staggered_spin_by_manhattan_distance": lattice_distance_average(
+            staggered_spin_corr,
+            coords,
+            **distance_kwargs,
+        ),
+        "connected_charge_by_manhattan_distance": lattice_distance_average(
+            charge_corr,
+            coords,
+            **distance_kwargs,
+        ),
+        "onsite_pair_by_manhattan_distance": lattice_distance_average(
+            pair_corr,
+            coords,
+            **distance_kwargs,
+        ),
     }
 
 
@@ -741,6 +1146,7 @@ def run_case(args) -> dict:
 
     ed_evals = None
     ed_info = None
+    phase_gaps = None
     if not args.skip_ed:
         ed_evals, ed_info = ed_ground_energy(
             args.lx,
@@ -754,6 +1160,19 @@ def run_case(args) -> dict:
             periodic_y=args.periodic_y,
             nroots=args.ed_roots,
         )
+        if args.ed_phase_gaps:
+            phase_gaps = ed_phase_gaps(
+                args.lx,
+                args.ly,
+                nup=args.nup,
+                ndown=args.ndown,
+                hopping=args.hopping,
+                hubbard_u=args.hubbard_u,
+                mu=args.mu,
+                periodic_x=args.periodic_x,
+                periodic_y=args.periodic_y,
+                ground_energy=float(ed_evals[0]),
+            )
 
     mpo_projected_evals = None
     if (
@@ -822,10 +1241,11 @@ def run_case(args) -> dict:
             checkpoint_path=args.dmrg_checkpoint,
             resume_from=args.resume_dmrg,
             checkpoint_interval=int(args.dmrg_checkpoint_interval),
+            recenter_final=bool(args.dmrg_recenter),
         )
         dmrg.run()
         dmrg_time = perf_counter() - start
-        sym_mps = dmrg.ground_state
+        sym_mps = dmrg.state
         dmrg_history = list(dmrg.sweep_history)
         dmrg_converged = bool(dmrg.converged)
 
@@ -878,19 +1298,20 @@ def run_case(args) -> dict:
                 noise=float(args.letta_expand_noise),
                 seed=int(args.seed),
             )
-        start = perf_counter()
-        letta.run(
-            dense_mpo,
-            nsweeps=int(args.letta_sweeps),
-            tol=float(args.letta_tol),
-            gauge=None if args.letta_gauge == "none" else args.letta_gauge,
-            verbose=int(args.verbose),
-            local_solver=args.letta_solver,
-            matrix_free_threshold=int(args.letta_matrix_free_threshold),
-            matrix_free_tol=float(args.letta_matrix_free_tol),
-            matrix_free_maxiter=int(args.letta_matrix_free_maxiter),
-        )
-        letta_time = perf_counter() - start
+        if int(args.letta_sweeps) > 0:
+            start = perf_counter()
+            letta.run(
+                dense_mpo,
+                nsweeps=int(args.letta_sweeps),
+                tol=float(args.letta_tol),
+                gauge=None if args.letta_gauge == "none" else args.letta_gauge,
+                verbose=int(args.verbose),
+                local_solver=args.letta_solver,
+                matrix_free_threshold=int(args.letta_matrix_free_threshold),
+                matrix_free_tol=float(args.letta_matrix_free_tol),
+                matrix_free_maxiter=int(args.letta_matrix_free_maxiter),
+            )
+            letta_time = perf_counter() - start
         letta_energy = float(letta.expectation_mpo(dense_mpo))
         if args.letta_save:
             letta.save(
@@ -911,24 +1332,22 @@ def run_case(args) -> dict:
 
     dmrg_metrics = None
     letta_metrics = None
-    if not args.skip_metrics and letta is not None:
+    if not args.skip_metrics:
         operators = hubbard_site_operators()
-        filling = (int(args.nup) + int(args.ndown)) / spatial_sites
         dmrg_metrics = _metrics_from_state(
             dense_mps,
             operators,
             lx=args.lx,
             mpo_info=mpo_info,
-            filling=filling,
         )
-        letta_metrics = _metrics_from_state(
-            letta,
-            operators,
-            lx=args.lx,
-            mpo_info=mpo_info,
-            filling=filling,
-            is_letta=True,
-        )
+        if letta is not None:
+            letta_metrics = _metrics_from_state(
+                letta,
+                operators,
+                lx=args.lx,
+                mpo_info=mpo_info,
+                is_letta=True,
+            )
 
     return {
         "params": {
@@ -950,10 +1369,12 @@ def run_case(args) -> dict:
             "sweeps": int(args.sweeps),
             "letta_sweeps": int(args.letta_sweeps),
             "dmrg_policy": args.dmrg_policy,
+            "dmrg_recenter": bool(args.dmrg_recenter),
             "init": args.init,
         },
         "mpo": mpo_info,
         "ed": None if ed_evals is None else {"energies": [float(x) for x in ed_evals], "info": ed_info},
+        "ed_phase_gaps": phase_gaps,
         "mpo_projected_evals": None if mpo_projected_evals is None else [float(x) for x in mpo_projected_evals],
         "dmrg_energy": float(dmrg_energy),
         "letta_energy": None if letta_energy is None else float(letta_energy),
@@ -1018,11 +1439,18 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--noise", type=float, default=1.0e-6)
     parser.add_argument("--noise-decay", type=float, default=0.2)
     parser.add_argument("--init", choices=("sector-random", "product"), default="sector-random")
-    parser.add_argument("--dmrg-policy", default="packed-cpp-fast")
+    parser.add_argument("--dmrg-policy", default="packed-compiled-fast")
     parser.add_argument("--dmrg-only", action="store_true")
     parser.add_argument("--dmrg-checkpoint", default=None)
     parser.add_argument("--resume-dmrg", default=None)
     parser.add_argument("--dmrg-checkpoint-interval", type=int, default=1)
+    parser.add_argument(
+        "--no-dmrg-recenter",
+        dest="dmrg_recenter",
+        action="store_false",
+        default=True,
+        help="return the converged boundary-centered MPS without a final optimizing recenter pass",
+    )
     parser.add_argument("--letta-from-dmrg-checkpoint", default=None)
     parser.add_argument("--letta-variant", choices=("standard", "nnn"), default="standard")
     parser.add_argument("--letta-gauge", choices=("conditional", "none"), default="conditional")
@@ -1035,6 +1463,11 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--letta-matrix-free-tol", type=float, default=1.0e-8)
     parser.add_argument("--letta-matrix-free-maxiter", type=int, default=80)
     parser.add_argument("--ed-roots", type=int, default=4)
+    parser.add_argument(
+        "--ed-phase-gaps",
+        action="store_true",
+        help="also diagonalize neighboring particle/spin sectors for finite-cluster gaps",
+    )
     parser.add_argument("--skip-ed", action="store_true")
     parser.add_argument("--check-mpo", action="store_true")
     parser.add_argument("--check-mpo-max-sites", type=int, default=4)
@@ -1049,6 +1482,12 @@ def parse_args(argv: list[str] | None = None):
         raise ValueError("--site-grouping rung requires --ly >= 2.")
     if args.dmrg_only and args.letta_from_dmrg_checkpoint:
         raise ValueError("--dmrg-only cannot be combined with --letta-from-dmrg-checkpoint.")
+    if args.skip_ed and args.ed_phase_gaps:
+        raise ValueError("--ed-phase-gaps cannot be combined with --skip-ed.")
+    if args.letta_sweeps < 0:
+        raise ValueError("--letta-sweeps must be nonnegative.")
+    if args.letta_sweeps == 0 and not args.letta_load:
+        raise ValueError("--letta-sweeps 0 requires --letta-load for metrics-only evaluation.")
     if args.nup is None:
         args.nup = nsites // 2
     if args.ndown is None:
@@ -1073,6 +1512,11 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"  ED E0 = {ed0: .12f}  "
             f"dim={result['ed']['info']['dimension']} bonds={len(result['ed']['info']['bonds'])}"
+        )
+    if result["ed_phase_gaps"] is not None:
+        print(
+            f"  finite-cluster gaps: charge={result['ed_phase_gaps']['charge_gap']:.8f}  "
+            f"spin={result['ed_phase_gaps']['spin_gap']:.8f}"
         )
     if result["mpo_projected_evals"] is not None and result["ed"] is not None:
         diff = max(
@@ -1108,29 +1552,45 @@ def main(argv: list[str] | None = None) -> int:
         if result["letta_minus_ed"] is not None:
             line += f"  LETTA-ED={result['letta_minus_ed']:+.3e}"
         print(line)
-    if result["dmrg"] is None or result["letta"] is None:
+    if result["dmrg"] is None:
         print("  Metrics skipped.")
     else:
-        print(
-            f"  AF(MPS,LETTA)=({result['dmrg']['af_order']:.6f}, {result['letta']['af_order']:.6f})  "
-            f"Sspin(pi,pi)=({result['dmrg']['spin_structure_pi_pi']:.6f}, {result['letta']['spin_structure_pi_pi']:.6f})"
-        )
-        print(
-            f"  CDW(MPS,LETTA)=({result['dmrg']['cdw_order']:.6f}, {result['letta']['cdw_order']:.6f})  "
-            f"Doublon=({result['dmrg']['avg_doublon']:.6f}, {result['letta']['avg_doublon']:.6f})"
-        )
-        print(
-            f"  Pair edge(MPS,LETTA)=({result['dmrg']['pair_pair_edge']:.6e}, "
-            f"{result['letta']['pair_pair_edge']:.6e})"
-        )
-        print(
-            "  Pair C(r) MPS   = "
-            + " ".join(f"{value:.3e}" for value in result["dmrg"]["pair_pair_by_mps_distance"][1:])
-        )
-        print(
-            "  Pair C(r) LETTA = "
-            + " ".join(f"{value:.3e}" for value in result["letta"]["pair_pair_by_mps_distance"][1:])
-        )
+        metric_states = [("MPS", result["dmrg"])]
+        if result["letta"] is not None:
+            metric_states.append(("LETTA", result["letta"]))
+        for label, metrics in metric_states:
+            spin_peak = metrics["spin_structure_peak"]
+            charge_peak = metrics["charge_structure_peak"]
+            print(
+                f"  {label}: Sdot(pi,pi)={metrics['spin_structure_factor_pi_pi_dot']:.6f} "
+                f"m_AF^2={metrics['spin_order_parameter_sq_pi_pi']:.6f} "
+                f"N(pi,pi)={metrics['charge_structure_factor_pi_pi']:.6f}"
+            )
+            print(
+                f"    local moment={metrics['avg_local_moment']:.6f} "
+                f"charge fluctuation={metrics['avg_charge_fluctuation']:.6f} "
+                f"doublon={metrics['avg_doublon']:.6f} "
+                f"onsite P(0)={metrics['onsite_pair_structure_q0']:.6e}"
+            )
+            print(
+                f"    bond singlet: d-wave={metrics['d_wave_pair_structure_per_bond']:.6e} "
+                f"d-wave offsite={metrics['d_wave_pair_offsite_per_bond']:.6e} "
+                f"extended-s={metrics['extended_s_pair_structure_per_bond']:.6e}"
+            )
+            print(
+                "    peaks: spin q/pi="
+                f"({spin_peak['qx_over_pi']:.3g},{spin_peak['qy_over_pi']:.3g}) "
+                f"S={spin_peak['value']:.6f}; charge q/pi="
+                f"({charge_peak['qx_over_pi']:.3g},{charge_peak['qy_over_pi']:.3g}) "
+                f"N={charge_peak['value']:.6f}"
+            )
+            print(
+                "    staggered spin C(r) = "
+                + " ".join(
+                    f"{value:.3e}"
+                    for value in metrics["staggered_spin_by_manhattan_distance"]
+                )
+            )
     out = Path(args.out).expanduser()
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(result, indent=2), encoding="utf-8")

@@ -25,7 +25,8 @@ from scipy.linalg import expm
 from matplotlib.ticker import ScalarFormatter
 
 from pyqed.mps.dmrg import DMRG
-from pyqed.mps.mps import MPS, MPO, _mpo_to_dense_operator
+from pyqed.mps.mps import MPS, _mpo_to_dense_operator
+from pyqed.tn import MPO
 from pyqed.mps.tdmps import TDMPS
 from pyqed.mps.first_quantization import Chain
 
@@ -188,8 +189,8 @@ def benchmark_ground_state(H_mpo, n_sites, d, chi=32, nsweeps=8):
     dmrg.init_guess = psi0
     dmrg.run()
 
-    e_dmrg = float(np.real(dmrg.e_tot))
-    psi_dmrg = mps_to_dense_state(dmrg.ground_state)
+    e_dmrg = float(np.real(dmrg.energy))
+    psi_dmrg = mps_to_dense_state(dmrg.state)
     overlap = float(np.abs(np.vdot(psi_exact, psi_dmrg)))
     rayleigh = float(np.real(np.vdot(psi_dmrg, h_dense @ psi_dmrg)))
 

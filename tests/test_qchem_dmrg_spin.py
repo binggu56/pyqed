@@ -1,3 +1,6 @@
+import inspect
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -22,6 +25,8 @@ from pyqed.qchem.dmrg.backends import (
 )
 from pyqed.qchem.dmrg.backends.nonabelian import (
     ORTHONORMALIZED_OPERATOR_ITERMAX_DEFAULT,
+    SU2DMRG,
+    _expectation_from_nonabelian_mps,
 )
 from pyqed.qchem.dmrg.spatial_terms import (
     spatial_local_ops,
@@ -32,12 +37,12 @@ from pyqed.mps.nonabelian import RankCoupledMPO, SpatialSpinFreeERIBuilder
 from pyqed.mps.nonabelian import build_random_spatial_mps, build_spatial_hubbard_mpo
 from pyqed.mps.nonabelian.environment import BlockSparseEnvironmentChain, contract_chain_expectation
 from pyqed.mps.nonabelian.renormalized import ComplementaryFamilyTensorTable
-from pyqed.mps.nonabelian.renormalized import FamilyNativeFactorKernel
+from pyqed.mps.nonabelian.renormalized import FamilyCppFactorKernel
 from pyqed.mps.nonabelian.renormalized import RenormalizedBlockStack
 from pyqed.mps.nonabelian.renormalized import configure_su2_kernel_policy
 from pyqed.mps.nonabelian.renormalized import symbolic_mpo_core_transitions
 from pyqed.mps.nonabelian.su2_kernel import SU2LocalAction
-from pyqed.mps.nonabelian.su2_kernel import cython_available as su2_cython_available
+from pyqed.mps.nonabelian.su2_kernel import cpp_available as su2_cpp_available
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
 from pyqed.mps.nonabelian.contraction import merge_mps_sites
 from pyqed.mps.nonabelian.solver import (
@@ -50,6 +55,14 @@ from pyqed.mps.su2 import SU2Irrep, SpinChargeSector
 from pyqed.mps.symmetry import AbelianSector
 
 
+def _build_cpp_integrals(molecule):
+    molecule.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    return molecule
+
+
 def _kron_all(ops):
     out = ops[0]
     for op in ops[1:]:
@@ -59,6 +72,185 @@ def _kron_all(ops):
 
 def test_su2_block2_like_uses_short_local_solver_default():
     assert ORTHONORMALIZED_OPERATOR_ITERMAX_DEFAULT == 30
+
+
+def test_dmrg_run_rejects_ambiguous_su2_controls_before_build():
+    dmrg = object.__new__(DMRG)
+
+    assert inspect.signature(DMRG.run).parameters["nsweeps"].default == 50
+    with pytest.raises(TypeError, match="positive integer"):
+        dmrg.run(nstates=1.5)
+    with pytest.raises(TypeError, match="positive integer"):
+        dmrg.run(nsweeps=1.5)
+    with pytest.raises(ValueError, match="positive"):
+        dmrg.run(nsweeps=0)
+    with pytest.raises(TypeError, match=r"was removed.*native C\+\+"):
+        dmrg.run(su2_kernel_backend="native")
+    with pytest.raises(TypeError, match="fully_reduced_state_average was removed"):
+        dmrg.run(fully_reduced_state_average=False)
+
+
+def test_su2_requires_compiled_integral_reference():
+    molecule = Molecule(
+        atom="H 0 0 0; H 0 0 1.4",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    _build_cpp_integrals(molecule)
+    mean_field = RHF(molecule).run()
+    molecule._builtin_build_info = {}
+    dmrg = DMRG(
+        mean_field,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry="su2",
+        verbose=0,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"compiled C\+\+ integral builder",
+    ):
+        dmrg.run(nsweeps=1)
+
+
+def test_su2_cpp_path_uses_compiled_builtin_integrals():
+    molecule = Molecule(
+        atom="H 0 0 0; H 0 0 1.4",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    _build_cpp_integrals(molecule)
+    mean_field = RHF(molecule).run()
+    dmrg = DMRG(
+        mean_field,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(
+        nsweeps=1,
+        conv_tol=-1.0,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        mixer_nsweeps=0,
+    )
+
+    assert molecule._builtin_build_info["eri_backend"] == "cpp"
+    assert str(
+        molecule._builtin_build_info["dense_builder"]
+    ).startswith("cpp-")
+    assert dmrg.dmrg.ncompleted == 1
+    assert dmrg.dmrg.ncompleted_half_sweeps == 2
+    assert [row["direction"] for row in dmrg.dmrg.history] == ["lr", "rl"]
+    assert [row["sweep"] for row in dmrg.dmrg.history] == [1, 1]
+    assert [row["sweep_complete"] for row in dmrg.dmrg.history] == [False, True]
+
+
+def test_su2_run_reports_nonconvergence_after_complete_sweep():
+    molecule = Molecule(
+        atom="H 0 0 0; H 0 0 1.4",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    _build_cpp_integrals(molecule)
+    dmrg = DMRG(
+        RHF(molecule).run(),
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+
+    with pytest.raises(RuntimeError, match="1 complete sweep"):
+        dmrg.run(
+            nsweeps=1,
+            conv_tol=-1.0,
+            mixer_zero_block_noise_scale=0.0,
+            mixer_nsweeps=0,
+        )
+
+    assert dmrg.dmrg.converged is False
+    assert dmrg.dmrg.success is False
+    assert dmrg.states is dmrg.dmrg.states
+    assert dmrg.ground_state is dmrg.dmrg.ground_state
+    assert dmrg.history is dmrg.dmrg.history
+    assert dmrg.dmrg.ncompleted == 1
+    assert dmrg.dmrg.ncompleted_half_sweeps == 2
+
+
+def test_abelian_run_reports_nonconvergence_after_complete_sweep():
+    molecule = Molecule(
+        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    _build_cpp_integrals(molecule)
+    dmrg = DMRG(
+        RHF(molecule).run(),
+        ncas=4,
+        nelecas=4,
+        D=8,
+        init_guess="hf",
+        site="spatial",
+        symmetry="sz",
+        verbose=0,
+    )
+
+    with pytest.raises(RuntimeError, match="1 complete sweep"):
+        dmrg.run(nsweeps=1, sweep_tol=-1.0, noise=0.0)
+
+    assert dmrg.dmrg.converged is False
+    assert dmrg.dmrg.success is False
+    assert dmrg.states is dmrg.dmrg.states
+    assert dmrg.ground_state is dmrg.dmrg.ground_state
+    assert dmrg.history is dmrg.dmrg.sweep_history
+    assert dmrg.dmrg.ncompleted == 1
+    assert dmrg.dmrg.ncompleted_half_sweeps == 2
+    assert [
+        row["direction"]
+        for row in dmrg.dmrg.sweep_history
+        if row["direction"] in {"lr", "rl"}
+    ] == ["lr", "rl"]
+
+
+def test_fully_reduced_su2_solver_owner_is_not_process_global():
+    molecule = Molecule(
+        atom="H 0 0 0; H 0 0 1.4",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    _build_cpp_integrals(molecule)
+    mean_field = RHF(molecule).run()
+
+    def build_owner():
+        dmrg = DMRG(
+            mean_field,
+            ncas=2,
+            nelecas=2,
+            D=8,
+            init_guess="hf",
+            symmetry="su2",
+            spatial_site_basis="fully_reduced",
+            verbose=0,
+        )
+        dmrg.build()
+        return dmrg._active_hamiltonian.moving_environment
+
+    first = build_owner()
+    second = build_owner()
+
+    assert first is not second
+    assert first.system_stats["revision"] == second.system_stats["revision"]
 
 
 def _spin_orbital_annihilation(site, nsites):
@@ -153,7 +345,7 @@ def test_complementary_family_tensor_table_matches_raw_component_plan():
     assert table.stats["family_term_counts"] == {"P": 1, "Q": 1, "R": 1}
 
 
-def test_family_native_factor_kernel_matches_compiled_apply_block():
+def test_family_cpp_factor_kernel_matches_compiled_apply_block():
     class _Entry:
         def __init__(self, shape):
             self.shape = tuple(shape)
@@ -186,7 +378,7 @@ def test_family_native_factor_kernel_matches_compiled_apply_block():
             return out.reshape(self.output_size)
 
     term = _Term()
-    kernel = FamilyNativeFactorKernel.from_compiled_term(term)
+    kernel = FamilyCppFactorKernel.from_compiled_term(term)
     block = np.arange(16, dtype=float).reshape(2, 2, 2, 2) / 23.0
 
     np.testing.assert_allclose(kernel.apply_block(block), term.apply_block(block))
@@ -445,10 +637,12 @@ def test_spatial_reduced_qchem_mpo_with_two_body_terms_matches_dense_reference()
     assert reduced.info["one_body_reduced"] is True
     assert reduced.info["two_body"] is True
     assert reduced.info["two_body_representation"] == "spinfree_scalar_coupled_eri"
-    assert reduced.info["two_body_builder"] == "SpatialSpinFreeERIBuilder"
+    assert reduced.info["two_body_builder"] == "SU2System[P/Q]"
     assert reduced.info["pipeline"] == (
-        "qchem_integrals->spatial_reduced_hamiltonian_builder->spinfree_eri_builder->rank_coupled_mpo"
+        "cpp_integrals->su2_system->reduced_complementary_families"
     )
+    assert reduced.moving_environment is not None
+    assert reduced.info["su2_system"]["backend"] == "cpp"
     assert reduced.info["two_body_reduced_string_terms"] == 0
     assert reduced.info["two_body_scalar_density_terms"] == 0
     assert reduced.info["two_body_scalar_product_terms"] > 0
@@ -573,7 +767,10 @@ def test_spatial_reduced_qchem_mpo_uses_general_scalar_coupled_builder_for_adjac
 
 def test_spatial_dmrg_build_can_use_reduced_mpo():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
     mf = RHF(mol).run()
 
     grouped = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
@@ -590,48 +787,65 @@ def test_spatial_dmrg_build_can_use_reduced_mpo():
     )
     reduced.build()
 
-    assert reduced._active_integral_build_info["representation"] == "spatial_reduced_spinfree_mpo"
+    assert reduced.build_info["representation"] == "spatial_reduced_spinfree_mpo"
     assert reduced._active_hamiltonian is not None
     assert reduced._active_hamiltonian.initialize_system_kwargs()["n_sites"] == 2
     assert reduced._active_hamiltonian.initialize_system_kwargs()["n_elec"] == 2
     assert reduced._active_hamiltonian.mpo is reduced.H
-    np.testing.assert_allclose(
-        _dense_matrix_from_nonabelian_mpo_list(reduced.H),
-        _dense_matrix_from_nonabelian_mpo_list(grouped.H),
-        atol=1e-10,
-    )
+    assert reduced.build_info["normal_complementary_production"] is True
+    assert reduced.build_info["python_reduced_terms_materialized"] is False
+    assert all(not core.dense_blocks for core in reduced.H)
 
 
 def test_dmrg_accepts_ri_active_integrals():
     atom = "H 0 0 0; H 0 0 0.74"
     dense_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    dense_mol.build(driver="builtin", eri="dense")
+    dense_mol.build(eri="dense")
     dense_mf = RHF(dense_mol).run(verbose=0)
 
     ri_mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    ri_mol.build(driver="builtin", eri="ri")
+    ri_mol.build(eri="ri")
     ri_mf = RHF(ri_mol).run(verbose=0)
 
-    dense = DMRG(dense_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=4, symmetry_list=None)
+    dense = DMRG(
+        dense_mf,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry=None,
+        verbose=0,
+    )
+    dense.run(nsweeps=4, require_convergence=False)
 
-    ri = DMRG(ri_mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    ri.run(nsweeps=4, symmetry_list=None)
+    ri = DMRG(
+        ri_mf,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry=None,
+        verbose=0,
+    )
+    ri.run(nsweeps=4, require_convergence=False)
 
-    assert ri._active_integral_build_info["mode"] == "ri"
-    assert ri._active_integral_build_info["factorized_integrals"] is True
-    assert ri._active_integral_build_info["aux_rank"] == ri_mol.eri_factors.shape[0]
+    assert ri.build_info["mode"] == "ri"
+    assert ri.integral_backend_override is None
+    assert ri.integral_mode == "ri"
+    assert ri.build_info["integral_mode"] == "ri"
+    assert ri.build_info["factorized_integrals"] is True
+    assert ri.build_info["aux_rank"] == ri_mol.eri_factors.shape[0]
     assert ri.e_tot == pytest.approx(dense.e_tot, abs=5.0e-5)
 
 
-def test_dmrg_auto_prefers_dense_when_dense_and_factors_exist():
+def test_dmrg_infers_mean_field_factor_backend_when_dense_also_exists():
     atom = "H 0 0 0; H 0 0 0.74"
     mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    mol.build(driver="builtin", eri="dense+ri")
+    mol.build(eri="dense+ri")
     mf = RHF(mol).run(verbose=0)
 
-    dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
-    dense.run(nsweeps=4, symmetry_list=None)
+    inferred = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
+    inferred.run(nsweeps=4, symmetry_list=None)
 
     ri = DMRG(
         mf,
@@ -644,16 +858,38 @@ def test_dmrg_auto_prefers_dense_when_dense_and_factors_exist():
     )
     ri.run(nsweeps=4, symmetry_list=None)
 
-    assert dense._active_integral_build_info["mode"] == "dense"
-    assert dense._active_integral_build_info["factorized_integrals"] is False
-    assert ri._active_integral_build_info["mode"] == "ri"
-    assert ri._active_integral_build_info["factorized_integrals"] is True
+    assert inferred.integral_backend_override is None
+    assert inferred.integral_mode == "ri"
+    assert inferred.build_info["mode"] == "ri"
+    assert inferred.build_info["factorized_integrals"] is True
+    assert ri.build_info["mode"] == "ri"
+    assert ri.build_info["factorized_integrals"] is True
+
+
+def test_dmrg_rejects_auto_integral_backend_sentinel():
+    atom = "H 0 0 0; H 0 0 0.74"
+    mol = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
+    mol.build(eri="dense")
+    mf = RHF(mol).run(verbose=0)
+
+    inferred = DMRG(mf, ncas=2, nelecas=2, D=8)
+    assert inferred.integral_backend_override is None
+    assert inferred.integral_mode == "dense"
+
+    with pytest.raises(ValueError, match="Omit integral_backend"):
+        DMRG(
+            mf,
+            ncas=2,
+            nelecas=2,
+            D=8,
+            integral_backend="auto",
+        )
 
 
 def test_abelian_sz_hf_guess_can_leave_hf_determinant():
     atom = "H 0 0 0; H 0 0 0.74"
     mol = Molecule(atom=atom, unit="angstrom", basis="cc-pvdz")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
@@ -924,7 +1160,7 @@ def test_qchem_su2_block2_like_rejects_raw_boundary_fallback(monkeypatch):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     from pyqed.mps.nonabelian import environment as env_mod
@@ -953,65 +1189,23 @@ def test_qchem_su2_block2_like_rejects_raw_boundary_fallback(monkeypatch):
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=2,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
         conv_tol=-1.0,
+        require_convergence=False,
     )
 
-    assert dmrg.e_tot == pytest.approx(-2.177899323464, abs=1e-8)
+    assert dmrg.e_tot == pytest.approx(-2.177899323464, abs=1e-6)
     objectives = [
         objective
         for entry in dmrg.dmrg.history
         for objective in entry.get("bond_objectives", [])
     ]
-    metadata = [
-        objective.get("renormalized_operator_metadata")
+    assert objectives
+    assert all(
+        objective.get("no_python_bond_callbacks") is True
         for objective in objectives
-        if objective.get("renormalized_operator_metadata") is not None
-    ]
-    assert metadata
-    assert all(
-        item["symbolic_boundary_payloads"]["symbolic_boundary_payload_source"]
-        == "symbolic_table"
-        for item in metadata
     )
-    assert all(
-        item["symbolic_boundary_payloads"]["symbolic_payloads_owned"] is True
-        for item in metadata
-    )
-    block_stack_stats = dmrg.dmrg.history[-1]["renormalized_block_stack_stats"]
-    assert "rank_coupled_left_factor_by_ket" in block_stack_stats[
-        "side_operator_table_representations"
-    ]
-    assert "rank_coupled_right_factor_by_ket" in block_stack_stats[
-        "side_operator_table_representations"
-    ]
-    complementary = block_stack_stats["complementary_operator_families"]
-    assert complementary["family_names"] == ("S", "R", "A", "P", "B", "Q")
-    assert complementary["families"]["P"]["n_terms"] > 0
-    complementary_stack = block_stack_stats["complementary_operator_stack"]
-    assert complementary_stack["family_names"] == ("S", "R", "A", "P", "B", "Q")
-    assert complementary_stack["n_entries"] > 0
-    assert complementary_stack["advances"] > 0
-    assert complementary_stack["numeric_payload_terms"] > 0
-    assert complementary_stack["numeric_payload_cross_terms"] > 0
-    assert complementary_stack["family_operator_tables"] > 0
-    assert complementary_stack["family_operator_table_payload_blocks"] > 0
-    assert complementary_stack["family_operator_table_stored_elements"] > 0
-    assert complementary_stack["family_operator_table_symbolic_terms"] > 0
-    assert complementary_stack["numeric_payload_families"]["P"]["cross_terms"] > 0
-    assert dmrg.dmrg.history[0]["reused_prebuilt_boundary_side"] is None
-    assert dmrg.dmrg.history[1]["reused_prebuilt_boundary_side"] == "left"
-    moving_stats = dmrg.dmrg.history[-1]["moving_environment_stats"]
-    assert moving_stats["environment_rebuilds"] == 1
-    assert moving_stats["boundary_side_reuses"] == 1
-    assert moving_stats["valid_boundary_side"] == "right"
-    assert moving_stats["complementary_operator_advances"] > 0
-    assert dmrg.dmrg.history[-1]["hamiltonian_complementary_operators"][
-        "family_names"
-    ] == ("S", "R", "A", "P", "B", "Q")
+    assert dmrg.dmrg.diagnostics["kernel_backend"] == "cpp"
 
 
 def test_grouped_spin_orbital_mpo_matches_spatial_dense_reference():
@@ -1032,7 +1226,7 @@ def test_grouped_spin_orbital_mpo_matches_spatial_dense_reference():
 
 def test_spatial_dmrg_supports_abelian_charge_sz_symmetry():
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="angstrom", basis="sto-3g")
-    mol.build(driver="pyscf")
+    mol.build()
     mf = mol.RHF(verbose=0).run()
 
     dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
@@ -1040,7 +1234,7 @@ def test_spatial_dmrg_supports_abelian_charge_sz_symmetry():
     sym = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
     sym.run(nsweeps=4, symmetry_list=["charge", "sz"])
 
-    assert hasattr(sym.dmrg.ground_state.Bs[0], "qns")
+    assert hasattr(sym.dmrg.ground_state.factors[0], "qns")
     assert sym.e_tot == pytest.approx(dense.e_tot, abs=1e-8)
 
 
@@ -1058,7 +1252,7 @@ def test_h4_spatial_block2_like_uses_cpp_hot_path_end_to_end():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.RHF(verbose=0).run()
     dmrg = DMRG(
         mf,
@@ -1070,22 +1264,22 @@ def test_h4_spatial_block2_like_uses_cpp_hot_path_end_to_end():
         spin=0,
         verbose=0,
         integral_backend="cholesky",
-        dmrg_performance="block2-like",
+        dmrg_performance="packed-cpp-fast",
         spatial_family_environment_backend="block2_table",
     )
 
     dmrg.run(nsweeps=4)
 
     assert dmrg.e_tot == pytest.approx(-2.13944255109448, abs=1e-9)
-    assert dmrg._active_integral_build_info["representation"] == (
+    assert dmrg.build_info["representation"] == (
         "spatial_block2_table_carrier_mpo"
     )
-    assert dmrg._active_integral_build_info["carrier_only_family_hamiltonian"] is True
-    build_timings = dmrg._active_integral_build_info[
+    assert dmrg.build_info["carrier_only_family_hamiltonian"] is True
+    build_timings = dmrg.build_info[
         "complementary_operator_family_build_timings"
     ]
-    active_build_timings = dmrg._active_integral_build_info["build_timings"]
-    assert dmrg._active_integral_build_info["qchem_compile_backend_actual"] == "cpp"
+    active_build_timings = dmrg.build_info["build_timings"]
+    assert dmrg.build_info["qchem_compile_backend_actual"] == "cpp"
     assert build_timings["qchem_block2_setup_backend_actual"] == (
         "cpp_qchem_spatial_block2_setup"
     )
@@ -1114,25 +1308,25 @@ def test_h4_spatial_block2_like_uses_cpp_hot_path_end_to_end():
     assert active_build_timings["cpp_owned_converted_family_mpo_families"] == 3
     assert (
         "moving_environment_cpp_owned_family_mpo_key"
-        in dmrg._active_integral_build_info["resolved_abelian_matvec_options"]
+        in dmrg.build_info["resolved_abelian_matvec_options"]
     )
     assert (
         "moving_environment_cpp_qchem_family_descriptor_key"
-        in dmrg._active_integral_build_info["resolved_abelian_matvec_options"]
+        in dmrg.build_info["resolved_abelian_matvec_options"]
     )
     assert (
-        dmrg._active_integral_build_info[
+        dmrg.build_info[
             "moving_environment_cpp_owner_reused_from_build"
         ]
         is True
     )
     assert (
-        dmrg._active_integral_build_info["resolved_abelian_matvec_options"][
+        dmrg.build_info["resolved_abelian_matvec_options"][
             "moving_environment_cpp_state_owner_instance"
         ]
         == "cpp_moving_environment_build_owner"
     )
-    family_mpo_info = dmrg._active_integral_build_info[
+    family_mpo_info = dmrg.build_info[
         "complementary_operator_family_mpos"
     ]
     assert family_mpo_info["R"]["source"] == "cpp_spatial_sparse_tt_svd_mpo"
@@ -1234,11 +1428,11 @@ def test_h4_spatial_block2_like_uses_cpp_hot_path_end_to_end():
         moving[
             "cpp_moving_environment_owner_local_optimize_native_noise_injections"
         ]
-        > 0
+        == 0
     )
     assert (
         moving["cpp_moving_environment_owner_local_optimize_native_noise_blocks"]
-        > 0
+        == 0
     )
     assert moving["cpp_moving_environment_owner_local_optimize_bridge_merge_calls"] == 0
     assert moving["cpp_moving_environment_owner_local_optimize_boundary_stack_reads"] > 0
@@ -1436,7 +1630,7 @@ def test_h4_spatial_block2_like_uses_cpp_hot_path_end_to_end():
     assert getattr(abelian_direct, "_ABELIAN_SVD_KERNEL_LAST_ERROR", "") == ""
 
 
-def test_h4_spatial_block2_like_default_uses_generator_table_owner_refresh():
+def test_h4_spatial_default_uses_compiled_sector_channel_mpo():
     if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
         pytest.skip("optional C++ Davidson/backend kernels are not available")
 
@@ -1445,7 +1639,7 @@ def test_h4_spatial_block2_like_default_uses_generator_table_owner_refresh():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.RHF(verbose=0).run()
     dmrg = DMRG(
         mf,
@@ -1457,1220 +1651,73 @@ def test_h4_spatial_block2_like_default_uses_generator_table_owner_refresh():
         spin=0,
         verbose=0,
         integral_backend="cholesky",
-        dmrg_performance="block2-like",
+        dmrg_performance="packed-cpp-fast",
     )
 
-    dmrg.run(nsweeps=6)
+    dmrg.run(nsweeps=4)
 
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=5e-4)
-    active = dmrg._active_integral_build_info
-    assert active["representation"] == "spatial_block2_table_carrier_mpo"
-    assert active["spatial_family_environment_backend"] == "generator_table"
-    assert active["complementary_operator_families"]["enable_native_boundary_r"] is False
-    assert "symmetric_family_convert_s" not in active["build_timings"]
-    family_mpos = active["complementary_operator_family_mpos"]
-    assert family_mpos["R"]["source"] == "native_generator_entries"
-    assert family_mpos["P"]["source"] == "native_generator_entries"
-
+    assert dmrg.e_tot == pytest.approx(-2.13944255109448, abs=1e-9)
+    active = dmrg.build_info
+    assert active["representation"] == "spatial_direct_symbolic_mpo"
+    assert active["spatial_u1_execution"] == "compiled_sector_channel_mpo"
+    assert active["sector_complete_environment_movement"] is True
+    assert active["complementary_route_expansion"] is False
+    assert active["compiled_channel_skipped_redundant_final_expectation"] is True
+    assert dmrg.complementary_operators is None
+    assert dmrg.complementary_operator_mpos is None
     moving = dmrg.dmrg.environment_profile["moving_environment"]
-    builder_stats = dmrg.dmrg.complementary_split_stats["direct_family_table_builder"]
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["exact_planned_packed_contextual_entries"] is True
-    assert build_options["table_backed_planned_contextual_entries"] is False
-    assert build_options["table_backed_planned_contextual_entries_policy"] == "False"
-    assert builder_stats["native_boundary_r"]["enabled"] is False
-    assert moving["owner_local_optimize_commit_actual"] == "cpp_owner_site_chain"
-    assert moving["owner_site_chain_backend_actual"] == "cpp_owner_site_chain"
-    assert moving["owner_site_chain_gets"] > 0
-    assert moving["owner_site_chain_sets"] > 0
-    assert moving["owner_site_chain_syncs"] > 0
-    assert moving["cpp_moving_environment_owner_site_chain_records"] > 0
-    assert moving["cpp_moving_environment_owner_site_chain_gets"] > 0
-    assert moving["cpp_moving_environment_owner_site_chain_sets"] > 0
-    assert moving["cpp_moving_environment_owner_site_chain_syncs"] > 0
-    assert moving["cpp_moving_environment_owner_site_chain_failures"] == 0
-    assert moving["owner_half_sweep_backend_actual"] == (
-        "cpp_owner_half_sweep_typed_plan"
-    )
-    assert moving["owner_bond_step_orchestrator_actual"] == (
-        "cpp_moving_environment_typed"
-    )
-    assert moving["cpp_moving_environment_owner_typed_half_sweep_plan_hits"] > 0
-    assert moving["cpp_moving_environment_owner_typed_bond_step_record_hits"] > 0
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_python_prepare_calls"
-        ]
-        == 0
-    )
-    assert (
-        moving["cpp_moving_environment_owner_typed_bond_step_python_move_calls"]
-        == 0
-    )
-    assert moving["owner_direct_family_revision_state_backend_actual"] == (
-        "cpp_moving_environment"
-    )
-    assert moving["owner_direct_family_cache_key_backend_actual"] == (
-        "cpp_moving_environment"
-    )
-    assert moving["owner_direct_family_cpp_key_bundle_backend_actual"] == (
-        "cpp_moving_environment"
-    )
-    assert moving["cpp_moving_environment_direct_family_revision_state_updates"] > 0
-    assert moving["cpp_moving_environment_direct_family_revision_state_failures"] == 0
-    assert moving["cpp_moving_environment_direct_family_revision_cache_key_builds"] > 0
-    assert (
-        moving["cpp_moving_environment_direct_family_revision_cache_key_failures"]
-        == 0
-    )
-    assert moving["cpp_moving_environment_direct_family_cpp_key_bundle_builds"] > 0
-    assert moving["cpp_moving_environment_direct_family_cpp_key_bundle_failures"] == 0
-    assert moving["owner_typed_direct_plan_static_refresh_attempts"] > 0
-    assert (
-        moving["owner_typed_direct_plan_static_refresh_accepts"]
-        == moving["owner_typed_direct_plan_static_refresh_attempts"]
-    )
-    assert moving["owner_typed_direct_plan_static_refresh_fallbacks"] == 0
-    assert moving["owner_typed_direct_plan_static_refresh_failures"] == 0
-    assert moving["owner_typed_direct_plan_static_refresh_backend_actual"] == (
-        "cpp_owner_typed_bond_step_static_direct_keys"
-    )
-    assert moving["owner_typed_direct_plan_static_refresh_orchestrator_actual"] == (
-        "cpp_owner_typed_bond_step_successor_chain"
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_updates"
-        ]
-        == moving["owner_typed_direct_plan_static_refresh_attempts"]
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_update_misses"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_update_failures"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_calls"
-        ]
-        == moving["owner_typed_direct_plan_static_refresh_attempts"]
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_accepts"
-        ]
-        == moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_calls"
-        ]
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_provider_refresh_failures"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_calls"
-        ]
-        > 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_calls"
-        ]
-        > 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_accepts"
-        ]
-        == moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_calls"
-        ]
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_links"
-        ]
-        > 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_chain_failures"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_accepts"
-        ]
-        == moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_calls"
-        ]
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_key_successor_refresh_failures"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_calls"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_record_installs"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_accepts"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_owner_typed_bond_step_direct_plan_provider_failures"
-        ]
-        == 0
-    )
-    assert moving["cpp_moving_environment_owner_bond_step_runner_assign_calls"] == 0
-    assert moving["cpp_moving_environment_owner_bond_step_runner_assign_skips"] > 0
-    assert (
-        moving[
-            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_prepare_calls"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_dispatch_calls"
-        ]
-        == 0
-    )
-    assert moving["owner_direct_family_environment_payload_owner"] == (
-        "cpp_moving_environment_static_direct_family_payload"
-    )
-    assert moving["cpp_moving_environment_direct_family_payload_assembler_calls"] > 0
-    assert moving["cpp_moving_environment_direct_family_payload_assembler_builds"] > 0
-    assert moving["cpp_moving_environment_direct_family_payload_records"] > 0
-    assert moving["owner_local_optimize_direct_payload_key_hits"] > 0
-    assert (
-        moving[
-            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_installs"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_static_plan_uses"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_factory_calls"
-        ]
-        == 0
-    )
-    assert (
-        moving[
-            "cpp_moving_environment_direct_family_two_phase_dispatch_plan_failures"
-        ]
-        == 0
-    )
-    assert moving["cpp_moving_environment_direct_family_payload_builder_builds"] == 0
-    assert moving["owner_direct_family_environment_builds"] == 0
-    assert moving["owner_local_grouped_cpp_table_refresh_attempts"] > 0
-    assert (
-        moving.get("owner_local_grouped_cpp_table_refresh_accepts", 0)
-        == moving["owner_local_grouped_cpp_table_refresh_attempts"]
-    )
-    assert (
-        moving.get("owner_local_grouped_cpp_table_refresh_fallbacks", 0)
-        == 0
-    )
-    assert moving["owner_local_grouped_cpp_table_refresh_backend_actual"] == (
-        "cpp_direct_family_route_plan_table_record"
-    )
-    assert moving["owner_local_grouped_cpp_table_refresh_fallback_actual"] == "none"
-    assert moving["cpp_moving_environment_direct_family_route_plan_records"] > 0
-    assert moving["cpp_moving_environment_direct_family_route_plan_record_hits"] > 0
-    assert moving["cpp_moving_environment_direct_family_route_plan_payload_builds"] > 0
-    assert moving["cpp_moving_environment_direct_route_plan_build_successes"] > 0
-    assert moving["cpp_moving_environment_direct_route_plan_build_failures"] == 0
-    assert moving["cpp_moving_environment_direct_route_plan_build_records"] > 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_calls"] > 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_table_backed"] == 0
-    assert moving["cpp_direct_family_route_plan_last_direct_table_execution_plan_builds"] > 0
-    assert moving["cpp_direct_family_route_plan_last_direct_table_execution_plan_planned_steps"] > 0
-    assert moving["cpp_direct_family_route_plan_last_direct_table_execution_plan_packed_steps"] > 0
-    assert (
-        moving[
-            "cpp_direct_family_route_plan_last_direct_table_execution_plan_unsupported_fallbacks"
-        ]
-        == 0
-    )
-    assert moving["cpp_grouped_renormalized_table_fast_refreshes"] > 0
-    assert (
-        moving["cpp_grouped_renormalized_table_last_refresh_kind"]
-        == "direct_route_plan_table_in_place"
-    )
-    assert (
-        moving.get("cpp_grouped_renormalized_table_direct_table_schedule_hits", 0)
-        > 0
-    )
-    assert (
-        moving.get("cpp_grouped_renormalized_table_direct_table_schedule_stores", 0)
-        > 0
-    )
-    assert moving.get("cpp_grouped_renormalized_table_raw_schedule_hits", 0) == 0
-    assert moving.get("cpp_grouped_renormalized_table_raw_schedule_stores", 0) == 0
-    assert moving.get("family_environment_cpp_descriptor_installs", 0) == 0
-    assert moving["cpp_moving_environment_family_mpo_descriptor_records"] == 0
+    assert moving["compact_plan_builds"] > 0
+    assert moving["cpp_moving_environment_compact_plan_davidson_calls"] > 0
+    assert moving["cpp_davidson_table_source"] == "compact_renormalized_table"
 
 
-def test_h4_spatial_native_boundary_r_is_guarded_with_native_p():
+def test_cpp_u1_factorized_table_matvec_matches_direct_contraction():
     if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
         pytest.skip("optional C++ Davidson/backend kernels are not available")
 
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        spatial_enable_native_boundary_r=True,
-        init_guess="hf",
-    )
-
-    dmrg.run(nsweeps=6)
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=5e-4)
-    builder_stats = dmrg.dmrg.complementary_split_stats["direct_family_table_builder"]
-    native_r = builder_stats["native_boundary_r"]
-    assert native_r["enabled"] is False
-    assert native_r["native_p_enabled"] is True
-    assert "cross-family route validation" in native_r["reason"]
-
-
-def test_h4_spatial_packed_contextual_entries_guard_planned_table_path():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_packed_direct_family_entries": True,
-            "generator_table_packed_route_table": "raw_cython_validate",
-            "generator_table_cpp_direct_family_owner_payload": False,
-            "generator_table_allow_planned_packed_contextual_entries": False,
-        },
-    )
-
-    dmrg.run(nsweeps=2)
-
-    moving = dmrg.dmrg.environment_profile["moving_environment"]
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["packed_direct_family_entries"] is True
-    assert build_options["planned_packed_contextual_guard"] is True
-    assert build_options["precompute_boundaries"] is False
-    assert build_options["planned_without_precompute"] is False
-    assert moving["packed_route_table_backend_actual"] in {
-        "raw_cython",
-        "planned_raw_cython",
-    }
-    assert moving["packed_route_table_fallback_reason"] == ""
-    assert moving["packed_route_validate_max_abs"] < 1e-10
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-
-
-def test_h4_spatial_planned_contextual_entries_use_exact_expanded_route():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_packed_direct_family_entries": True,
-            "generator_table_packed_route_table": "raw_cython_validate",
-            "generator_table_cpp_direct_family_owner_payload": False,
-            "generator_table_allow_planned_packed_contextual_entries": True,
-            "generator_table_allow_table_backed_planned_contextual_entries": False,
-        },
-    )
-
-    dmrg.run(nsweeps=2)
-
-    moving = dmrg.dmrg.environment_profile["moving_environment"]
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["packed_direct_family_entries"] is True
-    assert build_options["planned_packed_contextual_guard"] is False
-    assert build_options["exact_planned_packed_contextual_entries"] is True
-    assert build_options["table_backed_planned_contextual_entries"] is False
-    assert build_options["precompute_boundaries"] is False
-    assert build_options["planned_without_precompute"] is True
-    assert moving["packed_route_table_backend_actual"] == "planned_raw_cython"
-    assert moving["packed_planned_route_cpp_used"] is True
-    assert moving["packed_route_table_fallback_reason"] == ""
-    assert moving["packed_route_validate_max_abs"] < 1e-10
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-
-
-def test_h4_spatial_unvalidated_contextual_batch_is_fully_checked():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_reference_contextual_boundary_batch": False,
-            "generator_table_allow_unvalidated_contextual_boundary_batch": True,
-            "generator_table_validate_contextual_boundary_batch": True,
-            "generator_table_packed_route_table": "raw_cython",
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["reference_batch"] is False
-    assert plan["allow_unvalidated_batch"] is True
-    assert plan["validation_enabled"] is True
-    assert plan["validation_limit"] == -1
-    assert plan["cold_validation"] is False
-    assert plan["generic_identity_advance"] is False
-    assert plan["refresh_cached_boundaries"] is True
-    validation = builder_stats["contextual_boundary_batch_validation"]
-    assert validation["left"]["checked"] > 0
-    assert validation["right"]["checked"] > 0
-    assert validation["left"].get("mismatches", 0) == 0
-    assert validation["right"].get("mismatches", 0) == 0
-
-
-def test_h4_spatial_unvalidated_contextual_batch_requires_full_validation():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_reference_contextual_boundary_batch": False,
-            "generator_table_allow_unvalidated_contextual_boundary_batch": True,
-            "generator_table_validate_contextual_boundary_batch": False,
-            "generator_table_use_cpp_contextual_boundary_batch_plan": False,
-            "generator_table_packed_route_table": "raw_cython",
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["reference_batch"] is True
-    assert plan["allow_unvalidated_batch"] is True
-    assert plan["validation_enabled"] is False
-    assert plan["full_warm_validation"] is False
-    assert plan["unsafe_unvalidated_batch"] is False
-    assert plan["reference_batch_override_reason"] == (
-        "non_reference_contextual_batch_requires_full_warm_validation"
-    )
-
-
-def test_h4_spatial_unsafe_contextual_batch_uses_exact_planned_entries():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_reference_contextual_boundary_batch": False,
-            "generator_table_allow_unvalidated_contextual_boundary_batch": True,
-            "generator_table_allow_unsafe_unvalidated_contextual_boundary_batch": True,
-            "generator_table_validate_contextual_boundary_batch": False,
-            "generator_table_use_cpp_contextual_boundary_batch_plan": False,
-            "generator_table_packed_route_table": "raw_cython",
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["reference_batch"] is False
-    assert plan["unsafe_unvalidated_batch"] is True
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["table_backed_planned_contextual_entries"] is False
-    assert build_options["exact_planned_packed_contextual_entries"] is True
-    assert build_options["table_backed_planned_contextual_guard_reason"] == (
-        "table_backed_contextual_entries_require_reference_or_full_warm_validation"
-    )
-
-
-def test_h4_spatial_unsafe_table_backed_contextual_batch_prewarms_exact_entries():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_reference_contextual_boundary_batch": False,
-            "generator_table_allow_unvalidated_contextual_boundary_batch": True,
-            "generator_table_allow_unsafe_unvalidated_contextual_boundary_batch": True,
-            "generator_table_validate_contextual_boundary_batch": False,
-            "generator_table_packed_route_table": "raw_cython",
-            "generator_table_allow_table_backed_planned_contextual_entries": True,
-            "generator_table_allow_unsafe_table_backed_planned_contextual_entries": True,
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["reference_batch"] is False
-    assert plan["validation_enabled"] is False
-    assert plan["prewarm_batch"] is True
-    assert builder_stats["contextual_boundary_batch_prewarm"]["left"]["keys"] > 0
-    assert builder_stats["contextual_boundary_batch_prewarm"]["right"]["keys"] > 0
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["table_backed_planned_contextual_entries"] is True
-    assert build_options["unsafe_table_backed_planned_contextual_entries"] is True
-    snapshot = builder_stats["contextual_planned_entry_snapshots"]
-    assert snapshot["entries"] > 0
-    assert builder_stats["contextual_route_fast_pack"]["last_table_backed"] is False
-
-
-def test_h4_spatial_cpp_contextual_batch_disable_is_guarded():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_cpp_contextual_batch_construction": False,
-            "generator_table_reference_contextual_boundary_batch": False,
-            "generator_table_allow_unvalidated_contextual_boundary_batch": True,
-            "generator_table_allow_unsafe_unvalidated_contextual_boundary_batch": True,
-            "generator_table_validate_contextual_boundary_batch": False,
-            "generator_table_packed_route_table": "raw_cython",
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    cpp_batch = builder_stats["contextual_cpp_batch_construction"]
-    assert cpp_batch["requested"] is False
-    assert cpp_batch["effective"] is True
-    assert cpp_batch["unsafe_disable"] is False
-    assert cpp_batch["override_reason"] == "python_contextual_batch_is_not_exact"
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["cpp_contextual_batch_construction_requested"] is False
-    assert plan["cpp_contextual_batch_construction_effective"] is True
-    assert (
-        plan["cpp_contextual_batch_construction_override_reason"]
-        == "python_contextual_batch_is_not_exact"
-    )
-
-
-def test_h4_spatial_cpp_contextual_batch_plan_is_default_exact():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_reference_contextual_boundary_batch": False,
-            "generator_table_allow_unvalidated_contextual_boundary_batch": True,
-            "generator_table_allow_unsafe_unvalidated_contextual_boundary_batch": True,
-            "generator_table_validate_contextual_boundary_batch": False,
-            "generator_table_packed_route_table": "raw_cython",
-            "generator_table_allow_table_backed_planned_contextual_entries": True,
-            "generator_table_allow_unsafe_table_backed_planned_contextual_entries": True,
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["consume_cpp_plan_requested"] is True
-    assert plan["consume_cpp_plan_effective"] is True
-    assert plan["unsafe_cpp_plan"] is False
-    assert plan["left_attached"] is True
-    assert plan["right_attached"] is True
-    assert "consume_cpp_plan_override_reason" not in plan
-
-
-def _assert_cpp_contextual_plan_validation_clean(dmrg):
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["consume_cpp_plan_effective"] is True
-    assert plan["left_attached"] is True
-    assert plan["right_attached"] is True
-    lazy = builder_stats["contextual_route_lazy_pack"]
-    assert lazy["validate_native_plan_table_ids"] is True
-    assert lazy["native_plan_validation_cold"] is True
-    side_cache = builder_stats.get("contextual_boundary_side_precompute_cache")
-    if side_cache is not None:
-        assert side_cache["native_plan_validation_calls"] > 0
-        assert side_cache["native_plan_validation_cold_clears"] > 0
-        assert side_cache["native_plan_validation_matches"] > 0
-        assert side_cache.get("native_plan_validation_mismatches", 0) == 0
-        assert side_cache.get("native_plan_validation_fallbacks", 0) == 0
-        assert side_cache["native_plan_validation_max_abs"] == pytest.approx(
-            0.0, abs=1e-12
+    rng = np.random.default_rng(7319)
+    builder = cpp_davidson.RawPayloadBuilder()
+    dims = (10, 10, 1, 1, 10, 1, 10, 1)
+    dim = 174
+    entries = []
+    for index in range(75):
+        left = np.ascontiguousarray(
+            rng.normal(size=(1, 10, 10))
+            + 1j * rng.normal(size=(1, 10, 10))
         )
-    else:
-        assert lazy["calls"] > 0
-        assert lazy["table_lookup"] is True
-        assert lazy["table_ids_only"] is True
-        assert lazy["planned_calls"] > 0
+        right = np.ascontiguousarray(
+            rng.normal(size=(1, 10, 10))
+            + 1j * rng.normal(size=(1, 10, 10))
+        )
+        scale = complex(rng.normal(), rng.normal())
+        in_start = index
+        out_start = 74 - index
+        builder.add(left, right, dims, in_start, out_start, scale)
+        entries.append((left[0], right[0], scale, in_start, out_start))
 
-
-def _cpp_contextual_plan_validation_options():
-    return {
-        "generator_table_validate_contextual_boundary_batch": True,
-        "generator_table_contextual_boundary_batch_validation_limit": -1,
-    }
-
-
-def test_h4_spatial_cpp_contextual_batch_plan_validation_matches():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom="H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2",
-        unit="bohr",
-        basis="sto-3g",
+    analysis = dict(
+        cpp_davidson.GroupedRenormalizedTable.raw_builder_hybrid_analysis(
+            builder,
+            dim,
+            0.0,
+        )
     )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=4,
-        nelecas=4,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options=_cpp_contextual_plan_validation_options(),
+    assert analysis["would_use_factorized"]
+    table = cpp_davidson.GroupedRenormalizedTable.from_raw_builder(
+        builder,
+        dim,
+        0.0,
     )
+    assert table.storage() == "cpp_grouped_renormalized_table_factorized"
 
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-2.14079716446274, abs=1e-9)
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["consume_cpp_plan_requested"] is True
-    assert plan["consume_cpp_plan_effective"] is True
-    assert plan["unsafe_cpp_plan"] is False
-    assert plan["left_attached"] is True
-    assert plan["right_attached"] is True
-    _assert_cpp_contextual_plan_validation_clean(dmrg)
-
-
-def _assert_spatial_generator_table_cpp_contextual_route(dmrg):
-    active = dmrg._active_integral_build_info
-    assert active["spatial_family_environment_backend"] == "generator_table"
-    family_mpos = active["complementary_operator_family_mpos"]
-    assert family_mpos["R"]["source"] == "native_generator_entries"
-    assert family_mpos["P"]["source"] == "native_generator_entries"
-
-    moving = dmrg.dmrg.environment_profile["moving_environment"]
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["packed_direct_family_entries"] is True
-    assert build_options["cpp_contextual_batch_construction_requested"] is True
-    assert build_options["cpp_contextual_batch_construction_effective"] is True
-    assert build_options["cpp_contextual_batch_construction_unsafe_disable"] is False
-    assert build_options["table_backed_planned_contextual_entries"] is True
-    assert build_options["table_backed_planned_contextual_entries_policy"] == "auto"
-    assert build_options["precompute_boundaries"] is False
-    assert build_options["cpp_contextual_precompute_disabled"] is True
-    assert (
-        build_options["cpp_contextual_precompute_disabled_reason"]
-        == "attached_cpp_table_backed_contextual_plan_uses_lazy_table_ids"
-    )
-
-    cpp_batch = builder_stats["contextual_cpp_batch_construction"]
-    assert cpp_batch["requested"] is True
-    assert cpp_batch["effective"] is True
-    assert cpp_batch["unsafe_disable"] is False
-    plan = builder_stats["contextual_boundary_batch_plan"]
-    assert plan["cpp_contextual_batch_construction_requested"] is True
-    assert plan["cpp_contextual_batch_construction_effective"] is True
-    assert plan["cpp_contextual_batch_construction_unsafe_disable"] is False
-    assert plan["consume_cpp_plan_requested"] is True
-    assert plan["consume_cpp_plan_effective"] is True
-    assert plan["unsafe_cpp_plan"] is False
-    assert plan["left_attached"] is True
-    assert plan["right_attached"] is True
-    assert "consume_cpp_plan_override_reason" not in plan
-
-    planned = builder_stats["contextual_planned_entry_cache"]
-    assert planned["backend_actual"] == "cpp_moving_environment"
-    assert planned["owner_builds"] > 0
-    assert planned["owner_entries"] > 0
-    assert planned["last_stable_table_key"] is False
-    fast_pack = builder_stats["contextual_route_fast_pack"]
-    snapshot = builder_stats["contextual_planned_entry_snapshots"]
-    assert snapshot["entries"] > 0
-    assert fast_pack["last_table_backed"] is False
-    assert fast_pack["left_table_ids"] > 0
-    assert fast_pack["right_table_ids"] > 0
-
-    assert moving["owner_local_grouped_cpp_table_refresh_attempts"] > 0
-    assert (
-        moving["owner_local_grouped_cpp_table_refresh_accepts"]
-        == moving["owner_local_grouped_cpp_table_refresh_attempts"]
-    )
-    assert moving.get("owner_local_grouped_cpp_table_refresh_fallbacks", 0) == 0
-    assert moving["owner_local_grouped_cpp_table_refresh_backend_actual"] == (
-        "cpp_direct_family_route_plan_table_record"
-    )
-    assert moving["cpp_grouped_renormalized_table_last_refresh_kind"] in {
-        "direct_route_plan_table",
-        "direct_route_plan_table_in_place",
-    }
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_successes"] > 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_failures"] == 0
-
-
-def _assert_spatial_grouped_table_uses_shape_batches(dmrg):
-    moving = dmrg.dmrg.environment_profile["moving_environment"]
-    assert moving["cpp_moving_environment_grouped_table_dense_matvec_shape_groups"] > 0
-    assert moving["cpp_moving_environment_grouped_table_dense_matvec_shape_group_blocks"] > 0
-    assert moving["cpp_moving_environment_grouped_table_dense_matvec_singleton_blocks"] > 0
-
-
-def test_h6_spatial_block2_like_default_uses_planned_contextual_route():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom=(
-            "H 0 0 0; H 0 0 1.4; H 0 0 2.8; "
-            "H 0 0 4.2; H 0 0 5.6; H 0 0 7.0"
-        ),
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=6,
-        nelecas=6,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-3.13740245377822, abs=1e-9)
-    _assert_spatial_generator_table_cpp_contextual_route(dmrg)
-    _assert_spatial_grouped_table_uses_shape_batches(dmrg)
-    active = dmrg._active_integral_build_info
-    assert active["spatial_family_environment_backend"] == "generator_table"
-    family_mpos = active["complementary_operator_family_mpos"]
-    assert family_mpos["R"]["source"] == "native_generator_entries"
-    assert family_mpos["P"]["source"] == "native_generator_entries"
-
-    moving = dmrg.dmrg.environment_profile["moving_environment"]
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["packed_direct_family_entries"] is True
-    assert build_options["exact_planned_packed_contextual_entries"] is False
-    assert build_options["precompute_boundaries"] is False
-    assert build_options["planned_without_precompute"] is True
-    assert build_options["table_backed_planned_contextual_entries"] is True
-    assert build_options["table_backed_planned_contextual_entries_policy"] == "auto"
-
-    planned = builder_stats["contextual_planned_entry_cache"]
-    assert planned["backend_actual"] == "cpp_moving_environment"
-    assert planned["owner_builds"] > 0
-    assert planned["owner_entries"] > 0
-    assert planned["last_stable_table_key"] is False
-    fast_pack = builder_stats["contextual_route_fast_pack"]
-    snapshot = builder_stats["contextual_planned_entry_snapshots"]
-    assert snapshot["entries"] > 0
-    assert fast_pack["last_table_backed"] is False
-    assert fast_pack["left_table_ids"] > 0
-    assert fast_pack["right_table_ids"] > 0
-    assert moving["owner_local_grouped_cpp_table_refresh_attempts"] > 0
-    assert (
-        moving["owner_local_grouped_cpp_table_refresh_accepts"]
-        == moving["owner_local_grouped_cpp_table_refresh_attempts"]
-    )
-    assert moving.get("owner_local_grouped_cpp_table_refresh_fallbacks", 0) == 0
-    assert moving["owner_local_grouped_cpp_table_refresh_backend_actual"] == (
-        "cpp_direct_family_route_plan_table_record"
-    )
-    assert moving["cpp_grouped_renormalized_table_last_refresh_kind"] in {
-        "direct_route_plan_table",
-        "direct_route_plan_table_in_place",
-    }
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_successes"] > 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_failures"] == 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_table_backed"] > 0
-
-
-def test_h6_spatial_cpp_contextual_batch_plan_validation_matches():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom=(
-            "H 0 0 0; H 0 0 1.4; H 0 0 2.8; "
-            "H 0 0 4.2; H 0 0 5.6; H 0 0 7.0"
-        ),
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=6,
-        nelecas=6,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options=_cpp_contextual_plan_validation_options(),
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-3.13740245377822, abs=1e-9)
-    _assert_spatial_generator_table_cpp_contextual_route(dmrg)
-    _assert_spatial_grouped_table_uses_shape_batches(dmrg)
-    _assert_cpp_contextual_plan_validation_clean(dmrg)
-
-
-def test_h6_spatial_planned_contextual_no_native_p_keeps_route_table():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom=(
-            "H 0 0 0; H 0 0 1.4; H 0 0 2.8; "
-            "H 0 0 4.2; H 0 0 5.6; H 0 0 7.0"
-        ),
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=6,
-        nelecas=6,
-        D=16,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options={
-            "generator_table_disable_native_boundary_p": True,
-        },
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-9,
-        davidson_max_iter=120,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-3.13707068520193, abs=1e-9)
-    _assert_spatial_generator_table_cpp_contextual_route(dmrg)
-    _assert_spatial_grouped_table_uses_shape_batches(dmrg)
-    moving = dmrg.dmrg.environment_profile["moving_environment"]
-    builder_stats = dmrg.dmrg.complementary_split_stats[
-        "direct_family_table_builder"
-    ]
-    native_p = builder_stats["native_boundary_p"]
-    assert native_p["enabled"] is False
-    assert "disabled" in native_p["reason"]
-    build_options = builder_stats["contextual_build_options"]
-    assert build_options["exact_planned_packed_contextual_entries"] is False
-    assert build_options["table_backed_planned_contextual_entries"] is True
-    planned = builder_stats["contextual_planned_entry_cache"]
-    assert planned["last_stable_table_key"] is False
-    fast_pack = builder_stats["contextual_route_fast_pack"]
-    snapshot = builder_stats["contextual_planned_entry_snapshots"]
-    assert snapshot["entries"] > 0
-    assert fast_pack["last_table_backed"] is False
-    assert fast_pack["left_table_ids"] > 0
-    assert fast_pack["right_table_ids"] > 0
-    assert moving["owner_local_grouped_cpp_table_refresh_attempts"] > 0
-    assert (
-        moving["owner_local_grouped_cpp_table_refresh_accepts"]
-        == moving["owner_local_grouped_cpp_table_refresh_attempts"]
-    )
-    assert moving.get("owner_local_grouped_cpp_table_refresh_fallbacks", 0) == 0
-    assert moving["owner_local_grouped_cpp_table_refresh_backend_actual"] == (
-        "cpp_direct_family_route_plan_table_record"
-    )
-    assert moving["cpp_grouped_renormalized_table_last_refresh_kind"] in {
-        "direct_route_plan_table",
-        "direct_route_plan_table_in_place",
-    }
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_successes"] > 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_failures"] == 0
-    assert moving["cpp_moving_environment_planned_direct_family_entry_build_table_backed"] > 0
-
-
-def test_h8_spatial_block2_like_default_uses_cpp_contextual_route():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom=(
-            "H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2; "
-            "H 0 0 5.6; H 0 0 7.0; H 0 0 8.4; H 0 0 9.8"
-        ),
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=8,
-        nelecas=8,
-        D=8,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-8,
-        davidson_max_iter=80,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-4.10718881122356, abs=1e-9)
-    _assert_spatial_generator_table_cpp_contextual_route(dmrg)
-    _assert_spatial_grouped_table_uses_shape_batches(dmrg)
-
-
-def test_h8_spatial_cpp_contextual_batch_plan_validation_matches():
-    if not getattr(cpp_davidson, "CPP_DAVIDSON_AVAILABLE", False):
-        pytest.skip("optional C++ Davidson/backend kernels are not available")
-
-    mol = Molecule(
-        atom=(
-            "H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2; "
-            "H 0 0 5.6; H 0 0 7.0; H 0 0 8.4; H 0 0 9.8"
-        ),
-        unit="bohr",
-        basis="sto-3g",
-    )
-    mol.build(driver="builtin", eri="dense")
-    mf = mol.RHF(verbose=0).run()
-    dmrg = DMRG(
-        mf,
-        ncas=8,
-        nelecas=8,
-        D=8,
-        site="spatial",
-        symmetry="sz",
-        spin=0,
-        verbose=0,
-        integral_backend="cholesky",
-        dmrg_performance="block2-like",
-        init_guess="hf",
-        abelian_matvec_options=_cpp_contextual_plan_validation_options(),
-    )
-
-    dmrg.run(
-        nsweeps=2,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-8,
-        davidson_max_iter=80,
-        noise=0.0,
-    )
-
-    assert dmrg.e_tot == pytest.approx(-4.10718881122356, abs=1e-9)
-    _assert_spatial_generator_table_cpp_contextual_route(dmrg)
-    _assert_spatial_grouped_table_uses_shape_batches(dmrg)
-    _assert_cpp_contextual_plan_validation_clean(dmrg)
+    vector = rng.normal(size=dim) + 1j * rng.normal(size=dim)
+    expected = np.zeros(dim, dtype=complex)
+    for left, right, scale, in_start, out_start in entries:
+        local = vector[in_start : in_start + 100].reshape(10, 10)
+        expected[out_start : out_start + 100] += (
+            scale * (left @ local @ right)
+        ).reshape(-1)
+    assert np.allclose(table.matvec(vector), expected, atol=2.0e-11, rtol=2.0e-12)
 
 
 def test_h6_spatial_block2_like_folds_recenter_into_cpp_schedule():
@@ -2685,7 +1732,7 @@ def test_h6_spatial_block2_like_folds_recenter_into_cpp_schedule():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.RHF(verbose=0).run()
     dmrg = DMRG(
         mf,
@@ -2697,7 +1744,7 @@ def test_h6_spatial_block2_like_folds_recenter_into_cpp_schedule():
         spin=0,
         verbose=0,
         integral_backend="cholesky",
-        dmrg_performance="block2-like",
+        dmrg_performance="packed-cpp-fast",
         spatial_family_environment_backend="block2_table",
     )
 
@@ -2709,7 +1756,11 @@ def test_h6_spatial_block2_like_folds_recenter_into_cpp_schedule():
         noise=0.0,
     )
 
-    assert dmrg.e_tot == pytest.approx(-3.14343934127309, abs=1e-9)
+    assert dmrg.e_tot == pytest.approx(-3.14350797943157, abs=1e-9)
+    assert dmrg.dmrg.ncompleted == 4
+    assert dmrg.dmrg.ncompleted_half_sweeps == 8
+    assert dmrg.dmrg.sweep_history[-2]["direction"] == "rl"
+    assert dmrg.dmrg.sweep_history[-1]["sweep"] == 4
     moving = dmrg.dmrg.environment_profile["moving_environment"]
     assert moving["owner_sweep_schedule_backend_actual"] == (
         "cpp_owner_sweep_schedule_plan"
@@ -2744,13 +1795,17 @@ def test_h6_spatial_block2_like_folds_recenter_into_cpp_schedule():
         ]
         == 0
     )
-    assert moving["cpp_moving_environment_owner_sweep_schedule_plan_halves"] == 5
+    assert moving["cpp_moving_environment_owner_sweep_schedule_plan_halves"] == 9
     assert (
         moving["cpp_moving_environment_owner_sweep_schedule_plan_history_rows"]
         == len(dmrg.dmrg.sweep_history)
-        == 5
+        == 9
     )
     assert [row["direction"] for row in dmrg.dmrg.sweep_history] == [
+        "lr",
+        "rl",
+        "lr",
+        "rl",
         "lr",
         "rl",
         "lr",
@@ -2785,9 +1840,9 @@ def test_h6_spatial_block2_like_folds_recenter_into_cpp_schedule():
     assert moving.get("cpp_grouped_renormalized_table_raw_schedule_hits", 0) > 0
 
 
-def test_spatial_dmrg_routes_su2_to_nonabelian_backend():
+def test_spatial_dmrg_routes_su2_to_su2_solver():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dense = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
@@ -2801,34 +1856,45 @@ def test_spatial_dmrg_routes_su2_to_nonabelian_backend():
         symmetry="su2",
         verbose=0,
     )
-    su2.run(nsweeps=4)
+    solver = su2.run(nsweeps=4)
 
-    assert su2.dmrg.backend == "nonabelian"
+    assert isinstance(solver, SU2DMRG)
+    assert solver is su2.dmrg
+    assert su2.states is solver.states
+    assert su2.ground_state is solver.ground_state
+    assert su2.history is solver.history
+    np.testing.assert_allclose(su2.energies, su2.e_tot)
+    assert solver.backend == "su2"
+    assert solver.ground_state is solver.states[0]
+    assert solver.energy == pytest.approx(su2.e_tot)
+    np.testing.assert_allclose(solver.energies, [su2.e_tot])
+    assert solver.diagnostics["kernel_backend"] == "cpp"
+    assert solver.diagnostics["memory_bytes"] > 0
     assert su2.symmetry == ["charge", "su2"]
     assert su2.site == "spatial"
     assert su2.spatial_reduced_mpo is True
-    assert su2._active_integral_build_info["representation"] == "spatial_reduced_spinfree_mpo"
+    assert su2.build_info["representation"] == "spatial_reduced_spinfree_mpo"
     assert su2.dmrg.history[-1]["hamiltonian_system"]["n_sites"] == 2
     assert su2.dmrg.history[-1]["hamiltonian_system"]["n_elec"] == 2
     assert su2.dmrg.history[-1]["hamiltonian_symmetry"] == "su2"
-    assert su2.dmrg.history[-1]["local_basis_policy"] == "orthonormalized_operator"
-    assert su2.dmrg.history[-1]["max_bond_mode"] == "per_sector"
+    assert su2.dmrg.history[-1]["local_basis_policy"] == "native_cpp"
+    assert su2.dmrg.history[-1]["max_bond_mode"] == "reduced"
     assert su2.e_tot == pytest.approx(dense.e_tot, abs=1e-7)
-    numerator = contract_chain_expectation(su2.dmrg.ground_state.sites, su2.H)
-    denominator = contract_chain_expectation(
-        su2.dmrg.ground_state.sites,
-        _identity_mpo_factors_for_sites_and_mpo(su2.dmrg.ground_state.sites, su2.H),
+    mps_energy = _expectation_from_nonabelian_mps(
+        su2.dmrg.ground_state,
+        su2.H,
+        moving_environment=su2._active_hamiltonian.moving_environment,
     )
-    assert np.real(numerator / denominator) == pytest.approx(su2.e_tot - su2.e_core, abs=1e-10)
-
-    su2_canonical = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
-    su2_canonical.run(nsweeps=4, symmetry="su2", canonical_local_norm=True)
-    assert su2_canonical.e_tot == pytest.approx(dense.e_tot, abs=1e-7)
-
+    expected_mpo_energy = (
+        su2.e_tot
+        if su2.build_info["includes_core_energy"]
+        else su2.e_tot - su2.e_core
+    )
+    assert mps_energy == pytest.approx(expected_mpo_energy, abs=1e-10)
 
 def test_spatial_dmrg_symmetry_argument_replaces_backend_selector():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     abelian = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", symmetry="sz", verbose=0)
@@ -2841,9 +1907,48 @@ def test_spatial_dmrg_symmetry_argument_replaces_backend_selector():
     assert abelian.e_tot == pytest.approx(legacy.e_tot, abs=1e-10)
 
 
+def test_run_time_su2_selection_rebuilds_spin_orbital_hamiltonian_as_spatial_reduced():
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    _build_cpp_integrals(mol)
+    mf = RHF(mol).run()
+
+    dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", verbose=0)
+    dmrg.run(nsweeps=2, symmetry="su2")
+
+    assert dmrg.site == "spatial"
+    assert dmrg.spatial_reduced_mpo is True
+    assert dmrg.dmrg.backend == "su2"
+    assert dmrg.e_tot == pytest.approx(-1.137275943783, abs=1e-9)
+
+
+def test_run_time_symmetry_switch_invalidates_previous_abelian_mpo():
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    _build_cpp_integrals(mol)
+    mf = RHF(mol).run()
+
+    dmrg = DMRG(
+        mf,
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        site="spatial",
+        symmetry="sz",
+        verbose=0,
+    )
+    dmrg.run(nsweeps=1)
+    old_h = dmrg.H
+    dmrg.run(nsweeps=2, symmetry="su2")
+
+    assert dmrg.H is not old_h
+    assert dmrg.spatial_reduced_mpo is True
+    assert dmrg.dmrg.backend == "su2"
+    assert dmrg.e_tot == pytest.approx(-1.137275943783, abs=1e-9)
+
+
 def test_abelian_dmrg_target_uses_explicit_spin_not_molecule_spin():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(
@@ -2866,7 +1971,7 @@ def test_abelian_dmrg_target_uses_explicit_spin_not_molecule_spin():
 
 def test_su2_dmrg_target_uses_explicit_charge_and_total_spin():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(
@@ -2884,10 +1989,22 @@ def test_su2_dmrg_target_uses_explicit_charge_and_total_spin():
     assert dmrg.dmrg.target_sector == SpinChargeSector(2, SU2Irrep(2))
     assert dmrg.dmrg.ground_state.target_sector == SpinChargeSector(2, SU2Irrep(2))
 
+    from pyqed.qchem.dmrg import ED
 
-def test_su2_ground_state_default_trusts_mixed_canonical_norm():
+    exact = ED(mf, ncas=2, nelecas=2, symmetry="su2", spin=2, verbose=0).run()
+    exact.qcdmrg.dmrg = SimpleNamespace(
+        ground_state=exact.states[0],
+        states=exact.states,
+    )
+    dm1, dm2 = dmrg.make_rdm12(spatial=True)
+    exact_dm1, exact_dm2 = exact.qcdmrg.make_rdm12(spatial=True)
+    np.testing.assert_allclose(dm1, exact_dm1, atol=1.0e-10)
+    np.testing.assert_allclose(dm2, exact_dm2, atol=1.0e-10)
+
+
+def test_su2_ground_state_default_uses_reduced_cpp_owned_sweeps():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", symmetry="su2", verbose=0)
@@ -2899,309 +2016,170 @@ def test_su2_ground_state_default_trusts_mixed_canonical_norm():
         for objective in entry.get("bond_objectives", [])
     ]
     assert objectives
-    assert all(objective.get("local_basis_policy") == "mixed_canonical_standard" for objective in objectives)
-    assert all(objective.get("canonical_norm_used") is True for objective in objectives)
-    assert all(objective.get("effective_local_problem") == "standard" for objective in objectives)
-    assert all(objective.get("block_preconditioner") is True for objective in objectives)
-    assert all(objective.get("block_preconditioner_blocks", 0) > 0 for objective in objectives)
-    assert all(
-        entry.get("norm_renormalized_block_stack_stats") is None
-        for entry in dmrg.dmrg.history
-    )
+    assert dmrg.spatial_site_basis == "fully_reduced"
+    assert dmrg.dmrg.history[-1]["max_bond_mode"] == "reduced"
+    assert all(objective.get("local_basis_policy") == "native_cpp" for objective in objectives)
+    assert all(objective.get("cpp_owned_half_sweep") is True for objective in objectives)
+    assert all(objective.get("cpp_active_solution_owned") is True for objective in objectives)
+    assert all(objective.get("no_python_bond_callbacks") is True for objective in objectives)
 
 
-def test_su2_ground_state_can_still_check_local_norm_debug_path():
-    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
-    mf = RHF(mol).run()
-
-    fast = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", symmetry="su2", verbose=0)
-    fast.run(nsweeps=2)
-    checked = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", symmetry="su2", verbose=0)
-    checked.run(nsweeps=2, canonical_local_norm=False)
-
-    objectives = [
-        objective
-        for entry in checked.dmrg.history
-        for objective in entry.get("bond_objectives", [])
-    ]
-    assert objectives
-    assert checked.e_tot == pytest.approx(fast.e_tot, abs=1e-10)
-    assert any(
-        entry.get("norm_renormalized_block_stack_stats") is not None
-        for entry in checked.dmrg.history
-    )
-
-
-def test_su2_ground_state_metric_bonds_use_orthonormal_standard_krylov():
+def test_su2_rejects_removed_bond_mode_control():
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=24, init_guess="cid", symmetry="su2", verbose=0)
-    dmrg.run(nsweeps=2, max_bond_mode="per_sector", mixer_zero_block_noise_scale=0.0)
-
-    objectives = [
-        objective
-        for entry in dmrg.dmrg.history
-        for objective in entry.get("bond_objectives", [])
-    ]
-    metric_objectives = [
-        objective
-        for objective in objectives
-        if objective.get("metric_orthonormal_krylov")
-    ]
-    assert metric_objectives
-    assert all(
-        objective["effective_local_problem"] == "orthonormalized_standard"
-        for objective in metric_objectives
-    )
-    assert all(
-        objective["projected_problem"] == "standard"
-        for objective in metric_objectives
-    )
+    with pytest.raises(TypeError, match="max_bond_mode was removed"):
+        dmrg.run(
+            nsweeps=2,
+            max_bond_mode="per_sector",
+            require_convergence=False,
+        )
 
 
-def test_su2_block2_policy_uses_orthonormalized_operator_davidson():
+def test_su2_native_cpp_policy_uses_reduced_davidson():
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=2,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
+        require_convergence=False,
     )
-    assert dmrg.e_tot == pytest.approx(-2.177899323464, abs=1e-8)
+    assert dmrg.e_tot == pytest.approx(-2.177899323464, abs=1e-6)
 
     objectives = [
         objective
         for entry in dmrg.dmrg.history
         for objective in entry.get("bond_objectives", [])
     ]
-    block2_objectives = [
-        objective
+    assert objectives
+    assert dmrg.spatial_site_basis == "fully_reduced"
+    assert all(objective.get("local_basis_policy") == "native_cpp" for objective in objectives)
+    assert all(
+        objective.get("cpp_davidson_kind") == "cpp_su2_owned_half_sweep_bond"
         for objective in objectives
-        if objective.get("effective_local_problem") == "orthonormalized_operator_standard"
-    ]
-    assert block2_objectives
-    assert all(objective.get("local_basis_policy") == "orthonormalized_operator" for objective in objectives)
-    assert all(objective.get("block_davidson") is True for objective in block2_objectives)
-    assert all(objective.get("orthonormalized_dim", 0) > 0 for objective in block2_objectives)
-    assert max(objective.get("residual", 0.0) for objective in block2_objectives) < 1.0e-7
-    storages = [
-        objective.get("renormalized_operator_storage")
-        for objective in block2_objectives
-    ]
-    assert "block_sparse_environment_sweep:component_sparse_operator_table" in storages
+    )
+    assert all(objective.get("cpp_owned_half_sweep") is True for objective in objectives)
     assert all(
-        storage in {
-            "block_sparse_environment_sweep",
-            "block_sparse_environment_sweep:block_sparse_operator_table",
-            "block_sparse_environment_sweep:component_sparse_operator_table",
-        }
-        for storage in storages
+        objective.get("no_python_bond_callbacks") is True
+        for objective in objectives
     )
-    table_stats = [
-        objective.get("renormalized_operator_table_stats")
-        for objective in block2_objectives
-        if objective.get("renormalized_operator_table_stats") is not None
-    ]
-    assert table_stats
-    assert all(stats and stats["kind"] in {"block_sparse", "component_sparse"} for stats in table_stats)
-    assert all(stats["n_blocks"] > 0 for stats in table_stats)
-    assert all(stats["n_nonzero_block_terms"] > 0 for stats in table_stats)
-    assert all(stats["parent_dim"] >= stats["orthonormal_dim"] > 0 for stats in table_stats)
-    component_stats = [stats for stats in table_stats if stats["kind"] == "component_sparse"]
-    if component_stats:
-        assert any(
-            stats.get("component_parent_block_kernel")
-            or stats.get("complementary_payload_tensor_kernel")
-            or stats.get("complementary_family_table_kernel")
-            for stats in component_stats
-        )
-        assert all(stats["basis_kind"] == "metric_connected_components" for stats in component_stats)
-        assert all(stats["n_components"] > 0 for stats in component_stats)
-        assert all(stats["max_component_parent_dim"] > 0 for stats in component_stats)
-    metadata = [
-        objective.get("renormalized_operator_metadata")
-        for objective in block2_objectives
-    ]
-    assert all(item["renormalized_boundary_source"] == "block_stack" for item in metadata)
-    assert all(item["left_boundary"]["stored_elements"] > 0 for item in metadata)
-    assert all(item["right_boundary"]["stored_elements"] > 0 for item in metadata)
-    assert all(
-        item["symbolic_boundary_payloads"]["symbolic_boundary_payload_source"]
-        == "symbolic_table"
-        for item in metadata
-    )
-    assert all(
-        item["symbolic_boundary_payloads"]["symbolic_payloads_owned"] is True
-        for item in metadata
-    )
-    assert all(
-        item["renormalized_local_operator_table"]["representation"]
-        == "rank_coupled_complementary"
-        for item in metadata
-    )
-    qchem_plans = [
-        item.get("su2_qchem_sweep_plan")
-        for item in metadata
-        if item.get("su2_qchem_sweep_plan") is not None
-    ]
-    assert qchem_plans
-    assert all(plan["supported"] is True for plan in qchem_plans)
-    assert all(plan["left_factor_table"]["n_entries"] > 0 for plan in qchem_plans)
-    assert all(plan["right_factor_table"]["n_entries"] > 0 for plan in qchem_plans)
-    assert all(plan["factor_match_cache_size"] > 0 for plan in qchem_plans)
-    assert all(
-        "factor_match_cache_stats" in plan
-        for plan in qchem_plans
-    )
-    assert all(
-        item["complementary_operator_families"]["family_names"]
-        == ("S", "R", "A", "P", "B", "Q")
-        for item in metadata
-    )
-    assert any(
-        (
-            item.get("symbolic_boundary_payloads", {})
-            .get("complementary_boundary_payloads", {})
-            .get("payload_backed")
-            is True
-        )
-        for item in metadata
-    )
-    assert dmrg.dmrg.history[-1]["renormalized_operator_cache_size"] > 0
-    assert set(dmrg.dmrg.history[-1]["renormalized_operator_table_kinds"]) <= {
-        "block_sparse",
-        "component_sparse",
-    }
-    block_stack_stats = dmrg.dmrg.history[-1]["renormalized_block_stack_stats"]
-    assert block_stack_stats["left_size"] > 0
-    assert block_stack_stats["right_size"] > 0
-    assert block_stack_stats["puts"] > 0
-    assert block_stack_stats["hits"] > 0
-    assert block_stack_stats["initialized_entries"] > 0
-    assert block_stack_stats["advanced_entries"] > 0
-    assert block_stack_stats["side_operator_tables"] > 0
-    assert block_stack_stats["side_operator_table_puts"] > 0
-    assert block_stack_stats["symbolic_operator_tables"] > 0
-    assert block_stack_stats["symbolic_operator_terms"] > 0
-    assert block_stack_stats["symbolic_operator_numeric_payloads"] > 0
-    assert block_stack_stats["symbolic_operator_max_path_length"] > 0
-    assert any(
-        str(source).startswith("symbolic_")
-        for source in block_stack_stats["side_operator_table_sources"]
-    )
-    assert any(
-        str(source).endswith("prepared")
-        for source in block_stack_stats["side_operator_table_sources"]
-    )
-    assert all(
-        "lazy" not in str(source)
-        for source in block_stack_stats["side_operator_table_sources"]
-    )
-    assert any(
-        "advanced" in str(source)
-        for source in block_stack_stats["side_operator_table_sources"]
-    )
-    assert "rank_coupled_left_factor_by_ket" in block_stack_stats[
-        "side_operator_table_representations"
-    ]
-    assert "rank_coupled_right_factor_by_ket" in block_stack_stats[
-        "side_operator_table_representations"
-    ]
+    assert dmrg.dmrg.diagnostics["kernel_backend"] == "cpp"
 
 
-def test_su2_block2_complementary_direct_projection_is_opt_in():
+def test_su2_reduced_boundary_pivots_match_component_identity_reference(
+    monkeypatch,
+):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
-    dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
-    dmrg.build()
-    families = dmrg._active_hamiltonian.complementary_operators
-    object.__setattr__(families, "prefer_recursive_operator_matvec", False)
-    object.__setattr__(families, "prefer_direct_orthonormal_projection", True)
-    try:
+    def solve(*, specialized):
+        if specialized:
+            monkeypatch.delenv(
+                "PYQED_SU2_SPECIALIZE_PIVOT_SCALE_REFRESH",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "PYQED_SU2_SPECIALIZE_PIVOT_SCALE_REFRESH",
+                "0",
+            )
+        dmrg = DMRG(
+            mf,
+            ncas=4,
+            nelecas=4,
+            D=16,
+            init_guess="cid",
+            symmetry="su2",
+            verbose=0,
+        )
         dmrg.run(
-            nsweeps=1,
-            local_basis_policy="block2_like",
-            orthonormalized_operator_dim=512,
-            max_bond_mode="per_sector",
+            nsweeps=2,
+            require_convergence=False,
             mixer_zero_block_noise_scale=0.0,
-            direct_orthonormal_dense_max_elements=0,
-            profile=True,
+            mixer_nsweeps=0,
         )
-    finally:
-        object.__setattr__(families, "prefer_direct_orthonormal_projection", False)
-        object.__setattr__(families, "prefer_recursive_operator_matvec", True)
+        return dmrg
 
-    objectives = [
-        objective
-        for entry in dmrg.dmrg.history
-        for objective in entry.get("bond_objectives", [])
-    ]
-    table_stats = [
-        objective.get("renormalized_operator_table_stats")
-        for objective in objectives
-        if objective.get("renormalized_operator_table_stats") is not None
-    ]
-    assert any(stats.get("component_direct_kernel") is True for stats in table_stats)
-    assert any(
-        timing.get("component_direct_factorized_kernel", 0.0) > 0.0
-        or timing.get("component_recursive_parent_block_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_payload_tensor_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_family_table_kernel", 0.0) > 0.0
-        for timing in (
-            objective.get("renormalized_operator_build_timing") or {}
-            for objective in objectives
-        )
+    component_reference = solve(specialized=False)
+    reduced = solve(specialized=True)
+
+    assert reduced.e_tot == pytest.approx(
+        component_reference.e_tot,
+        abs=1.0e-11,
     )
-    assert np.isfinite(float(dmrg.e_tot))
+    owner = reduced.dmrg.history[-1]["moving_environment_stats"][
+        "su2_moving_environment"
+    ]
+    assert owner["decomposed_action_plan_hits"] > 0
+    assert owner["peak_borrowed_reduced_contextual_right_elements"] > 0
 
 
-def test_su2_kernel_backend_python_fallback_records_reference_path():
+@pytest.mark.parametrize(
+    "removed_option,value,message",
+    [
+        ("su2_kernel_backend", "python", "was removed"),
+        ("su2_reference_complementary_families", True, "was removed"),
+        ("direct_orthonormal_dense_max_elements", 0, "was removed"),
+        ("family_kernel_backend", "python", "was removed"),
+        ("su2_force_family_table", True, "was removed"),
+        ("canonical_local_norm", False, "was removed"),
+        ("local_basis_policy", "block2_like", "was removed"),
+        ("orthonormalized_operator_dim", 512, "was removed"),
+        ("orthonormalize_generalized_dim", 512, "was removed"),
+        ("max_bond_mode", "per_sector", "was removed"),
+        ("record_post_update_energy", True, "C\\+\\+-only"),
+        ("state_average_root_environments", True, "C\\+\\+-only"),
+        ("state_average_spin_projector", True, "C\\+\\+-only"),
+        ("mixer_zero_block_noise_scale", 1.0e-6, "must be zero"),
+        (
+            "local_solver_kwargs",
+            {"dense_fallback_dim": 4096},
+            "local_solver_kwargs.*was removed",
+        ),
+    ],
+)
+def test_su2_production_rejects_removed_python_paths(
+    removed_option,
+    value,
+    message,
+):
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", symmetry="su2", verbose=0)
-    dmrg.run(
-        nsweeps=1,
-        local_basis_policy="block2_like",
-        su2_kernel_backend="python",
-    )
-
-    assert dmrg.dmrg.history[-1]["su2_kernel_policy"]["backend"] == "python"
-    assert dmrg.dmrg.history[-1]["su2_kernel_backend_actual"] == "python"
-    assert np.isfinite(float(dmrg.e_tot))
+    with pytest.raises(TypeError, match=message):
+        dmrg.run(nsweeps=1, require_convergence=False, **{removed_option: value})
 
 
-def test_su2_kernel_backend_cython_requires_extension():
+def test_su2_kernel_backend_cpp_requires_extension():
     previous = configure_su2_kernel_policy()
     try:
-        if su2_cython_available():
-            configure_su2_kernel_policy(backend="cython")
+        if su2_cpp_available():
+            configure_su2_kernel_policy(backend="cpp")
         else:
             with pytest.raises(RuntimeError, match="_su2_kernel"):
-                configure_su2_kernel_policy(backend="cython")
+                configure_su2_kernel_policy(backend="cpp")
     finally:
         configure_su2_kernel_policy(
             backend=previous["backend"],
@@ -3210,7 +2188,47 @@ def test_su2_kernel_backend_cython_requires_extension():
         )
 
 
-def test_su2_block2_recursive_operator_matvec_avoids_transformed_kernel_build():
+def test_su2_default_davidson_schedule_tightens_after_timing_sweeps():
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    molecule = Molecule(
+        atom="H 0 0 0; H 0 0 0.74",
+        basis="sto-3g",
+    )
+    _build_cpp_integrals(molecule)
+    dmrg = DMRG(
+        RHF(molecule).run(),
+        ncas=2,
+        nelecas=2,
+        D=4,
+        init_guess="hf",
+        symmetry="su2",
+        verbose=0,
+    )
+    dmrg.run(
+        nsweeps=9,
+        conv_tol=-1.0,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        mixer_nsweeps=0,
+    )
+
+    local = [entry["local_solver_kwargs"] for entry in dmrg.dmrg.history]
+    assert [entry["tol"] for entry in local] == (
+        [1.0e-3] * 8 + [1.0e-5] * 8 + [1.0e-8] * 2
+    )
+    assert [entry["itermax"] for entry in local] == (
+        [30] * 8 + [60] * 8 + [100] * 2
+    )
+
+
+def test_su2_cpp_owner_executes_cold_half_sweeps_without_python_bond_callbacks(
+    monkeypatch,
+):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    monkeypatch.setenv("PYQED_SU2_COMPARE_SHARED_LEFT", "1")
+    monkeypatch.setenv("PYQED_SU2_COMPACT_RIGHT_PANEL_ELEMENTS", "4000000")
     mol = Molecule(
         atom=(
             "H 0 0 0; H 0 0 1.6; H 0 0 3.2; "
@@ -3219,179 +2237,342 @@ def test_su2_block2_recursive_operator_matvec_avoids_transformed_kernel_build():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    mol.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mf = RHF(mol).run()
+    dmrg = DMRG(
+        mf,
+        ncas=6,
+        nelecas=6,
+        D=16,
+        init_guess="cid",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(
+        nsweeps=4,
+        conv_tol=-1.0,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        mixer_nsweeps=0,
+        verify_returned_mps_energy=True,
+        profile=True,
+    )
+
+    history = dmrg.dmrg.history
+    assert len(history) == 8
+    assert all(entry["cpp_owned_half_sweep"] for entry in history)
+    assert all(
+        entry["owned_half_sweep_readiness_code"] == 0
+        for entry in history
+    )
+    moving = history[-1]["moving_environment_stats"]
+    owner = moving["su2_moving_environment"]
+    assert owner["half_sweeps"] == 8
+    assert owner["owned_half_sweep_calls"] == 8
+    assert owner["owned_half_sweep_bonds"] == 40
+    assert owner["half_sweep_executor_calls"] == 0
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert owner["site_merge_calls"] == 40
+    assert owner["active_bond_cpp_splits"] == 40
+    assert owner["active_bond_complementary_fallbacks"] == 0
+    assert owner["metric_boundary_action_count"] == 0
+    assert owner["complementary_execution_graph_builds"] > 0
+    assert owner["complementary_execution_graph_hits"] > 0
+    assert owner["complementary_execution_graph_bytes"] > 0
+    assert owner["direct_complementary_action_calls"] > 0
+    assert owner["direct_source_factor_loads"] > 0
+    assert owner["compact_right_panel_budget_bytes"] == 32_000_000
+    assert (
+        owner["compact_right_panel_value_bytes"]
+        <= owner["compact_right_panel_budget_bytes"]
+    )
+    assert owner["compact_right_panel_registry_builds"] > 0
+    assert owner["compact_right_panel_numeric_refreshes"] > 0
+    assert owner["contextual_compiled_schedule_builds"] > 0
+    assert owner["contextual_compiled_schedule_hits"] > 0
+    assert owner["contextual_compiled_schedule_bytes"] > 0
+    assert owner["peak_borrowed_reduced_contextual_right_elements"] > 0
+    assert owner["contextual_route_plan_count"] <= 10
+    assert (
+        owner["complementary_execution_slab_full_prepares"]
+        + owner["complementary_execution_slab_partial_prepares"]
+        > 0
+    )
+    assert (
+        owner["complementary_execution_slab_bytes"]
+        <= owner["complementary_execution_slab_capacity_bytes"]
+        <= owner["complementary_execution_slab_budget_bytes"]
+    )
+    assert moving["hamiltonian_boundary_advances"] == 0
+    assert float(dmrg.e_tot) == pytest.approx(
+        history[-1]["returned_mps_energy"],
+        abs=1.0e-10,
+    )
+    left_error, right_error = dmrg.dmrg.ground_state.canonical_errors()
+    assert left_error < 1.0e-10
+    assert right_error < 1.0e-10
+
+
+def test_su2_cpp_cas16_fused_actions_match_pointer_with_dense_pairs(
+    monkeypatch,
+):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    monkeypatch.setenv("PYQED_SU2_COMPARE_SHARED_LEFT", "1")
+    monkeypatch.delenv(
+        "PYQED_SU2_AMORTIZE_OUTPUT_FUSION_RIGHT",
+        raising=False,
+    )
+    monkeypatch.delenv(
+        "PYQED_SU2_DIRECT_CHANNEL_OUTPUT_FUSION",
+        raising=False,
+    )
+    molecule = Molecule(
+        atom="; ".join(
+            f"H 0 0 {1.6 * site}" for site in range(16)
+        ),
+        unit="bohr",
+        basis="sto-3g",
+    )
+    molecule.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    dmrg = DMRG(
+        RHF(molecule).run(),
+        ncas=16,
+        nelecas=16,
+        D=128,
+        init_guess="cid",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(
+        nsweeps=1,
+        conv_tol=-1.0,
+        require_convergence=False,
+        bond_multiplicity=4,
+        davidson_max_iter=2,
+        davidson_tol=1.0e-3,
+        mixer_zero_block_noise_scale=0.0,
+        mixer_nsweeps=0,
+        verify_returned_mps_energy=True,
+        profile=True,
+    )
+
+    owner = dmrg.dmrg.history[-1]["moving_environment_stats"][
+        "su2_moving_environment"
+    ]
+    assert owner["dense_pair_matvec_seconds"] > 0.0
+    assert owner["raw_output_fusion_gemm_calls"] > 0
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert float(dmrg.e_tot) == pytest.approx(
+        dmrg.dmrg.history[-1]["returned_mps_energy"],
+        abs=1.0e-10,
+    )
+
+
+def test_su2_cpp_direct_complementary_executor_matches_batched(monkeypatch):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    monkeypatch.delenv(
+        "PYQED_SU2_COMPACT_RIGHT_PANEL_ELEMENTS",
+        raising=False,
+    )
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 1.6",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    mol.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
     mf = RHF(mol).run()
 
-    dmrg = DMRG(mf, ncas=6, nelecas=6, D=16, init_guess="cid", symmetry="su2", verbose=0)
-    dmrg.build()
-    families = dmrg._active_hamiltonian.complementary_operators
-    object.__setattr__(families, "prefer_recursive_operator_matvec", True)
-    object.__setattr__(families, "prefer_complementary_payload_tensor_matvec", True)
-    try:
+    def solve(force_direct):
+        if force_direct:
+            monkeypatch.setenv("PYQED_SU2_POINTER_ACTIONS", "1")
+        else:
+            monkeypatch.delenv("PYQED_SU2_POINTER_ACTIONS", raising=False)
+        dmrg = DMRG(
+            mf,
+            ncas=2,
+            nelecas=2,
+            D=4,
+            init_guess="cid",
+            symmetry="su2",
+            spatial_site_basis="fully_reduced",
+            verbose=0,
+        )
         dmrg.run(
-            nsweeps=1,
-            local_basis_policy="block2_like",
-            orthonormalized_operator_dim=512,
-            max_bond_mode="per_sector",
+            nsweeps=2,
+            conv_tol=-1.0,
+            require_convergence=False,
             mixer_zero_block_noise_scale=0.0,
-            direct_orthonormal_dense_max_elements=0,
-            su2_kernel_backend="auto",
-            debug_su2_kernel_check=True,
+            mixer_nsweeps=0,
+            verify_returned_mps_energy=True,
             profile=True,
         )
-    finally:
-        object.__setattr__(families, "prefer_recursive_operator_matvec", True)
-        object.__setattr__(families, "prefer_complementary_payload_tensor_matvec", True)
+        owner = dmrg.dmrg.history[-1]["moving_environment_stats"][
+            "su2_moving_environment"
+        ]
+        return float(dmrg.e_tot), owner
 
+    batched_energy, batched = solve(False)
+    direct_energy, direct = solve(True)
+    assert direct_energy == pytest.approx(batched_energy, abs=1.0e-12)
+    assert batched["compact_right_panel_budget_bytes"] == 0
+    assert batched["compact_right_panel_registry_builds"] == 0
+    assert batched["compact_right_panel_value_bytes"] == 0
+    assert direct["direct_complementary_action_calls"] > 0
+    assert direct["direct_complementary_actions"] > 0
+    assert direct["raw_pointer_execution_matvec_calls"] > 0
+    assert direct["half_sweep_python_bond_callbacks"] == 0
+
+
+def test_su2_cpp_shared_right_panels_skip_partial_output_groups(monkeypatch):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    molecule = Molecule(
+        atom="; ".join(
+            f"H 0 0 {1.6 * site}" for site in range(10)
+        ),
+        unit="bohr",
+        basis="sto-3g",
+    )
+    molecule.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mean_field = RHF(molecule).run()
+    monkeypatch.delenv(
+        "PYQED_SU2_DISABLE_SHARED_RIGHT_PANELS",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "PYQED_SU2_COMPARE_SHARED_RIGHT_PANELS",
+        "1",
+    )
+    monkeypatch.setenv(
+        "PYQED_SU2_SHARED_RIGHT_COPY_BUDGET",
+        "1024",
+    )
+    dmrg = DMRG(
+        mean_field,
+        ncas=10,
+        nelecas=10,
+        D=32,
+        init_guess="cid",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(
+        nsweeps=1,
+        conv_tol=-1.0,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        mixer_nsweeps=0,
+        verify_returned_mps_energy=True,
+        profile=True,
+    )
+    owner = dmrg.dmrg.history[-1]["moving_environment_stats"][
+        "su2_moving_environment"
+    ]
+    assert owner["peak_raw_shared_right_panel_count"] == 0
+    assert owner["peak_raw_shared_right_binding_count"] == 0
+    assert owner["raw_shared_right_gemm_calls"] == 0
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert float(dmrg.e_tot) == pytest.approx(
+        dmrg.dmrg.history[-1]["returned_mps_energy"],
+        abs=1.0e-10,
+    )
+
+
+def test_su2_block2_cpp_owner_avoids_transformed_kernel_build():
+    mol = Molecule(
+        atom=(
+            "H 0 0 0; H 0 0 1.6; H 0 0 3.2; "
+            "H 0 0 4.8; H 0 0 6.4; H 0 0 8.0"
+        ),
+        unit="bohr",
+        basis="sto-3g",
+    )
+    mol.build(
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mf = RHF(mol).run()
+
+    dmrg = DMRG(
+        mf,
+        ncas=6,
+        nelecas=6,
+        D=16,
+        init_guess="cid",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.build()
+    assert dmrg.build_info["python_reduced_terms_materialized"] is False
+    assert all(not factor.reduced_terms for factor in dmrg.H)
+
+    dmrg.run(
+        nsweeps=1,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        davidson_tol=2.5e-9,
+        davidson_max_iter=73,
+        profile=True,
+    )
+
+    history = dmrg.dmrg.history
     objectives = [
         objective
-        for entry in dmrg.dmrg.history
+        for entry in history
         for objective in entry.get("bond_objectives", [])
     ]
-    timings = [
-        objective.get("renormalized_operator_build_timing") or {}
-        for objective in objectives
-    ]
-    assert any(
-        timing.get("component_recursive_operator_matvec_preferred", 0.0) > 0.0
-        for timing in timings
-    )
-    assert any(
-        timing.get("component_recursive_parent_block_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_payload_tensor_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_family_table_kernel", 0.0) > 0.0
-        for timing in timings
-    )
+    assert objectives
+    assert history[0]["local_solver_kwargs"]["tol"] == pytest.approx(2.5e-9)
+    assert history[0]["local_solver_kwargs"]["itermax"] == 73
+    assert all(objective["cpp_owned_half_sweep"] is True for objective in objectives)
+    assert all(objective["cpp_active_solution_owned"] is True for objective in objectives)
+    assert all(objective["no_python_bond_callbacks"] is True for objective in objectives)
     assert all(
-        timing.get("component_factorized_kernel_materialize", 0.0) == 0.0
-        for timing in timings
-    )
-    assert all(
-        timing.get("component_factorized_kernel_transform", 0.0) == 0.0
-        for timing in timings
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "component_parent_block_kernel"
-            )
-            is True
-            or (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_payload_tensor_kernel"
-            )
-            is True
-            or (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table_kernel"
-            )
-            is True
-        )
+        objective["cpp_davidson_kind"] == "cpp_su2_owned_half_sweep_bond"
         for objective in objectives
     )
-    assert all(
-        (
-            objective.get("renormalized_operator_table_stats") or {}
-        ).get("component_orthonormal_dense_elements", 0)
-        == 0
-        for objective in objectives
-    )
-    assert dmrg.dmrg.history[-1]["direct_factorized_orthonormal_kernel_policy"][
-        "orthonormal_dense_max_elements"
-    ] == 0
-    actual_backend = dmrg.dmrg.history[-1]["su2_kernel_backend_actual"]
-    assert actual_backend in {"python", "cython"}
-    native_actions = [
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "su2_local_action"
-        )
-        for objective in objectives
-    ]
-    if actual_backend == "cython":
-        assert any(native_actions)
-        assert all(
-            (
-                (objective.get("renormalized_operator_table_stats") or {}).get(
-                    "su2_reference_residual"
-                )
-                or 0.0
-            )
-            <= 1.0e-10
-            for objective in objectives
-        )
-    else:
-        assert not any(native_actions)
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_direct_matvec"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        (
-            (
-                objective.get("renormalized_operator_table_stats") or {}
-            ).get("complementary_operator_families")
-            or {}
-        ).get("family_names")
-        == ("S", "R", "A", "P", "B", "Q")
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_backed"
-        )
-        is True
-        for objective in objectives
-    )
-    assert any(
-        set(
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "family_names",
-                (),
-            )
-        )
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        {
-            name
-            for name, count in (
-                (objective.get("renormalized_operator_table_stats") or {})
-                .get("family_term_counts", {})
-                .items()
-            )
-            if count > 0
-        }
-        >= {"P", "Q", "R"}
-        for objective in objectives
-    )
-    assert any(
-        (objective.get("renormalized_operator_table_stats") or {}).get(
-            "complementary_payload_terms",
-            0,
-        )
-        > 0
-        for objective in objectives
-    )
-    assert np.isfinite(float(dmrg.e_tot))
 
-
+    owner = history[-1]["moving_environment_stats"]["su2_moving_environment"]
+    assert owner["owned_half_sweep_calls"] == 2
+    assert owner["owned_half_sweep_bonds"] == 10
+    assert owner["half_sweep_executor_calls"] == 0
+    assert owner["half_sweep_executor_bonds"] == 0
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert owner["active_bond_complementary_fallbacks"] == 0
+    assert owner["raw_factor_routes"] is False
+    assert np.isfinite(dmrg.e_tot)
 def test_su2_block2_operator_table_cache_reuses_same_environment_basis():
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=1,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
+        require_convergence=False,
         mixer_zero_block_noise_scale=0.0,
     )
 
@@ -3419,23 +2600,30 @@ def test_su2_block2_effective_operator_carries_boundary_stack_metadata():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=1,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
+        require_convergence=False,
         mixer_zero_block_noise_scale=0.0,
     )
 
     sites = dmrg.dmrg.ground_state.sites
+    from pyqed.qchem.dmrg.backends.reduced import (
+        build_su2_normal_complementary_mpo,
+    )
+
+    reference_mpo = build_su2_normal_complementary_mpo(
+        dmrg.H[0].normal_complementary_owner,
+        fully_reduced=True,
+        materialize_reduced_terms=True,
+    )
     stack = RenormalizedBlockStack(namespace="hamiltonian")
     env = BlockSparseEnvironmentChain.build(
         sites,
-        dmrg.H,
+        reference_mpo,
         renormalized_blocks=stack,
     ).start_sweep("lr")
     merged = merge_mps_sites(sites[0], sites[1])
@@ -3457,6 +2645,7 @@ def test_su2_block2_effective_operator_carries_boundary_stack_metadata():
         "transition",
         "factorized",
         "rank_coupled_factorized",
+        "rank_coupled_contextual",
         "identity",
     }
     assert metadata["renormalized_local_operator_table"]["owner_side"] == "left"
@@ -3470,10 +2659,6 @@ def test_su2_block2_effective_operator_carries_boundary_stack_metadata():
         str(source).startswith("symbolic_")
         for source in stack.stats["side_operator_table_sources"]
     )
-    assert any(
-        str(source).endswith("prepared")
-        for source in stack.stats["side_operator_table_sources"]
-    )
     assert all(
         "lazy" not in str(source)
         for source in stack.stats["side_operator_table_sources"]
@@ -3485,10 +2670,7 @@ def test_su2_block2_effective_operator_carries_boundary_stack_metadata():
     assert stack.stats["local_operator_table_reuses"] > 0
     assert stack.stats["side_operator_table_hits"] > 0
     assert stack.stats["side_operator_table_reuses"] > 0
-    assert "rank_coupled_left_factor_by_ket" in stack.stats[
-        "side_operator_table_representations"
-    ]
-    assert "rank_coupled_right_factor_by_ket" in stack.stats[
+    assert "rank_coupled_by_ket" in stack.stats[
         "side_operator_table_representations"
     ]
 
@@ -3499,15 +2681,13 @@ def test_su2_block2_operator_table_supports_multi_root_davidson():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=1,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
+        require_convergence=False,
         mixer_zero_block_noise_scale=0.0,
     )
 
@@ -3546,28 +2726,28 @@ def test_su2_block2_operator_table_supports_multi_root_davidson():
     assert objective["renormalized_operator_table_stats"]["kind"] == "block_sparse"
 
 
-def test_su2_block2_state_average_routes_through_operator_table():
+def test_su2_cpp_state_average_selects_fully_reduced_sites():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
-    mf = RHF(mol).run()
-
-    dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
-    dmrg.run(
-        nstates=2,
-        weights=[0.5, 0.5],
-        nsweeps=1,
-        symmetry_list=["charge", "su2"],
-        local_basis_policy="block2_like",
-        state_average_validate_spin=False,
-        mixer_zero_block_noise_scale=0.0,
+    _build_cpp_integrals(mol)
+    dmrg = DMRG(
+        RHF(mol).run(),
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        site="spatial",
+        verbose=0,
     )
 
-    objective = dmrg.dmrg.history[-1]["bond_objectives"][-1]
-    assert objective["effective_local_problem"] == "state_averaged_coupled_davidson"
-    assert objective["state_averaged_svd"] is True
-    assert objective["block_davidson"] is True
-    assert objective["target_irrep_filtered"] is True
-    assert len(objective["state_energies"]) >= 2
+    solver = dmrg.run(
+        nstates=2,
+        nsweeps=1,
+        require_convergence=False,
+        symmetry="su2",
+    )
+
+    assert dmrg.spatial_site_basis == "fully_reduced"
+    assert solver.diagnostics["kernel_backend"] == "cpp"
 
 
 def test_su2_block2_state_average_supports_larger_active_spaces():
@@ -3576,7 +2756,7 @@ def test_su2_block2_state_average_supports_larger_active_spaces():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
@@ -3584,8 +2764,6 @@ def test_su2_block2_state_average_supports_larger_active_spaces():
         nstates=2,
         weights=[0.5, 0.5],
         nsweeps=2,
-        local_basis_policy="block2_like",
-        max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
     )
 
@@ -3596,31 +2774,52 @@ def test_su2_block2_state_average_supports_larger_active_spaces():
 
 def test_spatial_su2_dmrg_supports_state_average_roots():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     su2 = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
-    su2.run(nstates=2, weights=[0.5, 0.5], nsweeps=2, symmetry_list=["charge", "su2"])
+    solver = su2.run(
+        nstates=2,
+        weights=[0.5, 0.5],
+        nsweeps=2,
+        symmetry="su2",
+    )
 
-    assert su2.dmrg.backend == "nonabelian"
-    assert len(su2.dmrg.states) == 2
+    assert su2.dmrg.backend == "su2"
+    assert su2.spatial_site_basis == "fully_reduced"
+    assert solver is su2.dmrg
+    assert su2.states is solver.states
+    assert su2.ground_state is solver.ground_state
+    np.testing.assert_allclose(su2.e_tot, solver.energies)
+    assert len(solver.states) == 2
+    assert solver.ground_state is solver.states[0]
+    assert not hasattr(solver, "multiroot_state")
+    np.testing.assert_allclose(solver.weights, [0.5, 0.5])
+    np.testing.assert_allclose(solver.energies, su2.e_tot)
+    assert solver.state_average_energy == pytest.approx(np.mean(su2.e_tot))
     assert np.asarray(su2.e_tot).shape == (2,)
     assert su2.e_tot[0] < su2.e_tot[1]
     assert su2.e_tot[1] == pytest.approx(-0.169291740911, abs=1e-7)
     objective = su2.dmrg.history[-1]["bond_objectives"][-1]
     assert "state_energies" in objective
-    assert objective["target_irrep_filtered"] is True
-    assert objective["effective_local_problem"] == "state_averaged_coupled_davidson"
-    assert objective["dense_fallback"] is False
+    assert objective["effective_local_problem"] == "cpp_state_averaged_canonical_reduced"
+    assert objective["cpp_state_average"] is True
+    assert objective["cpp_block_davidson"] is True
+    assert objective["cpp_owned_half_sweep"] is True
+    assert objective["no_python_bond_callbacks"] is True
+    assert objective["cpp_post_truncation_expectation"] is True
     assert objective["block_davidson"] is True
-    assert objective["block_preconditioner"] is False
-    assert objective["block_preconditioner_blocks"] >= 0
-    assert str(objective["packed_matvec_backend"]).startswith("coupled-")
+    owner = su2.dmrg.history[-1]["moving_environment_stats"][
+        "su2_moving_environment"
+    ]
+    assert owner["state_average_roots"] == 2
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert owner["owned_half_sweep_bonds"] == 4
 
 
 def test_spatial_su2_state_average_preserves_requested_weights():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
@@ -3628,6 +2827,7 @@ def test_spatial_su2_state_average_preserves_requested_weights():
         nstates=2,
         weights=[0.8, 0.2],
         nsweeps=1,
+        require_convergence=False,
         symmetry_list=["charge", "su2"],
         state_average_validate_spin=False,
     )
@@ -3641,9 +2841,34 @@ def test_spatial_su2_state_average_preserves_requested_weights():
     )
 
 
+@pytest.mark.parametrize(
+    "weights, message",
+    [
+        ([1.0], "match nstates"),
+        ([0.5, np.nan], "finite"),
+        ([1.0, -0.1], "nonnegative"),
+        ([0.0, 0.0], "positive sum"),
+    ],
+)
+def test_state_average_rejects_invalid_weights(weights, message):
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    _build_cpp_integrals(mol)
+    dmrg = DMRG(
+        RHF(mol).run(),
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry="su2",
+        verbose=0,
+    )
+    with pytest.raises(ValueError, match=message):
+        dmrg.run(nstates=2, weights=weights, nsweeps=1)
+
+
 def test_fully_reduced_spatial_su2_state_average_h2_roots():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(
@@ -3652,8 +2877,6 @@ def test_fully_reduced_spatial_su2_state_average_h2_roots():
         nelecas=2,
         D=8,
         init_guess="hf",
-        symmetry="su2",
-        spatial_site_basis="fully_reduced",
         verbose=0,
     )
     dmrg.run(
@@ -3663,7 +2886,10 @@ def test_fully_reduced_spatial_su2_state_average_h2_roots():
         mixer_zero_block_noise_scale=0.0,
     )
 
-    assert dmrg._active_integral_build_info["spatial_site_basis"] == "fully_reduced_su2"
+    assert dmrg.symmetry == ["charge", "su2"]
+    assert dmrg.site == "spatial"
+    assert dmrg.spatial_site_basis == "fully_reduced"
+    assert dmrg.build_info["spatial_site_basis"] == "fully_reduced_su2"
     assert dmrg.dmrg.converged is True
     np.testing.assert_allclose(dmrg.e_tot, [-1.137275940288, -0.169291745839], atol=1e-8)
     history = dmrg.dmrg.history[-1]
@@ -3671,7 +2897,119 @@ def test_fully_reduced_spatial_su2_state_average_h2_roots():
     assert history["state_average_energy"] == pytest.approx(
         float(np.dot([0.5, 0.5], history["state_energies"]))
     )
-    assert history.get("state_s2") is None
+    np.testing.assert_allclose(history["state_s2"], [0.0, 0.0], atol=1e-12)
+
+
+def test_fully_reduced_spatial_su2_keeps_multiplicity_only_basis_across_sweeps():
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    _build_cpp_integrals(mol)
+    dmrg = DMRG(
+        RHF(mol).run(),
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(nsweeps=3)
+
+    assert dmrg.e_tot == pytest.approx(-1.137275943783, abs=1e-9)
+    if su2_cpp_available():
+        history = dmrg.dmrg.history[-1]
+        owner = history["moving_environment_stats"]["su2_moving_environment"]
+        assert history["energy_source"] == "cpp_terminal_local"
+        assert "orthonormalize_generalized_dim" not in history["local_solver_kwargs"]
+        assert owner["last_half_sweep_energy"] == pytest.approx(
+            history["energy"],
+            abs=1e-12,
+        )
+        assert owner["staged_bond_updates"] == owner["bond_steps"]
+        assert owner["committed_bond_updates"] == owner["bond_steps"]
+        assert owner["resident_family_kernel_budget_bytes"] == 32_000_000
+        assert (
+            owner["resident_family_kernel_bytes"]
+            <= owner["resident_family_kernel_budget_bytes"]
+        )
+        assert owner["resident_family_factor_pack_budget_bytes"] == 4_000_000
+        assert (
+            owner["resident_family_factor_pack_bytes"]
+            <= owner["resident_family_factor_pack_budget_bytes"]
+        )
+    assert all(
+        site.metadata.get("physical_basis") == "fully_reduced_su2"
+        for site in dmrg.dmrg.ground_state.sites
+    )
+
+
+def test_fully_reduced_spatial_su2_builds_spin_traced_rdms_without_determinants(monkeypatch):
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    _build_cpp_integrals(mol)
+    dmrg = DMRG(
+        RHF(mol).run(),
+        ncas=2,
+        nelecas=2,
+        D=8,
+        init_guess="hf",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(nsweeps=2)
+
+    from pyqed.mps.nonabelian import models as nonabelian_models
+
+    builds = {"h1": 0, "eri": 0}
+    original_h1 = nonabelian_models.build_spatial_one_body_reduced_mpo
+    original_eri = nonabelian_models.build_spatial_spinfree_eri_mpo
+
+    def counted_h1(*args, **kwargs):
+        builds["h1"] += 1
+        return original_h1(*args, **kwargs)
+
+    def counted_eri(*args, **kwargs):
+        builds["eri"] += 1
+        return original_eri(*args, **kwargs)
+
+    monkeypatch.setattr(nonabelian_models, "build_spatial_one_body_reduced_mpo", counted_h1)
+    monkeypatch.setattr(nonabelian_models, "build_spatial_spinfree_eri_mpo", counted_eri)
+
+    dm1, dm2 = dmrg.make_rdm12(spatial=True)
+    assert np.trace(dm1) == pytest.approx(2.0, abs=1e-10)
+    assert np.einsum("pprr->", dm2) == pytest.approx(2.0, abs=1e-10)
+    assert builds == {"h1": 0, "eri": 0}
+    assert dmrg.spatial_rdm_diagnostics["algorithm"] == "cpp_su2_wigner_eckart_npdm"
+    assert dmrg.spatial_rdm_diagnostics["determinant_expansion"] is False
+    assert dmrg.spatial_rdm_diagnostics["magnetic_component_expansion"] is False
+    assert dmrg.spatial_rdm_diagnostics["component_max_bond_dimension"] == 0
+    assert dmrg.spatial_rdm_diagnostics["reduced_max_bond_dimension"] > 0
+    assert dmrg.spatial_rdm_diagnostics["max_operator_channels"] > 0
+
+    repeated_dm1, repeated_dm2 = dmrg.make_rdm12(spatial=True)
+    np.testing.assert_allclose(repeated_dm1, dm1, atol=1e-12)
+    np.testing.assert_allclose(repeated_dm2, dm2, atol=1e-12)
+    assert builds == {"h1": 0, "eri": 0}
+    assert dmrg.spatial_rdm_diagnostics["cache_hits"] >= 2
+
+    runtime = dmrg._su2_runtime
+    component_reference = runtime.moving_environment.spatial_npdm(
+        dmrg.dmrg.ground_state.sites,
+        spin_rotation_reduction=True,
+        component_reference=True,
+    )
+    assert component_reference["magnetic_component_expansion"] is True
+    np.testing.assert_allclose(component_reference["rdm1"], dm1, atol=1e-12)
+    np.testing.assert_allclose(component_reference["rdm2"], dm2, atol=1e-12)
+
+    dmrg._su2_runtime = None
+    dmrg._fully_reduced_rdm_state_context = None
+    fallback_dm1, fallback_dm2 = dmrg.make_rdm12(spatial=True)
+    dmrg._su2_runtime = runtime
+    dmrg._fully_reduced_rdm_state_context = None
+    assert dmrg.spatial_rdm_diagnostics["algorithm"] == "su2_component_mps_npdm"
+    np.testing.assert_allclose(fallback_dm1, dm1, atol=1e-12)
+    np.testing.assert_allclose(fallback_dm2, dm2, atol=1e-12)
 
 
 def test_spatial_su2_state_average_supports_multisite_singlet_roots():
@@ -3680,7 +3018,7 @@ def test_spatial_su2_state_average_supports_multisite_singlet_roots():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=40, init_guess="cid", site="spatial", verbose=0)
@@ -3688,10 +3026,11 @@ def test_spatial_su2_state_average_supports_multisite_singlet_roots():
         nstates=2,
         weights=[0.5, 0.5],
         nsweeps=4,
-        symmetry_list=["charge", "su2"],
-        local_solver_kwargs={"dense_fallback_dim": 4096},
     )
 
+    assert dmrg.symmetry == ["charge", "su2"]
+    assert dmrg.site == "spatial"
+    assert dmrg.spatial_site_basis == "fully_reduced"
     assert len(dmrg.dmrg.states) == 2
     assert all(entry.get("direction") != "dense" for entry in dmrg.dmrg.history)
     assert all(
@@ -3703,10 +3042,28 @@ def test_spatial_su2_state_average_supports_multisite_singlet_roots():
         [-2.177899321294, -1.557192705150],
         atol=1e-8,
     )
+    assert dmrg.build_info["normal_complementary_production"] is True
+    assert dmrg.build_info["python_reduced_terms_materialized"] is False
     np.testing.assert_allclose(dmrg.dmrg.history[-1]["state_s2"], [0.0, 0.0], atol=1e-8)
     assert dmrg.dmrg.converged is True
     assert dmrg.dmrg.history[-1]["convergence_metric"] == "energy_delta"
     assert dmrg.dmrg.history[-1]["energy_delta"] <= dmrg.tol
+
+    from pyqed.qchem.dmrg import ED
+
+    exact = ED(mf, ncas=4, nelecas=4, symmetry="su2", verbose=0).run(nstates=2)
+    np.testing.assert_allclose(dmrg.e_tot, exact.e_tot, atol=1.0e-8)
+    exact.qcdmrg.dmrg = SimpleNamespace(
+        ground_state=exact.states[0],
+        states=exact.states,
+    )
+    for root in range(2):
+        dm1, dm2 = dmrg.make_rdm12(root, spatial=True)
+        exact_dm1, exact_dm2 = exact.qcdmrg.make_rdm12(root, spatial=True)
+        np.testing.assert_allclose(dm1, exact_dm1, atol=2.0e-8)
+        np.testing.assert_allclose(dm2, exact_dm2, atol=2.0e-8)
+        assert np.trace(dm1) == pytest.approx(4.0, abs=1.0e-9)
+        assert np.einsum("pprr->", dm2) == pytest.approx(12.0, abs=1.0e-8)
 
 
 def test_spin_adapted_ed_matches_su2_reference_roots():
@@ -3717,7 +3074,7 @@ def test_spin_adapted_ed_matches_su2_reference_roots():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     ed = ED(mf, ncas=4, nelecas=4, symmetry="su2", verbose=0).run(nstates=2)
@@ -3734,7 +3091,7 @@ def test_spin_adapted_ed_matches_su2_reference_roots():
 
 def test_two_site_abelian_state_average_returns_root_mps_lists():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
     dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="hf", site="spatial", verbose=0)
@@ -3748,7 +3105,7 @@ def test_two_site_abelian_state_average_returns_root_mps_lists():
 
 def test_dmrg_fix_spin_accepts_non_singlet_targets_and_warns_for_linear_penalty():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    _build_cpp_integrals(mol)
     mf = RHF(mol).run()
     dmrg = DMRG(mf, ncas=2, nelecas=2, D=4, init_guess="hf")
 

@@ -17,6 +17,110 @@ from .tensor import NonabelianTensor
 _ROOT_AXIS_SECTOR = ("state_average_root", 0)
 
 
+def _ordered_max_multiplicity_union(legs):
+    order = []
+    multiplicities = {}
+    for leg in legs:
+        counts = {}
+        for sector in leg:
+            counts[sector] = counts.get(sector, 0) + 1
+            if sector not in order:
+                order.append(sector)
+        for sector, count in counts.items():
+            multiplicities[sector] = max(
+                multiplicities.get(sector, 0),
+                count,
+            )
+    return [
+        sector
+        for sector in order
+        for _ in range(multiplicities[sector])
+    ]
+
+
+def _align_shared_root_chains(root_sites):
+    """Embed root chains in the union reduced bond skeleton without projection."""
+
+    nroots = len(root_sites)
+    nsites = len(root_sites[0])
+    common_legs = []
+    for site in range(nsites):
+        common_legs.append(
+            [
+                _ordered_max_multiplicity_union(
+                    [root_sites[root][site].qns[axis] for root in range(nroots)]
+                )
+                for axis in range(3)
+            ]
+        )
+    for bond in range(nsites - 1):
+        bond_qns = _ordered_max_multiplicity_union(
+            [common_legs[bond][2], common_legs[bond + 1][0]]
+        )
+        common_legs[bond][2] = bond_qns[:]
+        common_legs[bond + 1][0] = bond_qns[:]
+
+    aligned_roots = [[] for _ in range(nroots)]
+    for site in range(nsites):
+        tensors = [root_sites[root][site] for root in range(nroots)]
+        keys = sorted(set().union(*(tensor.data for tensor in tensors)))
+        phys_dims = {}
+        for tensor in tensors:
+            for key, block in tensor.data.items():
+                phys_dims[key[1]] = max(
+                    phys_dims.get(key[1], 0),
+                    int(np.asarray(block).shape[1]),
+                )
+        left_dims = {
+            sector: common_legs[site][0].count(sector)
+            for sector in set(common_legs[site][0])
+        }
+        right_dims = {
+            sector: common_legs[site][2].count(sector)
+            for sector in set(common_legs[site][2])
+        }
+        physical_basis = next(
+            (
+                tensor.metadata.get("physical_basis")
+                for tensor in tensors
+                if tensor.metadata.get("physical_basis") is not None
+            ),
+            None,
+        )
+        for root, tensor in enumerate(tensors):
+            dtype = np.result_type(
+                *[np.asarray(block).dtype for block in tensor.data.values()],
+                float,
+            )
+            data = {}
+            for key in keys:
+                shape = (
+                    left_dims[key[0]],
+                    phys_dims[key[1]],
+                    right_dims[key[2]],
+                )
+                target = np.zeros(shape, dtype=dtype)
+                source = tensor.data.get(key)
+                if source is not None:
+                    source = np.asarray(source)
+                    target[tuple(slice(0, size) for size in source.shape)] = source
+                data[key] = target
+            aligned_roots[root].append(
+                NonabelianTensor(
+                    data,
+                    [leg[:] for leg in common_legs[site]],
+                    tensor.dirs[:],
+                    fusion_legs=[None, tensor.fusion_legs[1], None],
+                    metadata=(
+                        {"physical_basis": physical_basis}
+                        if physical_basis is not None
+                        else {}
+                    ),
+                )
+            )
+    return aligned_roots
+
+
 def fuse_root_center_tensors(center_tensors, *, root_sector=_ROOT_AXIS_SECTOR):
     """Stack rank-4 root center tensors behind one leading root axis."""
 
@@ -286,4 +390,77 @@ class MultiRootMPS:
                 bond_coupling=bond_coupling,
             )
         self.center = int(center)
+        return self
+
+    def canonicalize_shared(
+        self,
+        center,
+        *,
+        bond_coupling="left",
+        max_bond=None,
+        max_bond_mode="reduced",
+    ):
+        """Put every root in one shared isometric basis with one root center."""
+
+        from .canonical import mixed_canonicalize_sites
+        from .contraction import merge_mps_sites
+        from .decompose import state_averaged_svd_two_site
+
+        center = int(center)
+        nsites = len(self.roots[0])
+        if center not in {0, nsites - 1}:
+            raise ValueError(
+                "Shared multi-root initialization currently requires an edge center."
+            )
+        initial_center = 0 if center == nsites - 1 else nsites - 1
+        root_sites = [
+            mixed_canonicalize_sites(
+                root.sites,
+                initial_center,
+                max_bond=None,
+                cutoff=0.0,
+                max_bond_mode=max_bond_mode,
+                bond_coupling=bond_coupling,
+                retain_sector_topology=True,
+            )
+            for root in self.roots
+        ]
+        root_sites = _align_shared_root_chains(root_sites)
+        bonds = (
+            range(nsites - 1)
+            if center == nsites - 1
+            else range(nsites - 2, -1, -1)
+        )
+        absorb = "right" if center == nsites - 1 else "left"
+        for bond in bonds:
+            merged = [
+                merge_mps_sites(sites[bond], sites[bond + 1])
+                for sites in root_sites
+            ]
+            _left, _right, _singular, _error, _kept, pairs = (
+                state_averaged_svd_two_site(
+                    merged,
+                    self.weights,
+                    max_bond=max_bond,
+                    cutoff=0.0,
+                    absorb=absorb,
+                    bond_coupling=bond_coupling,
+                    max_bond_mode=max_bond_mode,
+                    retain_sector_topology=True,
+                )
+            )
+            for root, (left, right) in enumerate(pairs):
+                root_sites[root][bond] = left
+                root_sites[root][bond + 1] = right
+        self.roots = [
+            MPS.from_sites(
+                sites,
+                center=center,
+                target_sector=self.target_sector,
+            )
+            for sites in root_sites
+        ]
+        self.center = center
+        self.center_bond = None
+        self.center_tensor = None
         return self

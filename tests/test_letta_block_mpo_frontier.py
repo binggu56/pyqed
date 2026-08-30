@@ -16,7 +16,7 @@ from tests.test_letta_mpo_frontier import _identity_mpo
 def _engines(state, mpo):
     arguments = (
         state.dims,
-        state.physical_sites,
+        state.physical_groups,
         [tensor.shape for tensor in state.tensors],
         mpo.tensors,
     )
@@ -60,7 +60,20 @@ def test_identity_aware_blocks_match_dense_channel_frontiers():
             block_action = block_engine.hole_action(
                 site, block_left[site], block_right[site + 1], probe
             )
+            prepared = block_engine.prepare_hole_action(
+                site,
+                block_left[site],
+                block_right[site + 1],
+            )
+            prepared_action = prepared(probe)
             np.testing.assert_allclose(block_action, dense_action, atol=5.0e-13)
+            np.testing.assert_allclose(prepared_action, block_action, atol=5.0e-13)
+            batch = np.stack((probe, 0.3 * probe))
+            np.testing.assert_allclose(
+                prepared.many(batch),
+                np.stack((block_action, 0.3 * block_action)),
+                atol=5.0e-13,
+            )
 
         assert block_engine.peak_message_elements <= dense_engine.peak_message_elements
         assert (
@@ -156,4 +169,8 @@ def test_four_by_four_identity_channel_message_reduction():
     assert engine.dense_peak_message_elements == 143_360
     assert engine.peak_message_elements == 17_920
     assert engine.dense_total_message_elements == 1_430_978
-    assert engine.total_message_elements == 189_922
+    assert engine.total_message_elements == 189_826
+    assert any(
+        len(engine._active_channels[cut]) < engine.mpo_bonds[cut]
+        for cut in range(nsites + 1)
+    )

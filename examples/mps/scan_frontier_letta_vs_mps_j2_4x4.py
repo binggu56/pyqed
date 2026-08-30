@@ -70,7 +70,6 @@ def _random_mps(nsites, bond_dim, seed):
     rng = np.random.default_rng(seed)
     factors = [
         rng.normal(size=(ranks[site], 2, ranks[site + 1]))
-        / np.sqrt(ranks[site] * 2 * ranks[site + 1])
         for site in range(nsites)
     ]
     return MPS(factors, labels=["lv", "p", "rv"])
@@ -130,11 +129,15 @@ def _optimize_mps(
     tolerance,
     initial_state=None,
 ):
-    from pyqed.mps import DMRG, MPO
+    from pyqed.mps import DMRG
 
     nsites = len(hamiltonian.dims)
     if initial_state is None:
-        initial_state = _random_mps(nsites, bond_dim, seed)
+        initial_state = _random_mps(
+            nsites,
+            bond_dim,
+            seed,
+        ).right_canonicalize()
         initialization = "random"
     else:
         initial_state = initial_state.copy()
@@ -145,7 +148,7 @@ def _optimize_mps(
     )
     start = perf_counter()
     solver = DMRG(
-        MPO(list(hamiltonian.to_mpo().compress().tensors)),
+        hamiltonian.to_mpo().compress(),
         D=int(bond_dim),
         init_guess=initial_state,
         nsweeps=int(pass_limit),
@@ -164,7 +167,7 @@ def _optimize_mps(
     directional_history = [
         row for row in solver.sweep_history if row.get("direction") in {"lr", "rl"}
     ]
-    vector = _mps_state_vector(solver.ground_state)
+    vector = _mps_state_vector(solver.state)
     diagnostics = _diagnostics(
         vector,
         sparse_hamiltonian,
@@ -174,7 +177,7 @@ def _optimize_mps(
     )
     ranks = _mps_ranks(nsites, bond_dim)
     stored_parameters = int(
-        sum(np.asarray(factor).size for factor in solver.ground_state.factors)
+        sum(np.asarray(factor).size for factor in solver.state.factors)
     )
     record = {
         "method": f"mps_d{int(bond_dim)}",
@@ -208,7 +211,7 @@ def _optimize_mps(
             float(row["energy"]) for row in directional_history
         ],
     }
-    return solver.ground_state.copy(), record
+    return solver.state.copy(), record
 
 
 def _continued_letta_state(
@@ -245,7 +248,7 @@ def _optimize_letta(
     pass_limit,
     tolerance,
     frontier_gauge,
-    frontier_gauge_weighting,
+    gauge_weight,
     warm_mps_seconds,
 ):
     nsites = len(hamiltonian.dims)
@@ -281,8 +284,8 @@ def _optimize_letta(
         nsweeps=int(pass_limit),
         tol=float(tolerance),
         solver="direct",
-        frontier_canonicalization=bool(frontier_gauge),
-        frontier_gauge_weighting=frontier_gauge_weighting,
+        gauge="frontier" if frontier_gauge else None,
+        gauge_weight=gauge_weight,
     )
     seconds = perf_counter() - start
     diagnostics = _diagnostics(
@@ -333,8 +336,8 @@ def _optimize_letta(
         ),
         "directional_pass_energies": [float(row["energy"]) for row in state.history],
         "frontier_gauge": bool(frontier_gauge),
-        "frontier_gauge_weighting": (
-            frontier_gauge_weighting if frontier_gauge else None
+        "gauge_weight": (
+            gauge_weight if frontier_gauge else None
         ),
         "frontier_gauge_bond_attempts": len(gauge_updates),
         "applied_frontier_gauges": len(applied_gauges),
@@ -472,7 +475,7 @@ def run_scan(
     tolerance=1.0e-10,
     tie_noise=1.0e-3,
     frontier_gauge=True,
-    frontier_gauge_weighting="probability",
+    gauge_weight="probability",
 ):
     ratios = _validated_ratios(ratios)
     seeds = _validated_seeds(seeds)
@@ -486,8 +489,8 @@ def run_scan(
         raise ValueError("tolerance must be finite and nonnegative.")
     if not np.isfinite(tie_noise) or tie_noise < 0.0:
         raise ValueError("tie_noise must be finite and nonnegative.")
-    frontier_gauge_weighting = str(frontier_gauge_weighting).lower().replace("-", "_")
-    if frontier_gauge_weighting not in {"uniform", "probability"}:
+    gauge_weight = str(gauge_weight).lower().replace("-", "_")
+    if gauge_weight not in {"uniform", "probability"}:
         raise ValueError("frontier gauge weighting must be uniform or probability.")
 
     nrows = ncols = 4
@@ -515,8 +518,8 @@ def run_scan(
         "tolerance": tolerance,
         "tie_noise": tie_noise,
         "frontier_gauge": bool(frontier_gauge),
-        "frontier_gauge_weighting": (
-            frontier_gauge_weighting if frontier_gauge else None
+        "gauge_weight": (
+            gauge_weight if frontier_gauge else None
         ),
         "letta_initialization": (
             "lower variational energy of same-D MPS lift and previous-ratio LETTA"
@@ -591,7 +594,7 @@ def run_scan(
                     pass_limit=letta_passes,
                     tolerance=tolerance,
                     frontier_gauge=frontier_gauge,
-                    frontier_gauge_weighting=frontier_gauge_weighting,
+                    gauge_weight=gauge_weight,
                     warm_mps_seconds=mps_records[bond_dim]["optimization_seconds"],
                 )
                 previous_letta[(seed, bond_dim)] = state
@@ -674,7 +677,7 @@ def main():
     parser.add_argument("--tie-noise", type=float, default=1.0e-3)
     parser.add_argument("--no-frontier-gauge", action="store_true")
     parser.add_argument(
-        "--frontier-gauge-weighting",
+        "--gauge-weight",
         choices=("uniform", "probability"),
         default="probability",
     )
@@ -692,7 +695,7 @@ def main():
             tolerance=args.tolerance,
             tie_noise=args.tie_noise,
             frontier_gauge=not args.no_frontier_gauge,
-            frontier_gauge_weighting=args.frontier_gauge_weighting,
+            gauge_weight=args.gauge_weight,
         )
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

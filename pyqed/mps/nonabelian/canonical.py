@@ -150,11 +150,14 @@ def right_canonical_error(site):
     """
     if not isinstance(site, NonabelianTensor) or site.rank != 3:
         raise ValueError("right_canonical_error expects a rank-3 NonabelianTensor site tensor.")
+    use_reduced_metric = (
+        (site.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+    )
     grouped = {}
     for (q_left, _q_phys, q_right), block in site.data.items():
         arr = np.asarray(block)
         matrix = arr.reshape(arr.shape[0], -1)
-        if arr.shape[1] == 1:
+        if use_reduced_metric:
             weight = _irrep_dim(q_right) / max(_irrep_dim(q_left), 1)
         else:
             weight = 1.0
@@ -200,6 +203,7 @@ def left_canonicalize_sites(
     max_bond=None,
     max_bond_mode="states",
     bond_coupling="left",
+    retain_sector_topology=False,
 ):
     """
     Put a chain into left-canonical form by exact two-site gauge moves.
@@ -216,6 +220,7 @@ def left_canonicalize_sites(
             absorb="right",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("left_canonicalize_sites would truncate the state; increase max_bond or lower cutoff.")
@@ -230,6 +235,7 @@ def right_canonicalize_sites(
     max_bond=None,
     max_bond_mode="states",
     bond_coupling="left",
+    retain_sector_topology=False,
 ):
     """
     Put a chain into right-canonical form by exact two-site gauge moves.
@@ -246,6 +252,7 @@ def right_canonicalize_sites(
             absorb="left",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("right_canonicalize_sites would truncate the state; increase max_bond or lower cutoff.")
@@ -261,6 +268,7 @@ def mixed_canonicalize_sites(
     max_bond=None,
     max_bond_mode="states",
     bond_coupling="left",
+    retain_sector_topology=False,
 ):
     """
     Put a chain into mixed canonical form with orthogonality center at ``center``.
@@ -277,6 +285,7 @@ def mixed_canonicalize_sites(
             absorb="right",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("mixed_canonicalize_sites would truncate the state on the left pass.")
@@ -290,6 +299,7 @@ def mixed_canonicalize_sites(
             absorb="left",
             bond_coupling=bond_coupling,
             max_bond_mode=max_bond_mode,
+            retain_sector_topology=retain_sector_topology,
         )
         if trunc_err > 1e-12:
             raise ValueError("mixed_canonicalize_sites would truncate the state on the right pass.")

@@ -62,7 +62,7 @@ class CGWP:
         elif ndim > 1:
 
             if isinstance(a, float):
-                self.a = a * eye(ndim) # homogenous width
+                self.a = a * eye(ndim) # homogeneous width
             
             if isinstance(p, float):
                 self.p = np.array([p] * ndim)

@@ -52,7 +52,7 @@ class NARG:
         "return_spin": False,
         "variational": False,
         "project_growth_hamiltonian": None,
-        "project_v1_packages": False,
+        "project_v1_packages": None,
         "carry_rdm_operators": True,
         "carry_spin_rdm_operators": False,
         "su2_backend": "auto",
@@ -278,8 +278,14 @@ class NARG:
             )
         )
         variational = bool(opts.pop("variational", self.DEFAULT_OPTIONS["variational"]))
-        project_v1 = bool(
-            opts.pop("project_v1_packages", self.DEFAULT_OPTIONS["project_v1_packages"])
+        project_v1_option = opts.pop(
+            "project_v1_packages",
+            self.DEFAULT_OPTIONS["project_v1_packages"],
+        )
+        project_v1 = (
+            orbital_blocks is None
+            if project_v1_option is None
+            else bool(project_v1_option)
         )
         project_growth = opts.pop(
             "project_growth_hamiltonian",

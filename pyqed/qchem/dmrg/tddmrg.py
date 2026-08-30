@@ -2,7 +2,7 @@ import numpy as np
 from scipy.linalg import expm
 
 from pyqed.mps import MPS
-from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.tn import MPO as TensorMPO
 from pyqed.mps.mps import symmetric_to_dense
 from pyqed.mps.tdmps import TDMPS
 from pyqed.mps.decompose import decompose, tt_to_tensor
@@ -107,6 +107,17 @@ def _mpo_site_to_dense_factor(site):
         idx_lists = [maps[leg][key[leg]] for leg in range(4)]
         out[np.ix_(*idx_lists)] += np.asarray(block)
     return out
+
+
+def _dense_mpo_for_taylor(mpo):
+    """Return a dense-core MPO suitable for global Taylor construction."""
+    factors = mpo.factors if hasattr(mpo, "factors") else list(mpo)
+    if not any(hasattr(site, "qns") for site in factors):
+        return mpo
+    return TensorMPO(
+        [_mpo_site_to_dense_factor(site) for site in factors],
+        homogeneous=False,
+    )
 
 
 def _is_block_sparse_tdvp_backend(backend):
@@ -346,7 +357,7 @@ class TDDMRG(DMRG):
                 for p in range(phys_dim):
                     core[0, 0, p, p] = 1.0
             factors.append(core)
-        return TensorMPO(factors, homogenous=False)
+        return TensorMPO(factors, homogeneous=False)
 
     def optimize_ground_state(self, *args, **kwargs):
         """Run the static DMRG optimizer and keep the converged state for propagation."""
@@ -470,7 +481,7 @@ class TDDMRG(DMRG):
                 if key in {"h", "ham", "hamiltonian"}:
                     if self.H is None:
                         self.build()
-                    h_mpo = TensorMPO([w.copy() for w in self.H], homogenous=False)
+                    h_mpo = TensorMPO([w.copy() for w in self.H], homogeneous=False)
                     cache_key = getattr(self, "_hamiltonian_mpo_cache_key", None)
                     if cache_key is not None:
                         h_mpo._pyqed_cache_key = cache_key
@@ -492,7 +503,7 @@ class TDDMRG(DMRG):
                 continue
 
             if _is_mpo_like(op):
-                copied = TensorMPO(_copy_mpo_factors(op.factors), homogenous=False)
+                copied = TensorMPO(_copy_mpo_factors(op.factors), homogeneous=False)
                 cache_key = getattr(op, "_pyqed_cache_key", None)
                 if cache_key is not None:
                     copied._pyqed_cache_key = cache_key
@@ -500,7 +511,7 @@ class TDDMRG(DMRG):
                 continue
 
             if _is_mpo_factor_list(op):
-                normalized.append(TensorMPO(_copy_mpo_factors(op), homogenous=False))
+                normalized.append(TensorMPO(_copy_mpo_factors(op), homogeneous=False))
                 continue
 
             raise TypeError(f"Unsupported observable type: {type(op)}")
@@ -512,7 +523,7 @@ class TDDMRG(DMRG):
             self.build(mo_coeff=mo_coeff)
         elif self.H is None:
             self.build()
-        out = TensorMPO([w.copy() for w in self.H], homogenous=False)
+        out = TensorMPO([w.copy() for w in self.H], homogeneous=False)
         cache_key = getattr(self, "_hamiltonian_mpo_cache_key", None)
         if cache_key is not None:
             out._pyqed_cache_key = cache_key
@@ -547,8 +558,8 @@ class TDDMRG(DMRG):
 
         mpo_list = self._interaction_mpo_cache
         if axis is None:
-            return [TensorMPO([w.copy() for w in mpo.factors], homogenous=False) for mpo in mpo_list]
-        return TensorMPO([w.copy() for w in mpo_list[int(axis)].factors], homogenous=False)
+            return [TensorMPO([w.copy() for w in mpo.factors], homogeneous=False) for mpo in mpo_list]
+        return TensorMPO([w.copy() for w in mpo_list[int(axis)].factors], homogeneous=False)
 
     def get_interaction_spatial(self, axis=None):
         if self.mo_cas is None:
@@ -691,8 +702,11 @@ class TDDMRG(DMRG):
             self.build(mo_coeff=mo_coeff)
         if interaction_mpo is None and field is not None:
             interaction_mpo = self.get_interaction_mpo()
+        hamiltonian = _dense_mpo_for_taylor(
+            self._get_td_hamiltonian(mo_coeff=mo_coeff)
+        )
         self.tdmps = TDMPS(
-            self._get_td_hamiltonian(mo_coeff=mo_coeff),
+            hamiltonian,
             D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,
@@ -762,8 +776,13 @@ class TDDMRG(DMRG):
         if tdvp_projection_backend is not None and hasattr(self, "_tdvp_sector_settings"):
             sector_kwargs = dict(self._tdvp_sector_settings())
 
+        hamiltonian = self._get_td_hamiltonian(mo_coeff=mo_coeff)
+        integrator_key = str(integrator).lower().replace("_", "-")
+        if integrator_key in {"taylor", "mpo", "mpo-taylor"}:
+            hamiltonian = _dense_mpo_for_taylor(hamiltonian)
+
         self.tdmps = TDMPS(
-            self._get_td_hamiltonian(mo_coeff=mo_coeff),
+            hamiltonian,
             D=bond_dim,
             interaction_mpo=interaction_mpo,
             field=field,

@@ -91,6 +91,11 @@ class Sector(tuple):
         obj.components = tuple(components)
         return obj
 
+    @property
+    def is_abelian(self):
+        """Whether every labelled factor has Abelian fusion rules."""
+        return "su2" not in self.labels
+
     def fuse(self, other):
         if not isinstance(other, Sector) or self.labels != other.labels:
             return NotImplemented
@@ -117,6 +122,45 @@ class Sector(tuple):
 
     def __reduce__(self):
         return (Sector, (self.labels, self.components))
+
+
+def abelian_sector_view(leg):
+    """Translate a shared Abelian ``Leg`` into MPS sector labels."""
+    from pyqed.symmetry import Leg, ProductSymmetry, U1Symmetry
+
+    if not isinstance(leg, Leg):
+        raise TypeError("leg must be a pyqed.symmetry.Leg.")
+    symmetry = leg.symmetry
+    if isinstance(symmetry, U1Symmetry):
+        labels = (symmetry.name.lower(),)
+    elif isinstance(symmetry, ProductSymmetry) and all(
+        isinstance(factor, U1Symmetry) for factor in symmetry.factors
+    ):
+        labels = tuple(factor.name.lower() for factor in symmetry.factors)
+    else:
+        raise TypeError(
+            "the current MPS sector view supports Abelian Leg symmetries."
+        )
+
+    sectors = []
+    dims = {}
+    for irrep in leg.irreps:
+        if irrep.alpha != 0:
+            raise ValueError(
+                "MPS physical-sector views require multiplicities to be stored "
+                "in Leg.dims rather than Irrep.alpha."
+            )
+        components = (
+            tuple(irrep.charge)
+            if isinstance(irrep.charge, tuple)
+            else (irrep.charge,)
+        )
+        sector = AbelianSector(labels, components)
+        if sector in dims:
+            raise ValueError("distinct irreps collapse to the same MPS sector label.")
+        sectors.append(sector)
+        dims[sector] = leg.sector_dim(irrep)
+    return tuple(sectors), dims
 
 
 def zero_like_sector(sector):

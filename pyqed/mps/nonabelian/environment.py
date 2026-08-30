@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+import ctypes
+import sys
 import time
-from dataclasses import dataclass, replace
+import weakref
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
 import numpy as np
@@ -34,7 +37,7 @@ from .local_operator import (
     materialize_packed_matrix,
     transitions_are_identity_operator,
 )
-from .mpo import MPO, IrreducibleMPO, RankCoupledMPO
+from .mpo import MPO, IrreducibleMPO, RankCoupledMPO, iter_virtual_routes
 from .solver import (
     LocalOperator,
     ReducedStateVector,
@@ -45,6 +48,36 @@ from .solver import (
 from .renormalized import RenormalizedBlockStack, RenormalizedOperatorStack
 from .tensor import NonabelianTensor
 from pyqed.mps.su2 import SU2Irrep
+
+
+@lru_cache(maxsize=1)
+def _numeric_allocator_relief():
+    """Return the platform allocator's free-page release hook, if available."""
+
+    try:
+        if sys.platform == "darwin":
+            library = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            hook = library.malloc_zone_pressure_relief
+            hook.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+            hook.restype = ctypes.c_size_t
+            return lambda: hook(None, 0)
+        if sys.platform.startswith("linux"):
+            library = ctypes.CDLL(None)
+            hook = library.malloc_trim
+            hook.argtypes = [ctypes.c_size_t]
+            hook.restype = ctypes.c_int
+            return lambda: hook(0)
+    except (AttributeError, OSError):
+        pass
+    return None
+
+
+def _release_free_numeric_pages():
+    """Return freed large numerical arenas to the OS when supported."""
+
+    hook = _numeric_allocator_relief()
+    if hook is not None:
+        hook()
 
 
 _USE_REAL_RANK_COUPLED_ACCUMULATE = True
@@ -88,11 +121,16 @@ def _su2_kernel_module():
 
 
 def _real64_contiguous_or_none(array):
-    """Return a real float64 contiguous view/copy, or ``None`` for complex data."""
+    """Return a real float64 buffer, or ``None`` for genuinely complex data."""
 
     arr = np.asarray(array)
     if arr.dtype.kind == "c":
-        return None
+        if arr.size:
+            scale = max(1.0, float(np.max(np.abs(arr.real))))
+            tolerance = 64.0 * np.finfo(np.float64).eps * scale
+            if float(np.max(np.abs(arr.imag))) > tolerance:
+                return None
+        arr = arr.real
     if arr.dtype == np.float64 and arr.flags.c_contiguous:
         return arr
     return np.ascontiguousarray(arr, dtype=np.float64)
@@ -181,7 +219,45 @@ def _basis_cache_signature(basis):
     return tuple((entry.key, entry.shape, entry.size) for entry in basis)
 
 
+def _uses_channel_resolved_local_basis(two_site, W1, W2, *, rank_coupled):
+    """Use intermediate-channel blocks only for genuinely fully reduced cores."""
+
+    if (
+        not rank_coupled
+        or not bool(
+            two_site.metadata.get(
+                "contracted_channel_blocks_current",
+                False,
+            )
+        )
+    ):
+        return False
+    factors = (W1, W2)
+    normal_complementary = tuple(
+        factor
+        for factor in factors
+        if getattr(factor, "normal_complementary_plan", None) is not None
+    )
+    if normal_complementary:
+        return all(
+            bool(
+                getattr(
+                    factor,
+                    "normal_complementary_fully_reduced",
+                    False,
+                )
+            )
+            for factor in normal_complementary
+        )
+    return all(
+        bool(getattr(factor, "fully_reduced_identity", False))
+        for factor in factors
+    )
+
+
 def _array_digest(array):
+    if hasattr(array, "data") and isinstance(array.data, dict):
+        array = array.data
     if isinstance(array, dict):
         digest = hashlib.blake2b(digest_size=16)
         for key, value in sorted(array.items(), key=lambda item: repr(item[0])):
@@ -504,30 +580,32 @@ def _mpo_dtype(mpo_core):
 def _is_identity_mpo_core(mpo_core, *, tol=1e-12):
     cache_key = (id(mpo_core), float(tol))
     cached = _IDENTITY_MPO_CORE_CACHE.get(cache_key)
+    if cached is not None and cached[0]() is mpo_core:
+        return bool(cached[1])
     if cached is not None:
-        return bool(cached)
+        _IDENTITY_MPO_CORE_CACHE.pop(cache_key, None)
     if not isinstance(mpo_core, MPO):
         return False
     if mpo_core.left_dim != 1 or mpo_core.right_dim != 1:
-        _IDENTITY_MPO_CORE_CACHE[cache_key] = False
+        _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
         return False
     for q_out in mpo_core.phys_out_sectors:
         for q_in in mpo_core.phys_in_sectors:
             block = mpo_core.block(q_out, q_in)
             if q_out == q_in:
                 if block is None:
-                    _IDENTITY_MPO_CORE_CACHE[cache_key] = False
+                    _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
                     return False
-                eye = np.eye(mpo_core.phys_out_leg.dim(q_out), dtype=np.asarray(block).dtype)
+                eye = np.eye(mpo_core.phys_out_leg.sector_dim(q_out), dtype=np.asarray(block).dtype)
                 if not np.allclose(np.asarray(block)[0, 0], eye, atol=tol, rtol=tol):
-                    _IDENTITY_MPO_CORE_CACHE[cache_key] = False
+                    _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
                     return False
             elif block is not None and np.linalg.norm(np.asarray(block).reshape(-1)) > tol:
-                _IDENTITY_MPO_CORE_CACHE[cache_key] = False
+                _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
                 return False
     if len(_IDENTITY_MPO_CORE_CACHE) > 256:
         _IDENTITY_MPO_CORE_CACHE.clear()
-    _IDENTITY_MPO_CORE_CACHE[cache_key] = True
+    _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), True)
     return True
 
 
@@ -876,40 +954,161 @@ def _initial_right_env_blocks(site_layout, W):
 
 def _initial_left_env_blocks_rank_coupled(site_layout, W):
     env = {}
+    initial_channel = (
+        1
+        if getattr(W, "normal_complementary_plan", None) is not None
+        else 0
+    )
     for sector, dim in site_layout["sector_dims"][0].items():
-        entries = []
-        for idx, irrep in enumerate(W.left_channel_irreps):
-            block = np.zeros((irrep.dim, dim, dim), dtype=_mpo_dtype(W))
-            if idx == 0:
-                block[0] = np.eye(dim, dtype=_mpo_dtype(W))
-            entries.append(block)
-        env[(sector, sector)] = tuple(entries)
+        block = np.zeros(
+            (W.left_channel_irreps[initial_channel].dim, dim, dim),
+            dtype=_mpo_dtype(W),
+        )
+        block[0] = np.eye(dim, dtype=_mpo_dtype(W))
+        env[(sector, sector)] = RankCoupledChannelBlocks(
+            {initial_channel: block},
+            len(W.left_channel_irreps),
+        )
     return env
 
 
 def _initial_right_env_blocks_rank_coupled(site_layout, W):
     env = {}
     for sector, dim in site_layout["sector_dims"][2].items():
-        entries = []
-        for idx, irrep in enumerate(W.right_channel_irreps):
-            block = np.zeros((irrep.dim, dim, dim), dtype=_mpo_dtype(W))
-            if idx == 0:
-                block[0] = np.eye(dim, dtype=_mpo_dtype(W))
-            entries.append(block)
-        env[(sector, sector)] = tuple(entries)
+        block = np.zeros(
+            (W.right_channel_irreps[0].dim, dim, dim),
+            dtype=_mpo_dtype(W),
+        )
+        block[0] = np.eye(dim, dtype=_mpo_dtype(W))
+        env[(sector, sector)] = RankCoupledChannelBlocks(
+            {0: block},
+            len(W.right_channel_irreps),
+        )
     return env
+
+
+class RankCoupledChannelBlocks:
+    """Sparse channel-indexed reduced boundary blocks."""
+
+    __slots__ = ("data", "n_channels")
+
+    def __init__(self, data=None, n_channels=0):
+        self.data = dict(data or {})
+        self.n_channels = int(n_channels)
+
+    def __len__(self):
+        return self.n_channels
+
+    def __contains__(self, channel):
+        return int(channel) in self.data
+
+    def __getitem__(self, channel):
+        return self.data[int(channel)]
+
+    def __setitem__(self, channel, block):
+        self.data[int(channel)] = block
+
+    def get(self, channel, default=None):
+        return self.data.get(int(channel), default)
+
+    def items(self):
+        return self.data.items()
+
+    def values(self):
+        return self.data.values()
+
+    def copy(self):
+        return type(self)(
+            {channel: np.array(block, copy=True) for channel, block in self.data.items()},
+            self.n_channels,
+        )
+
+
+class _PackedRankCoupledEnvironmentMap:
+    """Sector-pair mapping view that owns no arrays beyond a packed boundary."""
+
+    def __init__(self, packed_table, n_channels=None):
+        self.packed_table = packed_table
+        sectors = tuple(packed_table.sector_codec.sectors)
+        self._entries = {}
+        max_channel = max(
+            (int(channel) for channel in packed_table.channel_ids),
+            default=-1,
+        )
+        self._n_channels = max(
+            max_channel + 1,
+            int(0 if n_channels is None else n_channels),
+        )
+        for row_idx, ket_id in enumerate(packed_table.ket_sector_ids):
+            q_in = sectors[int(ket_id)]
+            start = int(packed_table.entry_offsets[row_idx])
+            stop = int(packed_table.entry_offsets[row_idx + 1])
+            for entry_idx in range(start, stop):
+                q_out = sectors[int(packed_table.out_sector_ids[entry_idx])]
+                self._entries[(q_out, q_in)] = int(entry_idx)
+        self._blocks = {}
+
+    def __len__(self):
+        return len(self._entries)
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __contains__(self, key):
+        return key in self._entries
+
+    def __getitem__(self, key):
+        cached = self._blocks.get(key)
+        if cached is not None:
+            return cached
+        entry_idx = self._entries[key]
+        table = self.packed_table
+        start = int(table.channel_offsets[entry_idx])
+        stop = int(table.channel_offsets[entry_idx + 1])
+        cached = RankCoupledChannelBlocks(
+            {
+                int(table.channel_ids[channel_idx]):
+                table.block_pool.array(channel_idx)
+                for channel_idx in range(start, stop)
+            },
+            self._n_channels,
+        )
+        self._blocks[key] = cached
+        return cached
+
+    def get(self, key, default=None):
+        return self[key] if key in self._entries else default
+
+    def items(self):
+        return ((key, self[key]) for key in self._entries)
+
+    def keys(self):
+        return self._entries.keys()
+
+    def values(self):
+        return (self[key] for key in self._entries)
+
+
+def _rank_coupled_channel_items(blocks):
+    if isinstance(blocks, RankCoupledChannelBlocks):
+        return blocks.items()
+    return enumerate(tuple(blocks or ()))
 
 
 def _copy_rank_coupled_env_map(env_map):
     return {
-        key: tuple(np.array(block, copy=True) for block in blocks)
+        key: (
+            blocks.copy()
+            if isinstance(blocks, RankCoupledChannelBlocks)
+            else tuple(np.array(block, copy=True) for block in blocks)
+        )
         for key, blocks in env_map.items()
     }
 
 
 def _nonzero_rank_coupled_blocks(blocks, *, tol=0.0):
     out = []
-    for idx, block in enumerate(blocks):
+    for idx, block in _rank_coupled_channel_items(blocks):
         arr = np.asarray(block)
         if arr.size and np.any(np.abs(arr) > tol):
             out.append((idx, arr))
@@ -919,7 +1118,10 @@ def _nonzero_rank_coupled_blocks(blocks, *, tol=0.0):
 def _flatten_rank_coupled_env_map(env_map):
     flat = {}
     for key, blocks in env_map.items():
-        flat[key] = np.concatenate([np.asarray(block) for block in blocks], axis=0)
+        flat[key] = np.concatenate(
+            [np.asarray(block) for _channel, block in _rank_coupled_channel_items(blocks)],
+            axis=0,
+        )
     return flat
 
 
@@ -935,8 +1137,8 @@ def _sector_irrep(sector):
 def _rank_coupled_degeneracy_only_physical(W):
     if not isinstance(W, RankCoupledMPO):
         return False
-    return all(W.phys_out_leg.dim(sector) == 1 for sector in W.phys_out_leg.sectors) and all(
-        W.phys_in_leg.dim(sector) == 1 for sector in W.phys_in_leg.sectors
+    return all(W.phys_out_leg.sector_dim(sector) == 1 for sector in W.phys_out_leg.sectors) and all(
+        W.phys_in_leg.sector_dim(sector) == 1 for sector in W.phys_in_leg.sectors
     )
 
 
@@ -978,6 +1180,8 @@ _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY = "__fully_reduced_one_body_split__"
 
 def _rank_coupled_core_has_family(W, family):
     family = str(family)
+    if any(family in getattr(term, "family", ()) for term in W.reduced_terms):
+        return True
     for transition in getattr(W, "symbolic_transitions", ()) or ():
         if len(transition) < 4:
             continue
@@ -990,6 +1194,25 @@ def _rank_coupled_core_has_family(W, family):
         ):
             return True
     return False
+
+
+def _rank_coupled_sparse_environment_term_routes(W):
+    """Cache reduced terms together with their sparse virtual routes."""
+    cached = W._environment_reduced_term_routes_cache
+    if cached is not None:
+        return cached
+    cached = tuple(
+        (
+            term,
+            _reduced_operator_rank(term.reduced_operator),
+            _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY
+            in getattr(term, "family", ()),
+            tuple(iter_virtual_routes(term.visible_virtual_block)),
+        )
+        for term in W.reduced_terms
+    )
+    object.__setattr__(W, "_environment_reduced_term_routes_cache", cached)
+    return cached
 
 
 @lru_cache(maxsize=None)
@@ -1010,6 +1233,19 @@ def _component_basis_matrix(q_out, q_in, rank_irrep, two_m_component):
             if coeff:
                 block[row, col] = coeff
     return block
+
+
+@lru_cache(maxsize=None)
+def _component_basis_norm(q_out, q_in, rank_irrep, two_m_component):
+    """Return the reduced-component connection weight at an SU(2) cut."""
+
+    block = _component_basis_matrix(
+        q_out,
+        q_in,
+        rank_irrep,
+        int(two_m_component),
+    )
+    return float(np.vdot(block, block).real)
 
 
 @lru_cache(maxsize=None)
@@ -1034,6 +1270,243 @@ def _physical_component_matrix(q_out, q_in, rank_irrep, two_m_component, diagona
     return scale * _component_basis_matrix(q_out, q_in, rank_irrep, int(two_m_component))
 
 
+def _fully_reduced_operator_component_matrix(
+    operator,
+    two_m_component,
+    q_out,
+    q_in,
+):
+    """Expand one stored reduced local element into a magnetic component."""
+    name = type(operator).__name__
+    component = int(two_m_component)
+    if name == "ReducedTensorOperator":
+        reduced = operator.reduced_blocks.get((q_out, q_in))
+        if reduced is None:
+            return None
+        phase = operator.component_phases[component]
+        scale = float(_sector_irrep(q_in).dim)
+        return (
+            np.asarray(phase * reduced * scale, dtype=operator.dtype)
+            * _component_basis_matrix(
+                q_out,
+                q_in,
+                operator.rank_irrep,
+                component,
+            )
+        )
+    if name == "AdjointReducedTensorOperator":
+        block = _fully_reduced_operator_component_matrix(
+            operator.base_operator,
+            component,
+            q_in,
+            q_out,
+        )
+        if block is None:
+            return None
+        scale = 1.0
+        if operator.input_sector_scales:
+            scale = np.asarray(scale) * np.asarray(
+                operator.input_sector_scales[q_in]
+            )
+        if operator.output_sector_scales:
+            scale = np.asarray(scale) * np.asarray(
+                operator.output_sector_scales[q_out]
+            )
+        return np.asarray(scale, dtype=operator.dtype) * np.asarray(block).T.conj()
+    if name == "TimeReversedReducedTensorOperator":
+        block = _fully_reduced_operator_component_matrix(
+            operator.base_operator,
+            -component,
+            q_out,
+            q_in,
+        )
+        if block is None:
+            return None
+        exponent = (operator.rank_irrep.two_j - component) // 2
+        return ((-1.0) ** exponent) * np.asarray(block, dtype=operator.dtype)
+    if name == "CoupledReducedTensorProductOperator":
+        block = operator.magnetic_component_block(component, q_out, q_in)
+        if block is not None:
+            return np.asarray(block)
+    op_rank = _reduced_operator_rank(operator)
+    block = operator.component_block(component, q_out, q_in)
+    if block is None:
+        return None
+    return np.asarray(block) * _physical_component_matrix(
+        q_out,
+        q_in,
+        op_rank,
+        component,
+        op_rank.two_j == 0,
+    )
+
+
+def _left_reduced_recoupling_from_local_basis_uncached(
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+    left_irrep,
+    right_irrep,
+    two_m_left,
+    two_m_right,
+    local_basis,
+):
+    left_basis = _component_basis_matrix(
+        q_lb,
+        q_lk,
+        left_irrep,
+        int(two_m_left),
+    )
+    right_basis = _component_basis_matrix(
+        q_rb,
+        q_rk,
+        right_irrep,
+        int(two_m_right),
+    )
+    local_basis = np.asarray(local_basis)
+    if not np.any(left_basis) or not np.any(local_basis) or not np.any(right_basis):
+        return 0.0
+
+    q_lb_irrep = _sector_irrep(q_lb)
+    q_lk_irrep = _sector_irrep(q_lk)
+    q_pb_irrep = _sector_irrep(q_pb)
+    q_pk_irrep = _sector_irrep(q_pk)
+    q_rb_irrep = _sector_irrep(q_rb)
+    q_rk_irrep = _sector_irrep(q_rk)
+    projected = np.zeros(
+        (q_rb_irrep.dim, q_rk_irrep.dim),
+        dtype=np.result_type(local_basis.dtype, float),
+    )
+    for lb_row, two_m_lb in enumerate(ordered_two_m_values(q_lb_irrep)):
+        for lk_col, two_m_lk in enumerate(ordered_two_m_values(q_lk_irrep)):
+            env_coeff = left_basis[lb_row, lk_col]
+            if env_coeff == 0:
+                continue
+            for pb_row, two_m_pb in enumerate(ordered_two_m_values(q_pb_irrep)):
+                for pk_col, two_m_pk in enumerate(ordered_two_m_values(q_pk_irrep)):
+                    op_coeff = local_basis[pb_row, pk_col]
+                    if op_coeff == 0:
+                        continue
+                    for rb_row, two_m_rb in enumerate(
+                        ordered_two_m_values(q_rb_irrep)
+                    ):
+                        bra_cg = clebsch_gordan(
+                            q_lb_irrep,
+                            q_pb_irrep,
+                            q_rb_irrep,
+                            two_m_lb,
+                            two_m_pb,
+                            two_m_rb,
+                        )
+                        if bra_cg == 0:
+                            continue
+                        for rk_col, two_m_rk in enumerate(
+                            ordered_two_m_values(q_rk_irrep)
+                        ):
+                            ket_cg = clebsch_gordan(
+                                q_lk_irrep,
+                                q_pk_irrep,
+                                q_rk_irrep,
+                                two_m_lk,
+                                two_m_pk,
+                                two_m_rk,
+                            )
+                            if ket_cg:
+                                projected[rb_row, rk_col] += (
+                                    env_coeff * op_coeff * bra_cg * ket_cg
+                                )
+    norm = np.vdot(right_basis, right_basis)
+    if abs(norm) <= 1.0e-14:
+        return 0.0
+    return np.vdot(right_basis, projected) / norm
+
+
+@lru_cache(maxsize=65536)
+def _cached_left_reduced_recoupling_from_local_basis(
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+    left_irrep,
+    right_irrep,
+    two_m_left,
+    two_m_right,
+    local_shape,
+    local_dtype,
+    local_bytes,
+):
+    local_basis = np.frombuffer(
+        local_bytes,
+        dtype=np.dtype(local_dtype),
+    ).reshape(local_shape)
+    return _left_reduced_recoupling_from_local_basis_uncached(
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+        left_irrep,
+        right_irrep,
+        two_m_left,
+        two_m_right,
+        local_basis,
+    )
+
+
+def _left_reduced_recoupling_from_local_basis(
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+    left_irrep,
+    right_irrep,
+    two_m_left,
+    two_m_right,
+    local_basis,
+):
+    local_basis = np.ascontiguousarray(local_basis)
+    return _cached_left_reduced_recoupling_from_local_basis(
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+        left_irrep,
+        right_irrep,
+        int(two_m_left),
+        int(two_m_right),
+        tuple(int(dim) for dim in local_basis.shape),
+        local_basis.dtype.str,
+        local_basis.tobytes(),
+    )
+
+
+def _phase_stripped_reduced_block(operator, phys_out, phys_in):
+    reference_component = min(int(component) for component in operator.components)
+    return operator.component_block(reference_component, phys_out, phys_in)
+
+
+def _recoupling_component(operator, component):
+    component = int(component)
+    name = type(operator).__name__
+    if name == "ReducedTensorOperator":
+        return -component
+    if name == "TimeReversedReducedTensorOperator":
+        base = getattr(operator, "base_operator", None)
+        if type(base).__name__ == "AdjointReducedTensorOperator":
+            return -component
+    return component
+
+
 def _rank_coupled_reduced_terms_block(W, phys_out, phys_in):
     reduced = {}
     dtype = _mpo_dtype(W)
@@ -1047,8 +1520,8 @@ def _rank_coupled_reduced_terms_block(W, phys_out, phys_in):
                 (
                     W.left_channel_irreps[i].dim,
                     W.right_channel_irreps[j].dim,
-                    W.phys_out_leg.dim(phys_out),
-                    W.phys_in_leg.dim(phys_in),
+                    W.phys_out_leg.sector_dim(phys_out),
+                    W.phys_in_leg.sector_dim(phys_in),
                 ),
                 dtype=dtype,
             )
@@ -1057,6 +1530,61 @@ def _rank_coupled_reduced_terms_block(W, phys_out, phys_in):
             op_block,
             dtype=dtype,
         )
+    return reduced
+
+
+def _rank_coupled_single_term_block(W, term, phys_out, phys_in):
+    """Expand one explicit reduced AutoMPO term without recoupling it twice."""
+    reduced = {}
+    dtype = _mpo_dtype(W)
+    op_rank = _reduced_operator_rank(term.reduced_operator)
+    for left_idx, right_idx, visible_coeff in iter_virtual_routes(
+        term.visible_virtual_block
+    ):
+        left_irrep = W.left_channel_irreps[left_idx]
+        right_irrep = W.right_channel_irreps[right_idx]
+        local = np.zeros(
+            (
+                left_irrep.dim,
+                right_irrep.dim,
+                W.phys_out_leg.sector_dim(phys_out),
+                W.phys_in_leg.sector_dim(phys_in),
+            ),
+            dtype=dtype,
+        )
+        for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+            for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
+                component = _rank_coupled_component(
+                    left_irrep,
+                    right_irrep,
+                    int(two_m_left),
+                    int(two_m_right),
+                )
+                coefficient = visible_coeff
+                if term.use_cg_coupling:
+                    component = int(two_m_right) - int(two_m_left)
+                    coefficient = coefficient * _virtual_rank_coupling(
+                        left_irrep,
+                        op_rank,
+                        right_irrep,
+                        int(two_m_left),
+                        component,
+                        int(two_m_right),
+                    )
+                    if coefficient == 0:
+                        continue
+                op_block = term.reduced_operator.component_block(
+                    component,
+                    phys_out,
+                    phys_in,
+                )
+                if op_block is not None:
+                    local[row, col] += (
+                        np.asarray(coefficient, dtype=dtype)
+                        * np.asarray(op_block, dtype=dtype)
+                    )
+        if np.any(local):
+            reduced[(left_idx, right_idx)] = local
     return reduced
 
 
@@ -1158,6 +1686,7 @@ def _right_reduced_recoupling_coeff(
     two_m_left,
     two_m_right,
     two_m_component,
+    dual_right_basis=False,
 ):
     """Right-environment analogue of :func:`_left_reduced_recoupling_coeff`."""
     left_basis = _component_basis_matrix(q_lb, q_lk, left_irrep, int(two_m_left))
@@ -1168,7 +1697,21 @@ def _right_reduced_recoupling_coeff(
         int(two_m_component),
         op_rank.two_j == 0,
     )
-    right_basis = _component_basis_matrix(q_rb, q_rk, right_irrep, int(two_m_right))
+    right_basis = (
+        _dual_component_basis_matrix(
+            q_rb,
+            q_rk,
+            right_irrep,
+            int(two_m_right),
+        )
+        if dual_right_basis
+        else _component_basis_matrix(
+            q_rb,
+            q_rk,
+            right_irrep,
+            int(two_m_right),
+        )
+    )
     if not np.any(left_basis) or not np.any(local_basis) or not np.any(right_basis):
         return 0.0
 
@@ -1221,7 +1764,16 @@ def _right_reduced_recoupling_coeff(
     return np.vdot(left_basis, projected) / norm
 
 
-def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+def _reference_left_reduced_rank_coupled_block(
+    W,
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+):
+    """Reduced local block for explicit AutoMPO transition contractions."""
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -1230,11 +1782,235 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
         _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
     )
     if dense_block is not None:
-        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
-            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
-                local_scalar = np.asarray(dense_block[left_idx, right_idx, 0, 0], dtype=dtype)
-                if local_scalar == 0:
-                    continue
+        for left_idx, right_idx, local_payload in iter_virtual_routes(dense_block):
+            left_irrep = W.left_channel_irreps[left_idx]
+            right_irrep = W.right_channel_irreps[right_idx]
+            local_scalar = np.asarray(local_payload[0, 0], dtype=dtype)
+            block = np.zeros(
+                (left_irrep.dim, right_irrep.dim, 1, 1),
+                dtype=dtype,
+            )
+            for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+                for col, two_m_right in enumerate(
+                    ordered_two_m_values(right_irrep)
+                ):
+                    component = _rank_coupled_component(
+                        left_irrep,
+                        right_irrep,
+                        int(two_m_left),
+                        int(two_m_right),
+                    )
+                    if relaxed_scalar_transfer:
+                        virtual_cg = 1.0
+                    else:
+                        virtual_cg = _virtual_rank_coupling(
+                            left_irrep,
+                            SU2Irrep(0),
+                            right_irrep,
+                            int(two_m_left),
+                            component,
+                            int(two_m_right),
+                        )
+                        if virtual_cg == 0:
+                            continue
+                    coeff = _left_reduced_recoupling_coeff(
+                        q_lb,
+                        q_lk,
+                        q_pb,
+                        q_pk,
+                        q_rb,
+                        q_rk,
+                        left_irrep,
+                        right_irrep,
+                        SU2Irrep(0),
+                        int(two_m_left),
+                        int(two_m_right),
+                        0,
+                        False,
+                    )
+                    if coeff:
+                        block[row, col, 0, 0] += (
+                            local_scalar * virtual_cg * coeff
+                        )
+            if np.any(block):
+                reduced[(left_idx, right_idx)] = block
+
+    for term, op_rank, relaxed_term, routes in (
+        _rank_coupled_sparse_environment_term_routes(W)
+    ):
+        for left_idx, right_idx, visible_coeff in routes:
+            left_irrep = W.left_channel_irreps[left_idx]
+            right_irrep = W.right_channel_irreps[right_idx]
+            block = reduced.get(
+                (left_idx, right_idx),
+                np.zeros(
+                    (left_irrep.dim, right_irrep.dim, 1, 1),
+                    dtype=dtype,
+                ),
+            )
+            for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
+                for col, two_m_right in enumerate(
+                    ordered_two_m_values(right_irrep)
+                ):
+                    component = (
+                        int(two_m_right) - int(two_m_left)
+                        if getattr(term, "use_cg_coupling", False)
+                        else _rank_coupled_component(
+                            left_irrep,
+                            right_irrep,
+                            int(two_m_left),
+                            int(two_m_right),
+                        )
+                    )
+                    if relaxed_term:
+                        if (
+                            abs(int(component)) > op_rank.two_j
+                            or (op_rank.two_j - int(component)) % 2
+                        ):
+                            continue
+                        op_block = term.reduced_operator.component_block(
+                            component,
+                            q_pb,
+                            q_pk,
+                        )
+                        if op_block is None:
+                            continue
+                        reduced_block = _phase_stripped_reduced_block(
+                            term.reduced_operator,
+                            q_pb,
+                            q_pk,
+                        )
+                        if reduced_block is None:
+                            continue
+                        action_weight = visible_coeff
+                        if getattr(term, "use_cg_coupling", False):
+                            action_weight = action_weight * _virtual_rank_coupling(
+                                left_irrep,
+                                op_rank,
+                                right_irrep,
+                                int(two_m_left),
+                                component,
+                                int(two_m_right),
+                            )
+                            if action_weight == 0:
+                                continue
+                        recoupled = _left_reduced_recoupling_coeff(
+                            q_lb,
+                            q_lk,
+                            q_pb,
+                            q_pk,
+                            q_rb,
+                            q_rk,
+                            left_irrep,
+                            right_irrep,
+                            op_rank,
+                            int(two_m_left),
+                            int(two_m_right),
+                            _recoupling_component(
+                                term.reduced_operator,
+                                component,
+                            ),
+                        )
+                        if recoupled:
+                            block[row, col] += (
+                                np.asarray(action_weight, dtype=dtype)
+                                * np.asarray(reduced_block[0, 0], dtype=dtype)
+                                * recoupled
+                            )
+                        continue
+                    virtual_cg = _virtual_rank_coupling(
+                        left_irrep,
+                        op_rank,
+                        right_irrep,
+                        int(two_m_left),
+                        component,
+                        int(two_m_right),
+                    )
+                    if virtual_cg == 0:
+                        continue
+                    local_basis = _fully_reduced_operator_component_matrix(
+                        term.reduced_operator,
+                        -component,
+                        q_pb,
+                        q_pk,
+                    )
+                    if local_basis is None:
+                        continue
+                    recoupled = _left_reduced_recoupling_from_local_basis(
+                        q_lb,
+                        q_lk,
+                        q_pb,
+                        q_pk,
+                        q_rb,
+                        q_rk,
+                        left_irrep,
+                        right_irrep,
+                        int(two_m_left),
+                        int(two_m_right),
+                        local_basis,
+                    )
+                    if recoupled:
+                        block[row, col] += (
+                            np.asarray(visible_coeff, dtype=dtype)
+                            * np.asarray(virtual_cg, dtype=dtype)
+                            * recoupled
+                        )
+            if np.any(block):
+                reduced[(left_idx, right_idx)] = block
+    return reduced
+
+
+def _left_reduced_rank_coupled_block(
+    W,
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+):
+    if getattr(W, "normal_complementary_plan", None) is None:
+        return _reference_left_reduced_rank_coupled_block(
+            W,
+            q_lb,
+            q_lk,
+            q_pb,
+            q_pk,
+            q_rb,
+            q_rk,
+        )
+    return _normal_complementary_left_reduced_rank_coupled_block(
+        W,
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+    )
+
+
+def _normal_complementary_left_reduced_rank_coupled_block(
+    W,
+    q_lb,
+    q_lk,
+    q_pb,
+    q_pk,
+    q_rb,
+    q_rk,
+):
+    reduced = {}
+    dense_block = W.dense_blocks.get((q_pb, q_pk))
+    dtype = _mpo_dtype(W)
+    relaxed_scalar_transfer = _rank_coupled_core_has_family(
+        W,
+        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    )
+    if dense_block is not None:
+        for left_idx, right_idx, local_payload in iter_virtual_routes(dense_block):
+                left_irrep = W.left_channel_irreps[left_idx]
+                right_irrep = W.right_channel_irreps[right_idx]
+                local_scalar = np.asarray(local_payload[0, 0], dtype=dtype)
                 block = np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype)
                 for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
                     for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
@@ -1287,6 +2063,13 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                                 int(two_m_left),
                                 int(two_m_right),
                                 0,
+                                bool(
+                                    getattr(
+                                        W,
+                                        "normal_complementary_right_dual",
+                                        False,
+                                    )
+                                ),
                             )
                         )
                         if coeff:
@@ -1300,40 +2083,164 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
         return reduced
 
     for term in W.reduced_terms:
-        visible = term.visible_virtual_block
         op_rank = _reduced_operator_rank(term.reduced_operator)
-        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
-            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
-                visible_coeff = visible[left_idx, right_idx]
-                if visible_coeff == 0:
-                    continue
+        for left_idx, right_idx, visible_coeff in iter_virtual_routes(
+            term.visible_virtual_block
+        ):
+                left_irrep = W.left_channel_irreps[left_idx]
+                right_irrep = W.right_channel_irreps[right_idx]
                 block = reduced.get(
                     (left_idx, right_idx),
                     np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype),
                 )
                 for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
                     for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
-                        component = (
-                            int(two_m_right) - int(two_m_left)
-                            if getattr(term, "use_cg_coupling", False)
-                            else _rank_coupled_component(
+                        if getattr(term, "use_cg_coupling", False):
+                            oriented_left = (
+                                int(term.left_component_orientation)
+                                * int(two_m_left)
+                            )
+                            oriented_right = (
+                                int(term.right_component_orientation)
+                                * int(two_m_right)
+                            )
+                            component = oriented_right - oriented_left
+                            if op_rank.two_j == 0:
+                                component = 0
+                            if term.dual_right_coupling:
+                                component = -(
+                                    int(two_m_left)
+                                    + int(two_m_right)
+                                )
+                                if (
+                                    getattr(
+                                        W,
+                                        "normal_complementary_plan",
+                                        None,
+                                    )
+                                    is not None
+                                    and left_irrep.two_j == 2
+                                    and right_irrep.two_j == 1
+                                    and abs(
+                                        int(W.left_channel_charges[left_idx])
+                                    )
+                                    == 2
+                                ):
+                                    component *= int(
+                                        term.left_component_orientation
+                                    )
+                            if term.orient_virtual_coupling:
+                                coupling_left = oriented_left
+                                coupling_right = oriented_right
+                                coupling_component = component
+                            else:
+                                coupling_left = int(two_m_left)
+                                coupling_right = int(two_m_right)
+                                coupling_component = (
+                                    coupling_right - coupling_left
+                                )
+                        else:
+                            component = _rank_coupled_component(
                                 left_irrep,
                                 right_irrep,
                                 int(two_m_left),
                                 int(two_m_right),
                             )
-                        )
+                            oriented_left = int(two_m_left)
+                            oriented_right = int(two_m_right)
+                            coupling_left = oriented_left
+                            coupling_right = oriented_right
+                            coupling_component = component
                         virtual_cg = _virtual_rank_coupling(
                             left_irrep,
                             op_rank,
                             right_irrep,
-                            int(two_m_left),
-                            component,
-                            int(two_m_right),
+                            coupling_left,
+                            coupling_component,
+                            coupling_right,
                         )
+                        if term.dual_right_coupling:
+                            virtual_cg = (
+                                (-1.0)
+                                ** (
+                                    (
+                                        right_irrep.two_j
+                                        + int(two_m_right)
+                                    )
+                                    // 2
+                                )
+                                * _virtual_rank_coupling(
+                                    left_irrep,
+                                    op_rank,
+                                    right_irrep,
+                                    int(two_m_left),
+                                    -(
+                                        int(two_m_left)
+                                        + int(two_m_right)
+                                    ),
+                                    -int(two_m_right),
+                                )
+                            )
+                        if term.phase_from_charged_scalar_source:
+                            virtual_cg *= -int(two_m_right)
+                        if term.phase_to_charged_pair_target:
+                            virtual_cg *= -int(two_m_left)
+                        if (
+                            getattr(W, "normal_complementary_plan", None)
+                            is not None
+                            and op_rank.two_j == 0
+                            and left_irrep.two_j == right_irrep.two_j
+                            and left_irrep.two_j != 0
+                            and getattr(
+                                term.reduced_operator,
+                                "operator_id",
+                                -1,
+                            )
+                            in (0, 12, 18)
+                        ):
+                            virtual_cg = (
+                                (-1.0)
+                                ** (
+                                    (
+                                        left_irrep.two_j
+                                        + int(two_m_left)
+                                    )
+                                    // 2
+                                )
+                                if int(two_m_right)
+                                == -int(two_m_left)
+                                else 0.0
+                            )
+                            if (
+                                getattr(
+                                    term.reduced_operator,
+                                    "operator_id",
+                                    -1,
+                                )
+                                == 0
+                                and abs(
+                                    int(W.left_channel_charges[left_idx])
+                                )
+                                != 2
+                            ):
+                                virtual_cg *= (
+                                    term.left_component_orientation
+                                )
                         if virtual_cg == 0:
                             continue
-                        dual_factor = _virtual_dual_metric(left_irrep, op_rank, right_irrep)
+                        dual_factor = _virtual_dual_metric(
+                            left_irrep,
+                            op_rank,
+                            right_irrep,
+                        )
+                        if (
+                            getattr(W, "normal_complementary_plan", None)
+                            is not None
+                            and op_rank.two_j == 1
+                            and right_irrep.two_j == 0
+                            and left_irrep.two_j == 1
+                        ):
+                            dual_factor = -1.0
                         op_block = term.reduced_operator.component_block(component, q_pb, q_pk)
                         if op_block is None:
                             continue
@@ -1364,7 +2271,32 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     return reduced
 
 
+def _environment_reduced_rank_coupled_block(
+    W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk
+):
+    """Return the cached direction-independent block used by SU(2)-LETTA."""
+    key = (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk)
+    cache = W._environment_reduced_block_cache
+    cached = cache.get(key)
+    if cached is None:
+        cached = _left_reduced_rank_coupled_block(
+            W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk
+        )
+        cache[key] = cached
+    return cached
+
+
 def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    if getattr(W, "normal_complementary_plan", None) is None:
+        return _environment_reduced_rank_coupled_block(
+            W,
+            q_lb,
+            q_lk,
+            q_pb,
+            q_pk,
+            q_rb,
+            q_rk,
+        )
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -1373,11 +2305,10 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
         _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
     )
     if dense_block is not None:
-        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
-            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
-                local_scalar = np.asarray(dense_block[left_idx, right_idx, 0, 0], dtype=dtype)
-                if local_scalar == 0:
-                    continue
+        for left_idx, right_idx, local_payload in iter_virtual_routes(dense_block):
+                left_irrep = W.left_channel_irreps[left_idx]
+                right_irrep = W.right_channel_irreps[right_idx]
+                local_scalar = np.asarray(local_payload[0, 0], dtype=dtype)
                 block = np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype)
                 for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
                     for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
@@ -1414,6 +2345,13 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                                 int(two_m_left),
                                 int(two_m_right),
                                 0,
+                                bool(
+                                    getattr(
+                                        W,
+                                        "normal_complementary_right_dual",
+                                        False,
+                                    )
+                                ),
                             )
                             if relaxed_scalar_transfer
                             else _right_reduced_recoupling_coeff(
@@ -1442,40 +2380,164 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
         return reduced
 
     for term in W.reduced_terms:
-        visible = term.visible_virtual_block
         op_rank = _reduced_operator_rank(term.reduced_operator)
-        for left_idx, left_irrep in enumerate(W.left_channel_irreps):
-            for right_idx, right_irrep in enumerate(W.right_channel_irreps):
-                visible_coeff = visible[left_idx, right_idx]
-                if visible_coeff == 0:
-                    continue
+        for left_idx, right_idx, visible_coeff in iter_virtual_routes(
+            term.visible_virtual_block
+        ):
+                left_irrep = W.left_channel_irreps[left_idx]
+                right_irrep = W.right_channel_irreps[right_idx]
                 block = reduced.get(
                     (left_idx, right_idx),
                     np.zeros((left_irrep.dim, right_irrep.dim, 1, 1), dtype=dtype),
                 )
                 for row, two_m_left in enumerate(ordered_two_m_values(left_irrep)):
                     for col, two_m_right in enumerate(ordered_two_m_values(right_irrep)):
-                        component = (
-                            int(two_m_right) - int(two_m_left)
-                            if getattr(term, "use_cg_coupling", False)
-                            else _rank_coupled_component(
+                        if getattr(term, "use_cg_coupling", False):
+                            oriented_left = (
+                                int(term.left_component_orientation)
+                                * int(two_m_left)
+                            )
+                            oriented_right = (
+                                int(term.right_component_orientation)
+                                * int(two_m_right)
+                            )
+                            component = oriented_right - oriented_left
+                            if op_rank.two_j == 0:
+                                component = 0
+                            if term.dual_right_coupling:
+                                component = -(
+                                    int(two_m_left)
+                                    + int(two_m_right)
+                                )
+                                if (
+                                    getattr(
+                                        W,
+                                        "normal_complementary_plan",
+                                        None,
+                                    )
+                                    is not None
+                                    and left_irrep.two_j == 2
+                                    and right_irrep.two_j == 1
+                                    and abs(
+                                        int(W.left_channel_charges[left_idx])
+                                    )
+                                    == 2
+                                ):
+                                    component *= int(
+                                        term.left_component_orientation
+                                    )
+                            if term.orient_virtual_coupling:
+                                coupling_left = oriented_left
+                                coupling_right = oriented_right
+                                coupling_component = component
+                            else:
+                                coupling_left = int(two_m_left)
+                                coupling_right = int(two_m_right)
+                                coupling_component = (
+                                    coupling_right - coupling_left
+                                )
+                        else:
+                            component = _rank_coupled_component(
                                 left_irrep,
                                 right_irrep,
                                 int(two_m_left),
                                 int(two_m_right),
                             )
-                        )
+                            oriented_left = int(two_m_left)
+                            oriented_right = int(two_m_right)
+                            coupling_left = oriented_left
+                            coupling_right = oriented_right
+                            coupling_component = component
                         virtual_cg = _virtual_rank_coupling(
                             left_irrep,
                             op_rank,
                             right_irrep,
-                            int(two_m_left),
-                            component,
-                            int(two_m_right),
+                            coupling_left,
+                            coupling_component,
+                            coupling_right,
                         )
+                        if term.dual_right_coupling:
+                            virtual_cg = (
+                                (-1.0)
+                                ** (
+                                    (
+                                        right_irrep.two_j
+                                        + int(two_m_right)
+                                    )
+                                    // 2
+                                )
+                                * _virtual_rank_coupling(
+                                    left_irrep,
+                                    op_rank,
+                                    right_irrep,
+                                    int(two_m_left),
+                                    -(
+                                        int(two_m_left)
+                                        + int(two_m_right)
+                                    ),
+                                    -int(two_m_right),
+                                )
+                            )
+                        if term.phase_from_charged_scalar_source:
+                            virtual_cg *= -int(two_m_right)
+                        if term.phase_to_charged_pair_target:
+                            virtual_cg *= -int(two_m_left)
+                        if (
+                            getattr(W, "normal_complementary_plan", None)
+                            is not None
+                            and op_rank.two_j == 0
+                            and left_irrep.two_j == right_irrep.two_j
+                            and left_irrep.two_j != 0
+                            and getattr(
+                                term.reduced_operator,
+                                "operator_id",
+                                -1,
+                            )
+                            in (0, 12, 18)
+                        ):
+                            virtual_cg = (
+                                (-1.0)
+                                ** (
+                                    (
+                                        left_irrep.two_j
+                                        + int(two_m_left)
+                                    )
+                                    // 2
+                                )
+                                if int(two_m_right)
+                                == -int(two_m_left)
+                                else 0.0
+                            )
+                            if (
+                                getattr(
+                                    term.reduced_operator,
+                                    "operator_id",
+                                    -1,
+                                )
+                                == 0
+                                and abs(
+                                    int(W.left_channel_charges[left_idx])
+                                )
+                                != 2
+                            ):
+                                virtual_cg *= (
+                                    term.left_component_orientation
+                                )
                         if virtual_cg == 0:
                             continue
-                        dual_factor = _virtual_dual_metric(left_irrep, op_rank, right_irrep)
+                        dual_factor = _virtual_dual_metric(
+                            left_irrep,
+                            op_rank,
+                            right_irrep,
+                        )
+                        if (
+                            getattr(W, "normal_complementary_plan", None)
+                            is not None
+                            and op_rank.two_j == 1
+                            and right_irrep.two_j == 0
+                            and left_irrep.two_j == 1
+                        ):
+                            dual_factor = -1.0
                         op_block = term.reduced_operator.component_block(component, q_pb, q_pk)
                         if op_block is None:
                             continue
@@ -1492,6 +2554,13 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             int(two_m_left),
                             int(two_m_right),
                             component,
+                            bool(
+                                getattr(
+                                    W,
+                                    "normal_complementary_right_dual",
+                                    False,
+                                )
+                            ),
                         )
                         if recoupled:
                             block[row, col, 0, 0] += (
@@ -1510,11 +2579,68 @@ def _environment_map_expectation(env_map, *, rank_coupled):
     value = 0.0 + 0.0j
     if rank_coupled:
         for blocks in env_map.values():
-            for block in blocks:
+            for _channel, block in _rank_coupled_channel_items(blocks):
                 value += np.trace(np.asarray(block).sum(axis=0))
     else:
         for block in env_map.values():
             value += np.trace(np.asarray(block)[0])
+    return value
+
+
+def _rank_coupled_channel_expectation(env_map, channel):
+    """Trace one scalar reduced channel from a completed NC boundary."""
+
+    value = 0.0 + 0.0j
+    channel = int(channel)
+    for blocks in env_map.values():
+        for current, block in _rank_coupled_channel_items(blocks):
+            if int(current) == channel:
+                value += np.trace(np.asarray(block).sum(axis=0))
+    return value
+
+
+def _rank_coupled_cut_expectation(left, right, channel_irreps):
+    """Contract independently reduced SU(2) boundaries across one MPO cut."""
+
+    channel_irreps = tuple(channel_irreps)
+    value = 0.0 + 0.0j
+    for (q_out, q_in), left_blocks in left.items():
+        right_blocks = right.get((q_out, q_in))
+        if right_blocks is None:
+            continue
+        for channel, left_block in _rank_coupled_channel_items(left_blocks):
+            channel = int(channel)
+            right_block = right_blocks.get(channel)
+            if right_block is None:
+                continue
+            irrep = channel_irreps[channel]
+            weights = np.asarray(
+                [
+                    _component_basis_norm(
+                        q_out,
+                        q_in,
+                        irrep,
+                        two_m,
+                    )
+                    for two_m in ordered_two_m_values(irrep)
+                ],
+                dtype=float,
+            )
+            left_array = np.asarray(left_block)
+            right_array = np.asarray(right_block)
+            if (
+                left_array.shape != right_array.shape
+                or left_array.ndim < 1
+                or left_array.shape[0] != weights.size
+            ):
+                raise ValueError(
+                    "Rank-coupled cut blocks do not match their channel irrep."
+                )
+            value += np.sum(
+                weights.reshape((-1,) + (1,) * (left_array.ndim - 1))
+                * left_array
+                * right_array
+            )
     return value
 
 
@@ -1529,6 +2655,10 @@ class _BlockEnvironment:
 
     data: object
     rank_coupled: bool = False
+    packed_table: object | None = field(default=None, compare=False, repr=False)
+    cpp_owned_boundary: bool = field(default=False, compare=False, repr=False)
+    cpp_topology_revision: int = field(default=0, compare=False, repr=False)
+    cpp_numeric_revision: int = field(default=0, compare=False, repr=False)
 
     def __iter__(self):
         return iter(self.data)
@@ -1576,6 +2706,42 @@ class _BlockEnvironment:
         )
         return type(self)(copied, rank_coupled=self.rank_coupled)
 
+    def ensure_packed(self, *, side, bond):
+        """Return the persistent packed reduced-sector boundary table."""
+
+        if not self.rank_coupled:
+            return None
+        packed = self.packed_table
+        if (
+            packed is not None
+            and getattr(packed, "side", None) == str(side)
+            and int(getattr(packed, "bond", -1)) == int(bond)
+        ):
+            return packed
+        from .su2_qchem_plan import pack_rank_coupled_boundary_table_from_block_map
+
+        n_channels = max(
+            (
+                int(getattr(blocks, "n_channels", len(blocks)))
+                for blocks in self.data.values()
+            ),
+            default=0,
+        )
+        packed = pack_rank_coupled_boundary_table_from_block_map(
+            self,
+            side=side,
+            bond=bond,
+            representation="rank_coupled_by_ket",
+        )
+        object.__setattr__(self, "packed_table", packed)
+        if packed is not None:
+            object.__setattr__(
+                self,
+                "data",
+                _PackedRankCoupledEnvironmentMap(packed, n_channels=n_channels),
+            )
+        return packed
+
     def expectation(self):
         """
         Contract the scalar trace represented by this environment block.
@@ -1595,7 +2761,18 @@ class LeftBlock(_BlockEnvironment):
     sector-pair map and advances by absorbing one MPS/MPO site.
     """
 
-    def advance(self, W, bra_site, ket_site, *, phys_slices=None):
+    def advance(
+        self,
+        W,
+        bra_site,
+        ket_site,
+        *,
+        phys_slices=None,
+        moving_environment=None,
+        parent_bond=None,
+        child_bond=None,
+        numeric_revision=None,
+    ):
         """
         Absorb one site into this left block.
 
@@ -1607,7 +2784,36 @@ class LeftBlock(_BlockEnvironment):
         """
 
         if self.rank_coupled:
-            data = _contract_from_left_blocks_rank_coupled(W, bra_site, self, ket_site)
+            cpp_result = None
+            if moving_environment is not None:
+                cpp_result = _contract_rank_coupled_boundary_cpp(
+                    W,
+                    bra_site,
+                    self,
+                    ket_site,
+                    moving_environment=moving_environment,
+                    side="left",
+                    parent_bond=parent_bond,
+                    child_bond=child_bond,
+                    numeric_revision=numeric_revision,
+                )
+            if cpp_result is None:
+                data = _contract_from_left_blocks_rank_coupled(
+                    W,
+                    bra_site,
+                    self,
+                    ket_site,
+                )
+                return LeftBlock(data, rank_coupled=True)
+            data, packed, topology_revision, numeric_revision = cpp_result
+            return LeftBlock(
+                data,
+                rank_coupled=True,
+                packed_table=packed,
+                cpp_owned_boundary=True,
+                cpp_topology_revision=int(topology_revision),
+                cpp_numeric_revision=int(numeric_revision),
+            )
         else:
             if phys_slices is None:
                 raise ValueError("LeftBlock.advance requires phys_slices for non-rank-coupled blocks.")
@@ -1624,7 +2830,18 @@ class RightBlock(_BlockEnvironment):
     one MPS/MPO site from the right.
     """
 
-    def advance(self, W, bra_site, ket_site, *, phys_slices=None):
+    def advance(
+        self,
+        W,
+        bra_site,
+        ket_site,
+        *,
+        phys_slices=None,
+        moving_environment=None,
+        parent_bond=None,
+        child_bond=None,
+        numeric_revision=None,
+    ):
         """
         Absorb one site into this right block.
 
@@ -1636,7 +2853,36 @@ class RightBlock(_BlockEnvironment):
         """
 
         if self.rank_coupled:
-            data = _contract_from_right_blocks_rank_coupled(W, bra_site, self, ket_site)
+            cpp_result = None
+            if moving_environment is not None:
+                cpp_result = _contract_rank_coupled_boundary_cpp(
+                    W,
+                    bra_site,
+                    self,
+                    ket_site,
+                    moving_environment=moving_environment,
+                    side="right",
+                    parent_bond=parent_bond,
+                    child_bond=child_bond,
+                    numeric_revision=numeric_revision,
+                )
+            if cpp_result is None:
+                data = _contract_from_right_blocks_rank_coupled(
+                    W,
+                    bra_site,
+                    self,
+                    ket_site,
+                )
+                return RightBlock(data, rank_coupled=True)
+            data, packed, topology_revision, numeric_revision = cpp_result
+            return RightBlock(
+                data,
+                rank_coupled=True,
+                packed_table=packed,
+                cpp_owned_boundary=True,
+                cpp_topology_revision=int(topology_revision),
+                cpp_numeric_revision=int(numeric_revision),
+            )
         else:
             if phys_slices is None:
                 raise ValueError("RightBlock.advance requires phys_slices for non-rank-coupled blocks.")
@@ -1680,7 +2926,7 @@ def _contract_from_left_identity_blocks(A, E_map, B):
     for (q_lb, q_pb, q_rb), A_block in A.data.items():
         A_conj = np.asarray(A_block).conj()
         for (q_lk, q_pk, q_rk), B_block in B.data.items():
-            if q_pb != q_pk:
+            if q_pb != q_pk or q_rb != q_rk:
                 continue
             E_block = E_map.get((q_lb, q_lk))
             if E_block is None:
@@ -1754,6 +3000,1189 @@ def _rank_coupled_site_entries_by_edge(tensor, edge):
     return grouped
 
 
+def _packed_boundary_labels(packed):
+    """Return the integer topology payload installed in ``SU2MovingEnvironment``."""
+
+    topology_arrays = (
+        np.asarray(packed.ket_sector_ids, dtype=np.int64),
+        np.asarray(packed.entry_offsets, dtype=np.int64),
+        np.asarray(packed.out_sector_ids, dtype=np.int64),
+        np.asarray(packed.channel_offsets, dtype=np.int64),
+        np.asarray(packed.channel_ids, dtype=np.int64),
+        np.asarray(packed.block_pool.shape_offsets, dtype=np.int64),
+        np.asarray(packed.block_pool.shapes, dtype=np.int64),
+    )
+    header = np.asarray([array.size for array in topology_arrays], dtype=np.int64)
+    sector_quantum_numbers = []
+    for sector in packed.sector_codec.sectors:
+        charge = getattr(sector, "charge", None)
+        irrep = getattr(sector, "irrep", None)
+        two_j = getattr(irrep, "two_j", None)
+        if two_j is None:
+            two_j = getattr(sector, "two_j", None)
+        if charge is None or two_j is None:
+            sector_quantum_numbers = []
+            break
+        sector_quantum_numbers.extend((int(charge), int(two_j)))
+    labels = np.concatenate(
+        (
+            header,
+            *topology_arrays,
+            np.asarray(sector_quantum_numbers, dtype=np.int64),
+        )
+    )
+    digest = hashlib.blake2b(labels.tobytes(), digest_size=8).digest()
+    return labels, int.from_bytes(digest, "little") or 1
+
+
+def _empty_packed_boundary_from_specs(output_specs, *, side, bond):
+    """Build packed output topology without allocating its numerical arena."""
+
+    from .su2_qchem_plan import (
+        PackedArrayPool,
+        PackedSU2BoundaryTable,
+        SectorCodec,
+        _sort_key,
+    )
+
+    grouped = {}
+    for (q_out, q_in, channel), shape in output_specs.items():
+        grouped.setdefault(q_in, {}).setdefault(q_out, {})[int(channel)] = tuple(
+            int(dim) for dim in shape
+        )
+    sectors = [
+        sector
+        for q_in, out_map in grouped.items()
+        for sector in (q_in, *out_map)
+    ]
+    codec = SectorCodec.from_iterable(sectors)
+    ket_sector_ids = []
+    entry_offsets = [0]
+    out_sector_ids = []
+    channel_offsets = [0]
+    channel_ids = []
+    ordered_keys = []
+    offsets = [0]
+    shape_offsets = [0]
+    shapes = []
+    for q_in, out_map in sorted(grouped.items(), key=lambda item: _sort_key(item[0])):
+        ket_sector_ids.append(codec.id(q_in))
+        for q_out, channel_map in sorted(
+            out_map.items(),
+            key=lambda item: _sort_key(item[0]),
+        ):
+            out_sector_ids.append(codec.id(q_out))
+            for channel, shape in sorted(channel_map.items()):
+                key = (q_out, q_in, int(channel))
+                channel_ids.append(int(channel))
+                ordered_keys.append(key)
+                size = int(np.prod(shape, dtype=np.int64))
+                offsets.append(offsets[-1] + size)
+                shapes.extend(shape)
+                shape_offsets.append(len(shapes))
+            channel_offsets.append(len(channel_ids))
+        entry_offsets.append(len(out_sector_ids))
+    pool = PackedArrayPool(
+        data=np.empty(0, dtype=np.float64),
+        offsets=np.asarray(offsets, dtype=np.int64),
+        shape_offsets=np.asarray(shape_offsets, dtype=np.int64),
+        shapes=np.asarray(shapes, dtype=np.int64),
+    )
+    packed = PackedSU2BoundaryTable(
+        side=str(side),
+        bond=int(bond),
+        representation="rank_coupled_by_ket",
+        sector_codec=codec,
+        ket_sector_ids=np.asarray(ket_sector_ids, dtype=np.int64),
+        entry_offsets=np.asarray(entry_offsets, dtype=np.int64),
+        out_sector_ids=np.asarray(out_sector_ids, dtype=np.int64),
+        channel_offsets=np.asarray(channel_offsets, dtype=np.int64),
+        channel_ids=np.asarray(channel_ids, dtype=np.int64),
+        block_pool=pool,
+    )
+    return packed, {key: index for index, key in enumerate(ordered_keys)}
+
+
+def _contract_rank_coupled_boundary_cpp(
+    W,
+    A,
+    E_map,
+    B,
+    *,
+    moving_environment,
+    side,
+    parent_bond,
+    child_bond,
+    numeric_revision,
+):
+    """Plan one reduced boundary update and execute all numerical routes in C++."""
+
+    if (
+        not isinstance(W, RankCoupledMPO)
+        or parent_bond is None
+        or child_bond is None
+        or not hasattr(moving_environment, "advance_boundary")
+    ):
+        return None
+    side = str(side).lower()
+    edge = "left" if side == "left" else "right"
+    packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
+    if packed_parent is None:
+        return None
+    complex_update = bool(
+        np.iscomplexobj(packed_parent.block_pool.data)
+        or np.dtype(_mpo_dtype(W)).kind == "c"
+        or any(np.iscomplexobj(block) for block in A.data.values())
+        or any(np.iscomplexobj(block) for block in B.data.values())
+    )
+    if complex_update and not hasattr(moving_environment, "advance_boundary_complex"):
+        return None
+    if (
+        not complex_update
+        and getattr(W, "normal_complementary_owner", None) is moving_environment
+        and getattr(W, "normal_complementary_plan", None) is not None
+    ):
+        return _contract_normal_complementary_boundary_cpp(
+            W,
+            A,
+            E_map,
+            B,
+            moving_environment=moving_environment,
+            side=side,
+            parent_bond=parent_bond,
+            child_bond=child_bond,
+            numeric_revision=numeric_revision,
+        )
+
+    sectors = tuple(packed_parent.sector_codec.sectors)
+    parent_blocks = {}
+    for row_index, ket_id in enumerate(packed_parent.ket_sector_ids):
+        q_in = sectors[int(ket_id)]
+        entry_start = int(packed_parent.entry_offsets[row_index])
+        entry_stop = int(packed_parent.entry_offsets[row_index + 1])
+        for entry_index in range(entry_start, entry_stop):
+            q_out = sectors[int(packed_parent.out_sector_ids[entry_index])]
+            channel_start = int(packed_parent.channel_offsets[entry_index])
+            channel_stop = int(packed_parent.channel_offsets[entry_index + 1])
+            parent_blocks[(q_out, q_in)] = {
+                int(packed_parent.channel_ids[channel_index]): int(channel_index)
+                for channel_index in range(channel_start, channel_stop)
+            }
+
+    a_entries_by_edge = _rank_coupled_site_entries_by_edge(A, edge)
+    b_entries_by_edge = _rank_coupled_site_entries_by_edge(B, edge)
+    bra_arrays = []
+    ket_arrays = []
+    mpo_arrays = []
+    bra_keys = []
+    ket_keys = []
+    bra_indices = {}
+    ket_indices = {}
+    mpo_indices = {}
+    routes = []
+    output_specs = {}
+    reduced_cache = {}
+    fully_reduced_physical = any(
+        (tensor.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+        for tensor in (A, B)
+    )
+    reduced_physical = (
+        fully_reduced_physical
+        or bool(getattr(W, "normal_complementary_fully_reduced", False))
+        or (not W.reduced_terms)
+        or _rank_coupled_core_has_family(
+            W,
+            _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+        )
+    )
+
+    def register(array, arrays, index, *, block_key=None, keys=None):
+        packed = (
+            np.ascontiguousarray(array, dtype=np.complex128)
+            if complex_update
+            else _real64_contiguous_or_none(array)
+        )
+        if packed is None:
+            return None
+        key = id(packed)
+        found = index.get(key)
+        if found is None:
+            found = len(arrays)
+            index[key] = found
+            arrays.append(packed)
+            if keys is not None:
+                keys.append(block_key)
+        return int(found)
+
+    for (q_boundary_bra, q_boundary_ket), channel_map in parent_blocks.items():
+        a_entries = a_entries_by_edge.get(q_boundary_bra)
+        b_entries = b_entries_by_edge.get(q_boundary_ket)
+        if not a_entries or not b_entries:
+            continue
+        for q_next_bra, q_phys_bra, A_arr, bra_dim, _a_dtype in a_entries:
+            bra_key = (
+                (q_boundary_bra, q_phys_bra, q_next_bra)
+                if edge == "left"
+                else (q_next_bra, q_phys_bra, q_boundary_bra)
+            )
+            bra_index = register(
+                A_arr,
+                bra_arrays,
+                bra_indices,
+                block_key=bra_key,
+                keys=bra_keys,
+            )
+            if bra_index is None:
+                return None
+            for q_next_ket, q_phys_ket, B_arr, ket_dim, _b_dtype in b_entries:
+                ket_key = (
+                    (q_boundary_ket, q_phys_ket, q_next_ket)
+                    if edge == "left"
+                    else (q_next_ket, q_phys_ket, q_boundary_ket)
+                )
+                ket_index = register(
+                    B_arr,
+                    ket_arrays,
+                    ket_indices,
+                    block_key=ket_key,
+                    keys=ket_keys,
+                )
+                if ket_index is None:
+                    return None
+                reduced_key = (
+                    (
+                        q_boundary_bra,
+                        q_boundary_ket,
+                        q_phys_bra,
+                        q_phys_ket,
+                        q_next_bra,
+                        q_next_ket,
+                    )
+                    if reduced_physical
+                    else (q_phys_bra, q_phys_ket)
+                )
+                reduced = reduced_cache.get(reduced_key)
+                if reduced is None:
+                    if side == "left":
+                        raw_reduced = (
+                            _left_reduced_rank_coupled_block(
+                                W,
+                                q_boundary_bra,
+                                q_boundary_ket,
+                                q_phys_bra,
+                                q_phys_ket,
+                                q_next_bra,
+                                q_next_ket,
+                            )
+                            if reduced_physical
+                            else W.reduced_block(q_phys_bra, q_phys_ket)
+                        )
+                    else:
+                        raw_reduced = (
+                            _right_reduced_rank_coupled_block(
+                                W,
+                                q_boundary_bra,
+                                q_boundary_ket,
+                                q_phys_bra,
+                                q_phys_ket,
+                                q_next_bra,
+                                q_next_ket,
+                            )
+                            if reduced_physical
+                            else W.reduced_block(q_phys_bra, q_phys_ket)
+                        )
+                    reduced = tuple(
+                        (int(left_channel), int(right_channel), np.asarray(block))
+                        for (left_channel, right_channel), block in (
+                            raw_reduced or {}
+                        ).items()
+                    )
+                    reduced_cache[reduced_key] = reduced
+                for left_channel, right_channel, W_arr in reduced:
+                    parent_channel = (
+                        int(left_channel)
+                        if side == "left"
+                        else int(right_channel)
+                    )
+                    parent_index = channel_map.get(parent_channel)
+                    if parent_index is None:
+                        continue
+                    mpo_index = register(W_arr, mpo_arrays, mpo_indices)
+                    if mpo_index is None:
+                        return None
+                    output_channel = (
+                        int(right_channel)
+                        if side == "left"
+                        else int(left_channel)
+                    )
+                    output_key = (
+                        q_next_bra,
+                        q_next_ket,
+                        output_channel,
+                    )
+                    output_shape = (
+                        (
+                            int(W_arr.shape[1]),
+                            int(bra_dim),
+                            int(ket_dim),
+                        )
+                        if side == "left"
+                        else (
+                            int(W_arr.shape[0]),
+                            int(bra_dim),
+                            int(ket_dim),
+                        )
+                    )
+                    previous_shape = output_specs.setdefault(
+                        output_key,
+                        output_shape,
+                    )
+                    if previous_shape != output_shape:
+                        raise ValueError(
+                            "SU(2) boundary routes disagree on an output block shape."
+                        )
+                    routes.append(
+                        (
+                            int(parent_index),
+                            int(bra_index),
+                            int(ket_index),
+                            int(mpo_index),
+                            output_key,
+                        )
+                    )
+    if not routes:
+        return None
+
+    output_table, output_indices = _empty_packed_boundary_from_specs(
+        output_specs,
+        side=side,
+        bond=int(child_bond),
+    )
+    integer_routes = np.asarray(
+        [
+            (
+                parent_index,
+                bra_index,
+                ket_index,
+                mpo_index,
+                output_indices[output_key],
+            )
+            for (
+                parent_index,
+                bra_index,
+                ket_index,
+                mpo_index,
+                output_key,
+            ) in routes
+        ],
+        dtype=np.int64,
+    )
+    from .su2_qchem_plan import PackedArrayPool
+
+    bra_pool = PackedArrayPool.from_arrays(bra_arrays)
+    ket_pool = PackedArrayPool.from_arrays(ket_arrays)
+    mpo_pool = PackedArrayPool.from_arrays(mpo_arrays)
+    labels, topology_revision = _packed_boundary_labels(output_table)
+    numeric_revision = int(
+        1 if numeric_revision is None else numeric_revision
+    )
+    metric_route_coefficients = None
+    if (
+        bool(getattr(W, "fully_reduced_identity", False))
+        and side == "right"
+    ):
+        metric_route_coefficients = np.asarray(
+            [
+                (
+                    float(_sector_irrep(bra_keys[int(route[1])][2]).dim)
+                    * float(_sector_irrep(ket_keys[int(route[2])][2]).dim)
+                    / (
+                        float(_sector_irrep(bra_keys[int(route[1])][0]).dim)
+                        * float(_sector_irrep(ket_keys[int(route[2])][0]).dim)
+                    )
+                )
+                for route in integer_routes
+            ],
+            dtype=np.float64,
+        )
+    metric_route_digest = hashlib.blake2b(digest_size=8)
+    metric_route_digest.update(integer_routes.view(np.uint8))
+    metric_route_digest.update(
+        np.asarray(
+            (
+                np.ones(len(integer_routes), dtype=np.float64)
+                if metric_route_coefficients is None
+                else metric_route_coefficients
+            ),
+            dtype=np.float64,
+        ).view(np.uint8)
+    )
+    metric_route_digest.update(
+        np.asarray(mpo_pool.offsets, dtype=np.int64).view(np.uint8)
+    )
+    metric_route_digest.update(
+        np.asarray(mpo_pool.shapes, dtype=np.int64).view(np.uint8)
+    )
+    metric_route_topology_revision = (
+        int.from_bytes(metric_route_digest.digest(), "little") or 1
+    )
+    bra_split_marker = (
+        (getattr(A, "metadata", None) or {}).get("_cpp_split_site")
+    )
+    ket_split_marker = (
+        (getattr(B, "metadata", None) or {}).get("_cpp_split_site")
+    )
+    metric_split_action = (
+        not complex_update
+        and bool(getattr(W, "fully_reduced_identity", False))
+        and bra_split_marker is not None
+        and bra_split_marker == ket_split_marker
+        and len(bra_split_marker) == 4
+        and callable(
+            getattr(
+                moving_environment,
+                "advance_metric_boundary_from_split_site",
+                None,
+            )
+        )
+        and moving_environment.split_site_installed(
+            int(bra_split_marker[1]),
+            bra_split_marker,
+        )
+    )
+    if metric_split_action:
+        values, _same_topology = (
+            moving_environment.advance_metric_boundary_from_split_site(
+                side,
+                int(parent_bond),
+                int(child_bond),
+                int(bra_split_marker[1]),
+                integer_routes,
+                tuple(bra_keys),
+                tuple(ket_keys),
+                bra_split_marker,
+                mpo_pool.data,
+                mpo_pool.offsets,
+                mpo_pool.shape_offsets,
+                mpo_pool.shapes,
+                output_table.block_pool.offsets,
+                output_table.block_pool.shape_offsets,
+                output_table.block_pool.shapes,
+                labels,
+                int(topology_revision),
+                int(numeric_revision),
+                int(metric_route_topology_revision),
+                route_coefficients=metric_route_coefficients,
+            )
+        )
+    else:
+        advance = (
+            moving_environment.advance_boundary_complex
+            if complex_update
+            else moving_environment.advance_boundary
+        )
+        values, _same_topology = advance(
+            side,
+            int(parent_bond),
+            int(child_bond),
+            integer_routes,
+            bra_pool.data,
+            bra_pool.offsets,
+            bra_pool.shape_offsets,
+            bra_pool.shapes,
+            ket_pool.data,
+            ket_pool.offsets,
+            ket_pool.shape_offsets,
+            ket_pool.shapes,
+            mpo_pool.data,
+            mpo_pool.offsets,
+            mpo_pool.shape_offsets,
+            mpo_pool.shapes,
+            output_table.block_pool.offsets,
+            output_table.block_pool.shape_offsets,
+            output_table.block_pool.shapes,
+            labels,
+            int(topology_revision),
+            int(numeric_revision),
+            metric_boundary=bool(
+                getattr(W, "fully_reduced_identity", False)
+            ),
+            route_coefficients=metric_route_coefficients,
+        )
+    output_pool = replace(
+        output_table.block_pool,
+        data=np.ascontiguousarray(
+            values,
+            dtype=np.complex128 if complex_update else np.float64,
+        ),
+        _shape_cache=None,
+        _array_cache=None,
+    )
+    output_table = replace(output_table, block_pool=output_pool)
+    data = _PackedRankCoupledEnvironmentMap(
+        output_table,
+        n_channels=(
+            len(W.right_channel_irreps)
+            if side == "left"
+            else len(W.left_channel_irreps)
+        ),
+    )
+    return (
+        data,
+        output_table,
+        int(topology_revision),
+        int(numeric_revision),
+    )
+
+
+def _pack_normal_complementary_boundary_routes_cpp(
+    W,
+    A,
+    B,
+    packed_parent,
+    *,
+    side,
+    child_bond,
+):
+    """Pack NC topology in compiled code, leaving only sector objects in Python."""
+
+    module = _su2_kernel_module()
+    kernel = (
+        None
+        if module is None
+        else getattr(
+            module,
+            "pack_normal_complementary_boundary_routes",
+            None,
+        )
+    )
+    if kernel is None:
+        return None
+    plan = W.normal_complementary_plan
+    source = np.asarray(plan["source"], dtype=np.int64)
+    target = np.asarray(plan["target"], dtype=np.int64)
+    operator_ids = np.asarray(plan["operator"], dtype=np.int64)
+    parent_channels = source if side == "left" else target
+    output_channels = target if side == "left" else source
+    n_parent_channels = int(
+        plan["left_channels"] if side == "left" else plan["right_channels"]
+    )
+    schedule_key = f"_transition_schedule_{side}"
+    schedule = plan.get(schedule_key)
+    if schedule is None:
+        buckets = [[] for _ in range(n_parent_channels)]
+        for transition, channel in enumerate(parent_channels):
+            buckets[int(channel)].append(int(transition))
+        transition_offsets = np.asarray(
+            np.cumsum([0, *(len(bucket) for bucket in buckets)]),
+            dtype=np.int64,
+        )
+        transition_ids = np.asarray(
+            [transition for bucket in buckets for transition in bucket],
+            dtype=np.int64,
+        )
+        schedule = (transition_offsets, transition_ids)
+        plan[schedule_key] = schedule
+    transition_offsets, transition_ids = schedule
+
+    edge = "left" if side == "left" else "right"
+    a_items = tuple(A.data.items())
+    b_items = tuple(B.data.items())
+    next_sectors = []
+    for key, _block in (*a_items, *b_items):
+        q_left, _q_phys, q_right = key
+        next_sectors.append(q_right if edge == "left" else q_left)
+    next_sectors = tuple(dict.fromkeys(next_sectors))
+    next_index = {sector: idx for idx, sector in enumerate(next_sectors)}
+    parent_index = packed_parent.sector_codec.index
+
+    def site_entries(items):
+        entries = []
+        keys = []
+        for key, block in items:
+            q_left, q_phys, q_right = key
+            array = np.asarray(block)
+            if edge == "left":
+                q_boundary = q_left
+                q_next = q_right
+                dimension = int(array.shape[2])
+            else:
+                q_boundary = q_right
+                q_next = q_left
+                dimension = int(array.shape[0])
+            boundary_id = parent_index.get(q_boundary)
+            if boundary_id is None:
+                continue
+            array_index = len(keys)
+            keys.append(key)
+            entries.append(
+                (
+                    int(boundary_id),
+                    int(next_index[q_next]),
+                    int(q_phys.charge),
+                    int(q_phys.irrep.two_j),
+                    int(q_boundary.irrep.two_j),
+                    int(q_next.irrep.two_j),
+                    dimension,
+                    array_index,
+                )
+            )
+        return (
+            np.asarray(entries, dtype=np.int64).reshape((-1, 8)),
+            tuple(keys),
+        )
+
+    bra_entries, bra_keys = site_entries(a_items)
+    ket_entries, ket_keys = site_entries(b_items)
+    primitive_nonzero = np.asarray(
+        plan.get("_primitive_nonzero"),
+        dtype=np.uint8,
+    )
+    if (
+        primitive_nonzero.ndim != 3
+        or primitive_nonzero.shape[:2] != (3, 3)
+    ):
+        return None
+    integer_routes, output_specs = kernel(
+        packed_parent.ket_sector_ids,
+        packed_parent.entry_offsets,
+        packed_parent.out_sector_ids,
+        packed_parent.channel_offsets,
+        packed_parent.channel_ids,
+        transition_offsets,
+        transition_ids,
+        operator_ids,
+        output_channels,
+        primitive_nonzero,
+        bra_entries,
+        ket_entries,
+        len(next_sectors),
+        int(
+            plan["right_channels"]
+            if side == "left"
+            else plan["left_channels"]
+        ),
+    )
+    integer_routes = np.ascontiguousarray(integer_routes, dtype=np.int32)
+    output_specs = np.asarray(output_specs, dtype=np.int64).reshape((-1, 6))
+    if integer_routes.size == 0:
+        return None
+    output_quantum_numbers = np.asarray(
+        plan[
+            "right_channel_quantum_numbers"
+            if side == "left"
+            else "left_channel_quantum_numbers"
+        ],
+        dtype=np.int64,
+    )
+    specs = {}
+    output_keys = [None] * int(output_specs.shape[0])
+    for (
+        next_bra,
+        next_ket,
+        output_channel,
+        bra_dim,
+        ket_dim,
+        output_id,
+    ) in output_specs:
+        output_key = (
+            next_sectors[int(next_bra)],
+            next_sectors[int(next_ket)],
+            int(output_channel),
+        )
+        output_keys[int(output_id)] = output_key
+        specs[output_key] = (
+            int(output_quantum_numbers[int(output_channel), 1]) + 1,
+            int(bra_dim),
+            int(ket_dim),
+        )
+    output_table, output_indices = _empty_packed_boundary_from_specs(
+        specs,
+        side=side,
+        bond=int(child_bond),
+    )
+    output_remap = np.asarray(
+        [output_indices[key] for key in output_keys],
+        dtype=np.int64,
+    )
+    integer_routes[:, 6] = output_remap[integer_routes[:, 6]]
+    route_topology_revision = int.from_bytes(
+        hashlib.blake2b(
+            integer_routes.view(np.uint8),
+            digest_size=8,
+        ).digest(),
+        "little",
+    ) or 1
+    labels, topology_revision = _packed_boundary_labels(output_table)
+    return {
+        "bra_keys": bra_keys,
+        "ket_keys": ket_keys,
+        "routes": integer_routes,
+        "output_table": output_table,
+        "labels": labels,
+        "topology_revision": int(topology_revision),
+        "route_topology_revision": int(route_topology_revision),
+    }
+
+
+def _contract_normal_complementary_boundary_cpp(
+    W,
+    A,
+    E_map,
+    B,
+    *,
+    moving_environment,
+    side,
+    parent_bond,
+    child_bond,
+    numeric_revision,
+):
+    """Advance one NC boundary without constructing Python MPO component cores."""
+
+    if (
+        parent_bond is None
+        or child_bond is None
+        or not hasattr(
+            moving_environment,
+            "advance_normal_complementary_boundary",
+        )
+    ):
+        return None
+    side = str(side).lower()
+    edge = "left" if side == "left" else "right"
+    packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
+    if (
+        packed_parent is None
+        or np.iscomplexobj(packed_parent.block_pool.data)
+    ):
+        return None
+    parent_labels, parent_topology_revision = _packed_boundary_labels(
+        packed_parent
+    )
+    parent_numeric_revision = int(
+        getattr(E_map, "cpp_numeric_revision", 0) or 1
+    )
+    if not moving_environment.boundary_installed(
+        side,
+        int(parent_bond),
+        int(parent_topology_revision),
+        parent_numeric_revision,
+    ):
+        moving_environment.install_boundary(
+            side,
+            int(parent_bond),
+            packed_parent.block_pool.data,
+            packed_parent.block_pool.offsets,
+            parent_labels,
+            int(parent_topology_revision),
+            parent_numeric_revision,
+        )
+
+    plan = W.normal_complementary_plan
+    def tensor_topology_signature(tensor):
+        metadata = getattr(tensor, "metadata", None)
+        cache_key = "_normal_complementary_tensor_topology"
+        if (
+            isinstance(metadata, dict)
+            and cache_key in metadata
+        ):
+            return metadata[cache_key]
+        signature = tuple(
+            (key, tuple(int(dim) for dim in np.asarray(block).shape))
+            for key, block in tensor.data.items()
+        )
+        if isinstance(metadata, dict):
+            metadata[cache_key] = signature
+        return signature
+
+    parent_sector_signature = tuple(
+        (
+            int(getattr(sector, "charge", 0)),
+            int(getattr(getattr(sector, "irrep", None), "two_j", 0)),
+            repr(getattr(sector, "point_group", None)),
+        )
+        for sector in packed_parent.sector_codec.sectors
+    )
+
+    route_cache = plan.setdefault("_boundary_action_cache", {})
+    route_cache_key = (
+        side,
+        int(parent_bond),
+        int(child_bond),
+        int(parent_topology_revision),
+        parent_sector_signature,
+        tensor_topology_signature(A),
+        tensor_topology_signature(B),
+    )
+    cached_route_plan = route_cache.get(route_cache_key)
+    if (
+        cached_route_plan is not None
+        and cached_route_plan.get("routes") is None
+    ):
+        # A fully C++ half sweep may replace the action stored for this bond
+        # after Python discarded its duplicate route array. Repack the compact
+        # topology for this explicit reference/expectation contraction instead
+        # of assuming that the last C++ action still has this cache revision.
+        cached_route_plan = None
+    if cached_route_plan is None:
+        cached_route_plan = _pack_normal_complementary_boundary_routes_cpp(
+            W,
+            A,
+            B,
+            packed_parent,
+            side=side,
+            child_bond=child_bond,
+        )
+        if cached_route_plan is not None:
+            for key in tuple(route_cache):
+                if (
+                    key[:3] == route_cache_key[:3]
+                    and key != route_cache_key
+                ):
+                    route_cache.pop(key)
+            route_cache[route_cache_key] = cached_route_plan
+    if cached_route_plan is not None:
+        bra_keys = cached_route_plan["bra_keys"]
+        ket_keys = cached_route_plan["ket_keys"]
+        integer_routes = cached_route_plan["routes"]
+        output_table = cached_route_plan["output_table"]
+        labels = cached_route_plan["labels"]
+        topology_revision = cached_route_plan["topology_revision"]
+        route_topology_revision = cached_route_plan[
+            "route_topology_revision"
+        ]
+    else:
+        source = np.asarray(plan["source"], dtype=np.int64)
+        target = np.asarray(plan["target"], dtype=np.int64)
+        operator_ids = np.asarray(plan["operator"], dtype=np.int64)
+        primitive_nonzero = plan.get("_primitive_nonzero")
+        parent_channels = source if side == "left" else target
+        output_channels = target if side == "left" else source
+        output_quantum_numbers = np.asarray(
+            plan[
+                "right_channel_quantum_numbers"
+                if side == "left"
+                else "left_channel_quantum_numbers"
+            ],
+            dtype=np.int64,
+        )
+        transitions_by_parent = {}
+        for transition, channel in enumerate(parent_channels):
+            transitions_by_parent.setdefault(int(channel), []).append(
+                int(transition)
+            )
+
+        sectors = tuple(packed_parent.sector_codec.sectors)
+        parent_blocks = {}
+        for row_index, ket_id in enumerate(packed_parent.ket_sector_ids):
+            q_in = sectors[int(ket_id)]
+            entry_start = int(packed_parent.entry_offsets[row_index])
+            entry_stop = int(packed_parent.entry_offsets[row_index + 1])
+            for entry_index in range(entry_start, entry_stop):
+                q_out = sectors[int(packed_parent.out_sector_ids[entry_index])]
+                channel_start = int(packed_parent.channel_offsets[entry_index])
+                channel_stop = int(packed_parent.channel_offsets[entry_index + 1])
+                parent_blocks[(q_out, q_in)] = {
+                    int(packed_parent.channel_ids[channel_index]): int(channel_index)
+                    for channel_index in range(channel_start, channel_stop)
+                }
+
+        a_entries_by_edge = _rank_coupled_site_entries_by_edge(A, edge)
+        b_entries_by_edge = _rank_coupled_site_entries_by_edge(B, edge)
+        a_keys_by_array = {
+            id(np.asarray(block)): key for key, block in A.data.items()
+        }
+        b_keys_by_array = {
+            id(np.asarray(block)): key for key, block in B.data.items()
+        }
+        bra_arrays = []
+        ket_arrays = []
+        bra_keys = []
+        ket_keys = []
+        bra_indices = {}
+        ket_indices = {}
+        routes = []
+        output_specs = {}
+        cacheable = True
+
+        def register(array, arrays, keys, index, source_keys):
+            nonlocal cacheable
+            source_array = np.asarray(array)
+            real = _real64_contiguous_or_none(source_array)
+            if real is None:
+                return None
+            array_id = id(source_array)
+            found = index.get(array_id)
+            if found is None:
+                found = len(arrays)
+                index[array_id] = found
+                arrays.append(real)
+                source_key = source_keys.get(array_id)
+                if source_key is None:
+                    cacheable = False
+                keys.append(source_key)
+            return int(found)
+
+        for (q_boundary_bra, q_boundary_ket), channel_map in parent_blocks.items():
+            a_entries = a_entries_by_edge.get(q_boundary_bra)
+            b_entries = b_entries_by_edge.get(q_boundary_ket)
+            if not a_entries or not b_entries:
+                continue
+            for q_next_bra, q_phys_bra, A_arr, bra_dim, _a_dtype in a_entries:
+                bra_index = register(
+                    A_arr,
+                    bra_arrays,
+                    bra_keys,
+                    bra_indices,
+                    a_keys_by_array,
+                )
+                if bra_index is None:
+                    return None
+                for q_next_ket, q_phys_ket, B_arr, ket_dim, _b_dtype in b_entries:
+                    ket_index = register(
+                        B_arr,
+                        ket_arrays,
+                        ket_keys,
+                        ket_indices,
+                        b_keys_by_array,
+                    )
+                    if ket_index is None:
+                        return None
+                    physical_out_charge = int(q_phys_bra.charge)
+                    physical_in_charge = int(q_phys_ket.charge)
+                    for parent_channel, parent_index in channel_map.items():
+                        for transition in transitions_by_parent.get(
+                            int(parent_channel),
+                            (),
+                        ):
+                            operator_id = int(operator_ids[transition])
+                            if (
+                                primitive_nonzero is not None
+                                and not primitive_nonzero[
+                                    physical_out_charge,
+                                    physical_in_charge,
+                                    operator_id,
+                                ]
+                            ):
+                                continue
+                            output_channel = int(output_channels[transition])
+                            output_key = (
+                                q_next_bra,
+                                q_next_ket,
+                                output_channel,
+                            )
+                            channel_two_j = int(
+                                output_quantum_numbers[output_channel, 1]
+                            )
+                            output_shape = (
+                                channel_two_j + 1,
+                                int(bra_dim),
+                                int(ket_dim),
+                            )
+                            previous_shape = output_specs.setdefault(
+                                output_key,
+                                output_shape,
+                            )
+                            if previous_shape != output_shape:
+                                raise ValueError(
+                                    "SU(2) NC routes disagree on an output block shape."
+                                )
+                            routes.append(
+                                (
+                                    int(parent_index),
+                                    int(bra_index),
+                                    int(ket_index),
+                                    int(transition),
+                                    physical_out_charge,
+                                    physical_in_charge,
+                                    output_key,
+                                    int(q_boundary_bra.irrep.two_j),
+                                    int(q_boundary_ket.irrep.two_j),
+                                    int(q_phys_bra.irrep.two_j),
+                                    int(q_phys_ket.irrep.two_j),
+                                    int(q_next_bra.irrep.two_j),
+                                    int(q_next_ket.irrep.two_j),
+                                )
+                            )
+        if not routes:
+            return None
+
+        output_table, output_indices = _empty_packed_boundary_from_specs(
+            output_specs,
+            side=side,
+            bond=int(child_bond),
+        )
+        integer_routes = np.asarray(
+            [
+                (
+                    parent_index,
+                    bra_index,
+                    ket_index,
+                    transition,
+                    physical_out_charge,
+                    physical_in_charge,
+                    output_indices[output_key],
+                    q_boundary_bra,
+                    q_boundary_ket,
+                    q_phys_bra,
+                    q_phys_ket,
+                    q_next_bra,
+                    q_next_ket,
+                )
+                for (
+                    parent_index,
+                    bra_index,
+                    ket_index,
+                    transition,
+                    physical_out_charge,
+                    physical_in_charge,
+                    output_key,
+                    q_boundary_bra,
+                    q_boundary_ket,
+                    q_phys_bra,
+                    q_phys_ket,
+                    q_next_bra,
+                    q_next_ket,
+                ) in routes
+            ],
+            dtype=np.int32,
+        )
+        route_topology_revision = int.from_bytes(
+            hashlib.blake2b(
+                integer_routes.view(np.uint8),
+                digest_size=8,
+            ).digest(),
+            "little",
+        ) or 1
+        labels, topology_revision = _packed_boundary_labels(output_table)
+        if cacheable:
+            for key in tuple(route_cache):
+                if (
+                    key[:3] == route_cache_key[:3]
+                    and key != route_cache_key
+                ):
+                    route_cache.pop(key)
+            route_cache[route_cache_key] = {
+                "bra_keys": tuple(bra_keys),
+                "ket_keys": tuple(ket_keys),
+                "routes": integer_routes,
+                "output_table": output_table,
+                "labels": labels,
+                "topology_revision": int(topology_revision),
+                "route_topology_revision": int(route_topology_revision),
+            }
+    numeric_revision = int(
+        1 if numeric_revision is None else numeric_revision
+    )
+    bra_split_marker = (
+        (getattr(A, "metadata", None) or {}).get("_cpp_split_site")
+    )
+    ket_split_marker = (
+        (getattr(B, "metadata", None) or {}).get("_cpp_split_site")
+    )
+    split_site_action = (
+        bra_split_marker is not None
+        and bra_split_marker == ket_split_marker
+        and len(bra_split_marker) == 4
+        and int(bra_split_marker[1]) == int(W.normal_complementary_site)
+        and all(key is not None for key in (*bra_keys, *ket_keys))
+        and hasattr(
+            moving_environment,
+            "advance_normal_complementary_boundary_from_split_site",
+        )
+        and moving_environment.split_site_installed(
+            int(W.normal_complementary_site),
+            bra_split_marker,
+        )
+    )
+    if split_site_action:
+        values, _same_topology = (
+            moving_environment.advance_normal_complementary_boundary_from_split_site(
+                side,
+                int(parent_bond),
+                int(child_bond),
+                int(W.normal_complementary_site),
+                bool(getattr(W, "normal_complementary_fully_reduced", False)),
+                integer_routes,
+                bra_keys,
+                ket_keys,
+                bra_split_marker,
+                output_table.block_pool.offsets,
+                output_table.block_pool.shape_offsets,
+                output_table.block_pool.shapes,
+                labels,
+                int(topology_revision),
+                int(numeric_revision),
+                bool(getattr(W, "normal_complementary_right_dual", False)),
+                int(route_topology_revision),
+            )
+        )
+    else:
+        bra_arrays = [
+            _real64_contiguous_or_none(A.data[key])
+            for key in bra_keys
+        ]
+        ket_arrays = [
+            _real64_contiguous_or_none(B.data[key])
+            for key in ket_keys
+        ]
+        if any(array is None for array in (*bra_arrays, *ket_arrays)):
+            return None
+        from .su2_qchem_plan import PackedArrayPool
+
+        bra_pool = PackedArrayPool.from_arrays(bra_arrays)
+        ket_pool = PackedArrayPool.from_arrays(ket_arrays)
+        values, _same_topology = (
+            moving_environment.advance_normal_complementary_boundary(
+                side,
+                int(parent_bond),
+                int(child_bond),
+                int(W.normal_complementary_site),
+                bool(getattr(W, "normal_complementary_fully_reduced", False)),
+                integer_routes,
+                bra_pool.data,
+                bra_pool.offsets,
+                bra_pool.shape_offsets,
+                bra_pool.shapes,
+                ket_pool.data,
+                ket_pool.offsets,
+                ket_pool.shape_offsets,
+                ket_pool.shapes,
+                output_table.block_pool.offsets,
+                output_table.block_pool.shape_offsets,
+                output_table.block_pool.shapes,
+                labels,
+                int(topology_revision),
+                int(numeric_revision),
+                bool(getattr(W, "normal_complementary_right_dual", False)),
+                int(route_topology_revision),
+            )
+        )
+    if cached_route_plan is not None:
+        cached_route_plan["routes"] = None
+    output_pool = replace(
+        output_table.block_pool,
+        data=np.ascontiguousarray(values, dtype=np.float64),
+        _shape_cache=None,
+        _array_cache=None,
+    )
+    output_table = replace(output_table, block_pool=output_pool)
+    data = _PackedRankCoupledEnvironmentMap(
+        output_table,
+        n_channels=int(
+            plan["right_channels"]
+            if side == "left"
+            else plan["left_channels"]
+        ),
+    )
+    return (
+        data,
+        output_table,
+        int(topology_revision),
+        int(numeric_revision),
+    )
+
+
 def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
     out = {}
     mpo_dtype = _mpo_dtype(W)
@@ -1768,28 +4197,52 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
         if module is None or not _USE_REAL_RANK_COUPLED_ACCUMULATE
         else getattr(module, "accumulate_rank_coupled_left_real_terms", None)
     )
-    reduced_physical = (not W.reduced_terms) or _rank_coupled_core_has_family(
-        W,
-        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    fully_reduced_physical = any(
+        (tensor.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+        for tensor in (A, B)
+    )
+    reduced_physical = (
+        fully_reduced_physical
+        or bool(getattr(W, "normal_complementary_fully_reduced", False))
+        or (not W.reduced_terms)
+        or _rank_coupled_core_has_family(
+            W,
+            _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+        )
     )
     a_blocks_by_left = _rank_coupled_site_entries_by_edge(A, "left")
     b_blocks_by_left = _rank_coupled_site_entries_by_edge(B, "left")
     reduced_cache = {}
+    active_reduced_cache = {}
     for (q_lb, q_lk), E_blocks in E_map.items():
         a_entries = a_blocks_by_left.get(q_lb)
         b_entries = b_blocks_by_left.get(q_lk)
         if not a_entries or not b_entries:
             continue
-        e_arrays = tuple(np.asarray(block) for block in E_blocks)
+        e_arrays = RankCoupledChannelBlocks(
+            {
+                int(channel): np.asarray(block)
+                for channel, block in _rank_coupled_channel_items(E_blocks)
+            },
+            len(E_blocks),
+        )
         if real_batch_kernel is not None:
-            e_real_arrays = tuple(_real64_contiguous_or_none(block) for block in e_arrays)
-            if any(block is None for block in e_real_arrays):
+            e_real_data = {
+                channel: _real64_contiguous_or_none(block)
+                for channel, block in e_arrays.items()
+            }
+            if any(block is None for block in e_real_data.values()):
                 e_real_arrays = None
+            else:
+                e_real_arrays = RankCoupledChannelBlocks(
+                    e_real_data,
+                    len(e_arrays),
+                )
         else:
             e_real_arrays = None
-        e_dtypes = tuple(block.dtype for block in e_arrays)
+        e_dtypes = tuple(block.dtype for block in e_arrays.values())
         for q_rb, q_pb, A_arr, bra_dim, a_dtype in a_entries:
-            A_conj = A_arr.conj()
+            A_conj = A_arr if not np.iscomplexobj(A_arr) else A_arr.conj()
             A_real = (
                 None
                 if real_batch_kernel is None
@@ -1841,18 +4294,41 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                         ),
                     )
                     reduced_cache[reduced_key] = cached
-                reduced, reduced_real = cached
+                reduced, _reduced_real = cached
+                active_key = (reduced_key, tuple(e_arrays.data))
+                active_cached = active_reduced_cache.get(active_key)
+                if active_cached is None:
+                    reduced = tuple(
+                        term for term in reduced if int(term[0]) in e_arrays
+                    )
+                    active_cached = (
+                        reduced,
+                        (
+                            None
+                            if real_batch_kernel is None
+                            else _rank_coupled_real_term_arrays(reduced)
+                        ),
+                    )
+                    active_reduced_cache[active_key] = active_cached
+                reduced, reduced_real = active_cached
                 if not reduced:
                     continue
                 key = (q_rb, q_rk)
+                dtype = np.result_type(mpo_dtype, a_dtype, b_dtype, *e_dtypes)
                 target = out.get(key)
                 if target is None:
-                    dtype = np.result_type(mpo_dtype, a_dtype, b_dtype, *e_dtypes)
-                    target = [
-                        np.zeros((irrep.dim, bra_dim, ket_dim), dtype=dtype)
-                        for irrep in W.right_channel_irreps
-                    ]
+                    target = RankCoupledChannelBlocks(
+                        {},
+                        len(W.right_channel_irreps),
+                    )
                     out[key] = target
+                for _left_idx, right_idx, _w_block in reduced:
+                    if int(right_idx) not in target:
+                        irrep = W.right_channel_irreps[int(right_idx)]
+                        target.data[int(right_idx)] = np.zeros(
+                            (irrep.dim, bra_dim, ket_dim),
+                            dtype=dtype,
+                        )
                 real_attempted = (
                     real_batch_kernel is not None
                     and reduced_real is not None
@@ -1882,7 +4358,7 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                 ):
                     continue
                 for left_idx, right_idx, w_block in reduced:
-                    if left_idx >= len(e_arrays):
+                    if left_idx not in e_arrays:
                         continue
                     target[right_idx] += _contract_rank_coupled_left_step(
                         e_arrays[left_idx],
@@ -1890,7 +4366,7 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                         w_block,
                         B_arr,
                     )
-    return {key: tuple(blocks) for key, blocks in out.items()}
+    return out
 
 
 def _contract_from_right_blocks(W, A, F_map, B, phys_slices):
@@ -1977,28 +4453,52 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
         if module is None or not _USE_REAL_RANK_COUPLED_ACCUMULATE
         else getattr(module, "accumulate_rank_coupled_right_real_terms", None)
     )
-    reduced_physical = (not W.reduced_terms) or _rank_coupled_core_has_family(
-        W,
-        _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+    fully_reduced_physical = any(
+        (tensor.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+        for tensor in (A, B)
+    )
+    reduced_physical = (
+        fully_reduced_physical
+        or bool(getattr(W, "normal_complementary_fully_reduced", False))
+        or (not W.reduced_terms)
+        or _rank_coupled_core_has_family(
+            W,
+            _FULLY_REDUCED_ONE_BODY_SPLIT_FAMILY,
+        )
     )
     a_blocks_by_right = _rank_coupled_site_entries_by_edge(A, "right")
     b_blocks_by_right = _rank_coupled_site_entries_by_edge(B, "right")
     reduced_cache = {}
+    active_reduced_cache = {}
     for (q_rb, q_rk), F_blocks in F_map.items():
         a_entries = a_blocks_by_right.get(q_rb)
         b_entries = b_blocks_by_right.get(q_rk)
         if not a_entries or not b_entries:
             continue
-        f_arrays = tuple(np.asarray(block) for block in F_blocks)
+        f_arrays = RankCoupledChannelBlocks(
+            {
+                int(channel): np.asarray(block)
+                for channel, block in _rank_coupled_channel_items(F_blocks)
+            },
+            len(F_blocks),
+        )
         if real_batch_kernel is not None:
-            f_real_arrays = tuple(_real64_contiguous_or_none(block) for block in f_arrays)
-            if any(block is None for block in f_real_arrays):
+            f_real_data = {
+                channel: _real64_contiguous_or_none(block)
+                for channel, block in f_arrays.items()
+            }
+            if any(block is None for block in f_real_data.values()):
                 f_real_arrays = None
+            else:
+                f_real_arrays = RankCoupledChannelBlocks(
+                    f_real_data,
+                    len(f_arrays),
+                )
         else:
             f_real_arrays = None
-        f_dtypes = tuple(block.dtype for block in f_arrays)
+        f_dtypes = tuple(block.dtype for block in f_arrays.values())
         for q_lb, q_pb, A_arr, bra_dim, a_dtype in a_entries:
-            A_conj = A_arr.conj()
+            A_conj = A_arr if not np.iscomplexobj(A_arr) else A_arr.conj()
             A_real = (
                 None
                 if real_batch_kernel is None
@@ -2050,18 +4550,41 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                         ),
                     )
                     reduced_cache[reduced_key] = cached
-                reduced, reduced_real = cached
+                reduced, _reduced_real = cached
+                active_key = (reduced_key, tuple(f_arrays.data))
+                active_cached = active_reduced_cache.get(active_key)
+                if active_cached is None:
+                    reduced = tuple(
+                        term for term in reduced if int(term[1]) in f_arrays
+                    )
+                    active_cached = (
+                        reduced,
+                        (
+                            None
+                            if real_batch_kernel is None
+                            else _rank_coupled_real_term_arrays(reduced)
+                        ),
+                    )
+                    active_reduced_cache[active_key] = active_cached
+                reduced, reduced_real = active_cached
                 if not reduced:
                     continue
                 key = (q_lb, q_lk)
+                dtype = np.result_type(mpo_dtype, a_dtype, b_dtype, *f_dtypes)
                 target = out.get(key)
                 if target is None:
-                    dtype = np.result_type(mpo_dtype, a_dtype, b_dtype, *f_dtypes)
-                    target = [
-                        np.zeros((irrep.dim, bra_dim, ket_dim), dtype=dtype)
-                        for irrep in W.left_channel_irreps
-                    ]
+                    target = RankCoupledChannelBlocks(
+                        {},
+                        len(W.left_channel_irreps),
+                    )
                     out[key] = target
+                for left_idx, _right_idx, _w_block in reduced:
+                    if int(left_idx) not in target:
+                        irrep = W.left_channel_irreps[int(left_idx)]
+                        target.data[int(left_idx)] = np.zeros(
+                            (irrep.dim, bra_dim, ket_dim),
+                            dtype=dtype,
+                        )
                 real_attempted = (
                     real_batch_kernel is not None
                     and reduced_real is not None
@@ -2091,7 +4614,7 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                 ):
                     continue
                 for left_idx, right_idx, w_block in reduced:
-                    if right_idx >= len(f_arrays):
+                    if right_idx not in f_arrays:
                         continue
                     target[left_idx] += _contract_rank_coupled_right_step(
                         A_conj,
@@ -2099,7 +4622,7 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                         f_arrays[right_idx],
                         B_arr,
                     )
-    return {key: tuple(blocks) for key, blocks in out.items()}
+    return out
 
 
 def _precompute_two_site_block_env_transitions(
@@ -2558,6 +5081,8 @@ def _effective_block_operator_from_parts(
     left_entry=None,
     right_entry=None,
     complementary_operator_families=None,
+    su2_operator_engine=None,
+    su2_moving_environment=None,
     name=None,
 ):
     """
@@ -2576,6 +5101,8 @@ def _effective_block_operator_from_parts(
     :param right_entry: Optional persisted right boundary-stack entry.
     :param complementary_operator_families: Optional block2-style
         complementary families owned by the Hamiltonian stack.
+    :param su2_operator_engine: Persistent packed SU(2) operator owner.
+    :param su2_moving_environment: Persistent C++ sweep owner.
     :param name: Optional operator name used by diagnostics.
     :returns: ``EffectiveBlockOperator`` owning the local block problem.
     """
@@ -2595,6 +5122,8 @@ def _effective_block_operator_from_parts(
         left_entry=left_entry,
         right_entry=right_entry,
         complementary_operator_families=complementary_operator_families,
+        su2_operator_engine=su2_operator_engine,
+        su2_moving_environment=su2_moving_environment,
         name=name,
     )
 
@@ -2729,7 +5258,10 @@ class DenseEnvironmentChain:
         F = np.asarray(right_env)
         W1 = np.asarray(self.mpo_factors[bond])
         W2 = np.asarray(self.mpo_factors[bond + 1])
-        _, layout = pack_two_site_state(two_site_template)
+        _, layout = pack_two_site_state(
+            two_site_template,
+            channel_resolved=False,
+        )
         basis = two_site_state_basis(two_site_template, layout=layout)
         dense_layout = _tensor_dense_layout(
             two_site_template,
@@ -2827,8 +5359,12 @@ class DenseEnvironmentSweep:
 
         operator = self.bond_operator(bond, two_site_template)
         norm_operator = norm_sweep.bond_operator(bond, two_site_template)
-        _, layout = pack_two_site_state(two_site_template)
-        basis = two_site_state_basis(two_site_template, layout=layout)
+        basis = operator.basis
+        if not basis.compatible_with_layout(norm_operator.basis):
+            raise ValueError(
+                "Hamiltonian and norm operators selected incompatible "
+                "two-site bases."
+            )
         if cache is not None:
             right_env = self.chain.right_envs[bond + 1] if self.direction == "lr" else self.current_env
             left_env = self.current_env if self.direction == "lr" else self.chain.left_envs[bond]
@@ -2851,6 +5387,8 @@ class DenseEnvironmentSweep:
             cached = cache.get(cache_key)
             if cached is not None:
                 return replace(cached, cache_hit=True)
+            if isinstance(cache, RenormalizedOperatorStack):
+                cache.prepare_miss(cache_key)
         problem = build_orthonormalized_local_problem(
             operator,
             norm_operator,
@@ -2932,7 +5470,10 @@ def build_dense_bond_operator(sites, mpo_factors, bond, two_site_template):
     F = env_chain.right_envs[bond + 1]
     W1 = np.asarray(env_chain.mpo_factors[bond])
     W2 = np.asarray(env_chain.mpo_factors[bond + 1])
-    _, layout = pack_two_site_state(two_site_template)
+    _, layout = pack_two_site_state(
+        two_site_template,
+        channel_resolved=False,
+    )
     basis = two_site_state_basis(two_site_template, layout=layout)
     dense_layout = _tensor_dense_layout(
         two_site_template,
@@ -3028,6 +5569,48 @@ class BlockSparseEnvironmentChain:
             mpo_factors,
             site_layouts=site_layouts,
         )
+        lightweight_owner = getattr(
+            sparse_mpo_factors[0],
+            "normal_complementary_owner",
+            None,
+        )
+        if (
+            renormalized_blocks is None
+            and lightweight_owner is not None
+            and all(
+                getattr(factor, "normal_complementary_plan", None) is not None
+                and not factor.reduced_terms
+                for factor in sparse_mpo_factors
+            )
+        ):
+            from pyqed.qchem.dmrg.backends.reduced import (
+                build_su2_normal_complementary_mpo,
+            )
+
+            right_dual = bool(
+                getattr(
+                    sparse_mpo_factors[0],
+                    "normal_complementary_right_dual",
+                    False,
+                )
+            )
+            sparse_mpo_factors = build_su2_normal_complementary_mpo(
+                lightweight_owner,
+                fully_reduced=bool(
+                    getattr(
+                        sparse_mpo_factors[0],
+                        "normal_complementary_fully_reduced",
+                        False,
+                    )
+                ),
+                materialize_reduced_terms=True,
+            )
+            for factor in sparse_mpo_factors:
+                object.__setattr__(
+                    factor,
+                    "normal_complementary_right_dual",
+                    right_dual,
+                )
 
         rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
         nsites = len(sites)
@@ -3038,11 +5621,49 @@ class BlockSparseEnvironmentChain:
         elif reuse_prebuilt_boundary_side == "right":
             build_right = False
         if rank_coupled:
+            normal_complementary_owner = getattr(
+                sparse_mpo_factors[0],
+                "normal_complementary_owner",
+                None,
+            )
+            nc_moving_environment = (
+                (
+                    getattr(
+                        renormalized_blocks,
+                        "su2_moving_environment",
+                        None,
+                    )
+                    or getattr(
+                        renormalized_blocks,
+                        "su2_boundary_environment",
+                        None,
+                    )
+                )
+                if getattr(
+                    sparse_mpo_factors[0],
+                    "normal_complementary_plan",
+                    None,
+                )
+                is not None
+                else None
+            ) or normal_complementary_owner
             initial_left = LeftBlock(
                 _initial_left_env_blocks_rank_coupled(site_layouts[0], sparse_mpo_factors[0]),
                 rank_coupled=True,
             )
             if build_left:
+                if (
+                    nc_moving_environment is not None
+                    and renormalized_blocks is not None
+                ):
+                    renormalized_blocks.initialize(
+                        "left",
+                        0,
+                        initial_left,
+                        side_table_builders=_renormalized_side_table_builders(
+                            rank_coupled=True,
+                        ),
+                    )
                 left_envs = [initial_left]
                 for i in range(nsites - 1):
                     left_envs.append(
@@ -3050,6 +5671,10 @@ class BlockSparseEnvironmentChain:
                             sparse_mpo_factors[i],
                             sites[i],
                             sites[i],
+                            moving_environment=nc_moving_environment,
+                            parent_bond=i,
+                            child_bond=i + 1,
+                            numeric_revision=i + 1,
                         )
                     )
             else:
@@ -3060,6 +5685,18 @@ class BlockSparseEnvironmentChain:
                 rank_coupled=True,
             )
             if build_right:
+                if (
+                    nc_moving_environment is not None
+                    and renormalized_blocks is not None
+                ):
+                    renormalized_blocks.initialize(
+                        "right",
+                        nsites - 1,
+                        initial_right,
+                        side_table_builders=_renormalized_side_table_builders(
+                            rank_coupled=True,
+                        ),
+                    )
                 right_envs = [initial_right]
                 for i in range(nsites - 1, 0, -1):
                     right_envs.append(
@@ -3067,6 +5704,10 @@ class BlockSparseEnvironmentChain:
                             sparse_mpo_factors[i],
                             sites[i],
                             sites[i],
+                            moving_environment=nc_moving_environment,
+                            parent_bond=i,
+                            child_bond=i - 1,
+                            numeric_revision=nsites - i,
                         )
                     )
                 right_envs = list(reversed(right_envs))
@@ -3336,8 +5977,21 @@ class BlockSparseEnvironmentChain:
         if self.require_symbolic_payloads:
             self._require_symbolic_payload_entry(left_entry, "left", bond)
             self._require_symbolic_payload_entry(right_entry, "right", bond + 1)
-        _, layout = pack_two_site_state(two_site_template)
-        basis = two_site_state_basis(two_site_template, layout=layout)
+        channel_resolved = _uses_channel_resolved_local_basis(
+            two_site_template,
+            W1,
+            W2,
+            rank_coupled=self.rank_coupled,
+        )
+        _, layout = pack_two_site_state(
+            two_site_template,
+            channel_resolved=channel_resolved,
+        )
+        basis = (
+            TwoSiteBasis.from_channel_tensor(two_site_template)
+            if channel_resolved
+            else two_site_state_basis(two_site_template, layout=layout)
+        )
         phys1_slices = self.site_layouts[bond]["sector_slices"][1]
         phys2_slices = self.site_layouts[bond + 1]["sector_slices"][1]
         operator = _effective_block_operator_from_parts(
@@ -3356,6 +6010,24 @@ class BlockSparseEnvironmentChain:
                 None
                 if self.renormalized_blocks is None
                 else self.renormalized_blocks.complementary_operator_families
+            ),
+            su2_operator_engine=(
+                None
+                if self.renormalized_blocks is None
+                else self.renormalized_blocks.su2_operator_engine
+            ),
+            su2_moving_environment=(
+                None
+                if self.renormalized_blocks is None
+                else (
+                    self.renormalized_blocks.su2_moving_environment
+                    or getattr(
+                        self.renormalized_blocks,
+                        "su2_boundary_environment",
+                        None,
+                    )
+                    or getattr(W1, "normal_complementary_owner", None)
+                )
             ),
             name=f"bond-{bond}-block-sparse-effective-H",
         )
@@ -3533,8 +6205,30 @@ class BlockSparseEnvironmentSweep:
             "cache_lookup": 0.0,
             "build_orthonormalized_problem": 0.0,
         } if profile else None
-        _, layout = pack_two_site_state(two_site_template)
-        basis = two_site_state_basis(two_site_template, layout=layout)
+        W1 = self.chain.mpo_factors[bond]
+        W2 = self.chain.mpo_factors[bond + 1]
+        channel_resolved = _uses_channel_resolved_local_basis(
+            two_site_template,
+            W1,
+            W2,
+            rank_coupled=self.chain.rank_coupled,
+        )
+        _, layout = pack_two_site_state(
+            two_site_template,
+            channel_resolved=channel_resolved,
+        )
+        basis = (
+            TwoSiteBasis.from_channel_tensor(two_site_template)
+            if channel_resolved
+            else two_site_state_basis(two_site_template, layout=layout)
+        )
+        if max_dim is not None and int(basis.size) > int(max_dim):
+            return None
+        cpp_owner = (
+            None
+            if self.renormalized_blocks is None
+            else self.renormalized_blocks.su2_moving_environment
+        )
         cache_key = None
         if cache is not None:
             t0 = time.perf_counter() if profile else None
@@ -3590,6 +6284,8 @@ class BlockSparseEnvironmentSweep:
                 else:
                     cached = replace(cached, cache_hit=True)
                 return cached
+            if isinstance(cache, RenormalizedOperatorStack):
+                cache.prepare_miss(cache_key)
         t0 = time.perf_counter() if profile else None
         operator = self.bond_operator(bond, two_site_template)
         if profile:
@@ -3616,6 +6312,10 @@ class BlockSparseEnvironmentSweep:
                 if self.renormalized_blocks is None
                 else self.renormalized_blocks.moving_environment_cache
             ),
+            su2_moving_environment=cpp_owner,
+            local_operator_key=(
+                f"{self.direction}:{int(bond)}:orthonormal-factor-route"
+            ),
         )
         if profile:
             timing["build_orthonormalized_problem"] += time.perf_counter() - t0
@@ -3640,6 +6340,7 @@ class BlockSparseEnvironmentSweep:
                 if self.chain.rank_coupled
                 else self.chain.site_layouts[bond]["sector_slices"][2]
             )
+            consumed_moving_entry = self.current_entry
             if self.renormalized_blocks is not None and self.current_entry is not None:
                 self.current_entry = self.renormalized_blocks.advance_left(
                     self.current_entry,
@@ -3660,12 +6361,28 @@ class BlockSparseEnvironmentSweep:
                     phys_slices=phys_slices,
                 )
                 self._store_current_boundary(bond + 1)
+            if self.renormalized_blocks is not None:
+                self.renormalized_blocks.release_consumed_numeric_tables(
+                    "right",
+                    bond + 1,
+                )
+                if self.renormalized_blocks.release_consumed_boundary(
+                    "right",
+                    bond + 1,
+                ):
+                    self.chain.right_envs[bond + 1] = None
+                if consumed_moving_entry is not None:
+                    self.renormalized_blocks.release_consumed_numeric_tables(
+                        consumed_moving_entry.side,
+                        consumed_moving_entry.bond,
+                    )
         else:
             phys_slices = (
                 None
                 if self.chain.rank_coupled
                 else self.chain.site_layouts[bond + 1]["sector_slices"][2]
             )
+            consumed_moving_entry = self.current_entry
             if self.renormalized_blocks is not None and self.current_entry is not None:
                 self.current_entry = self.renormalized_blocks.advance_right(
                     self.current_entry,
@@ -3686,6 +6403,26 @@ class BlockSparseEnvironmentSweep:
                     phys_slices=phys_slices,
                 )
                 self._store_current_boundary(bond)
+            if self.renormalized_blocks is not None:
+                self.renormalized_blocks.release_consumed_numeric_tables(
+                    "left",
+                    bond,
+                )
+                if self.renormalized_blocks.release_consumed_boundary(
+                    "left",
+                    bond,
+                ):
+                    self.chain.left_envs[bond] = None
+                if consumed_moving_entry is not None:
+                    self.renormalized_blocks.release_consumed_numeric_tables(
+                        consumed_moving_entry.side,
+                        consumed_moving_entry.bond,
+                    )
+        if self.renormalized_blocks is not None:
+            operator_engine = self.renormalized_blocks.su2_operator_engine
+            if operator_engine is not None:
+                operator_engine.release_numeric()
+                _release_free_numeric_pages()
         self.generation += 1
         return self
 
@@ -3718,6 +6455,15 @@ class BlockSparseEnvironmentSweep:
                     else self.chain.site_layouts[site_index]["sector_slices"][2]
                 ),
             )
+        if getattr(
+            self.chain.mpo_factors[site_index],
+            "normal_complementary_plan",
+            None,
+        ) is not None:
+            return _rank_coupled_channel_expectation(
+                env.data,
+                0 if self.direction == "lr" else 1,
+            )
         return env.expectation()
 
     def clone(self):
@@ -3739,17 +6485,33 @@ def build_block_sparse_bond_operator(sites, mpo_factors, bond, two_site_template
     return env_chain.bond_operator(bond, two_site_template)
 
 
-def contract_chain_expectation(sites, mpo_factors):
+def contract_chain_expectation(
+    sites,
+    mpo_factors,
+    *,
+    bra_sites=None,
+    moving_environment=None,
+    site_layouts=None,
+):
     """
-    Contract ``<sites|MPO|sites>`` for one non-Abelian MPS chain.
+    Contract ``<bra|MPO|sites>`` for one non-Abelian MPS chain.
 
     Parameters
     ----------
     sites
-        Sequence of rank-3 non-Abelian MPS site tensors.
+        Ket sequence of rank-3 non-Abelian MPS site tensors.
+    bra_sites
+        Optional bra sequence. Omitting it computes an expectation value.
     mpo_factors
         Sequence of MPO cores (dense or block-sparse ``MPO`` objects), one per
         site.
+    moving_environment
+        Optional persistent C++ owner for direct normal/complementary
+        boundary actions. Omitting it preserves the Python reference path.
+    site_layouts
+        Optional precomputed dense-layout metadata for ``sites``. Supplying it
+        avoids rebuilding identical sector maps when many operators are
+        contracted against the same MPS, as in reduced 1-/2-RDM evaluation.
 
     Returns
     -------
@@ -3760,8 +6522,16 @@ def contract_chain_expectation(sites, mpo_factors):
         raise ValueError("contract_chain_expectation requires one MPO core per site tensor.")
     if not sites:
         raise ValueError("contract_chain_expectation requires at least one site tensor.")
+    bra_sites = sites if bra_sites is None else list(bra_sites)
+    if len(bra_sites) != len(sites):
+        raise ValueError("Bra and ket MPS lengths must match.")
 
-    site_layouts = [_tensor_dense_layout(site) for site in sites]
+    if site_layouts is None:
+        site_layouts = [_tensor_dense_layout(site) for site in sites]
+    else:
+        site_layouts = list(site_layouts)
+        if len(site_layouts) != len(sites):
+            raise ValueError("site_layouts must contain one layout per MPS site.")
     phys_slice_maps = [layout["sector_slices"][1] for layout in site_layouts]
     sparse_mpo_factors = _normalize_block_sparse_mpo_factors(
         mpo_factors,
@@ -3770,24 +6540,431 @@ def contract_chain_expectation(sites, mpo_factors):
 
     rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
     if rank_coupled:
-        env = _initial_left_env_blocks_rank_coupled(site_layouts[0], sparse_mpo_factors[0])
-        for idx in range(len(sites)):
-            env = _contract_from_left_blocks_rank_coupled(
-                sparse_mpo_factors[idx],
-                sites[idx],
-                env,
-                sites[idx],
+        if moving_environment is None and bra_sites is sites:
+            candidate_owner = getattr(
+                sparse_mpo_factors[0],
+                "normal_complementary_owner",
+                None,
             )
+            if candidate_owner is not None and all(
+                getattr(factor, "normal_complementary_plan", None) is not None
+                and not factor.reduced_terms
+                for factor in sparse_mpo_factors
+            ):
+                moving_environment = candidate_owner
+        direct_normal_complementary = bool(
+            bra_sites is sites
+            and moving_environment is not None
+            and getattr(
+                sparse_mpo_factors[0],
+                "normal_complementary_owner",
+                None,
+            )
+            is moving_environment
+        )
+        if direct_normal_complementary:
+            moving_environment.clear_boundaries()
+            env = LeftBlock(
+                _initial_left_env_blocks_rank_coupled(
+                    site_layouts[0],
+                    sparse_mpo_factors[0],
+                ),
+                rank_coupled=True,
+            )
+            for idx in range(len(sites)):
+                env = env.advance(
+                    sparse_mpo_factors[idx],
+                    bra_sites[idx],
+                    sites[idx],
+                    moving_environment=moving_environment,
+                    parent_bond=idx,
+                    child_bond=idx + 1,
+                    numeric_revision=idx + 1,
+                )
+        else:
+            env = _initial_left_env_blocks_rank_coupled(
+                site_layouts[0],
+                sparse_mpo_factors[0],
+            )
+            for idx in range(len(sites)):
+                env = _contract_from_left_blocks_rank_coupled(
+                    sparse_mpo_factors[idx],
+                    bra_sites[idx],
+                    env,
+                    sites[idx],
+                )
     else:
         env = _initial_left_env_blocks(site_layouts[0], sparse_mpo_factors[0])
         for idx in range(len(sites)):
             env = _contract_from_left_blocks(
                 sparse_mpo_factors[idx],
-                sites[idx],
+                bra_sites[idx],
                 env,
                 sites[idx],
                 phys_slice_maps[idx],
             )
 
     value = 0.0 + 0.0j
+    if rank_coupled and getattr(
+        sparse_mpo_factors[0],
+        "normal_complementary_plan",
+        None,
+    ) is not None:
+        return _rank_coupled_channel_expectation(env, 0)
     return _environment_map_expectation(env, rank_coupled=rank_coupled)
+
+def contract_chain_transition(bra_sites, mpo_factors, ket_sites):
+    """Contract ``<bra|MPO|ket>`` in the native reduced representation."""
+    if len(bra_sites) != len(ket_sites) or len(ket_sites) != len(mpo_factors):
+        raise ValueError(
+            "contract_chain_transition requires equally sized bra, MPO, and ket chains."
+        )
+    if not ket_sites:
+        raise ValueError("contract_chain_transition requires at least one site tensor.")
+
+    bra_sites = [normalize_site_tensor_layout(site) for site in bra_sites]
+    ket_sites = [normalize_site_tensor_layout(site) for site in ket_sites]
+    site_layouts = [_tensor_dense_layout(site) for site in ket_sites]
+    sparse_mpo_factors = _normalize_block_sparse_mpo_factors(
+        mpo_factors,
+        site_layouts=site_layouts,
+    )
+    rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
+    if rank_coupled:
+        env = _initial_left_env_blocks_rank_coupled(
+            site_layouts[0], sparse_mpo_factors[0]
+        )
+        for core, bra, ket in zip(sparse_mpo_factors, bra_sites, ket_sites):
+            env = _contract_from_left_blocks_rank_coupled(core, bra, env, ket)
+    else:
+        phys_slice_maps = [layout["sector_slices"][1] for layout in site_layouts]
+        env = _initial_left_env_blocks(site_layouts[0], sparse_mpo_factors[0])
+        for core, bra, ket, phys_slices in zip(
+            sparse_mpo_factors, bra_sites, ket_sites, phys_slice_maps
+        ):
+            env = _contract_from_left_blocks(
+                core, bra, env, ket, phys_slices
+            )
+    if rank_coupled and getattr(
+        sparse_mpo_factors[0], "normal_complementary_plan", None
+    ) is not None:
+        return _rank_coupled_channel_expectation(env, 0)
+    return _environment_map_expectation(env, rank_coupled=rank_coupled)
+
+
+@dataclass(frozen=True)
+class LocalTransitionPlan:
+    """Cached exact contraction plan for a single varying MPS site.
+
+    The fixed half of the chain is contracted once.  Each subsequent
+    ``contract`` call only absorbs the varying bra/ket tensor and the shorter
+    unfixed half.  Rank-coupled MPO cores remain in their reduced
+    Wigner--Eckart representation throughout.
+    """
+
+    site: int
+    sites: tuple
+    mpo_factors: tuple
+    phys_slices: tuple
+    rank_coupled: bool
+    direction: str
+    anchor: object
+
+    @classmethod
+    def build(cls, sites, mpo_factors, site, *, direction=None):
+        if len(sites) != len(mpo_factors):
+            raise ValueError(
+                "LocalTransitionPlan requires one MPO core per site tensor."
+            )
+        if not sites:
+            raise ValueError("LocalTransitionPlan requires a nonempty chain.")
+        site = int(site)
+        if site < 0 or site >= len(sites):
+            raise IndexError(f"Site {site} is outside a chain of length {len(sites)}.")
+
+        sites = tuple(normalize_site_tensor_layout(tensor) for tensor in sites)
+        layouts = tuple(_tensor_dense_layout(tensor) for tensor in sites)
+        factors = tuple(
+            _normalize_block_sparse_mpo_factors(
+                mpo_factors,
+                site_layouts=layouts,
+            )
+        )
+        rank_coupled = _is_rank_coupled_chain(factors)
+        phys_slices = tuple(layout["sector_slices"][1] for layout in layouts)
+
+        # Cache the longer side so a repeated local transition traverses only
+        # the shorter side of the chain.
+        if direction is None:
+            direction = "lr" if site >= len(sites) - site - 1 else "rl"
+        else:
+            direction = str(direction).lower()
+            if direction not in {"lr", "rl"}:
+                raise ValueError("LocalTransitionPlan direction must be 'lr' or 'rl'.")
+        if direction == "lr":
+            if rank_coupled:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks_rank_coupled(layouts[0], factors[0]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks(layouts[0], factors[0]),
+                    rank_coupled=False,
+                )
+            for index in range(site):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+        else:
+            direction = "rl"
+            if rank_coupled:
+                anchor = RightBlock(
+                    _initial_right_env_blocks_rank_coupled(layouts[-1], factors[-1]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = RightBlock(
+                    _initial_right_env_blocks(layouts[-1], factors[-1]),
+                    rank_coupled=False,
+                )
+            for index in range(len(sites) - 1, site, -1):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+
+        return cls(
+            site=site,
+            sites=sites,
+            mpo_factors=factors,
+            phys_slices=phys_slices,
+            rank_coupled=rank_coupled,
+            direction=direction,
+            anchor=anchor,
+        )
+
+    @property
+    def cached_sites(self):
+        if self.direction == "lr":
+            return int(self.site)
+        return int(len(self.sites) - self.site - 1)
+
+    @property
+    def traversed_sites(self):
+        return int(len(self.sites) - self.cached_sites)
+
+    def contract(self, bra_site, ket_site):
+        bra_site = normalize_site_tensor_layout(bra_site)
+        ket_site = normalize_site_tensor_layout(ket_site)
+        physical = None if self.rank_coupled else self.phys_slices[self.site]
+        env = self.anchor.advance(
+            self.mpo_factors[self.site],
+            bra_site,
+            ket_site,
+            phys_slices=physical,
+        )
+        if self.direction == "lr":
+            for index in range(self.site + 1, len(self.sites)):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=(
+                        None if self.rank_coupled else self.phys_slices[index]
+                    ),
+                )
+        else:
+            for index in range(self.site - 1, -1, -1):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=(
+                        None if self.rank_coupled else self.phys_slices[index]
+                    ),
+                )
+        if self.rank_coupled and getattr(
+            self.mpo_factors[0], "normal_complementary_plan", None
+        ) is not None:
+            return _rank_coupled_channel_expectation(
+                env.data,
+                0 if self.direction == "lr" else 1,
+            )
+        return env.expectation()
+
+
+@dataclass(frozen=True)
+class AdjacentPairTransitionPlan:
+    """Cached exact contraction plan for two adjacent varying MPS sites.
+
+    Unlike the generic merged-pair effective operator, this plan keeps the
+    intermediate reduced bond explicit.  That distinction matters whenever
+    several SU(2) fusion channels have the same four external sector labels.
+    The longer fixed side of the chain is contracted once; each call absorbs
+    the two varying tensors and only traverses the shorter fixed side.
+    """
+
+    bond: int
+    sites: tuple
+    mpo_factors: tuple
+    phys_slices: tuple
+    rank_coupled: bool
+    direction: str
+    anchor: object
+
+    @classmethod
+    def build(cls, sites, mpo_factors, bond, *, direction=None):
+        if len(sites) != len(mpo_factors):
+            raise ValueError(
+                "AdjacentPairTransitionPlan requires one MPO core per site tensor."
+            )
+        if len(sites) < 2:
+            raise ValueError("AdjacentPairTransitionPlan requires at least two sites.")
+        bond = int(bond)
+        if bond < 0 or bond >= len(sites) - 1:
+            raise IndexError(
+                f"Bond {bond} is outside a chain of length {len(sites)}."
+            )
+
+        sites = tuple(normalize_site_tensor_layout(tensor) for tensor in sites)
+        layouts = tuple(_tensor_dense_layout(tensor) for tensor in sites)
+        factors = tuple(
+            _normalize_block_sparse_mpo_factors(
+                mpo_factors,
+                site_layouts=layouts,
+            )
+        )
+        rank_coupled = _is_rank_coupled_chain(factors)
+        phys_slices = tuple(layout["sector_slices"][1] for layout in layouts)
+
+        left_fixed = bond
+        right_fixed = len(sites) - bond - 2
+        if direction is None:
+            direction = "lr" if left_fixed >= right_fixed else "rl"
+        else:
+            direction = str(direction).lower()
+            if direction not in {"lr", "rl"}:
+                raise ValueError(
+                    "AdjacentPairTransitionPlan direction must be 'lr' or 'rl'."
+                )
+
+        if direction == "lr":
+            if rank_coupled:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks_rank_coupled(layouts[0], factors[0]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks(layouts[0], factors[0]),
+                    rank_coupled=False,
+                )
+            for index in range(bond):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+        else:
+            if rank_coupled:
+                anchor = RightBlock(
+                    _initial_right_env_blocks_rank_coupled(layouts[-1], factors[-1]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = RightBlock(
+                    _initial_right_env_blocks(layouts[-1], factors[-1]),
+                    rank_coupled=False,
+                )
+            for index in range(len(sites) - 1, bond + 1, -1):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+
+        return cls(
+            bond=bond,
+            sites=sites,
+            mpo_factors=factors,
+            phys_slices=phys_slices,
+            rank_coupled=rank_coupled,
+            direction=direction,
+            anchor=anchor,
+        )
+
+    @property
+    def cached_sites(self):
+        if self.direction == "lr":
+            return int(self.bond)
+        return int(len(self.sites) - self.bond - 2)
+
+    @property
+    def traversed_sites(self):
+        return int(len(self.sites) - self.cached_sites)
+
+    def contract(self, bra_left, bra_right, ket_left, ket_right):
+        bra_left = normalize_site_tensor_layout(bra_left)
+        bra_right = normalize_site_tensor_layout(bra_right)
+        ket_left = normalize_site_tensor_layout(ket_left)
+        ket_right = normalize_site_tensor_layout(ket_right)
+        physical = lambda index: (
+            None if self.rank_coupled else self.phys_slices[index]
+        )
+
+        if self.direction == "lr":
+            env = self.anchor.advance(
+                self.mpo_factors[self.bond],
+                bra_left,
+                ket_left,
+                phys_slices=physical(self.bond),
+            )
+            env = env.advance(
+                self.mpo_factors[self.bond + 1],
+                bra_right,
+                ket_right,
+                phys_slices=physical(self.bond + 1),
+            )
+            for index in range(self.bond + 2, len(self.sites)):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=physical(index),
+                )
+        else:
+            env = self.anchor.advance(
+                self.mpo_factors[self.bond + 1],
+                bra_right,
+                ket_right,
+                phys_slices=physical(self.bond + 1),
+            )
+            env = env.advance(
+                self.mpo_factors[self.bond],
+                bra_left,
+                ket_left,
+                phys_slices=physical(self.bond),
+            )
+            for index in range(self.bond - 1, -1, -1):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=physical(index),
+                )
+        if self.rank_coupled and getattr(
+            self.mpo_factors[0], "normal_complementary_plan", None
+        ) is not None:
+            return _rank_coupled_channel_expectation(
+                env.data,
+                0 if self.direction == "lr" else 1,
+            )
+        return env.expectation()

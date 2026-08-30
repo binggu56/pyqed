@@ -9,8 +9,14 @@ from __future__ import annotations
 import numpy as np
 
 from .coupling import normalize_coupling_scheme, reduced_bond_space
-from pyqed.mps.su2 import SpinChargeSector, fuse_charge_spin_sectors
-from .tensor import FusionLeg, FusionPipe, FusionPipeEntry, NonabelianTensor
+from pyqed.mps.su2 import SU2Irrep, SpinChargeSector, fuse_charge_spin_sectors
+from .tensor import (
+    FusionLeg,
+    FusionPipe,
+    FusionPipeEntry,
+    IdentityBasisTransform,
+    NonabelianTensor,
+)
 
 
 def _normalize_axes(axes):
@@ -148,10 +154,16 @@ def tensordot(A, B, axes):
             "right_metadata": B.metadata.copy(),
         }
     if contracted_channels:
-        metadata["contracted_channels"] = {
-            key: tuple(sorted(channels))
-            for key, channels in contracted_channels.items()
-        }
+        if len(a_ax) == 1 and len(b_ax) == 1:
+            metadata["contracted_channels"] = {
+                key: tuple(channel[0] for channel in sorted(channels))
+                for key, channels in contracted_channels.items()
+            }
+        else:
+            metadata["contracted_channels"] = {
+                key: tuple(sorted(channels))
+                for key, channels in contracted_channels.items()
+            }
         if len(a_ax) == 1 and len(b_ax) == 1:
             fused_sectors = tuple(
                 sorted(
@@ -222,7 +234,533 @@ def merge_mps_sites(A, B):
         raise ValueError("merge_mps_sites expects rank-3 site tensors.")
     A = normalize_site_tensor_layout(A)
     B = normalize_site_tensor_layout(B)
-    return tensordot(A, B, axes=([2], [0]))
+    merged = tensordot(A, B, axes=([2], [0]))
+    channel_blocks = {}
+    for (q_left, q_phys1, q_mid), left_block in A.data.items():
+        for (q_mid_right, q_phys2, q_right), right_block in B.data.items():
+            if q_mid_right != q_mid:
+                continue
+            key = (q_left, q_phys1, q_mid, q_phys2, q_right)
+            contribution = np.tensordot(
+                np.asarray(left_block),
+                np.asarray(right_block),
+                axes=([2], [0]),
+            )
+            if key in channel_blocks:
+                channel_blocks[key] = channel_blocks[key] + contribution
+            else:
+                channel_blocks[key] = contribution
+    merged.metadata["contracted_channel_blocks"] = channel_blocks
+    merged.metadata["contracted_channel_blocks_current"] = True
+    # Two-site decomposition consumes contracted bond channels as one-element
+    # axis tuples, while the public single-axis tensordot metadata exposes the
+    # contracted sectors directly.
+    channels = merged.metadata.get("contracted_channels")
+    if channels:
+        merged.metadata["contracted_channels"] = {
+            key: tuple((sector,) for sector in sectors)
+            for key, sectors in channels.items()
+        }
+    return merged
+
+
+def merge_mps_sites_from_packed(A, B, packed):
+    """
+    Restore a two-site reduced tensor produced by the C++ sweep owner.
+
+    The numerical contraction and channel aggregation have already happened
+    in C++; this function only reconnects the packed sector labels to the
+    Python tensor metadata still consumed by the local solver and SVD.
+    """
+    if A.rank != 3 or B.rank != 3:
+        raise ValueError("merge_mps_sites_from_packed expects rank-3 site tensors.")
+    A = normalize_site_tensor_layout(A)
+    B = normalize_site_tensor_layout(B)
+    _validate_contraction_metadata(A, B, [2], [0])
+
+    def sector_label(sector):
+        charge = getattr(sector, "charge", None)
+        irrep = getattr(sector, "irrep", None)
+        two_j = getattr(irrep, "two_j", None)
+        if two_j is None:
+            two_j = getattr(sector, "two_j", None)
+        if charge is None or two_j is None:
+            raise TypeError(
+                "Packed C++ MPS merge requires charge/two_j sector labels."
+            )
+        return int(charge), int(two_j)
+
+    sectors = {}
+    for leg in A.qns + B.qns:
+        for sector in leg:
+            label = sector_label(sector)
+            previous = sectors.setdefault(label, sector)
+            if previous != sector:
+                raise ValueError(
+                    f"Ambiguous SU(2) sector label {label!r} in packed MPS merge."
+                )
+
+    def unpack(arena, label_rank, value_rank):
+        values = np.asarray(arena["values"], dtype=np.float64).reshape(-1)
+        offsets = np.asarray(arena["offsets"], dtype=np.int64).reshape(-1)
+        labels = np.asarray(arena["labels"], dtype=np.int64).reshape(
+            (-1, 2 * label_rank)
+        )
+        shape_offsets = np.asarray(
+            arena["shape_offsets"],
+            dtype=np.int64,
+        ).reshape(-1)
+        shapes = np.asarray(arena["shapes"], dtype=np.int64).reshape(-1)
+        nblocks = max(0, offsets.size - 1)
+        if labels.shape[0] != nblocks or shape_offsets.size != nblocks + 1:
+            raise ValueError("Malformed packed C++ MPS merge topology.")
+        data = {}
+        for block in range(nblocks):
+            shape = tuple(
+                int(value)
+                for value in shapes[
+                    int(shape_offsets[block]):int(shape_offsets[block + 1])
+                ]
+            )
+            if len(shape) != value_rank:
+                raise ValueError(
+                    f"Packed C++ MPS merge block has rank {len(shape)}, "
+                    f"expected {value_rank}."
+                )
+            key = []
+            for axis in range(label_rank):
+                label = (
+                    int(labels[block, 2 * axis]),
+                    int(labels[block, 2 * axis + 1]),
+                )
+                sector = sectors.get(label)
+                if sector is None:
+                    sector = SpinChargeSector(label[0], SU2Irrep(label[1]))
+                    sectors[label] = sector
+                key.append(sector)
+            key = tuple(key)
+            start = int(offsets[block])
+            stop = int(offsets[block + 1])
+            if int(np.prod(shape, dtype=int)) != stop - start:
+                raise ValueError("Packed C++ MPS merge shape disagrees with its offsets.")
+            data[key] = np.array(values[start:stop], copy=True).reshape(shape)
+        return data
+
+    data = unpack(packed["merged"], 4, 4)
+    channel_blocks = unpack(packed["channels"], 5, 4)
+    new_qns = [A.qns[0][:], A.qns[1][:], B.qns[1][:], B.qns[2][:]]
+    new_dirs = [A.dirs[0], A.dirs[1], B.dirs[1], B.dirs[2]]
+    new_fusion_legs = [
+        A.fusion_legs[0],
+        A.fusion_legs[1],
+        B.fusion_legs[1],
+        B.fusion_legs[2],
+    ]
+
+    if _metadata_equal(A.metadata, B.metadata):
+        metadata = A.metadata.copy()
+    elif A.metadata or B.metadata:
+        metadata = {
+            "left_metadata": A.metadata.copy(),
+            "right_metadata": B.metadata.copy(),
+        }
+    else:
+        metadata = {}
+
+    contracted_channels = {}
+    for q_left, q_phys1, q_mid, q_phys2, q_right in channel_blocks:
+        key = (q_left, q_phys1, q_phys2, q_right)
+        contracted_channels.setdefault(key, set()).add(q_mid)
+    contracted_channels = {
+        key: tuple(sorted(channels))
+        for key, channels in contracted_channels.items()
+    }
+    metadata["contracted_channels"] = contracted_channels
+    metadata["contracted_channel_blocks"] = channel_blocks
+    metadata["contracted_channel_blocks_current"] = True
+
+    if contracted_channels:
+        fused_sectors = tuple(
+            sorted(
+                {
+                    sector
+                    for channels in contracted_channels.values()
+                    for sector in channels
+                }
+            )
+        )
+        slot_counts = {sector: 0 for sector in fused_sectors}
+        offset_counts = {sector: 0 for sector in fused_sectors}
+        pipe_entries = []
+        for key in sorted(contracted_channels):
+            local_dim = int(np.prod(data[key].shape, dtype=int))
+            for sector in contracted_channels[key]:
+                pipe_entries.append(
+                    FusionPipeEntry(
+                        child_sectors=tuple(key),
+                        fused_sector=sector,
+                        slot=slot_counts[sector],
+                        offset=offset_counts[sector],
+                        local_dim=local_dim,
+                        selected_shape=tuple(int(x) for x in data[key].shape),
+                    )
+                )
+                slot_counts[sector] += 1
+                offset_counts[sector] += local_dim
+        contracted_pipe = FusionPipe.from_entries(
+            child_legs=tuple(range(4)),
+            child_sector_lists=tuple(tuple(leg_qns) for leg_qns in new_qns),
+            child_dirs=tuple(new_dirs),
+            fused_sectors=fused_sectors,
+            entries=tuple(pipe_entries),
+            orientation=1,
+            coupling="contracted",
+        )
+        metadata["contracted_fusion_leg"] = FusionLeg(
+            child_legs=tuple(range(4)),
+            child_sector_lists=tuple(tuple(leg_qns) for leg_qns in new_qns),
+            child_dirs=tuple(new_dirs),
+            sectors=fused_sectors,
+            orientation=1,
+            coupling="contracted",
+            selected_channel=None,
+            pipe=contracted_pipe,
+        )
+
+    return NonabelianTensor(
+        data,
+        new_qns,
+        new_dirs,
+        fusion_legs=new_fusion_legs,
+        metadata=metadata,
+    )
+
+
+def split_mps_sites_from_packed(A, B, packed):
+    """Restore the two rank-3 site views produced by the C++ bond split."""
+
+    if A.rank != 3 or B.rank != 3:
+        raise ValueError("split_mps_sites_from_packed expects rank-3 sites.")
+    A = normalize_site_tensor_layout(A)
+    B = normalize_site_tensor_layout(B)
+
+    def sector_label(sector):
+        return int(sector.charge), int(sector.irrep.two_j)
+
+    sectors = {}
+    for leg in A.qns + B.qns:
+        for sector in leg:
+            sectors.setdefault(sector_label(sector), sector)
+    bond_labels = np.asarray(packed["bond_labels"], dtype=np.int64).reshape(-1, 2)
+    bond_dims = np.asarray(packed["bond_dims"], dtype=np.int64).reshape(-1)
+    if bond_labels.shape[0] != bond_dims.size or np.any(bond_dims <= 0):
+        raise ValueError("Malformed C++ split bond-sector topology.")
+    bond_sectors = []
+    for charge, two_j in bond_labels:
+        label = (int(charge), int(two_j))
+        bond_sectors.append(
+            sectors.setdefault(
+                label,
+                SpinChargeSector(label[0], SU2Irrep(label[1])),
+            )
+        )
+    bond_qns = [
+        sector
+        for sector, dim in zip(bond_sectors, bond_dims)
+        for _ in range(int(dim))
+    ]
+
+    def unpack(arena):
+        values = np.asarray(arena["values"], dtype=np.float64).reshape(-1)
+        offsets = np.asarray(arena["offsets"], dtype=np.int64).reshape(-1)
+        labels = np.asarray(arena["labels"], dtype=np.int64).reshape(-1, 6)
+        shape_offsets = np.asarray(
+            arena["shape_offsets"], dtype=np.int64
+        ).reshape(-1)
+        shapes = np.asarray(arena["shapes"], dtype=np.int64).reshape(-1)
+        if (
+            offsets.size != labels.shape[0] + 1
+            or shape_offsets.size != offsets.size
+        ):
+            raise ValueError("Malformed C++ split-site arena.")
+        data = {}
+        for block in range(labels.shape[0]):
+            shape = tuple(
+                int(value)
+                for value in shapes[
+                    int(shape_offsets[block]):int(shape_offsets[block + 1])
+                ]
+            )
+            if len(shape) != 3:
+                raise ValueError("A C++ split-site block is not rank three.")
+            key = tuple(
+                sectors.setdefault(
+                    (
+                        int(labels[block, 2 * axis]),
+                        int(labels[block, 2 * axis + 1]),
+                    ),
+                    SpinChargeSector(
+                        int(labels[block, 2 * axis]),
+                        SU2Irrep(int(labels[block, 2 * axis + 1])),
+                    ),
+                )
+                for axis in range(3)
+            )
+            start = int(offsets[block])
+            stop = int(offsets[block + 1])
+            if int(np.prod(shape, dtype=int)) != stop - start:
+                raise ValueError(
+                    "A C++ split-site shape disagrees with its value range."
+                )
+            data[key] = np.array(values[start:stop], copy=True).reshape(shape)
+        return data
+
+    left_data = unpack(packed["left"])
+    right_data = unpack(packed["right"])
+    slot_counts = {sector: 0 for sector in bond_sectors}
+    pipe_entries = []
+    for sector, dim in zip(bond_sectors, bond_dims):
+        for _ in range(int(dim)):
+            slot = slot_counts[sector]
+            pipe_entries.append(
+                FusionPipeEntry(
+                    child_sectors=(sector,),
+                    fused_sector=sector,
+                    slot=slot,
+                    offset=slot,
+                    local_dim=1,
+                    selected_shape=(1,),
+                )
+            )
+            slot_counts[sector] += 1
+    bond_pipe = FusionPipe.from_entries(
+        child_legs=(0,),
+        child_sector_lists=(tuple(bond_sectors),),
+        child_dirs=(1,),
+        fused_sectors=tuple(bond_sectors),
+        entries=tuple(pipe_entries),
+        orientation=1,
+        coupling="left",
+    )
+    bond_leg = FusionLeg(
+        child_legs=(0,),
+        child_sector_lists=(tuple(bond_sectors),),
+        child_dirs=(1,),
+        sectors=tuple(bond_sectors),
+        orientation=1,
+        coupling="left",
+        pipe=bond_pipe,
+    )
+    from .basis import BondBasis
+
+    right_bond_basis = BondBasis(
+        sectors=tuple(bond_sectors),
+        dims={
+            sector: int(dim)
+            for sector, dim in zip(bond_sectors, bond_dims)
+        },
+        direction=1,
+        name="cpp-split-right-bond",
+    )
+    left_bond_basis = BondBasis(
+        sectors=tuple(bond_sectors),
+        dims=right_bond_basis.dims,
+        direction=-1,
+        name="cpp-split-left-bond",
+    )
+    fully_reduced = (
+        A.metadata.get("physical_basis") == "fully_reduced_su2"
+        or B.metadata.get("physical_basis") == "fully_reduced_su2"
+    )
+    common_metadata = {
+        "source": "cpp_active_bond_split",
+        **({"physical_basis": "fully_reduced_su2"} if fully_reduced else {}),
+    }
+    left = NonabelianTensor(
+        left_data,
+        [A.qns[0][:], A.qns[1][:], bond_qns],
+        [A.dirs[0], A.dirs[1], A.dirs[2]],
+        fusion_legs=[A.fusion_legs[0], A.fusion_legs[1], bond_leg],
+        metadata={
+            **common_metadata,
+            "svd_role": "left",
+            "bond_bases": {2: right_bond_basis},
+        },
+    )
+    right = NonabelianTensor(
+        right_data,
+        [bond_qns, B.qns[1][:], B.qns[2][:]],
+        [B.dirs[0], B.dirs[1], B.dirs[2]],
+        fusion_legs=[bond_leg, B.fusion_legs[1], B.fusion_legs[2]],
+        metadata={
+            **common_metadata,
+            "svd_role": "right",
+            "bond_bases": {0: left_bond_basis},
+        },
+    )
+    singular_values = {}
+    values = np.asarray(packed["singular_values"], dtype=float).reshape(-1)
+    offsets = np.asarray(packed["singular_offsets"], dtype=np.int64).reshape(-1)
+    if offsets.size != len(bond_sectors) + 1:
+        raise ValueError("Malformed C++ split singular-value topology.")
+    for index, sector in enumerate(bond_sectors):
+        singular_values[sector] = np.diag(
+            values[int(offsets[index]):int(offsets[index + 1])]
+        )
+    return left, right, singular_values
+
+
+def mps_site_from_packed(
+    template,
+    arena,
+    *,
+    left_bond=None,
+    right_bond=None,
+    svd_role=None,
+):
+    """Restore one final MPS site exported by a C++-owned half sweep."""
+
+    if template.rank != 3:
+        raise ValueError("mps_site_from_packed expects a rank-3 site.")
+    template = normalize_site_tensor_layout(template)
+
+    def label(sector):
+        return int(sector.charge), int(sector.irrep.two_j)
+
+    sectors = {}
+    for leg in template.qns:
+        for sector in leg:
+            sectors.setdefault(label(sector), sector)
+
+    values = np.asarray(arena["values"], dtype=np.float64).reshape(-1)
+    offsets = np.asarray(arena["offsets"], dtype=np.int64).reshape(-1)
+    labels = np.asarray(arena["labels"], dtype=np.int64).reshape(-1, 6)
+    shape_offsets = np.asarray(
+        arena["shape_offsets"], dtype=np.int64
+    ).reshape(-1)
+    shapes = np.asarray(arena["shapes"], dtype=np.int64).reshape(-1)
+    if offsets.size != labels.shape[0] + 1 or shape_offsets.size != offsets.size:
+        raise ValueError("Malformed C++ final-site arena.")
+    data = {}
+    for block in range(labels.shape[0]):
+        shape = tuple(
+            int(value)
+            for value in shapes[
+                int(shape_offsets[block]):int(shape_offsets[block + 1])
+            ]
+        )
+        if len(shape) != 3:
+            raise ValueError("A C++ final-site block is not rank three.")
+        key = tuple(
+            sectors.setdefault(
+                (
+                    int(labels[block, 2 * axis]),
+                    int(labels[block, 2 * axis + 1]),
+                ),
+                SpinChargeSector(
+                    int(labels[block, 2 * axis]),
+                    SU2Irrep(int(labels[block, 2 * axis + 1])),
+                ),
+            )
+            for axis in range(3)
+        )
+        start = int(offsets[block])
+        stop = int(offsets[block + 1])
+        if int(np.prod(shape, dtype=int)) != stop - start:
+            raise ValueError(
+                "A C++ final-site shape disagrees with its value range."
+            )
+        data[key] = np.array(values[start:stop], copy=True).reshape(shape)
+
+    qns = [leg[:] for leg in template.qns]
+    fusion_legs = list(template.fusion_legs)
+    bond_bases = {}
+
+    def install_bond(axis, topology):
+        from .basis import BondBasis
+
+        bond_labels, bond_dims = topology
+        bond_labels = np.asarray(bond_labels, dtype=np.int64).reshape(-1, 2)
+        bond_dims = np.asarray(bond_dims, dtype=np.int64).reshape(-1)
+        if bond_labels.shape[0] != bond_dims.size or np.any(bond_dims <= 0):
+            raise ValueError("Malformed C++ final bond-sector topology.")
+        bond_sectors = [
+            sectors.setdefault(
+                (int(charge), int(two_j)),
+                SpinChargeSector(int(charge), SU2Irrep(int(two_j))),
+            )
+            for charge, two_j in bond_labels
+        ]
+        qns[axis] = [
+            sector
+            for sector, dim in zip(bond_sectors, bond_dims)
+            for _ in range(int(dim))
+        ]
+        slot_counts = {sector: 0 for sector in bond_sectors}
+        pipe_entries = []
+        for sector, dim in zip(bond_sectors, bond_dims):
+            for _ in range(int(dim)):
+                slot = slot_counts[sector]
+                pipe_entries.append(
+                    FusionPipeEntry(
+                        child_sectors=(sector,),
+                        fused_sector=sector,
+                        slot=slot,
+                        offset=slot,
+                        local_dim=1,
+                        selected_shape=(1,),
+                    )
+                )
+                slot_counts[sector] += 1
+        bond_pipe = FusionPipe.from_entries(
+            child_legs=(0,),
+            child_sector_lists=(tuple(bond_sectors),),
+            child_dirs=(1,),
+            fused_sectors=tuple(bond_sectors),
+            entries=tuple(pipe_entries),
+            orientation=1,
+            coupling="left",
+        )
+        fusion_legs[axis] = FusionLeg(
+            child_legs=(0,),
+            child_sector_lists=(tuple(bond_sectors),),
+            child_dirs=(1,),
+            sectors=tuple(bond_sectors),
+            orientation=1,
+            coupling="left",
+            pipe=bond_pipe,
+        )
+        direction = -1 if axis == 0 else 1
+        bond_bases[axis] = BondBasis(
+            sectors=tuple(bond_sectors),
+            dims={
+                sector: int(dim)
+                for sector, dim in zip(bond_sectors, bond_dims)
+            },
+            direction=direction,
+            name=f"cpp-final-bond-{axis}",
+        )
+
+    if left_bond is not None:
+        install_bond(0, left_bond)
+    if right_bond is not None:
+        install_bond(2, right_bond)
+    fully_reduced = (
+        template.metadata.get("physical_basis") == "fully_reduced_su2"
+    )
+    metadata = {
+        "source": "cpp_owned_half_sweep",
+        **({"physical_basis": "fully_reduced_su2"} if fully_reduced else {}),
+        **({"svd_role": str(svd_role)} if svd_role is not None else {}),
+        **({"bond_bases": bond_bases} if bond_bases else {}),
+    }
+    return NonabelianTensor(
+        data,
+        qns,
+        list(template.dirs),
+        fusion_legs=fusion_legs,
+        metadata=metadata,
+    )
 
 
 def combine_legs(tensor, legs, new_axis=None, fusion_leg=None, use_cg=False):
@@ -568,9 +1106,14 @@ def split_legs(tensor, axis):
                         f"Missing reduced basis transform for slot {entry.slot} and "
                         f"child sectors {entry.child_sectors!r}."
                     )
-                flat = sliced.reshape((-1, entry.local_dim, int(np.prod(after or (1,), dtype=int))))
-                expanded = np.einsum("bya,xy->bxa", flat, transform, optimize=True)
-                piece = expanded.reshape(before + tuple(entry.selected_shape) + after)
+                if isinstance(transform, IdentityBasisTransform):
+                    piece = sliced.reshape(before + tuple(entry.selected_shape) + after)
+                else:
+                    flat = sliced.reshape(
+                        (-1, entry.local_dim, int(np.prod(after or (1,), dtype=int)))
+                    )
+                    expanded = np.einsum("bya,xy->bxa", flat, transform, optimize=True)
+                    piece = expanded.reshape(before + tuple(entry.selected_shape) + after)
             else:
                 piece = sliced.reshape(before + tuple(entry.selected_shape) + after)
 

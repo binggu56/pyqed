@@ -16,13 +16,13 @@ from pyqed.mps.symmetry import Sector
 from .builder import identity_operator
 from .contraction import normalize_site_tensor_layout
 from .coupling import clebsch_gordan, ordered_two_m_values
-from .mpo import PhysicalLeg, SiteOperator
+from .mpo import Leg, SiteOperator
 from .tensor import NonabelianTensor
 
 
 def _canonical_spatial_leg():
     site = SpatialOrbitalSite()
-    return PhysicalLeg.from_dims(
+    return Leg.from_dims(
         {
             sector: len(indices)
             for sector, indices in zip(site.qn, site.state_index)
@@ -33,7 +33,7 @@ def _canonical_spatial_leg():
 
 def _fully_reduced_spatial_leg():
     site = SpatialOrbitalSite()
-    return PhysicalLeg.from_dims(
+    return Leg.from_dims(
         {sector: 1 for sector in site.qn},
         sectors=site.qn,
     )
@@ -99,16 +99,16 @@ class ReducedTensorOperator:
     """
 
     reduced_blocks: dict[tuple[object, object], complex]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     rank_irrep: SU2Irrep
     component_phases: dict[int, complex] | None = None
 
     def __post_init__(self):
-        if not isinstance(self.phys_out_leg, PhysicalLeg):
-            raise TypeError("ReducedTensorOperator phys_out_leg must be a PhysicalLeg.")
-        if not isinstance(self.phys_in_leg, PhysicalLeg):
-            raise TypeError("ReducedTensorOperator phys_in_leg must be a PhysicalLeg.")
+        if not isinstance(self.phys_out_leg, Leg):
+            raise TypeError("ReducedTensorOperator phys_out_leg must be a Leg.")
+        if not isinstance(self.phys_in_leg, Leg):
+            raise TypeError("ReducedTensorOperator phys_in_leg must be a Leg.")
         if not isinstance(self.rank_irrep, SU2Irrep):
             raise TypeError("ReducedTensorOperator rank_irrep must be an SU2Irrep.")
         normalized_blocks = {}
@@ -119,8 +119,8 @@ class ReducedTensorOperator:
                 raise ValueError(f"Undeclared input sector {q_in!r} in reduced operator.")
             _, out_irrep = _extract_charge_spin(q_out)
             _, in_irrep = _extract_charge_spin(q_in)
-            out_dim = self.phys_out_leg.dim(q_out)
-            in_dim = self.phys_in_leg.dim(q_in)
+            out_dim = self.phys_out_leg.sector_dim(q_out)
+            in_dim = self.phys_in_leg.sector_dim(q_in)
             if out_dim not in {1, out_irrep.dim}:
                 raise NotImplementedError(
                     "ReducedTensorOperator currently requires canonical irrep dimensions or fully reduced output sectors."
@@ -170,7 +170,7 @@ class ReducedTensorOperator:
         _, out_irrep = _extract_charge_spin(q_out)
         _, in_irrep = _extract_charge_spin(q_in)
         phase = self.component_phases[two_m_component]
-        if self.phys_out_leg.dim(q_out) == 1 and self.phys_in_leg.dim(q_in) == 1:
+        if self.phys_out_leg.sector_dim(q_out) == 1 and self.phys_in_leg.sector_dim(q_in) == 1:
             block = np.asarray([[phase * reduced_value]], dtype=self.dtype)
             cache[cache_key] = block
             return block
@@ -517,9 +517,10 @@ class CoupledReducedTensorProductOperator:
     """
 
     component_blocks: dict[int, dict[tuple[object, object], np.ndarray]]
-    phys_out_leg: PhysicalLeg
-    phys_in_leg: PhysicalLeg
+    phys_out_leg: Leg
+    phys_in_leg: Leg
     rank_irrep: SU2Irrep
+    magnetic_component_blocks: dict[int, dict[tuple[object, object], np.ndarray]] | None = None
 
     def __post_init__(self):
         blocks = {}
@@ -536,7 +537,7 @@ class CoupledReducedTensorProductOperator:
                     raise ValueError(f"Undeclared output sector {q_out!r} in coupled product.")
                 if q_in not in self.phys_in_leg.sectors:
                     raise ValueError(f"Undeclared input sector {q_in!r} in coupled product.")
-                if block.shape != (self.phys_out_leg.dim(q_out), self.phys_in_leg.dim(q_in)):
+                if block.shape != (self.phys_out_leg.sector_dim(q_out), self.phys_in_leg.sector_dim(q_in)):
                     raise ValueError(
                         f"Coupled product block {(q_out, q_in)!r} shape {block.shape!r} "
                         "does not match physical leg dimensions."
@@ -546,6 +547,23 @@ class CoupledReducedTensorProductOperator:
         for component in ordered_two_m_values(self.rank_irrep):
             blocks.setdefault(int(component), {})
         object.__setattr__(self, "component_blocks", blocks)
+        magnetic = {}
+        for component, by_sector in dict(self.magnetic_component_blocks or {}).items():
+            normalized = {}
+            for (q_out, q_in), block in dict(by_sector).items():
+                array = np.asarray(block)
+                expected = (
+                    _extract_charge_spin(q_out)[1].dim,
+                    _extract_charge_spin(q_in)[1].dim,
+                )
+                if array.shape != expected:
+                    raise ValueError(
+                        f"Magnetic coupled-product block {(q_out, q_in)!r} shape "
+                        f"{array.shape!r} does not match irrep dimensions {expected!r}."
+                    )
+                normalized[(q_out, q_in)] = array
+            magnetic[int(component)] = normalized
+        object.__setattr__(self, "magnetic_component_blocks", magnetic)
 
     @property
     def components(self):
@@ -558,10 +576,20 @@ class CoupledReducedTensorProductOperator:
             for by_sector in self.component_blocks.values()
             for block in by_sector.values()
         ]
+        dtypes.extend(
+            block.dtype
+            for by_sector in self.magnetic_component_blocks.values()
+            for block in by_sector.values()
+        )
         return np.result_type(*(dtypes or [float]))
 
     def component_block(self, two_m_component, q_out, q_in):
         return self.component_blocks.get(int(two_m_component), {}).get((q_out, q_in))
+
+    def magnetic_component_block(self, two_m_component, q_out, q_in):
+        return self.magnetic_component_blocks.get(int(two_m_component), {}).get(
+            (q_out, q_in)
+        )
 
     def component(self, two_m_component):
         blocks = dict(self.component_blocks.get(int(two_m_component), {}))
@@ -594,6 +622,13 @@ class CoupledReducedTensorProductOperator:
             phys_out_leg=self.phys_out_leg,
             phys_in_leg=self.phys_in_leg,
             rank_irrep=self.rank_irrep,
+            magnetic_component_blocks={
+                component: {
+                    (q_out, q_in): np.asarray(block) * sector_scales[q_in]
+                    for (q_out, q_in), block in by_sector.items()
+                }
+                for component, by_sector in self.magnetic_component_blocks.items()
+            },
         )
 
     def left_multiply_sector_scalar(self, scalar_operator):
@@ -619,7 +654,78 @@ class CoupledReducedTensorProductOperator:
             phys_out_leg=self.phys_out_leg,
             phys_in_leg=self.phys_in_leg,
             rank_irrep=self.rank_irrep,
+            magnetic_component_blocks={
+                component: {
+                    (q_out, q_in): sector_scales[q_out] * np.asarray(block)
+                    for (q_out, q_in), block in by_sector.items()
+                }
+                for component, by_sector in self.magnetic_component_blocks.items()
+            },
         )
+
+
+def _fully_reduced_magnetic_component(operator, component, q_out, q_in):
+    """Return the canonical magnetic block of a fully reduced local tensor."""
+    component = int(component)
+    name = type(operator).__name__
+    if name == "ReducedTensorOperator":
+        reduced = operator.reduced_blocks.get((q_out, q_in))
+        if reduced is None:
+            return None
+        _, in_irrep = _extract_charge_spin(q_in)
+        phase = operator.component_phases[component]
+        return (
+            np.asarray(phase * reduced * in_irrep.dim, dtype=operator.dtype)
+            * _canonical_component_basis(
+                q_out, q_in, operator.rank_irrep, component
+            )
+        )
+    if name == "AdjointReducedTensorOperator":
+        block = _fully_reduced_magnetic_component(
+            operator.base_operator, component, q_in, q_out
+        )
+        if block is None:
+            return None
+        scale = 1.0
+        if operator.input_sector_scales:
+            scale = np.asarray(scale) * np.asarray(
+                operator.input_sector_scales[q_in]
+            )
+        if operator.output_sector_scales:
+            scale = np.asarray(scale) * np.asarray(
+                operator.output_sector_scales[q_out]
+            )
+        return np.asarray(scale, dtype=operator.dtype) * np.asarray(block).T.conj()
+    if name == "TimeReversedReducedTensorOperator":
+        block = _fully_reduced_magnetic_component(
+            operator.base_operator, -component, q_out, q_in
+        )
+        if block is None:
+            return None
+        exponent = (operator.rank_irrep.two_j - component) // 2
+        return ((-1.0) ** exponent) * np.asarray(block, dtype=operator.dtype)
+    if name == "CoupledReducedTensorProductOperator":
+        return operator.magnetic_component_block(component, q_out, q_in)
+    return None
+
+
+def _canonical_component_basis(q_out, q_in, rank_irrep, component):
+    _, out_irrep = _extract_charge_spin(q_out)
+    _, in_irrep = _extract_charge_spin(q_in)
+    block = np.zeros((out_irrep.dim, in_irrep.dim), dtype=float)
+    for row, two_m_out in enumerate(ordered_two_m_values(out_irrep)):
+        for col, two_m_in in enumerate(ordered_two_m_values(in_irrep)):
+            coefficient = clebsch_gordan(
+                in_irrep,
+                rank_irrep,
+                out_irrep,
+                two_m_in,
+                int(component),
+                two_m_out,
+            )
+            if coefficient:
+                block[row, col] = coefficient
+    return block
 
 
 def coupled_reduced_tensor_product(left_operator, right_operator, rank_irrep, *, tol=1.0e-12):
@@ -657,12 +763,17 @@ def coupled_reduced_tensor_product(left_operator, right_operator, rank_irrep, *,
         float,
     )
     component_blocks = {}
+    fully_reduced = all(
+        phys_out_leg.sector_dim(sector) == 1
+        for sector in phys_out_leg.sectors
+    )
+    magnetic_component_blocks = {}
     for two_m in ordered_two_m_values(rank_irrep):
         blocks = {}
         for q_out in phys_out_leg.sectors:
             for q_in in phys_in_leg.sectors:
                 block = np.zeros(
-                    (phys_out_leg.dim(q_out), phys_in_leg.dim(q_in)),
+                    (phys_out_leg.sector_dim(q_out), phys_in_leg.sector_dim(q_in)),
                     dtype=dtype,
                 )
                 for q_mid in phys_mid_leg.sectors:
@@ -693,6 +804,63 @@ def coupled_reduced_tensor_product(left_operator, right_operator, rank_irrep, *,
                 if np.linalg.norm(block.reshape(-1)) > tol:
                     blocks[(q_out, q_in)] = block
         component_blocks[int(two_m)] = blocks
+        if fully_reduced:
+            magnetic_blocks = {}
+            for q_out in phys_out_leg.sectors:
+                for q_in in phys_in_leg.sectors:
+                    _, out_irrep = _extract_charge_spin(q_out)
+                    _, in_irrep = _extract_charge_spin(q_in)
+                    block = np.zeros((out_irrep.dim, in_irrep.dim), dtype=dtype)
+                    for q_mid in phys_mid_leg.sectors:
+                        for left_m in left_operator.components:
+                            left_block = _fully_reduced_magnetic_component(
+                                left_operator, left_m, q_out, q_mid
+                            )
+                            if left_block is None:
+                                continue
+                            for right_m in right_operator.components:
+                                if int(left_m) + int(right_m) != int(two_m):
+                                    continue
+                                cg = clebsch_gordan(
+                                    left_rank,
+                                    right_rank,
+                                    rank_irrep,
+                                    int(left_m),
+                                    int(right_m),
+                                    int(two_m),
+                                )
+                                if not cg:
+                                    continue
+                                right_block = _fully_reduced_magnetic_component(
+                                    right_operator, right_m, q_mid, q_in
+                                )
+                                if right_block is not None:
+                                    block += (
+                                        cg
+                                        * np.asarray(left_block)
+                                        @ np.asarray(right_block)
+                                    )
+                    if np.linalg.norm(block.reshape(-1)) > tol:
+                        magnetic_blocks[(q_out, q_in)] = block
+            magnetic_component_blocks[int(two_m)] = magnetic_blocks
+
+    if fully_reduced:
+        # The one-dimensional physical blocks are reduced multiplicity data,
+        # not magnetic component matrices. Keep only component sectors that
+        # survive after restoring the hidden magnetic substates.
+        filtered_component_blocks = {}
+        for component, magnetic_blocks in magnetic_component_blocks.items():
+            filtered = {}
+            for sector_pair, magnetic_block in magnetic_blocks.items():
+                scalar = component_blocks.get(component, {}).get(sector_pair)
+                if scalar is None or not np.any(np.asarray(scalar)):
+                    nonzero = np.asarray(magnetic_block)[
+                        np.abs(np.asarray(magnetic_block)) > tol
+                    ]
+                    scalar = np.asarray([[nonzero[0]]], dtype=dtype)
+                filtered[sector_pair] = np.asarray(scalar, dtype=dtype)
+            filtered_component_blocks[component] = filtered
+        component_blocks = filtered_component_blocks
 
     if not any(component_blocks.values()):
         raise ValueError("Coupled reduced tensor product is numerically zero.")
@@ -701,6 +869,7 @@ def coupled_reduced_tensor_product(left_operator, right_operator, rank_irrep, *,
         phys_out_leg=phys_out_leg,
         phys_in_leg=phys_in_leg,
         rank_irrep=rank_irrep,
+        magnetic_component_blocks=magnetic_component_blocks,
     )
 
 
@@ -713,7 +882,7 @@ def physical_leg_from_spatial_orbital(site=None):
     site
         Optional source object describing the local spatial-orbital basis.
         Accepts ``None`` (canonical basis), :class:`SpatialOrbitalSite`,
-        :class:`PhysicalLeg`, or a rank-3 :class:`NonabelianTensor` MPS site.
+        :class:`Leg`, or a rank-3 :class:`NonabelianTensor` MPS site.
     """
     canonical_leg = _canonical_spatial_leg()
     reduced_leg = _fully_reduced_spatial_leg()
@@ -723,12 +892,12 @@ def physical_leg_from_spatial_orbital(site=None):
         return reduced_leg
     if isinstance(site, SpatialOrbitalSite):
         return _canonical_spatial_leg()
-    if isinstance(site, PhysicalLeg):
+    if isinstance(site, Leg):
         if site == canonical_leg or site == reduced_leg:
             return site
         if site != canonical_leg:
             raise ValueError(
-                "physical_leg_from_spatial_orbital expects a canonical or fully reduced spatial-orbital PhysicalLeg."
+                "physical_leg_from_spatial_orbital expects a canonical or fully reduced spatial-orbital Leg."
             )
         return site
     if isinstance(site, NonabelianTensor):
@@ -737,6 +906,8 @@ def physical_leg_from_spatial_orbital(site=None):
                 "physical_leg_from_spatial_orbital expects a rank-3 NonabelianTensor site tensor."
             )
         site = normalize_site_tensor_layout(site)
+        if site.metadata.get("physical_basis") == "fully_reduced_su2":
+            return reduced_leg
         dims = {}
         for key, block in site.data.items():
             sector = key[1]
@@ -746,7 +917,7 @@ def physical_leg_from_spatial_orbital(site=None):
                 raise ValueError(
                     f"Inconsistent physical dimension for sector {sector!r}: {prev} vs {dim}."
                 )
-        leg = PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+        leg = Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
         if leg == canonical_leg or leg == reduced_leg:
             return leg
         if leg != canonical_leg:
@@ -755,7 +926,7 @@ def physical_leg_from_spatial_orbital(site=None):
             )
         return leg
     raise TypeError(
-        "physical_leg_from_spatial_orbital expects None, SpatialOrbitalSite, PhysicalLeg, "
+        "physical_leg_from_spatial_orbital expects None, SpatialOrbitalSite, Leg, "
         "or a rank-3 NonabelianTensor."
     )
 
@@ -764,7 +935,7 @@ def _projector_weights(weights, *, phys_leg, dtype=float):
     blocks = {}
     for sector in phys_leg.sectors:
         blocks[(sector, sector)] = np.asarray(weights[sector], dtype=dtype) * np.eye(
-            phys_leg.dim(sector), dtype=dtype
+            phys_leg.sector_dim(sector), dtype=dtype
         )
     return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
 
@@ -890,7 +1061,7 @@ def reduced_spatial_fermion_annihilation(site=None, *, dtype=float):
     q_empty, q_single, q_double = phys_leg.sectors
     empty_single_value = (
         1.0 / np.sqrt(2.0)
-        if phys_leg.dim(q_single) == 1
+        if phys_leg.sector_dim(q_single) == 1
         else np.sqrt(2.0)
     )
     return ReducedTensorOperator(

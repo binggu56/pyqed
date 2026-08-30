@@ -6,7 +6,11 @@ from pyqed.narg.qchem import NARG, SU2NARG
 from pyqed.narg.qchem import su2_three_site as su2_three_site_module
 from pyqed.narg.qchem import su2_backend as su2_backend_module
 from pyqed.narg.qchem.su2_backend import SU2NARGBackend, resolve_su2_narg_backend
-from pyqed.narg.qchem.su2_core import su2_projected_roots
+from pyqed.narg.qchem.su2_core import (
+    scalar_hamiltonian_irrep_tensor,
+    su2_product_symmetry,
+    su2_projected_roots,
+)
 from pyqed.narg.qchem.su2_chain import (
     LowRankERI,
     diagonalize_block,
@@ -24,8 +28,10 @@ from pyqed.narg.qchem.su2_chain import (
 from pyqed.narg.qchem.su2_three_site import (
     PackedBilinearEntries,
     accumulate_bilinear_entries,
+    assembled_hamiltonian_irrep_tensor,
     coalesce_bilinear_entries,
     local_reduced_operator,
+    product_operator_irrep_tensor,
     product_tensor_angular_terms,
     reduced_product_tensor_irrep,
     rotate_reduced_tensor_to_truncated,
@@ -38,6 +44,7 @@ from pyqed.narg.qchem.su2_two_site import (
     diagonalize_all_sectors,
     truncate_to_D,
 )
+from pyqed.symmetry import Irrep, Leg
 
 
 def _hubbard_integrals(nsites: int, *, t: float = 0.7, u: float = 2.0):
@@ -95,6 +102,32 @@ def _assert_reduced_tensors_allclose(actual, expected, *, atol=1.0e-12):
         assert set(actual[key].blocks) == set(tensor.blocks)
         for block_key, block in tensor.blocks.items():
             np.testing.assert_allclose(actual[key].blocks[block_key], block, atol=atol)
+
+
+def test_projected_operator_helpers_preserve_the_supplied_leg():
+    irrep = Irrep((0, 0))
+    leg = Leg({irrep: 1}, symmetry=su2_product_symmetry())
+    basis = {irrep: np.ones((1, 1))}
+
+    scalar = scalar_hamiltonian_irrep_tensor(np.array([[2.0]]), leg, basis)
+    block_basis = np.ones((1, 1))
+    primitive_bases = {irrep: np.array([[1.0], [0.0], [0.0], [0.0]])}
+    assembled = assembled_hamiltonian_irrep_tensor(
+        np.diag([3.0, 0.0, 0.0, 0.0]),
+        block_basis,
+        leg,
+        primitive_bases,
+    )
+    product = product_operator_irrep_tensor(
+        np.diag([4.0, 0.0, 0.0, 0.0]),
+        block_basis,
+        leg,
+        primitive_bases,
+    )
+
+    for tensor in (scalar, assembled, product):
+        assert tensor.bra is leg
+        assert tensor.ket is leg
 
 
 def test_grown_reduced_v1_packages_match_projected_components_random_and_hubbard():

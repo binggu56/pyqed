@@ -13,7 +13,8 @@ from pyqed import dag, tensor, transform
 
 
 from pyqed import SpinHalfFermionOperators, eigh
-from pyqed.mps.dmrg import MPO, DMRG
+from pyqed.mps.dmrg import DMRG
+from pyqed.tn import MPO
 
 
 from scipy.sparse.linalg import eigsh

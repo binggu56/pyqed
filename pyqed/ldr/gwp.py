@@ -132,7 +132,7 @@ class GWP:
         else:
             
             if isinstance(a, (float, int)):
-                a = [a] * ndim # homogenous width
+                a = [a] * ndim # homogeneous width
             
             self.a = a 
             

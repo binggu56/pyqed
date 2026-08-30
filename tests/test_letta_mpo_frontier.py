@@ -1,14 +1,13 @@
 import numpy as np
 
-from pyqed.letta import LocalHamiltonian, LocalTerm
-from pyqed.letta.local_terms import LocalMPO
+from pyqed.tn import LocalHamiltonian, LocalTerm
 from pyqed.letta.mpo_frontier import MPOFrontier
+from pyqed.tn import MPO
 from tests.test_letta_frontier_tying import _states
 
 
 def _identity_mpo(dims):
-    return LocalMPO(
-        dims,
+    return MPO(
         [np.eye(dim)[None, None, :, :] for dim in dims],
     )
 
@@ -16,7 +15,7 @@ def _identity_mpo(dims):
 def _engine(state, mpo):
     return MPOFrontier(
         state.dims,
-        state.physical_sites,
+        state.physical_groups,
         [tensor.shape for tensor in state.tensors],
         mpo.tensors,
     )

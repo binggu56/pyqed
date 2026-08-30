@@ -36,6 +36,7 @@ Dynamics and representations
 * :mod:`pyqed.floquet` -- periodically driven models.
 * :mod:`pyqed.polariton` -- light--matter model workflows.
 * :mod:`pyqed.mps` -- matrix-product-state and related research methods.
+* :mod:`pyqed.peps` -- finite PEPS states, boundary contraction, and optimization.
 * :mod:`pyqed.protein` -- experimental protein-analysis helpers.
 
 API stability

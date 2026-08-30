@@ -231,7 +231,7 @@ pyqed/mps/umps.py
 pyqed/mps/vibrational.py
 pyqed/mps/vibronic.py
 pyqed/mps/nonabelian/__init__.py
-pyqed/mps/nonabelian/_su2_kernel.c
+pyqed/mps/nonabelian/_su2_kernel.cpp
 pyqed/mps/nonabelian/_su2_kernel.pyx
 pyqed/mps/nonabelian/basis.py
 pyqed/mps/nonabelian/builder.py
@@ -253,6 +253,9 @@ pyqed/mps/nonabelian/renormalized.py
 pyqed/mps/nonabelian/solver.py
 pyqed/mps/nonabelian/states.py
 pyqed/mps/nonabelian/su2_kernel.py
+pyqed/mps/nonabelian/su2_coupling_core.hpp
+pyqed/mps/nonabelian/su2_dmrg_engine.cpp
+pyqed/mps/nonabelian/su2_dmrg_engine.hpp
 pyqed/mps/nonabelian/su2_qchem_plan.py
 pyqed/mps/nonabelian/sweep.py
 pyqed/mps/nonabelian/tensor.py
@@ -1302,7 +1305,6 @@ pyqed/qchem/dmrg/dmrg_dvr.py
 pyqed/qchem/dmrg/dmrgscf.py
 pyqed/qchem/dmrg/dmrgscf_bak.py
 pyqed/qchem/dmrg/ed.py
-pyqed/qchem/dmrg/nonabelian.py
 pyqed/qchem/dmrg/overlap.py
 pyqed/qchem/dmrg/spatial_mpo.py
 pyqed/qchem/dmrg/spatial_terms.py
