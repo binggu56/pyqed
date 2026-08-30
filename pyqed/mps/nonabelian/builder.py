@@ -200,6 +200,22 @@ def _reduced_operator_signature(operator):
                     blocks.append((component, q_out, q_in, None))
                 else:
                     blocks.append((component, q_out, q_in, _dense_signature(block)))
+    magnetic_blocks = getattr(operator, "magnetic_component_blocks", None)
+    magnetic_signature = ()
+    if magnetic_blocks is not None:
+        magnetic_signature = tuple(
+            (
+                int(component),
+                q_out,
+                q_in,
+                _dense_signature(block),
+            )
+            for component, by_sector in sorted(magnetic_blocks.items())
+            for (q_out, q_in), block in sorted(
+                by_sector.items(),
+                key=lambda item: (repr(item[0][0]), repr(item[0][1])),
+            )
+        )
     rank_irrep = (
         operator.rank_irrep
         if hasattr(operator, "rank_irrep")
@@ -214,6 +230,7 @@ def _reduced_operator_signature(operator):
         _leg_signature(phys_out_leg),
         _leg_signature(phys_in_leg),
         tuple(blocks),
+        magnetic_signature,
     )
 
 
@@ -889,11 +906,11 @@ class AutoMPO:
             if family is None:
                 return ()
             if isinstance(family, str):
-                return (family,) if family.startswith("__prefix_") else ()
+                return (family,)
             return tuple(
                 str(item)
                 for item in family
-                if item is not None and str(item).startswith("__prefix_")
+                if item is not None
             )
 
         def add_dense_transition(
@@ -1360,6 +1377,7 @@ class AutoMPO:
                     key = (
                         _reduced_operator_signature(record["operator"]),
                         bool(record["use_cg_coupling"]),
+                        tuple(record["family"]),
                     )
                     item = reduced_blocks.get(key)
                     routes = None if item is None else item[0]
@@ -1402,6 +1420,7 @@ class AutoMPO:
                         dtype=dtype,
                     ),
                     use_cg_coupling=use_cg_coupling,
+                    family=family,
                 )
                 for (_signature, use_cg_coupling), (routes, operator) in reduced_blocks.items()
                 if any(value != 0 for value in routes.values())

@@ -198,8 +198,6 @@ def run_pyqed(case, basis, *, symmetry, bond_dim, nsweeps, max_bond_mode):
     }
 
 
-def run_pyqed_su2_strict(case, basis, *, bond_dim, nsweeps):
-    """Run PyQED SU(2) with stricter local solves and no mixer noise."""
 
     mol = build_pyqed_cpp_molecule(case, basis)
     mf = RHF(mol).run()
@@ -420,48 +418,13 @@ def main():
         e_casci,
     )
     print_result(
-        "PyQED SU2 states-D",
+        "PyQED SU2 native C++",
         run_pyqed(
             case,
             args.basis,
             symmetry="su2",
             bond_dim=args.D,
             nsweeps=args.nsweeps,
-            max_bond_mode="states",
-        ),
-        e_casci,
-    )
-    print_result(
-        "PyQED SU2 reduced-D",
-        run_pyqed(
-            case,
-            args.basis,
-            symmetry="su2",
-            bond_dim=args.D,
-            nsweeps=args.nsweeps,
-            max_bond_mode="reduced",
-        ),
-        e_casci,
-    )
-    print_result(
-        "PyQED SU2 strict",
-        run_pyqed_su2_strict(
-            case,
-            args.basis,
-            bond_dim=args.D,
-            nsweeps=args.nsweeps,
-        ),
-        e_casci,
-    )
-    print_result(
-        "PyQED SU2 block2-D",
-        run_pyqed(
-            case,
-            args.basis,
-            symmetry="su2",
-            bond_dim=args.D,
-            nsweeps=args.nsweeps,
-            max_bond_mode="per_sector",
         ),
         e_casci,
     )

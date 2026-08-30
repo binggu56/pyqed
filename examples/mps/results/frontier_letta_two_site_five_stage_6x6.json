@@ -1,0 +1,5307 @@
+{
+  "status": "complete",
+  "protocol": {
+    "benchmark": "five fixed-graph LETTA two-site upgrades",
+    "site_indexing": "zero based",
+    "representative_left_sites": [
+      14,
+      20
+    ],
+    "full_update_left_sites": [
+      14
+    ],
+    "outer_cycle_variants": [
+      1,
+      3
+    ],
+    "operator_backends": [
+      "dense",
+      "block"
+    ],
+    "factor_solvers": [
+      "matrix_free",
+      "dense"
+    ],
+    "timing_warmups": 0,
+    "timing_repeats": 1,
+    "metric_tol": 1e-12,
+    "metric_support": "regularized",
+    "eig_tol": 1e-10,
+    "maxiter": 1600,
+    "max_subspace": 96,
+    "merged_dense_fallback_dim": 2048,
+    "split_metric_sweeps": 6,
+    "split_variational_sweeps": 8,
+    "random_starts": 0,
+    "symmetry": "none",
+    "timing_policy": "state construction is excluded from solver/update timing; raw samples are retained and ratios must be formed from matching rows",
+    "outer_convergence_probe": 8
+  },
+  "software_and_host": {
+    "python": "3.13.5 | packaged by Anaconda, Inc. | (main, Jun 12 2025, 11:23:37) [Clang 14.0.6 ]",
+    "platform": "macOS-26.2-arm64-arm-64bit-Mach-O",
+    "numpy": "2.1.3",
+    "scipy": "1.15.3",
+    "thread_environment": {
+      "OPENBLAS_NUM_THREADS": "1",
+      "OMP_NUM_THREADS": "1",
+      "VECLIB_MAXIMUM_THREADS": "1",
+      "NUMEXPR_NUM_THREADS": "1"
+    }
+  },
+  "source": {
+    "result": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_bond_expansion_6x6.json",
+    "snapshot": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/mps/results/frontier_letta_bond_expansion_6x6.npz",
+    "result_sha256": "1ea1e661b78a5778ec20885fe3f09257e1dadf482ff25dc0d3b9280938a77d47",
+    "snapshot_sha256": "90ae1f786db62fe1d4722b69b34f5aecba66bac1fc29a6281a13e40bbeea3b43",
+    "frontier_tying_source": "/Users/bingg/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/pyqed/letta/frontier_tying.py",
+    "frontier_tying_sha256": "03ea0adb076b21134ec2915d7cc54d5c807dc5c7207e1775ac73591adbb468e9",
+    "model": {
+      "nrows": 6,
+      "ncols": 6,
+      "nsites": 36,
+      "j1": 1.0,
+      "j2": 0.5,
+      "boundary": "open",
+      "site_order": "row-wise snake",
+      "tie_graph": "all nearest-neighbor J1 bonds",
+      "tie_edges": 60,
+      "j2_diagonal_edges": 50,
+      "full_hilbert_dimension": 68719476736
+    },
+    "energy": -16.849164652685822,
+    "parameters": 4008,
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      6,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ]
+  },
+  "pair_metadata": {
+    "14": {
+      "sites": [
+        14,
+        15
+      ],
+      "spanned_cut": 15,
+      "union_sites": [
+        14,
+        15,
+        16,
+        20,
+        21
+      ],
+      "overlap_sites": [
+        15
+      ],
+      "merged_shape": [
+        4,
+        4,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "merged_dimension": 512,
+      "left_factor_shape": [
+        4,
+        6,
+        2,
+        2,
+        2
+      ],
+      "right_factor_shape": [
+        6,
+        4,
+        2,
+        2,
+        2
+      ],
+      "bond_dimension": 6
+    },
+    "20": {
+      "sites": [
+        20,
+        21
+      ],
+      "spanned_cut": 21,
+      "union_sites": [
+        20,
+        21,
+        22,
+        26,
+        27
+      ],
+      "overlap_sites": [
+        21
+      ],
+      "merged_shape": [
+        4,
+        4,
+        2,
+        2,
+        2,
+        2,
+        2
+      ],
+      "merged_dimension": 512,
+      "left_factor_shape": [
+        4,
+        6,
+        2,
+        2,
+        2
+      ],
+      "right_factor_shape": [
+        6,
+        4,
+        2,
+        2,
+        2
+      ],
+      "bond_dimension": 6
+    }
+  },
+  "merged_solver_ablation": {
+    "14": {
+      "operator_build_excluded_from_solver_timings": true,
+      "warm_energy": -16.849164650001686,
+      "metric_support": {
+        "requested_rank": 511,
+        "numerical_rank": 512,
+        "metric_scale": 1405734.4411704144,
+        "minimum_numerically_positive": 9.644895376892742e-07,
+        "numerical_condition": 877175722689.8097
+      },
+      "cutoff_whitened": {
+        "energy": -16.851069538570354,
+        "energy_gain": 0.001904888568667218,
+        "retained_rank": 511,
+        "identity_metric_error": 9.599205002030792e-08,
+        "coordinate_residual_norm": 1.9361744856723333e-11,
+        "full_residual": {
+          "raw": 6.560323587022957e-05,
+          "backward": 3.0079287111057926e-14,
+          "dual": 2.924859457993283e-08,
+          "dual_relative": 2.730763040215713e-14,
+          "null": 0.0,
+          "discarded": 1.3394934152177513e-08
+        },
+        "lowest_root_certified": false,
+        "timing": {
+          "samples_seconds": [
+            0.9967928749974817
+          ],
+          "median_seconds": 0.9967928749974817,
+          "minimum_seconds": 0.9967928749974817,
+          "maximum_seconds": 0.9967928749974817,
+          "repeats": 1
+        }
+      },
+      "verified": {
+        "regularized": {
+          "energy": -16.85106952359887,
+          "energy_gain": 0.0019048735971836095,
+          "diagnostics": {
+            "method": "dense_certified",
+            "attempts": [
+              "warm_davidson",
+              "dense_certification"
+            ],
+            "verified": true,
+            "lowest_root_certified": true,
+            "fallback_reason": "warm Davidson failed full metric-dual verification",
+            "dense_fallback": true,
+            "metric_requested_rank": 511,
+            "metric_numerical_rank": 512,
+            "metric_min_positive": 9.644895376892742e-07,
+            "metric_condition": 877175722689.8097,
+            "backward_residual": 3.007923620688894e-14,
+            "metric_dual_residual": 7.806788213430985e-07,
+            "metric_dual_relative_residual": 7.288727816094528e-13,
+            "null_residual": 0.0,
+            "warm_energy": -16.84916465191315,
+            "upper_bound_gap": -0.0019048716857206216,
+            "metric_support": "regularized",
+            "discarded_support_residual": 1.3394929294141709e-08
+          },
+          "local_update": {
+            "site": 14,
+            "raw_dim": 512,
+            "metric_rank": 511,
+            "metric_rank_is_projected": true,
+            "solver": "dense_certified",
+            "solver_converged": true,
+            "message": "verified merged-pair root",
+            "hamiltonian_matvecs": 129,
+            "metric_matvecs": 129,
+            "iterations": 128,
+            "residual_norm": 6.56030762758404e-05,
+            "energy_before": -16.84916465191315,
+            "energy": -16.85106952359887,
+            "accepted": true,
+            "physical_blocks": 0,
+            "hamiltonian_blocks": 0,
+            "block_component_sizes": [],
+            "stored_operator_elements": 0,
+            "solver_metric_is_identity": false,
+            "solver_metric_identity_error": NaN,
+            "solver_coordinate_residual_norm": 7.288727816094528e-13
+          },
+          "timing": {
+            "samples_seconds": [
+              0.4030465830001049
+            ],
+            "median_seconds": 0.4030465830001049,
+            "minimum_seconds": 0.4030465830001049,
+            "maximum_seconds": 0.4030465830001049,
+            "repeats": 1
+          }
+        },
+        "numerical": {
+          "energy": -16.85211650545025,
+          "energy_gain": 0.0029518554485647996,
+          "diagnostics": {
+            "method": "dense_certified",
+            "attempts": [
+              "warm_davidson",
+              "dense_certification"
+            ],
+            "verified": true,
+            "lowest_root_certified": true,
+            "fallback_reason": "warm Davidson failed full metric-dual verification",
+            "dense_fallback": true,
+            "metric_requested_rank": 511,
+            "metric_numerical_rank": 512,
+            "metric_min_positive": 9.644895376892742e-07,
+            "metric_condition": 877175722689.8097,
+            "backward_residual": 5.99437642032254e-19,
+            "metric_dual_residual": 4.8810622349070316e-08,
+            "metric_dual_relative_residual": 4.3128701921300385e-14,
+            "null_residual": 0.0,
+            "warm_energy": -16.84916465191315,
+            "upper_bound_gap": -0.0029518535371018118,
+            "metric_support": "numerical",
+            "discarded_support_residual": 0.0
+          },
+          "local_update": {
+            "site": 14,
+            "raw_dim": 512,
+            "metric_rank": 512,
+            "metric_rank_is_projected": false,
+            "solver": "dense_certified",
+            "solver_converged": true,
+            "message": "verified merged-pair root",
+            "hamiltonian_matvecs": 129,
+            "metric_matvecs": 129,
+            "iterations": 128,
+            "residual_norm": 1.3814764930819436e-09,
+            "energy_before": -16.84916465191315,
+            "energy": -16.85211650545025,
+            "accepted": true,
+            "physical_blocks": 0,
+            "hamiltonian_blocks": 0,
+            "block_component_sizes": [],
+            "stored_operator_elements": 0,
+            "solver_metric_is_identity": false,
+            "solver_metric_identity_error": NaN,
+            "solver_coordinate_residual_norm": 4.3128701921300385e-14
+          },
+          "timing": {
+            "samples_seconds": [
+              0.36104625003645197
+            ],
+            "median_seconds": 0.36104625003645197,
+            "minimum_seconds": 0.36104625003645197,
+            "maximum_seconds": 0.36104625003645197,
+            "repeats": 1
+          }
+        }
+      },
+      "dense_full_numerical_support_kernel": {
+        "coordinate_eigenvalue": -16.85211650545025,
+        "rayleigh_energy": -16.852116502564396,
+        "full_residual": {
+          "raw": 8.377289566741703e-07,
+          "backward": 3.6349968527663355e-16,
+          "dual": 6.470384272529564e-08,
+          "dual_relative": 5.717183292298576e-14,
+          "null": 0.0,
+          "discarded": 0.0
+        },
+        "timing": {
+          "samples_seconds": [
+            0.06769579095998779
+          ],
+          "median_seconds": 0.06769579095998779,
+          "minimum_seconds": 0.06769579095998779,
+          "maximum_seconds": 0.06769579095998779,
+          "repeats": 1
+        },
+        "scope": "lowest generalized eigensolver kernel only"
+      }
+    },
+    "20": {
+      "operator_build_excluded_from_solver_timings": true,
+      "warm_energy": -16.84916465287231,
+      "metric_support": {
+        "requested_rank": 512,
+        "numerical_rank": 512,
+        "metric_scale": 120.96043509274719,
+        "minimum_numerically_positive": 1.738808274891014e-09,
+        "numerical_condition": 38617109427.9951
+      },
+      "cutoff_whitened": {
+        "energy": -16.84960779077521,
+        "energy_gain": 0.0004431379028986271,
+        "retained_rank": 512,
+        "identity_metric_error": 8.497839391246855e-09,
+        "coordinate_residual_norm": 6.954485191283893e-12,
+        "full_residual": {
+          "raw": 1.3960306862747482e-11,
+          "backward": 1.9441159628705502e-17,
+          "dual": 1.0710658678598682e-09,
+          "dual_relative": 2.6415772896398456e-14,
+          "null": 0.0,
+          "discarded": 0.0
+        },
+        "lowest_root_certified": false,
+        "timing": {
+          "samples_seconds": [
+            0.9847312089987099
+          ],
+          "median_seconds": 0.9847312089987099,
+          "minimum_seconds": 0.9847312089987099,
+          "maximum_seconds": 0.9847312089987099,
+          "repeats": 1
+        }
+      },
+      "verified": {
+        "regularized": {
+          "energy": -16.849607790741754,
+          "energy_gain": 0.0004431378694427224,
+          "diagnostics": {
+            "method": "dense_certified",
+            "attempts": [
+              "warm_davidson",
+              "dense_certification"
+            ],
+            "verified": true,
+            "lowest_root_certified": true,
+            "fallback_reason": "warm Davidson failed full metric-dual verification",
+            "dense_fallback": true,
+            "metric_requested_rank": 512,
+            "metric_numerical_rank": 512,
+            "metric_min_positive": 1.738808274891014e-09,
+            "metric_condition": 38617109427.9951,
+            "backward_residual": 2.33870182285288e-18,
+            "metric_dual_residual": 2.3486151032470365e-09,
+            "metric_dual_relative_residual": 5.792405951422988e-14,
+            "null_residual": 0.0,
+            "warm_energy": -16.849164652883896,
+            "upper_bound_gap": -0.00044313785785732307,
+            "metric_support": "regularized",
+            "discarded_support_residual": 0.0
+          },
+          "local_update": {
+            "site": 20,
+            "raw_dim": 512,
+            "metric_rank": 512,
+            "metric_rank_is_projected": false,
+            "solver": "dense_certified",
+            "solver_converged": true,
+            "message": "verified merged-pair root",
+            "hamiltonian_matvecs": 129,
+            "metric_matvecs": 129,
+            "iterations": 128,
+            "residual_norm": 1.6793748825399833e-12,
+            "energy_before": -16.849164652883896,
+            "energy": -16.849607790741754,
+            "accepted": true,
+            "physical_blocks": 0,
+            "hamiltonian_blocks": 0,
+            "block_component_sizes": [],
+            "stored_operator_elements": 0,
+            "solver_metric_is_identity": false,
+            "solver_metric_identity_error": NaN,
+            "solver_coordinate_residual_norm": 5.792405951422988e-14
+          },
+          "timing": {
+            "samples_seconds": [
+              0.36699487501755357
+            ],
+            "median_seconds": 0.36699487501755357,
+            "minimum_seconds": 0.36699487501755357,
+            "maximum_seconds": 0.36699487501755357,
+            "repeats": 1
+          }
+        },
+        "numerical": {
+          "energy": -16.849607790741754,
+          "energy_gain": 0.0004431378694427224,
+          "diagnostics": {
+            "method": "dense_certified",
+            "attempts": [
+              "warm_davidson",
+              "dense_certification"
+            ],
+            "verified": true,
+            "lowest_root_certified": true,
+            "fallback_reason": "warm Davidson failed full metric-dual verification",
+            "dense_fallback": true,
+            "metric_requested_rank": 512,
+            "metric_numerical_rank": 512,
+            "metric_min_positive": 1.738808274891014e-09,
+            "metric_condition": 38617109427.9951,
+            "backward_residual": 2.33870182285288e-18,
+            "metric_dual_residual": 2.3486151032470365e-09,
+            "metric_dual_relative_residual": 5.792405951422988e-14,
+            "null_residual": 0.0,
+            "warm_energy": -16.849164652883896,
+            "upper_bound_gap": -0.00044313785785732307,
+            "metric_support": "numerical",
+            "discarded_support_residual": 0.0
+          },
+          "local_update": {
+            "site": 20,
+            "raw_dim": 512,
+            "metric_rank": 512,
+            "metric_rank_is_projected": false,
+            "solver": "dense_certified",
+            "solver_converged": true,
+            "message": "verified merged-pair root",
+            "hamiltonian_matvecs": 129,
+            "metric_matvecs": 129,
+            "iterations": 128,
+            "residual_norm": 1.6793748825399833e-12,
+            "energy_before": -16.849164652883896,
+            "energy": -16.849607790741754,
+            "accepted": true,
+            "physical_blocks": 0,
+            "hamiltonian_blocks": 0,
+            "block_component_sizes": [],
+            "stored_operator_elements": 0,
+            "solver_metric_is_identity": false,
+            "solver_metric_identity_error": NaN,
+            "solver_coordinate_residual_norm": 5.792405951422988e-14
+          },
+          "timing": {
+            "samples_seconds": [
+              0.3798723749932833
+            ],
+            "median_seconds": 0.3798723749932833,
+            "minimum_seconds": 0.3798723749932833,
+            "maximum_seconds": 0.3798723749932833,
+            "repeats": 1
+          }
+        }
+      },
+      "dense_full_numerical_support_kernel": {
+        "coordinate_eigenvalue": -16.849607790741754,
+        "rayleigh_energy": -16.84960779076179,
+        "full_residual": {
+          "raw": 2.7714670537766112e-11,
+          "backward": 3.8595522167378734e-17,
+          "dual": 1.999050760662926e-09,
+          "dual_relative": 4.930272954156648e-14,
+          "null": 0.0,
+          "discarded": 0.0
+        },
+        "timing": {
+          "samples_seconds": [
+            0.06788933294592425
+          ],
+          "median_seconds": 0.06788933294592425,
+          "minimum_seconds": 0.06788933294592425,
+          "maximum_seconds": 0.06788933294592425,
+          "repeats": 1
+        },
+        "scope": "lowest generalized eigensolver kernel only"
+      }
+    }
+  },
+  "full_update_grid": {
+    "14": {
+      "dense__matrix_free__outer_1": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.851292971532636,
+        "fresh_energy": -16.851292971532636,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.0021283188468146363,
+        "merged_energy": -16.85106952359887,
+        "merged_energy_history": [
+          -16.85106952359887
+        ],
+        "factor_energy_history": [
+          -16.851292969671253
+        ],
+        "requested_outer_cycles": 1,
+        "completed_outer_cycles": 1,
+        "factor_sweeps": 8,
+        "factor_accepted_half_updates": 16,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.014866884857839109,
+        "relative_euclidean_truncation_error": 0.0008294367347872123,
+        "pair_operator_backend": "dense",
+        "pair_operator_stored_elements": 524288,
+        "merged_solve": {
+          "method": "dense_certified",
+          "attempts": [
+            "warm_davidson",
+            "dense_certification"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "warm Davidson failed full metric-dual verification",
+          "dense_fallback": true,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644895376892742e-07,
+          "metric_condition": 877175722689.8097,
+          "backward_residual": 3.007923620688894e-14,
+          "metric_dual_residual": 7.806788213430985e-07,
+          "metric_dual_relative_residual": 7.288727816094528e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.84916465191315,
+          "upper_bound_gap": -0.0019048716857206216,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394929294141709e-08
+        },
+        "certified_merged_root_reused": false,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0018856048785884348
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00971380746279068
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0028195167278406603
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.002034396215779346
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0019051865312002636
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0012079211087210322
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0014025423466708328
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0009517038690840064
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0010320122461342396
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006386908940665653
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006037962107282606
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006654472489405719
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00040232756021547195
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003052877043856901
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00038156136688891713
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00032034006867304583
+            }
+          ],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 16,
+          "design_calls": [],
+          "full_design_matrices_constructed": false,
+          "total_design_elements": 0,
+          "largest_design_elements": 0,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "dense",
+        "requested_factor_solver": "matrix_free",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.1805365000036545
+            ],
+            "median_seconds": 0.1805365000036545,
+            "minimum_seconds": 0.1805365000036545,
+            "maximum_seconds": 0.1805365000036545,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              9.99532566696871
+            ],
+            "median_seconds": 9.99532566696871,
+            "minimum_seconds": 9.99532566696871,
+            "maximum_seconds": 9.99532566696871,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              10.955677416990511
+            ],
+            "median_seconds": 10.955677416990511,
+            "minimum_seconds": 10.955677416990511,
+            "maximum_seconds": 10.955677416990511,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 0.0
+      },
+      "dense__matrix_free__outer_3": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.8513013114326,
+        "fresh_energy": -16.8513013114326,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.002136658746778153,
+        "merged_energy": -16.85106952359887,
+        "merged_energy_history": [
+          -16.85106952359887,
+          -16.85106952359887,
+          -16.85106952359887
+        ],
+        "factor_energy_history": [
+          -16.851292969671253,
+          -16.851300629058144,
+          -16.851301311574733
+        ],
+        "requested_outer_cycles": 3,
+        "completed_outer_cycles": 3,
+        "factor_sweeps": 24,
+        "factor_accepted_half_updates": 48,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.014866884863837934,
+        "relative_euclidean_truncation_error": 0.0008294367347872162,
+        "pair_operator_backend": "dense",
+        "pair_operator_stored_elements": 524288,
+        "merged_solve": {
+          "method": "cached_dense_certified",
+          "attempts": [
+            "cached_certified_root"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "warm Davidson failed full metric-dual verification",
+          "dense_fallback": true,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644895376892742e-07,
+          "metric_condition": 877175722689.8097,
+          "backward_residual": 3.007923620688894e-14,
+          "metric_dual_residual": 7.806788213430985e-07,
+          "metric_dual_relative_residual": 7.288727816094528e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.851300629058144,
+          "upper_bound_gap": 0.00023110545927451653,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394929294141709e-08
+        },
+        "certified_merged_root_reused": true,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0018856048785884348
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00971380746279068
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0028195167278406603
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.002034396215779346
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0019051865312002636
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0012079211087210322
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0014025423466708328
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0009517038690840064
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0010320122461342396
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006386908940665653
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006037962107282606
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006654472489405719
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00040232756021547195
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003052877043856901
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00038156136688891713
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00032034006867304583
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0002683772438315469
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.000502319355914704
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00026786641098123604
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00033965771924547973
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00026594944931583055
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003432945966807315
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001628646766409103
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003530878920674815
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00014405060066385877
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00015534421909135264
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00012944137617916678
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00018120023199713113
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.781072098749819e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00017770508147547918
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001245550472670343
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001247068899891312
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.63048109917839e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0002150385944810639
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00010002648388198742
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00017317236882274142
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00011305998764430034
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00014963846162516667
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.929318874485267e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00012048800183939886
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 8.007039650373283e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 8.301846460364658e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 6.739044635832947e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 7.126933908593736e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 4.798603983465726e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 3.618623161595813e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 4.3899602387161556e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 4.494441616460912e-05
+            }
+          ],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 48,
+          "design_calls": [],
+          "full_design_matrices_constructed": false,
+          "total_design_elements": 0,
+          "largest_design_elements": 0,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "dense",
+        "requested_factor_solver": "matrix_free",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.1793760409927927
+            ],
+            "median_seconds": 0.1793760409927927,
+            "minimum_seconds": 0.1793760409927927,
+            "maximum_seconds": 0.1793760409927927,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              26.391084917006083
+            ],
+            "median_seconds": 26.391084917006083,
+            "minimum_seconds": 26.391084917006083,
+            "maximum_seconds": 26.391084917006083,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              27.365033042035066
+            ],
+            "median_seconds": 27.365033042035066,
+            "minimum_seconds": 27.365033042035066,
+            "maximum_seconds": 27.365033042035066,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 8.339899963516473e-06
+      },
+      "dense__dense__outer_1": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.851292971534605,
+        "fresh_energy": -16.851292971534605,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.0021283188487828397,
+        "merged_energy": -16.85106952359887,
+        "merged_energy_history": [
+          -16.85106952359887
+        ],
+        "factor_energy_history": [
+          -16.851292970316962
+        ],
+        "requested_outer_cycles": 1,
+        "completed_outer_cycles": 1,
+        "factor_sweeps": 8,
+        "factor_accepted_half_updates": 16,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.014866884857839109,
+        "relative_euclidean_truncation_error": 0.0008294367347872123,
+        "pair_operator_backend": "dense",
+        "pair_operator_stored_elements": 524288,
+        "merged_solve": {
+          "method": "dense_certified",
+          "attempts": [
+            "warm_davidson",
+            "dense_certification"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "warm Davidson failed full metric-dual verification",
+          "dense_fallback": true,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644895376892742e-07,
+          "metric_condition": 877175722689.8097,
+          "backward_residual": 3.007923620688894e-14,
+          "metric_dual_residual": 7.806788213430985e-07,
+          "metric_dual_relative_residual": 7.288727816094528e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.84916465191315,
+          "upper_bound_gap": -0.0019048716857206216,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394929294141709e-08
+        },
+        "certified_merged_root_reused": false,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 0,
+          "design_calls": [
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            }
+          ],
+          "full_design_matrices_constructed": true,
+          "total_design_elements": 1572864,
+          "largest_design_elements": 98304,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "dense",
+        "requested_factor_solver": "dense",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.1862755420152098
+            ],
+            "median_seconds": 0.1862755420152098,
+            "minimum_seconds": 0.1862755420152098,
+            "maximum_seconds": 0.1862755420152098,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              3.481889875023626
+            ],
+            "median_seconds": 3.481889875023626,
+            "minimum_seconds": 3.481889875023626,
+            "maximum_seconds": 3.481889875023626,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              4.450391291989945
+            ],
+            "median_seconds": 4.450391291989945,
+            "minimum_seconds": 4.450391291989945,
+            "maximum_seconds": 4.450391291989945,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 0.0
+      },
+      "dense__dense__outer_3": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.8513013114776,
+        "fresh_energy": -16.8513013114776,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.0021366587917768243,
+        "merged_energy": -16.85106952359887,
+        "merged_energy_history": [
+          -16.85106952359887,
+          -16.85106952359887,
+          -16.85106952359887
+        ],
+        "factor_energy_history": [
+          -16.851292970316962,
+          -16.851300630786007,
+          -16.8513013100107
+        ],
+        "requested_outer_cycles": 3,
+        "completed_outer_cycles": 3,
+        "factor_sweeps": 24,
+        "factor_accepted_half_updates": 48,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.01486688485919845,
+        "relative_euclidean_truncation_error": 0.000829436734787212,
+        "pair_operator_backend": "dense",
+        "pair_operator_stored_elements": 524288,
+        "merged_solve": {
+          "method": "cached_dense_certified",
+          "attempts": [
+            "cached_certified_root"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "warm Davidson failed full metric-dual verification",
+          "dense_fallback": true,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644895376892742e-07,
+          "metric_condition": 877175722689.8097,
+          "backward_residual": 3.007923620688894e-14,
+          "metric_dual_residual": 7.806788213430985e-07,
+          "metric_dual_relative_residual": 7.288727816094528e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.851300630786007,
+          "upper_bound_gap": 0.00023110718713681422,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394929294141709e-08
+        },
+        "certified_merged_root_reused": true,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 0,
+          "design_calls": [
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            }
+          ],
+          "full_design_matrices_constructed": true,
+          "total_design_elements": 4718592,
+          "largest_design_elements": 98304,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "dense",
+        "requested_factor_solver": "dense",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.18552108301082626
+            ],
+            "median_seconds": 0.18552108301082626,
+            "minimum_seconds": 0.18552108301082626,
+            "maximum_seconds": 0.18552108301082626,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              5.845102334045805
+            ],
+            "median_seconds": 5.845102334045805,
+            "minimum_seconds": 5.845102334045805,
+            "maximum_seconds": 5.845102334045805,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              6.832003124989569
+            ],
+            "median_seconds": 6.832003124989569,
+            "minimum_seconds": 6.832003124989569,
+            "maximum_seconds": 6.832003124989569,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 8.33994299398455e-06
+      },
+      "block__matrix_free__outer_1": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.851292971710922,
+        "fresh_energy": -16.851292971710922,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.002128319025100467,
+        "merged_energy": -16.851069530069257,
+        "merged_energy_history": [
+          -16.851069530069257
+        ],
+        "factor_energy_history": [
+          -16.851292967417912
+        ],
+        "requested_outer_cycles": 1,
+        "completed_outer_cycles": 1,
+        "factor_sweeps": 8,
+        "factor_accepted_half_updates": 16,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.01486688672446847,
+        "relative_euclidean_truncation_error": 0.0008294374689493013,
+        "pair_operator_backend": "block",
+        "pair_operator_stored_elements": 90112,
+        "merged_solve": {
+          "method": "conditional_blocks_certified",
+          "attempts": [
+            "conditional_blocks"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "",
+          "dense_fallback": false,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644899738210218e-07,
+          "metric_condition": 877175326040.6039,
+          "backward_residual": 3.0079252541344946e-14,
+          "metric_dual_residual": 8.565008059745992e-07,
+          "metric_dual_relative_residual": 7.996627490320228e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.84916464919879,
+          "upper_bound_gap": -0.0019048808704660303,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394944410504384e-08
+        },
+        "certified_merged_root_reused": false,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0018846892703888974
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.009577121544491102
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0028852810812011213
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.001987720051312629
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0019145898826755463
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0012348351991834472
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0013746007863931395
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00069358108403652
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.000916995525378977
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006362848327552927
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006245843328304462
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0004220799342225512
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003832755835767778
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00037309569002156424
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00034345868013495437
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003319685154338174
+            }
+          ],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 16,
+          "design_calls": [],
+          "full_design_matrices_constructed": false,
+          "total_design_elements": 0,
+          "largest_design_elements": 0,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "block",
+        "requested_factor_solver": "matrix_free",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.18311462498968467
+            ],
+            "median_seconds": 0.18311462498968467,
+            "minimum_seconds": 0.18311462498968467,
+            "maximum_seconds": 0.18311462498968467,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              24.27966291696066
+            ],
+            "median_seconds": 24.27966291696066,
+            "minimum_seconds": 24.27966291696066,
+            "maximum_seconds": 24.27966291696066,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              25.30225608299952
+            ],
+            "median_seconds": 25.30225608299952,
+            "minimum_seconds": 25.30225608299952,
+            "maximum_seconds": 25.30225608299952,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 0.0
+      },
+      "block__matrix_free__outer_3": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.85130131146461,
+        "fresh_energy": -16.85130131146461,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.002136658778788103,
+        "merged_energy": -16.851069530069257,
+        "merged_energy_history": [
+          -16.851069530069257,
+          -16.851069530069257,
+          -16.851069530069257
+        ],
+        "factor_energy_history": [
+          -16.851292967417912,
+          -16.851300629281674,
+          -16.851301307134406
+        ],
+        "requested_outer_cycles": 3,
+        "completed_outer_cycles": 3,
+        "factor_sweeps": 24,
+        "factor_accepted_half_updates": 48,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.014866886716958426,
+        "relative_euclidean_truncation_error": 0.0008294374689492949,
+        "pair_operator_backend": "block",
+        "pair_operator_stored_elements": 90112,
+        "merged_solve": {
+          "method": "cached_conditional_blocks_certified",
+          "attempts": [
+            "cached_certified_root"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "",
+          "dense_fallback": false,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644899738210218e-07,
+          "metric_condition": 877175326040.6039,
+          "backward_residual": 3.0079252541344946e-14,
+          "metric_dual_residual": 8.565008059745992e-07,
+          "metric_dual_relative_residual": 7.996627490320228e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.851300629281674,
+          "upper_bound_gap": 0.00023109921241726283,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394944410504384e-08
+        },
+        "certified_merged_root_reused": true,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0018846892703888974
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.009577121544491102
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0028852810812011213
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.001987720051312629
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0019145898826755463
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0012348351991834472
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0013746007863931395
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00069358108403652
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.000916995525378977
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006362848327552927
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0006245843328304462
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0004220799342225512
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003832755835767778
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00037309569002156424
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00034345868013495437
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0003319685154338174
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00033088617804928036
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00026528444585510394
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0002520263637703907
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00025916090041282766
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00021758467271698097
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00022501336251041612
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00021963279991473535
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001738319170219434
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0002223011728162185
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00017185673159371008
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001599728897940066
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00013272198868501993
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001441156145297833
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001315057235761911
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.047423187934815e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001057622822004057
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.0001381162603418617
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.100119595960613e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00010276222833360263
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.127563772953098e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 8.148243815046592e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 0.00011149106512248987
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.701967728612783e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 9.532885235414066e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 8.258172869331908e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 7.797832067473154e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 4.3158859416559744e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 7.555601816632139e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 5.768919731768112e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 6.202190667963581e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 4.422742166603984e-05
+            },
+            {
+              "size": 192,
+              "returned": true,
+              "converged": false,
+              "iterations": 256,
+              "hamiltonian_matvecs": 257,
+              "metric_matvecs": 257,
+              "residual_norm": 4.4063118296964104e-05
+            }
+          ],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 48,
+          "design_calls": [],
+          "full_design_matrices_constructed": false,
+          "total_design_elements": 0,
+          "largest_design_elements": 0,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "block",
+        "requested_factor_solver": "matrix_free",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.18093645898625255
+            ],
+            "median_seconds": 0.18093645898625255,
+            "minimum_seconds": 0.18093645898625255,
+            "maximum_seconds": 0.18093645898625255,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              42.553053250012454
+            ],
+            "median_seconds": 42.553053250012454,
+            "minimum_seconds": 42.553053250012454,
+            "maximum_seconds": 42.553053250012454,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              43.51653974998044
+            ],
+            "median_seconds": 43.51653974998044,
+            "minimum_seconds": 43.51653974998044,
+            "maximum_seconds": 43.51653974998044,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 8.339753687636176e-06
+      },
+      "block__dense__outer_1": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.851292971710922,
+        "fresh_energy": -16.851292971710922,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.002128319025100467,
+        "merged_energy": -16.851069530069257,
+        "merged_energy_history": [
+          -16.851069530069257
+        ],
+        "factor_energy_history": [
+          -16.851292967417912
+        ],
+        "requested_outer_cycles": 1,
+        "completed_outer_cycles": 1,
+        "factor_sweeps": 8,
+        "factor_accepted_half_updates": 16,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.01486688672446847,
+        "relative_euclidean_truncation_error": 0.0008294374689493013,
+        "pair_operator_backend": "block",
+        "pair_operator_stored_elements": 90112,
+        "merged_solve": {
+          "method": "conditional_blocks_certified",
+          "attempts": [
+            "conditional_blocks"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "",
+          "dense_fallback": false,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644899738210218e-07,
+          "metric_condition": 877175326040.6039,
+          "backward_residual": 3.0079252541344946e-14,
+          "metric_dual_residual": 8.565008059745992e-07,
+          "metric_dual_relative_residual": 7.996627490320228e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.84916464919879,
+          "upper_bound_gap": -0.0019048808704660303,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394944410504384e-08
+        },
+        "certified_merged_root_reused": false,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 0,
+          "design_calls": [],
+          "full_design_matrices_constructed": false,
+          "total_design_elements": 0,
+          "largest_design_elements": 0,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "block",
+        "requested_factor_solver": "dense",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.1851213329937309
+            ],
+            "median_seconds": 0.1851213329937309,
+            "minimum_seconds": 0.1851213329937309,
+            "maximum_seconds": 0.1851213329937309,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              18.206550833012443
+            ],
+            "median_seconds": 18.206550833012443,
+            "minimum_seconds": 18.206550833012443,
+            "maximum_seconds": 18.206550833012443,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              19.179546916973777
+            ],
+            "median_seconds": 19.179546916973777,
+            "minimum_seconds": 19.179546916973777,
+            "maximum_seconds": 19.179546916973777,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 0.0
+      },
+      "block__dense__outer_3": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652685822,
+        "energy": -16.85130131146461,
+        "fresh_energy": -16.85130131146461,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.002136658778788103,
+        "merged_energy": -16.851069530069257,
+        "merged_energy_history": [
+          -16.851069530069257,
+          -16.851069530069257,
+          -16.851069530069257
+        ],
+        "factor_energy_history": [
+          -16.851292967417912,
+          -16.851300629281674,
+          -16.851301307134406
+        ],
+        "requested_outer_cycles": 3,
+        "completed_outer_cycles": 3,
+        "factor_sweeps": 24,
+        "factor_accepted_half_updates": 48,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.014866886716958426,
+        "relative_euclidean_truncation_error": 0.0008294374689492949,
+        "pair_operator_backend": "block",
+        "pair_operator_stored_elements": 90112,
+        "merged_solve": {
+          "method": "cached_conditional_blocks_certified",
+          "attempts": [
+            "cached_certified_root"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "",
+          "dense_fallback": false,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644899738210218e-07,
+          "metric_condition": 877175326040.6039,
+          "backward_residual": 3.0079252541344946e-14,
+          "metric_dual_residual": 8.565008059745992e-07,
+          "metric_dual_relative_residual": 7.996627490320228e-13,
+          "null_residual": 0.0,
+          "warm_energy": -16.851300629281674,
+          "upper_bound_gap": 0.00023109921241726283,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394944410504384e-08
+        },
+        "certified_merged_root_reused": true,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 0,
+          "design_calls": [],
+          "full_design_matrices_constructed": false,
+          "total_design_elements": 0,
+          "largest_design_elements": 0,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "block",
+        "requested_factor_solver": "dense",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.18134570796974003
+            ],
+            "median_seconds": 0.18134570796974003,
+            "minimum_seconds": 0.18134570796974003,
+            "maximum_seconds": 0.18134570796974003,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              25.465385582996532
+            ],
+            "median_seconds": 25.465385582996532,
+            "minimum_seconds": 25.465385582996532,
+            "maximum_seconds": 25.465385582996532,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              26.42065779096447
+            ],
+            "median_seconds": 26.42065779096447,
+            "minimum_seconds": 26.42065779096447,
+            "maximum_seconds": 26.42065779096447,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 8.339753687636176e-06
+      },
+      "dense__dense__outer_8_until_stalled": {
+        "sites": [
+          14,
+          15
+        ],
+        "accepted": true,
+        "source_energy": -16.849164652335514,
+        "energy": -16.8513013597788,
+        "fresh_energy": -16.8513013597788,
+        "fresh_energy_error": 0.0,
+        "energy_gain": 0.0021367074432880884,
+        "merged_energy": -16.851069553100007,
+        "merged_energy_history": [
+          -16.851069553100007,
+          -16.851069553100007,
+          -16.851069553100007,
+          -16.851069553100007,
+          -16.851069553100007,
+          -16.851069553100007,
+          -16.851069553100007
+        ],
+        "factor_energy_history": [
+          -16.85129296859394,
+          -16.851300628209046,
+          -16.851301308651305,
+          -16.851301348972836,
+          -16.85130135128423,
+          -16.851301358747012,
+          -16.851301358747012
+        ],
+        "requested_outer_cycles": 8,
+        "completed_outer_cycles": 7,
+        "factor_sweeps": 43,
+        "factor_accepted_half_updates": 72,
+        "selected_retraction_start": "metric",
+        "metric_projection_error": 0.01486689430267055,
+        "relative_euclidean_truncation_error": 0.0008294363113248695,
+        "pair_operator_backend": "dense",
+        "pair_operator_stored_elements": 524288,
+        "merged_solve": {
+          "method": "cached_dense_certified",
+          "attempts": [
+            "cached_certified_root"
+          ],
+          "verified": true,
+          "lowest_root_certified": true,
+          "fallback_reason": "warm Davidson failed full metric-dual verification",
+          "dense_fallback": true,
+          "metric_requested_rank": 511,
+          "metric_numerical_rank": 512,
+          "metric_min_positive": 9.644905521355906e-07,
+          "metric_condition": 877174800079.311,
+          "backward_residual": 3.007920057675249e-14,
+          "metric_dual_residual": 1.2153859978877557e-06,
+          "metric_dual_relative_residual": 1.1347315313580335e-12,
+          "null_residual": 0.0,
+          "warm_energy": -16.851301358747012,
+          "upper_bound_gap": 0.00023180564700453488,
+          "metric_support": "regularized",
+          "discarded_support_residual": 1.3394926947789394e-08
+        },
+        "certified_merged_root_reused": true,
+        "factor_solver_instrumentation": {
+          "davidson_calls": [],
+          "projected_dense_calls": [
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            },
+            {
+              "size": 192,
+              "returned": true
+            }
+          ],
+          "observed_dense_fallbacks": 0,
+          "design_calls": [
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            },
+            {
+              "shape": [
+                512,
+                192
+              ],
+              "elements": 98304
+            }
+          ],
+          "full_design_matrices_constructed": true,
+          "total_design_elements": 8454144,
+          "largest_design_elements": 98304,
+          "note": "Matrix-free factor solves and their projected-dense fallback do not construct J. The explicit dense baseline may construct J when dense pair operators are already resident."
+        },
+        "requested_operator_backend": "dense",
+        "requested_factor_solver": "dense",
+        "repeat_energy_spread": 0.0,
+        "timing": {
+          "pair_plan_build_or_lookup": {
+            "samples_seconds": [
+              0.18044900003587827
+            ],
+            "median_seconds": 0.18044900003587827,
+            "minimum_seconds": 0.18044900003587827,
+            "maximum_seconds": 0.18044900003587827,
+            "repeats": 1
+          },
+          "update_with_prebuilt_environment": {
+            "samples_seconds": [
+              11.644903042004444
+            ],
+            "median_seconds": 11.644903042004444,
+            "minimum_seconds": 11.644903042004444,
+            "maximum_seconds": 11.644903042004444,
+            "repeats": 1
+          },
+          "plan_plus_update_and_fresh_check": {
+            "samples_seconds": [
+              12.60017779195914
+            ],
+            "median_seconds": 12.60017779195914,
+            "minimum_seconds": 12.60017779195914,
+            "maximum_seconds": 12.60017779195914,
+            "repeats": 1
+          },
+          "fixed_source_pair_environment_reused": true,
+          "state_load_and_construction_excluded": true
+        },
+        "incremental_gain_vs_outer_1": 8.388244197021777e-06,
+        "stopping_probe": true
+      }
+    }
+  },
+  "environment_cache_microbenchmark": {
+    "scope": "two fixed-source pair environments and pencils; this is not an end-to-end sweep timing",
+    "per_pair_rebuild_vs_cached": {
+      "14": {
+        "sites": [
+          14,
+          15
+        ],
+        "cached_path_prewarmed_once": true,
+        "temporary_path_rebuilt_each_sample": true,
+        "temporary_rebuild_samples": [
+          {
+            "temporary_state_construction_seconds": 2.040946541004814,
+            "environment_seconds": 2.572198749985546,
+            "operator_seconds": 0.3218071660376154,
+            "total_seconds": 4.93495508399792
+          }
+        ],
+        "cached_pair_samples": [
+          {
+            "cached_plan_lookup_seconds": 2.987496554851532e-05,
+            "environment_seconds": 1.4973692080238834,
+            "operator_seconds": 0.31172849994618446,
+            "total_seconds": 1.8091003749868833
+          }
+        ],
+        "temporary_rebuild_total": {
+          "samples_seconds": [
+            4.93495508399792
+          ],
+          "median_seconds": 4.93495508399792,
+          "minimum_seconds": 4.93495508399792,
+          "maximum_seconds": 4.93495508399792,
+          "repeats": 1
+        },
+        "cached_pair_total": {
+          "samples_seconds": [
+            1.8091003749868833
+          ],
+          "median_seconds": 1.8091003749868833,
+          "minimum_seconds": 1.8091003749868833,
+          "maximum_seconds": 1.8091003749868833,
+          "repeats": 1
+        },
+        "operator_only_rebuild": {
+          "samples_seconds": [
+            0.3218071660376154
+          ],
+          "median_seconds": 0.3218071660376154,
+          "minimum_seconds": 0.3218071660376154,
+          "maximum_seconds": 0.3218071660376154,
+          "repeats": 1
+        },
+        "operator_only_cached": {
+          "samples_seconds": [
+            0.31172849994618446
+          ],
+          "median_seconds": 0.31172849994618446,
+          "minimum_seconds": 0.31172849994618446,
+          "maximum_seconds": 0.31172849994618446,
+          "repeats": 1
+        },
+        "maximum_metric_difference": 0.0,
+        "maximum_hamiltonian_difference": 0.0,
+        "cached_over_rebuild_total_ratio": 0.3665890254711882,
+        "cached_over_rebuild_operator_only_ratio": 0.9686810389727217
+      },
+      "20": {
+        "sites": [
+          20,
+          21
+        ],
+        "cached_path_prewarmed_once": true,
+        "temporary_path_rebuilt_each_sample": true,
+        "temporary_rebuild_samples": [
+          {
+            "temporary_state_construction_seconds": 2.0084854169981554,
+            "environment_seconds": 2.551192832994275,
+            "operator_seconds": 0.32061749999411404,
+            "total_seconds": 4.8802982089691795
+          }
+        ],
+        "cached_pair_samples": [
+          {
+            "cached_plan_lookup_seconds": 3.316602669656277e-05,
+            "environment_seconds": 1.478067124960944,
+            "operator_seconds": 0.30988845898536965,
+            "total_seconds": 1.7879592499812134
+          }
+        ],
+        "temporary_rebuild_total": {
+          "samples_seconds": [
+            4.8802982089691795
+          ],
+          "median_seconds": 4.8802982089691795,
+          "minimum_seconds": 4.8802982089691795,
+          "maximum_seconds": 4.8802982089691795,
+          "repeats": 1
+        },
+        "cached_pair_total": {
+          "samples_seconds": [
+            1.7879592499812134
+          ],
+          "median_seconds": 1.7879592499812134,
+          "minimum_seconds": 1.7879592499812134,
+          "maximum_seconds": 1.7879592499812134,
+          "repeats": 1
+        },
+        "operator_only_rebuild": {
+          "samples_seconds": [
+            0.32061749999411404
+          ],
+          "median_seconds": 0.32061749999411404,
+          "minimum_seconds": 0.32061749999411404,
+          "maximum_seconds": 0.32061749999411404,
+          "repeats": 1
+        },
+        "operator_only_cached": {
+          "samples_seconds": [
+            0.30988845898536965
+          ],
+          "median_seconds": 0.30988845898536965,
+          "minimum_seconds": 0.30988845898536965,
+          "maximum_seconds": 0.30988845898536965,
+          "repeats": 1
+        },
+        "maximum_metric_difference": 0.0,
+        "maximum_hamiltonian_difference": 0.0,
+        "cached_over_rebuild_total_ratio": 0.3663627043722944,
+        "cached_over_rebuild_operator_only_ratio": 0.9665363212895698
+      }
+    },
+    "shared_all_cut_messages": {
+      "samples": [
+        {
+          "all_cut_message_seconds": 1.4182074579875916,
+          "pair_environment_extraction_seconds": 0.0893760829931125,
+          "operator_seconds": 0.6236518749501556,
+          "total_seconds": 2.1312375419656746
+        }
+      ],
+      "total": {
+        "samples_seconds": [
+          2.1312375419656746
+        ],
+        "median_seconds": 2.1312375419656746,
+        "minimum_seconds": 2.1312375419656746,
+        "maximum_seconds": 2.1312375419656746,
+        "repeats": 1
+      },
+      "equivalence": {
+        "14": {
+          "maximum_metric_difference": 0.0,
+          "maximum_hamiltonian_difference": 0.0
+        },
+        "20": {
+          "maximum_metric_difference": 0.0,
+          "maximum_hamiltonian_difference": 0.0
+        }
+      }
+    }
+  },
+  "conditional_block_microbenchmark": {
+    "14": {
+      "sites": [
+        14,
+        15
+      ],
+      "dense": {
+        "stored_elements": 524288,
+        "build_timing": {
+          "samples_seconds": [
+            0.3191077089868486
+          ],
+          "median_seconds": 0.3191077089868486,
+          "minimum_seconds": 0.3191077089868486,
+          "maximum_seconds": 0.3191077089868486,
+          "repeats": 1
+        }
+      },
+      "conditional_blocks": {
+        "stored_elements": 90112,
+        "dense_equivalent_elements": 524288,
+        "storage_fraction": 0.171875,
+        "metric_blocks": 32,
+        "hamiltonian_blocks": 320,
+        "hamiltonian_component_sizes": [
+          32
+        ],
+        "build_timing": {
+          "samples_seconds": [
+            13.217967750038952
+          ],
+          "median_seconds": 13.217967750038952,
+          "minimum_seconds": 13.217967750038952,
+          "maximum_seconds": 13.217967750038952,
+          "repeats": 1
+        },
+        "block_over_dense_build_time_ratio": 41.42164973702877,
+        "validation_only_densify_seconds": 0.0018318750080652535,
+        "maximum_metric_difference": 5.820766091346741e-11,
+        "maximum_hamiltonian_difference": 9.313225746154785e-10,
+        "overlap_sectors_independent": false,
+        "hamiltonian_changes_shared_label": true
+      },
+      "interpretation": "The block update uses block actions directly.  Densification above is performed only to validate equivalence in this benchmark; any dense fallback in a full update is reported by merged_solve."
+    },
+    "20": {
+      "sites": [
+        20,
+        21
+      ],
+      "dense": {
+        "stored_elements": 524288,
+        "build_timing": {
+          "samples_seconds": [
+            0.3290679170168005
+          ],
+          "median_seconds": 0.3290679170168005,
+          "minimum_seconds": 0.3290679170168005,
+          "maximum_seconds": 0.3290679170168005,
+          "repeats": 1
+        }
+      },
+      "conditional_blocks": {
+        "stored_elements": 90112,
+        "dense_equivalent_elements": 524288,
+        "storage_fraction": 0.171875,
+        "metric_blocks": 32,
+        "hamiltonian_blocks": 320,
+        "hamiltonian_component_sizes": [
+          32
+        ],
+        "build_timing": {
+          "samples_seconds": [
+            13.127698875032365
+          ],
+          "median_seconds": 13.127698875032365,
+          "minimum_seconds": 13.127698875032365,
+          "maximum_seconds": 13.127698875032365,
+          "repeats": 1
+        },
+        "block_over_dense_build_time_ratio": 39.89358486856722,
+        "validation_only_densify_seconds": 0.0015592919662594795,
+        "maximum_metric_difference": 3.552713678800501e-15,
+        "maximum_hamiltonian_difference": 5.684341886080802e-14,
+        "overlap_sectors_independent": false,
+        "hamiltonian_changes_shared_label": true
+      },
+      "interpretation": "The block update uses block actions directly.  Densification above is performed only to validate equivalence in this benchmark; any dense fallback in a full update is reported by merged_solve."
+    }
+  },
+  "interpretation_guardrails": [
+    "A residual-verifed eigenpair is not automatically the lowest root; use lowest_root_certified.",
+    "Environment-cache timings cover the stated pair preparation scope, not a full sweep.",
+    "Matrix-free factor rows may use projected-dense fallback; instrumentation reports it.",
+    "The matrix-free factor path avoids J; the explicit dense baseline may construct J and reports it.",
+    "Conditional-block storage is structural; check dense_fallback before claiming end-to-end memory avoidance.",
+    "Historical timings from other scripts or runs are not used in speed ratios."
+  ],
+  "timing_seconds": {
+    "total": 251.02340549998917,
+    "outer_convergence_probe": 11.644903042004444
+  }
+}

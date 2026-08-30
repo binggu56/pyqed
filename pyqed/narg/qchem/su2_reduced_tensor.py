@@ -22,7 +22,7 @@ import os
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep
+from pyqed.symmetry import Irrep, Leg, IrrepTensor, OpIrrep
 from .su2_core import Multiplet, asarray, cg, su2_product_symmetry
 
 
@@ -102,7 +102,7 @@ class ReducedSU2Tensor:
         return self.tensor.op
 
     @property
-    def site(self) -> IrrepSite:
+    def leg(self) -> Leg:
         return self.tensor.bra
 
     @property
@@ -120,9 +120,12 @@ def group_multiplets(multiplets: list[Multiplet]) -> dict[Irrep, list[Multiplet]
     return dict(sorted(groups.items(), key=lambda item: item[0].charge))
 
 
-def site_from_multiplets(multiplets: list[Multiplet]) -> IrrepSite:
+def leg_from_multiplets(multiplets: list[Multiplet]) -> Leg:
     groups = group_multiplets(multiplets)
-    return IrrepSite(su2_product_symmetry(), {irrep: len(mps) for irrep, mps in groups.items()})
+    return Leg(
+        {irrep: len(mps) for irrep, mps in groups.items()},
+        symmetry=su2_product_symmetry(),
+    )
 
 
 def component_basis(groups: dict[Irrep, list[Multiplet]], irrep: Irrep, m2: int) -> np.ndarray:
@@ -149,7 +152,7 @@ def reduced_tensor_from_components(
     ``component_ops`` maps component ``q2`` to a primitive-basis matrix.
     """
     groups = group_multiplets(multiplets)
-    site = site_from_multiplets(multiplets)
+    site = leg_from_multiplets(multiplets)
     dnelec, rank2 = op_irrep.charge
     dense_component_ops = {q2: asarray(op) for q2, op in component_ops.items()}
     basis_cache = {}
@@ -227,17 +230,17 @@ def scale_reduced_tensor(tensor: ReducedSU2Tensor, factor: complex) -> ReducedSU
         for key, block in tensor.blocks.items()
         if np.any(np.abs(factor * block) > 0.0)
     }
-    return ReducedSU2Tensor(IrrepTensor(tensor.site, tensor.site, tensor.op, blocks))
+    return ReducedSU2Tensor(IrrepTensor(tensor.leg, tensor.leg, tensor.op, blocks))
 
 
 def add_reduced_tensors(*tensors: ReducedSU2Tensor, atol: float = 1e-14) -> ReducedSU2Tensor:
     """Add reduced tensors with identical sites and operator irreps."""
     if not tensors:
         raise ValueError("at least one reduced tensor is required")
-    site = tensors[0].site
+    site = tensors[0].leg
     op = tensors[0].op
     for tensor in tensors:
-        if tensor.site != site or tensor.op != op:
+        if tensor.leg != site or tensor.op != op:
             raise ValueError("reduced tensor site/op mismatch")
 
     blocks = {}
@@ -257,10 +260,10 @@ def add_reduced_tensors(*tensors: ReducedSU2Tensor, atol: float = 1e-14) -> Redu
     return ReducedSU2Tensor(IrrepTensor(site, site, op, blocks))
 
 
-def _site_charge_signature(site: IrrepSite) -> tuple[tuple[tuple[int, int], int], ...]:
+def _leg_charge_signature(leg: Leg) -> tuple[tuple[tuple[int, int], int], ...]:
     return tuple(
-        (tuple(int(x) for x in irrep.charge), int(site.sector_dim(irrep)))
-        for irrep in site.irreps
+        (tuple(int(x) for x in irrep.charge), int(leg.sector_dim(irrep)))
+        for irrep in leg.irreps
     )
 
 
@@ -461,10 +464,10 @@ def _prepare_coupled_reduced_product(
     atol: float,
     scale: complex,
 ):
-    if left.site != right.site:
+    if left.leg != right.leg:
         raise ValueError("left and right reduced tensors must use the same site")
 
-    site = left.site
+    site = left.leg
     left_dnelec, left_rank2 = left.op.charge
     right_dnelec, right_rank2 = right.op.charge
     op_irrep = OpIrrep((left_dnelec + right_dnelec, int(rank2)))
@@ -473,7 +476,7 @@ def _prepare_coupled_reduced_product(
     use_native = _cpp_product_kernel() is not None
 
     angular_terms = _coupled_product_angular_terms(
-        _site_charge_signature(site),
+        _leg_charge_signature(site),
         tuple(int(x) for x in left.op.charge),
         tuple(int(x) for x in right.op.charge),
         int(rank2),
@@ -605,13 +608,13 @@ def validate_reduced_tensor_components(
     errors = {}
     dnelec, rank2 = reduced.op.charge
 
-    for bra_irrep in reduced.site.irreps:
+    for bra_irrep in reduced.leg.irreps:
         bra_nelec, bra_j2 = bra_irrep.charge
-        for ket_irrep in reduced.site.irreps:
+        for ket_irrep in reduced.leg.irreps:
             ket_nelec, ket_j2 = ket_irrep.charge
             if bra_nelec != ket_nelec + dnelec:
                 continue
-            if not reduced.site.symmetry.allows(bra_irrep.charge, reduced.op.charge, ket_irrep.charge):
+            if not reduced.leg.symmetry.allows(bra_irrep.charge, reduced.op.charge, ket_irrep.charge):
                 continue
             if reduced.block(bra_irrep, ket_irrep).size == 0:
                 continue

@@ -92,7 +92,7 @@ def _optimized_mps_d4(
     initialization_seed,
     passes,
 ):
-    from pyqed.mps import DMRG, MPS, MPO
+    from pyqed.mps import DMRG, MPS
 
     start = perf_counter()
     nsites = len(hamiltonian.dims)
@@ -104,7 +104,7 @@ def _optimized_mps_d4(
         for site in range(nsites)
     ]
     solver = DMRG(
-        MPO(list(hamiltonian.to_mpo().compress().tensors)),
+        hamiltonian.to_mpo().compress(),
         D=4,
         init_guess=MPS(factors, labels=["lv", "p", "rv"]),
         nsweeps=passes,
@@ -119,7 +119,7 @@ def _optimized_mps_d4(
         recenter_final=False,
         performance="generic",
     ).run()
-    ordered_state = solver.ground_state.to_order(["lv", "p", "rv"])
+    ordered_state = solver.state.to_order(["lv", "p", "rv"])
     ordered_factors = tuple(
         np.asarray(factor).copy() for factor in ordered_state.factors
     )
@@ -158,7 +158,7 @@ def _run_variant(
     warm_start,
     block_metric,
     frontier_gauge,
-    frontier_gauge_weighting,
+    gauge_weight,
     setup_seconds,
     warm_start_seconds,
 ):
@@ -171,9 +171,8 @@ def _run_variant(
         natural_gradient_every=2 if block_metric else 0,
         natural_gradient_damping=1.0e-6,
         natural_gradient_trust_radius=0.25,
-        virtual_canonicalization=False,
-        frontier_canonicalization=frontier_gauge,
-        frontier_gauge_weighting=frontier_gauge_weighting,
+        gauge="frontier" if frontier_gauge else None,
+        gauge_weight=gauge_weight,
     )
     seconds = perf_counter() - start
     diagnostics = _vector_diagnostics(
@@ -218,8 +217,8 @@ def _run_variant(
         "warm_start": bool(warm_start),
         "block_metric_relaxation": bool(block_metric),
         "frontier_gauge": bool(frontier_gauge),
-        "frontier_gauge_weighting": (
-            frontier_gauge_weighting if frontier_gauge else None
+        "gauge_weight": (
+            gauge_weight if frontier_gauge else None
         ),
         "converged": bool(posthoc_converged),
         "solver_reported_converged": bool(state.converged),
@@ -403,7 +402,7 @@ def run_benchmark(
     mps_warm_passes=100,
     tie_noise=1.0e-3,
     variants=VARIANTS,
-    frontier_gauge_weighting="uniform",
+    gauge_weight="uniform",
 ):
     passes, seeds, mps_warm_passes, tie_noise, variants = _validated_run_inputs(
         passes,
@@ -412,9 +411,9 @@ def run_benchmark(
         tie_noise,
         variants,
     )
-    frontier_gauge_weighting = str(frontier_gauge_weighting).lower().replace("-", "_")
-    if frontier_gauge_weighting not in {"uniform", "probability"}:
-        raise ValueError("frontier_gauge_weighting must be 'uniform' or 'probability'.")
+    gauge_weight = str(gauge_weight).lower().replace("-", "_")
+    if gauge_weight not in {"uniform", "probability"}:
+        raise ValueError("gauge_weight must be 'uniform' or 'probability'.")
     nearest, diagonals = square_j1_j2_bonds(4, 4)
     weighted_bonds = tuple((i, j, 1.0) for i, j in nearest)
     weighted_bonds += tuple((i, j, 0.5) for i, j in diagonals)
@@ -486,7 +485,7 @@ def run_benchmark(
                 warm_start=warm,
                 block_metric=block_metric,
                 frontier_gauge=frontier_gauge,
-                frontier_gauge_weighting=frontier_gauge_weighting,
+                gauge_weight=gauge_weight,
                 setup_seconds=setup_seconds,
                 warm_start_seconds=(warm_record["seconds"] if warm else 0.0),
             )
@@ -512,8 +511,8 @@ def run_benchmark(
             "natural_gradient_every": 2,
             "natural_gradient_damping": 1.0e-6,
             "natural_gradient_trust_radius": 0.25,
-            "virtual_canonicalization": False,
-            "frontier_gauge_weighting": frontier_gauge_weighting,
+            "gauge": "frontier",
+            "gauge_weight": gauge_weight,
             "fixed_budget": True,
             "posthoc_convergence_window": POSTHOC_CONVERGENCE_WINDOW,
             "posthoc_convergence_tolerance": POSTHOC_CONVERGENCE_TOL,
@@ -670,7 +669,7 @@ def main():
     )
     parser.add_argument("--tie-noise", type=float, default=1.0e-3)
     parser.add_argument(
-        "--frontier-gauge-weighting",
+        "--gauge-weight",
         choices=("uniform", "probability"),
         default="uniform",
     )
@@ -692,7 +691,7 @@ def main():
             mps_warm_passes=args.mps_warm_passes,
             tie_noise=args.tie_noise,
             variants=args.variants,
-            frontier_gauge_weighting=args.frontier_gauge_weighting,
+            gauge_weight=args.gauge_weight,
         )
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)

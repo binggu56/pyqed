@@ -8,8 +8,6 @@ import numpy as np
 from pyqed.mps.nonabelian import (
     MPS,
     MultiRootMPS,
-    build_product_spatial_mps,
-    build_random_spatial_mps,
     build_random_reduced_spatial_mps,
     contract_chain_expectation,
     run_sweeps,
@@ -18,11 +16,7 @@ from pyqed.mps.nonabelian import (
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
 from pyqed.mps.nonabelian.su2_kernel import cpp_available as su2_cpp_available
 from pyqed.mps.nonabelian.renormalized import (
-    configure_complementary_family_kernel_policy,
-    configure_direct_factorized_orthonormal_kernel_policy,
     configure_su2_kernel_policy,
-    get_complementary_family_kernel_policy,
-    get_direct_factorized_orthonormal_kernel_policy,
     get_su2_kernel_policy,
 )
 
@@ -171,6 +165,14 @@ def _make_initial_mps(
             )
     else:
         raise ValueError(f"Unsupported non-Abelian initial guess {guess!r}.")
+    # A fully reduced SU(2) site has no spin-projection product state. Seed the
+    # requested target-sector manifold directly for every public guess label.
+    sites = build_random_reduced_spatial_mps(
+        qcdmrg.ncas,
+        target_sector=target_sector,
+        bond_multiplicity=bond_multiplicity,
+        seed=seed,
+    )
     return MPS.from_sites(sites, target_sector=target_sector)
 
 
@@ -413,6 +415,7 @@ def _run_spatial_qchem_dmrg(
     nstates=1,
     weights=None,
     local_solver_kwargs=None,
+    n_threads=None,
     verbose=0,
     **sweep_kwargs,
 ):
@@ -433,12 +436,52 @@ def _run_spatial_qchem_dmrg(
         raise ValueError("DMRG Hamiltonian MPO is not built. Call build() before the backend.")
     if qcdmrg.spin_purification:
         raise NotImplementedError("Spin-purification penalties are not supported by the SU(2) backend.")
-    active_hamiltonian = getattr(qcdmrg, "_active_hamiltonian", None)
-    mpo_factors = active_hamiltonian.mpo if active_hamiltonian is not None else qcdmrg.H
-    complementary_operator_families = (
-        getattr(active_hamiltonian, "complementary_operators", None)
-        if active_hamiltonian is not None
-        else None
+    for removed_option in (
+        "su2_kernel_backend",
+        "su2_reference_complementary_families",
+        "su2_force_family_table",
+        "family_kernel_backend",
+        "family_dense_threshold",
+        "family_dense_max_total_elements",
+        "direct_orthonormal_block_max_elements",
+        "direct_orthonormal_dense_max_elements",
+        "su2_qchem_direct_parent_blocks",
+        "su2_qchem_direct_parent_block_max_elements",
+        "canonical_local_norm",
+        "prefer_reduced_local_operator",
+        "local_basis_policy",
+        "orthonormalized_operator_dim",
+        "orthonormalize_generalized_dim",
+        "max_bond_mode",
+        "state_average_dense_fallback_dim",
+        "state_average_projector_dim",
+        "state_average_projector_dense_dim",
+        "state_average_projector_block_dim",
+        "state_average_projector_block_max_columns",
+    ):
+        if removed_option in sweep_kwargs:
+            raise TypeError(
+                f"{removed_option} was removed. SU(2)-QCDMRG always uses "
+                "the native C++ normal/complementary backend."
+            )
+    for incompatible_option in (
+        "record_post_update_energy",
+        "state_average_local_norm",
+        "state_average_root_environments",
+        "state_average_spin_projector",
+    ):
+        if bool(sweep_kwargs.get(incompatible_option, False)):
+            raise TypeError(
+                f"{incompatible_option}=True is unavailable in the C++-only "
+                "SU(2)-QCDMRG backend."
+            )
+    if float(sweep_kwargs.get("mixer_zero_block_noise_scale", 0.0)) != 0.0:
+        raise TypeError(
+            "mixer_zero_block_noise_scale must be zero in the C++-only "
+            "SU(2)-QCDMRG backend."
+        )
+    active_hamiltonian, su2_moving_environment, mpo_factors = (
+        _native_su2_hamiltonian(qcdmrg)
     )
     normal_complementary_production = bool(
         active_hamiltonian is not None
@@ -518,48 +561,17 @@ def _run_spatial_qchem_dmrg(
 
     state_average_spin_tol = float(sweep_kwargs.pop("state_average_spin_tol", 1.0e-6))
     state_average_validate_spin = bool(
-        sweep_kwargs.pop("state_average_validate_spin", not fully_reduced_sites)
+        sweep_kwargs.pop("state_average_validate_spin", False)
     )
-    state_average_spin_projector = bool(
-        sweep_kwargs.pop("state_average_spin_projector", not fully_reduced_sites)
-    )
+    sweep_kwargs.pop("state_average_spin_projector", False)
     debug_state_average = bool(sweep_kwargs.pop("debug_state_average", False))
     if debug_state_average and int(verbose) < 2:
         verbose = 2
-    allow_experimental_su2_state_average = bool(
-        sweep_kwargs.pop("allow_experimental_su2_state_average", False)
-    )
-    default_local_basis_policy = (
-        "block2_like"
-        if nstates == 1 or fully_reduced_sites
-        else "mixed_canonical_standard"
-    )
-    requested_policy_name = str(
-        sweep_kwargs.pop("local_basis_policy", default_local_basis_policy)
-    ).lower().replace("-", "_")
-    block2_like_state_average = False
-    if requested_policy_name in {"block2", "block2_like"}:
-        if nstates > 1:
-            # The production block2-like SA path is the metric-aware two-site
-            # sweep with state-averaged density-matrix truncation.  The older
-            # orthonormalized-operator transform remains available by asking
-            # for local_basis_policy='orthonormalized_operator' explicitly.
-            local_basis_policy = "mixed_canonical_standard"
-            block2_like_state_average = True
-        else:
-            local_basis_policy = "orthonormalized_operator"
-    elif requested_policy_name in {"orthonormalized", "metric_orthonormalized"}:
-        local_basis_policy = "mixed_canonical_standard"
-    else:
-        local_basis_policy = requested_policy_name
-    if local_basis_policy not in {
-        "mixed_canonical_standard",
-        "orthonormalized_operator",
-        "legacy_generalized",
-    }:
-        raise ValueError(
-            "local_basis_policy must be 'mixed_canonical_standard', "
-            "'block2_like', 'orthonormalized_operator', or 'legacy_generalized'."
+    local_basis_policy = "native_cpp"
+    dual_right_environment = bool(
+        sweep_kwargs.pop(
+            "su2_dual_right_environment",
+            fully_reduced_sites,
         )
     dual_right_environment = bool(
         sweep_kwargs.pop(
@@ -634,25 +646,37 @@ def _run_spatial_qchem_dmrg(
     state_initialization_seconds = (
         time.perf_counter() - state_initialization_started
     )
+    state_initialization_seconds = (
+        time.perf_counter() - state_initialization_started
+    )
+    local_solver_kwargs = dict(local_solver_kwargs or {})
+    for removed_local_option in (
+        "dense_fallback_dim",
+        "orthonormalized_dense_dim",
+        "orthonormalize_generalized_dim",
+        "orthonormalize_generalized_operator",
+        "use_block_preconditioner",
+        "couple_physical",
+        "filter_coupled_boundary",
+        "root_target_value",
+        "root_target_tol",
+        "root_selection_buffer",
+        "root_projector_dim",
+        "root_projector_dense_dim",
+        "root_projector_block_dim",
+        "root_projector_block_max_columns",
+    ):
+        if removed_local_option in local_solver_kwargs:
+            raise TypeError(
+                f"local_solver_kwargs[{removed_local_option!r}] was removed. "
+                "The C++-owned Davidson solver controls its reduced basis "
+                "internally."
+            )
     if nstates > 1:
-        orthonormalize_generalized_dim = (
-            orthonormalized_operator_dim
-            if local_basis_policy == "orthonormalized_operator"
-            else None
-        )
         solver_kwargs = {
             "tol": 1.0e-7,
             "itermax": 30,
             "max_space": 96,
-            "dense_fallback_dim": int(
-                sweep_kwargs.pop("state_average_dense_fallback_dim", 8192)
-            ),
-            "allow_unconverged_roots": True,
-            "use_block_preconditioner": False,
-            "orthonormalize_generalized_dim": orthonormalize_generalized_dim,
-            "orthonormalize_generalized_operator": (
-                local_basis_policy == "orthonormalized_operator"
-            ),
         }
     else:
         if requested_orthonormalize_dim is not None:
@@ -740,19 +764,6 @@ def _run_spatial_qchem_dmrg(
             )
         )
         candidate_nstates = max(nstates, candidate_nstates)
-        if (
-            state_average_spin_projector
-            and getattr(qcdmrg, "spatial_site_basis", "canonical") == "canonical"
-        ):
-            # The canonical spatial SU(2) basis still carries explicit spin
-            # components on the singly occupied site.  Until the fully reduced
-            # Wigner-Eckart Hamiltonian is the production path, keep enough
-            # internal target-selection roots to skip the low triplet even when
-            # callers request exactly ``nstates`` candidates.
-            candidate_nstates = max(
-                candidate_nstates,
-                nstates + max(0, root_selection_buffer),
-            )
         solver_kwargs["nstates"] = candidate_nstates
         local_weights = np.zeros(candidate_nstates, dtype=float)
         local_weights[: min(nstates, candidate_nstates)] = weights[: min(nstates, candidate_nstates)]
@@ -761,30 +772,6 @@ def _run_spatial_qchem_dmrg(
             local_weights[: min(nstates, candidate_nstates)] = 1.0
             local_weight_sum = float(np.sum(local_weights))
         solver_kwargs["weights"] = local_weights / local_weight_sum
-        solver_kwargs.setdefault("couple_physical", not fully_reduced_sites)
-        solver_kwargs.setdefault("filter_coupled_boundary", True)
-        target_s = 0.5 * abs(float(qcdmrg.spin))
-        solver_kwargs.setdefault("root_target_value", target_s * (target_s + 1.0))
-        solver_kwargs.setdefault("root_target_tol", state_average_spin_tol)
-        solver_kwargs.setdefault("root_selection_buffer", root_selection_buffer)
-        state_average_projector_dim = sweep_kwargs.pop(
-            "state_average_projector_dim",
-            nstates + max(0, root_selection_buffer),
-        )
-        if state_average_projector_dim is not None:
-            solver_kwargs.setdefault("root_projector_dim", int(state_average_projector_dim))
-        solver_kwargs.setdefault(
-            "root_projector_dense_dim",
-            int(sweep_kwargs.pop("state_average_projector_dense_dim", 512)),
-        )
-        solver_kwargs.setdefault(
-            "root_projector_block_dim",
-            int(sweep_kwargs.pop("state_average_projector_block_dim", 512)),
-        )
-        solver_kwargs.setdefault(
-            "root_projector_block_max_columns",
-            int(sweep_kwargs.pop("state_average_projector_block_max_columns", 512)),
-        )
     initial_multiroot_mps = (
         _make_state_average_multiroot_mps(
             qcdmrg,
@@ -843,9 +830,6 @@ def _run_spatial_qchem_dmrg(
         "debug_su2_kernel_check_tol",
         None,
     )
-    su2_force_family_table = bool(
-        sweep_kwargs.pop("su2_force_family_table", False)
-    )
     verify_returned_energy = bool(
         sweep_kwargs.pop("verify_returned_mps_energy", False)
     )
@@ -867,7 +851,7 @@ def _run_spatial_qchem_dmrg(
     )
     direct_policy_active = get_direct_factorized_orthonormal_kernel_policy()
     su2_kernel_previous = configure_su2_kernel_policy(
-        backend=su2_kernel_backend,
+        backend="cpp",
         debug_check=debug_su2_kernel_check,
         debug_check_tol=debug_su2_kernel_check_tol,
     )
@@ -978,13 +962,17 @@ def _run_spatial_qchem_dmrg(
             ),
             mixer_zero_block_noise_scale=sweep_kwargs.pop(
                 "mixer_zero_block_noise_scale",
-                default_mixer_scale,
+                0.0,
             ),
             mixer_zero_block_noise_seed=sweep_kwargs.pop("mixer_zero_block_noise_seed", seed + 4),
             mixer_nsweeps=2 * int(sweep_kwargs.pop("mixer_nsweeps", 2)),
             record_post_update_energy=sweep_kwargs.pop(
                 "record_post_update_energy",
-                debug_state_average,
+                False,
+            ),
+            compute_final_expectation=sweep_kwargs.pop(
+                "compute_final_expectation",
+                not (normal_complementary_production and int(nstates) == 1),
             ),
             compute_final_expectation=sweep_kwargs.pop(
                 "compute_final_expectation",
@@ -1014,30 +1002,29 @@ def _run_spatial_qchem_dmrg(
             **sweep_kwargs,
         )
     finally:
-        configure_complementary_family_kernel_policy(**family_policy_previous)
-        configure_direct_factorized_orthonormal_kernel_policy(
-            **direct_policy_previous
-        )
         configure_su2_kernel_policy(
             backend=su2_kernel_previous["backend"],
             debug_check=su2_kernel_previous["debug_check"],
             debug_check_tol=su2_kernel_previous["debug_check_tol"],
         )
+    native_bond_updates = 0
     for entry in result.get("history", []):
-        entry["local_basis_policy"] = (
-            "block2_like" if block2_like_state_average else local_basis_policy
-        )
+        entry["local_basis_policy"] = local_basis_policy
         entry["max_bond_mode"] = max_bond_mode
-        entry["family_kernel_policy"] = dict(family_policy_active)
-        entry["direct_factorized_orthonormal_kernel_policy"] = dict(
-            direct_policy_active
-        )
         entry["su2_kernel_policy"] = dict(su2_kernel_active)
-        local_backend_actuals = []
+        entry["threading"] = dict(su2_moving_environment.threading_info)
         for objective in entry.get("bond_objectives", []) or []:
+            native_bond_updates += 1
+            if (
+                objective.get("cpp_owned_half_sweep") is not True
+                or objective.get("no_python_bond_callbacks") is not True
+            ):
+                raise RuntimeError(
+                    "SU(2)-QCDMRG left the required C++-owned half-sweep path."
+                )
             objective.setdefault(
                 "local_basis_policy",
-                "block2_like" if block2_like_state_average else local_basis_policy,
+                local_basis_policy,
             )
             table_stats = objective.get("renormalized_operator_table_stats") or {}
             if bool(
@@ -1049,14 +1036,10 @@ def _run_spatial_qchem_dmrg(
                 local_backend_actuals.append(
                     str(table_stats.get("su2_kernel_backend_actual"))
                 )
-        if local_backend_actuals:
-            entry["su2_kernel_backend_actual"] = (
-                local_backend_actuals[0]
-                if len(set(local_backend_actuals)) == 1
-                else tuple(sorted(set(local_backend_actuals)))
-            )
-        else:
-            entry["su2_kernel_backend_actual"] = "python"
+        entry["su2_kernel_backend_actual"] = "cpp"
+        entry["backend_actual"] = "cpp_su2_normal_complementary"
+    if native_bond_updates == 0:
+        raise RuntimeError("SU(2)-QCDMRG produced no C++-owned bond updates.")
     energy = result["best_energy"]
     if energy is None:
         for entry in reversed(result["history"]):
@@ -1116,14 +1099,7 @@ def _run_spatial_qchem_dmrg(
             root_mps,
             nstates,
             compute_s2=state_average_validate_spin,
-            select_by_spin=(
-                False
-                if fully_reduced_sites
-                else (
-                    not state_average_spin_projector
-                    or int(candidate_nstates) > int(nstates)
-                )
-            ),
+            select_by_spin=False,
             spin_tol=state_average_spin_tol,
             precomputed_energies=(state_energies if cpp_state_average else None),
         )
@@ -1167,8 +1143,7 @@ def _run_spatial_qchem_dmrg(
         ):
             raise RuntimeError(
                 "SU(2) state-averaged sweep did not produce target-spin roots. "
-                "Enable state_average_spin_projector=True for a local spin projector, "
-                "disable state_average_validate_spin if contaminated roots are acceptable, "
+                "Disable state_average_validate_spin if contaminated roots are acceptable, "
                 "or compare against pyqed.qchem.mcscf.direct_ci.CASCI as a separate reference."
             )
     ncompleted_half_sweeps = int(result["ncompleted"])

@@ -1,15 +1,21 @@
 import numpy as np
 
+import pyqed.narg as narg_module
 from pyqed.narg import (
     Block,
     NARGBase,
     SequentialNARGState,
-    Step,
     fuse_two_sites,
     narg_state_vector,
 )
+from pyqed.lattice import Site
 from pyqed.letta import Layout, LETTA
 from pyqed.letta.core import _lowest_generalized_eigenpair, _metric_basis
+
+
+def test_narg_reexports_the_canonical_site_without_a_step_wrapper():
+    assert narg_module.Site is Site
+    assert not hasattr(narg_module, "Step")
 
 
 def _random_hermitian(n, seed):
@@ -277,16 +283,15 @@ def test_sequential_narg_state_accepts_two_site_growth_tensors():
 def test_narg_base_two_site_growth_keeps_full_intermediate_space():
     class DummyGrowth(NARGBase):
         def __init__(self):
-            super().__init__(D=2, growth_sites=2, site_dim=3)
+            super().__init__(D=2, growth_sites=2, sites=Site(3))
             self.keeps = []
 
-        def grow_one(self, block, site, keep):
+        def grow_one(self, block, site, index, keep):
             self.keeps.append(keep)
             left = block.h.shape[0]
             tensor = np.zeros((site.dim * left, keep, site.dim))
-            return Step(
-                site=site,
-                block=Block(h=np.zeros((keep, keep)), tensor=tensor),
+            return Block(
+                h=np.zeros((keep, keep)),
                 tensor=tensor,
             )
 
@@ -295,25 +300,29 @@ def test_narg_base_two_site_growth_keeps_full_intermediate_space():
 
     assert growth.keeps == [6, 2]
     assert len(steps) == 1
-    assert steps[0].tensor.shape == (6, 2, 3, 3)
+    assert steps[0].factor.shape == (6, 2, 3, 3)
 
 
 def test_narg_base_rebranch_two_site_growth_uses_pair_hook():
     class DummyGrowth(NARGBase):
         def __init__(self):
-            super().__init__(D=2, growth_sites=2, site_dim=3, two_site_mode="rebranch")
+            super().__init__(
+                D=2,
+                growth_sites=2,
+                sites=Site(3),
+                two_site_mode="rebranch",
+            )
             self.calls = []
 
-        def grow_one(self, block, site, keep):
-            self.calls.append(("one", site.idx, keep))
+        def grow_one(self, block, site, index, keep):
+            self.calls.append(("one", index, keep))
             raise AssertionError("rebranched two-site growth should not call grow_one")
 
-        def grow_two(self, block, first, second, keep):
-            self.calls.append(("two", first.idx, second.idx, keep))
+        def grow_two(self, block, first, second, index, keep):
+            self.calls.append(("two", index, index + 1, keep))
             tensor = np.zeros((block.h.shape[0], keep, first.dim, second.dim))
-            return Step(
-                site=first,
-                block=Block(h=np.zeros((keep, keep)), tensor=tensor),
+            return Block(
+                h=np.zeros((keep, keep)),
                 tensor=tensor,
             )
 
@@ -322,35 +331,39 @@ def test_narg_base_rebranch_two_site_growth_uses_pair_hook():
 
     assert growth.calls == [("two", 0, 1, 2)]
     assert len(steps) == 1
-    assert steps[0].meta["growth_sites"] == 2
-    assert steps[0].tensor.shape == (2, 2, 3, 3)
+    assert steps[0].data["growth_sites"] == 2
+    assert steps[0].factor.shape == (2, 2, 3, 3)
 
 
 def test_narg_base_auto_growth_uses_budget():
     class DummyGrowth(NARGBase):
         def __init__(self, max_dim):
-            super().__init__(D=2, growth_sites="auto", two_site_max_dim=max_dim, site_dim=3)
+            super().__init__(
+                D=2,
+                growth_sites="auto",
+                two_site_max_dim=max_dim,
+                sites=Site(3),
+            )
             self.keeps = []
 
-        def grow_one(self, block, site, keep):
+        def grow_one(self, block, site, index, keep):
             self.keeps.append(keep)
             left = block.h.shape[0]
             tensor = np.zeros((site.dim * left, keep, site.dim))
-            return Step(
-                site=site,
-                block=Block(h=np.zeros((keep, keep)), tensor=tensor),
+            return Block(
+                h=np.zeros((keep, keep)),
                 tensor=tensor,
             )
 
     two_site = DummyGrowth(max_dim=6)
     two_steps = list(two_site.grow_range(Block(h=np.zeros((2, 2))), 0, 1))
     assert two_site.keeps == [6, 2]
-    assert [step.meta["growth_sites"] for step in two_steps] == [2]
+    assert [block.data["growth_sites"] for block in two_steps] == [2]
 
     one_site = DummyGrowth(max_dim=5)
     one_steps = list(one_site.grow_range(Block(h=np.zeros((2, 2))), 0, 1))
     assert one_site.keeps == [2, 2]
-    assert [step.meta["growth_sites"] for step in one_steps] == [1, 1]
+    assert [block.data["growth_sites"] for block in one_steps] == [1, 1]
 
 
 def test_leg_tied_letta_mpo_local_effective_matches_dense_projector():

@@ -7086,15 +7086,6 @@ class AbelianPlannedPackedDirectFamilyEntries:
             and bool(np.all(left_table_ids >= 0))
             and bool(np.all(right_table_ids >= 0))
         )
-        if schedule_key is None:
-            schedule_key = (
-                "planned_direct_route",
-                getattr(route_plan, "signature", None),
-                str(source),
-                bool(table_backed),
-                tuple(int(value) for value in left_table_ids),
-                tuple(int(value) for value in right_table_ids),
-            )
         return cls(
             route_plan.pair_coeffs,
             route_plan.pair_left_ids,
@@ -7162,19 +7153,19 @@ class AbelianPlannedPackedDirectFamilyEntries:
         for table_id in self.left_table_ids:
             table_id = int(table_id)
             if table_id < 0 or table_id >= len(left_payloads):
-                raise ValueError("planned packed direct left table payload is missing")
+                return self
             payload = left_payloads[table_id]
             if payload is None:
-                raise ValueError("planned packed direct left table payload is empty")
+                return self
             left_values.append(payload)
         right_values = []
         for table_id in self.right_table_ids:
             table_id = int(table_id)
             if table_id < 0 or table_id >= len(right_payloads):
-                raise ValueError("planned packed direct right table payload is missing")
+                return self
             payload = right_payloads[table_id]
             if payload is None:
-                raise ValueError("planned packed direct right table payload is empty")
+                return self
             right_values.append(payload)
         self.left_values = tuple(left_values)
         self.right_values = tuple(right_values)
@@ -10417,7 +10408,10 @@ class AbelianContextualDirectFamilyBuilder:
         cache_table_values = []
         cache_table_positions = []
         for idx, raw_key, storage_key in unresolved:
-            cached_value = cache.get(storage_key, cache_missing)
+            cached_value = cache.get(
+                raw_key,
+                cache.get(storage_key, cache_missing),
+            )
             if cached_value is not cache_missing:
                 values[idx] = cached_value
                 hits += 1
@@ -10763,6 +10757,11 @@ class AbelianContextualDirectFamilyBuilder:
             cached_batch = self.boundary_batch_cache.get(precompute_cache_key)
             if cached_batch is not None:
                 _increment_counter(precompute_cache_stats, "hits")
+                boundary_cache_stats = self.stats.setdefault(
+                    "contextual_boundary_batch_cache",
+                    {"hits": 0, "misses": 0, "stores": 0},
+                )
+                _increment_counter(boundary_cache_stats, "hits", 2)
                 left_unique = len(left_keys)
                 right_unique = len(right_keys)
                 phase_stats = self.stats.setdefault(
@@ -11928,15 +11927,45 @@ class AbelianContextualDirectFamilyBuilder:
                             right_table_ids,
                             dtype=np.int64,
                         )
+                        if bool(np.all(lazy_left_table_id_array >= 0)):
+                            lazy_left_values = tuple(
+                                left_lazy_table.values_for_ids(left_table_ids)
+                            )
+                        else:
+                            lazy_left_values = tuple(
+                                left_cache.get(
+                                    (str(family_name), tuple(pattern), str(piece))
+                                )
+                                for pattern, piece in left_keys
+                            )
+                        if bool(np.all(lazy_right_table_id_array >= 0)):
+                            lazy_right_values = tuple(
+                                right_lazy_table.values_for_ids(right_table_ids)
+                            )
+                        else:
+                            lazy_right_values = tuple(
+                                right_cache.get(
+                                    (str(family_name), tuple(pattern), str(piece))
+                                )
+                                for pattern, piece in right_keys
+                            )
                         lazy_left_packed = bool(
                             lazy_left_values
                             and lazy_left_table_id_array.size == len(left_keys)
                             and bool(np.all(lazy_left_table_id_array >= 0))
+                            and all(
+                                _contextual_boundary_payload_kind(result) == "packed"
+                                for result in lazy_left_values
+                            )
                         )
                         lazy_right_packed = bool(
                             lazy_right_values
                             and lazy_right_table_id_array.size == len(right_keys)
                             and bool(np.all(lazy_right_table_id_array >= 0))
+                            and all(
+                                _contextual_boundary_payload_kind(result) == "packed"
+                                for result in lazy_right_values
+                            )
                         )
                     else:
                         lazy_left_packed = all(
@@ -11962,6 +11991,10 @@ class AbelianContextualDirectFamilyBuilder:
                     ) = _lookup_unique_boundaries(right_keys, right_cache, right_builder)
                     left_table_ids = tuple(-1 for _ in lazy_left_values)
                     right_table_ids = tuple(-1 for _ in lazy_right_values)
+                for key, value in zip(left_keys, lazy_left_values):
+                    left_cache[key] = value
+                for key, value in zip(right_keys, lazy_right_values):
+                    right_cache[key] = value
                 left_hits += int(lazy_left_hits)
                 left_misses += int(lazy_left_misses)
                 right_hits += int(lazy_right_hits)
@@ -12208,17 +12241,28 @@ class AbelianContextualDirectFamilyBuilder:
                         {"calls": 0},
                     )
                     _increment_counter(fast_stats, "calls")
-                    _increment_counter(fast_stats, "entries", planned_count)
+                    _increment_counter(fast_stats, "entries", compact_pair_count)
                     _increment_counter(
                         fast_stats,
                         "compact_pairs",
                         compact_pair_count,
                     )
-                    fast_stats["last_entries"] = int(planned_count)
+                    _increment_counter(
+                        fast_stats,
+                        "coalesced_records",
+                        planned_count - compact_pair_count,
+                    )
+                    fast_stats["last_entries"] = int(compact_pair_count)
                     fast_stats["last_records"] = int(record_count)
                     fast_stats["last_compact_pairs"] = int(compact_pair_count)
-                    fast_stats["last_coalesced_records"] = 0
-                    _increment_counter(fast_stats, "planned_entries", planned_count)
+                    fast_stats["last_coalesced_records"] = int(
+                        planned_count - compact_pair_count
+                    )
+                    _increment_counter(
+                        fast_stats,
+                        "planned_entries",
+                        compact_pair_count,
+                    )
                     _increment_counter(fast_stats, "planned_calls")
                     left_table_id_hits = int(
                         np.count_nonzero(left_table_id_array >= 0)

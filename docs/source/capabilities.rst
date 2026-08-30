@@ -89,6 +89,10 @@ Current development-branch matrix
      - Experimental
      - :doc:`mps`, :doc:`nonabelian_dmrg_design`
      - Method-specific tests under ``tests/``; support varies by solver
+   * - Finite open-boundary PEPS
+     - Experimental
+     - :doc:`peps`
+     - ``tests/test_peps.py``, ``examples/peps/heisenberg_2d.py``
    * - Spectroscopy, Floquet, polariton, UED, MD, and ML research workflows
      - Experimental
      - :doc:`guide/guide_spectroscopy`, :doc:`pyqed.floquet`,

@@ -1,3 +1,5 @@
+from collections import Counter
+
 import numpy as np
 import pytest
 
@@ -10,6 +12,8 @@ from pyqed.letta import (
     SymmetricLETTA,
     SymmetryLayout,
     abelian_frontier_tied_letta_from_mps,
+    conditional_frontier_letta_from_mps,
+    exact_block_factor_layout,
 )
 from pyqed.letta.physical_blocks import (
     PhysicalBlockLinearOperator,
@@ -834,6 +838,364 @@ def test_frontier_abelian_local_solvers_preserve_support_and_agree(solver):
         np.testing.assert_array_equal(tensor[~mask], 0.0)
 
 
+def test_frontier_abelian_two_site_split_preserves_charge_and_lowers_energy():
+    hamiltonian = _heisenberg_chain()
+    layout = FrontierAbelianLayout.spin_half(
+        4,
+        target_two_sz=0,
+        bond_dims=2,
+    )
+    state = AbelianFrontierTiedLETTA(
+        hamiltonian,
+        hamiltonian.dims,
+        ((),) * 4,
+        abelian_layout=layout,
+        frontier_backend="identity_block",
+        seed=29,
+    )
+    energy_before = state.expectation()
+
+    update = state.optimize_two_sites(
+        1,
+        solver="direct",
+        pair_operator_backend="dense",
+        split_strategy="svd",
+        eig_tol=1.0e-11,
+    )
+
+    assert update.accepted
+    assert update.energy <= energy_before
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+    for configuration, amplitude in zip(
+        np.ndindex(*state.dims),
+        state.state_vector(),
+    ):
+        two_sz = sum(1 if local == 0 else -1 for local in configuration)
+        if two_sz != 0:
+            np.testing.assert_allclose(amplitude, 0.0, atol=1.0e-14)
+
+
+def test_frontier_abelian_tied_two_site_supports_action_blocks():
+    state = _state(seed=30)
+    energy_before = state.expectation()
+
+    update = state.optimize_two_sites(
+        1,
+        solver="matrix_free",
+        pair_operator_backend="action",
+        split_strategy="svd",
+        eig_tol=1.0e-11,
+        maxiter=300,
+        max_subspace=24,
+    )
+
+    assert update.accepted
+    assert update.merged_solve.verified
+    assert update.pair_operator_backend == "action"
+    assert update.energy <= energy_before
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
+def test_frontier_abelian_variational_pair_split_stays_in_charge_support():
+    state = _state(seed=30)
+    energy_before = state.expectation()
+
+    update = state.optimize_two_sites(
+        1,
+        solver="matrix_free",
+        pair_operator_backend="action",
+        split_strategy="variational",
+        split_metric_sweeps=1,
+        split_variational_sweeps=2,
+        outer_cycles=1,
+        metric_tol=1.0e-10,
+        eig_tol=1.0e-9,
+        maxiter=300,
+        max_subspace=24,
+    )
+
+    assert update.accepted
+    assert update.energy <= energy_before + 1.0e-11
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
+def test_frontier_abelian_optimized_schedule_records_certified_phases(monkeypatch):
+    state = _state(seed=32)
+    certificates = state.pair_residual_certificates
+    certificate_calls = 0
+
+    def counted_certificates(**kwargs):
+        nonlocal certificate_calls
+        certificate_calls += 1
+        return certificates(**kwargs)
+
+    monkeypatch.setattr(state, "pair_residual_certificates", counted_certificates)
+    state.run_optimized(
+        warmup_sweeps=1,
+        two_site_cycles=1,
+        polish_sweeps=1,
+        tol=1.0e-7,
+        two_site_options={
+            "max_pairs": 1,
+            "split_metric_sweeps": 1,
+            "split_variational_sweeps": 1,
+            "maxiter": 100,
+            "max_subspace": 24,
+        },
+    )
+
+    assert tuple(name for name, _history in state.optimization_history) == (
+        "warmup",
+        "two_site",
+        "polish",
+    )
+    assert np.isfinite(state.optimization_summary["maximum_pair_residual"])
+    assert certificate_calls == 1
+    pair_history = dict(state.optimization_history)["two_site"]
+    assert not any(row["residual_certification_due"] for row in pair_history)
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
+def test_frontier_abelian_pair_problem_removes_forbidden_charge_coordinates():
+    state = _state(seed=30)
+    site = 1
+    plan = state._pair_plan(site)
+    merged, _union = state._merged_pair_tensor(site)
+    mask = state._pair_action_mask(site, plan).reshape(-1)
+    problem = state.pair_local_action_block_problem(site)
+    rng = np.random.default_rng(91)
+    vector = rng.normal(size=merged.size)
+
+    assert np.count_nonzero(mask) < mask.size
+    np.testing.assert_array_equal(merged.reshape(-1)[~mask], 0.0)
+    metric = problem.metric.to_dense()
+    np.testing.assert_array_equal(metric[~mask], 0.0)
+    np.testing.assert_array_equal(metric[:, ~mask], 0.0)
+    applied = problem.hamiltonian.matvec(vector)
+    np.testing.assert_array_equal(applied[~mask], 0.0)
+    np.testing.assert_allclose(
+        problem.hamiltonian.matvec(np.where(mask, 0.0, vector)),
+        0.0,
+        atol=0.0,
+    )
+    assert problem.metric_rank() <= np.count_nonzero(mask)
+
+
+def test_frontier_abelian_packed_pair_action_matches_generic_action():
+    state = _state(seed=33)
+    site = 1
+    generic = state.pair_local_action_block_problem(site)
+    packed = state.pair_local_packed_action_block_problem(site)
+    vector = np.random.default_rng(17).normal(size=generic.layout.size)
+
+    np.testing.assert_allclose(
+        packed.metric.to_dense(),
+        generic.metric.to_dense(),
+        atol=3.0e-13,
+    )
+    np.testing.assert_allclose(
+        packed.hamiltonian.matvec(vector),
+        generic.hamiltonian.matvec(vector),
+        atol=3.0e-13,
+    )
+    np.testing.assert_allclose(
+        packed.hamiltonian.matvecs(np.stack((vector, -0.3 * vector))),
+        np.stack(
+            (
+                generic.hamiltonian.matvec(vector),
+                generic.hamiltonian.matvec(-0.3 * vector),
+            )
+        ),
+        atol=3.0e-13,
+    )
+    assert packed.hamiltonian.backend == "packed-u1-pair-blocks-cpu"
+    assert packed.hamiltonian.stored_elements > 0
+    assert packed.hamiltonian.stored_elements < generic.layout.size**2
+
+
+def test_frontier_abelian_packed_pair_update_is_variational():
+    state = _state(seed=35)
+    energy = state.expectation()
+    update = state.optimize_two_sites(
+        1,
+        solver="matrix_free",
+        pair_operator_backend="packed",
+        split_strategy="svd",
+        eig_tol=1.0e-10,
+        maxiter=300,
+        max_subspace=24,
+        block_size=2,
+        recycle=True,
+        recycle_min_size=1,
+        preconditioner="auto",
+    )
+
+    assert update.accepted
+    assert update.energy <= energy
+    assert update.pair_operator_backend == "packed"
+    assert state._davidson_recycle
+
+
+def test_frontier_abelian_packed_pair_mixed_precision_has_exact_verifier():
+    base = _state(seed=36)
+    state = AbelianFrontierTiedLETTA(
+        base.hamiltonian,
+        base.parent_sets,
+        abelian_layout=base.abelian_layout,
+        tensors=base.tensors,
+        frontier_backend="identity_block",
+        compute_dtype=np.float32,
+    )
+    problem = state.pair_local_packed_action_block_problem(1)
+    vector = state._merged_pair_tensor(1)[0].reshape(-1)
+
+    assert problem.hamiltonian.has_verification_action
+    np.testing.assert_allclose(
+        problem.hamiltonian.matvec(vector),
+        problem.hamiltonian.verification_matvec(vector),
+        rtol=2.0e-6,
+        atol=2.0e-6,
+    )
+
+
+def test_frontier_abelian_pair_residual_scores_are_finite():
+    state = _state(seed=34)
+    scores = state.pair_residual_scores()
+
+    assert len(scores) == len(state.dims) - 1
+    assert np.all(np.isfinite(scores))
+    assert np.all(np.asarray(scores) >= 0.0)
+
+
+def test_frontier_abelian_two_site_sweep_reports_complete_cycle():
+    state = _state(seed=32)
+    energy_before = state.expectation()
+
+    state.run_two_site(
+        nsweeps=2,
+        tol=0.0,
+        solver="matrix_free",
+        pair_operator_backend="action",
+        factor_solver="matrix_free",
+        split_strategy="svd",
+        outer_cycles=1,
+        eig_tol=1.0e-10,
+        maxiter=300,
+        max_subspace=24,
+    )
+
+    assert [row["cycle_complete"] for row in state.history] == [False, True]
+    assert state.history[-1]["cycle_endpoints_accepted"]
+    assert state.history[-1]["cycle_delta"] == pytest.approx(
+        abs(state.energy - energy_before),
+        abs=2.0e-11,
+    )
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
+def test_frontier_abelian_two_site_rejects_unknown_split_strategy():
+    state = _state(seed=31)
+
+    with pytest.raises(ValueError, match="must be 'svd', 'variational', or 'hybrid'"):
+        state.optimize_two_sites(1, split_strategy="unsupported")
+
+
+def test_frontier_abelian_natural_gradient_preserves_support_and_lowers_energy():
+    state = _state(seed=7)
+    energy = state.expectation()
+
+    update = state.natural_gradient_step(trust_radius=0.1)
+
+    assert update.accepted
+    assert update.energy < energy
+    assert state.energy == update.energy
+    assert update.metric_ranks == (5, 5, 3, 2)
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+    for configuration, amplitude in zip(np.ndindex(*state.dims), state.state_vector()):
+        two_sz = sum(1 if local == 0 else -1 for local in configuration)
+        if two_sz != 0:
+            np.testing.assert_allclose(amplitude, 0.0, atol=1.0e-14)
+
+
+def test_frontier_abelian_natural_gradient_data_match_dense_support():
+    state = _state(seed=7)
+    energy = state.expectation()
+
+    for site in range(len(state.dims)):
+        environment = state.site_environment(site)
+        metric, effective = state.local_operators(site, environment=environment)
+        support = state._support_indices(site)
+        reduced_metric, vector, residual, returned_support = (
+            state._natural_gradient_local_data(site, environment, energy)
+        )
+
+        np.testing.assert_array_equal(returned_support, support)
+        np.testing.assert_array_equal(
+            vector,
+            state.tensors[site].reshape(-1)[support],
+        )
+        np.testing.assert_allclose(
+            reduced_metric,
+            metric[np.ix_(support, support)],
+            atol=2.0e-14,
+        )
+        np.testing.assert_allclose(
+            residual,
+            (
+                effective @ state.tensors[site].reshape(-1)
+                - energy * (metric @ state.tensors[site].reshape(-1))
+            )[support],
+            atol=2.0e-14,
+        )
+
+
+def test_frontier_abelian_natural_gradient_accepts_cached_energy_and_norm(
+    monkeypatch,
+):
+    state = _state(seed=7)
+    state.normalize()
+    energy = state.expectation()
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("cached scalar data must be reused")
+
+    monkeypatch.setattr(state, "expectation", forbidden)
+    monkeypatch.setattr(state, "norm", forbidden)
+    update = state.natural_gradient_step(
+        trust_radius=0.1,
+        energy_before=energy,
+        state_norm=1.0,
+    )
+
+    assert update.accepted
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
+def test_frontier_abelian_sweep_can_interleave_natural_gradient():
+    state = _state(seed=13)
+
+    state.run(
+        nsweeps=1,
+        tol=0.0,
+        solver="direct",
+        natural_gradient_every=1,
+        natural_gradient_trust_radius=0.1,
+    )
+
+    update = state.history[0]["natural_gradient"]
+    assert update is not None
+    assert update.energy <= update.energy_before
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
 def test_frontier_abelian_sector_gauge_preserves_state_and_support():
     state = _state(seed=11)
     vector = state.state_vector()
@@ -922,6 +1284,37 @@ def test_charge_resolved_mps_lift_preserves_nonuniform_bonds_and_state():
         atol=3.0e-13,
     )
     for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+
+def test_charge_resolved_mps_lift_into_conditional_factors_is_exact():
+    layout, cores = _charge_resolved_mps()
+    state = conditional_frontier_letta_from_mps(
+        _heisenberg_chain(),
+        ((1, 2), (2, 3), (3,), ()),
+        cores,
+        abelian_layout=layout,
+        frontier_backend="identity_block",
+    )
+
+    expected = _mps_vector(cores)
+    expected /= np.linalg.norm(expected)
+    assert isinstance(state, U1ConditionalFrontierLETTA)
+    np.testing.assert_allclose(state.state_vector(), expected, atol=3.0e-13)
+    for tensor, mask in zip(state.tensors, state.local_masks):
+        np.testing.assert_array_equal(tensor[~mask], 0.0)
+
+    paired = conditional_frontier_letta_from_mps(
+        _heisenberg_chain(),
+        ((1, 2), (2, 3), (3,), ()),
+        cores,
+        abelian_layout=layout,
+        parent_group_size=2,
+        frontier_backend="identity_block",
+    )
+    np.testing.assert_allclose(paired.state_vector(), expected, atol=3.0e-13)
+    assert paired.factors[0][1].ndim == 5
+    for tensor, mask in zip(paired.tensors, paired.local_masks):
         np.testing.assert_array_equal(tensor[~mask], 0.0)
 
 

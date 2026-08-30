@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from pyqed.mps.symmetry import Sector
+from pyqed.mps.symmetry import Sector, abelian_sector_view
 
 from .mpo import Leg
 
@@ -152,7 +152,19 @@ class SymmetryBasis:
 
 @dataclass(frozen=True)
 class SiteBasis(SymmetryBasis):
-    """Physical local basis descriptor."""
+    """Oriented MPS-axis view of a physical ``Leg``."""
+
+    @classmethod
+    def from_leg(cls, leg, *, direction=1, name=None):
+        if not isinstance(leg, Leg):
+            raise TypeError("leg must be a pyqed.symmetry.Leg.")
+        sectors, dims = abelian_sector_view(leg)
+        return cls(
+            sectors=sectors,
+            dims=dims,
+            direction=direction,
+            name=name,
+        )
 
     def as_physical_leg(self):
         return Leg.from_dims(self.dims, sectors=self.sectors)

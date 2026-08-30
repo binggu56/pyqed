@@ -63,8 +63,8 @@ def continue_run(
     metric_tol=1.0e-12,
     maxiter=1600,
     max_subspace=96,
-    frontier_canonicalization=False,
-    frontier_gauge_weighting="probability",
+    gauge=None,
+    gauge_weight="probability",
     natural_gradient_every=0,
     natural_gradient_damping=1.0e-6,
     natural_gradient_trust_radius=0.25,
@@ -112,8 +112,8 @@ def continue_run(
         metric_tol=float(metric_tol),
         maxiter=int(maxiter),
         max_subspace=int(max_subspace),
-        frontier_canonicalization=bool(frontier_canonicalization),
-        frontier_gauge_weighting=str(frontier_gauge_weighting),
+        gauge=gauge,
+        gauge_weight=str(gauge_weight),
         natural_gradient_every=int(natural_gradient_every),
         natural_gradient_damping=float(natural_gradient_damping),
         natural_gradient_trust_radius=float(natural_gradient_trust_radius),
@@ -142,8 +142,8 @@ def continue_run(
         "metric_tol": float(metric_tol),
         "maxiter": int(maxiter),
         "max_subspace": int(max_subspace),
-        "frontier_canonicalization": bool(frontier_canonicalization),
-        "frontier_gauge_weighting": str(frontier_gauge_weighting),
+        "gauge": gauge,
+        "gauge_weight": str(gauge_weight),
         "natural_gradient_every": int(natural_gradient_every),
         "natural_gradient_damping": float(natural_gradient_damping),
         "natural_gradient_trust_radius": float(natural_gradient_trust_radius),
@@ -300,9 +300,13 @@ def main():
     parser.add_argument("--metric-tol", type=float, default=1.0e-12)
     parser.add_argument("--maxiter", type=int, default=1600)
     parser.add_argument("--max-subspace", type=int, default=96)
-    parser.add_argument("--frontier-canonicalization", action="store_true")
     parser.add_argument(
-        "--frontier-gauge-weighting",
+        "--gauge",
+        choices=("auto", "frontier", "virtual", "none"),
+        default="none",
+    )
+    parser.add_argument(
+        "--gauge-weight",
         choices=("uniform", "probability"),
         default="probability",
     )
@@ -322,8 +326,8 @@ def main():
         metric_tol=args.metric_tol,
         maxiter=args.maxiter,
         max_subspace=args.max_subspace,
-        frontier_canonicalization=args.frontier_canonicalization,
-        frontier_gauge_weighting=args.frontier_gauge_weighting,
+        gauge=None if args.gauge == "none" else args.gauge,
+        gauge_weight=args.gauge_weight,
         natural_gradient_every=args.natural_gradient_every,
         natural_gradient_damping=args.natural_gradient_damping,
         natural_gradient_trust_radius=args.natural_gradient_trust_radius,

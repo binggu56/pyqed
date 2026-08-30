@@ -880,6 +880,9 @@ def sweep_once(
     require_symbolic_renormalized_operators
         If True, Hamiltonian local operators must be assembled from symbolic
         renormalized boundary payloads rather than raw environment maps.
+    require_cpp_owned_sweep
+        If True, require the native owner to execute the complete half-sweep.
+        Raise instead of falling back to Python bond callbacks.
     verbose
         Logging level. ``0`` is silent, ``1`` is sweep-level only, ``2`` also
         prints per-bond updates.
@@ -2717,6 +2720,7 @@ def run_sweeps(
     renormalized_operator_cache_max_size=256,
     require_block_sparse_renormalized_operator_table=False,
     require_symbolic_renormalized_operators=False,
+    require_cpp_owned_sweeps=False,
     complementary_operator_families=None,
     materialize_complementary_family_operator_tables=True,
     su2_moving_environment=None,
@@ -2741,6 +2745,9 @@ def run_sweeps(
     prefer_reduced_local_operator, canonical_local_norm, warm_start_bonds,
     compact_history_updates
         Passed through to :func:`sweep_once`.
+    require_cpp_owned_sweeps
+        Require every half-sweep to be executed by the native C++ owner.
+        This disables silent fallback to Python bond callbacks.
     conv_tol
         Optional convergence tolerance applied to ``measure(sweep_result)``.
     measure

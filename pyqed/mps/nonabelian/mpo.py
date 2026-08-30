@@ -12,7 +12,7 @@ import numpy as np
 
 from pyqed.lattice.site import Leg
 from pyqed.mps.su2 import SU2Irrep
-from pyqed.mps.symmetry import Sector
+from pyqed.mps.symmetry import Sector, abelian_sector_view
 
 from .coupling import clebsch_gordan, left_or_right_fusion, ordered_two_m_values
 
@@ -208,6 +208,24 @@ class SiteOperator:
                     f"does not match declared sector dimension {self.phys_in_leg.sector_dim(q_in)}."
                 )
         object.__setattr__(self, "blocks", blocks)
+
+    @classmethod
+    def from_irrep_tensor(cls, tensor):
+        """Create the block-sparse MPO view of a canonical ``IrrepTensor``."""
+        if not isinstance(tensor, IrrepTensor):
+            raise TypeError("tensor must be a pyqed.symmetry.IrrepTensor.")
+        out_leg = _operator_leg_view(tensor.bra)
+        in_leg = _operator_leg_view(tensor.ket)
+        out_map = dict(zip(tensor.bra.irreps, out_leg.sectors))
+        in_map = dict(zip(tensor.ket.irreps, in_leg.sectors))
+        return cls(
+            blocks={
+                (out_map[bra], in_map[ket]): block
+                for (bra, ket), block in tensor.blocks.items()
+            },
+            phys_out_leg=out_leg,
+            phys_in_leg=in_leg,
+        )
 
     @property
     def dtype(self):
@@ -869,6 +887,20 @@ class RankCoupledMPO:
     )
     _reduced_block_cache: dict[tuple[Sector, Sector], dict[tuple[int, int], np.ndarray]] = field(
         default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _environment_reduced_block_cache: dict[
+        tuple[Sector, ...], dict[tuple[int, int], np.ndarray]
+    ] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _environment_reduced_term_routes_cache: tuple | None = field(
+        default=None,
         init=False,
         repr=False,
         compare=False,

@@ -166,7 +166,7 @@ def mps_run(
     ).run()
     seconds = perf_counter() - started
     return {
-        "energy": float(np.real(solver.e_tot)),
+        "energy": float(np.real(solver.energy)),
         "seconds": seconds,
         "converged": bool(solver.converged),
         "passes_completed": len(solver.sweep_history),

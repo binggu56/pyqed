@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark SU(2) component-table and direct complementary kernels."""
+"""Benchmark the native C++ SU(2) normal/complementary kernel."""
 
 from __future__ import annotations
 
@@ -17,9 +17,6 @@ if str(REPO_ROOT) not in sys.path:
 from pyqed.qchem import Molecule
 from pyqed.qchem.dmrg.dmrg import DMRG
 from pyqed.qchem.hf import RHF
-from pyqed.mps.nonabelian.renormalized import (
-    set_complementary_family_native_kernel_max_elements,
-)
 
 
 PRESETS = {
@@ -129,7 +126,7 @@ def _max_timing(result, key):
     return max((row["timing"].get(key, 0.0) for row in result["history"]), default=0.0)
 
 
-def run_case(mf, case, *, bond_dim, nsweeps, direct, recursive=False):
+def run_case(mf, case, *, bond_dim, nsweeps):
     """
     Run one PyQED SU(2) block2-like DMRG benchmark.
 
@@ -151,14 +148,6 @@ def run_case(mf, case, *, bond_dim, nsweeps, direct, recursive=False):
         symmetry="su2",
         verbose=0,
     )
-    families = None
-    if direct or recursive:
-        dmrg.build()
-        families = dmrg._active_hamiltonian.complementary_operators
-        if direct:
-            object.__setattr__(families, "prefer_direct_orthonormal_projection", True)
-        if recursive:
-            object.__setattr__(families, "prefer_recursive_operator_matvec", True)
     t0 = time.perf_counter()
     try:
         dmrg.run(
@@ -192,16 +181,6 @@ def main():
     parser.add_argument("--D", type=int, default=16)
     parser.add_argument("--nsweeps", type=int, default=2)
     parser.add_argument(
-        "--direct",
-        action="store_true",
-        help="Also run the experimental component-direct projection path.",
-    )
-    parser.add_argument(
-        "--recursive",
-        action="store_true",
-        help="Also run the recursive matrix-free complementary-operator path.",
-    )
-    parser.add_argument(
         "--max-default-elapsed",
         type=float,
         default=None,
@@ -219,18 +198,7 @@ def main():
         default=None,
         help="Fail if any default sweep local-matvec time exceeds this threshold.",
     )
-    parser.add_argument(
-        "--family-dense-threshold",
-        type=int,
-        default=None,
-        help="Dense family-kernel element threshold; use 0 for factor-native only.",
-    )
     args = parser.parse_args()
-
-    if args.family_dense_threshold is not None:
-        set_complementary_family_native_kernel_max_elements(
-            args.family_dense_threshold
-        )
 
     case = PRESETS[args.system]
     mol = Molecule(atom=case["atom"], unit="bohr", basis=args.basis)
@@ -248,21 +216,13 @@ def main():
         raise RuntimeError("The SU(2) component benchmark requires the compiled C++ ERI backend.")
     mf = RHF(mol).run()
 
-    runs = [("default", False)]
-    if args.direct:
-        runs.append(("direct-opt-in", True))
-    recursive_labels = {"recursive-matvec"}
-    if args.recursive:
-        runs.append(("recursive-matvec", False))
     results = {}
-    for label, direct in runs:
+    for label in ("native-cpp",):
         result = run_case(
             mf,
             case,
             bond_dim=args.D,
             nsweeps=args.nsweeps,
-            direct=direct,
-            recursive=label in recursive_labels,
         )
         results[label] = result
         print(f"{label}: E={result['energy']:.12f} time={result['elapsed']:.3f}s")
@@ -274,7 +234,7 @@ def main():
                 f"kernels={row['kernels']} build={build}"
             )
 
-    default = results["default"]
+    default = results["native-cpp"]
     failures = []
     if args.max_default_elapsed is not None and default["elapsed"] > args.max_default_elapsed:
         failures.append(

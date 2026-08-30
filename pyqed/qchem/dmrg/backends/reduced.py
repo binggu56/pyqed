@@ -1156,7 +1156,7 @@ class ReducedSpatialHamiltonian:
     :param factors: Rank-coupled MPO cores for the active-space Hamiltonian.
     :param info: Assembly metadata and diagnostics.
     :param n_sites: Number of spatial active orbitals.
-    :param n_elec: Target active-electron count, if known.
+    :param nelec: Target active-electron count, if known.
     :param spin: Target doubled spin ``2S``.
     :param ecore: Scalar core energy added outside the active MPO.
     :param orb_sym: Optional orbital symmetry labels.
@@ -1168,7 +1168,7 @@ class ReducedSpatialHamiltonian:
     factors: list
     info: dict
     n_sites: int
-    n_elec: int | None = None
+    nelec: int | None = None
     spin: int = 0
     ecore: float = 0.0
     orb_sym: tuple | None = None
@@ -1206,10 +1206,40 @@ class ReducedSpatialHamiltonian:
 
         return {
             "n_sites": int(self.n_sites),
-            "n_elec": None if self.n_elec is None else int(self.n_elec),
+            "n_elec": None if self.nelec is None else int(self.nelec),
             "spin": int(self.spin),
             "orb_sym": None if self.orb_sym is None else tuple(self.orb_sym),
         }
+
+    def materialize_transition_factors(self):
+        """Build the exact reduced MPO view used for arbitrary bra/ket contractions.
+
+        Production SU(2)-DMRG contracts the compact normal/complementary
+        Hamiltonian through ``moving_environment`` and never calls this method.
+        Optimizers such as LETTA need arbitrary transition matrix elements, so
+        they use this explicit Wigner--Eckart carrier reconstructed from the
+        canonical spatial integrals.
+        """
+        if self.info.get("python_reduced_terms_materialized", True):
+            return list(self.factors)
+        if self.h1e is None:
+            raise ValueError(
+                "Native SU(2) Hamiltonian has no integral recipe for transition contractions."
+            )
+        eri = None
+        if self.eri is not None:
+            eri = np.asarray(self.eri)[None, None, ...]
+        explicit = SpatialReducedHamiltonianBuilder(
+            np.asarray(self.h1e),
+            eri=eri,
+            cutoff=float(self.cutoff),
+            fully_reduced=bool(self.fully_reduced),
+            nelec=None,
+            spin=int(self.spin),
+            ecore=0.0,
+            orb_sym=self.orb_sym,
+        ).build()
+        return list(explicit.factors)
 
     def with_info(self, **updates):
         """
@@ -1225,7 +1255,7 @@ class ReducedSpatialHamiltonian:
             factors=list(self.factors),
             info=info,
             n_sites=self.n_sites,
-            n_elec=self.n_elec,
+            nelec=self.nelec,
             spin=self.spin,
             ecore=self.ecore,
             orb_sym=self.orb_sym,
@@ -1257,7 +1287,7 @@ class SpatialReducedHamiltonianBuilder:
     eri: object | None = None
     cutoff: float = 1.0e-10
     fully_reduced: bool = False
-    n_elec: int | None = None
+    nelec: int | None = None
     spin: int = 0
     ecore: float = 0.0
     orb_sym: tuple | None = None
@@ -1450,7 +1480,7 @@ class SpatialReducedHamiltonianBuilder:
             "spatial_site_basis": "fully_reduced_su2" if self.fully_reduced else "canonical_su2",
             "ncas": int(h_spatial.shape[0]),
             "n_sites": int(h_spatial.shape[0]),
-            "n_elec": None if self.n_elec is None else int(self.n_elec),
+            "n_elec": None if self.nelec is None else int(self.nelec),
             "spin": int(self.spin),
             "ecore": float(self.ecore),
             "orb_sym": None if self.orb_sym is None else tuple(self.orb_sym),
@@ -1534,7 +1564,7 @@ class SpatialReducedHamiltonianBuilder:
             factors=list(factors),
             info=info,
             n_sites=int(h_spatial.shape[0]),
-            n_elec=self.n_elec,
+            nelec=self.nelec,
             spin=int(self.spin),
             ecore=float(self.ecore),
             orb_sym=None if self.orb_sym is None else tuple(self.orb_sym),
@@ -1567,7 +1597,7 @@ def build_spatial_reduced_hamiltonian_mpo(
     *,
     cutoff=1.0e-10,
     fully_reduced=False,
-    n_elec=None,
+    nelec=None,
     spin=0,
     ecore=0.0,
     orb_sym=None,
@@ -1594,7 +1624,7 @@ def build_spatial_reduced_hamiltonian_mpo(
     :param eri: Optional restricted spin-resolved two-electron integrals.
     :param cutoff: Absolute screening threshold.
     :param fully_reduced: Whether to use fully reduced spatial SU(2) sites.
-    :param n_elec: Target active-electron count, used as system metadata.
+    :param nelec: Target active-electron count, used as system metadata.
     :param spin: Target doubled spin ``2S``.
     :param ecore: Scalar core energy outside the active-space MPO.
     :param orb_sym: Optional orbital symmetry labels.
@@ -1605,7 +1635,7 @@ def build_spatial_reduced_hamiltonian_mpo(
         eri=eri,
         cutoff=cutoff,
         fully_reduced=fully_reduced,
-        n_elec=n_elec,
+        nelec=nelec,
         spin=spin,
         ecore=ecore,
         orb_sym=None if orb_sym is None else tuple(orb_sym),

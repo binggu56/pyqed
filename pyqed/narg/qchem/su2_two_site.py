@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, spin_label
+from pyqed.symmetry import Irrep, Leg, IrrepTensor, OpIrrep, spin_label
 from .su2_core import (
     Multiplet,
     asarray,
@@ -56,7 +56,7 @@ class TwoSiteSU2NARG:
     """Untruncated two-site SU(2)-NARG data."""
 
     branch_states: list[BranchMultiplet]
-    site: IrrepSite
+    leg: Leg
     bases: dict[Irrep, np.ndarray]
     provenance: dict[Irrep, list[BranchMultiplet]]
     hamiltonian: IrrepTensor
@@ -100,7 +100,7 @@ class TruncatedSU2NARG:
 
     source: TwoSiteSU2NARG
     kept_roots: list[SectorRoot]
-    site: IrrepSite
+    leg: Leg
     bases: dict[Irrep, np.ndarray]
     transform: IrrepTensor
     hamiltonian: IrrepTensor
@@ -170,10 +170,10 @@ def component_vector(mp: Multiplet, m2: int | None = None) -> np.ndarray | None:
     return mp.states.get(selected_m2)
 
 
-def branch_irrep_site(
+def branch_leg(
     states: list[BranchMultiplet], m2: int | None = None
-) -> tuple[IrrepSite, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
-    """Build an IrrepSite from branch-generated two-site multiplets."""
+) -> tuple[Leg, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
+    """Build an Leg from branch-generated two-site multiplets."""
     sectors: dict[Irrep, list[np.ndarray]] = {}
     provenance: dict[Irrep, list[BranchMultiplet]] = {}
     for state in states:
@@ -186,14 +186,14 @@ def branch_irrep_site(
 
     dims = {irrep: len(cols) for irrep, cols in sectors.items()}
     bases = {irrep: np.column_stack(cols) for irrep, cols in sectors.items()}
-    return IrrepSite(su2_product_symmetry(), dims), bases, provenance
+    return Leg(dims, symmetry=su2_product_symmetry()), bases, provenance
 
 
 def build_two_site_su2_narg(h1e, eri, m2: int | None = None) -> TwoSiteSU2NARG:
     """Construct the untruncated two-site SU(2)-NARG Hamiltonian."""
     block_multiplets = build_site_csf_multiplets(1)
     branch_states = two_site_branch_states(block_multiplets)
-    site, bases, provenance = branch_irrep_site(branch_states, m2=m2)
+    site, bases, provenance = branch_leg(branch_states, m2=m2)
     model = full_jw_model(h1e, eri, nelec=2)
     hamiltonian = scalar_hamiltonian_irrep_tensor(model.H, site, bases)
     return TwoSiteSU2NARG(branch_states, site, bases, provenance, hamiltonian)
@@ -225,7 +225,7 @@ def diagonalize_all_sectors(
     """Diagonalize every allowed scalar sector and sort roots by energy."""
     backend = resolve_su2_narg_backend(backend)
     roots: list[SectorRoot] = []
-    for irrep in narg.site.irreps:
+    for irrep in narg.leg.irreps:
         nelec, _ = irrep.charge
         if allowed_nelec is not None and nelec not in allowed_nelec:
             continue
@@ -309,8 +309,8 @@ def truncate_to_D(
             bases[irrep] = np.column_stack(primitive_cols)
         blocks[(irrep, irrep)] = np.diag([root.energy for root in roots])
 
-    site = IrrepSite(su2_product_symmetry(), dims)
-    transform = IrrepTensor(narg.site, site, OpIrrep((0, 0)), transform_blocks)
+    site = Leg(dims, symmetry=su2_product_symmetry())
+    transform = IrrepTensor(narg.leg, site, OpIrrep((0, 0)), transform_blocks)
     hamiltonian = IrrepTensor(site, site, OpIrrep((0, 0)), blocks)
     return TruncatedSU2NARG(narg, kept, site, bases, transform, hamiltonian)
 
@@ -373,12 +373,12 @@ def project_primitive_operator(
     blocks = {}
     for bra_irrep, bra_basis in narg.bases.items():
         for ket_irrep, ket_basis in narg.bases.items():
-            if not narg.site.symmetry.allows(bra_irrep.charge, op_irrep.charge, ket_irrep.charge):
+            if not narg.leg.symmetry.allows(bra_irrep.charge, op_irrep.charge, ket_irrep.charge):
                 continue
             block = bra_basis.conj().T @ dense_op @ ket_basis
             if np.any(np.abs(block) > atol):
                 blocks[(bra_irrep, ket_irrep)] = block
-    return IrrepTensor(narg.site, narg.site, op_irrep, blocks)
+    return IrrepTensor(narg.leg, narg.leg, op_irrep, blocks)
 
 
 def project_primitive_operator_to_truncated(
@@ -393,12 +393,12 @@ def project_primitive_operator_to_truncated(
     blocks = {}
     for bra_irrep, bra_basis in truncated.bases.items():
         for ket_irrep, ket_basis in truncated.bases.items():
-            if not truncated.site.symmetry.allows(bra_irrep.charge, op_irrep.charge, ket_irrep.charge):
+            if not truncated.leg.symmetry.allows(bra_irrep.charge, op_irrep.charge, ket_irrep.charge):
                 continue
             block = bra_basis.conj().T @ dense_op @ ket_basis
             if np.any(np.abs(block) > atol):
                 blocks[(bra_irrep, ket_irrep)] = block
-    return IrrepTensor(truncated.site, truncated.site, op_irrep, blocks)
+    return IrrepTensor(truncated.leg, truncated.leg, op_irrep, blocks)
 
 
 def rotate_operator_to_truncated(
@@ -415,13 +415,13 @@ def rotate_operator_to_truncated(
     backend = resolve_su2_narg_backend(backend)
     block_specs = []
     for (bra_irrep, ket_irrep), old_block in operator.blocks.items():
-        if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
+        if bra_irrep not in truncated.leg.dims or ket_irrep not in truncated.leg.dims:
             continue
-        source_bra_dim = truncated.source.site.sector_dim(bra_irrep)
-        source_ket_dim = truncated.source.site.sector_dim(ket_irrep)
+        source_bra_dim = truncated.source.leg.sector_dim(bra_irrep)
+        source_ket_dim = truncated.source.leg.sector_dim(ket_irrep)
         if source_bra_dim == 0 or source_ket_dim == 0:
             continue
-        if not truncated.site.symmetry.allows(
+        if not truncated.leg.symmetry.allows(
             bra_irrep.charge, operator.op.charge, ket_irrep.charge
         ):
             continue
@@ -435,7 +435,7 @@ def rotate_operator_to_truncated(
     for (bra_irrep, ket_irrep), new_block in backend.rotate_operator_blocks(block_specs):
         if np.any(np.abs(new_block) > 1e-12):
             blocks[(bra_irrep, ket_irrep)] = new_block
-    return IrrepTensor(truncated.site, truncated.site, operator.op, blocks)
+    return IrrepTensor(truncated.leg, truncated.leg, operator.op, blocks)
 
 
 def primitive_parity_operator(nsites: int) -> np.ndarray:
@@ -588,7 +588,7 @@ def validate_adjoint_pairs(block: RenormalizedSU2Block) -> dict[str, float]:
 def validate_parity(block: RenormalizedSU2Block) -> dict[str, float]:
     """Check parity is Hermitian and squares to identity in retained sectors."""
     parity = block.parity
-    identity = IrrepTensor.identity(block.truncated.site)
+    identity = IrrepTensor.identity(block.truncated.leg)
     return {
         "P-Pdag": irrep_tensor_difference_norm(parity, parity.adjoint()),
         "P2-I": irrep_tensor_difference_norm(parity.scalar_matmul(parity), identity),
@@ -647,7 +647,7 @@ def print_truncated_block(truncated: TruncatedSU2NARG, enuc: float) -> None:
             f"Ne={nelec} S={spin_label(j2)}  branches[{weight_text}]"
         )
     print("  kept sectors:")
-    for irrep, dim in truncated.site.dims.items():
+    for irrep, dim in truncated.leg.dims.items():
         nelec, j2 = irrep.charge
         print(f"    Ne={nelec} S={spin_label(j2)} dim={dim}")
 

@@ -30,10 +30,10 @@ from pyqed.qchem.gdvr.rhf import (
 # DMRG / MPO imports
 # ============================================================
 from pyqed.mps import DMRG as DMRG_SOLVER, dense_to_symmetric_mpo
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSimpleElectron
-from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.operator_mpo.model import Model
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSimpleElectron
+from pyqed.operator_mpo.model_mpo import ModelMPO
 import pyqed.mps.mps as mps_lib
 
 try:
@@ -756,7 +756,7 @@ def run_dmrg_from_hf_data(
 
     basis = [BasisSimpleElectron(i) for i in range(2 * nkeep)]
     model = Model(basis=basis, ham_terms=ham_terms)
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
 
     mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
     for w in mpo_dmrg:
@@ -799,17 +799,17 @@ def run_dmrg_from_hf_data(
     solver.run()
 
     try:
-        psi_tensors = solver.ground_state.Bs
+        psi_tensors = solver.state.tensors
         e_elec = mps_lib.expect_mps(psi_tensors, solver.H, psi_tensors)
         E_dmrg = np.real(e_elec) + Enuc
     except Exception as e:
-        logger.info(f"[DMRG] expect_mps failed, fallback to solver.e_tot. Error: {e}")
-        E_dmrg = solver.e_tot + Enuc
+        logger.info(f"[DMRG] expect_mps failed, fallback to solver.energy. Error: {e}")
+        E_dmrg = solver.energy + Enuc
 
     with open(os.path.join(outdir, "dmrg_ground_state.pkl"), "wb") as f:
         pickle.dump(
             {
-                "Bs": solver.ground_state.Bs,
+                "Bs": solver.state.tensors,
                 "nkeep": nkeep,
                 "charge": nelec,
                 "spin": 0,

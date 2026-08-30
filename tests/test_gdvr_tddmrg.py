@@ -801,7 +801,7 @@ def test_direct_gdvr_tddmrg_optimize_ground_state_tiny_native_setup():
 
     assert td._has_ground_state()
     assert np.isfinite(td.e_tot)
-    assert hasattr(td.dmrg.ground_state.factors[0], "qns")
+    assert hasattr(td.dmrg.state.factors[0], "qns")
 
 
 def test_gdvr_tddmrg_dense_export_preserves_spatial_local_order():

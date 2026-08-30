@@ -1,0 +1,98 @@
+{
+  "model": {
+    "shape": [
+      4,
+      4
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "target_two_sz": 0
+  },
+  "blocking": {
+    "shape": [
+      2,
+      2
+    ],
+    "nblocks": 4,
+    "blocks": [
+      [
+        0,
+        1,
+        7,
+        6
+      ],
+      [
+        2,
+        3,
+        5,
+        4
+      ],
+      [
+        10,
+        11,
+        13,
+        12
+      ],
+      [
+        8,
+        9,
+        15,
+        14
+      ]
+    ],
+    "block_dims": [
+      16,
+      16,
+      16,
+      16
+    ],
+    "unfused_physical_shape": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "parent_sets": [
+      [],
+      [],
+      [],
+      []
+    ],
+    "intra_block_ties": false,
+    "hamiltonian_mapping": "exact product-basis permutation",
+    "blocking_seconds": 0.009950417006621137
+  },
+  "solver": {
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      1
+    ],
+    "optimizer": "two_site",
+    "solver": "matrix_free",
+    "frontier_backend": "identity_block",
+    "sweeps": 10,
+    "symmetry_parameters": 134,
+    "dense_parameters": 640,
+    "setup_seconds": 0.08311229199171066,
+    "sweep_seconds": 2.863501083003939,
+    "initial_energy": -0.23592315026880437,
+    "energy": -4.775708626409396,
+    "history": [
+      -4.775708626409394,
+      -4.775708626409396
+    ],
+    "peak_frontier_elements": 185,
+    "cached_environment_elements": 554
+  },
+  "exact": {
+    "energy": null,
+    "seconds": null,
+    "block_tt_svd_reference": null,
+    "energy_error": null,
+    "energy_error_per_site": null
+  }
+}

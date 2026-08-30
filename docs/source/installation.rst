@@ -48,6 +48,13 @@ C/C++ toolchain and opt in explicitly:
 
    PYQED_BUILD_EXTENSIONS=1 python -m pip install .
 
+SU(2)-QCDMRG specifically requires the MPS extension group and has no Python
+fallback:
+
+.. code-block:: bash
+
+   PYQED_BUILD_EXTENSIONS=1 PYQED_EXTENSION_GROUPS=mps python -m pip install .
+
 Record the commit for any research result:
 
 .. code-block:: bash

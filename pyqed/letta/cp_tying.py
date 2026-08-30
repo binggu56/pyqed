@@ -118,7 +118,7 @@ class CPTiedLETTA:
         parameter_dtype = np.result_type(self.hamiltonian.dtype, np.complex128)
         self._configs = np.asarray(list(np.ndindex(*self.dims)), dtype=np.intp)
         self.rng = np.random.default_rng(seed)
-        self.physical_sites = tuple(
+        self.physical_groups = tuple(
             (site,) + parents for site, parents in enumerate(self.parent_sets)
         )
         bonds = (1,) + (self.bond_dim,) * max(0, len(self.dims) - 1) + (1,)
@@ -132,7 +132,7 @@ class CPTiedLETTA:
                 shape = (bonds[site], bonds[site + 1], rank)
                 core = self.rng.normal(size=shape) / np.sqrt(max(1, np.prod(shape)))
                 factors = []
-                for physical_site in self.physical_sites[site]:
+                for physical_site in self.physical_groups[site]:
                     factor = self.rng.normal(size=(rank, self.dims[physical_site]))
                     factor /= np.maximum(np.linalg.norm(factor, axis=1, keepdims=True), 1.0e-15)
                     factors.append(factor)
@@ -176,9 +176,9 @@ class CPTiedLETTA:
             if self.cores[site].shape != expected_core:
                 raise ValueError(f"core {site} shape must be {expected_core}.")
             factors = self.physical_factors[site]
-            if len(factors) != len(self.physical_sites[site]):
+            if len(factors) != len(self.physical_groups[site]):
                 raise ValueError(f"site {site} has the wrong number of CP leg factors.")
-            for factor, physical_site in zip(factors, self.physical_sites[site]):
+            for factor, physical_site in zip(factors, self.physical_groups[site]):
                 expected = (rank, self.dims[physical_site])
                 if factor.shape != expected:
                     raise ValueError(f"physical factor at site {site} must have shape {expected}.")
@@ -288,7 +288,7 @@ class CPTiedLETTA:
         )
         environment = np.ones((nconfigs, 1), dtype=dtype)
         for site, (core, factors, physical_sites) in enumerate(
-            zip(self.cores, self.physical_factors, self.physical_sites)
+            zip(self.cores, self.physical_factors, self.physical_groups)
         ):
             weights = np.ones((nconfigs, self.tie_ranks[site]), dtype=dtype)
             for factor, physical_site in zip(factors, physical_sites):
@@ -336,7 +336,7 @@ class CPTiedLETTA:
         weights = np.ones((len(self._configs), self.tie_ranks[site]), dtype=dtype)
         for factor, physical_site in zip(
             self.physical_factors[site],
-            self.physical_sites[site],
+            self.physical_groups[site],
         ):
             weights *= factor[:, self._configs[:, physical_site]].T
         return np.einsum("abm,cm->cab", core, weights, optimize=True)
@@ -634,11 +634,11 @@ class CPTiedLETTA:
         parents = tuple(sorted({int(parent) for parent in parents}))
         if any(parent <= site or parent >= len(self.dims) for parent in parents):
             raise ValueError("parents must be future physical sites.")
-        old_sites = self.physical_sites[site]
+        old_physical_groups = self.physical_groups[site]
         old_factors = {
             physical_site: factor
             for physical_site, factor in zip(
-                old_sites,
+                old_physical_groups,
                 self.physical_factors[site],
             )
         }
@@ -661,9 +661,9 @@ class CPTiedLETTA:
         parent_sets = list(self.parent_sets)
         parent_sets[site] = parents
         self.parent_sets = tuple(parent_sets)
-        physical_sites = list(self.physical_sites)
+        physical_sites = list(self.physical_groups)
         physical_sites[site] = new_sites
-        self.physical_sites = tuple(physical_sites)
+        self.physical_groups = tuple(physical_sites)
         self.physical_factors[site] = new_factors
         self._initial_dense_factors = None
         self.balance_gauges()
@@ -818,7 +818,7 @@ class CPTiedLETTA:
                 continue
             added_parameters = (
                 self.cores[site].shape[0] * self.cores[site].shape[1]
-                + sum(self.dims[physical_site] for physical_site in self.physical_sites[site])
+                + sum(self.dims[physical_site] for physical_site in self.physical_groups[site])
             )
             proposals.append(
                 {
@@ -940,7 +940,7 @@ class CPTiedLETTA:
 
     def _adopt(self, other: "CPTiedLETTA") -> None:
         self.parent_sets = other.parent_sets
-        self.physical_sites = other.physical_sites
+        self.physical_groups = other.physical_groups
         self.tie_ranks = other.tie_ranks
         self.cores = [core.copy() for core in other.cores]
         self.physical_factors = [
@@ -1254,7 +1254,7 @@ class CPTiedLETTA:
                 )
             grown_factors = []
             for mode, (factor, physical_site) in enumerate(
-                zip(self.physical_factors[site], self.physical_sites[site])
+                zip(self.physical_factors[site], self.physical_groups[site])
             ):
                 grown = np.empty((new_rank, self.dims[physical_site]), dtype=factor.dtype)
                 grown[:old_rank] = factor

@@ -13,10 +13,10 @@ from pyqed.qchem.gdvr.rhf import (
     build_h1_nm, V_en_sp_total_at_z, CollocatedERIOp, rebuild_Hcore_from_d,
     SweepNewtonHelper, sweep_optimize_driver
 )
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSimpleElectron
-from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.operator_mpo.model import Model
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSimpleElectron
+from pyqed.operator_mpo.model_mpo import ModelMPO
 import pyqed.mps.mps as mps_lib
 import pyqed.mps.dmrg as dmrg_lib
 from pyqed.mps.mps import dense_to_symmetric_mpo, SymmetryManager
@@ -860,9 +860,9 @@ def run_gdvr_dmrg_loop(
         basis = [BasisSimpleElectron(i) for i in range(2 * Nz)]
         model = Model(basis=basis, ham_terms=ham_terms)
 
-        mpo = Mpo(model, algo="qr")
+        mpo = ModelMPO(model, algo="qr")
 
-        # Convert AutoMPO tensor layout to DMRG layout:
+        # Convert ModelMPO tensor layout to DMRG layout:
         # expected dense layout = (left, right, physical_out, physical_in)
         mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
 
@@ -910,13 +910,13 @@ def run_gdvr_dmrg_loop(
         solver.run()
 
         try:
-            psi_tensors = solver.ground_state.Bs
+            psi_tensors = solver.state.tensors
             e_elec = mps_lib.expect_mps(psi_tensors, solver.H, psi_tensors)
             e_dmrg = np.real(e_elec) + Enuc
         except Exception:
-            e_dmrg = solver.e_tot + Enuc
+            e_dmrg = solver.energy + Enuc
 
-        last_mps_tensors = solver.ground_state.Bs
+        last_mps_tensors = solver.state.tensors
         final_dmrg_energy = e_dmrg
 
         logger.info(f"     -> Final Cycle Energy: {e_dmrg:.8f} Ha")

@@ -69,6 +69,25 @@ def _normalize_contracted_channel_values(value):
     return tuple(normalized)
 
 
+def _channel_blocks_match_tensor_data(tensor, *, atol=1.0e-12, rtol=1.0e-10):
+    """Check that cached intermediate-channel blocks still represent ``data``."""
+    metadata = tensor.metadata or {}
+    if not metadata.get("contracted_channel_blocks_current", False):
+        return False
+    aggregate = {}
+    for key, block in metadata.get("contracted_channel_blocks", {}).items():
+        outer_key = (key[0], key[1], key[3], key[4])
+        value = np.asarray(block)
+        aggregate[outer_key] = aggregate.get(outer_key, 0) + value
+    if set(aggregate) != set(tensor.data):
+        return False
+    return all(
+        np.asarray(aggregate[key]).shape == np.asarray(tensor.data[key]).shape
+        and np.allclose(aggregate[key], tensor.data[key], atol=atol, rtol=rtol)
+        for key in tensor.data
+    )
+
+
 def _expand_two_site_support(A, B, merged):
     """
     Add zero blocks for all symmetry-allowed two-site keys on the current bond.

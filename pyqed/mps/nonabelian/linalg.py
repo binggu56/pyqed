@@ -360,6 +360,7 @@ def truncate_reduced_svds(
         normalized = {svd.sector: svd for svd in sector_svds}
 
     sv_list = []
+    full_sq_norm = 0.0
     for sector, svd in normalized.items():
         if sector != svd.sector:
             raise ValueError(
@@ -367,6 +368,8 @@ def truncate_reduced_svds(
                 f"SVD sector {svd.sector!r}."
             )
         sv_list.extend(svd.singular_items(cutoff=cutoff))
+        values = np.asarray(svd.singular_values, dtype=float).reshape(-1)
+        full_sq_norm += svd.state_weight * float(np.dot(values, values))
 
     if not sv_list and not retain_sector_topology:
         raise ValueError("All non-Abelian singular values were truncated.")
@@ -454,7 +457,11 @@ def truncate_reduced_svds(
     if not kept_items:
         raise ValueError("All non-Abelian singular values were truncated.")
     kept_sq_norm = sum(weight * sval**2 for sval, _, _, weight in kept_items)
-    trunc_err = 0.0 if full_sq_norm <= 1.0e-15 else 1.0 - kept_sq_norm / full_sq_norm
+    trunc_err = (
+        0.0
+        if full_sq_norm <= 1.0e-15
+        else float(np.clip(1.0 - kept_sq_norm / full_sq_norm, 0.0, 1.0))
+    )
 
     kept_indices_by_sector = {}
     for _sval, sector, idx, _weight in kept_items:

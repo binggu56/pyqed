@@ -2600,7 +2600,9 @@ def symbolic_mpo_core_transitions(core):
     cache_key = id(core)
     cached = _SYMBOLIC_MPO_TRANSITION_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        if cached[0] is core:
+            return cached[1]
+        _SYMBOLIC_MPO_TRANSITION_CACHE.pop(cache_key, None)
     records = tuple(getattr(core, "symbolic_transitions", ()) or ())
     if records:
         result = (
@@ -2617,7 +2619,7 @@ def symbolic_mpo_core_transitions(core):
         )
         if len(_SYMBOLIC_MPO_TRANSITION_CACHE) > 512:
             _SYMBOLIC_MPO_TRANSITION_CACHE.clear()
-        _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = result
+        _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = (core, result)
         return result
     transitions = {}
     dense_blocks = getattr(core, "dense_blocks", None)
@@ -2660,7 +2662,7 @@ def symbolic_mpo_core_transitions(core):
     result = (tuple(transitions.values()), False)
     if len(_SYMBOLIC_MPO_TRANSITION_CACHE) > 512:
         _SYMBOLIC_MPO_TRANSITION_CACHE.clear()
-    _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = result
+    _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = (core, result)
     return result
 
 
@@ -2695,7 +2697,9 @@ def _symbolic_transition_summary(transitions, direction):
     key = (id(transitions), str(direction))
     cached = _SYMBOLIC_TRANSITION_SUMMARY_CACHE.get(key)
     if cached is not None:
-        return cached
+        if cached[0] is transitions:
+            return cached[1]
+        _SYMBOLIC_TRANSITION_SUMMARY_CACHE.pop(key, None)
     summary = []
     for transition in transitions:
         if direction == "left":
@@ -2714,7 +2718,7 @@ def _symbolic_transition_summary(transitions, direction):
     out = tuple(summary)
     if len(_SYMBOLIC_TRANSITION_SUMMARY_CACHE) > 512:
         _SYMBOLIC_TRANSITION_SUMMARY_CACHE.clear()
-    _SYMBOLIC_TRANSITION_SUMMARY_CACHE[key] = out
+    _SYMBOLIC_TRANSITION_SUMMARY_CACHE[key] = (transitions, out)
     return out
 
 

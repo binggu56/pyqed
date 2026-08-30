@@ -1,9 +1,11 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import numpy as np
 import pytest
 
 from pyqed.letta.core import _lowest_generalized_eigenpair
 from pyqed.letta.frontier_tying import FrontierTiedLETTA
-from pyqed.letta.local_terms import LocalHamiltonian, LocalTerm
+from pyqed.tn import LocalHamiltonian, LocalTerm
 from pyqed.letta.physical_blocks import (
     PhysicalBlockGeneralizedProblem,
     PhysicalBlockLayout,
@@ -59,6 +61,32 @@ def test_physical_block_layout_preserves_native_tensor_flattening():
     )
 
 
+def test_metric_eigensystems_are_cached(monkeypatch):
+    metric = np.diag([1.0, 2.0, 3.0, 4.0])
+    hamiltonian = np.diag([-1.0, 0.0, 1.0, 2.0])
+    problem = PhysicalBlockGeneralizedProblem.from_dense(
+        metric,
+        hamiltonian,
+        (1, 2, 2),
+    )
+    from pyqed.letta import physical_blocks
+
+    calls = 0
+    original = physical_blocks.linalg.eigh
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(physical_blocks.linalg, "eigh", counted)
+    first = problem.metric_eigensystems()
+    second = problem.metric_eigensystems()
+
+    assert first is second
+    assert calls == problem.layout.nblocks
+
+
 def test_block_linear_operator_applies_only_supplied_connections():
     layout = PhysicalBlockLayout((1, 2, 2, 2))
     calls = []
@@ -103,7 +131,7 @@ def test_frustrated_graph_physical_blocks_match_dense_local_problem():
     site = 0
     metric, hamiltonian = state.local_operators(site)
     pairs = hamiltonian_physical_connectivity(
-        state.hamiltonian, state.physical_sites[site]
+        state.hamiltonian, state.physical_groups[site]
     )
     problem = PhysicalBlockGeneralizedProblem.from_dense(
         metric,
@@ -178,6 +206,59 @@ def test_component_solver_finds_an_unoccupied_lower_component():
     assert diagnostics.component_sizes == (1, 1)
     assert diagnostics.selected_component == 1
     assert diagnostics.positive_metric_components == 2
+
+
+def test_component_solver_dispatches_independent_blocks_and_recycles_vectors():
+    layout = PhysicalBlockLayout((1, 8, 4))
+    metric = np.eye(layout.size)
+    hamiltonian = np.zeros((layout.size, layout.size))
+    for block, indices in enumerate(layout.block_indices):
+        local = np.diag(np.linspace(float(block), float(block) + 0.7, 8))
+        local += 0.02 * (np.ones((8, 8)) - np.eye(8))
+        hamiltonian[np.ix_(indices, indices)] = local
+    problem = PhysicalBlockGeneralizedProblem.from_dense(
+        metric,
+        hamiltonian,
+        layout.tensor_shape,
+        hamiltonian_pairs=tuple((block, block) for block in range(layout.nblocks)),
+        omitted_atol=0.0,
+    )
+
+    class RecordingExecutor:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def map(self, function, values):
+            values = tuple(values)
+            self.batch_sizes.append(len(values))
+            return map(function, values)
+
+    initial = np.linspace(0.2, 1.0, layout.size)
+    recycle = {}
+    recorder = RecordingExecutor()
+    energy, _vector, diagnostics = problem.solve(
+        initial,
+        tol=1.0e-12,
+        executor=recorder,
+        recycle_spaces=recycle,
+        recycle_prefix=("test",),
+        recycle_min_size=8,
+    )
+
+    assert recorder.batch_sizes == [layout.nblocks]
+    assert diagnostics.positive_metric_components == layout.nblocks
+    assert recycle
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        repeated_energy, _vector, repeated = problem.solve(
+            initial,
+            tol=1.0e-12,
+            executor=executor,
+            recycle_spaces=recycle,
+            recycle_prefix=("test",),
+            recycle_min_size=8,
+        )
+    assert repeated.converged
+    np.testing.assert_allclose(repeated_energy, energy, atol=1.0e-12)
 
 
 @pytest.mark.parametrize("frontier_backend", ["compressed", "identity_block"])

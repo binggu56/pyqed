@@ -15,14 +15,17 @@ order used by :class:`~pyqed.letta.mpo_frontier.MPOFrontier`.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from math import sqrt
 from typing import Hashable, Iterable
 
 import numpy as np
 from opt_einsum import contract
+from pyqed.tn import MPO
+from pyqed.tn.hamiltonian import _operator_string_mpo
 
-from .local_terms import LocalMPO
+from .block_mpo_frontier import BlockFrontierMessage, BlockMPOFrontier
 from .mpo_frontier import MPOFrontier
 
 
@@ -498,6 +501,47 @@ class TTFrontier:
             )
         return type(self)(cores, self.labels)
 
+    def add(self, other):
+        """Return the exact direct-sum TT for two aligned frontiers."""
+        if not isinstance(other, TTFrontier):
+            return NotImplemented
+        if self.labels != other.labels or self.shape != other.shape:
+            raise ValueError("TT sums require aligned labels and dimensions.")
+        if len(self.cores) == 1:
+            return type(self)([self.cores[0] + other.cores[0]], self.labels)
+        dtype = np.result_type(self.dtype, other.dtype)
+        cores = [
+            np.concatenate(
+                (
+                    np.asarray(self.cores[0], dtype=dtype),
+                    np.asarray(other.cores[0], dtype=dtype),
+                ),
+                axis=2,
+            )
+        ]
+        for left, right in zip(self.cores[1:-1], other.cores[1:-1]):
+            core = np.zeros(
+                (
+                    left.shape[0] + right.shape[0],
+                    left.shape[1],
+                    left.shape[2] + right.shape[2],
+                ),
+                dtype=dtype,
+            )
+            core[: left.shape[0], :, : left.shape[2]] = left
+            core[left.shape[0] :, :, left.shape[2] :] = right
+            cores.append(core)
+        cores.append(
+            np.concatenate(
+                (
+                    np.asarray(self.cores[-1], dtype=dtype),
+                    np.asarray(other.cores[-1], dtype=dtype),
+                ),
+                axis=0,
+            )
+        )
+        return type(self)(cores, self.labels)
+
     def sum_over(self, labels: Iterable[Hashable]):
         """Exactly sum the requested variables out of this TT."""
 
@@ -576,7 +620,7 @@ class TTMPOFrontier:
             optimize=optimize,
         )
         self.dims = self._metadata.dims
-        self.physical_sites = self._metadata.physical_sites
+        self.physical_groups = self._metadata.physical_groups
         self.tensor_shapes = self._metadata.tensor_shapes
         self.mpo_tensors = self._metadata.mpo_tensors
         self.paired_sites = self._metadata.paired_sites
@@ -936,7 +980,7 @@ class TTMPOFrontier:
             self._metadata.bra_bonds[site + 1],
             *(
                 self._metadata.bra_physical[index]
-                for index in self.physical_sites[site]
+                for index in self.physical_groups[site]
             ),
         )
         ket_labels = (
@@ -948,7 +992,7 @@ class TTMPOFrontier:
                     if index in self.paired_sites
                     else self._metadata.local_ket_physical[index]
                 )
-                for index in self.physical_sites[site]
+                for index in self.physical_groups[site]
             ),
         )
         own_ket_label = (
@@ -963,7 +1007,7 @@ class TTMPOFrontier:
             own_ket_label,
         )
         identity_factors = []
-        for physical_site in self.physical_sites[site][1:]:
+        for physical_site in self.physical_groups[site][1:]:
             if physical_site not in self.paired_sites:
                 identity_factors.append(
                     (
@@ -1216,7 +1260,7 @@ def _product_mpo(dims, local_operators):
         if operator is None:
             operator = np.eye(dim, dtype=dtype)
         tensors.append(np.asarray(operator, dtype=dtype)[None, None])
-    return LocalMPO(dims, tensors)
+    return MPO(tensors)
 
 
 def _validated_local_qns(dims, local_qns):
@@ -1400,7 +1444,7 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
     ):
         self.hamiltonian = hamiltonian
         self.dims = tuple(hamiltonian.dims)
-        self.physical_sites = tuple(tuple(sites) for sites in physical_sites)
+        self.physical_groups = tuple(tuple(sites) for sites in physical_sites)
         self.tensor_shapes = tuple(tuple(shape) for shape in tensor_shapes)
         self.nsites = len(self.dims)
         self.absorption = str(absorption).lower().replace("-", "_")
@@ -1422,6 +1466,7 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
                 "truncate only boundary messages with max_rank/rtol/atol."
             )
         self._groups = []
+        self._group_supports = []
         self._engines = []
         if hamiltonian.constant != 0.0:
             constant_mpo = _product_mpo(
@@ -1431,7 +1476,7 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
             self._engines.append(
                 TTMPOFrontier(
                     self.dims,
-                    self.physical_sites,
+                    self.physical_groups,
                     self.tensor_shapes,
                     constant_mpo.tensors,
                     paired_sites=(),
@@ -1446,7 +1491,8 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
                 )
             )
             self._groups.append(((0,), True))
-        for term in hamiltonian.terms:
+            self._group_supports.append((0,))
+        for term in hamiltonian.local_terms:
             group = []
             for mpo in _term_product_mpos(
                 self.dims,
@@ -1455,7 +1501,7 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
             ):
                 engine = TTMPOFrontier(
                     self.dims,
-                    self.physical_sites,
+                    self.physical_groups,
                     self.tensor_shapes,
                     mpo.tensors,
                     paired_sites=term.sites,
@@ -1473,6 +1519,30 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
             self._groups.append((tuple(group), np.allclose(
                 term.operator, term.operator.T.conj()
             )))
+            self._group_supports.append(tuple(term.sites))
+        for product in hamiltonian.products:
+            if product.coefficient == 0:
+                continue
+            mpo = _operator_string_product_mpo(self.dims, product)
+            self._engines.append(
+                TTMPOFrontier(
+                    self.dims,
+                    self.physical_groups,
+                    self.tensor_shapes,
+                    mpo.tensors,
+                    paired_sites=_offdiagonal_product_sites(product),
+                    max_rank=self.max_rank,
+                    rtol=self.rtol,
+                    atol=self.atol,
+                    transfer_max_rank=self.transfer_max_rank,
+                    transfer_rtol=self.transfer_rtol,
+                    transfer_atol=self.transfer_atol,
+                    absorption=self.absorption,
+                    optimize=self.optimize,
+                )
+            )
+            self._groups.append(((len(self._engines) - 1,), False))
+            self._group_supports.append(tuple(product.sites))
         if not self._engines:
             raise ValueError("a termwise TT Hamiltonian requires at least one term.")
         self.frontier_sites = self._engines[0].frontier_sites
@@ -1577,8 +1647,48 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
         return messages
 
     def scalar(self, tensors):
+        if self.channel_grouping == "component":
+            return self._shared_component_scalar(tensors)
         values = [engine.scalar(tensors) for engine in self._engines]
         return self._grouped_scalar(values)
+
+    def _shared_component_scalar(self, tensors):
+        """Reuse identity prefixes/suffixes within each protected term."""
+        for engine in self._engines:
+            engine.reset_diagnostics()
+        total = 0.0j
+        for (indices, hermitian), sites in zip(
+            self._groups, self._group_supports
+        ):
+            if len(indices) == 1:
+                value = self._engines[indices[0]].scalar(tensors)
+                total += np.real(value) if hermitian else value
+                continue
+            engines = tuple(self._engines[index] for index in indices)
+            start = min(sites)
+            stop = max(sites) + 1
+            prefix = engines[0].left_boundary()
+            for site in range(start):
+                prefix = engines[0].advance_left(prefix, tensors, site)
+            branches = []
+            for engine in engines:
+                message = prefix
+                for site in range(start, stop):
+                    message = engine.advance_left(message, tensors, site)
+                branches.append(message)
+            message = branches[0]
+            for branch in branches[1:]:
+                message = message.add(branch)
+            message = message.round(
+                max_rank=self.max_rank,
+                rtol=self.rtol,
+                atol=self.atol,
+            )
+            for site in range(stop, self.nsites):
+                message = engines[0].advance_left(message, tensors, site)
+            value = message.to_dense().reshape(()).item()
+            total += np.real(value) if hermitian else value
+        return total
 
     def _grouped_scalar(self, values):
         total = 0.0j
@@ -1623,12 +1733,655 @@ class TermwiseTTMPOFrontier(TTMPOFrontier):
         )
 
 
+class TermwiseBlockMPOFrontier:
+    """Exact identity-block frontiers over bounded Hamiltonian chunks.
+
+    Product strings are compiled into small shared-prefix MPO automata. Scalar
+    contractions splice spatially grouped chunks between precomputed identity
+    prefixes and suffixes, so only their coherence-safe active intervals are
+    traversed. Independent chunks may run on a bounded thread pool.
+    ``chunk_size=1`` is the original strictly termwise partition. Directional
+    environments retain one block message per chunk; checkpoint/recompute
+    therefore remains important during sweeps.
+    """
+
+    def __init__(
+        self,
+        hamiltonian,
+        physical_sites,
+        tensor_shapes,
+        *,
+        optimize="greedy",
+        local_qns=None,
+        bond_qns=None,
+        chunk_size=8,
+        chunk_memory=64,
+        chunk_span=None,
+        workers=1,
+        compute_dtype=None,
+        device="cpu",
+    ):
+        self.hamiltonian = hamiltonian
+        self.dims = tuple(hamiltonian.dims)
+        self.physical_groups = tuple(tuple(sites) for sites in physical_sites)
+        self.tensor_shapes = tuple(tuple(shape) for shape in tensor_shapes)
+        self.nsites = len(self.dims)
+        self.optimize = optimize
+        self.compute_dtype = compute_dtype
+        self.device = str(device)
+        self.local_qns = local_qns
+        self.bond_qns = bond_qns
+        if isinstance(chunk_size, (bool, np.bool_)):
+            raise TypeError("chunk_size must be a positive integer.")
+        self.chunk_size = int(chunk_size)
+        if self.chunk_size < 1:
+            raise ValueError("chunk_size must be a positive integer.")
+        if chunk_memory is None:
+            self.chunk_memory = None
+        else:
+            self.chunk_memory = float(chunk_memory)
+            if not np.isfinite(self.chunk_memory) or self.chunk_memory <= 0.0:
+                raise ValueError("chunk_memory must be positive and finite or None.")
+        self._chunk_limit_elements = (
+            None
+            if self.chunk_memory is None
+            else max(1, int(self.chunk_memory * 2**20 // 16))
+        )
+        if chunk_span is None:
+            self.chunk_span = None
+        else:
+            if isinstance(chunk_span, (bool, np.bool_)):
+                raise TypeError("chunk_span must be a positive integer or None.")
+            self.chunk_span = int(chunk_span)
+            if self.chunk_span < 1:
+                raise ValueError("chunk_span must be a positive integer or None.")
+        if isinstance(workers, (bool, np.bool_)):
+            raise TypeError("workers must be a positive integer.")
+        self.workers = int(workers)
+        if self.workers < 1:
+            raise ValueError("workers must be a positive integer.")
+        self._executor = (
+            ThreadPoolExecutor(
+                max_workers=self.workers,
+                thread_name_prefix="letta-frontier",
+            )
+            if self.workers > 1
+            else None
+        )
+        self._engines = []
+        self.chunk_sizes = []
+        self.chunk_intervals = []
+        first_reference = list(range(self.nsites))
+        for owner, group in enumerate(self.physical_groups):
+            for physical_site in group[1:]:
+                first_reference[physical_site] = min(
+                    first_reference[physical_site], owner
+                )
+        self._first_reference = tuple(first_reference)
+
+        def make_engine(mpo):
+            return BlockMPOFrontier(
+                self.dims,
+                self.physical_groups,
+                self.tensor_shapes,
+                mpo.tensors,
+                optimize=self.optimize,
+                local_qns=self.local_qns,
+                bond_qns=self.bond_qns,
+                compute_dtype=self.compute_dtype,
+                device=self.device,
+            )
+
+        @dataclass(frozen=True)
+        class ProductComponent:
+            sites: tuple[int, ...]
+            operators: tuple[np.ndarray, ...]
+            coefficient: complex
+
+        def mpo_product(mpo):
+            sites = []
+            operators = []
+            coefficient = 1.0
+            for site, tensor in enumerate(mpo.tensors):
+                matrix = np.asarray(tensor)[0, 0]
+                scalar = np.trace(matrix) / matrix.shape[0]
+                residual = matrix - scalar * np.eye(
+                    matrix.shape[0], dtype=matrix.dtype
+                )
+                if not np.any(residual):
+                    coefficient *= scalar
+                else:
+                    sites.append(site)
+                    operators.append(matrix)
+            if not sites:
+                sites = [0]
+                operators = [np.eye(self.dims[0], dtype=self.hamiltonian.dtype)]
+            return ProductComponent(
+                tuple(sites),
+                tuple(operators),
+                np.asarray(coefficient).item(),
+            )
+
+        def component_interval(component):
+            return int(component.sites[0]), int(component.sites[-1]) + 1
+
+        def chunk_mpo(entries):
+            return _operator_string_mpo(
+                self.hamiltonian.sites,
+                tuple(entries),
+                self.hamiltonian.dtype,
+            )
+
+        def append_bounded_chunk(entries):
+            engine = make_engine(chunk_mpo(entries))
+            start = min(component.sites[0] for component in entries)
+            stop = max(component.sites[-1] for component in entries) + 1
+            while start:
+                paired = engine.paired_sites(start, 0)
+                if not paired:
+                    break
+                safe_start = min(
+                    start,
+                    *(self._first_reference[site] for site in paired),
+                )
+                if safe_start == start:
+                    break
+                start = safe_start
+            if (
+                self._chunk_limit_elements is not None
+                and engine.peak_message_elements > self._chunk_limit_elements
+                and len(entries) > 1
+            ):
+                middle = len(entries) // 2
+                del engine
+                append_bounded_chunk(entries[:middle])
+                append_bounded_chunk(entries[middle:])
+                return
+            self._engines.append(engine)
+            self.chunk_sizes.append(len(entries))
+            self.chunk_intervals.append((int(start), int(stop)))
+
+        components = []
+        if hamiltonian.constant != 0.0:
+            constant_mpo = _product_mpo(
+                self.dims,
+                {0: hamiltonian.constant * np.eye(self.dims[0])},
+            )
+            components.append(mpo_product(constant_mpo))
+        for term in hamiltonian.local_terms:
+            components.extend(
+                mpo_product(mpo)
+                for mpo in _term_product_mpos(
+                    self.dims, term, local_qns=self.local_qns
+                )
+            )
+        for product in hamiltonian.products:
+            if product.coefficient != 0:
+                components.append(product)
+        if not components:
+            raise ValueError("a termwise Hamiltonian requires at least one term.")
+
+        components.sort(
+            key=lambda component: (
+                component.sites[0],
+                component.sites[-1],
+                len(component.sites),
+            )
+        )
+        pending = []
+        pending_start = pending_stop = None
+        for component in components:
+            start, stop = component_interval(component)
+            combined_start = start if pending_start is None else min(pending_start, start)
+            combined_stop = stop if pending_stop is None else max(pending_stop, stop)
+            exceeds_span = (
+                self.chunk_span is not None
+                and pending
+                and combined_stop - combined_start > self.chunk_span
+            )
+            if pending and (len(pending) >= self.chunk_size or exceeds_span):
+                append_bounded_chunk(pending)
+                pending = []
+                pending_start = pending_stop = None
+                combined_start, combined_stop = start, stop
+            pending.append(component)
+            pending_start, pending_stop = combined_start, combined_stop
+        if pending:
+            append_bounded_chunk(pending)
+        self.chunk_sizes = tuple(self.chunk_sizes)
+        self.chunk_intervals = tuple(self.chunk_intervals)
+
+        reference = self._engines[0]
+        self.frontier_sites = reference.frontier_sites
+        self.virtual_bonds = reference.virtual_bonds
+        self.mpo_bonds = tuple(1 for _ in range(self.nsites + 1))
+        self.dtype = np.dtype(
+            np.result_type(*(engine.dtype for engine in self._engines))
+        )
+        identity_mpo = _product_mpo(self.dims, {})
+        self._identity_engine = make_engine(identity_mpo)
+
+    def _map_chunks(self, function):
+        if self._executor is None or len(self._engines) == 1:
+            return [function(index, engine) for index, engine in enumerate(self._engines)]
+        return list(
+            self._executor.map(
+                lambda item: function(*item),
+                enumerate(self._engines),
+            )
+        )
+
+    def close(self):
+        """Release the persistent bounded worker pool."""
+
+        executor = self._executor
+        self._executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def __del__(self):
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)
+
+    def _identity_seed_block(self, engine, cut, block):
+        identity = self._identity_engine
+        source_shape = identity.block_shape(cut, 0)
+        target_shape = engine.block_shape(cut, 0)
+        if np.shape(block) != identity.storage_shape(cut, 0):
+            raise ValueError("identity prefix has an invalid frontier shape.")
+        if engine.charge_resolved:
+            if engine._bond_pairs[cut][0] != identity._bond_pairs[cut][0]:
+                raise ValueError("identity prefix has incompatible virtual-charge pairs.")
+            source_bra_bond, source_ket_bond, source_bra, source_ket = (
+                identity._expanded_storage_coordinates(cut, 0)
+            )
+            target_pairs = {
+                pair: index
+                for index, pair in enumerate(engine._bond_pairs[cut][0])
+            }
+            target_paired = set(engine.paired_sites(cut, 0))
+            target_inverse = engine._storage_inverse(cut, 0)
+            promoted = np.zeros(
+                engine.storage_shape(cut, 0),
+                dtype=np.asarray(block).dtype,
+            )
+            for source_index in range(len(source_bra_bond)):
+                pair = (
+                    int(source_bra_bond[source_index]),
+                    int(source_ket_bond[source_index]),
+                )
+                coordinate = [target_pairs[pair]]
+                for physical_site in engine.frontier_sites[cut]:
+                    bra_value = int(source_bra[physical_site][source_index])
+                    ket_value = int(source_ket[physical_site][source_index])
+                    coordinate.append(bra_value)
+                    if physical_site in target_paired:
+                        coordinate.append(ket_value)
+                    elif bra_value != ket_value:
+                        raise ValueError(
+                            "identity prefix is not diagonal on a shared frontier leg."
+                        )
+                logical = int(np.ravel_multi_index(tuple(coordinate), target_shape))
+                packed = int(target_inverse[logical])
+                if packed >= 0:
+                    promoted.reshape(-1)[packed] += np.asarray(block).reshape(-1)[
+                        source_index
+                    ]
+            return promoted
+        block = identity._logical_block(cut, 0, block)
+        leading = 2
+        paired = set(engine.paired_sites(cut, 0))
+        if not paired:
+            if source_shape != target_shape:
+                raise ValueError(
+                    "identity prefix is incompatible with the chunk frontier."
+                )
+            return engine._store_block(cut, 0, block)
+
+        source_labels = list(range(len(source_shape)))
+        output_labels = source_labels[:leading]
+        arguments = [block, tuple(source_labels)]
+        next_label = len(source_labels)
+        for offset, site in enumerate(identity.frontier_sites[cut]):
+            shared = source_labels[leading + offset]
+            if site not in paired:
+                output_labels.append(shared)
+                continue
+            bra, ket = next_label, next_label + 1
+            next_label += 2
+            arguments.extend(
+                (
+                    identity._copies[self.dims[site]],
+                    (shared, bra, ket),
+                )
+            )
+            output_labels.extend((bra, ket))
+        promoted = contract(*arguments, tuple(output_labels), optimize=self.optimize)
+        if promoted.shape != target_shape:
+            raise ValueError("promoted identity prefix has an invalid frontier shape.")
+        return engine._store_block(cut, 0, promoted)
+
+    def _seeded_message(self, engine, cut, block):
+        blocks = [np.zeros(0, dtype=engine.dtype) for _ in range(engine.mpo_bonds[cut])]
+        blocks[0] = self._identity_seed_block(engine, cut, block)
+        return BlockFrontierMessage(int(cut), tuple(blocks))
+
+    def _window_scalar(self, index, engine, tensors, identity_left, identity_right):
+        start, stop = self.chunk_intervals[index]
+        message = self._seeded_message(
+            engine,
+            start,
+            identity_left[start].blocks[0],
+        )
+        for site in range(start, stop):
+            message = engine.advance_left(message, tensors, site)
+        suffix = identity_right[stop].blocks[0]
+        value = message.blocks[0]
+        if value.shape != suffix.shape:
+            raise ValueError(
+                "identity suffix is incompatible with the completed chunk frontier."
+            )
+        return np.sum(value * suffix)
+
+    def _identity_window_boundaries(self, tensors):
+        """Build only identity messages referenced by active chunk windows."""
+
+        left_cuts = {start for start, _stop in self.chunk_intervals}
+        right_cuts = {stop for _start, stop in self.chunk_intervals}
+        left = {}
+        message = self._identity_engine.left_boundary()
+        if 0 in left_cuts:
+            left[0] = message
+        for site in range(self.nsites):
+            message = self._identity_engine.advance_left(message, tensors, site)
+            if site + 1 in left_cuts:
+                left[site + 1] = message
+
+        right = {}
+        message = self._identity_engine.right_boundary()
+        if self.nsites in right_cuts:
+            right[self.nsites] = message
+        for site in range(self.nsites - 1, -1, -1):
+            message = self._identity_engine.advance_right(message, tensors, site)
+            if site in right_cuts:
+                right[site] = message
+        return left, right
+
+    @property
+    def plan_count(self):
+        return sum(engine.plan_count for engine in self._engines)
+
+    @property
+    def nchunks(self):
+        return len(self._engines)
+
+    def message_elements(self, cut):
+        return sum(engine.message_elements(cut) for engine in self._engines)
+
+    def dense_message_elements(self, cut):
+        return sum(engine.dense_message_elements(cut) for engine in self._engines)
+
+    @property
+    def peak_message_elements(self):
+        return max(self.message_elements(cut) for cut in range(self.nsites + 1))
+
+    @property
+    def stream_peak_message_elements(self):
+        """Largest stored chunk message during a streamed scalar contraction."""
+
+        chunk_peak = max(
+            max(
+                engine.message_elements(cut)
+                for cut in range(start, stop + 1)
+            )
+            for engine, (start, stop) in zip(
+                self._engines, self.chunk_intervals
+            )
+        )
+        identity_peak = max(
+            self._identity_engine.message_elements(cut)
+            for cut in range(self.nsites + 1)
+        )
+        return max(chunk_peak, identity_peak)
+
+    @property
+    def dense_peak_message_elements(self):
+        return max(
+            self.dense_message_elements(cut) for cut in range(self.nsites + 1)
+        )
+
+    @property
+    def total_message_elements(self):
+        return sum(self.message_elements(cut) for cut in range(self.nsites + 1))
+
+    @property
+    def dense_total_message_elements(self):
+        return sum(
+            self.dense_message_elements(cut) for cut in range(self.nsites + 1)
+        )
+
+    def _validated_message(self, message, cut):
+        if not isinstance(message, tuple) or len(message) != len(self._engines):
+            raise ValueError("termwise block message has the wrong component count.")
+        for engine, part in zip(self._engines, message):
+            engine._validated_message(part, int(cut))
+        return message
+
+    def left_boundary(self):
+        return tuple(engine.left_boundary() for engine in self._engines)
+
+    def right_boundary(self):
+        return tuple(engine.right_boundary() for engine in self._engines)
+
+    def advance_left(self, message, tensors, site):
+        self._validated_message(message, int(site))
+
+        def advance(index, engine):
+            return engine.advance_left(message[index], tensors, site)
+
+        return tuple(self._map_chunks(advance))
+
+    def advance_right(self, message, tensors, site):
+        self._validated_message(message, int(site) + 1)
+
+        def advance(index, engine):
+            return engine.advance_right(message[index], tensors, site)
+
+        return tuple(self._map_chunks(advance))
+
+    def build_left(self, tensors):
+        messages = [None] * (self.nsites + 1)
+        messages[0] = self.left_boundary()
+        for site in range(self.nsites):
+            messages[site + 1] = self.advance_left(messages[site], tensors, site)
+        return messages
+
+    def build_right(self, tensors):
+        messages = [None] * (self.nsites + 1)
+        messages[-1] = self.right_boundary()
+        for site in range(self.nsites - 1, -1, -1):
+            messages[site] = self.advance_right(messages[site + 1], tensors, site)
+        return messages
+
+    def scalar(self, tensors):
+        identity_left, identity_right = self._identity_window_boundaries(tensors)
+
+        def contract_window(index, engine):
+            return self._window_scalar(
+                index,
+                engine,
+                tensors,
+                identity_left,
+                identity_right,
+            )
+
+        return sum(self._map_chunks(contract_window), 0.0j)
+
+    def boundary_scalar(self, message, cut):
+        message = self._validated_message(message, int(cut))
+        return sum(
+            engine.boundary_scalar(part, cut)
+            for engine, part in zip(self._engines, message)
+        )
+
+    def hole_matrix(self, site, left, right):
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        def action(index, engine):
+            return engine.hole_matrix(
+                site,
+                left[index],
+                right[index],
+            )
+
+        return sum(self._map_chunks(action), 0)
+
+    def hole_block(self, site, left, right, bra_configuration, ket_configuration):
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        def action(index, engine):
+            return engine.hole_block(
+                site,
+                left[index],
+                right[index],
+                bra_configuration,
+                ket_configuration,
+            )
+
+
+        return sum(self._map_chunks(action), 0)
+
+    def hole_blocks(
+        self,
+        site,
+        left,
+        right,
+        bra_configurations,
+        ket_configurations,
+    ):
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        def action(index, engine):
+            return engine.hole_blocks(
+                site,
+                left[index],
+                right[index],
+                bra_configurations,
+                ket_configurations,
+            )
+
+
+        return sum(self._map_chunks(action), 0)
+
+    def hole_action(self, site, left, right, vector):
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        def action(index, engine):
+            return engine.hole_action(
+                site,
+                left[index],
+                right[index],
+                vector,
+            )
+
+
+        return sum(self._map_chunks(action), 0)
+
+    def prepare_hole_action(self, site, left, right):
+        """Bind all chunk messages and retain their compiled grouped plans."""
+
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        actions = tuple(
+            engine.prepare_hole_action(site, left_part, right_part)
+            for engine, left_part, right_part in zip(self._engines, left, right)
+        )
+
+        def action(vector):
+            def apply(index, _engine):
+                return actions[index](vector)
+
+            return sum(self._map_chunks(apply), 0)
+
+        def actions_many(vectors):
+            def apply(index, _engine):
+                return actions[index].many(vectors)
+
+            return sum(self._map_chunks(apply), 0)
+
+        action.many = actions_many
+        if any(hasattr(item, "verify") for item in actions):
+            def verify(vector):
+                def apply(index, _engine):
+                    verifier = getattr(actions[index], "verify", actions[index])
+                    return verifier(vector)
+
+                return sum(self._map_chunks(apply), 0)
+
+            action.verify = verify
+        return action
+
+    def hole_action_components(self, site, left, right, vector):
+        """Yield one exact local-action contribution per Hamiltonian chunk."""
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        for engine, left_part, right_part in zip(self._engines, left, right):
+            yield engine.hole_action(
+                site,
+                left_part,
+                right_part,
+                vector,
+            )
+
+    def hole_action_component_count(self, site):
+        return len(self._engines)
+
+    def left_enrichment_components(self, site, left, vector):
+        """Stream exact open ``L W A`` ranges one Hamiltonian chunk at a time."""
+        self._validated_message(left, int(site))
+        for engine, left_part in zip(self._engines, left):
+            yield from engine.left_enrichment_components(
+                site,
+                left_part,
+                vector,
+            )
+
+    def right_enrichment_components(self, site, right, vector):
+        """Stream exact open ``A W R`` ranges one Hamiltonian chunk at a time."""
+        self._validated_message(right, int(site) + 1)
+        for engine, right_part in zip(self._engines, right):
+            yield from engine.right_enrichment_components(
+                site,
+                right_part,
+                vector,
+            )
+
+    def enrichment_component_count(self, site):
+        return sum(engine.enrichment_component_count(site) for engine in self._engines)
+
+    def hole_actions(self, site, left, right, vectors):
+        self._validated_message(left, int(site))
+        self._validated_message(right, int(site) + 1)
+        def action(index, engine):
+            return engine.hole_actions(
+                site,
+                left[index],
+                right[index],
+                vectors,
+            )
+
+
+        return sum(self._map_chunks(action), 0)
+
+
 __all__ = [
     "TTAdvanceDiagnostics",
     "TTContractionDiagnostics",
     "TTFrontier",
     "TTHoleDiagnostics",
     "TTMPOFrontier",
+    "TermwiseBlockMPOFrontier",
     "TermwiseTTMPOFrontier",
     "TTRoundDiagnostics",
 ]

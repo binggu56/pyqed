@@ -3,7 +3,7 @@ Matrix Product States
 
 Matrix product states (MPS) are compact tensor-network representations for
 one-dimensional quantum many-body states. PyQED uses MPS ideas for lattice
-models, vibrational problems, quantum chemistry DMRG prototypes, and
+models, vibrational problems, quantum chemistry DMRG, and
 time-dependent simulations.
 
 MPS Ansatz
@@ -94,6 +94,28 @@ local block are held fixed, producing an effective eigenvalue problem:
 Sweeping repeatedly through the chain relaxes the MPS toward the ground state
 or targeted low-lying states.
 
+For large Abelian bond dimensions, ``DMRG(..., opt="3s")`` selects the
+strictly one-site DMRG3S/AMEn path.  Its local Davidson vector is a rank-3
+U(1)-blocked tensor rather than a rank-4 two-site tensor.  Partial residuals
+``L W A`` and ``A W F`` enrich the next bond without constructing a two-site
+effective Hamiltonian::
+
+   solver = DMRG(
+       H,
+       D=512,
+       init_guess=psi,
+       opt="3s",
+       target_qn=target,
+       enrichment=1e-4,
+   ).run()
+
+A labelled ``target_qn`` automatically enables Abelian symmetry and supplies
+the symmetry labels; a separate ``sym_mgr`` argument is unnecessary.
+
+``opt="1site"`` is an alias for this implementation.  It currently supports
+one Abelian target state and an explicit block-sparse MPO; use ``opt="2site"``
+for dense, state-averaged, SU(2), or complementary-operator calculations.
+
 Infinite-system DMRG
 --------------------
 
@@ -135,13 +157,18 @@ Symmetries
 
 Symmetry-adapted MPS implementations reduce cost by block-sparsifying tensors.
 Common symmetries include particle number, spin projection, point group labels,
-and total spin. PyQED contains both Abelian and prototype non-Abelian/SU(2)
-development paths.
+and total spin. PyQED contains Abelian and non-Abelian/SU(2) paths.
 
 For SU(2)-adapted quantum chemistry, tensors store reduced multiplet data
 rather than all spin components. This requires explicit Clebsch-Gordan and
 fusion-tree bookkeeping, but can substantially reduce the number of states
 needed for spin-adapted calculations.
+
+The quantum-chemistry SU(2) driver is a strict compiled backend. It uses fully
+reduced spatial sites and a C++-owned normal/complementary half-sweep; it raises
+if the compiled route is unavailable instead of switching to Python bond
+callbacks. The generic Python non-Abelian contractions remain available for
+models, LETTA, and reference validation.
 
 Time-Dependent MPS
 ------------------
@@ -194,11 +221,14 @@ Package Map
 
 The MPS-related code is split across several namespaces:
 
-* ``pyqed.mps`` contains general MPS, MPO, TEBD, DMRG, symmetry, and AutoMPO
-  utilities, plus ``UniformMPS`` for one-site uniform/infinite MPS work.
-* ``pyqed.mps.autompo`` contains automatic MPO construction helpers.
-* ``pyqed.mps.nonabelian`` contains prototype SU(2)/non-Abelian tensor and DMRG
-  components.
+* ``pyqed.tn`` contains the canonical dense ``MPS``, ``MPO``,
+  ``Hamiltonian``, and analytical operator-string compiler.
+* ``pyqed.mps`` contains explicit MPS algorithms such as DMRG, TEBD, TDVP,
+  and uniform or continuous MPS drivers.
+* ``pyqed.operator_mpo`` contains the specialized ``ModelMPO`` compiler used
+  by vibronic and grid Hamiltonian models.
+* ``pyqed.mps.nonabelian`` contains reduced SU(2)/non-Abelian tensors,
+  ``AutoMPO``, and sweep components.
 * ``pyqed.qchem.dmrg`` contains quantum-chemistry DMRG and DMRG-SCF-facing
   code.
 * ``pyqed.dmrg`` contains older/simple DMRG examples and prototypes.
@@ -208,8 +238,8 @@ Examples
 
 Useful example entry points:
 
-* ``examples/mps/autompo.py``
-* ``examples/mps/autompo_boson.py``
+* ``examples/mps/model_mpo_fermion.py``
+* ``examples/mps/model_mpo_boson.py``
 * ``examples/mps/hydrogen_chain.py``
 * ``examples/mps/nonabelian_hubbard_chain_benchmark.py``
 * ``examples/mps/nonabelian_hubbard_solver_scaling.py``

@@ -582,7 +582,7 @@ def _nonabelian_mps_to_dense_vector(state):
 
     from pyqed.mps.nonabelian.environment import _site_to_dense
 
-    sites = list(getattr(state, "sites", state))
+    sites = list(getattr(state, "factors", getattr(state, "sites", state)))
     psi = np.array([1.0 + 0.0j])
     for site in sites:
         tensor = _site_to_dense(site)
@@ -4094,7 +4094,7 @@ class DMRG(CASCI):
                     eri,
                     cutoff=1e-10,
                     fully_reduced=self.spatial_site_basis == "fully_reduced",
-                    n_elec=self.nelecas,
+                    nelec=self.nelecas,
                     spin=self.spin,
                     ecore=self.e_core,
                     orb_sym=self.orb_sym,
@@ -4561,7 +4561,10 @@ class DMRG(CASCI):
         scale=1,
         identity_tol=1e-10,
         phase_align_tol=1e-14,
-        backend="structured",
+        backend="auto",
+        cutoff=1.0e-10,
+        max_bond="auto",
+        return_info=False,
     ):
         from pyqed.qchem.dmrg.overlap import biorthogonal_overlap
 
@@ -4578,6 +4581,9 @@ class DMRG(CASCI):
             identity_tol=identity_tol,
             phase_align_tol=phase_align_tol,
             backend=backend,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            return_info=return_info,
         )
 
     def overlap_auto(
@@ -5428,7 +5434,7 @@ class DMRG(CASCI):
         dmrg.sweep_history = all_stage_history
         self.dmrg = dmrg
         # Report
-        e_dmrg_total = dmrg.e_tot + self.e_core
+        e_dmrg_total = np.asarray(dmrg.energy) + self.e_core
         if self.spin_purification:
             compute_s2 = True
         s2_val = self.calc_spin_square() if compute_s2 else None
@@ -5852,6 +5858,15 @@ class DMRG(CASCI):
                 with_core=with_core,
             )
         state = self._get_state_for_rdm(state_id)
+        if (
+            getattr(self, "spatial_site_basis", "canonical") == "fully_reduced"
+            and _is_fully_reduced_spatial_mps(state)
+        ):
+            return self._make_fully_reduced_spatial_rdm1(
+                state_id,
+                spatial=spatial,
+                with_core=with_core,
+            )
         mps_state = _spatial_rdm_dense_mps(
             state,
             site_qn_maps=(
@@ -5937,6 +5952,19 @@ class DMRG(CASCI):
                 with_core=with_core,
             )
         state = self._get_state_for_rdm(state_id)
+        if (
+            getattr(self, "spatial_site_basis", "canonical") == "fully_reduced"
+            and _is_fully_reduced_spatial_mps(state)
+        ):
+            if idx_pairs is not None:
+                raise NotImplementedError(
+                    "idx_pairs is not implemented for the fully reduced SU(2) 2-RDM."
+                )
+            return self._make_fully_reduced_spatial_rdm2(
+                state_id,
+                spatial=spatial,
+                with_core=with_core,
+            )
         mps_state = _spatial_rdm_dense_mps(
             state,
             site_qn_maps=(

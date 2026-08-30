@@ -28,7 +28,7 @@ from pyqed import gwp, discretize, pauli, sigmaz
 
 
 class MPS:
-    def __init__(self, factors, homogenous=False, form=None):
+    def __init__(self, factors, homogeneous=False, form=None):
         """
         class for matrix product states.
 
@@ -51,7 +51,7 @@ class MPS:
 
         self.form = form
         
-        if homogenous:
+        if homogeneous:
             self.dims = [mps[0].shape[1], ] * self.nsites
         else:
             self.dims = [t.shape[1] for t in factors] # physical dims of each site

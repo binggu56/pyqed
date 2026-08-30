@@ -4,6 +4,7 @@ from itertools import permutations
 
 from pyqed.mps.nonabelian import (
     AutoMPO,
+    MPO,
     NonabelianTensor,
     RankCoupledChannelTerm,
     RankCoupledMPO,
@@ -950,6 +951,99 @@ def test_fully_reduced_exchange_eri_matrix_matches_exact_reduced_cg_reference():
                 assert actual == pytest.approx(expected, abs=1.0e-12)
 
 
+def test_fully_reduced_four_orbital_eri_matrix_matches_exact_csf_reference():
+    nsites = 4
+    path_specs = _reduced_spatial_path_specs(
+        nsites,
+        spatial_target_sector(4, 0),
+    )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    eri = np.zeros((nsites, nsites, nsites, nsites))
+    for (p, q, r, s), value in {
+        (0, 0, 1, 1): 0.17,
+        (0, 1, 1, 0): -0.11,
+        (0, 1, 1, 2): 0.07,
+        (0, 0, 1, 2): -0.05,
+        (0, 1, 0, 2): 0.13,
+        (0, 1, 2, 3): -0.09,
+    }.items():
+        for index in {
+            (p, q, r, s),
+            (q, p, r, s),
+            (p, q, s, r),
+            (q, p, s, r),
+            (r, s, p, q),
+            (s, r, p, q),
+            (r, s, q, p),
+            (s, r, q, p),
+        }:
+            eri[index] = value
+    autompo = AutoMPO([phys_leg] * nsites)
+    add_spatial_spinfree_eri_terms(autompo, eri, cutoff=1.0e-12)
+    mpo = [as_rank_coupled_mpo(core) for core in autompo.build()]
+    expected_operator = _dense_spatial_spinfree_eri_hamiltonian(eri)
+    actual = np.asarray(
+        [
+            [
+                _contract_chain_transition(bra_state, mpo, ket_state)
+                for ket_state in basis_states
+            ]
+            for bra_state in basis_states
+        ]
+    )
+    dense_basis = np.column_stack(dense_vectors)
+    expected = dense_basis.conj().T @ expected_operator @ dense_basis
+
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+
+def test_fully_reduced_eri_parity_strings_cross_spectator_sites():
+    nsites = 5
+    path_specs = _reduced_spatial_path_specs(
+        nsites,
+        spatial_target_sector(4, 0),
+    )
+    basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    eri = np.zeros((nsites, nsites, nsites, nsites))
+    for (p, q, r, s), value in {
+        (0, 0, 0, 4): 0.07,
+        (0, 0, 2, 4): -0.05,
+        (0, 2, 0, 4): 0.13,
+    }.items():
+        for index in {
+            (p, q, r, s),
+            (q, p, r, s),
+            (p, q, s, r),
+            (q, p, s, r),
+            (r, s, p, q),
+            (s, r, p, q),
+            (r, s, q, p),
+            (s, r, q, p),
+        }:
+            eri[index] = value
+    eri[0, 2, 0, 4] = np.nextafter(eri[0, 2, 0, 4], np.inf)
+
+    autompo = AutoMPO([phys_leg] * nsites)
+    add_spatial_spinfree_eri_terms(autompo, eri, cutoff=1.0e-12)
+    mpo = [as_rank_coupled_mpo(core) for core in autompo.build()]
+    actual = np.asarray(
+        [
+            [
+                _contract_chain_transition(bra_state, mpo, ket_state)
+                for ket_state in basis_states
+            ]
+            for bra_state in basis_states
+        ]
+    )
+    dense_basis = np.column_stack(dense_vectors)
+    expected_operator = _dense_spatial_spinfree_eri_hamiltonian(eri)
+    expected = dense_basis.conj().T @ expected_operator @ dense_basis
+
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+
 def test_fully_reduced_adjacent_one_body_matrix_matches_exact_reduced_cg_reference():
     nsites = 4
     path_specs = _reduced_spatial_path_specs(
@@ -959,7 +1053,14 @@ def test_fully_reduced_adjacent_one_body_matrix_matches_exact_reduced_cg_referen
     basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
     phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
 
-    for create_site, annihilate_site in ((0, 1), (1, 0)):
+    for create_site, annihilate_site in (
+        (0, 1),
+        (1, 0),
+        (1, 2),
+        (2, 1),
+        (2, 3),
+        (3, 2),
+    ):
         h1e = np.zeros((nsites, nsites))
         h1e[create_site, annihilate_site] = 1.0
         autompo = AutoMPO([phys_leg] * nsites)
@@ -975,6 +1076,35 @@ def test_fully_reduced_adjacent_one_body_matrix_matches_exact_reduced_cg_referen
                 )
                 actual = _contract_chain_transition(bra_state, mpo, ket_state)
                 assert actual == pytest.approx(expected, abs=1.0e-12)
+
+
+def test_fully_reduced_path_identity_keeps_fusion_channels_orthogonal():
+    nsites = 4
+    path_specs = _reduced_spatial_path_specs(
+        nsites,
+        spatial_target_sector(4, 0),
+    )
+    basis_states, _dense_vectors = _reduced_spatial_path_basis(path_specs)
+    phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
+    identity = MPO(
+        blocks={
+            (sector, sector): np.ones((1, 1, 1, 1))
+            for sector in phys_leg.sectors
+        },
+        phys_out_leg=phys_leg,
+        phys_in_leg=phys_leg,
+    )
+    gram = np.asarray(
+        [
+            [
+                _contract_chain_transition(bra, (identity,) * nsites, ket)
+                for ket in basis_states
+            ]
+            for bra in basis_states
+        ]
+    )
+
+    np.testing.assert_allclose(gram, np.eye(len(basis_states)), atol=1.0e-12)
 
 
 def test_fully_reduced_one_body_embedded_matrix_matches_exact_reduced_cg_reference():

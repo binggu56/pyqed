@@ -2,7 +2,7 @@ import numpy as np
 from scipy.linalg import expm
 
 from pyqed.mps import MPS
-from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.tn import MPO as TensorMPO
 from pyqed.mps.mps import symmetric_to_dense
 from pyqed.mps.tdmps import _normalize_projection_setting, TDMPS
 from pyqed.mps.decompose import decompose, tt_to_tensor
@@ -1362,6 +1362,11 @@ class TDDMRG(DMRG):
             sector_kwargs = dict(self._tdvp_sector_settings())
             if not sector_kwargs:
                 projection = None
+
+        hamiltonian = self._get_td_hamiltonian(mo_coeff=mo_coeff)
+        integrator_key = str(integrator).lower().replace("_", "-")
+        if integrator_key in {"taylor", "mpo", "mpo-taylor"}:
+            hamiltonian = _dense_mpo_for_taylor(hamiltonian)
 
         hamiltonian = self._get_td_hamiltonian(mo_coeff=mo_coeff)
         integrator_key = str(integrator).lower().replace("_", "-")

@@ -41,8 +41,9 @@ from functools import lru_cache
 
 from .active_space import CAS_OPTION_DEFAULTS, pop_active_space_options, prepare_active_space
 from .rdm import make_rdm1_from_narg, make_rdm2_from_narg
+from pyqed.lattice import Site
 from pyqed.narg.hamiltonian import normalize_orbital_blocks
-from ..core import Block, NARGBase, Step
+from ..core import Block, NARGBase
 
 try:
     from numba import njit
@@ -50,9 +51,9 @@ except Exception:  # pragma: no cover - optional accelerator
     njit = None
 
 try:
-    from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
+    from pyqed.symmetry import Irrep, Leg, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
 except Exception:  # pragma: no cover - optional bridge
-    Irrep = IrrepSite = IrrepTensor = OpIrrep = ProductSymmetry = U1Symmetry = None
+    Irrep = Leg = IrrepTensor = OpIrrep = ProductSymmetry = U1Symmetry = None
 
 try:
     from . import abelian_cython as _abelian_cython
@@ -449,11 +450,11 @@ def qn_array(qns):
 
 
 def irrep_tensor_available():
-    return all(x is not None for x in (Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry))
+    return all(x is not None for x in (Irrep, Leg, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry))
 
 
-def irrep_site_from_qn(basis_qn):
-    """Build an IrrepSite from existing Abelian (Ne, 2Sz) labels."""
+def leg_from_qn(basis_qn):
+    """Build an Leg from existing Abelian (Ne, 2Sz) labels."""
     if not irrep_tensor_available():
         raise ImportError("irrep_tensor module is not available.")
     basis_qn = qn_array(basis_qn)
@@ -465,7 +466,7 @@ def irrep_site_from_qn(basis_qn):
         idx = np.flatnonzero(np.all(basis_qn == np.asarray(qn), axis=1))
         sector_indices[irrep] = idx
         dims[irrep] = len(idx)
-    return IrrepSite(symmetry, dims), sector_indices
+    return Leg(dims, symmetry=symmetry), sector_indices
 
 
 def op_charge_add(left, right):
@@ -485,8 +486,8 @@ def labeled_irrep_tensor(matrix, bra_qn, ket_qn=None, op=(0, 0), *, atol=0.0):
     ket_qn = bra_qn if ket_qn is None else qn_array(ket_qn)
     if matrix.shape != (len(bra_qn), len(ket_qn)):
         raise ValueError(f"matrix shape {matrix.shape} does not match labels {(len(bra_qn), len(ket_qn))}")
-    bra_site, bra_idx = irrep_site_from_qn(bra_qn)
-    ket_site, ket_idx = irrep_site_from_qn(ket_qn)
+    bra_site, bra_idx = leg_from_qn(bra_qn)
+    ket_site, ket_idx = leg_from_qn(ket_qn)
     op = OpIrrep(tuple(np.asarray(op, dtype=int).reshape(-1).tolist()))
     blocks = {}
     for bra_irrep, rows in bra_idx.items():
@@ -503,8 +504,8 @@ def labeled_dense(tensor, bra_qn, ket_qn=None):
     """Expand an IrrepTensor back to the original labeled basis order."""
     bra_qn = qn_array(bra_qn)
     ket_qn = bra_qn if ket_qn is None else qn_array(ket_qn)
-    _, bra_idx = irrep_site_from_qn(bra_qn)
-    _, ket_idx = irrep_site_from_qn(ket_qn)
+    _, bra_idx = leg_from_qn(bra_qn)
+    _, ket_idx = leg_from_qn(ket_qn)
     dense = np.zeros((len(bra_qn), len(ket_qn)), dtype=tensor.dtype)
     for bra_irrep, rows in bra_idx.items():
         for ket_irrep, cols in ket_idx.items():
@@ -517,7 +518,7 @@ def labeled_dense(tensor, bra_qn, ket_qn=None):
 def matmul_tensors(left, right, *, atol=1e-14):
     """Block-multiply Abelian IrrepTensors, adding their charge shifts."""
     if left.ket != right.bra:
-        raise ValueError("inner IrrepSite mismatch")
+        raise ValueError("inner Leg mismatch")
     op = OpIrrep(op_charge_add(left.op.charge, right.op.charge))
     blocks = {}
     for (bra, mid), left_block in left.blocks.items():
@@ -628,8 +629,8 @@ def product_irrep_tensor_from_block(block_tensor, B, block_qn, local_shift=None,
     block_qn = qn_array(block_qn)
     local_qn = LOCAL_QN[:B.shape[0]]
     source_qn = branch_qn(block_qn, local_qn)
-    source_site, source_idx = irrep_site_from_qn(source_qn)
-    _, block_idx = irrep_site_from_qn(block_qn)
+    source_site, source_idx = leg_from_qn(source_qn)
+    _, block_idx = leg_from_qn(block_qn)
     local_shift = tuple(np.zeros(LOCAL_QN.shape[1], dtype=int)) if local_shift is None else local_shift
     op = OpIrrep(op_charge_add(block_tensor.op.charge, local_shift))
     source_dim = len(source_qn)
@@ -757,7 +758,7 @@ def dense_triple_residuals(irrep_residuals, qn):
 
 def extend_irrep_operator_table(table, patterns, U, block_qn, output_qn, new_site, required=None):
     """Project composite operators as Abelian IrrepTensors when adding one orbital."""
-    old_site, _ = irrep_site_from_qn(block_qn)
+    old_site, _ = leg_from_qn(block_qn)
     Iblock = IrrepTensor.identity(old_site)
     Isite = np.eye(4)
     local = {
@@ -818,7 +819,7 @@ def abelian_block_from_dense(h, qn, table=None, residuals=None, spins=None, *, a
 
 def scalar_irrep_tensor_from_labeled_matrix(H, basis_qn):
     """Wrap a scalar matrix over labeled basis states as an IrrepTensor."""
-    site, sector_indices = irrep_site_from_qn(basis_qn)
+    site, sector_indices = leg_from_qn(basis_qn)
     blocks = {}
     for irrep, idx in sector_indices.items():
         block = H[np.ix_(idx, idx)]
@@ -837,7 +838,7 @@ def irrep_scalar_diagonalize(H, basis_qn, nroots, allowed_qn=None):
 def diagonalize_scalar_irrep_tensor(tensor, basis_qn, nroots, allowed_qn=None, allow_empty=False):
     """Diagonalize an existing scalar Abelian IrrepTensor without rebuilding dense blocks."""
     basis_qn = qn_array(basis_qn)
-    site, sector_indices = irrep_site_from_qn(basis_qn)
+    site, sector_indices = leg_from_qn(basis_qn)
     scalar = tuple(0 for _ in basis_qn[0])
     if tuple(tensor.op.charge) != scalar:
         raise ValueError(f"expected scalar tensor charge {scalar}, got {tensor.op.charge}")
@@ -1837,11 +1838,11 @@ def feasible_multi_branch_qns(target_qn, block_nsites, total_sites, local_qn, nl
 
 
 def charge_diagonalize(H, basis_qn, nroots, allowed_qn=None, allow_empty=False):
-    """Diagonalize H by Abelian (Ne, 2Sz) IrrepSite sectors."""
+    """Diagonalize H by Abelian (Ne, 2Sz) Leg sectors."""
     basis_qn = qn_array(basis_qn)
     allowed = None if allowed_qn is None else {qn_key(q) for q in allowed_qn}
     dim = len(basis_qn)
-    site, sector_indices = irrep_site_from_qn(basis_qn)
+    site, sector_indices = leg_from_qn(basis_qn)
     roots = []
 
     for irrep in site.irreps:
@@ -1960,7 +1961,7 @@ def branch_diagonalize_block_sparse(
     """Diagonalize a branch Hamiltonian by assembling only requested charge blocks."""
     basis_qn = qn_array(basis_qn)
     allowed = None if allowed_qn is None else {qn_key(q) for q in allowed_qn}
-    site, sector_indices = irrep_site_from_qn(basis_qn)
+    site, sector_indices = leg_from_qn(basis_qn)
     blocks = []
     for irrep in site.irreps:
         q = qn_key(irrep.charge)
@@ -3945,8 +3946,8 @@ def project_weighted_new_site_terms(
 
 def project_weighted_new_site_terms_irrep(table, U, block_qn, new_site, terms, output_qn, shift):
     """Project weighted new-site residual terms as Abelian IrrepTensors."""
-    old_site, _ = irrep_site_from_qn(block_qn)
-    output_site, _ = irrep_site_from_qn(output_qn)
+    old_site, _ = leg_from_qn(block_qn)
+    output_site, _ = leg_from_qn(output_qn)
     Iblock = IrrepTensor.identity(old_site)
     grouped = {}
 
@@ -4109,7 +4110,7 @@ def extend_triple_residuals_irrep(
     residuals, table, U, block_qn, new_site, total_sites, triple_terms, output_qn
 ):
     """Update future-site triple residuals using IrrepTensor operators."""
-    output_site, _ = irrep_site_from_qn(output_qn)
+    output_site, _ = leg_from_qn(output_qn)
     new_residuals = {}
     shift_u = pattern_qn_shift(('Cdu', 'Cdu', 'Cu'))
     shift_d = pattern_qn_shift(('Cdd', 'Cdu', 'Cu'))
@@ -5263,7 +5264,7 @@ def kernel(
                 growth_sites=growth_sites,
                 two_site_dim=two_site_intermediate_dim,
                 two_site_max_dim=two_site_max_dim,
-                site_dim=d,
+                sites=Site(d),
                 two_site_mode=two_site_mode,
             )
             self.table = table
@@ -5275,12 +5276,12 @@ def kernel(
             self.spins = spins
             self.table_nsites = int(table_nsites)
 
-        def before_site(self, block, site):
-            if self.table_nsites >= site.idx:
+        def before_site(self, block, site, index):
+            if self.table_nsites >= index:
                 return block
-            if self.table_nsites != site.idx - 1:
+            if self.table_nsites != index - 1:
                 raise RuntimeError(
-                    f"operator table contains {self.table_nsites} sites, cannot prepare site {site.idx}."
+                    f"operator table contains {self.table_nsites} sites, cannot prepare site {index}."
                 )
             (
                 self.table,
@@ -5297,16 +5298,21 @@ def kernel(
                 self.irrep_residuals,
                 self.spins,
                 block.tensor,
-                site.idx - 1,
+                index - 1,
                 block.qn,
             )
-            self.table_nsites = site.idx
+            self.table_nsites = index
             return block
 
-        def choose_growth_sites(self, block, site, remaining_sites):
+        def choose_growth_sites(self, block, site, index, remaining_sites):
             if self.growth_sites != "auto" or remaining_sites < 2:
-                return super().choose_growth_sites(block, site, remaining_sites)
-            gap = abs(orbital_energy[site.idx + 1] - orbital_energy[site.idx])
+                return super().choose_growth_sites(
+                    block,
+                    site,
+                    index,
+                    remaining_sites,
+                )
+            gap = abs(orbital_energy[index + 1] - orbital_energy[index])
             if gap > two_site_energy_tol:
                 return 1
             if self.two_site_max_dim is not None:
@@ -5315,9 +5321,9 @@ def kernel(
                     return 1
             return 2
 
-        def grow_one(self, block, site, keep):
-            maybe_print(verbose, '\n--- adding the {}th orbital ---'.format(site.idx + 1))
-            maybe_print(verbose, 'p = ', site.idx)
+        def grow_one(self, block, site, index, keep):
+            maybe_print(verbose, '\n--- adding the {}th orbital ---'.format(index + 1))
+            maybe_print(verbose, 'p = ', index)
             (
                 h_new,
                 h_new_irrep,
@@ -5334,7 +5340,7 @@ def kernel(
                 self.irrep_table,
                 self.residuals,
                 self.irrep_residuals,
-                site.idx,
+                index,
                 keep,
             )
             self.h_irrep = h_new_irrep
@@ -5343,13 +5349,13 @@ def kernel(
                     self.residuals,
                     self.table,
                     projector,
-                    site.idx,
+                    index,
                     L,
                     triple_terms,
                 )
                 required_entries = (
                     required_operator_entries(
-                        pair_terms, triple_terms, L, site.idx + 1
+                        pair_terms, triple_terms, L, index + 1
                     )
                     if sparse_operator_table
                     else None
@@ -5358,7 +5364,7 @@ def kernel(
                     self.table,
                     OPERATOR_PATTERNS,
                     projector,
-                    site.idx,
+                    index,
                     qn,
                     required=required_entries,
                     sparse_output=use_sparse_operator_projection,
@@ -5367,7 +5373,7 @@ def kernel(
                 self.irrep_table = None
                 self.residuals = next_residuals
                 self.irrep_residuals = None
-                self.table_nsites = site.idx + 1
+                self.table_nsites = index + 1
             meta = {}
             if cc_diagnostics is not None:
                 meta["dressing"] = dressing_key
@@ -5386,10 +5392,16 @@ def kernel(
                 meta=meta,
             )
 
-        def grow_two(self, block, first, second, keep):
+        def grow_two(self, block, first, second, index, keep):
             if use_irrep_operator_table:
                 raise NotImplementedError("qchem two-site growth does not yet support use_irrep_operator_table.")
-            maybe_print(verbose, '\n--- adding orbitals {} and {} together ---'.format(first.idx + 1, second.idx + 1))
+            maybe_print(
+                verbose,
+                '\n--- adding orbitals {} and {} together ---'.format(
+                    index + 1,
+                    index + 2,
+                ),
+            )
             if self.two_site_mode == "rolling":
                 (
                     h_new,
@@ -5406,7 +5418,7 @@ def kernel(
                     block.qn,
                     self.table,
                     self.residuals,
-                    first.idx,
+                    index,
                     keep,
                 )
                 plan = None
@@ -5416,7 +5428,7 @@ def kernel(
                     block.qn,
                     self.table,
                     self.residuals,
-                    first.idx,
+                    index,
                     keep,
                 )
                 projector = None
@@ -5424,18 +5436,18 @@ def kernel(
                 cc_diagnostics = None
                 plan = RotationPlan(tensor3, qn)
             required_entries = (
-                required_operator_entries(pair_terms, triple_terms, L, second.idx + 1)
+                required_operator_entries(pair_terms, triple_terms, L, index + 2)
                 if sparse_operator_table
                 else None
             )
             if need_spin:
-                required_entries = add_initial_spin_entries(required_entries, second.idx + 1)
+                required_entries = add_initial_spin_entries(required_entries, index + 2)
             if self.two_site_mode == "rolling":
                 next_residuals = extend_triple_residuals_two_site_projector(
                     self.residuals,
                     self.table,
                     projector,
-                    first.idx,
+                    index,
                     L,
                     triple_terms,
                 )
@@ -5443,7 +5455,7 @@ def kernel(
                     self.table,
                     OPERATOR_PATTERNS,
                     projector,
-                    first.idx,
+                    index,
                     qn,
                     required=required_entries,
                     sparse_output=use_sparse_operator_projection,
@@ -5453,7 +5465,7 @@ def kernel(
                     self.table,
                     OPERATOR_PATTERNS,
                     tensor3,
-                    first.idx,
+                    index,
                     qn,
                     use_irrep_blocks,
                     plan,
@@ -5467,8 +5479,8 @@ def kernel(
             else:
                 self.residuals = build_triple_residuals_from_table(
                     self.table,
-                    second.idx + 1,
-                    range(second.idx + 1, L),
+                    index + 2,
+                    range(index + 2, L),
                     triple_terms,
                 )
             self.irrep_residuals = None
@@ -5476,7 +5488,7 @@ def kernel(
                 if self.two_site_mode == "rolling":
                     raise NotImplementedError("rolling two-site qchem NARG does not yet support spin observables.")
                 self.spins = extend_spin_operators_two_site(self.spins, tensor3)
-            self.table_nsites = second.idx + 1
+            self.table_nsites = index + 2
             meta = {
                 "local_qn": local_qn.copy(),
                 "local_dim": d if self.two_site_mode == "rolling" else d * d,
@@ -5490,12 +5502,12 @@ def kernel(
             if cc_diagnostics is not None:
                 meta["dressing"] = dressing_key
                 meta["cc_diagnostics"] = dict(cc_diagnostics)
-            return Step(
-                site=first,
-                block=Block(h=h_new, qn=qn, tensor=tensor),
+            return Block(
+                h=h_new,
+                qn=qn,
                 tensor=tensor,
-                qn=branch_qn,
-                meta=meta,
+                branch_qn=branch_qn,
+                data=meta,
             )
 
     Htot_irrep = labeled_irrep_tensor(Htot, htot_qn, op=(0, 0)) if use_irrep_operator_table else None
@@ -5503,11 +5515,10 @@ def kernel(
         op_table, irrep_op_table, op_table_qn, Htot_irrep, triple_residuals, irrep_triple_residuals, spin_ops, nstart
     )
     block = Block(h=Htot, qn=htot_qn, tensor=U)
-    for step in growth.grow_range(block, p + 1, L - 1):
-        block = step.block
-        narg_tensors.append(step.tensor)
-        tensor_qns.append(step.meta)
-        p = step.site.idx + step.meta["growth_sites"] - 1
+    for block in growth.grow_range(block, p + 1, L - 1):
+        narg_tensors.append(block.factor)
+        tensor_qns.append(block.data)
+        p = block.data["index"] + block.data["growth_sites"] - 1
 
     Htot = block.h
     htot_qn = block.qn

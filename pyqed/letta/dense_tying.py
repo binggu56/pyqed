@@ -78,14 +78,14 @@ class DenseTiedLETTA:
 
         self.rng = np.random.default_rng(seed)
         self._configs = np.asarray(list(np.ndindex(*self.dims)), dtype=np.intp)
-        self.physical_sites = tuple(
+        self.physical_groups = tuple(
             (site,) + parents for site, parents in enumerate(self.parent_sets)
         )
         bonds = self._bond_dims()
         shapes = tuple(
             (bonds[site], bonds[site + 1])
             + tuple(self.dims[index] for index in physical_sites)
-            for site, physical_sites in enumerate(self.physical_sites)
+            for site, physical_sites in enumerate(self.physical_groups)
         )
         parameter_dtype = np.result_type(self.hamiltonian.dtype, np.float64)
         if tensors is None:
@@ -112,7 +112,7 @@ class DenseTiedLETTA:
                 tuple(self._configs[:, index] for index in physical_sites),
                 tuple(self.dims[index] for index in physical_sites),
             ).astype(np.int32, copy=False)
-            for physical_sites in self.physical_sites
+            for physical_sites in self.physical_groups
         )
         self.history: list[dict] = []
         self.energy: float | None = None

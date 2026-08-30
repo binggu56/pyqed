@@ -32,6 +32,12 @@ def is_positive_def(a):
 
 
 _LAZY_ATTRS = {
+    "PEPS": ("pyqed.peps", "PEPS"),
+    "PEPSOptimizer": ("pyqed.peps", "PEPSOptimizer"),
+    "PEPSEvolution": ("pyqed.peps", "PEPSEvolution"),
+    "U1PEPS": ("pyqed.peps", "U1PEPS"),
+    "BoundaryMPSContractor": ("pyqed.peps", "BoundaryMPSContractor"),
+    "CTMRGContractor": ("pyqed.peps", "CTMRGContractor"),
     "view": ("pyqed.visualization", "view"),
     "MoleculeView": ("pyqed.visualization", "MoleculeView"),
     "ScalarField3D": ("pyqed.visualization", "ScalarField3D"),

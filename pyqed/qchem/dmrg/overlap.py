@@ -108,11 +108,11 @@ def _get_spin_chain_term_robust(op_str_list, orbital_indices, spin, factor):
 
 
 def _dmrg_states(solver):
-    if not hasattr(solver, "dmrg") or solver.dmrg.ground_state is None:
+    if not hasattr(solver, "dmrg") or solver.dmrg.state is None:
         raise ValueError("Run DMRG first to generate a state.")
     if hasattr(solver.dmrg, "states") and solver.dmrg.states is not None:
         return list(solver.dmrg.states)
-    return [solver.dmrg.ground_state]
+    return [solver.dmrg.state]
 
 
 def _normalize_state_ids(state_ids, nstates):
@@ -298,7 +298,7 @@ def _build_orbital_generator_mpo(kappa_spatial, cutoff=1e-12):
         return _identity_mpo(2 * ncas)
     basis_sites = [BasisSimpleElectron(i) for i in range(2 * ncas)]
     model = Model(basis=basis_sites, ham_terms=terms)
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
     return MPO([w.transpose(0, 3, 1, 2) for w in mpo.matrices])
 
 
@@ -311,7 +311,7 @@ def _single_spin_shear_mpo(nsites, src, dst, alpha):
     term = _get_spin_chain_term_robust([r"a^\dagger", "a"], [src // 2, dst // 2], spin, alpha)
     basis_sites = [BasisSimpleElectron(i) for i in range(nsites)]
     model = Model(basis=basis_sites, ham_terms=[term])
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
     return _identity_mpo(nsites, dtype=np.result_type(alpha, complex)) + MPO(
         [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
     )

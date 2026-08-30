@@ -52,8 +52,6 @@ _COMPONENT_BASIS_CACHE_MAX_SIZE = 128
 _COMPONENT_BASIS_CACHE_MAX_NUMERIC_ELEMENTS = 1_000_000
 _COMPONENT_BASIS_CACHE_TOTAL_NUMERIC_ELEMENTS = 2_000_000
 _COMPONENT_BASIS_CACHE = {}
-_METRIC_ENTRY_KERNEL_SIGNATURE_CACHE_MAX_SIZE = 256
-_METRIC_ENTRY_KERNEL_SIGNATURE_CACHE = {}
 _METRIC_BLOCK_TRANSFORM_CACHE_MAX_SIZE = 256
 _METRIC_BLOCK_TRANSFORM_CACHE_MAX_ELEMENTS = 1_000_000
 _METRIC_BLOCK_TRANSFORM_CACHE_TOTAL_ELEMENTS = 2_000_000
@@ -815,13 +813,35 @@ class TwoSiteEffectiveH:
     name: str | None = None
 
 
-def pack_two_site_state(two_site, *, layout=None):
+def pack_two_site_state(two_site, *, layout=None, channel_resolved=None):
     """
     Pack a rank-4 non-Abelian two-site tensor into a dense vector.
+
+    ``channel_resolved=False`` explicitly selects the ordinary four-sector
+    layout. This is required for component-expanded or dense operators, whose
+    local action has no reduced intermediate-channel index.
     """
     if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
         raise ValueError("pack_two_site_state expects a rank-4 NonabelianTensor.")
 
+    if layout is None:
+        metadata = two_site.metadata or {}
+        fully_reduced = (
+            metadata.get("physical_basis") == "fully_reduced_su2"
+            or metadata.get("left_metadata", {}).get("physical_basis")
+            == "fully_reduced_su2"
+            or metadata.get("right_metadata", {}).get("physical_basis")
+            == "fully_reduced_su2"
+        )
+        if (
+            channel_resolved is not False
+            and fully_reduced
+            and metadata.get("contracted_channel_blocks_current", False)
+            and metadata.get("contracted_channel_blocks")
+        ):
+            basis = TwoSiteBasis.from_channel_tensor(two_site)
+            vector, _ = _pack_tensor_state(two_site, layout=basis)
+            return vector, basis
     return _pack_tensor_state(two_site, layout=layout)
 
 
@@ -838,6 +858,8 @@ def two_site_state_basis(two_site, *, layout=None):
         raise ValueError("two_site_state_basis expects a rank-4 NonabelianTensor.")
     if layout is None:
         _, layout = pack_two_site_state(two_site)
+    if isinstance(layout, TwoSiteBasis):
+        return layout
     return TwoSiteBasis.from_tensor_and_layout(two_site, _layout_entries(layout))
 
 
@@ -2101,6 +2123,8 @@ def _solve_packed_generalized_davidson(
     )
     vec_packed = _canonicalize_eigenvector(vec_packed, reference=guess_packed)
     residual_norm = float(np.linalg.norm((AVp @ coeff) - theta * (BVp @ coeff)))
+    if residual_norm <= tol_res:
+        converged = True
     if profile:
         timing["davidson"] = time.perf_counter() - total_t0
     info = {
@@ -5755,24 +5779,6 @@ def _entry_kernel_content_signature(entry_kernel_items):
 
     if entry_kernel_items is None:
         return None
-    fast_key = []
-    for in_idx, out_idx, kernel in entry_kernel_items:
-        arr = np.asarray(kernel)
-        fast_key.append(
-            (
-                int(in_idx),
-                int(out_idx),
-                id(kernel),
-                str(arr.dtype),
-                tuple(int(dim) for dim in arr.shape),
-                int(arr.size),
-            )
-        )
-    fast_key = tuple(fast_key)
-    cached = _METRIC_ENTRY_KERNEL_SIGNATURE_CACHE.get(fast_key)
-    if cached is not None:
-        return cached
-
     signature = []
     for in_idx, out_idx, kernel in entry_kernel_items:
         arr = np.ascontiguousarray(np.asarray(kernel))
@@ -5789,13 +5795,7 @@ def _entry_kernel_content_signature(entry_kernel_items):
                 digest.hexdigest(),
             )
         )
-    signature = tuple(signature)
-    if len(_METRIC_ENTRY_KERNEL_SIGNATURE_CACHE) >= _METRIC_ENTRY_KERNEL_SIGNATURE_CACHE_MAX_SIZE:
-        _METRIC_ENTRY_KERNEL_SIGNATURE_CACHE.pop(
-            next(iter(_METRIC_ENTRY_KERNEL_SIGNATURE_CACHE))
-        )
-    _METRIC_ENTRY_KERNEL_SIGNATURE_CACHE[fast_key] = signature
-    return signature
+    return tuple(signature)
 
 
 def _component_basis_cache_key(norm_op, basis, metric_entry_kernels, *, tol):

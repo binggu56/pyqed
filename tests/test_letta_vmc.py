@@ -1,13 +1,45 @@
 import numpy as np
 
-from pyqed.letta import FrontierTiedLETTA, LocalHamiltonian, LocalTerm
+from pyqed.letta import FrontierTiedLETTA, VMC
+from pyqed.tn import LocalHamiltonian, LocalTerm
 from pyqed.letta.vmc import (
-    LETTAVMC,
     LETTAWavefunction,
+    MetropolisSampler,
     MetropolisDiagnostics,
     SRProposal,
     VMCSamples,
 )
+
+
+def test_charge_pair_proposal_preserves_two_u1_charges_and_changes_composition():
+    charges = ((0, 0), (1, 1), (1, -1), (2, 0))
+    wavefunction = LETTAWavefunction(
+        (
+            np.ones((1, 1, 4)),
+            np.ones((1, 1, 4)),
+        ),
+        ((0,), (1,)),
+    )
+    sampler = MetropolisSampler(
+        wavefunction,
+        seed=4,
+        initial_configuration=(3, 0),
+        proposal="charge_pair",
+        exchange_pairs=((0, 1),),
+        site_charges=(charges, charges),
+    )
+    seen = set()
+    for _ in range(20):
+        sampler.step(pair=(0, 1))
+        configuration = tuple(int(value) for value in sampler.cache.configuration)
+        seen.add(configuration)
+        total = tuple(
+            charges[configuration[0]][component]
+            + charges[configuration[1]][component]
+            for component in range(2)
+        )
+        assert total == (2, 0)
+    assert seen & {(1, 2), (2, 1)}
 
 
 def _complex_frontier_state(seed=4):
@@ -41,7 +73,8 @@ def _complex_frontier_state(seed=4):
 
 def test_vmc_amplitudes_and_local_energies_match_exact_state():
     state, hamiltonian = _complex_frontier_state()
-    vmc = LETTAVMC(state, hamiltonian, seed=12)
+    vmc = VMC(state, seed=12)
+    assert vmc.hamiltonian is state.hamiltonian is hamiltonian
     configurations = np.asarray(list(np.ndindex(*hamiltonian.dims)), dtype=np.intp)
     vector = state.state_vector()
 
@@ -93,7 +126,7 @@ def test_product_cache_updates_every_tensor_affected_by_a_tied_spin():
 
 def test_complex_log_derivative_matches_finite_difference():
     state, hamiltonian = _complex_frontier_state(seed=3)
-    vmc = LETTAVMC(state, hamiltonian, seed=7)
+    vmc = VMC(state, seed=7)
     configuration = np.array([1, 0, 1])
     amplitude = vmc.amplitude(configuration)
     derivative = vmc.log_derivative(configuration)
@@ -121,10 +154,10 @@ def test_complex_log_derivative_matches_finite_difference():
 def test_integer_input_tensors_are_promoted_for_log_derivatives():
     tensor = np.array([[[2, 1]]], dtype=np.int64)
     hamiltonian = LocalHamiltonian((2,), ())
-    vmc = LETTAVMC(
+    vmc = VMC.from_tensors(
         (tensor,),
         hamiltonian,
-        physical_sites=((0,),),
+        graph=(),
         initial_configuration=np.array([0]),
     )
 
@@ -138,8 +171,8 @@ def test_metropolis_sampling_is_reproducible_and_reports_diagnostics():
         seed=31,
         initial_configuration=np.array([0, 0, 0]),
     )
-    first = LETTAVMC(state, hamiltonian, **kwargs)
-    second = LETTAVMC(state, hamiltonian, **kwargs)
+    first = VMC(state, **kwargs)
+    second = VMC(state, **kwargs)
     samples_a = first.sample(
         40, burn_in=7, sweeps_between=2, include_log_derivatives=True
     )
@@ -168,10 +201,10 @@ def test_exchange_proposals_sample_a_fixed_magnetization_sector():
     hamiltonian = LocalHamiltonian((2, 2), ())
     initial = np.array([0, 1])
 
-    single = LETTAVMC(
+    single = VMC.from_tensors(
         tensors,
         hamiltonian,
-        physical_sites=((0,), (1,)),
+        graph=(),
         seed=5,
         initial_configuration=initial,
     )
@@ -180,10 +213,10 @@ def test_exchange_proposals_sample_a_fixed_magnetization_sector():
     assert single_samples.diagnostics.zero_amplitude_rejections == 10
     np.testing.assert_array_equal(single_samples.configurations, np.tile(initial, (4, 1)))
 
-    exchange = LETTAVMC(
+    exchange = VMC.from_tensors(
         tensors,
         hamiltonian,
-        physical_sites=((0,), (1,)),
+        graph=(),
         seed=5,
         initial_configuration=initial,
         proposal="exchange",
@@ -199,16 +232,58 @@ def test_exchange_proposals_sample_a_fixed_magnetization_sector():
     assert np.all(np.sum(exchange_samples.configurations, axis=1) == 1)
 
 
+def test_heat_bath_exchange_samples_the_exact_two_state_conditional():
+    tensors = (
+        np.array([[[1.0, 0.0], [0.0, 1.0]]]),
+        np.array([[[0.0, 1.0]], [[2.0, 0.0]]]),
+    )
+    hamiltonian = LocalHamiltonian((2, 2), ())
+    vmc = VMC.from_tensors(
+        tensors,
+        hamiltonian,
+        graph=(),
+        seed=21,
+        initial_configuration=np.array([0, 1]),
+        proposal="heat_bath",
+    )
+
+    samples = vmc.sample(4000, burn_in=20, sweeps_between=1)
+    probability_10 = np.mean(np.all(samples.configurations == (1, 0), axis=1))
+
+    np.testing.assert_allclose(probability_10, 0.8, atol=0.025)
+    assert np.all(np.sum(samples.configurations, axis=1) == 1)
+    assert samples.diagnostics.exchange_attempts == samples.diagnostics.attempts
+    assert 0.2 < samples.diagnostics.exchange_acceptance_rate < 0.45
+
+
+def test_heat_bath_candidates_follow_hamiltonian_support():
+    tensors = tuple(np.ones((1, 1, 2)) for _ in range(3))
+    hamiltonian = LocalHamiltonian(
+        (2, 2, 2),
+        (LocalTerm((0, 2), np.eye(4)),),
+    )
+
+    vmc = VMC.from_tensors(
+        tensors,
+        hamiltonian,
+        graph=(),
+        initial_configuration=np.array([0, 1, 1]),
+        proposal="heat_bath",
+    )
+
+    assert vmc.sampler.exchange_pairs == ((0, 2),)
+
+
 def test_mixed_proposal_reports_each_move_type_and_validates_controls():
     tensors = (
         np.ones((1, 1, 2)),
         np.ones((1, 1, 2)),
     )
     hamiltonian = LocalHamiltonian((2, 2), ())
-    vmc = LETTAVMC(
+    vmc = VMC.from_tensors(
         tensors,
         hamiltonian,
-        physical_sites=((0,), (1,)),
+        graph=(),
         seed=13,
         proposal="mixed",
         exchange_probability=0.4,
@@ -223,17 +298,17 @@ def test_mixed_proposal_reports_each_move_type_and_validates_controls():
     assert diagnostics.exchange_attempts > 0
 
     with np.testing.assert_raises_regex(ValueError, "proposal"):
-        LETTAVMC(
+        VMC.from_tensors(
             tensors,
             hamiltonian,
-            physical_sites=((0,), (1,)),
+            graph=(),
             proposal="bad",
         )
     with np.testing.assert_raises_regex(ValueError, "exchange_probability"):
-        LETTAVMC(
+        VMC.from_tensors(
             tensors,
             hamiltonian,
-            physical_sites=((0,), (1,)),
+            graph=(),
             proposal="mixed",
             exchange_probability=1.1,
         )
@@ -261,7 +336,7 @@ def test_energy_estimate_reports_autocorrelation_effective_sample_size():
         log_derivatives=None,
         diagnostics=diagnostics,
     )
-    estimate = LETTAVMC.estimate_from_samples(samples)
+    estimate = VMC.estimate_from_samples(samples)
 
     np.testing.assert_allclose(estimate.real_variance, np.var(values))
     np.testing.assert_allclose(
@@ -273,14 +348,56 @@ def test_energy_estimate_reports_autocorrelation_effective_sample_size():
     assert estimate.autocorrelation_standard_error > estimate.standard_error
 
 
+def test_sparse_sr_matches_dense_sr_with_fewer_stored_derivative_elements():
+    state, hamiltonian = _complex_frontier_state(seed=18)
+    vmc = VMC(state, seed=22)
+    samples = vmc.sample(
+        80,
+        burn_in=10,
+        sweeps_between=1,
+        include_log_derivatives=True,
+    )
+    options = dict(
+        diagonal_shift=1.0e-2,
+        diagonal_floor=1.0e-9,
+        tolerance=1.0e-10,
+        max_iterations=300,
+    )
+
+    dense = vmc.sr_direction(samples, derivative_backend="dense", **options)
+    sparse = vmc.sr_direction(
+        samples,
+        derivative_backend="sparse",
+        derivative_batch_size=13,
+        **options,
+    )
+
+    np.testing.assert_allclose(sparse.force, dense.force, rtol=2.0e-12, atol=2.0e-12)
+    np.testing.assert_allclose(
+        sparse.metric_diagonal,
+        dense.metric_diagonal,
+        rtol=2.0e-12,
+        atol=2.0e-12,
+    )
+    np.testing.assert_allclose(
+        sparse.direction,
+        dense.direction,
+        rtol=2.0e-8,
+        atol=2.0e-9,
+    )
+    assert sparse.derivative_backend == "sparse"
+    assert dense.derivative_backend == "dense"
+    assert sparse.stored_derivative_elements < dense.stored_derivative_elements
+
+
 def test_regularized_matrix_free_sr_proposal_lowers_one_spin_energy():
     sx = np.array([[0.0, 1.0], [1.0, 0.0]])
     hamiltonian = LocalHamiltonian((2,), (LocalTerm((0,), -sx),))
     tensor = np.array([[[0.82 + 0.03j, 0.57 - 0.02j]]])
-    vmc = LETTAVMC(
+    vmc = VMC.from_tensors(
         (tensor,),
         hamiltonian,
-        physical_sites=((0,),),
+        graph=(),
         seed=17,
         initial_configuration=np.array([0]),
     )
@@ -314,7 +431,7 @@ def test_regularized_matrix_free_sr_proposal_lowers_one_spin_energy():
 def test_vmc_parameters_sync_explicitly_to_source_state():
     state, hamiltonian = _complex_frontier_state(seed=14)
     original = [tensor.copy() for tensor in state.tensors]
-    vmc = LETTAVMC(state, hamiltonian, seed=9)
+    vmc = VMC(state, seed=9)
     parameters = vmc.wavefunction.parameter_vector()
     parameters[0] += 0.125 - 0.03j
     vmc.wavefunction.set_parameter_vector(parameters)
@@ -330,11 +447,13 @@ def test_vmc_parameters_sync_explicitly_to_source_state():
     assert not state.converged
     assert state.history == []
 
-    detached = LETTAVMC(
+    detached = VMC.from_tensors(
         tuple(original),
         hamiltonian,
-        physical_sites=state.physical_sites,
+        graph=((2, 0), (2, 1)),
         seed=9,
     )
+    assert detached.graph == ((0, 2), (1, 2))
+    assert detached.physical_groups == state.physical_groups
     with np.testing.assert_raises_regex(ValueError, "no source state"):
         detached.sync_to_state()

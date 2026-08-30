@@ -18,7 +18,7 @@ import time
 import numpy as np
 from scipy.linalg import eigh
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, spin_label
+from pyqed.symmetry import Irrep, Leg, IrrepTensor, OpIrrep, spin_label
 from pyqed import SpinHalfFermionOperators
 from .su2_core import (
     Multiplet,
@@ -205,7 +205,7 @@ class ThreeSiteSU2NARG:
 
     source_block: TruncatedSU2NARG
     branch_states: list[BranchMultiplet]
-    site: IrrepSite
+    leg: Leg
     bases: dict[Irrep, np.ndarray]
     provenance: dict[Irrep, list[BranchMultiplet]]
     hamiltonian: IrrepTensor
@@ -340,9 +340,9 @@ def scalar_product_angular_cache(block: RenormalizedSU2Block) -> dict:
     return cache
 
 
-def branch_irrep_site(
+def branch_leg(
     states: list[BranchMultiplet], m2: int | None = None
-) -> tuple[IrrepSite, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
+) -> tuple[Leg, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
     """Build SU(2) sector bases from grown branch multiplets."""
     sectors: dict[Irrep, list[np.ndarray]] = {}
     provenance: dict[Irrep, list[BranchMultiplet]] = {}
@@ -357,7 +357,7 @@ def branch_irrep_site(
 
     dims = {irrep: len(cols) for irrep, cols in sectors.items()}
     bases = {irrep: np.column_stack(cols) for irrep, cols in sectors.items()}
-    return IrrepSite(su2_product_symmetry(), dims), bases, provenance
+    return Leg(dims, symmetry=su2_product_symmetry()), bases, provenance
 
 
 def expanded_component_states(block: TruncatedSU2NARG) -> list[ComponentState]:
@@ -793,7 +793,7 @@ def scalar_product_angular_terms(
 
     grouped = product_states_for_block(block)
     dims = {irrep: len(states) for irrep, states in grouped.items()}
-    site = IrrepSite(su2_product_symmetry(), dims)
+    site = Leg(dims, symmetry=su2_product_symmetry())
     block_dnelec, block_rank2 = block_op.charge
     local_dnelec, local_rank2 = local_op.charge
     terms_by_irrep = {}
@@ -1588,7 +1588,10 @@ def product_tensor_angular_terms(
         return cached
 
     grouped = product_states_for_block(block)
-    site = IrrepSite(su2_product_symmetry(), {irrep: len(states) for irrep, states in grouped.items()})
+    site = Leg(
+        {irrep: len(states) for irrep, states in grouped.items()},
+        symmetry=su2_product_symmetry(),
+    )
     block_dnelec, block_rank2 = block_op.charge
     local_dnelec, local_rank2 = local_op.charge
     dnelec = block_dnelec + local_dnelec
@@ -1774,14 +1777,14 @@ def rotate_reduced_tensor_to_truncated(
     backend = resolve_su2_narg_backend(backend)
     block_specs = []
     for (bra_irrep, ket_irrep), old_block in tensor.blocks.items():
-        if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
+        if bra_irrep not in truncated.leg.dims or ket_irrep not in truncated.leg.dims:
             continue
         if (
-            truncated.source.site.sector_dim(bra_irrep) == 0
-            or truncated.source.site.sector_dim(ket_irrep) == 0
+            truncated.source.leg.sector_dim(bra_irrep) == 0
+            or truncated.source.leg.sector_dim(ket_irrep) == 0
         ):
             continue
-        if not truncated.site.symmetry.allows(
+        if not truncated.leg.symmetry.allows(
             bra_irrep.charge,
             tensor.op.charge,
             ket_irrep.charge,
@@ -1797,7 +1800,7 @@ def rotate_reduced_tensor_to_truncated(
     for (bra_irrep, ket_irrep), new_block in backend.rotate_operator_blocks(block_specs):
         if np.any(np.abs(new_block) > atol):
             blocks[(bra_irrep, ket_irrep)] = new_block
-    return ReducedSU2Tensor(IrrepTensor(truncated.site, truncated.site, tensor.op, blocks))
+    return ReducedSU2Tensor(IrrepTensor(truncated.leg, truncated.leg, tensor.op, blocks))
 
 
 @profile_function("rotate_reduced_tensors_to_truncated")
@@ -1820,14 +1823,14 @@ def rotate_reduced_tensors_to_truncated(
     for tensor_key, tensor in tensors.items():
         ops[tensor_key] = tensor.op
         for (bra_irrep, ket_irrep), old_block in tensor.blocks.items():
-            if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
+            if bra_irrep not in truncated.leg.dims or ket_irrep not in truncated.leg.dims:
                 continue
             if (
-                truncated.source.site.sector_dim(bra_irrep) == 0
-                or truncated.source.site.sector_dim(ket_irrep) == 0
+                truncated.source.leg.sector_dim(bra_irrep) == 0
+                or truncated.source.leg.sector_dim(ket_irrep) == 0
             ):
                 continue
-            if not truncated.site.symmetry.allows(
+            if not truncated.leg.symmetry.allows(
                 bra_irrep.charge,
                 tensor.op.charge,
                 ket_irrep.charge,
@@ -1846,7 +1849,7 @@ def rotate_reduced_tensors_to_truncated(
 
     return {
         tensor_key: ReducedSU2Tensor(
-            IrrepTensor(truncated.site, truncated.site, ops[tensor_key], blocks)
+            IrrepTensor(truncated.leg, truncated.leg, ops[tensor_key], blocks)
         )
         for tensor_key, blocks in rotated_blocks.items()
     }
@@ -1867,8 +1870,14 @@ def direct_reduced_hopping_tensor(block: RenormalizedSU2Block, h1e, site_index: 
     if out is None:
         grouped = product_states_for_block(block)
         return IrrepTensor(
-            IrrepSite(su2_product_symmetry(), {irrep: len(states) for irrep, states in grouped.items()}),
-            IrrepSite(su2_product_symmetry(), {irrep: len(states) for irrep, states in grouped.items()}),
+            Leg(
+                {irrep: len(states) for irrep, states in grouped.items()},
+                symmetry=su2_product_symmetry(),
+            ),
+            Leg(
+                {irrep: len(states) for irrep, states in grouped.items()},
+                symmetry=su2_product_symmetry(),
+            ),
             OpIrrep((0, 0)),
             {},
         )
@@ -1924,13 +1933,13 @@ def block_retained_scalar_tensor(
         if np.any(np.abs(reduced_block) > 1e-14):
             blocks[(irrep, irrep)] = reduced_block
     return ReducedSU2Tensor(
-        IrrepTensor(block.truncated.site, block.truncated.site, OpIrrep((0, 0)), blocks)
+        IrrepTensor(block.truncated.leg, block.truncated.leg, OpIrrep((0, 0)), blocks)
     )
 
 
 def block_zero_reduced_tensor(block: RenormalizedSU2Block, op_irrep: OpIrrep) -> ReducedSU2Tensor:
     """Zero reduced tensor on the retained block site."""
-    return ReducedSU2Tensor(IrrepTensor(block.truncated.site, block.truncated.site, op_irrep, {}))
+    return ReducedSU2Tensor(IrrepTensor(block.truncated.leg, block.truncated.leg, op_irrep, {}))
 
 
 def block_primitive_data(block: RenormalizedSU2Block):
@@ -2304,11 +2313,11 @@ def direct_reduced_base_tensor(
     """Direct reduced-space block Hamiltonian plus local-site Hamiltonian."""
     h_blocks = {
         irrep: block.truncated.hamiltonian.block(irrep, irrep)
-        for irrep in block.truncated.site.irreps
+        for irrep in block.truncated.leg.irreps
     }
     i_blocks = {
-        irrep: np.eye(block.truncated.site.sector_dim(irrep), dtype=complex)
-        for irrep in block.truncated.site.irreps
+        irrep: np.eye(block.truncated.leg.sector_dim(irrep), dtype=complex)
+        for irrep in block.truncated.leg.irreps
     }
     block_h_tensor = block_retained_scalar_tensor(block, h_blocks)
     block_i_tensor = block_retained_scalar_tensor(block, i_blocks)
@@ -2489,20 +2498,25 @@ def product_basis_coordinates(block_basis: np.ndarray, primitive_basis: np.ndarr
     return out
 
 
-def assembled_hamiltonian_irrep_tensor(h_component: np.ndarray, block_basis: np.ndarray, site: IrrepSite, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
+def assembled_hamiltonian_irrep_tensor(
+    h_component: np.ndarray,
+    block_basis: np.ndarray,
+    leg: Leg,
+    bases: dict[Irrep, np.ndarray],
+) -> IrrepTensor:
     """Project an assembled product-basis Hamiltonian into grown SU(2) sectors."""
     blocks = {}
     for irrep, primitive_basis in bases.items():
         product_basis = product_basis_coordinates(block_basis, primitive_basis)
         block = product_basis.conj().T @ h_component @ product_basis
         blocks[(irrep, irrep)] = 0.5 * (block + block.conj().T)
-    return IrrepTensor(site, site, OpIrrep((0, 0)), blocks)
+    return IrrepTensor(leg, leg, OpIrrep((0, 0)), blocks)
 
 
 def product_operator_irrep_tensor(
     operator_component: np.ndarray,
     block_basis: np.ndarray,
-    site: IrrepSite,
+    leg: Leg,
     bases: dict[Irrep, np.ndarray],
 ) -> IrrepTensor:
     """Project a product-basis scalar operator into grown SU(2) sectors."""
@@ -2512,13 +2526,13 @@ def product_operator_irrep_tensor(
         block = product_basis.conj().T @ operator_component @ product_basis
         if np.any(np.abs(block) > 1e-14):
             blocks[(irrep, irrep)] = block
-    return IrrepTensor(site, site, OpIrrep((0, 0)), blocks)
+    return IrrepTensor(leg, leg, OpIrrep((0, 0)), blocks)
 
 
 def validate_direct_reduced_hopping(block: RenormalizedSU2Block, h1e) -> dict[Irrep, float]:
     """Compare direct reduced tensor-product hopping with component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, _, ops = expanded_reduced_operators(block)
     nb = block_basis.shape[1]
     component = np.zeros((nb * 4, nb * 4), dtype=complex)
@@ -2534,7 +2548,7 @@ def validate_direct_reduced_hopping(block: RenormalizedSU2Block, h1e) -> dict[Ir
 def validate_direct_reduced_density(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare direct reduced density coupling with component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, _, ops = expanded_reduced_operators(block)
     nb = block_basis.shape[1]
     density = np.zeros((nb, nb), dtype=complex)
@@ -2552,7 +2566,7 @@ def validate_direct_reduced_density(block: RenormalizedSU2Block, h1e, eri) -> di
 def validate_direct_reduced_exchange(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare direct reduced exchange/spin-flip package with component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, _, ops = expanded_reduced_operators(block)
     nb = block_basis.shape[1]
     exchange_u = np.zeros((nb, nb), dtype=complex)
@@ -2578,7 +2592,7 @@ def validate_direct_reduced_exchange(block: RenormalizedSU2Block, h1e, eri) -> d
 def validate_direct_reduced_pair_transfer(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare direct reduced pair-transfer package with component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, _, ops = expanded_reduced_operators(block)
     nb = block_basis.shape[1]
     v2b = np.zeros((nb, nb), dtype=complex)
@@ -2597,7 +2611,7 @@ def validate_direct_reduced_pair_transfer(block: RenormalizedSU2Block, h1e, eri)
 def validate_direct_reduced_v1(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare direct reduced v1 spinor package with component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, _, ops = expanded_reduced_operators(block)
     nb = block_basis.shape[1]
     v1u = np.zeros((nb, nb), dtype=complex)
@@ -2621,7 +2635,7 @@ def validate_direct_reduced_v1(block: RenormalizedSU2Block, h1e, eri) -> dict[Ir
 def validate_direct_reduced_v3(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare direct reduced v3 density-assisted spinor package with components."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, _, ops = expanded_reduced_operators(block)
     nb = block_basis.shape[1]
     v3u = np.zeros((nb, nb), dtype=complex)
@@ -2639,7 +2653,7 @@ def validate_direct_reduced_v3(block: RenormalizedSU2Block, h1e, eri) -> dict[Ir
 def validate_direct_reduced_base(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare direct reduced base Hamiltonian with component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, states = expanded_component_basis(block.truncated)
     h_block = np.diag([state.energy for state in states]).astype(complex)
     component = np.kron(h_block, np.eye(4, dtype=complex)) + np.kron(
@@ -2654,7 +2668,7 @@ def validate_direct_reduced_base(block: RenormalizedSU2Block, h1e, eri) -> dict[
 def validate_direct_reduced_partial(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare partial direct reduced H3 with the same component terms."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, states, _, ops = expanded_reduced_operators(block)
     h_block = np.diag([state.energy for state in states]).astype(complex)
     nb = h_block.shape[0]
@@ -2686,7 +2700,7 @@ def validate_direct_reduced_partial(block: RenormalizedSU2Block, h1e, eri) -> di
 def validate_direct_reduced_partial_exchange(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare partial direct reduced H3 through exchange with component terms."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, states, _, ops = expanded_reduced_operators(block)
     h_block = np.diag([state.energy for state in states]).astype(complex)
     nb = h_block.shape[0]
@@ -2728,7 +2742,7 @@ def validate_direct_reduced_partial_exchange(block: RenormalizedSU2Block, h1e, e
 def validate_direct_reduced_partial_exchange_pair(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare partial direct reduced H3 through pair transfer with component terms."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, states, _, ops = expanded_reduced_operators(block)
     h_block = np.diag([state.energy for state in states]).astype(complex)
     nb = h_block.shape[0]
@@ -2775,7 +2789,7 @@ def validate_direct_reduced_partial_exchange_pair(block: RenormalizedSU2Block, h
 def validate_direct_reduced_full(block: RenormalizedSU2Block, h1e, eri) -> dict[Irrep, float]:
     """Compare full direct reduced H3 with full component assembly."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(block.truncated))
-    site, bases, _ = branch_irrep_site(branch_states)
+    site, bases, _ = branch_leg(branch_states)
     block_basis, _, h_block, ops = expanded_reduced_operators(block)
     component = assemble_component_hamiltonian_from_operators(block_basis, h_block, ops, h1e, eri)
     component_tensor = product_operator_irrep_tensor(component, block_basis, site, bases)
@@ -2786,7 +2800,7 @@ def validate_direct_reduced_full(block: RenormalizedSU2Block, h1e, eri) -> dict[
 def build_three_site_su2_narg(h1e, eri, source_block: TruncatedSU2NARG) -> ThreeSiteSU2NARG:
     """Grow a retained two-site block by one site and project H3."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(source_block))
-    site, bases, provenance = branch_irrep_site(branch_states)
+    site, bases, provenance = branch_leg(branch_states)
     model = full_jw_model(h1e, eri, nelec=3)
     hamiltonian = scalar_hamiltonian_irrep_tensor(model.H, site, bases)
     return ThreeSiteSU2NARG(source_block, branch_states, site, bases, provenance, hamiltonian)
@@ -2795,7 +2809,7 @@ def build_three_site_su2_narg(h1e, eri, source_block: TruncatedSU2NARG) -> Three
 def build_three_site_su2_narg_assembled(h1e, eri, source_block: TruncatedSU2NARG) -> ThreeSiteSU2NARG:
     """Grow by one site and assemble H3 from retained block operators."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(source_block))
-    site, bases, provenance = branch_irrep_site(branch_states)
+    site, bases, provenance = branch_leg(branch_states)
     h_component, block_basis = assemble_component_hamiltonian_for_site3(source_block, h1e, eri)
     hamiltonian = assembled_hamiltonian_irrep_tensor(h_component, block_basis, site, bases)
     return ThreeSiteSU2NARG(source_block, branch_states, site, bases, provenance, hamiltonian)
@@ -2804,7 +2818,7 @@ def build_three_site_su2_narg_assembled(h1e, eri, source_block: TruncatedSU2NARG
 def build_three_site_su2_narg_reduced(h1e, eri, source_block: RenormalizedSU2Block) -> ThreeSiteSU2NARG:
     """Grow by one site and assemble H3 from reduced SU(2) tensor operators."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(source_block.truncated))
-    site, bases, provenance = branch_irrep_site(branch_states)
+    site, bases, provenance = branch_leg(branch_states)
     h_component, block_basis = assemble_reduced_hamiltonian_for_site3(source_block, h1e, eri)
     hamiltonian = assembled_hamiltonian_irrep_tensor(h_component, block_basis, site, bases)
     return ThreeSiteSU2NARG(source_block.truncated, branch_states, site, bases, provenance, hamiltonian)
@@ -2813,7 +2827,7 @@ def build_three_site_su2_narg_reduced(h1e, eri, source_block: RenormalizedSU2Blo
 def build_three_site_su2_narg_direct_reduced(h1e, eri, source_block: RenormalizedSU2Block) -> ThreeSiteSU2NARG:
     """Grow by one site and assemble H3 directly from reduced SU(2) tensors."""
     branch_states = grow_su2_block_by_one_site(retained_multiplets(source_block.truncated))
-    site, bases, provenance = branch_irrep_site(branch_states)
+    site, bases, provenance = branch_leg(branch_states)
     hamiltonian = direct_reduced_full_hamiltonian_tensor(source_block, h1e, eri)
     return ThreeSiteSU2NARG(source_block.truncated, branch_states, site, bases, provenance, hamiltonian)
 
@@ -2855,7 +2869,7 @@ def compare_three_site_roots(h1e, eri, narg: ThreeSiteSU2NARG, nelec: int, j2: i
 def compare_two_narg_blocks(left: ThreeSiteSU2NARG, right: ThreeSiteSU2NARG) -> dict[Irrep, float]:
     """Blockwise Hamiltonian difference norms for matching grown bases."""
     errors = {}
-    for irrep in left.site.irreps:
+    for irrep in left.leg.irreps:
         lblock = left.hamiltonian.block(irrep, irrep)
         rblock = right.hamiltonian.block(irrep, irrep)
         if lblock.shape == rblock.shape and lblock.size:

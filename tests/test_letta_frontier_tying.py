@@ -4,6 +4,7 @@ import pytest
 from pyqed.letta import (
     DenseTiedLETTA,
     FrontierBondExpansion,
+    FrontierBondReduction,
     FrontierGaugeUpdate,
     FrontierNaturalGradientUpdate,
     FrontierSiteUpdate,
@@ -217,8 +218,13 @@ def test_frontier_whitened_solver_uses_an_exact_local_identity_metric():
 
     direct = initial.copy()
     whitened = initial.copy()
+    orthonormal = initial.copy()
     direct_update = direct.optimize_site(site, solver="direct")
     whitened_update = whitened.optimize_site(site, solver="whitened")
+    orthonormal_update = orthonormal.optimize_site(
+        site,
+        solver="metric_orthonormal",
+    )
 
     assert direct_update.accepted
     assert whitened_update.accepted
@@ -226,6 +232,13 @@ def test_frontier_whitened_solver_uses_an_exact_local_identity_metric():
     assert whitened_update.solver_metric_is_identity
     assert whitened_update.solver_metric_identity_error < 2.0e-11
     assert whitened_update.solver_coordinate_residual_norm < 2.0e-10
+    assert orthonormal_update.solver == "metric_orthonormal"
+    assert orthonormal_update.solver_metric_is_identity
+    np.testing.assert_allclose(
+        orthonormal_update.energy,
+        whitened_update.energy,
+        atol=2.0e-10,
+    )
     np.testing.assert_allclose(
         whitened_update.energy,
         direct_update.energy,
@@ -421,6 +434,33 @@ def test_multi_bond_zero_expansion_preserves_state_with_nonuniform_dimensions():
     assert all(update.seeded_directions == 0 for update in updates)
     assert state.bond_dims == (1, 3, 4, 2, 1)
     np.testing.assert_array_equal(state.state_vector(), vector)
+    np.testing.assert_allclose(state.energy, energy, atol=3.0e-14)
+
+    reductions = state.reduce_null_bonds()
+
+    assert [update.cut for update in reductions] == [1, 2]
+    assert state.bond_dims == (1, 2, 2, 2, 1)
+    np.testing.assert_allclose(state.state_vector(), vector, atol=3.0e-14)
+    np.testing.assert_allclose(state.energy, energy, atol=3.0e-14)
+
+
+def test_null_bond_reduction_removes_zero_expansion_without_changing_state():
+    state, _dense = _states(seed=23)
+    vector = state.state_vector()
+    energy = state.energy
+    state.expand_bond(2, 4, strategy="zero")
+
+    reductions = state.reduce_null_bonds()
+
+    assert len(reductions) == 1
+    assert isinstance(reductions[0], FrontierBondReduction)
+    assert reductions[0].cut == 2
+    assert reductions[0].old_dimension == 4
+    assert reductions[0].new_dimension == 2
+    assert reductions[0].relative_discarded_weight < 1.0e-14
+    assert reductions[0].norm_error < 2.0e-14
+    assert state.bond_dims == (1, 2, 2, 2, 1)
+    np.testing.assert_allclose(state.state_vector(), vector, atol=2.0e-14)
     np.testing.assert_allclose(state.energy, energy, atol=3.0e-14)
 
 
@@ -1313,18 +1353,164 @@ def test_frontier_sweep_can_interleave_natural_gradient_relaxation():
     assert state.history[1]["energy"] == update.energy
 
 
+def test_adaptive_natural_gradient_backs_off_rejected_steps(monkeypatch):
+    state, _dense = _states(seed=3)
+    calls = []
+
+    def rejected_step(**options):
+        calls.append(
+            (
+                len(state.history) + 1,
+                float(options["trust_radius"]),
+            )
+        )
+        energy = float(state.energy)
+        return FrontierNaturalGradientUpdate(
+            energy_before=energy,
+            energy=energy,
+            accepted=False,
+            message="rejected for controller test",
+            step_size=0.0,
+            backtracks=2,
+            gradient_norm=1.0,
+            preconditioned_norm=1.0,
+            metric_direction_norm=1.0,
+            directional_derivative=-1.0,
+            max_relative_direction=0.0,
+            metric_ranks=(1,) * len(state.dims),
+        )
+
+    monkeypatch.setattr(state, "natural_gradient_step", rejected_step)
+    state.run(
+        nsweeps=7,
+        tol=-1.0,
+        solver="direct",
+        natural_gradient_every=2,
+        natural_gradient_trust_radius=0.1,
+        natural_gradient_adaptive=True,
+        natural_gradient_max_interval=8,
+    )
+
+    assert calls == [(2, 0.1), (6, 0.05)]
+    assert state.history[1]["natural_gradient_interval"] == 4
+    assert state.history[1]["natural_gradient_next_sweep"] == 6
+    assert state.history[1]["natural_gradient_next_trust_radius"] == 0.05
+    assert state.history[5]["natural_gradient_interval"] == 8
+    assert state.history[5]["natural_gradient_next_sweep"] == 14
+    assert state.history[5]["natural_gradient_next_trust_radius"] == 0.025
+
+
+def test_fixed_natural_gradient_schedule_remains_available(monkeypatch):
+    state, _dense = _states(seed=3)
+    calls = []
+
+    def rejected_step(**options):
+        calls.append(
+            (
+                len(state.history) + 1,
+                float(options["trust_radius"]),
+            )
+        )
+        energy = float(state.energy)
+        return FrontierNaturalGradientUpdate(
+            energy_before=energy,
+            energy=energy,
+            accepted=False,
+            message="rejected for controller test",
+            step_size=0.0,
+            backtracks=2,
+            gradient_norm=1.0,
+            preconditioned_norm=1.0,
+            metric_direction_norm=1.0,
+            directional_derivative=-1.0,
+            max_relative_direction=0.0,
+            metric_ranks=(1,) * len(state.dims),
+        )
+
+    monkeypatch.setattr(state, "natural_gradient_step", rejected_step)
+    state.run(
+        nsweeps=6,
+        tol=-1.0,
+        solver="direct",
+        natural_gradient_every=2,
+        natural_gradient_trust_radius=0.1,
+        natural_gradient_adaptive=False,
+    )
+
+    assert calls == [(2, 0.1), (4, 0.1), (6, 0.1)]
+    assert state.history[1]["natural_gradient_interval"] == 2
+    assert state.history[3]["natural_gradient_interval"] == 2
+    assert state.history[5]["natural_gradient_interval"] == 2
+
+
+def test_adaptive_natural_gradient_grows_trust_for_accurate_step(monkeypatch):
+    state, _dense = _states(seed=3)
+
+    def accurate_step(**_options):
+        energy_before = float(state.energy)
+        energy = energy_before - 0.02
+        state.energy = energy
+        return FrontierNaturalGradientUpdate(
+            energy_before=energy_before,
+            energy=energy,
+            accepted=True,
+            message="accepted for controller test",
+            step_size=0.1,
+            backtracks=0,
+            gradient_norm=1.0,
+            preconditioned_norm=1.0,
+            metric_direction_norm=1.0,
+            directional_derivative=-0.2,
+            max_relative_direction=0.1,
+            metric_ranks=(1,) * len(state.dims),
+        )
+
+    monkeypatch.setattr(state, "natural_gradient_step", accurate_step)
+    state.run(
+        nsweeps=2,
+        tol=0.0,
+        solver="direct",
+        natural_gradient_every=2,
+        natural_gradient_trust_radius=0.1,
+        natural_gradient_adaptive=True,
+    )
+
+    record = state.history[1]
+    np.testing.assert_allclose(record["natural_gradient_quality_ratio"], 1.0)
+    np.testing.assert_allclose(record["natural_gradient_relative_gain"], 0.02)
+    np.testing.assert_allclose(
+        record["natural_gradient_next_trust_radius"],
+        0.125,
+    )
+    assert record["natural_gradient_interval"] == 2
+    assert record["natural_gradient_next_sweep"] == 4
+
+
 def test_frontier_sweep_can_use_frontier_canonical_gauge():
     state, _dense = _states(seed=3)
     state.run(
         nsweeps=1,
         tol=0.0,
         solver="direct",
-        frontier_canonicalization=True,
+        gauge="frontier",
     )
 
-    gauge_updates = state.history[0]["frontier_gauge"]
+    gauge_updates = state.history[0]["gauge_update"]
     assert len(gauge_updates) == len(state.dims) - 1
     assert all(update.applied for update in gauge_updates)
+
+
+def test_frontier_sweep_defaults_to_metric_orthonormal_conditional_gauge():
+    state, _dense = _states(seed=3)
+    state.run(nsweeps=1, tol=0.0)
+
+    record = state.history[0]
+    assert all(
+        update.solver == "metric_orthonormal"
+        for update in record["updates"]
+    )
+    assert len(record["gauge_update"]) == len(state.dims) - 1
+    assert all(update.applied for update in record["gauge_update"])
 
 
 def test_cached_bidirectional_frontier_sweep_energies_match_explicit_updates():
@@ -1411,6 +1597,60 @@ def test_frontier_sweep_does_not_claim_convergence_after_solver_failures(
 
     assert not state.converged
     assert state.history[0]["solver_failures"] == len(state.dims)
+
+
+def test_one_site_convergence_requires_complete_directional_cycle(monkeypatch):
+    one_direction, _dense = _states(seed=32)
+    complete_cycle = one_direction.copy()
+    reverse_then_forward = one_direction.copy()
+
+    def stationary_update(state):
+        def update(site, **kwargs):
+            energy = float(kwargs["energy_before"])
+            return FrontierSiteUpdate(
+                site=site,
+                raw_dim=state.tensors[site].size,
+                metric_rank=state.tensors[site].size,
+                metric_rank_is_projected=False,
+                solver="direct",
+                solver_converged=True,
+                message="stationary test update",
+                energy_before=energy,
+                energy=energy,
+                accepted=True,
+                residual_norm=0.0,
+                hamiltonian_matvecs=0,
+                metric_matvecs=0,
+                iterations=0,
+            )
+
+        return update
+
+    monkeypatch.setattr(one_direction, "optimize_site", stationary_update(one_direction))
+    monkeypatch.setattr(complete_cycle, "optimize_site", stationary_update(complete_cycle))
+    monkeypatch.setattr(
+        reverse_then_forward,
+        "optimize_site",
+        stationary_update(reverse_then_forward),
+    )
+    one_direction.run(nsweeps=1, tol=1.0e-12, gauge=None)
+    complete_cycle.run(nsweeps=2, tol=1.0e-12, gauge=None)
+    reverse_then_forward.run(
+        nsweeps=2,
+        sweep_offset=1,
+        tol=1.0e-12,
+        gauge=None,
+    )
+
+    assert not one_direction.converged
+    assert complete_cycle.converged
+    assert not reverse_then_forward.converged
+    assert not any(row["cycle_complete"] for row in reverse_then_forward.history)
+    assert [row["cycle_complete"] for row in complete_cycle.history] == [
+        False,
+        True,
+    ]
+    assert complete_cycle.history[-1]["cycle_stationary"]
 
 
 def test_identity_block_backend_matches_compressed_backend_and_uses_less_memory():

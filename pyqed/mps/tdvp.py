@@ -1576,6 +1576,20 @@ def _apply_block_site_heff(theta, left, W, right):
     return _apply_block_site_heff_python(theta, left, W, right)
 
 
+def _apply_block_two_site_heff(theta, left, W_left, W_right, right):
+    """Apply a two-site effective Hamiltonian to native Abelian blocks."""
+
+    tmp = abelian_tensor_data_tensordot(left, theta, ([2], [0]))
+    tmp = abelian_tensor_data_tensordot(tmp, W_left, ([0, 3], [0, 3]))
+    tmp = abelian_tensor_data_tensordot(tmp, W_right, ([3, 2], [0, 3]))
+    tmp = abelian_tensor_data_tensordot(tmp, right, ([3, 1], [0, 2]))
+    return abelian_transpose_tensor_data(
+        tmp,
+        (0, 3, 1, 2),
+        carrier=AbelianSiteTensorData,
+    )
+
+
 def _apply_block_bond_heff(center, left, right):
     if _should_try_block_heff_cpp(center, left, right):
         if _should_try_block_heff_plan(center, left, right):
@@ -1862,6 +1876,37 @@ def _evolve_block_site(
     krylov_method="lanczos",
 ):
     apply_heff = _make_planned_block_site_heff(theta, left, W, right)
+    return _block_krylov_expm_apply(
+        theta,
+        apply_heff,
+        dt,
+        krylov_dim=krylov_dim,
+        tol=krylov_tol,
+        method=krylov_method,
+    )
+
+
+def _evolve_block_two_site(
+    theta,
+    left,
+    W_left,
+    W_right,
+    right,
+    dt,
+    *,
+    krylov_dim=12,
+    krylov_tol=1.0e-13,
+    krylov_method="lanczos",
+):
+    def apply_heff(local):
+        return _apply_block_two_site_heff(
+            local,
+            left,
+            W_left,
+            W_right,
+            right,
+        )
+
     return _block_krylov_expm_apply(
         theta,
         apply_heff,
@@ -4467,6 +4512,27 @@ class SymmetricTDVP:
         if self.projection_backend == "block-sparse":
             phys_dims, site_qn_maps, target_qn = self._block_sparse_sector_data(psi)
             block_mpo = self._block_sparse_cached_mpo(phys_dims, site_qn_maps)
+            if self.integrator == "tdvp2":
+                out, info = block_sparse_two_site_tdvp_step(
+                    psi,
+                    self.mpo,
+                    dt,
+                    local_sectors=self.local_sectors,
+                    target_sector=self.target_sector,
+                    max_bond=self.max_bond,
+                    cutoff=self.cutoff,
+                    site_qn_maps=site_qn_maps,
+                    target_qn=target_qn,
+                    block_mpo=block_mpo,
+                    krylov_dim=self.krylov_dim,
+                    krylov_tol=self.krylov_tol,
+                    krylov_method=self.krylov_method,
+                    canonicalize=canonicalize,
+                    normalize=normalize,
+                    return_info=True,
+                )
+                self._prepared = True
+                return (out, info) if return_info else out
             moving_environment = self._block_sparse_moving_environment()
             if self.integrator == "tdvp2":
                 out, info = block_sparse_two_site_tdvp_step(

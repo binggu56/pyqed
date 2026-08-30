@@ -529,6 +529,14 @@ def lowest_generalized_davidson(
     maxiter: int | None = None,
     max_subspace: int = 32,
     random_seed: int | None = 0,
+    initial_subspace=None,
+    recycle_out=None,
+    hamiltonian_actions=None,
+    metric_actions=None,
+    preconditioner=None,
+    block_size: int = 1,
+    verification_hamiltonian_action=None,
+    verification_metric_action=None,
 ):
     r"""Find the lowest finite eigenpair of ``H x = E N x`` by actions.
 
@@ -559,6 +567,30 @@ def lowest_generalized_davidson(
         Maximum Davidson basis size before a two-vector restart.
     random_seed
         Seed used only for metric-null initialization or subspace breakdown.
+    initial_subspace
+        Optional vectors recycled from a nearby solve. Their operator images
+        are recomputed for the current local problem before use.
+    recycle_out
+        Optional mutable list replaced by a compact pair of vectors suitable
+        for a subsequent solve of the same dimension.
+    hamiltonian_actions, metric_actions
+        Optional native batched actions accepting arrays of shape
+        ``(batch, size)``. These are used when a recycled subspace seeds the
+        solve; scalar actions remain the reference fallback.
+    preconditioner
+        Optional callable ``preconditioner(residual, eigenvalue)``. It should
+        approximate ``(H - eigenvalue*N)**-1 residual`` and is applied before
+        orthogonalization. The final eigenpair is always verified with fresh
+        unpreconditioned operator actions.
+    block_size
+        Number of correction directions appended together. Values above one
+        use the native batched actions and supplement the preconditioned
+        residual with deterministic orthogonal probes.
+    verification_hamiltonian_action, verification_metric_action
+        Optional full-precision actions used for the final Rayleigh quotient
+        and residual. If a reduced-precision solve does not satisfy the
+        requested tolerance, Davidson automatically refines from that vector
+        with these actions.
 
     Returns
     -------
@@ -587,6 +619,12 @@ def lowest_generalized_davidson(
     max_subspace = min(size, int(max_subspace))
     if max_subspace < min(size, 2):
         raise ValueError("max_subspace must be at least two for a nontrivial problem.")
+    block_size = int(block_size)
+    if block_size < 1:
+        raise ValueError("block_size must be positive.")
+    block_size = min(block_size, max_subspace - 1, size)
+    if preconditioner is not None and not callable(preconditioner):
+        raise TypeError("preconditioner must be callable or None.")
 
     hamiltonian_matvecs = 0
     metric_matvecs = 0
@@ -609,6 +647,24 @@ def lowest_generalized_davidson(
             name="metric_action",
         )
 
+    def apply_many(vectors, action, scalar_action, *, name, counter):
+        nonlocal hamiltonian_matvecs, metric_matvecs
+        vectors = np.asarray(vectors)
+        if action is None or vectors.shape[0] == 1:
+            return np.stack([scalar_action(vector) for vector in vectors])
+        result = np.asarray(action(vectors))
+        if result.shape != vectors.shape:
+            raise ValueError(
+                f"{name} must return an array with shape {vectors.shape}."
+            )
+        if np.any(~np.isfinite(result)):
+            raise ValueError(f"{name} returned nonfinite vectors.")
+        if counter == "hamiltonian":
+            hamiltonian_matvecs += vectors.shape[0]
+        else:
+            metric_matvecs += vectors.shape[0]
+        return result
+
     rng = np.random.default_rng(random_seed)
     basis = []
     hamiltonian_basis = []
@@ -630,6 +686,43 @@ def lowest_generalized_davidson(
         metric_basis.append(n_vector)
         return True
 
+    def append_basis_batch(vectors):
+        accepted = []
+        for vector in vectors:
+            vector = np.asarray(vector)
+            if vector.shape != (size,) or np.any(~np.isfinite(vector)):
+                continue
+            vector = _orthogonalize(
+                vector,
+                [*basis, *accepted],
+                tolerance=breakdown_tolerance,
+            )
+            if vector is not None:
+                accepted.append(vector)
+            if len(basis) + len(accepted) >= max_subspace:
+                break
+        if not accepted:
+            return 0
+        stacked = np.stack(accepted)
+        h_stacked = apply_many(
+            stacked,
+            hamiltonian_actions,
+            apply_h,
+            name="hamiltonian_actions",
+            counter="hamiltonian",
+        )
+        n_stacked = apply_many(
+            stacked,
+            metric_actions,
+            apply_n,
+            name="metric_actions",
+            counter="metric",
+        )
+        basis.extend(accepted)
+        hamiltonian_basis.extend(h_stacked)
+        metric_basis.extend(n_stacked)
+        return len(accepted)
+
     def random_probe():
         dtype = np.result_type(
             initial_vector.dtype,
@@ -641,8 +734,28 @@ def lowest_generalized_davidson(
             probe = probe + 1.0j * rng.normal(size=size)
         return probe
 
-    if not append_basis(initial_vector):
+    def precondition(vector, eigenvalue):
+        if preconditioner is None:
+            return vector
+        result = np.asarray(preconditioner(vector, eigenvalue))
+        if result.shape != (size,):
+            raise ValueError(
+                f"preconditioner must return a vector with shape {(size,)}."
+            )
+        if np.any(~np.isfinite(result)):
+            raise ValueError("preconditioner returned a nonfinite vector.")
+        return result
+
+    if _orthogonalize(
+        initial_vector,
+        (),
+        tolerance=breakdown_tolerance,
+    ) is None:
         raise ValueError("initial_vector is numerically zero.")
+    seed_vectors = [initial_vector]
+    if initial_subspace is not None:
+        seed_vectors.extend(initial_subspace)
+    append_basis_batch(seed_vectors)
 
     energy_history = []
     residual_history = []
@@ -717,7 +830,7 @@ def lowest_generalized_davidson(
             break
 
         correction = _orthogonalize(
-            current_residual,
+            precondition(current_residual, current_energy),
             basis,
             tolerance=breakdown_tolerance,
         )
@@ -743,7 +856,7 @@ def lowest_generalized_davidson(
             metric_basis = [retained_n]
             restarts += 1
             correction = _orthogonalize(
-                current_residual,
+                precondition(current_residual, current_energy),
                 basis,
                 tolerance=breakdown_tolerance,
             )
@@ -753,15 +866,42 @@ def lowest_generalized_davidson(
                     basis,
                     tolerance=breakdown_tolerance,
                 )
-        if correction is None or not append_basis(correction):
+        corrections = [] if correction is None else [correction]
+        for _probe in range(block_size - len(corrections)):
+            probe = _orthogonalize(
+                precondition(random_probe(), current_energy),
+                [*basis, *corrections],
+                tolerance=breakdown_tolerance,
+            )
+            if probe is not None:
+                corrections.append(probe)
+        if not corrections or append_basis_batch(corrections) == 0:
             message = "Davidson restart failed to produce a new direction"
             break
 
     if current_vector is None:
         raise ValueError(message)
 
-    h_final = apply_h(current_vector)
-    n_final = apply_n(current_vector)
+    verify_h = (
+        apply_h
+        if verification_hamiltonian_action is None
+        else lambda vector: _as_finite_vector(
+            verification_hamiltonian_action(vector),
+            size,
+            name="verification_hamiltonian_action",
+        )
+    )
+    verify_n = (
+        apply_n
+        if verification_metric_action is None
+        else lambda vector: _as_finite_vector(
+            verification_metric_action(vector),
+            size,
+            name="verification_metric_action",
+        )
+    )
+    h_final = verify_h(current_vector)
+    n_final = verify_n(current_vector)
     final_metric = float(np.real(np.vdot(current_vector, n_final)))
     if not np.isfinite(final_metric) or final_metric <= 0.0:
         raise ValueError("final Davidson vector has nonpositive metric norm.")
@@ -780,6 +920,29 @@ def lowest_generalized_davidson(
         np.finfo(float).tiny,
     )
     converged = residual_norm <= atol + tol * residual_scale
+    if (
+        not converged
+        and (
+            verification_hamiltonian_action is not None
+            or verification_metric_action is not None
+        )
+    ):
+        refinement_subspace = [current_residual]
+        return lowest_generalized_davidson(
+            verification_hamiltonian_action or hamiltonian_action,
+            verification_metric_action or metric_action,
+            current_vector,
+            tol=tol,
+            atol=atol,
+            metric_tol=metric_tol,
+            maxiter=maxiter,
+            max_subspace=max_subspace,
+            random_seed=random_seed,
+            initial_subspace=refinement_subspace,
+            recycle_out=recycle_out,
+            preconditioner=preconditioner,
+            block_size=block_size,
+        )
     if converged:
         message = "converged"
     elif message == "converged":
@@ -799,6 +962,20 @@ def lowest_generalized_davidson(
         energy_history=tuple(energy_history),
         residual_history=tuple(residual_history),
     )
+    if recycle_out is not None:
+        retained_direction = current_vector / np.linalg.norm(current_vector)
+        residual_direction = _orthogonalize(
+            current_residual,
+            [retained_direction],
+            tolerance=breakdown_tolerance,
+        )
+        # Retaining the converged Ritz vector is more useful than retaining
+        # only its nearly-zero residual. Operator images are deliberately
+        # recomputed for the next local environment, so this remains a safe
+        # Krylov seed rather than a stale-action cache.
+        recycle_out[:] = [np.array(retained_direction, copy=True)]
+        if residual_direction is not None:
+            recycle_out.append(np.array(residual_direction, copy=True))
     return current_energy, current_vector, diagnostics
 
 

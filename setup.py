@@ -60,6 +60,51 @@ def _cpp_include_dirs(np):
     return include_dirs
 
 
+def _mps_openmp_flags():
+    """Return optional OpenMP compile and link flags for native MPS kernels."""
+    requested = os.environ.get("PYQED_MPS_OPENMP", "auto").strip().lower()
+    if requested in {"0", "false", "no", "off"}:
+        return [], []
+    if sys.platform == "win32":
+        return ["/openmp"], []
+    if sys.platform != "darwin":
+        return ["-fopenmp"], ["-fopenmp"]
+
+    prefixes = []
+    explicit = os.environ.get("PYQED_OPENMP_PREFIX")
+    if explicit:
+        prefixes.append(Path(explicit))
+    # Apple clang should use the matching Homebrew LLVM runtime when it is
+    # available.  Conda may inject an older libomp and its RPATH ahead of
+    # extension-specific flags, which can otherwise break module import.
+    prefixes.extend((Path("/opt/homebrew/opt/libomp"), Path("/usr/local/opt/libomp")))
+    prefixes.extend(
+        Path(value)
+        for value in (sys.prefix, os.environ.get("CONDA_PREFIX"))
+        if value
+    )
+    prefixes = list(dict.fromkeys(prefixes))
+    for prefix in prefixes:
+        include = prefix / "include"
+        library = prefix / "lib"
+        dylib = library / "libomp.dylib"
+        archive = library / "libomp.a"
+        runtime = dylib if dylib.exists() else archive
+        if (include / "omp.h").exists() and runtime.exists():
+            link_args = [str(runtime)]
+            if runtime.suffix == ".dylib":
+                link_args.append("-Wl,-rpath," + str(library))
+            return (
+                ["-Xpreprocessor", "-fopenmp", "-I" + str(include)],
+                link_args,
+            )
+    if requested in {"1", "true", "yes", "on", "required"}:
+        raise RuntimeError(
+            "OpenMP was requested but libomp was not found; set PYQED_OPENMP_PREFIX"
+        )
+    return [], []
+
+
 def _optional_extensions():
     enabled = os.environ.get("PYQED_BUILD_EXTENSIONS", "0")
     if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
@@ -104,7 +149,8 @@ def _optional_extensions():
                 ["pyqed/qchem/_integrals.cpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
-                extra_compile_args=cpp_compile_args,
+                extra_compile_args=qchem_integral_compile_args,
+                extra_link_args=qchem_integral_link_args,
                 optional=True,
             )
         )
@@ -147,7 +193,7 @@ def _optional_extensions():
         extensions.append(
             Extension(
                 "pyqed.qchem._basis_cy",
-                ["pyqed/qchem/_basis_cy.c"],
+                ["pyqed/qchem/_basis_cy.pyx"],
                 include_dirs=[np.get_include()],
                 extra_compile_args=c_compile_args,
                 optional=True,
@@ -156,7 +202,7 @@ def _optional_extensions():
         extensions.append(
             Extension(
                 "pyqed.qchem._rys_cy",
-                ["pyqed/qchem/_rys_cy.c"],
+                ["pyqed/qchem/_rys_cy.pyx"],
                 include_dirs=[np.get_include()],
                 extra_compile_args=c_compile_args,
                 optional=True,
@@ -237,5 +283,5 @@ def _optional_extensions():
 # retained solely for the optional native extensions.
 setup(
     cmdclass={"build_py": _CleanBuildPy},
-    ext_modules=_optional_extensions(),
+    ext_modules=extensions,
 )

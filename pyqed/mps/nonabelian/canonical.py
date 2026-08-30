@@ -150,11 +150,14 @@ def right_canonical_error(site):
     """
     if not isinstance(site, NonabelianTensor) or site.rank != 3:
         raise ValueError("right_canonical_error expects a rank-3 NonabelianTensor site tensor.")
+    use_reduced_metric = (
+        (site.metadata or {}).get("physical_basis") == "fully_reduced_su2"
+    )
     grouped = {}
     for (q_left, _q_phys, q_right), block in site.data.items():
         arr = np.asarray(block)
         matrix = arr.reshape(arr.shape[0], -1)
-        if arr.shape[1] == 1:
+        if use_reduced_metric:
             weight = _irrep_dim(q_right) / max(_irrep_dim(q_left), 1)
         else:
             weight = 1.0

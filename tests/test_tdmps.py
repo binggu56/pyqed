@@ -9,7 +9,8 @@ from pyqed.models.heisenberg import Heisenberg
 from pyqed.models.impurity.sbm import SBM
 import pyqed.mps.tdvp as tdvp_module
 from pyqed.mps.decompose import decompose, tt_to_tensor
-from pyqed.mps.mps import MPS, MPO, _mpo_to_dense_operator
+from pyqed.mps.mps import MPS, _mpo_to_dense_operator
+from pyqed.tn import MPO
 from pyqed.mps.tdmps import TDMPS
 from pyqed.mps.tdvp import SymmetricTDVP, spatial_fermion_number_sz_sectors, two_site_tdvp_step
 
@@ -187,7 +188,7 @@ def test_affine_block_sparse_mpo_reuses_shared_tail(monkeypatch):
     w0[0, 2] = destroy
     w1[1, 0] = destroy
     w1[2, 0] = create
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
     td = TDMPS(h_mpo, D=8, interaction_mpo=h_mpo)
     site_qn_maps, _target_qn = tdvp_module._block_sparse_site_qn_maps(
         [0, 1],
@@ -721,7 +722,7 @@ def test_symmetric_tdvp_projects_dense_mps_to_target_sector():
     )
     zero_h = MPO(
         [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
-        homogenous=False,
+        homogeneous=False,
     )
     engine = SymmetricTDVP(
         zero_h,
@@ -754,7 +755,7 @@ def test_symmetric_tdvp_one_site_step_preserves_target_sector():
     ).normalize()
     zero_h = MPO(
         [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
-        homogenous=False,
+        homogeneous=False,
     )
     engine = SymmetricTDVP(
         zero_h,
@@ -786,7 +787,7 @@ def test_symmetric_tdvp_block_sparse_step_matches_exact_fixed_sector():
     w0[0, 2] = destroy
     w1[1, 0] = destroy
     w1[2, 0] = create
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
 
     vec = np.zeros((2, 2), dtype=complex)
     vec[1, 0] = 0.8
@@ -866,7 +867,7 @@ def test_block_sparse_tdvp_native_one_site_sweep_matches_python(monkeypatch):
     w0[0, 2] = destroy
     w1[1, 0] = destroy
     w1[2, 0] = create
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
 
     vec = np.zeros((2, 2), dtype=complex)
     vec[1, 0] = 0.8
@@ -1180,7 +1181,7 @@ def test_symmetric_tdvp_block_sparse_accepts_spatial_sector_tuples():
     psi = MPS(decompose(vec, rank=4), labels=["lv", "p", "rv"]).normalize()
     zero_h = MPO(
         [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
-        homogenous=False,
+        homogeneous=False,
     )
     engine = SymmetricTDVP(
         zero_h,
@@ -1211,7 +1212,7 @@ def test_symmetric_tdvp_block_sparse_reuses_native_mpo(monkeypatch):
     w0[0, 2] = destroy
     w1[1, 0] = destroy
     w1[2, 0] = create
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
 
     vec = np.zeros((2, 2), dtype=complex)
     vec[1, 0] = 1.0
@@ -1249,7 +1250,7 @@ def test_block_sparse_tdvp_reuses_global_static_mpo_cache(monkeypatch):
     w1 = np.zeros((1, 1, 2, 2), dtype=complex)
     w0[0, 0] = identity
     w1[0, 0] = identity
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
     h_mpo._pyqed_cache_key = ("test-static-mpo-cache", 2)
 
     site_qn_maps, _target_qn = tdvp_module._block_sparse_site_qn_maps(
@@ -1293,7 +1294,7 @@ def test_block_sparse_tdvp_cpp_heff_kernels_match_python():
     w0[0, 2] = destroy
     w1[1, 0] = destroy
     w1[2, 0] = create
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
 
     vec = np.zeros((2, 2), dtype=complex)
     vec[1, 0] = 0.8
@@ -1412,7 +1413,7 @@ def test_block_sparse_symmetric_tdvp_reuses_native_state_after_first_step(monkey
     w1 = np.zeros((1, 1, 2, 2), dtype=complex)
     w0[0, 0] = identity
     w1[0, 0] = identity
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
 
     vec = np.zeros((2, 2), dtype=complex)
     vec[1, 0] = 1.0
@@ -1453,7 +1454,7 @@ def test_tdmps_block_sparse_observables_do_not_densify(monkeypatch):
     w0[0, 2] = destroy
     w1[1, 0] = destroy
     w1[2, 0] = create
-    h_mpo = MPO([w0, w1], homogenous=False)
+    h_mpo = MPO([w0, w1], homogeneous=False)
 
     vec = np.zeros((2, 2), dtype=complex)
     vec[1, 0] = 0.8
@@ -1504,7 +1505,7 @@ def test_symmetric_tdvp_mpo_projector_matches_dense_reference():
     )
     zero_h = MPO(
         [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
-        homogenous=False,
+        homogeneous=False,
     )
     engine = SymmetricTDVP(
         zero_h,
@@ -1536,7 +1537,7 @@ def test_symmetric_tdvp_mpo_projector_does_not_need_dense_guard():
     psi = MPS(factors, labels=["lv", "p", "rv"])
     zero_h = MPO(
         [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
-        homogenous=False,
+        homogeneous=False,
     )
     engine = SymmetricTDVP(
         zero_h,
@@ -1557,7 +1558,7 @@ def test_symmetric_tdvp_accepts_per_site_scalar_sector_tables():
     phys_dim = 2
     zero_h = MPO(
         [np.zeros((1, 1, phys_dim, phys_dim), dtype=complex) for _ in range(nsites)],
-        homogenous=False,
+        homogeneous=False,
     )
     engine = SymmetricTDVP(
         zero_h,
@@ -1597,7 +1598,7 @@ def test_two_site_tdvp_diagonal_mpo_fast_path_matches_dense_path():
         for p in range(phys_dim):
             core[:, :, p, p] = diag[:, :, p]
         mpo_factors.append(core)
-    H = MPO(mpo_factors, homogenous=False)
+    H = MPO(mpo_factors, homogeneous=False)
 
     fast = two_site_tdvp_step(
         psi,

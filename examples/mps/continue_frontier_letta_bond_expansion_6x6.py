@@ -120,8 +120,8 @@ def continue_run(
             eig_tol=1.0e-10,
             maxiter=1600,
             max_subspace=96,
-            frontier_canonicalization=True,
-            frontier_gauge_weighting="uniform",
+            gauge="frontier",
+            gauge_weight="uniform",
             verbose=True,
         )
         pair_timings.append(float(perf_counter() - pair_start))
@@ -194,8 +194,8 @@ def continue_run(
             "source_snapshot": str(Path(source_snapshot).resolve()),
             "symmetry": "none",
             "solver": "whitened exact local S=I frame",
-            "frontier_canonicalization": True,
-            "frontier_gauge_weighting": "uniform",
+            "gauge": "frontier",
+            "gauge_weight": "uniform",
             "maximum_directional_passes": int(maximum_passes),
             "source_absolute_directional_sweeps": source_passes,
             "resume_sweep_offset_rule": "source passes + completed passes",

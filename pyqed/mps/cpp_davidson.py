@@ -42,6 +42,9 @@ AbelianTDVPBondHeffPlan = None
 AbelianTDVPTwoSiteHeffPlan = None
 AbelianEnvironmentAdvancePlan = None
 BlockTable = None
+PackedGroupedAction = None
+build_packed_advance_routes = None
+build_packed_hole_routes = None
 RenormalizedTable = None
 SparseRenormalizedTable = None
 GroupedRenormalizedTable = None
@@ -288,6 +291,9 @@ def _initialize():
     global AbelianTDVPTwoSiteHeffPlan
     global AbelianEnvironmentAdvancePlan
     global BlockTable
+    global PackedGroupedAction
+    global build_packed_advance_routes
+    global build_packed_hole_routes
     global RenormalizedTable
     global SparseRenormalizedTable
     global GroupedRenormalizedTable
@@ -489,6 +495,11 @@ def _initialize():
         None,
     )
     BlockTable = getattr(module, "BlockTable", None)
+    PackedGroupedAction = getattr(module, "PackedGroupedAction", None)
+    build_packed_advance_routes = getattr(
+        module, "build_packed_advance_routes", None
+    )
+    build_packed_hole_routes = getattr(module, "build_packed_hole_routes", None)
     RenormalizedTable = getattr(module, "RenormalizedTable", BlockTable)
     SparseRenormalizedTable = getattr(module, "SparseRenormalizedTable", None)
     GroupedRenormalizedTable = getattr(module, "GroupedRenormalizedTable", None)

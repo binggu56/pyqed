@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from pyqed.mps.mps import MPO as TensorMPO
+from pyqed.tn import MPO as TensorMPO
 
 
 @dataclass(frozen=True)

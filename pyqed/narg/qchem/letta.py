@@ -43,6 +43,31 @@ class LETTA:
     qn_info: object = None
 
     @classmethod
+    def from_integrals(
+        cls,
+        h1e,
+        eri=None,
+        *,
+        symmetry="su2",
+        **kwargs,
+    ):
+        """Build the native reduced qchem LETTA selected by ``symmetry``.
+
+        The first native path is SU(2): ties condition on invariant local
+        multiplet labels and the Hamiltonian remains a rank-coupled reduced
+        MPO throughout contraction and optimization.
+        """
+        key = str(symmetry).lower().replace("-", "").replace("_", "")
+        if key != "su2":
+            raise NotImplementedError(
+                "LETTA.from_integrals currently implements symmetry='su2'; "
+                "use FrontierLETTA with a canonical Hamiltonian for dense/U(1) work."
+            )
+        from pyqed.letta import SU2LETTA
+
+        return SU2LETTA.from_integrals(h1e, eri=eri, **kwargs)
+
+    @classmethod
     def from_narg(
         cls,
         narg,

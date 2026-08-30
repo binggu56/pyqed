@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from time import perf_counter
@@ -10,7 +11,7 @@ import numpy as np
 from scipy import linalg
 from scipy.sparse.linalg import LinearOperator, cg, lsmr
 
-from .block_mpo_frontier import BlockMPOFrontier
+from .block_mpo_frontier import BlockFrontierMessage, BlockMPOFrontier
 from .core import (
     _lowest_generalized_eigenpair,
     _lowest_hermitian_eigenpair,
@@ -98,6 +99,30 @@ class FrontierMergedSolveDiagnostics:
     hamiltonian_batch_calls: int = 0
     recycled_vectors: int = 0
     preconditioner_blocks: int = 0
+
+
+@dataclass(frozen=True)
+class FrontierMergedSolveDiagnostics:
+    """Verification record for one merged adjacent-pair eigenproblem."""
+
+    method: str
+    attempts: tuple[str, ...]
+    verified: bool
+    lowest_root_certified: bool
+    fallback_reason: str
+    dense_fallback: bool
+    metric_requested_rank: int
+    metric_numerical_rank: int
+    metric_min_positive: float
+    metric_condition: float
+    backward_residual: float
+    metric_dual_residual: float
+    metric_dual_relative_residual: float
+    null_residual: float
+    warm_energy: float
+    upper_bound_gap: float
+    metric_support: str = "regularized"
+    discarded_support_residual: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -196,6 +221,67 @@ class FrontierBondExpansion:
     norm_error: float
     energy_before: float
     energy: float
+    residual_components: int = 0
+    relative_discarded_weight: float = 0.0
+
+
+@dataclass(frozen=True)
+class FrontierBondReduction:
+    """Diagnostic record for one null-space virtual-bond reduction."""
+
+    cut: int
+    old_dimension: int
+    new_dimension: int
+    support_source: str
+    sector_dimensions: tuple[tuple[tuple[int, ...], int, int], ...]
+    relative_discarded_weight: float
+    norm_error: float
+    energy_before: float
+    energy: float
+
+
+@dataclass(frozen=True)
+class FrontierTieReduction:
+    """Diagnostic record for removing one redundant future-physical tie."""
+
+    edge: tuple[int, int]
+    relative_discarded_weight: float
+    norm_error: float
+    energy_before: float
+    energy: float
+    exact: bool
+
+
+@dataclass(frozen=True)
+class FrontierBondRefresh:
+    """Diagnostic record for one saturated AMEn expand--optimize--retract."""
+
+    cut: int
+    temporary_dimension: int
+    target_dimension: int
+    overlap_sites: tuple[int, ...]
+    conditional_ranks: tuple[int, ...]
+    relative_truncation_error: float
+    sector_dimensions: tuple[tuple[tuple[int, ...], int], ...] = ()
+    subspace_change: float = 0.0
+    accepted: bool = True
+
+
+@dataclass(frozen=True)
+class _PendingAMEnRetraction:
+    """Temporary saturated bond retained through its neighboring solve."""
+
+    cut: int
+    target_dimension: int
+    expansion_direction: str
+    source_site: int
+    mixing_scale: float
+    energy_before: float
+    left_tensor: np.ndarray
+    right_tensor: np.ndarray
+    anchor_norm: object
+    anchor_hamiltonian: object
+    occupied_basis: tuple[np.ndarray, ...]
 
 
 @dataclass(frozen=True)
@@ -247,7 +333,7 @@ class FrontierTiedLETTA:
     r"""Unrestricted graph-tied LETTA contracted by frontier messages.
 
     This class represents the same local tensors as :class:`DenseTiedLETTA`,
-    but it accepts a :class:`LocalHamiltonian` and never constructs the
+    but it accepts a :class:`Hamiltonian` and never constructs the
     many-body configuration table during initialization or optimization.
     The local-term sum is converted to an exact finite-state operator
     network.  Numerical left/right double-layer messages are cached across
@@ -281,6 +367,10 @@ class FrontierTiedLETTA:
         tensors=None,
         seed: int | None = None,
         frontier_backend="compressed",
+        chunk_size=8,
+        chunk_memory=64,
+        chunk_span=None,
+        workers=1,
         path_optimizer="greedy",
         local_backend="dense",
         local_rank: int | None = None,
@@ -353,7 +443,7 @@ class FrontierTiedLETTA:
             raise TypeError("_balance_initial_gauges must be boolean.")
         self._balance_initial_gauges = bool(_balance_initial_gauges)
         self.parent_sets = _validated_parent_sets(self.dims, parent_sets)
-        self.physical_sites = tuple(
+        self.physical_groups = tuple(
             (site,) + parents for site, parents in enumerate(self.parent_sets)
         )
         self._physical_block_connectivity_cache = {}
@@ -466,13 +556,19 @@ class FrontierTiedLETTA:
         if not isinstance(tt_hermitize, (bool, np.bool_)):
             raise TypeError("tt_hermitize must be boolean.")
         self.tt_hermitize = bool(tt_hermitize)
+        self.tt_channels = str(tt_channels).lower().replace("-", "_")
+        if self.tt_channels not in {"component", "term"}:
+            raise ValueError("tt_channels must be 'component' or 'term'.")
+        if not isinstance(tt_gauge, (bool, np.bool_)):
+            raise TypeError("tt_gauge must be boolean.")
+        self.tt_gauge = bool(tt_gauge)
         self.rng = np.random.default_rng(seed)
 
         bonds = self._bond_dims()
         shapes = tuple(
             (bonds[site], bonds[site + 1])
             + tuple(self.dims[index] for index in physical_sites)
-            for site, physical_sites in enumerate(self.physical_sites)
+            for site, physical_sites in enumerate(self.physical_groups)
         )
         parameter_dtype = np.result_type(self.hamiltonian.dtype, np.float64)
         if tensors is None:
@@ -552,7 +648,7 @@ class FrontierTiedLETTA:
             self.hamiltonian_mpo = compressed_hamiltonian_mpo
             self._hamiltonian_frontier = MPOFrontier(
                 self.dims,
-                self.physical_sites,
+                self.physical_groups,
                 shapes,
                 self.hamiltonian_mpo.tensors,
                 optimize=path_optimizer,
@@ -567,7 +663,7 @@ class FrontierTiedLETTA:
             self.hamiltonian_mpo = None
             self._hamiltonian_frontier = TermRenormalizedFrontier(
                 self.hamiltonian,
-                self.physical_sites,
+                self.physical_groups,
                 shapes,
                 optimize=path_optimizer,
                 local_backend=self.local_backend,
@@ -667,12 +763,487 @@ class FrontierTiedLETTA:
         """Virtual dimensions at every cut, including unit boundaries."""
         return self._bond_dims()
 
+    def draw(self, path=None, **kwargs):
+        """Draw the backbone, physical legs, and tied physical indices."""
+        from .drawing import draw_frontier_letta
+
+        return draw_frontier_letta(self, path=path, **kwargs)
+
+    def _copy_public_settings_to(self, result):
+        for name in (
+            "graph",
+            "ordering",
+            "inverse_ordering",
+            "original_hamiltonian",
+            "original_graph",
+            "target_charge",
+            "D",
+            "adaptive_bond",
+            "tie_backbone",
+            "_maximum_bond_dims",
+            "_null_reduced_cuts",
+        ):
+            if hasattr(self, name):
+                value = getattr(self, name)
+                setattr(
+                    result,
+                    name,
+                    value if name == "original_hamiltonian" else deepcopy(value),
+                )
+        return result
+
+    def _condition_sweep_bond(
+        self,
+        cut,
+        message,
+        *,
+        direction,
+        metric_tol,
+        max_condition,
+    ):
+        r"""Whiten the already-contracted side of one active sweep bond.
+
+        AMEn appends a residual direction using a Euclidean QR, but the next
+        LETTA local problem is measured by the graph-dependent frontier norm.
+        This applies a state-preserving, one-sided frontier gauge immediately
+        after enrichment.  It uses only the moving norm message, so it does
+        not rebuild or retain another set of environments.
+        """
+        cut = int(cut)
+        direction = str(direction).lower()
+        if direction not in {"left", "right"}:
+            raise ValueError("direction must be 'left' or 'right'.")
+        dimension = self._bond_dims()[cut]
+        conditional = np.asarray(message).reshape(dimension, dimension, -1)
+        gram = np.sum(conditional, axis=-1)
+        if direction == "left":
+            gram = gram.T
+        gram = self._hermitian_part(gram)
+        metric_tol = max(float(metric_tol), 128.0 * np.finfo(float).eps)
+        max_condition = float(max_condition)
+        gauge = np.eye(dimension, dtype=np.result_type(gram, self.tensors[cut - 1]))
+        applied = False
+        tiny = np.finfo(float).tiny
+        for indices in self._bond_gauge_blocks(cut):
+            indices = np.asarray(indices, dtype=np.intp)
+            if not indices.size:
+                continue
+            block = self._hermitian_part(gram[np.ix_(indices, indices)])
+            values, vectors = np.linalg.eigh(block)
+            scale = max(float(np.max(values, initial=0.0)), tiny)
+            if np.any(values <= metric_tol * scale):
+                # A truly null sector has no stable inverse.  Null-bond
+                # reduction handles it after both sides have been varied.
+                continue
+            floor = scale / max_condition**2
+            regularized = np.maximum(values, floor)
+            mean = max(float(np.mean(regularized)), tiny)
+            normalized = regularized / mean
+            powers = (
+                1.0 / np.sqrt(normalized)
+                if direction == "right"
+                else np.sqrt(normalized)
+            )
+            gauge[np.ix_(indices, indices)] = (
+                vectors * powers
+            ) @ vectors.conj().T
+            applied = True
+        if not applied:
+            return False
+
+        left_tensor = self.tensors[cut - 1]
+        transformed_left = np.tensordot(left_tensor, gauge, axes=(1, 0))
+        self.tensors[cut - 1] = np.real_if_close(
+            np.moveaxis(transformed_left, -1, 1)
+        )
+        right_tensor = self.tensors[cut]
+        transformed_right = np.linalg.solve(
+            gauge,
+            right_tensor.reshape(dimension, -1),
+        )
+        self.tensors[cut] = np.real_if_close(
+            transformed_right.reshape(right_tensor.shape)
+        )
+        self._apply_bond_gauge_constraints()
+        return True
+
+    @staticmethod
+    def _gram_support(matrix, *, rtol, atol):
+        matrix = FrontierTiedLETTA._hermitian_part(matrix)
+        values, vectors = np.linalg.eigh(matrix)
+        scale = max(
+            float(np.max(np.abs(values), initial=0.0)),
+            np.finfo(float).tiny,
+        )
+        threshold = max(
+            float(atol),
+            float(rtol) * scale,
+            256.0 * np.finfo(float).eps * scale,
+        )
+        active = values > threshold
+        positive = np.maximum(values, 0.0)
+        total = float(np.sum(positive))
+        discarded = (
+            float(np.sum(positive[~active]) / total)
+            if total > np.finfo(float).tiny
+            else 0.0
+        )
+        return vectors[:, active], int(np.count_nonzero(active)), discarded
+
+    def _null_bond_basis(self, cut, left, right, *, rtol, atol):
+        left_basis, left_rank, left_discarded = self._gram_support(
+            left,
+            rtol=rtol,
+            atol=atol,
+        )
+        right_basis, right_rank, right_discarded = self._gram_support(
+            right,
+            rtol=rtol,
+            atol=atol,
+        )
+        if left_rank <= right_rank:
+            return left_basis, "left", (), left_discarded, None
+        return right_basis, "right", (), right_discarded, None
+
+    def _set_reduced_bond_layouts(self, labels_by_cut):
+        if labels_by_cut:
+            raise TypeError("dense frontier bonds do not carry charge labels.")
+
+    def reduce_null_bonds(
+        self,
+        *,
+        rtol: float = 0.0,
+        atol: float = 0.0,
+    ) -> tuple[FrontierBondReduction, ...]:
+        r"""Remove numerically null virtual directions without changing the state.
+
+        With the default zero user tolerances, only directions below a
+        machine-precision floor are removed.  Positive tolerances opt into
+        approximate compression.  Exact frontier norm messages are required.
+        """
+        rtol = float(rtol)
+        atol = float(atol)
+        if not np.isfinite(rtol) or rtol < 0.0:
+            raise ValueError("rtol must be finite and nonnegative.")
+        if not np.isfinite(atol) or atol < 0.0:
+            raise ValueError("atol must be finite and nonnegative.")
+        if isinstance(self._norm_frontier, TTMPOFrontier):
+            raise NotImplementedError(
+                "null-space bond reduction requires exact dense frontier Grams."
+            )
+
+        old_dimensions = self._bond_dims()
+        left_messages = self._norm_frontier.build_left(self.tensors)
+        right_messages = self._norm_frontier.build_right(self.tensors)
+        bases = {}
+        diagnostics = {}
+        labels_by_cut = {}
+        for cut in range(1, len(self.dims)):
+            left, right = self.frontier_bond_grams(
+                cut,
+                left_messages=left_messages,
+                right_messages=right_messages,
+            )
+            (
+                basis,
+                source,
+                sector_dimensions,
+                discarded,
+                labels,
+            ) = self._null_bond_basis(
+                cut,
+                left,
+                right,
+                rtol=rtol,
+                atol=atol,
+            )
+            new_dimension = int(basis.shape[1])
+            if new_dimension < 1:
+                raise ValueError(
+                    f"bond {cut} has no occupied support; the state norm is zero."
+                )
+            if new_dimension >= old_dimensions[cut]:
+                continue
+            bases[cut] = np.asarray(basis)
+            diagnostics[cut] = (
+                source,
+                tuple(sector_dimensions),
+                float(discarded),
+            )
+            if labels is not None:
+                labels_by_cut[cut] = tuple(labels)
+
+        if not bases:
+            return ()
+
+        energy_before = self.expectation()
+        norm_before = float(np.real(self._norm_frontier.scalar(self.tensors)))
+        reduced_tensors = []
+        for site, tensor in enumerate(self.tensors):
+            left_basis = bases.get(site)
+            if left_basis is not None:
+                tensor = np.tensordot(
+                    left_basis.conj().T,
+                    tensor,
+                    axes=(1, 0),
+                )
+            right_basis = bases.get(site + 1)
+            if right_basis is not None:
+                tensor = np.tensordot(
+                    tensor,
+                    right_basis,
+                    axes=(1, 0),
+                )
+                tensor = np.moveaxis(tensor, -1, 1)
+            reduced_tensors.append(np.asarray(tensor))
+        self.tensors = reduced_tensors
+
+        dimensions = list(old_dimensions)
+        for cut, basis in bases.items():
+            dimensions[cut] = int(basis.shape[1])
+        self._virtual_bond_dims = tuple(dimensions)
+        self.bond_dim = max(self._virtual_bond_dims)
+        self._set_reduced_bond_layouts(labels_by_cut)
+        self._rebuild_frontier_engines()
+
+        norm_after = float(np.real(self._norm_frontier.scalar(self.tensors)))
+        energy_after = self.expectation()
+        norm_error = abs(norm_after - norm_before) / max(abs(norm_before), 1.0)
+        self.energy = energy_after
+        self.history = []
+        self.converged = False
+        suppressed = set(getattr(self, "_null_reduced_cuts", ()))
+        suppressed.update(bases)
+        self._null_reduced_cuts = suppressed
+        return tuple(
+            FrontierBondReduction(
+                cut=cut,
+                old_dimension=old_dimensions[cut],
+                new_dimension=int(bases[cut].shape[1]),
+                support_source=diagnostics[cut][0],
+                sector_dimensions=diagnostics[cut][1],
+                relative_discarded_weight=diagnostics[cut][2],
+                norm_error=float(norm_error),
+                energy_before=energy_before,
+                energy=energy_after,
+            )
+            for cut in sorted(bases)
+        )
+
+    def _replace_parent_sets(self, parent_sets):
+        """Install a new tie graph after tensors have been reshaped."""
+
+        self.parent_sets = _validated_parent_sets(self.dims, parent_sets)
+        self.physical_groups = tuple(
+            (site,) + parents for site, parents in enumerate(self.parent_sets)
+        )
+        self._physical_block_connectivity_cache = {}
+        if hasattr(self, "abelian_layout"):
+            self.local_masks = self.abelian_layout.local_masks(
+                self.physical_groups
+            )
+            self._apply_local_masks()
+        self._rebuild_frontier_engines()
+
+    def prune_ties(
+        self,
+        *,
+        rtol: float = 0.0,
+        atol: float = 0.0,
+        energy_tol: float | None = None,
+    ) -> tuple[FrontierTieReduction, ...]:
+        r"""Remove future-physical legs whose local dependence has rank one.
+
+        For a tie ``(i, j)``, the corresponding mode of tensor ``i`` is
+        factorized as ``u(rest) v(s_j)``.  The factor ``v`` is absorbed into
+        the owned physical leg of tensor ``j`` before the leg is removed, so
+        an exactly rank-one mode preserves the represented state. Positive
+        ``rtol``/``atol`` values opt into a rank-one approximation; every
+        accepted proposal is additionally checked by exact norm and energy
+        contractions. ``energy_tol`` is a relative allowed energy change and
+        defaults to the same tolerance as the local discarded weight.
+        """
+
+        rtol = float(rtol)
+        atol = float(atol)
+        if not np.isfinite(rtol) or rtol < 0.0:
+            raise ValueError("rtol must be finite and nonnegative.")
+        if not np.isfinite(atol) or atol < 0.0:
+            raise ValueError("atol must be finite and nonnegative.")
+        if energy_tol is None:
+            energy_tol = max(rtol, 0.0)
+        energy_tol = float(energy_tol)
+        if not np.isfinite(energy_tol) or energy_tol < 0.0:
+            raise ValueError("energy_tol must be finite and nonnegative.")
+        if not self.contraction_is_exact:
+            raise ValueError("tie pruning requires exact norm and energy contraction.")
+
+        records = []
+        machine_floor = 512.0 * np.finfo(float).eps
+        for owner in range(len(self.dims) - 1):
+            for parent in tuple(self.parent_sets[owner]):
+                group = self.physical_groups[owner]
+                axis = 2 + group.index(parent)
+                tensor = self.tensors[owner]
+                moved = np.moveaxis(tensor, axis, -1)
+                matrix = moved.reshape(-1, self.dims[parent])
+                left, singular_values, right = np.linalg.svd(
+                    matrix,
+                    full_matrices=False,
+                )
+                total = float(np.linalg.norm(singular_values))
+                discarded = float(np.linalg.norm(singular_values[1:]))
+                relative = discarded / max(total, np.finfo(float).tiny)
+                threshold = max(
+                    atol / max(total, np.finfo(float).tiny),
+                    rtol,
+                    machine_floor,
+                )
+                if relative > threshold:
+                    continue
+
+                energy_before = float(self.expectation())
+                norm_before = float(
+                    np.real(self._norm_frontier.scalar(self.tensors))
+                )
+                tensors_before = [value.copy() for value in self.tensors]
+                parents_before = self.parent_sets
+
+                reduced = (left[:, 0] * singular_values[0]).reshape(
+                    moved.shape[:-1]
+                )
+                target = self.tensors[parent]
+                factor_shape = [1] * target.ndim
+                factor_shape[2] = self.dims[parent]
+                self.tensors[owner] = reduced
+                self.tensors[parent] = target * right[0].reshape(factor_shape)
+                new_parents = list(self.parent_sets)
+                new_parents[owner] = tuple(
+                    candidate
+                    for candidate in new_parents[owner]
+                    if candidate != parent
+                )
+                try:
+                    self._replace_parent_sets(tuple(new_parents))
+                    norm_after = float(
+                        np.real(self._norm_frontier.scalar(self.tensors))
+                    )
+                    energy_after = float(self.expectation())
+                    norm_error = abs(norm_after - norm_before) / max(
+                        abs(norm_before), 1.0
+                    )
+                    allowed_energy = max(
+                        machine_floor,
+                        energy_tol,
+                    ) * max(1.0, abs(energy_before))
+                    accepted = bool(
+                        np.isfinite(energy_after)
+                        and abs(energy_after - energy_before) <= allowed_energy
+                    )
+                except Exception:
+                    accepted = False
+                    norm_error = float("inf")
+                    energy_after = energy_before
+                if not accepted:
+                    self.tensors = tensors_before
+                    self._replace_parent_sets(parents_before)
+                    continue
+
+                records.append(
+                    FrontierTieReduction(
+                        edge=(int(owner), int(parent)),
+                        relative_discarded_weight=relative,
+                        norm_error=float(norm_error),
+                        energy_before=energy_before,
+                        energy=energy_after,
+                        exact=bool(relative <= machine_floor),
+                    )
+                )
+
+        if records:
+            self.energy = float(self.expectation())
+            self.history = []
+            self.converged = False
+        return tuple(records)
+
+    def adapt_bonds(
+        self,
+        *,
+        rtol: float = 1.0e-8,
+        growth: int = 2,
+        direction="right",
+        strategy="residual",
+        scale: float = 1.0e-3,
+    ) -> tuple[FrontierBondExpansion, ...]:
+        """Grow saturated virtual cuts up to the configured public ``D`` cap."""
+        if not getattr(self, "adaptive_bond", False):
+            return ()
+        maximum = tuple(
+            getattr(self, "_maximum_bond_dims", self._bond_dims())
+        )
+        if len(maximum) != len(self.dims) + 1:
+            raise ValueError("the adaptive bond cap has the wrong number of cuts.")
+        rtol = float(rtol)
+        growth = int(growth)
+        if not np.isfinite(rtol) or rtol < 0.0:
+            raise ValueError("rtol must be finite and nonnegative.")
+        if growth < 2:
+            raise ValueError("growth must be at least two.")
+        if isinstance(self._norm_frontier, TTMPOFrontier):
+            raise NotImplementedError(
+                "adaptive bonds require exact dense frontier Grams."
+            )
+
+        suppressed = set(getattr(self, "_null_reduced_cuts", ()))
+        candidates = tuple(
+            cut
+            for cut in range(1, len(self.dims))
+            if self._bond_dims()[cut] < maximum[cut]
+            and cut not in suppressed
+        )
+        if not candidates:
+            return ()
+        left_messages = self._norm_frontier.build_left(self.tensors)
+        right_messages = self._norm_frontier.build_right(self.tensors)
+        grow = []
+        for cut in candidates:
+            current = self._bond_dims()[cut]
+            left, right = self.frontier_bond_grams(
+                cut,
+                left_messages=left_messages,
+                right_messages=right_messages,
+            )
+
+            def numerical_rank(matrix):
+                values = np.linalg.eigvalsh(self._hermitian_part(matrix))
+                scale_value = max(float(np.max(values, initial=0.0)), 1.0)
+                threshold = max(
+                    rtol * scale_value,
+                    256.0 * np.finfo(float).eps * scale_value,
+                )
+                return int(np.count_nonzero(values > threshold))
+
+            if min(numerical_rank(left), numerical_rank(right)) == current:
+                grow.append((cut, min(maximum[cut], growth * current)))
+
+        records = []
+        for cut, dimension in grow:
+            records.append(
+                self.expand_bond(
+                    cut,
+                    dimension,
+                    direction=direction,
+                    strategy=strategy,
+                    scale=scale,
+                )
+            )
+        return tuple(records)
+
     @classmethod
-    def from_dense(cls, state, hamiltonian: LocalHamiltonian, **kwargs):
+    def from_dense(cls, state, hamiltonian: Hamiltonian, **kwargs):
         """Copy tensors from a dense-projector reference state."""
         result = cls(
             hamiltonian,
-            state.dims,
             state.parent_sets,
             bond_dim=state.bond_dim,
             bond_dims=getattr(state, "bond_dims", None),
@@ -685,12 +1256,15 @@ class FrontierTiedLETTA:
     def copy(self):
         result = type(self)(
             self.hamiltonian,
-            self.dims,
             self.parent_sets,
             bond_dim=self.bond_dim,
             bond_dims=self.bond_dims,
             tensors=[tensor.copy() for tensor in self.tensors],
             frontier_backend=self.frontier_backend,
+            chunk_size=self.chunk_size,
+            chunk_memory=self.chunk_memory,
+            chunk_span=self.chunk_span,
+            workers=self.workers,
             path_optimizer=self.path_optimizer,
             local_backend=self.local_backend,
             local_rank=self.local_options["rank"],
@@ -717,7 +1291,24 @@ class FrontierTiedLETTA:
         result.converged = self.converged
         result.symmetry = deepcopy(self.symmetry)
         result.rng.bit_generator.state = deepcopy(self.rng.bit_generator.state)
-        return result
+        return self._copy_public_settings_to(result)
+
+    def close(self):
+        """Release bounded worker pools owned by this state."""
+
+        frontier = getattr(self, "_hamiltonian_frontier", None)
+        close_frontier = getattr(frontier, "close", None)
+        if close_frontier is not None:
+            close_frontier()
+        executor = getattr(self, "_solver_executor", None)
+        self._solver_executor = None
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def __del__(self):
+        executor = getattr(self, "_solver_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=False)
 
     def _rebuild_frontier_engines(self):
         """Replan contractions after a virtual-bond shape change."""
@@ -758,7 +1349,7 @@ class FrontierTiedLETTA:
         elif self.frontier_backend == "renormalized":
             self._hamiltonian_frontier = TermRenormalizedFrontier(
                 self.hamiltonian,
-                self.physical_sites,
+                self.physical_groups,
                 shapes,
                 optimize=self.path_optimizer,
                 local_backend=self.local_backend,
@@ -873,6 +1464,10 @@ class FrontierTiedLETTA:
         strategy="residual",
         scale: float = 1.0e-3,
         seed=None,
+        _directions=None,
+        _source_norm=None,
+        _evaluate=True,
+        _reset_history=True,
     ) -> FrontierBondExpansion:
         r"""Open ansatz-preserving variational directions at one chain cut.
 
@@ -898,14 +1493,31 @@ class FrontierTiedLETTA:
         if direction not in {"left", "right"}:
             raise ValueError("direction must be 'left' or 'right'.")
         strategy = str(strategy).lower().replace("-", "_")
-        if strategy not in {"residual", "random", "zero"}:
-            raise ValueError("strategy must be 'residual', 'random', or 'zero'.")
+        if strategy not in {"residual", "random", "zero", "amen", "amen_raw"}:
+            raise ValueError(
+                "strategy must be 'residual', 'random', 'zero', 'amen', "
+                "or 'amen_raw'."
+            )
+        if strategy in {"amen", "amen_raw"} and _directions is None:
+            raise ValueError(
+                f"strategy='{strategy}' requires streamed residual directions."
+            )
         scale = float(scale)
         if not np.isfinite(scale) or scale < 0.0:
             raise ValueError("scale must be finite and nonnegative.")
 
-        energy_before = self.expectation()
-        norm_before = float(np.real(self._norm_frontier.scalar(self.tensors)))
+        _evaluate = bool(_evaluate)
+        _reset_history = bool(_reset_history)
+        energy_before = (
+            self.expectation()
+            if _evaluate or self.energy is None
+            else float(self.energy)
+        )
+        norm_before = (
+            float(np.real(self._norm_frontier.scalar(self.tensors)))
+            if _evaluate
+            else None
+        )
         if new_dimension == old_dimension:
             return FrontierBondExpansion(
                 cut=cut,
@@ -932,7 +1544,26 @@ class FrontierTiedLETTA:
             inverse_axes = np.argsort(axes)
             old_ordered = left_tensor.transpose(axes)
             old_matrix = old_ordered.reshape(-1, old_dimension)
-            if strategy == "residual":
+            if _directions is not None:
+                directions = np.asarray(
+                    _directions,
+                    dtype=np.result_type(left_tensor.dtype, _directions),
+                )
+                if (
+                    directions.ndim != 2
+                    or directions.shape[0] != old_matrix.shape[0]
+                    or directions.shape[1] > added
+                ):
+                    raise ValueError(
+                        "right-going enrichment directions have an invalid shape."
+                    )
+                directions = self._prepare_amen_directions(
+                    cut,
+                    direction,
+                    directions,
+                )
+                source_matrix = directions
+            elif strategy == "residual":
                 environment = self.site_environment(left_site)
                 source_tensor = (
                     self.hamiltonian_action(
@@ -956,40 +1587,77 @@ class FrontierTiedLETTA:
                 )
             else:
                 source_matrix = np.zeros_like(old_matrix)
-            source_norm = float(np.linalg.norm(source_matrix))
-            directions = (
-                np.zeros((old_matrix.shape[0], 0), dtype=left_tensor.dtype)
-                if strategy == "zero" or scale == 0.0
-                else self._orthogonal_enrichment(
-                    old_matrix,
-                    source_matrix,
-                    added,
-                    rng=rng,
-                )
+            source_norm = (
+                float(_source_norm)
+                if _source_norm is not None
+                else float(np.linalg.norm(source_matrix))
             )
+            if _directions is None:
+                directions = (
+                    np.zeros((old_matrix.shape[0], 0), dtype=left_tensor.dtype)
+                    if strategy == "zero" or scale == 0.0
+                    else self._orthogonal_enrichment(
+                        old_matrix,
+                        source_matrix,
+                        added,
+                        rng=rng,
+                    )
+                )
             amplitude = scale * max(
                 float(np.linalg.norm(old_matrix)) / np.sqrt(old_dimension),
                 np.finfo(float).tiny,
             )
             ordered_shape = old_ordered.shape[:-1] + (new_dimension,)
-            expanded_ordered = np.zeros(
-                ordered_shape,
-                dtype=np.result_type(left_tensor.dtype, directions.dtype),
-            )
-            expanded_matrix = expanded_ordered.reshape(-1, new_dimension)
-            expanded_matrix[:, :old_dimension] = old_matrix
-            expanded_matrix[:, old_dimension : old_dimension + directions.shape[1]] = (
-                amplitude * directions
-            )
-            expanded_left = expanded_ordered.transpose(inverse_axes)
-            expanded_right = np.zeros(
-                (new_dimension,) + right_tensor.shape[1:],
-                dtype=right_tensor.dtype,
-            )
-            expanded_right[:old_dimension] = right_tensor
+            if strategy == "amen":
+                augmented = np.concatenate(
+                    (old_matrix, amplitude * directions),
+                    axis=1,
+                )
+                expanded_matrix, center = np.linalg.qr(augmented, mode="reduced")
+                expanded_ordered = expanded_matrix.reshape(ordered_shape)
+                expanded_left = expanded_ordered.transpose(inverse_axes)
+                right_matrix = right_tensor.reshape(old_dimension, -1)
+                expanded_right = (
+                    center[:, :old_dimension] @ right_matrix
+                ).reshape((new_dimension,) + right_tensor.shape[1:])
+            else:
+                expanded_ordered = np.zeros(
+                    ordered_shape,
+                    dtype=np.result_type(left_tensor.dtype, directions.dtype),
+                )
+                expanded_matrix = expanded_ordered.reshape(-1, new_dimension)
+                expanded_matrix[:, :old_dimension] = old_matrix
+                expanded_matrix[
+                    :, old_dimension : old_dimension + directions.shape[1]
+                ] = amplitude * directions
+                expanded_left = expanded_ordered.transpose(inverse_axes)
+                expanded_right = np.zeros(
+                    (new_dimension,) + right_tensor.shape[1:],
+                    dtype=right_tensor.dtype,
+                )
+                expanded_right[:old_dimension] = right_tensor
         else:
             old_matrix = right_tensor.reshape(old_dimension, -1)
-            if strategy == "residual":
+            if _directions is not None:
+                directions = np.asarray(
+                    _directions,
+                    dtype=np.result_type(right_tensor.dtype, _directions),
+                )
+                if (
+                    directions.ndim != 2
+                    or directions.shape[1] != old_matrix.shape[1]
+                    or directions.shape[0] > added
+                ):
+                    raise ValueError(
+                        "left-going enrichment directions have an invalid shape."
+                    )
+                directions = self._prepare_amen_directions(
+                    cut,
+                    direction,
+                    directions,
+                )
+                source_matrix = directions
+            elif strategy == "residual":
                 environment = self.site_environment(right_site)
                 source_matrix = (
                     self.hamiltonian_action(
@@ -1012,34 +1680,57 @@ class FrontierTiedLETTA:
                 )
             else:
                 source_matrix = np.zeros_like(old_matrix)
-            source_norm = float(np.linalg.norm(source_matrix))
-            directions = (
-                np.zeros((0, old_matrix.shape[1]), dtype=right_tensor.dtype)
-                if strategy == "zero" or scale == 0.0
-                else self._orthogonal_enrichment(
-                    old_matrix.T,
-                    source_matrix.T,
-                    added,
-                    rng=rng,
-                ).T
+            source_norm = (
+                float(_source_norm)
+                if _source_norm is not None
+                else float(np.linalg.norm(source_matrix))
             )
+            if _directions is None:
+                directions = (
+                    np.zeros((0, old_matrix.shape[1]), dtype=right_tensor.dtype)
+                    if strategy == "zero" or scale == 0.0
+                    else self._orthogonal_enrichment(
+                        old_matrix.T,
+                        source_matrix.T,
+                        added,
+                        rng=rng,
+                    ).T
+                )
             amplitude = scale * max(
                 float(np.linalg.norm(old_matrix)) / np.sqrt(old_dimension),
                 np.finfo(float).tiny,
             )
-            expanded_right = np.zeros(
-                (new_dimension,) + right_tensor.shape[1:],
-                dtype=np.result_type(right_tensor.dtype, directions.dtype),
-            )
-            expanded_right[:old_dimension] = right_tensor
-            expanded_right.reshape(new_dimension, -1)[
-                old_dimension : old_dimension + directions.shape[0]
-            ] = amplitude * directions
-            expanded_left = np.zeros(
-                (left_tensor.shape[0], new_dimension) + left_tensor.shape[2:],
-                dtype=left_tensor.dtype,
-            )
-            expanded_left[:, :old_dimension] = left_tensor
+            if strategy == "amen":
+                augmented = np.concatenate(
+                    (old_matrix, amplitude * directions),
+                    axis=0,
+                )
+                right_basis, center = np.linalg.qr(augmented.T, mode="reduced")
+                expanded_right = right_basis.T.reshape(
+                    (new_dimension,) + right_tensor.shape[1:]
+                )
+                axes = (0, *range(2, left_tensor.ndim), 1)
+                inverse_axes = np.argsort(axes)
+                left_ordered = left_tensor.transpose(axes)
+                left_matrix = left_ordered.reshape(-1, old_dimension)
+                expanded_left_ordered = (
+                    left_matrix @ center.T[:old_dimension]
+                ).reshape(left_ordered.shape[:-1] + (new_dimension,))
+                expanded_left = expanded_left_ordered.transpose(inverse_axes)
+            else:
+                expanded_right = np.zeros(
+                    (new_dimension,) + right_tensor.shape[1:],
+                    dtype=np.result_type(right_tensor.dtype, directions.dtype),
+                )
+                expanded_right[:old_dimension] = right_tensor
+                expanded_right.reshape(new_dimension, -1)[
+                    old_dimension : old_dimension + directions.shape[0]
+                ] = amplitude * directions
+                expanded_left = np.zeros(
+                    (left_tensor.shape[0], new_dimension) + left_tensor.shape[2:],
+                    dtype=left_tensor.dtype,
+                )
+                expanded_left[:, :old_dimension] = left_tensor
 
         self.tensors[left_site] = expanded_left
         self.tensors[right_site] = expanded_right
@@ -1048,12 +1739,20 @@ class FrontierTiedLETTA:
         self._virtual_bond_dims = tuple(dimensions)
         self.bond_dim = max(self._virtual_bond_dims)
         self._rebuild_frontier_engines()
-        norm_after = float(np.real(self._norm_frontier.scalar(self.tensors)))
-        energy_after = self.expectation()
-        norm_error = abs(norm_after - norm_before) / max(abs(norm_before), 1.0)
+        if _evaluate:
+            norm_after = float(np.real(self._norm_frontier.scalar(self.tensors)))
+            energy_after = self.expectation()
+            norm_error = abs(norm_after - norm_before) / max(abs(norm_before), 1.0)
+        else:
+            energy_after = energy_before
+            norm_error = 0.0
         self.energy = energy_after
-        self.history = []
+        if _reset_history:
+            self.history = []
         self.converged = False
+        suppressed = set(getattr(self, "_null_reduced_cuts", ()))
+        suppressed.discard(cut)
+        self._null_reduced_cuts = suppressed
         return FrontierBondExpansion(
             cut=cut,
             old_dimension=old_dimension,
@@ -1818,8 +2517,8 @@ class FrontierTiedLETTA:
         if site < 0 or site + 1 >= len(self.dims):
             raise ValueError("site must be the left member of an adjacent pair.")
         following = site + 1
-        left_sites = self.physical_sites[site]
-        right_sites = self.physical_sites[following]
+        left_sites = self.physical_groups[site]
+        right_sites = self.physical_groups[following]
         union_sites = (site,) + tuple(
             sorted((set(left_sites) | set(right_sites)) - {site})
         )
@@ -1846,7 +2545,42 @@ class FrontierTiedLETTA:
             merged[(slice(None), slice(None), *configuration)] = left @ right
         return merged, union_sites
 
-    def _split_merged_pair_tensor(self, site, merged, union_sites):
+    def _merged_block_tensor(self, start, stop):
+        """Contract a contiguous block while retaining each physical label once."""
+        plan = self._block_plan(start, stop)
+        merged = np.empty(
+            plan.merged_shape,
+            dtype=np.result_type(
+                *(self.tensors[site].dtype for site in plan.sites)
+            ),
+        )
+        physical_shape = tuple(
+            self.dims[index] for index in plan.union_sites
+        )
+        for configuration in np.ndindex(*physical_shape):
+            values = dict(zip(plan.union_sites, configuration))
+            product = None
+            for site in plan.sites:
+                tensor = self.tensors[site][
+                    (
+                        slice(None),
+                        slice(None),
+                        *(values[index] for index in self.physical_groups[site]),
+                    )
+                ]
+                product = tensor if product is None else product @ tensor
+            merged[(slice(None), slice(None), *configuration)] = product
+        return merged, plan.union_sites
+
+    def _split_merged_pair_tensor(
+        self,
+        site,
+        merged,
+        union_sites,
+        *,
+        middle_dimension=None,
+        middle_labels=None,
+    ):
         r"""Conditionally SVD a merged pair back into its graph-leg pattern.
 
         If the two local tensors share tied physical labels, the split is one
@@ -1856,8 +2590,8 @@ class FrontierTiedLETTA:
         """
         site = int(site)
         following = site + 1
-        left_sites = self.physical_sites[site]
-        right_sites = self.physical_sites[following]
+        left_sites = self.physical_groups[site]
+        right_sites = self.physical_groups[following]
         union_sites = tuple(int(index) for index in union_sites)
         expected_union = (site,) + tuple(
             sorted((set(left_sites) | set(right_sites)) - {site})
@@ -1881,9 +2615,23 @@ class FrontierTiedLETTA:
         right_shape = tuple(self.dims[index] for index in right_only)
         left_dimension = merged.shape[0]
         right_dimension = merged.shape[1]
-        middle_dimension = self._bond_dims()[following]
-        left_result = np.zeros_like(self.tensors[site], dtype=merged.dtype)
-        right_result = np.zeros_like(self.tensors[following], dtype=merged.dtype)
+        if middle_labels is not None:
+            raise TypeError("dense frontier bonds do not carry charge labels.")
+        middle_dimension = (
+            self._bond_dims()[following]
+            if middle_dimension is None
+            else int(middle_dimension)
+        )
+        if middle_dimension < 1:
+            raise ValueError("middle_dimension must be positive.")
+        left_result = np.zeros(
+            (left_dimension, middle_dimension, *self.tensors[site].shape[2:]),
+            dtype=merged.dtype,
+        )
+        right_result = np.zeros(
+            (middle_dimension, right_dimension, *self.tensors[following].shape[2:]),
+            dtype=merged.dtype,
+        )
         discarded_weight = 0.0
         total_weight = 0.0
         conditional_ranks = []
@@ -1989,8 +2737,8 @@ class FrontierTiedLETTA:
         variable = str(variable).lower()
         if variable not in {"left", "right"}:
             raise ValueError("variable must be 'left' or 'right'.")
-        left_sites = self.physical_sites[site]
-        right_sites = self.physical_sites[following]
+        left_sites = self.physical_groups[site]
+        right_sites = self.physical_groups[following]
         expected_union = (site,) + tuple(
             sorted((set(left_sites) | set(right_sites)) - {site})
         )
@@ -3733,6 +4481,24 @@ class FrontierTiedLETTA:
         scale = np.sqrt(right_norm / left_norm)
         return left_tensor * scale, right_tensor / scale
 
+    def _pair_factor_support_indices(self, site, variable):
+        """Optional exact parameter support for a pair-factor update."""
+        return None
+
+    def _project_pair_factor_support(self, site, left_tensor, right_tensor):
+        """Project pair factors onto any symmetry-restricted coordinates."""
+        result = []
+        for variable, tensor in (("left", left_tensor), ("right", right_tensor)):
+            tensor = np.asarray(tensor).copy()
+            support = self._pair_factor_support_indices(site, variable)
+            if support is not None:
+                support = np.asarray(support, dtype=int)
+                flat = np.zeros(tensor.size, dtype=tensor.dtype)
+                flat[support] = tensor.reshape(-1)[support]
+                tensor = flat.reshape(tensor.shape)
+            result.append(tensor)
+        return tuple(result)
+
     def _metric_project_pair_factors(
         self,
         site,
@@ -4125,11 +4891,11 @@ class FrontierTiedLETTA:
                 if completed is not None:
                     vector = completed
                 if variable == "left":
-                    proposed_left = vector.reshape(left_tensor.shape)
+                    proposed_left = embed(vector).reshape(left_tensor.shape)
                     proposed_right = right_tensor
                 else:
                     proposed_left = left_tensor
-                    proposed_right = vector.reshape(right_tensor.shape)
+                    proposed_right = embed(vector).reshape(right_tensor.shape)
                 proposed_energy = pair_energy(proposed_left, proposed_right)
                 # Near-null metric directions can make a nominal generalized
                 # eigenvector unreliable.  Never commit such a half-step
@@ -4393,6 +5159,11 @@ class FrontierTiedLETTA:
             metric_left = euclidean_left.copy()
             metric_right = euclidean_right.copy()
             projection_error = float("inf")
+        metric_left, metric_right = self._project_pair_factor_support(
+            site,
+            metric_left,
+            metric_right,
+        )
 
         starts = [
             ("old", old_left.copy(), old_right.copy()),
@@ -4646,8 +5417,12 @@ class FrontierTiedLETTA:
         split_strategy = str(split_strategy).lower().replace("-", "_")
         if split_strategy in {"environment", "metric", "als"}:
             split_strategy = "variational"
-        if split_strategy not in {"variational", "svd"}:
-            raise ValueError("split_strategy must be 'variational' or 'svd'.")
+        if split_strategy in {"auto", "adaptive"}:
+            split_strategy = "hybrid"
+        if split_strategy not in {"variational", "svd", "hybrid"}:
+            raise ValueError(
+                "split_strategy must be 'svd', 'variational', or 'hybrid'."
+            )
         split_metric_tol = float(split_metric_tol)
         split_energy_tol = float(split_energy_tol)
         split_metric_sweeps = int(split_metric_sweeps)
@@ -4668,7 +5443,7 @@ class FrontierTiedLETTA:
         merged, union_sites = self._merged_pair_tensor(site)
         right_dimension = self._bond_dims()[following + 1]
         identity = np.eye(right_dimension, dtype=merged.dtype)
-        right_sites = self.physical_sites[following]
+        right_sites = self.physical_groups[following]
         identity_tensor = np.broadcast_to(
             identity.reshape(
                 right_dimension,
@@ -4690,11 +5465,14 @@ class FrontierTiedLETTA:
         temporary_bonds[following] = right_dimension
         temporary = FrontierTiedLETTA(
             self.hamiltonian,
-            self.dims,
             tuple(temporary_parents),
             bond_dims=tuple(temporary_bonds),
             tensors=temporary_tensors,
             frontier_backend=self.frontier_backend,
+            chunk_size=self.chunk_size,
+            chunk_memory=self.chunk_memory,
+            chunk_span=self.chunk_span,
+            workers=self.workers,
             path_optimizer=self.path_optimizer,
             local_backend=self.local_backend,
             local_rank=self.local_options["rank"],
@@ -4709,6 +5487,8 @@ class FrontierTiedLETTA:
             tt_absorption=self.tt_options["absorption"],
             tt_norm_backend=self.tt_norm_backend,
             tt_hermitize=self.tt_hermitize,
+            tt_channels=self.tt_channels,
+            tt_gauge=self.tt_gauge,
         )
         temporary.tensors = [tensor.copy() for tensor in temporary_tensors]
         temporary.energy = temporary.expectation()
@@ -5906,6 +6686,29 @@ class FrontierTiedLETTA:
     def hamiltonian_peak_frontier_elements(self) -> int:
         return self._dense_peak_elements(self._hamiltonian_frontier)
 
+    @property
+    def hamiltonian_chunks(self) -> tuple[int, ...]:
+        """Numbers of Hamiltonian components in the active exact chunks."""
+
+        return tuple(getattr(self._hamiltonian_frontier, "chunk_sizes", ()))
+
+    @property
+    def hamiltonian_windows(self) -> tuple[tuple[int, int], ...]:
+        """Half-open active site intervals of exact Hamiltonian chunks."""
+
+        return tuple(getattr(self._hamiltonian_frontier, "chunk_intervals", ()))
+
+    @property
+    def stream_peak_frontier_elements(self) -> int:
+        """Largest stored message during a scalar expectation contraction."""
+
+        if not isinstance(self._hamiltonian_frontier, TermwiseBlockMPOFrontier):
+            return self.peak_frontier_elements
+        return max(
+            self._dense_peak_elements(self._norm_frontier),
+            int(self._hamiltonian_frontier.stream_peak_message_elements),
+        )
+
     @staticmethod
     def _dense_peak_elements(engine) -> int:
         if isinstance(engine, TTMPOFrontier):
@@ -6067,7 +6870,10 @@ class FrontierTiedLETTA:
             raise ValueError("a scalar can only be extracted at a boundary cut.")
         if isinstance(frontier, BlockMPOFrontier):
             return frontier.boundary_scalar(message, cut)
-        if isinstance(frontier, TermwiseTTMPOFrontier):
+        if isinstance(
+            frontier,
+            (TermwiseBlockMPOFrontier, TermwiseTTMPOFrontier),
+        ):
             return frontier.boundary_scalar(message, cut)
         if isinstance(frontier, TTMPOFrontier):
             if not isinstance(message, TTFrontier):
@@ -6663,29 +7469,50 @@ class FrontierTiedLETTA:
             raise NotImplementedError(
                 "physical-slice block construction currently requires an exact "
                 "dense or identity-block frontier; use solver='matrix_free' "
-                "for tensor-train frontiers."
+                "for this frontier."
             )
         site = self._validated_site(site)
         environment = self._resolved_environment(site, environment)
         layout = PhysicalBlockLayout(self.tensors[site].shape)
         pairs = self._hamiltonian_physical_blocks(site)
+        parameter_mask = self._local_action_mask(site)
+        block_masks = (
+            None
+            if parameter_mask is None
+            else layout.as_blocks(np.asarray(parameter_mask, dtype=bool).reshape(-1))
+        )
+
+        def masked(block, row, column):
+            if block_masks is None:
+                return block
+            return np.asarray(block) * (
+                block_masks[row][:, None] * block_masks[column][None, :]
+            )
 
         def metric_factory(row, column):
-            return self._norm_frontier.hole_block(
-                site,
-                environment.norm_left,
-                environment.norm_right,
-                layout.configurations[row],
-                layout.configurations[column],
+            return masked(
+                self._norm_frontier.hole_block(
+                    site,
+                    environment.norm_left,
+                    environment.norm_right,
+                    layout.configurations[row],
+                    layout.configurations[column],
+                ),
+                row,
+                column,
             )
 
         def hamiltonian_factory(row, column):
-            return self._hamiltonian_frontier.hole_block(
-                site,
-                environment.hamiltonian_left,
-                environment.hamiltonian_right,
-                layout.configurations[row],
-                layout.configurations[column],
+            return masked(
+                self._hamiltonian_frontier.hole_block(
+                    site,
+                    environment.hamiltonian_left,
+                    environment.hamiltonian_right,
+                    layout.configurations[row],
+                    layout.configurations[column],
+                ),
+                row,
+                column,
             )
 
         return PhysicalBlockGeneralizedProblem.from_block_factories(
@@ -6697,6 +7524,131 @@ class FrontierTiedLETTA:
                 self.tensors[site].dtype,
                 self.hamiltonian.dtype,
             ),
+        )
+
+    def local_action_block_problem(
+        self,
+        site: int,
+        *,
+        environment=None,
+    ) -> PhysicalBlockGeneralizedProblem:
+        r"""Build conditional norm blocks with a matrix-free Hamiltonian.
+
+        The norm is exactly block diagonal in the tied physical
+        configuration.  Whitening those small virtual blocks supplies the
+        conditional-canonical coordinates needed by Davidson, while the
+        substantially larger local Hamiltonian is retained only as an action.
+        """
+        site = self._validated_site(site)
+        environment = self._resolved_environment(site, environment)
+        layout = PhysicalBlockLayout(self.tensors[site].shape)
+        pairs = self._hamiltonian_physical_blocks(site)
+        parameter_mask = self._local_action_mask(site)
+        if parameter_mask is None:
+            flat_mask = None
+            block_masks = None
+        else:
+            flat_mask = np.asarray(parameter_mask, dtype=bool).reshape(-1)
+            if flat_mask.size != layout.size:
+                raise ValueError("the local action mask has the wrong size.")
+            block_masks = layout.as_blocks(flat_mask)
+
+        prepare_action = getattr(
+            self._hamiltonian_frontier,
+            "prepare_hole_action",
+            None,
+        )
+        prepared_action = (
+            prepare_action(
+                site,
+                environment.hamiltonian_left,
+                environment.hamiltonian_right,
+            )
+            if prepare_action is not None
+            else None
+        )
+
+        def metric_factory(rows, columns):
+            blocks = self._norm_frontier.hole_blocks(
+                site,
+                environment.norm_left,
+                environment.norm_right,
+                tuple(layout.configurations[row] for row in rows),
+                tuple(layout.configurations[column] for column in columns),
+            )
+            if block_masks is not None:
+                blocks = np.asarray(blocks).copy()
+                for offset, (row, column) in enumerate(zip(rows, columns)):
+                    blocks[offset] *= (
+                        block_masks[row][:, None]
+                        * block_masks[column][None, :]
+                    )
+            return blocks
+
+        def hamiltonian_action(vector):
+            trial = np.asarray(vector)
+            if flat_mask is not None:
+                trial = np.where(flat_mask, trial, 0)
+            result = (
+                prepared_action(trial)
+                if prepared_action is not None
+                else self.hamiltonian_action(
+                    site,
+                    trial,
+                    environment=environment,
+                )
+            )
+            return (
+                result
+                if flat_mask is None
+                else np.where(flat_mask, result, 0)
+            )
+
+        def hamiltonian_actions(vectors):
+            trials = np.asarray(vectors)
+            if flat_mask is not None:
+                trials = np.where(flat_mask[None, :], trials, 0)
+            prepared_many = getattr(prepared_action, "many", None)
+            if prepared_many is not None:
+                result = prepared_many(trials)
+            else:
+                result = np.stack(
+                    [hamiltonian_action(trial) for trial in trials]
+                )
+            return (
+                result
+                if flat_mask is None
+                else np.where(flat_mask[None, :], result, 0)
+            )
+
+        hamiltonian_action.many = hamiltonian_actions
+        prepared_verify = getattr(prepared_action, "verify", None)
+        if prepared_verify is not None:
+            def hamiltonian_verify(vector):
+                trial = np.asarray(vector)
+                if flat_mask is not None:
+                    trial = np.where(flat_mask, trial, 0)
+                result = prepared_verify(trial)
+                return (
+                    result
+                    if flat_mask is None
+                    else np.where(flat_mask, result, 0)
+                )
+
+            hamiltonian_action.verify = hamiltonian_verify
+
+        return (
+            PhysicalBlockGeneralizedProblem
+            .from_batched_metric_factory_and_hamiltonian_action(
+                self.tensors[site].shape,
+                pairs,
+                metric_factory,
+                hamiltonian_action,
+                dtype=np.result_type(
+                    self.tensors[site].dtype,
+                    self.hamiltonian.dtype,
+                ),
+            )
         )
 
     def metric_action(self, site: int, vector, *, environment=None) -> np.ndarray:
@@ -6754,6 +7706,796 @@ class FrontierTiedLETTA:
             return 0.5 * (forward + adjoint)
         return forward
 
+    def _amen_enrichment_directions(
+        self,
+        site,
+        *,
+        environment,
+        direction,
+        rank,
+        rtol,
+    ):
+        r"""Compress the conditional Hamiltonian-component ranges at a cut.
+
+        Each exact MPO transition group or termwise Hamiltonian chunk is
+        applied separately.  For every assignment of the physical labels
+        shared by the tensors across the cut, its component orthogonal to that
+        assignment's occupied virtual range updates an independent small
+        running SVD.  The :math:`k`-th direction from every assignment is then
+        packed into one virtual channel.  This matches the conditional SVD
+        used when the temporary bond is retracted: one nominal bond channel
+        may represent a different vector in every tied-label block.
+
+        With no shared physical labels there is one block and this reduces to
+        ordinary MPS AMEn.  The metric component :math:`-E N A` is included as
+        the identity channel of the residual.
+        """
+        site = self._validated_site(site)
+        direction = str(direction).lower()
+        rank = int(rank)
+        rtol = float(rtol)
+        if direction not in {"left", "right"}:
+            raise ValueError("direction must be 'left' or 'right'.")
+        if rank < 1:
+            raise ValueError("enrichment rank must be positive.")
+        if not np.isfinite(rtol) or rtol < 0.0:
+            raise ValueError("enrichment tolerance must be finite and nonnegative.")
+
+        tensor = self.tensors[site]
+        if direction == "right":
+            axes = (0, *range(2, tensor.ndim), 1)
+            occupied_matrix = tensor.transpose(axes).reshape(-1, tensor.shape[1])
+
+            def ordered(value):
+                return np.asarray(value).reshape(tensor.shape).transpose(axes).reshape(
+                    occupied_matrix.shape
+                )
+
+            transpose_result = False
+        else:
+            occupied_matrix = tensor.reshape(tensor.shape[0], -1).T
+
+            def ordered(value):
+                return np.asarray(value).reshape(tensor.shape).reshape(
+                    tensor.shape[0], -1
+                ).T
+
+            transpose_result = True
+
+        condition_rows = self._amen_condition_rows(site, direction)
+        occupied = []
+        conditional_available = []
+        for rows in condition_rows:
+            block = occupied_matrix[rows]
+            left, singular_values, _right = np.linalg.svd(
+                block,
+                full_matrices=False,
+            )
+            occupied_scale = max(
+                float(np.max(singular_values, initial=0.0)),
+                1.0,
+            )
+            occupied_rank = int(
+                np.count_nonzero(
+                    singular_values
+                    > 256.0 * np.finfo(float).eps * occupied_scale
+                )
+            )
+            occupied.append(left[:, :occupied_rank])
+            conditional_available.append(max(len(rows) - occupied_rank, 0))
+        # The augmented QR must fit ``current bond + new directions`` in the
+        # local row space.  Rank deficiency of the occupied columns does not
+        # create additional tensor rows; those null channels are handled by
+        # bond reduction or by the capped retraction.
+        available = occupied_matrix.shape[0] - occupied_matrix.shape[1]
+        requested = min(
+            rank,
+            max(available, 0),
+            max(conditional_available, default=0),
+        )
+        if requested == 0:
+            empty = np.zeros(
+                (0, occupied_matrix.shape[0])
+                if transpose_result
+                else (occupied_matrix.shape[0], 0),
+                dtype=tensor.dtype,
+            )
+            return empty, 0.0, 0, 0.0
+
+        vector = tensor.reshape(-1)
+        frontier = self._hamiltonian_frontier
+        open_action = getattr(
+            frontier,
+            (
+                "left_enrichment_components"
+                if direction == "right"
+                else "right_enrichment_components"
+            ),
+            None,
+        )
+        if open_action is not None:
+            components = open_action(
+                site,
+                (
+                    environment.hamiltonian_left
+                    if direction == "right"
+                    else environment.hamiltonian_right
+                ),
+                vector,
+            )
+            open_components = True
+        else:
+            component_action = getattr(frontier, "hole_action_components", None)
+            if component_action is None:
+                components = (
+                    self.hamiltonian_action(site, vector, environment=environment),
+                )
+            else:
+                components = component_action(
+                    site,
+                    environment.hamiltonian_left,
+                    environment.hamiltonian_right,
+                    vector,
+                )
+            open_components = False
+
+        if open_components:
+            count_action = getattr(frontier, "enrichment_component_count", None)
+            expected_components = (
+                int(count_action(site)) if count_action is not None else None
+            )
+            metric_share = None
+        else:
+            count_action = getattr(frontier, "hole_action_component_count", None)
+            expected_components = (
+                int(count_action(site)) if count_action is not None else 1
+            )
+            metric_share = (
+                float(self.energy)
+                / expected_components
+                * self.metric_action(site, vector, environment=environment)
+            )
+        bases = [
+            np.zeros((len(rows), 0), dtype=tensor.dtype)
+            for rows in condition_rows
+        ]
+        values = [np.zeros(0, dtype=float) for _rows in condition_rows]
+        workspace_ranks = [
+            min(block_available, requested + 8)
+            for block_available in conditional_available
+        ]
+        total_weight = 0.0
+        component_count = 0
+        if expected_components is not None and expected_components < 1:
+            raise ValueError("Hamiltonian action has no enrichment components.")
+
+        def consume(component):
+            nonlocal total_weight, component_count
+            residual = (
+                np.asarray(component)
+                if open_components
+                else ordered(np.asarray(component) - metric_share)
+            )
+            if residual.ndim != 2 or residual.shape[0] != occupied_matrix.shape[0]:
+                raise ValueError("open enrichment component has an invalid shape.")
+            for block_index, rows in enumerate(condition_rows):
+                block = residual[rows]
+                occupied_block = occupied[block_index]
+                if occupied_block.shape[1]:
+                    block = block - occupied_block @ (
+                        occupied_block.conj().T @ block
+                    )
+                weight = float(np.linalg.norm(block) ** 2)
+                total_weight += weight
+                if weight <= np.finfo(float).tiny:
+                    continue
+                weighted_basis = (
+                    bases[block_index] * values[block_index][None, :]
+                )
+                work = np.concatenate((weighted_basis, block), axis=1)
+                next_basis, next_values, _right = np.linalg.svd(
+                    work,
+                    full_matrices=False,
+                )
+                retained = min(
+                    workspace_ranks[block_index],
+                    next_values.size,
+                )
+                bases[block_index] = next_basis[:, :retained]
+                values[block_index] = next_values[:retained]
+            component_count += 1
+
+        for component in components:
+            consume(component)
+        if (
+            expected_components is not None
+            and component_count != expected_components
+        ):
+            raise ValueError(
+                "Hamiltonian enrichment component count changed during streaming."
+            )
+
+        leading_value = max(
+            (float(block_values[0]) for block_values in values if block_values.size),
+            default=0.0,
+        )
+        numerical_threshold = (
+            256.0
+            * np.finfo(float).eps
+            * max(leading_value, 1.0)
+        )
+        selected_per_block = []
+        for block_values in values:
+            if not block_values.size:
+                selected_per_block.append(0)
+                continue
+            threshold = max(
+                rtol * float(block_values[0]),
+                numerical_threshold,
+            )
+            selected_per_block.append(
+                min(requested, int(np.count_nonzero(block_values > threshold)))
+            )
+        selected = max(selected_per_block, default=0)
+        packed = np.zeros(
+            (occupied_matrix.shape[0], selected),
+            dtype=np.result_type(
+                tensor.dtype,
+                *(basis.dtype for basis in bases),
+            ),
+        )
+        retained_weight = 0.0
+        for rows, basis, block_values, block_selected in zip(
+            condition_rows,
+            bases,
+            values,
+            selected_per_block,
+        ):
+            if block_selected:
+                packed[np.ix_(rows, np.arange(block_selected))] = (
+                    basis[:, :block_selected]
+                    * block_values[None, :block_selected]
+                )
+                retained_weight += float(
+                    np.sum(block_values[:block_selected] ** 2)
+                )
+        if selected:
+            norms = np.linalg.norm(packed, axis=0)
+            usable = norms > numerical_threshold
+            packed = packed[:, usable]
+            packed /= np.linalg.norm(packed, axis=0)[None, :]
+        discarded = (
+            max(0.0, min(1.0, 1.0 - retained_weight / total_weight))
+            if total_weight > np.finfo(float).tiny
+            else 0.0
+        )
+        directions = packed.T if transpose_result else packed
+        return (
+            directions,
+            float(np.sqrt(total_weight)),
+            component_count,
+            discarded,
+        )
+
+    def _amen_condition_rows(self, site, direction):
+        """Return ordered-matrix rows for each shared-tie assignment."""
+        site = self._validated_site(site)
+        direction = str(direction).lower()
+        if direction == "right":
+            following = site + 1
+            if following >= len(self.dims):
+                tensor = self.tensors[site]
+                size = tensor.shape[0] * int(np.prod(tensor.shape[2:], dtype=int))
+                return (np.arange(size, dtype=np.intp),)
+            tensor = self.tensors[site]
+            physical_sites = self.physical_groups[site]
+            overlap = tuple(
+                sorted(
+                    set(physical_sites)
+                    & set(self.physical_groups[following])
+                )
+            )
+            row_shape = (tensor.shape[0],) + tuple(
+                self.dims[index] for index in physical_sites
+            )
+        elif direction == "left":
+            preceding = site - 1
+            if preceding < 0:
+                tensor = self.tensors[site]
+                size = tensor.shape[1] * int(np.prod(tensor.shape[2:], dtype=int))
+                return (np.arange(size, dtype=np.intp),)
+            tensor = self.tensors[site]
+            physical_sites = self.physical_groups[site]
+            overlap = tuple(
+                sorted(
+                    set(physical_sites)
+                    & set(self.physical_groups[preceding])
+                )
+            )
+            row_shape = (tensor.shape[1],) + tuple(
+                self.dims[index] for index in physical_sites
+            )
+        else:
+            raise ValueError("direction must be 'left' or 'right'.")
+
+        rows = np.arange(np.prod(row_shape, dtype=int), dtype=np.intp).reshape(
+            row_shape
+        )
+        if not overlap:
+            return (rows.reshape(-1),)
+        result = []
+        overlap_shape = tuple(self.dims[index] for index in overlap)
+        for configuration in np.ndindex(*overlap_shape):
+            selection = [slice(None)] * len(row_shape)
+            for physical_site, value in zip(overlap, configuration):
+                selection[1 + physical_sites.index(physical_site)] = value
+            result.append(rows[tuple(selection)].reshape(-1))
+        return tuple(result)
+
+    def _amen_occupied_basis(self, cut, direction):
+        """Return occupied bases conditional on shared tied configurations."""
+        cut = int(cut)
+        direction = str(direction).lower()
+        left_site = cut - 1
+        right_site = cut
+        overlap = tuple(
+            sorted(
+                set(self.physical_groups[left_site])
+                & set(self.physical_groups[right_site])
+            )
+        )
+        overlap_shape = tuple(self.dims[index] for index in overlap)
+        configurations = (
+            np.ndindex(*overlap_shape) if overlap_shape else ((),)
+        )
+        if direction == "right":
+            tensor = self.tensors[left_site]
+            physical_sites = self.physical_groups[left_site]
+            exclusive = tuple(
+                index for index in physical_sites if index not in overlap
+            )
+            exclusive_shape = tuple(self.dims[index] for index in exclusive)
+
+            def matrix_at(overlap_configuration):
+                values = dict(zip(overlap, overlap_configuration))
+                block = np.empty(
+                    (tensor.shape[0], *exclusive_shape, tensor.shape[1]),
+                    dtype=tensor.dtype,
+                )
+                exclusive_configurations = (
+                    np.ndindex(*exclusive_shape) if exclusive_shape else ((),)
+                )
+                for configuration in exclusive_configurations:
+                    values.update(zip(exclusive, configuration))
+                    physical = tuple(values[index] for index in physical_sites)
+                    block[(slice(None), *configuration, slice(None))] = tensor[
+                        (slice(None), slice(None), *physical)
+                    ]
+                return block.reshape(-1, tensor.shape[1])
+        elif direction == "left":
+            tensor = self.tensors[right_site]
+            physical_sites = self.physical_groups[right_site]
+            exclusive = tuple(
+                index for index in physical_sites if index not in overlap
+            )
+            exclusive_shape = tuple(self.dims[index] for index in exclusive)
+
+            def matrix_at(overlap_configuration):
+                values = dict(zip(overlap, overlap_configuration))
+                block = np.empty(
+                    (tensor.shape[0], tensor.shape[1], *exclusive_shape),
+                    dtype=tensor.dtype,
+                )
+                exclusive_configurations = (
+                    np.ndindex(*exclusive_shape) if exclusive_shape else ((),)
+                )
+                for configuration in exclusive_configurations:
+                    values.update(zip(exclusive, configuration))
+                    physical = tuple(values[index] for index in physical_sites)
+                    block[(slice(None), slice(None), *configuration)] = tensor[
+                        (slice(None), slice(None), *physical)
+                    ]
+                return block.reshape(tensor.shape[0], -1).conj().T
+        else:
+            raise ValueError("direction must be 'left' or 'right'.")
+
+        result = []
+        for configuration in configurations:
+            matrix = matrix_at(configuration)
+            basis, values, _right = np.linalg.svd(matrix, full_matrices=False)
+            scale = max(float(np.max(values, initial=0.0)), 1.0)
+            rank = int(
+                np.count_nonzero(
+                    values > 256.0 * np.finfo(float).eps * scale
+                )
+            )
+            result.append(basis[:, :rank])
+        return tuple(result)
+
+    def _amen_subspace_change(self, before, cut, direction):
+        """Frobenius distance between pre-expansion and retained projectors."""
+        before = tuple(np.asarray(basis) for basis in before)
+        after = self._amen_occupied_basis(cut, direction)
+        if len(before) != len(after):
+            raise ValueError("AMEn conditional subspace counts are incompatible.")
+        distance_squared = 0.0
+        for old_basis, new_basis in zip(before, after):
+            if old_basis.shape[0] != new_basis.shape[0]:
+                raise ValueError(
+                    "AMEn occupied subspaces have incompatible supports."
+                )
+            overlap_weight = float(
+                np.linalg.norm(old_basis.conj().T @ new_basis) ** 2
+            )
+            distance_squared += max(
+                0.0,
+                old_basis.shape[1]
+                + new_basis.shape[1]
+                - 2.0 * overlap_weight,
+            )
+        return float(np.sqrt(distance_squared))
+
+    def _amen_expand_after_site(
+        self,
+        site,
+        *,
+        environment,
+        direction,
+        rank,
+        rtol,
+        scale,
+        refresh_saturated=True,
+        metric_tol=1.0e-12,
+        max_condition=1.0e8,
+        energy_before=None,
+    ):
+        """Expand the outgoing sweep bond from a streamed residual range."""
+        site = self._validated_site(site)
+        cut = site + 1 if direction == "right" else site
+        if cut <= 0 or cut >= len(self.dims):
+            return None, None
+        maximum = tuple(getattr(self, "_maximum_bond_dims", self._bond_dims()))
+        current = self._bond_dims()[cut]
+        if current > maximum[cut]:
+            return None, None
+        if cut in set(getattr(self, "_null_reduced_cuts", ())):
+            return None, None
+        saturated = current == maximum[cut]
+        if saturated and not bool(refresh_saturated):
+            return None, None
+        growth = (
+            maximum[cut] - current
+            if not saturated
+            else min(int(rank), maximum[cut])
+        )
+        if growth < 1:
+            return None, None
+        directions, source_norm, components, discarded = (
+            self._amen_enrichment_directions(
+                site,
+                environment=environment,
+                direction=direction,
+                rank=min(int(rank), growth),
+                rtol=rtol,
+            )
+        )
+        count = directions.shape[1] if direction == "right" else directions.shape[0]
+        if count == 0:
+            return None, None
+        if saturated:
+            occupied_basis = self._amen_occupied_basis(cut, direction)
+            left_tensor = self.tensors[cut - 1].copy()
+            right_tensor = self.tensors[cut].copy()
+            if energy_before is None:
+                energy_before = self.expectation()
+            directions, temporary_labels = (
+                self._prepare_saturated_amen_directions(
+                    cut,
+                    direction,
+                    directions,
+                )
+            )
+            record = self._expand_saturated_amen_bond(
+                cut,
+                direction=direction,
+                directions=directions,
+                scale=scale,
+                source_norm=source_norm,
+                temporary_labels=temporary_labels,
+            )
+            pending = _PendingAMEnRetraction(
+                cut=cut,
+                target_dimension=current,
+                expansion_direction=direction,
+                source_site=site,
+                mixing_scale=float(scale),
+                energy_before=float(energy_before),
+                left_tensor=left_tensor,
+                right_tensor=right_tensor,
+                anchor_norm=(
+                    environment.norm_left
+                    if direction == "right"
+                    else environment.norm_right
+                ),
+                anchor_hamiltonian=(
+                    environment.hamiltonian_left
+                    if direction == "right"
+                    else environment.hamiltonian_right
+                ),
+                occupied_basis=occupied_basis,
+            )
+        else:
+            record = self.expand_bond(
+                cut,
+                current + count,
+                direction=direction,
+                strategy="amen",
+                scale=scale,
+                _directions=directions,
+                _source_norm=source_norm,
+                _evaluate=False,
+                _reset_history=False,
+            )
+            pending = None
+        if not saturated:
+            self._condition_after_site(
+                site,
+                environment=environment,
+                direction=direction,
+                metric_tol=metric_tol,
+                max_condition=max_condition,
+            )
+        return (
+            replace(
+                record,
+                residual_components=int(components),
+                relative_discarded_weight=float(discarded),
+            ),
+            pending,
+        )
+
+    def _expand_saturated_amen_bond(
+        self,
+        cut,
+        *,
+        direction,
+        directions,
+        scale,
+        source_norm,
+        temporary_labels=None,
+    ):
+        """Open a temporary dense bond retained through the neighboring solve."""
+        if temporary_labels is not None:
+            raise TypeError("dense frontier bonds do not carry charge labels.")
+        count = (
+            directions.shape[1]
+            if direction == "right"
+            else directions.shape[0]
+        )
+        return self.expand_bond(
+            cut,
+            self._bond_dims()[int(cut)] + count,
+            direction=direction,
+            strategy="amen",
+            scale=scale,
+            _directions=directions,
+            _source_norm=source_norm,
+            _evaluate=False,
+            _reset_history=False,
+        )
+
+    def _retract_amen_bond(self, cut, target_dimension, *, direction):
+        """Conditionally split an optimized pair back to its configured cap."""
+        cut = int(cut)
+        target_dimension = int(target_dimension)
+        temporary_dimension = self._bond_dims()[cut]
+        if cut <= 0 or cut >= len(self.dims):
+            raise ValueError("cut must be an internal virtual bond.")
+        if target_dimension < 1 or target_dimension > temporary_dimension:
+            raise ValueError("invalid AMEn target bond dimension.")
+        if target_dimension == temporary_dimension:
+            return None
+        direction = str(direction).lower()
+        if direction not in {"left", "right"}:
+            raise ValueError("direction must be 'left' or 'right'.")
+
+        left_site = cut - 1
+        labels = self._amen_compression_labels(cut, target_dimension)
+        merged, union_sites = self._merged_pair_tensor(left_site)
+        (
+            new_left,
+            new_right,
+            overlap,
+            conditional_ranks,
+            truncation_error,
+        ) = self._split_merged_pair_tensor(
+            left_site,
+            merged,
+            union_sites,
+            middle_dimension=target_dimension,
+            middle_labels=labels,
+        )
+        self.tensors[left_site] = np.asarray(new_left)
+        self.tensors[cut] = np.asarray(new_right)
+        dimensions = list(self._bond_dims())
+        dimensions[cut] = target_dimension
+        self._virtual_bond_dims = tuple(dimensions)
+        self.bond_dim = max(self._virtual_bond_dims)
+        self._set_amen_compressed_bond_layout(cut, labels)
+        self._rebuild_frontier_engines()
+
+        sector_dimensions = ()
+        if labels is not None:
+            sector_dimensions = tuple(
+                (charge, labels.count(charge))
+                for charge in dict.fromkeys(labels)
+            )
+        return FrontierBondRefresh(
+            cut=cut,
+            temporary_dimension=temporary_dimension,
+            target_dimension=target_dimension,
+            overlap_sites=overlap,
+            conditional_ranks=tuple(conditional_ranks),
+            relative_truncation_error=float(truncation_error),
+            sector_dimensions=sector_dimensions,
+        )
+
+    def _condition_after_site(
+        self,
+        site,
+        *,
+        environment,
+        direction,
+        metric_tol,
+        max_condition,
+    ):
+        """Put the outgoing bond into the moving frontier-metric gauge."""
+        cut = site + 1 if direction == "right" else site
+        if cut <= 0 or cut >= len(self.dims):
+            return False
+        if direction == "right":
+            metric_message = self._norm_frontier.advance_left(
+                environment.norm_left,
+                self.tensors,
+                site,
+            )
+        else:
+            metric_message = self._norm_frontier.advance_right(
+                environment.norm_right,
+                self.tensors,
+                site,
+            )
+        return self._condition_sweep_bond(
+            cut,
+            metric_message,
+            direction=direction,
+            metric_tol=metric_tol,
+            max_condition=max_condition,
+        )
+
+    def _finish_amen_retraction(self, pending, environment, site):
+        """Retract after the neighboring solve and locally guard the result."""
+        if not isinstance(pending, _PendingAMEnRetraction):
+            raise TypeError("pending must be an AMEn retraction record.")
+        site = self._validated_site(site)
+        if pending.expansion_direction == "right":
+            if site != pending.source_site + 1:
+                raise ValueError("right-going AMEn must retract at the next site.")
+            self.tensors[pending.cut][pending.target_dimension :] *= (
+                pending.mixing_scale
+            )
+            refresh = self._retract_amen_bond(
+                pending.cut,
+                pending.target_dimension,
+                direction="left",
+            )
+        elif pending.expansion_direction == "left":
+            if site != pending.source_site - 1:
+                raise ValueError("left-going AMEn must retract at the previous site.")
+            self.tensors[pending.cut - 1][
+                :, pending.target_dimension :
+            ] *= pending.mixing_scale
+            refresh = self._retract_amen_bond(
+                pending.cut,
+                pending.target_dimension,
+                direction="right",
+            )
+        else:
+            raise ValueError("AMEn expansion direction is invalid.")
+        environment = self._repair_amen_environment(
+            pending,
+            environment,
+        )
+        subspace_change = self._amen_subspace_change(
+            pending.occupied_basis,
+            pending.cut,
+            pending.expansion_direction,
+        )
+        candidate_energy = self._amen_environment_energy(site, environment)
+        tolerance = (
+            512.0
+            * np.finfo(float).eps
+            * max(1.0, abs(pending.energy_before))
+        )
+        energy_accepted = bool(
+            np.isfinite(candidate_energy)
+            and candidate_energy <= pending.energy_before + tolerance
+        )
+        effective = bool(
+            subspace_change > 1024.0 * np.finfo(float).eps
+        )
+        retry = not energy_accepted
+        if retry:
+            self.tensors[pending.cut - 1] = pending.left_tensor.copy()
+            self.tensors[pending.cut] = pending.right_tensor.copy()
+            self._apply_bond_gauge_constraints()
+            self._rebuild_frontier_engines()
+            environment = self._repair_amen_environment(
+                pending,
+                environment,
+            )
+        return (
+            replace(
+                refresh,
+                subspace_change=subspace_change,
+                accepted=energy_accepted and effective,
+            ),
+            environment,
+            retry,
+        )
+
+    def _repair_amen_environment(self, pending, environment):
+        """Recompute the fixed moving side changed by a two-tensor retraction."""
+        if pending.expansion_direction == "right":
+            norm_left = self._norm_frontier.advance_left(
+                pending.anchor_norm,
+                self.tensors,
+                pending.source_site,
+            )
+            hamiltonian_left = self._hamiltonian_frontier.advance_left(
+                pending.anchor_hamiltonian,
+                self.tensors,
+                pending.source_site,
+            )
+            return replace(
+                environment,
+                norm_left=norm_left,
+                hamiltonian_left=hamiltonian_left,
+            )
+        norm_right = self._norm_frontier.advance_right(
+            pending.anchor_norm,
+            self.tensors,
+            pending.source_site,
+        )
+        hamiltonian_right = self._hamiltonian_frontier.advance_right(
+            pending.anchor_hamiltonian,
+            self.tensors,
+            pending.source_site,
+        )
+        return replace(
+            environment,
+            norm_right=norm_right,
+            hamiltonian_right=hamiltonian_right,
+        )
+
+    def _amen_environment_energy(self, site, environment):
+        """Evaluate the exact Rayleigh quotient in one repaired local frame."""
+        vector = self.tensors[int(site)].reshape(-1)
+        metric_vector = self.metric_action(
+            site,
+            vector,
+            environment=environment,
+        )
+        norm = float(np.real(np.vdot(vector, metric_vector)))
+        if not np.isfinite(norm) or norm <= np.finfo(float).tiny:
+            return float("inf")
+        hamiltonian_vector = self.hamiltonian_action(
+            site,
+            vector,
+            environment=environment,
+        )
+        return float(np.real(np.vdot(vector, hamiltonian_vector)) / norm)
+
     def _validated_site(self, site):
         site = int(site)
         if site < 0 or site >= len(self.dims):
@@ -6787,7 +8529,7 @@ class FrontierTiedLETTA:
         if cached is None:
             cached = hamiltonian_physical_connectivity(
                 self.hamiltonian,
-                self.physical_sites[site],
+                self.physical_groups[site],
             )
             self._physical_block_connectivity_cache[site] = cached
         return cached
@@ -6803,10 +8545,12 @@ class FrontierTiedLETTA:
         eig_tol: float = 1.0e-10,
         maxiter: int | None = None,
         max_subspace: int = 32,
+        preconditioner="auto",
+        block_size: int = 1,
         energy_before: float | None = None,
         environment=None,
     ) -> FrontierSiteUpdate:
-        """Minimize one tensor with a dense, whitened, action-only, or block solver.
+        """Minimize one tensor with a dense, metric-orthonormal, action, or block solver.
 
         ``auto`` retains the dense solver below ``matrix_free_threshold``.
         Above it, a structurally sparse physical-block pencil is used only
@@ -6816,12 +8560,15 @@ class FrontierTiedLETTA:
         """
         site = self._validated_site(site)
         solver = str(solver).lower().replace("-", "_")
+        solver_record = solver
         if solver in {"block", "physical_block", "physical_blocks"}:
             solver = "block_sparse"
         if solver in {
             "canonical",
             "identity_metric",
             "local_canonical",
+            "metric_orthonormal",
+            "orthonormal_metric",
             "s_identity",
         }:
             solver = "whitened"
@@ -6833,7 +8580,8 @@ class FrontierTiedLETTA:
             "block_sparse",
         }:
             raise ValueError(
-                "solver must be 'auto', 'direct', 'whitened', "
+                "solver must be 'auto', 'direct', 'metric_orthonormal' "
+                "(alias 'whitened'), "
                 "'matrix_free', or 'block_sparse'."
             )
         if not self.norm_contraction_is_exact:
@@ -6891,8 +8639,8 @@ class FrontierTiedLETTA:
             and self.uses_tensor_train_frontier
         ):
             raise ValueError(
-                f"solver='{selected_solver}' is unavailable for tensor-train "
-                "frontiers; "
+                f"solver='{selected_solver}' is unavailable for this "
+                "matrix-free frontier; "
                 "use solver='matrix_free'."
             )
         accepted = False
@@ -6902,7 +8650,11 @@ class FrontierTiedLETTA:
         metric_matvecs = 0
         iterations = 0
         residual_norm = float("inf")
-        solver_record = selected_solver
+        solver_record = (
+            "metric_orthonormal"
+            if solver_record in {"metric_orthonormal", "orthonormal_metric"}
+            else selected_solver
+        )
         solver_converged = False
         message = "local solve not attempted"
         physical_blocks = 0
@@ -6991,6 +8743,11 @@ class FrontierTiedLETTA:
                     maxiter=maxiter,
                     max_subspace=max_subspace,
                     random_seed=site,
+                    recycle_spaces=self._davidson_recycle,
+                    recycle_prefix=("block", site),
+                    executor=self._solver_executor,
+                    preconditioner=preconditioner,
+                    block_size=block_size,
                 )
                 metric_rank = diagnostics.projected_rank
                 hamiltonian_matvecs = diagnostics.hamiltonian_matvecs
@@ -7006,24 +8763,69 @@ class FrontierTiedLETTA:
                 if not diagnostics.converged:
                     raise ValueError(diagnostics.message)
             else:
-                energy_after, vector, diagnostics = lowest_generalized_davidson(
-                    lambda trial: self.hamiltonian_action(
-                        site,
-                        trial,
-                        environment=environment,
-                    ),
-                    lambda trial: self.metric_action(
-                        site,
-                        trial,
-                        environment=environment,
-                    ),
-                    old_tensor.reshape(-1),
-                    tol=eig_tol,
-                    metric_tol=metric_tol,
-                    maxiter=maxiter,
-                    max_subspace=max_subspace,
-                    random_seed=site,
+                layout = PhysicalBlockLayout(old_tensor.shape)
+                conditional_metric_elements = (
+                    layout.nblocks * layout.virtual_size**2
                 )
+                use_conditional_metric = (
+                    block_sparse_max_elements is None
+                    or conditional_metric_elements <= block_sparse_max_elements
+                )
+                if use_conditional_metric:
+                    problem = self.local_action_block_problem(
+                        site,
+                        environment=environment,
+                    )
+                    energy_after, vector, diagnostics = problem.solve(
+                        old_tensor.reshape(-1),
+                        tol=eig_tol,
+                        metric_tol=metric_tol,
+                        maxiter=maxiter,
+                        max_subspace=max_subspace,
+                        random_seed=site,
+                        dense_component_max_size=0,
+                        recycle_spaces=self._davidson_recycle,
+                        recycle_prefix=("action", site),
+                        executor=self._solver_executor,
+                        preconditioner=preconditioner,
+                        block_size=block_size,
+                    )
+                else:
+                    recycle_key = ("global", site, old_tensor.size)
+                    recycle_out = []
+                    use_recycle = old_tensor.size >= 256
+                    energy_after, vector, diagnostics = (
+                        lowest_generalized_davidson(
+                            lambda trial: self.hamiltonian_action(
+                                site,
+                                trial,
+                                environment=environment,
+                            ),
+                            lambda trial: self.metric_action(
+                                site,
+                                trial,
+                                environment=environment,
+                            ),
+                            old_tensor.reshape(-1),
+                            tol=eig_tol,
+                            metric_tol=metric_tol,
+                            maxiter=maxiter,
+                            max_subspace=max_subspace,
+                            random_seed=site,
+                            initial_subspace=(
+                                self._davidson_recycle.get(recycle_key)
+                                if use_recycle
+                                else None
+                            ),
+                            recycle_out=(recycle_out if use_recycle else None),
+                            preconditioner=(
+                                preconditioner if callable(preconditioner) else None
+                            ),
+                            block_size=block_size,
+                        )
+                    )
+                    if use_recycle:
+                        self._davidson_recycle[recycle_key] = tuple(recycle_out)
                 metric_rank = diagnostics.projected_rank
                 hamiltonian_matvecs = diagnostics.hamiltonian_matvecs
                 metric_matvecs = diagnostics.metric_matvecs
@@ -7031,6 +8833,16 @@ class FrontierTiedLETTA:
                 residual_norm = diagnostics.residual_norm
                 solver_converged = diagnostics.converged
                 message = diagnostics.message
+                if use_conditional_metric:
+                    physical_blocks = diagnostics.metric_blocks
+                    hamiltonian_blocks = diagnostics.hamiltonian_blocks
+                    block_component_sizes = diagnostics.component_sizes
+                    stored_operator_elements = diagnostics.stored_elements
+                    solver_metric_is_identity = True
+                else:
+                    message = (
+                        f"{message}; conditional metric exceeds the storage cap"
+                    )
                 if not diagnostics.converged:
                     raise ValueError(diagnostics.message)
             vector = self._complete_local_solution(
@@ -7105,7 +8917,7 @@ class FrontierTiedLETTA:
                     and energy_after <= energy_before + tolerance
                 )
                 if accepted:
-                    self.tensors[site][...] = vector.reshape(old_tensor.shape)
+                    self.tensors[site] = np.array(candidate, copy=True)
         except (ValueError, np.linalg.LinAlgError) as error:
             accepted = False
             solver_converged = False
@@ -7114,7 +8926,7 @@ class FrontierTiedLETTA:
             else:
                 message = f"{message}; {error}"
         if not accepted:
-            self.tensors[site][...] = old_tensor
+            self.tensors[site] = old_tensor
             energy_after = energy_before
         self.energy = float(energy_after)
         return FrontierSiteUpdate(
@@ -7141,6 +8953,35 @@ class FrontierTiedLETTA:
             solver_coordinate_residual_norm=solver_coordinate_residual_norm,
         )
 
+    def _natural_gradient_support_indices(self, site):
+        """Return an optional reduced parameter support for global relaxation."""
+        return None
+
+    def _natural_gradient_local_data(self, site, environment, energy):
+        """Return the local metric, residual, and active parameter support."""
+        metric, effective = self.local_operators(
+            site,
+            environment=environment,
+        )
+        vector = self.tensors[site].reshape(-1)
+        residual = effective @ vector - float(energy) * (metric @ vector)
+        support = self._natural_gradient_support_indices(site)
+        if support is None:
+            return metric, vector, residual, None
+        support = np.asarray(support, dtype=np.intp)
+        if support.ndim != 1:
+            raise ValueError(
+                "natural-gradient parameter support must be one-dimensional."
+            )
+        if support.size == 0:
+            raise ValueError(f"tensor {site} has empty natural-gradient support.")
+        return (
+            metric[np.ix_(support, support)],
+            vector[support],
+            residual[support],
+            support,
+        )
+
     def natural_gradient_step(
         self,
         *,
@@ -7149,6 +8990,8 @@ class FrontierTiedLETTA:
         trust_radius: float = 0.25,
         max_backtracks: int = 12,
         armijo: float = 1.0e-4,
+        energy_before: float | None = None,
+        state_norm: float | None = None,
     ) -> FrontierNaturalGradientUpdate:
         r"""Move all tensors along a block-metric natural-gradient direction.
 
@@ -7159,14 +9002,16 @@ class FrontierTiedLETTA:
             g_k = (H_k - E N_k)t_k.
 
         This uses the block-diagonal collection of local metrics, not the full
-        cross-site metric.  Each direction is projected orthogonal to the
-        radial state direction.  A shared metric trust radius and exact Armijo
-        line search handle nonlinear cross terms when all tensors move.
+        cross-site metric.  Subclasses may restrict every local solve to an
+        exact structural parameter support.  Each direction is projected
+        orthogonal to the radial state direction.  A shared metric trust radius
+        and exact Armijo line search handle nonlinear cross terms when all
+        tensors move.
         """
         if isinstance(self._hamiltonian_frontier, TTMPOFrontier):
             raise NotImplementedError(
                 "natural_gradient_step currently requires dense local operators; "
-                "use matrix-free sweeps or LETTAVMC stochastic reconfiguration."
+                "use matrix-free sweeps or VMC stochastic reconfiguration."
             )
         metric_tol = float(metric_tol)
         damping = float(damping)
@@ -7184,8 +9029,16 @@ class FrontierTiedLETTA:
         if not np.isfinite(armijo) or not 0.0 < armijo < 1.0:
             raise ValueError("armijo must lie strictly between zero and one.")
 
-        energy_before = float(self.expectation())
-        state_norm = float(self.norm())
+        if energy_before is None:
+            energy_before = float(self.expectation())
+        else:
+            energy_before = float(energy_before)
+            if not np.isfinite(energy_before):
+                raise ValueError("energy_before must be finite.")
+        if state_norm is None:
+            state_norm = float(self.norm())
+        else:
+            state_norm = float(state_norm)
         if not np.isfinite(state_norm) or state_norm <= 0.0:
             raise ValueError("frontier-tied LETTA state is numerically zero.")
         norm_left = self._norm_frontier.build_left(self.tensors)
@@ -7208,13 +9061,18 @@ class FrontierTiedLETTA:
                 hamiltonian_left=hamiltonian_left[site],
                 hamiltonian_right=hamiltonian_right[site + 1],
             )
-            metric, effective = self.local_operators(
+            (
+                local_metric,
+                local_vector,
+                residual,
+                support,
+            ) = self._natural_gradient_local_data(
                 site,
-                environment=environment,
+                environment,
+                energy_before,
             )
             vector = tensor.reshape(-1)
-            residual = effective @ vector - energy_before * (metric @ vector)
-            eigenvalues, eigenvectors = np.linalg.eigh(metric)
+            eigenvalues, eigenvectors = np.linalg.eigh(local_metric)
             scale = max(
                 float(np.max(np.abs(eigenvalues), initial=0.0)),
                 np.finfo(float).tiny,
@@ -7233,31 +9091,46 @@ class FrontierTiedLETTA:
                 basis = eigenvectors[:, active]
                 values = eigenvalues[active]
                 coefficients = basis.conj().T @ residual
-                direction = -basis @ (coefficients / (values + damping * scale))
-            else:
-                direction = np.zeros_like(vector)
-            metric_vector = metric @ vector
-            metric_direction = metric @ direction
-            radial_denominator = np.vdot(vector, metric_vector)
-            if abs(radial_denominator) > np.finfo(float).tiny:
-                direction = direction - vector * (
-                    np.vdot(vector, metric_direction) / radial_denominator
+                local_direction = -basis @ (
+                    coefficients / (values + damping * scale)
                 )
-                metric_direction = metric @ direction
+            else:
+                local_direction = np.zeros_like(local_vector)
+            local_metric_vector = local_metric @ local_vector
+            local_metric_direction = local_metric @ local_direction
+            radial_denominator = np.vdot(local_vector, local_metric_vector)
+            if abs(radial_denominator) > np.finfo(float).tiny:
+                local_direction = local_direction - local_vector * (
+                    np.vdot(local_vector, local_metric_direction)
+                    / radial_denominator
+                )
+                local_metric_direction = local_metric @ local_direction
+            if support is None:
+                direction = local_direction
+            else:
+                direction = np.zeros(
+                    vector.shape,
+                    dtype=np.result_type(vector.dtype, local_direction.dtype),
+                )
+                direction[support] = local_direction
             direction = np.real_if_close(direction).astype(
                 np.result_type(tensor.dtype, direction.dtype),
                 copy=False,
             )
-            metric_direction = metric @ direction
             directions.append(direction.reshape(tensor.shape))
             gradient_norm_squared += float(np.vdot(residual, residual).real)
             direction_norm_squared += float(np.vdot(direction, direction).real)
             metric_direction_norm_squared += max(
-                float(np.vdot(direction, metric_direction).real / state_norm),
+                float(
+                    np.vdot(local_direction, local_metric_direction).real
+                    / state_norm
+                ),
                 0.0,
             )
             directional_derivative += float(
-                2.0 * np.real(np.vdot(residual, direction)) / state_norm
+                2.0
+                * np.real(np.vdot(residual, local_direction))
+                / state_norm
             )
             relative_directions.append(
                 float(np.linalg.norm(direction))
@@ -7465,12 +9338,22 @@ class FrontierTiedLETTA:
         sweep_offset: int = 0,
         tol: float = 1.0e-10,
         metric_tol: float = 1.0e-12,
-        solver="auto",
+        solver=None,
         matrix_free_threshold: int = 256,
         block_sparse_max_elements: int | None = 4_000_000,
         eig_tol: float = 1.0e-10,
+        adaptive_solver: bool = False,
+        eig_tol_initial: float = 1.0e-5,
         maxiter: int | None = None,
         max_subspace: int = 32,
+        preconditioner="auto",
+        block_size: int = 1,
+        enrich=None,
+        enrich_rank: int = 8,
+        enrich_tol: float = 1.0e-7,
+        enrich_scale: float = 1.0e-3,
+        enrich_every: int = 8,
+        enrich_trigger: float | None = 1.0e-4,
         natural_gradient_every: int = 0,
         natural_gradient_damping: float = 1.0e-6,
         natural_gradient_trust_radius: float = 0.25,
@@ -7495,6 +9378,86 @@ class FrontierTiedLETTA:
         nsweeps = int(nsweeps)
         if nsweeps < 0:
             raise ValueError("nsweeps must be nonnegative.")
+        adaptive_solver = bool(adaptive_solver)
+        eig_tol = float(eig_tol)
+        eig_tol_initial = float(eig_tol_initial)
+        if not np.isfinite(eig_tol) or eig_tol < 0.0:
+            raise ValueError("eig_tol must be finite and nonnegative.")
+        if not np.isfinite(eig_tol_initial) or eig_tol_initial < eig_tol:
+            raise ValueError("eig_tol_initial must be finite and at least eig_tol.")
+        block_size = int(block_size)
+        if block_size < 1:
+            raise ValueError("block_size must be positive.")
+        if solver is None:
+            solver = (
+                "matrix_free"
+                if self.requires_matrix_free_solver
+                else "metric_orthonormal"
+            )
+        if enrich is None:
+            enrich = "none"
+        else:
+            enrich = str(enrich).lower().replace("-", "_")
+        if enrich in {"off", "false"}:
+            enrich = "none"
+        if enrich in {"3s", "dmrg3s", "subspace_expansion"}:
+            enrich = "amen"
+        if enrich not in {"none", "amen"}:
+            raise ValueError("enrich must be 'amen' or None.")
+        enrich_rank = int(enrich_rank)
+        enrich_tol = float(enrich_tol)
+        enrich_scale = float(enrich_scale)
+        enrich_every = int(enrich_every)
+        if enrich_trigger is not None:
+            enrich_trigger = float(enrich_trigger)
+        if enrich_rank < 1:
+            raise ValueError("enrich_rank must be positive.")
+        if not np.isfinite(enrich_tol) or enrich_tol < 0.0:
+            raise ValueError("enrich_tol must be finite and nonnegative.")
+        if not np.isfinite(enrich_scale) or enrich_scale < 0.0:
+            raise ValueError("enrich_scale must be finite and nonnegative.")
+        if enrich_every < 1:
+            raise ValueError("enrich_every must be positive.")
+        if (
+            enrich_trigger is not None
+            and (
+                not np.isfinite(enrich_trigger)
+                or enrich_trigger < 0.0
+            )
+        ):
+            raise ValueError(
+                "enrich_trigger must be finite and nonnegative or None."
+            )
+        if enrich == "amen":
+            if not getattr(self, "adaptive_bond", False):
+                raise ValueError(
+                    "enrich='amen' requires adaptive_bond=True so D defines "
+                    "the expansion cap."
+                )
+            if self.uses_tensor_train_frontier:
+                raise ValueError(
+                    "enrich='amen' currently requires an exact dense, "
+                    "identity-block, or termwise frontier."
+                )
+            if not self.contraction_is_exact:
+                raise ValueError("enrich='amen' requires exact contraction.")
+        if gauge is None:
+            gauge = "none"
+        else:
+            gauge = str(gauge).lower().replace("-", "_")
+        if gauge == "auto":
+            gauge = (
+                "none"
+                if self.uses_tensor_train_frontier
+                else "frontier"
+            )
+        if gauge not in {"none", "frontier", "virtual"}:
+            raise ValueError(
+                "gauge must be 'auto', 'frontier', 'virtual', or None."
+            )
+        gauge_weight = str(gauge_weight).lower().replace("-", "_")
+        if gauge_weight not in {"uniform", "probability"}:
+            raise ValueError("gauge_weight must be 'uniform' or 'probability'.")
         sweep_offset = int(sweep_offset)
         if sweep_offset < 0:
             raise ValueError("sweep_offset must be nonnegative.")
@@ -7517,6 +9480,37 @@ class FrontierTiedLETTA:
         natural_gradient_every = int(natural_gradient_every)
         if natural_gradient_every < 0:
             raise ValueError("natural_gradient_every must be nonnegative.")
+        natural_gradient_adaptive = bool(natural_gradient_adaptive)
+        natural_gradient_trust_radius = float(natural_gradient_trust_radius)
+        if (
+            not np.isfinite(natural_gradient_trust_radius)
+            or natural_gradient_trust_radius <= 0.0
+        ):
+            raise ValueError(
+                "natural_gradient_trust_radius must be finite and positive."
+            )
+        natural_gradient_min_relative_gain = float(
+            natural_gradient_min_relative_gain
+        )
+        if (
+            not np.isfinite(natural_gradient_min_relative_gain)
+            or natural_gradient_min_relative_gain < 0.0
+        ):
+            raise ValueError(
+                "natural_gradient_min_relative_gain must be finite and "
+                "nonnegative."
+            )
+        if natural_gradient_max_interval is None:
+            natural_gradient_max_interval = (
+                4 * natural_gradient_every if natural_gradient_every else 0
+            )
+        else:
+            natural_gradient_max_interval = int(natural_gradient_max_interval)
+            if natural_gradient_max_interval < natural_gradient_every:
+                raise ValueError(
+                    "natural_gradient_max_interval must be at least "
+                    "natural_gradient_every."
+                )
         if nsweeps and not self.norm_contraction_is_exact:
             raise ValueError(
                 "variational sweeps require an exact norm contraction; all-TT "
@@ -7533,33 +9527,125 @@ class FrontierTiedLETTA:
         ):
             raise ValueError(
                 "natural-gradient sweeps are unavailable for tensor-train "
-                "frontiers; use LETTAVMC stochastic reconfiguration."
+                "frontiers; use VMC stochastic reconfiguration."
             )
-        if isinstance(self._norm_frontier, TTMPOFrontier) and frontier_canonicalization:
+        if isinstance(self._norm_frontier, TTMPOFrontier) and gauge == "frontier":
             raise ValueError(
                 "frontier canonicalization currently requires dense exact "
-                "messages; use virtual_canonicalization instead."
+                "messages; use gauge='virtual' or gauge=None."
             )
-        if virtual_canonicalization and frontier_canonicalization:
-            raise ValueError(
-                "virtual and frontier canonicalization cannot both be enabled."
-            )
+        retained_run_history = tuple(self.history)
         previous = self.expectation()
         self.energy = previous
         self.history = []
         self.converged = False
+        cycle_start_energy = previous
+        cycle_stationary = True
+        cycle_started = False
+        natural_gradient_interval = natural_gradient_every
+        natural_gradient_next_sweep = (
+            (
+                sweep_offset // natural_gradient_every + 1
+            )
+            * natural_gradient_every
+            if natural_gradient_every
+            else None
+        )
+        current_natural_gradient_trust_radius = natural_gradient_trust_radius
+        minimum_natural_gradient_trust_radius = (
+            natural_gradient_trust_radius / 16.0
+        )
+        maximum_natural_gradient_trust_radius = (
+            4.0 * natural_gradient_trust_radius
+        )
+        natural_gradient_attempts = 0
+        last_natural_gradient_was_useful = False
+        if retained_run_history:
+            last_record = retained_run_history[-1]
+            last_relative_sweep_gain = float(
+                last_record.get(
+                    "relative_sweep_gain",
+                    abs(float(last_record.get("delta_energy", np.inf)))
+                    / max(1.0, abs(float(last_record.get("energy", previous)))),
+                )
+            )
+        else:
+            last_relative_sweep_gain = float("inf")
         for sweep in range(nsweeps):
             directional_sweep = sweep_offset + sweep
-            updates = []
-            frontier_gauge = None
-            if frontier_canonicalization:
-                frontier_gauge = self.canonicalize_frontier_gauge(
-                    metric_tol=metric_tol,
-                    max_condition=frontier_gauge_max_condition,
-                    weighting=frontier_gauge_weighting,
-                )
             if directional_sweep % 2 == 0:
-                if virtual_canonicalization:
+                cycle_start_energy = previous
+                cycle_stationary = True
+                cycle_started = True
+            active_eig_tol = eig_tol
+            if adaptive_solver:
+                gain_tolerance = (
+                    eig_tol_initial
+                    if not np.isfinite(last_relative_sweep_gain)
+                    else 0.1 * last_relative_sweep_gain
+                )
+                active_eig_tol = max(
+                    eig_tol,
+                    min(eig_tol_initial, gain_tolerance),
+                )
+            amen_refresh_scheduled = bool(
+                enrich == "amen"
+                and directional_sweep % enrich_every == 0
+            )
+            amen_refresh_due = bool(
+                amen_refresh_scheduled
+                and (
+                    enrich_trigger is None
+                    or last_relative_sweep_gain <= enrich_trigger
+                )
+            )
+            updates = []
+            gauge_update = None
+            bond_refreshes = []
+            amen_refresh_accepted = True
+            amen_sweep_snapshot = None
+            retained_history = self.history
+            bond_reductions = (
+                self.reduce_null_bonds()
+                if (
+                    getattr(self, "adaptive_bond", False)
+                    # An AMEn channel opened in a left-to-right pass has only
+                    # been varied from its right tensor.  Keep it through the
+                    # reverse pass before deciding that it is exactly null.
+                    and not (enrich == "amen" and directional_sweep % 2 == 1)
+                )
+                else ()
+            )
+            self.history = retained_history
+            bond_expansions = list(
+                self.adapt_bonds(
+                    direction="left" if directional_sweep % 2 == 0 else "right"
+                )
+            )
+            self.history = retained_history
+            if bond_expansions:
+                previous = self.expectation()
+                self.energy = previous
+            if gauge == "frontier":
+                gauge_update = self.canonicalize_frontier_gauge(
+                    metric_tol=metric_tol,
+                    max_condition=gauge_max_condition,
+                    weighting=gauge_weight,
+                )
+            if enrich == "amen":
+                amen_sweep_snapshot = {
+                    "tensors": [tensor.copy() for tensor in self.tensors],
+                    "bond_dims": self._bond_dims(),
+                    "bond_dim": self.bond_dim,
+                    "energy": float(self.expectation()),
+                    "layout": deepcopy(getattr(self, "abelian_layout", None)),
+                    "null_reduced_cuts": set(
+                        getattr(self, "_null_reduced_cuts", ())
+                    ),
+                }
+            pending_amen = None
+            if directional_sweep % 2 == 0:
+                if gauge == "virtual":
                     self.canonicalize_virtual("right")
                     if not self.hamiltonian_contraction_is_exact:
                         previous = self.expectation()
@@ -7640,7 +9726,7 @@ class FrontierTiedLETTA:
                             site,
                         )
             else:
-                if virtual_canonicalization:
+                if gauge == "virtual":
                     self.canonicalize_virtual("left")
                     if not self.hamiltonian_contraction_is_exact:
                         previous = self.expectation()
@@ -7739,28 +9825,184 @@ class FrontierTiedLETTA:
             )
             directional_endpoint_energy = float(np.real(numerator / norm))
             if self.hamiltonian_contraction_is_exact:
+                if bond_refreshes:
+                    candidate_energy = directional_endpoint_energy
+                    start_energy = amen_sweep_snapshot["energy"]
+                    acceptance_tolerance = (
+                        512.0
+                        * np.finfo(float).eps
+                        * max(1.0, abs(start_energy))
+                    )
+                    amen_refresh_accepted = bool(
+                        np.isfinite(candidate_energy)
+                        and candidate_energy <= start_energy + acceptance_tolerance
+                    )
+                    if amen_refresh_accepted:
+                        energy = candidate_energy
+                    else:
+                        self.tensors = [
+                            tensor.copy()
+                            for tensor in amen_sweep_snapshot["tensors"]
+                        ]
+                        self._virtual_bond_dims = tuple(
+                            amen_sweep_snapshot["bond_dims"]
+                        )
+                        self.bond_dim = int(amen_sweep_snapshot["bond_dim"])
+                        if amen_sweep_snapshot["layout"] is not None:
+                            self.abelian_layout = amen_sweep_snapshot["layout"]
+                            self.local_masks = self.abelian_layout.local_masks(
+                                self.physical_groups
+                            )
+                            self._apply_bond_gauge_constraints()
+                        self._null_reduced_cuts = set(
+                            amen_sweep_snapshot["null_reduced_cuts"]
+                        )
+                        self._rebuild_frontier_engines()
+                        norm = float(
+                            np.real(self._norm_frontier.scalar(self.tensors))
+                        )
+                        energy = start_energy
+                        bond_refreshes = tuple(
+                            replace(record, accepted=False)
+                            for record in bond_refreshes
+                        )
+                else:
+                    energy = directional_endpoint_energy
                 self.balance_gauges(state_norm=np.sqrt(norm))
-                energy = directional_endpoint_energy
             else:
                 # Per-tensor gauge rescalings preserve the exact state but can
                 # change a rank-truncated TT contraction through finite-rank
                 # rounding.  Keep the gauge in which every proposal was checked.
                 energy = self.expectation()
             self.energy = energy
+            sweep_delta = abs(energy - previous)
             natural_gradient = None
-            if (
-                natural_gradient_every
-                and (directional_sweep + 1) % natural_gradient_every == 0
-            ):
+            natural_gradient_quality_ratio = float("nan")
+            natural_gradient_relative_gain = 0.0
+            completed_sweeps = directional_sweep + 1
+            if natural_gradient_adaptive:
+                stagnation_trigger = bool(
+                    sweep_delta <= tol
+                    and (
+                        natural_gradient_attempts == 0
+                        or last_natural_gradient_was_useful
+                    )
+                )
+                natural_gradient_due = bool(
+                    natural_gradient_every
+                    and (
+                        completed_sweeps >= natural_gradient_next_sweep
+                        or stagnation_trigger
+                    )
+                )
+            else:
+                natural_gradient_due = bool(
+                    natural_gradient_every
+                    and completed_sweeps % natural_gradient_every == 0
+                )
+            used_natural_gradient_trust_radius = (
+                current_natural_gradient_trust_radius
+            )
+            if natural_gradient_due:
+                natural_gradient_attempts += 1
                 natural_gradient = self.natural_gradient_step(
                     metric_tol=metric_tol,
                     damping=natural_gradient_damping,
-                    trust_radius=natural_gradient_trust_radius,
+                    trust_radius=used_natural_gradient_trust_radius,
                     max_backtracks=natural_gradient_max_backtracks,
+                    energy_before=energy,
+                    state_norm=1.0,
                 )
                 energy = float(self.energy)
+                actual_gain = max(
+                    float(natural_gradient.energy_before - natural_gradient.energy),
+                    0.0,
+                )
+                natural_gradient_relative_gain = actual_gain / max(
+                    1.0,
+                    abs(float(natural_gradient.energy_before)),
+                )
+                last_natural_gradient_was_useful = bool(
+                    natural_gradient.accepted
+                    and natural_gradient_relative_gain
+                    >= natural_gradient_min_relative_gain
+                )
+                predicted_gain = (
+                    -float(natural_gradient.step_size)
+                    * float(natural_gradient.directional_derivative)
+                )
+                if predicted_gain > np.finfo(float).tiny:
+                    natural_gradient_quality_ratio = actual_gain / predicted_gain
+                if natural_gradient_adaptive:
+                    low_utility = (
+                        not natural_gradient.accepted
+                        or natural_gradient_relative_gain
+                        < natural_gradient_min_relative_gain
+                    )
+                    poor_model = (
+                        natural_gradient.backtracks > 1
+                        or (
+                            np.isfinite(natural_gradient_quality_ratio)
+                            and natural_gradient_quality_ratio < 0.25
+                        )
+                    )
+                    good_model = bool(
+                        natural_gradient.accepted
+                        and natural_gradient.backtracks == 0
+                        and np.isfinite(natural_gradient_quality_ratio)
+                        and natural_gradient_quality_ratio > 0.75
+                    )
+                    if low_utility:
+                        natural_gradient_interval = min(
+                            natural_gradient_max_interval,
+                            max(
+                                natural_gradient_interval + 1,
+                                2 * natural_gradient_interval,
+                            ),
+                        )
+                        current_natural_gradient_trust_radius = max(
+                            minimum_natural_gradient_trust_radius,
+                            0.5 * current_natural_gradient_trust_radius,
+                        )
+                    elif poor_model:
+                        natural_gradient_interval = min(
+                            natural_gradient_max_interval,
+                            natural_gradient_interval + 1,
+                        )
+                        current_natural_gradient_trust_radius = max(
+                            minimum_natural_gradient_trust_radius,
+                            0.5 * current_natural_gradient_trust_radius,
+                        )
+                    elif good_model:
+                        natural_gradient_interval = max(
+                            natural_gradient_every,
+                            (natural_gradient_interval + 1) // 2,
+                        )
+                        current_natural_gradient_trust_radius = min(
+                            maximum_natural_gradient_trust_radius,
+                            1.25 * current_natural_gradient_trust_radius,
+                        )
+                    natural_gradient_next_sweep = (
+                        completed_sweeps + natural_gradient_interval
+                    )
+                else:
+                    natural_gradient_next_sweep = (
+                        completed_sweeps + natural_gradient_every
+                    )
             delta = abs(energy - previous)
+            relative_sweep_gain = delta / max(1.0, abs(previous))
             solver_failures = sum(not update.solver_converged for update in updates)
+            bond_regrowth_cooldown = tuple(
+                sorted(set(getattr(self, "_null_reduced_cuts", ())))
+            )
+            maximum_bonds = tuple(
+                getattr(self, "_maximum_bond_dims", self._bond_dims())
+            )
+            permanent_bond_expansions = tuple(
+                expansion
+                for expansion in bond_expansions
+                if expansion.new_dimension <= maximum_bonds[expansion.cut]
+            )
             self.energy = energy
             self.history.append(
                 {
@@ -7774,7 +10016,56 @@ class FrontierTiedLETTA:
                     ),
                     "metric_matvecs": sum(update.metric_matvecs for update in updates),
                     "natural_gradient": natural_gradient,
-                    "frontier_gauge": frontier_gauge,
+                    "natural_gradient_adaptive": natural_gradient_adaptive,
+                    "natural_gradient_interval": natural_gradient_interval,
+                    "natural_gradient_next_sweep": natural_gradient_next_sweep,
+                    "natural_gradient_trust_radius": (
+                        used_natural_gradient_trust_radius
+                    ),
+                    "natural_gradient_next_trust_radius": (
+                        current_natural_gradient_trust_radius
+                    ),
+                    "natural_gradient_quality_ratio": (
+                        natural_gradient_quality_ratio
+                    ),
+                    "natural_gradient_relative_gain": (
+                        natural_gradient_relative_gain
+                    ),
+                    "gauge": gauge,
+                    "gauge_weight": gauge_weight,
+                    "gauge_update": gauge_update,
+                    "bond_reductions": bond_reductions,
+                    "bond_expansions": tuple(bond_expansions),
+                    "permanent_bond_expansions": permanent_bond_expansions,
+                    "bond_refreshes": bond_refreshes,
+                    "amen_refresh_accepted": amen_refresh_accepted,
+                    "bond_regrowth_cooldown": bond_regrowth_cooldown,
+                    "enrich": None if enrich == "none" else enrich,
+                    "enrich_rank": enrich_rank,
+                    "enrich_tol": enrich_tol,
+                    "enrich_scale": enrich_scale,
+                    "enrich_every": enrich_every,
+                    "enrich_trigger": enrich_trigger,
+                    "amen_refresh_scheduled": amen_refresh_scheduled,
+                    "amen_refresh_due": amen_refresh_due,
+                    "relative_sweep_gain": relative_sweep_gain,
+                    "cycle": directional_sweep // 2,
+                    "cycle_complete": bool(
+                        cycle_started and directional_sweep % 2 == 1
+                    ),
+                    "cycle_start_energy": float(cycle_start_energy),
+                    "cycle_delta": (
+                        abs(energy - cycle_start_energy)
+                        if cycle_started and directional_sweep % 2 == 1
+                        else None
+                    ),
+                    "adaptive_solver": adaptive_solver,
+                    "eig_tol": active_eig_tol,
+                    "block_size": block_size,
+                    "preconditioner": (
+                        "callable" if callable(preconditioner) else preconditioner
+                    ),
+                    "bond_dims": self.bond_dims,
                     "contraction_is_exact": self.contraction_is_exact,
                     "norm_contraction_is_exact": self.norm_contraction_is_exact,
                     "hamiltonian_contraction_is_exact": (
@@ -7808,14 +10099,39 @@ class FrontierTiedLETTA:
                     f"natural={None if natural_gradient is None else natural_gradient.accepted}",
                     flush=True,
                 )
+            # Reduction suppresses only same-pass regrowth.  The opposite
+            # sweep has a changed residual and may legitimately reopen a cut.
+            self._null_reduced_cuts = set()
+            last_relative_sweep_gain = relative_sweep_gain
             natural_gradient_stationary = (
                 natural_gradient is None
                 or natural_gradient.accepted
                 or abs(natural_gradient.directional_derivative) <= tol
             )
-            if delta <= tol and solver_failures == 0 and natural_gradient_stationary:
+            directional_stationary = bool(
+                delta <= tol
+                and solver_failures == 0
+                and natural_gradient_stationary
+                and not bond_reductions
+                and not permanent_bond_expansions
+                and amen_refresh_accepted
+                and (enrich != "amen" or amen_refresh_due)
+            )
+            cycle_stationary = bool(cycle_stationary and directional_stationary)
+            cycle_complete = bool(
+                cycle_started and directional_sweep % 2 == 1
+            )
+            cycle_delta = (
+                abs(energy - cycle_start_energy) if cycle_complete else None
+            )
+            self.history[-1]["cycle_stationary"] = (
+                cycle_stationary if cycle_complete else None
+            )
+            if cycle_complete and cycle_stationary and cycle_delta <= tol:
                 self.converged = True
                 break
+            if cycle_complete:
+                cycle_started = False
             previous = energy
         return self
 
@@ -7824,7 +10140,7 @@ class FrontierTiedLETTA:
         configs = np.asarray(list(np.ndindex(*self.dims)), dtype=np.intp)
         dtype = np.result_type(*[tensor.dtype for tensor in self.tensors])
         environment = np.ones((len(configs), 1), dtype=dtype)
-        for site, physical_sites in enumerate(self.physical_sites):
+        for site, physical_sites in enumerate(self.physical_groups):
             tensor = self.tensors[site]
             left_dim, right_dim = tensor.shape[:2]
             columns = np.ravel_multi_index(
@@ -7858,6 +10174,8 @@ GraphLETTA = FrontierTiedLETTA
 
 __all__ = [
     "FrontierBondExpansion",
+    "FrontierBondRefresh",
+    "FrontierTieReduction",
     "FrontierGaugeUpdate",
     "FrontierNaturalGradientUpdate",
     "FrontierSiteEnvironment",

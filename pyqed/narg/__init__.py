@@ -4,13 +4,13 @@
 Nonadiabatic renormalization-group utilities.
 """
 
+from pyqed.lattice import Site
+
 from .core import (
     Block,
     NARGBase,
     SequentialNARGState,
-    Site,
     State,
-    Step,
     fuse_two_sites,
     narg_state_vector,
 )
@@ -216,7 +216,6 @@ from .functional import (
     Phi4MomentumSpaceNARGResult,
     Phi4MomentumSpaceNARGStepResult,
 )
-from .irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, SU2Symmetry, U1Symmetry
 from .hamiltonian import (
     HamiltonianSpec,
     IntegralHamiltonian,
@@ -263,7 +262,6 @@ __all__ = [
     "SequentialNARGState",
     "Site",
     "State",
-    "Step",
     "InfiniteNARG",
     "iNARG",
     "iNARGStep",
@@ -470,19 +468,12 @@ __all__ = [
     "polynomial_one_mode_narg_shell_projection",
     "polynomial_pes_value",
     "stationary_curvature_window",
-    "Irrep",
-    "IrrepSite",
-    "IrrepTensor",
     "HamiltonianSpec",
     "IntegralHamiltonian",
     "MPOHamiltonian",
     "normalize_orbital_blocks",
     "normalize_symmetry",
     "NARG",
-    "OpIrrep",
-    "ProductSymmetry",
-    "SU2Symmetry",
-    "U1Symmetry",
     "QCNARG",
 ]
 

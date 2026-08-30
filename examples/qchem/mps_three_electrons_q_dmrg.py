@@ -5,7 +5,7 @@ Three-electron q-coordinate demo with MPO + two-site DMRG.
 
 This script:
 1) builds a 3-electron t-V Hamiltonian in q-space (dense matrix),
-2) builds an MPO via AutoMPO terms,
+2) builds an MPO via ModelMPO terms,
 3) runs pyqed's DMRG,
 4) compares to exact diagonalization.
 """
@@ -13,11 +13,11 @@ This script:
 import numpy as np
 
 from pyqed.mps.dmrg import DMRG
-from pyqed.mps.mps import MPO
-from pyqed.mps.autompo.basis import BasisSet
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.autompo.light_automatic_mpo import Mpo as AutoMPO
+from pyqed.tn import MPO
+from pyqed.operator_mpo.basis import BasisSet
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.model import Model
+from pyqed.operator_mpo.model_mpo import ModelMPO as ModelMPO
 
 
 class BasisQFinite(BasisSet):
@@ -174,7 +174,7 @@ def build_hamiltonian_q3(L=20, t=1.0, V=2.0, qmax=8, lam=100.0):
 
 def autompo_hamiltonian_q3(H, d, *, base=3, n_digits=2, tol=1e-14):
     """
-    Build AutoMPO from a dense q-space Hamiltonian by expanding it into local
+    Build ModelMPO from a dense q-space Hamiltonian by expanding it into local
     transition operators |q'_1 q'_2 q'_3><q_1 q_2 q_3| on a multi-site code.
     """
     if base ** n_digits != d:
@@ -203,7 +203,7 @@ def autompo_hamiltonian_q3(H, d, *, base=3, n_digits=2, tol=1e-14):
         terms.append(term)
 
     model = Model(basis=basis, ham_terms=terms)
-    auto_mpo = AutoMPO(model, algo="qr")
+    auto_mpo = ModelMPO(model, algo="qr")
     factors = []
     for w in auto_mpo.matrices:
         arr = np.asarray(w)
@@ -303,7 +303,7 @@ def main():
         not_conv_err=False,
     ).run()
 
-    mps_gs = dmrg.ground_state.to_order(['lv', 'p', 'rv']).factors
+    mps_gs = dmrg.state.to_order(['lv', 'p', 'rv']).factors
     psi_dmrg_encoded = mps_to_state(mps_gs)
     psi_dmrg = encoded_state_to_q_state(psi_dmrg_encoded, d, base=base, n_digits=n_digits)
     psi_dmrg /= np.linalg.norm(psi_dmrg)
@@ -322,14 +322,14 @@ def main():
     dpsi = np.linalg.norm(psi_exact - psi_dmrg_aligned)
     dens, w_phys = density_from_q_state(psi_dmrg, d=d, L=L)
 
-    print("=== 3-electron q-coordinate AutoMPO+DMRG demo ===")
+    print("=== 3-electron q-coordinate ModelMPO+DMRG demo ===")
     print(f"L={L}, t={t}, V={V}, qmax={qmax}, lambda={lam}, d={d}")
     print(f"Encoding: base={base}, n_digits={n_digits}, nsites={nsites}")
-    print(f"AutoMPO input terms: {nterms}")
+    print(f"ModelMPO input terms: {nterms}")
     print(f"Product-space dimension: {d**3}")
-    print(f"DMRG energy:  {float(dmrg.e_tot):.12f}")
+    print(f"DMRG energy:  {float(dmrg.energy):.12f}")
     print(f"Exact energy: {e_exact:.12f}")
-    print(f"|dE|:         {abs(float(dmrg.e_tot) - e_exact):.3e}")
+    print(f"|dE|:         {abs(float(dmrg.energy) - e_exact):.3e}")
     print(f"Overlap |<exact|dmrg>|: {overlap:.12f}")
     print(f"||psi_exact-psi_dmrg||_2: {dpsi:.3e}")
     print(f"Physical-sector weight: {w_phys:.12f}")

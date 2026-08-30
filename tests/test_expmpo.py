@@ -3,7 +3,8 @@ from scipy.linalg import expm
 from tensorly.decomposition import tensor_train_matrix
 
 from pyqed.mps.decompose import decompose, tt_to_tensor
-from pyqed.mps.mps import MPS, MPO, expmpo
+from pyqed.mps.mps import MPS, expmpo
+from pyqed.tn import MPO
 
 
 def _dense_to_mpo(matrix, nsites, phys_dim=2):

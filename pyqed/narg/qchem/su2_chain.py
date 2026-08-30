@@ -10,7 +10,7 @@ import time
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep
+from pyqed.symmetry import Irrep, Leg, IrrepTensor, OpIrrep
 from .su2_three_site import (
     CDD,
     CDU,
@@ -21,7 +21,7 @@ from .su2_three_site import (
     block_density_tensor,
     block_spin_density_tensor,
     block_retained_scalar_tensor,
-    branch_irrep_site,
+    branch_leg,
     coupled_product_states,
     direct_reduced_full_hamiltonian_tensor,
     expanded_operator_from_reduced,
@@ -153,7 +153,7 @@ def _local_v1_reduced_operator(name: str) -> ReducedSU2Tensor:
 
 def block_dim(narg: ThreeSiteSU2NARG) -> int:
     """Total multiplicity-space dimension of an IrrepTensor Hamiltonian."""
-    return int(sum(narg.site.dims.values()))
+    return int(sum(narg.leg.dims.values()))
 
 
 def block_identity_reduced_tensor(block: RenormalizedSU2Block):
@@ -161,8 +161,8 @@ def block_identity_reduced_tensor(block: RenormalizedSU2Block):
     return block_retained_scalar_tensor(
         block,
         {
-            irrep: np.eye(block.truncated.site.sector_dim(irrep), dtype=complex)
-            for irrep in block.truncated.site.irreps
+            irrep: np.eye(block.truncated.leg.sector_dim(irrep), dtype=complex)
+            for irrep in block.truncated.leg.irreps
         },
     )
 
@@ -1135,10 +1135,10 @@ def add_weighted_reduced_terms(
     if not terms:
         return None
 
-    site = terms[0][0].site
+    site = terms[0][0].leg
     op = terms[0][0].op
     for tensor, _ in terms:
-        if tensor.site != site or tensor.op != op:
+        if tensor.leg != site or tensor.op != op:
             raise ValueError("weighted reduced tensor site/op mismatch")
 
     blocks = {}
@@ -1684,12 +1684,12 @@ def reduced_coupling_operators_from_growth(
             backend=backend,
         )
 
-    selected = set(truncated.site.irreps)
+    selected = set(truncated.leg.irreps)
     return {
         key: ReducedSU2Tensor(
             IrrepTensor(
-                truncated.site,
-                truncated.site,
+                truncated.leg,
+                truncated.leg,
                 tensor.op,
                 {
                     (bra, ket): value
@@ -1857,7 +1857,7 @@ def renormalized_block_from_narg(
         else block_sites + len(tuple(future_sites))
     )
     allowed_irreps = feasible_irreps_for_target_spin(
-        narg.site.irreps,
+        narg.leg.irreps,
         block_sites=block_sites,
         final_sites=final_sites,
         target_nelec=target_nelec if target_nelec is not None else final_sites,
@@ -1866,7 +1866,7 @@ def renormalized_block_from_narg(
     if retain_all:
         selected_irreps = [
             irrep
-            for irrep in narg.site.irreps
+            for irrep in narg.leg.irreps
             if (allowed_nelec is None or irrep.charge[0] in allowed_nelec)
             and (allowed_irreps is None or irrep in allowed_irreps)
         ]
@@ -1874,8 +1874,8 @@ def renormalized_block_from_narg(
             raise ValueError(
                 "no feasible SU2 multiplets remain in the exact cluster interior"
             )
-        dims = {irrep: narg.site.sector_dim(irrep) for irrep in selected_irreps}
-        site = IrrepSite(narg.site.symmetry, dims)
+        dims = {irrep: narg.leg.sector_dim(irrep) for irrep in selected_irreps}
+        site = Leg(dims, symmetry=narg.leg.symmetry)
         roots = []
         transform_blocks = {}
         hamiltonian_blocks = {}
@@ -1896,7 +1896,7 @@ def renormalized_block_from_narg(
                     )
                 )
         transform = IrrepTensor(
-            narg.site,
+            narg.leg,
             site,
             OpIrrep((0, 0)),
             transform_blocks,
@@ -1980,7 +1980,7 @@ def grow_one_site_direct_reduced(
     )
     if build_branch_basis:
         branch_states = grow_su2_block_by_one_site(retained_multiplets(source_block.truncated))
-        site, bases, provenance = branch_irrep_site(branch_states)
+        site, bases, provenance = branch_leg(branch_states)
         site = hamiltonian.bra
     else:
         branch_states = []
@@ -2131,7 +2131,7 @@ def run_su2_narg_chain(
             else:
                 # Keeping every feasible multiplet makes the internal growth an
                 # exact reduced-basis realization of one composite supersite.
-                retain = sum(int(dim) for dim in final.site.dims.values())
+                retain = sum(int(dim) for dim in final.leg.dims.values())
             blocks[nsites] = renormalized_block_from_narg(
                 final,
                 h1e_n,
@@ -2372,7 +2372,7 @@ def project_hamiltonian_irrep_tensor(
     blocks = {}
     norb = np.asarray(h1e).shape[0]
     for irrep, basis in narg.bases.items():
-        if irrep not in narg.site.dims:
+        if irrep not in narg.leg.dims:
             continue
         if basis.size == 0:
             continue
@@ -2392,4 +2392,4 @@ def project_hamiltonian_irrep_tensor(
         block = 0.5 * (block + block.conj().T)
         if block.size and np.any(np.abs(block) > 1.0e-14):
             blocks[(irrep, irrep)] = block
-    return IrrepTensor(narg.site, narg.site, OpIrrep((0, 0)), blocks)
+    return IrrepTensor(narg.leg, narg.leg, OpIrrep((0, 0)), blocks)

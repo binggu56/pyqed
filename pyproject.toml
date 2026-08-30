@@ -43,6 +43,7 @@ dependencies = [
     "opt-einsum>=3.3",
     "periodictable>=1.7",
     "scipy>=1.13",
+    "threadpoolctl>=3.5",
 ]
 
 [project.optional-dependencies]

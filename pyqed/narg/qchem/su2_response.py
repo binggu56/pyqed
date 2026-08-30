@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepTensor, OpIrrep
+from pyqed.symmetry import Irrep, IrrepTensor, OpIrrep
 from pyqed.qchem.mcscf.orbopt import orbital_eri_response, orbital_h1_response
 
 from .su2_rdm import build_su2_rdms
@@ -457,8 +457,8 @@ def truncation_tangent(
             )
 
     d_hamiltonian = IrrepTensor(
-        truncated.site,
-        truncated.site,
+        truncated.leg,
+        truncated.leg,
         truncated.hamiltonian.op,
         d_h_blocks,
     )
@@ -698,8 +698,8 @@ def truncation_bilinear_tangent(
                 diag.append(dxy_energies[root_key])
             d_h_blocks[(irrep, irrep)] = np.diag(diag)
         dxy_hamiltonian = IrrepTensor(
-            truncated.site,
-            truncated.site,
+            truncated.leg,
+            truncated.leg,
             truncated.hamiltonian.op,
             d_h_blocks,
         )
@@ -903,14 +903,14 @@ def rotate_irrep_tensor_tangent(
     blocks = {}
     keys = set(operator.blocks) | set(operator_tangent.blocks)
     for bra_irrep, ket_irrep in keys:
-        if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
+        if bra_irrep not in truncated.leg.dims or ket_irrep not in truncated.leg.dims:
             continue
         if (
-            truncated.source.site.sector_dim(bra_irrep) == 0
-            or truncated.source.site.sector_dim(ket_irrep) == 0
+            truncated.source.leg.sector_dim(bra_irrep) == 0
+            or truncated.source.leg.sector_dim(ket_irrep) == 0
         ):
             continue
-        if not truncated.site.symmetry.allows(
+        if not truncated.leg.symmetry.allows(
             bra_irrep.charge,
             operator.op.charge,
             ket_irrep.charge,
@@ -935,7 +935,7 @@ def rotate_irrep_tensor_tangent(
         )
         if np.any(np.abs(block) > atol):
             blocks[(bra_irrep, ket_irrep)] = block
-    return IrrepTensor(truncated.site, truncated.site, operator.op, blocks)
+    return IrrepTensor(truncated.leg, truncated.leg, operator.op, blocks)
 
 
 def rotate_irrep_tensor_tangent_adjoint(
@@ -961,14 +961,14 @@ def rotate_irrep_tensor_tangent_adjoint(
     transform_adjoint_blocks = {}
 
     for (bra_irrep, ket_irrep), adj_block in rotated_adjoint.blocks.items():
-        if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
+        if bra_irrep not in truncated.leg.dims or ket_irrep not in truncated.leg.dims:
             continue
         if (
-            truncated.source.site.sector_dim(bra_irrep) == 0
-            or truncated.source.site.sector_dim(ket_irrep) == 0
+            truncated.source.leg.sector_dim(bra_irrep) == 0
+            or truncated.source.leg.sector_dim(ket_irrep) == 0
         ):
             continue
-        if not truncated.site.symmetry.allows(
+        if not truncated.leg.symmetry.allows(
             bra_irrep.charge,
             operator.op.charge,
             ket_irrep.charge,
@@ -1033,8 +1033,8 @@ def _bilinear_rotation_pairs(truncated, truncation_response, op):
     if cached is not None:
         return cached
 
-    source_site = truncated.source.site
-    target_site = truncated.site
+    source_site = truncated.source.leg
+    target_site = truncated.leg
     transform = truncated.transform
     pair_data = {}
     for bra_irrep in target_site.dims:
@@ -1137,7 +1137,7 @@ def rotate_irrep_tensor_bilinear(
             continue
         if np.any(np.abs(block) > atol):
             blocks[key] = block
-    return IrrepTensor(truncated.site, truncated.site, operator.op, blocks)
+    return IrrepTensor(truncated.leg, truncated.leg, operator.op, blocks)
 
 
 def rotate_irrep_tensor_bilinear_adjoint_x(
@@ -1304,7 +1304,7 @@ def rotate_reduced_tensor_bilinear(
 
 
 def _zero_reduced_like(tensor: ReducedSU2Tensor) -> ReducedSU2Tensor:
-    return ReducedSU2Tensor(IrrepTensor(tensor.site, tensor.site, tensor.op, {}))
+    return ReducedSU2Tensor(IrrepTensor(tensor.leg, tensor.leg, tensor.op, {}))
 
 
 def _zero_reduced(site, op) -> ReducedSU2Tensor:
@@ -1412,7 +1412,7 @@ def reduced_scalar_product_block_adjoint(
         if np.any(np.abs(value) > 1.0e-14)
     }
     return ReducedSU2Tensor(
-        IrrepTensor(block_tensor.site, block_tensor.site, block_tensor.op, out_blocks)
+        IrrepTensor(block_tensor.leg, block_tensor.leg, block_tensor.op, out_blocks)
     )
 
 
@@ -1455,7 +1455,7 @@ def reduced_product_tensor_block_adjoint(
         if np.any(np.abs(value) > 1.0e-14)
     }
     return ReducedSU2Tensor(
-        IrrepTensor(block_tensor.site, block_tensor.site, block_tensor.op, out_blocks)
+        IrrepTensor(block_tensor.leg, block_tensor.leg, block_tensor.op, out_blocks)
     )
 
 
@@ -1469,10 +1469,10 @@ def coupled_reduced_product_adjoint(
     atol: float = 1.0e-12,
 ) -> tuple[ReducedSU2Tensor, ReducedSU2Tensor]:
     """Adjoint of ``coupled_reduced_product`` wrt both input tensors."""
-    from .su2_reduced_tensor import _coupled_product_angular_terms, _site_charge_signature
+    from .su2_reduced_tensor import _coupled_product_angular_terms, _leg_charge_signature
 
     terms = _coupled_product_angular_terms(
-        _site_charge_signature(left.site),
+        _leg_charge_signature(left.leg),
         tuple(int(x) for x in left.op.charge),
         tuple(int(x) for x in right.op.charge),
         int(rank2),
@@ -1516,8 +1516,8 @@ def coupled_reduced_product_adjoint(
         if np.any(np.abs(value) > 1.0e-14)
     }
     return (
-        ReducedSU2Tensor(IrrepTensor(left.site, left.site, left.op, left_blocks)),
-        ReducedSU2Tensor(IrrepTensor(right.site, right.site, right.op, right_blocks)),
+        ReducedSU2Tensor(IrrepTensor(left.leg, left.leg, left.op, left_blocks)),
+        ReducedSU2Tensor(IrrepTensor(right.leg, right.leg, right.op, right_blocks)),
     )
 
 
@@ -1566,12 +1566,12 @@ def direct_reduced_full_hamiltonian_tangent_adjoint(
     zero_h_blocks = {
         irrep: np.zeros(
             (
-                block.truncated.site.sector_dim(irrep),
-                block.truncated.site.sector_dim(irrep),
+                block.truncated.leg.sector_dim(irrep),
+                block.truncated.leg.sector_dim(irrep),
             ),
             dtype=complex,
         )
-        for irrep in block.truncated.site.irreps
+        for irrep in block.truncated.leg.irreps
     }
     h_template = block_retained_scalar_tensor(block, zero_h_blocks)
     h_reduced_adjoint = reduced_scalar_product_block_adjoint(
@@ -1881,7 +1881,7 @@ def _coupled_product_tangent(left, dleft, right, dright, rank2, *, scale=1.0):
     if dright is not None and dright.blocks and left.blocks:
         terms.append(coupled_reduced_product(left, dright, rank2=rank2, scale=scale))
     return _add_optional_tensors(terms) or _zero_reduced(
-        left.site,
+        left.leg,
         OpIrrep(
             (
                 left.op.charge[0] + right.op.charge[0],
@@ -1914,7 +1914,7 @@ def _coupled_product_bilinear(
     if xyright is not None and xyright.blocks and left.blocks:
         terms.append(coupled_reduced_product(left, xyright, rank2=rank2, scale=scale))
     return _add_optional_tensors(terms) or _zero_reduced(
-        left.site,
+        left.leg,
         OpIrrep(
             (
                 left.op.charge[0] + right.op.charge[0],
@@ -2326,10 +2326,10 @@ def _reduced_tensor_from_components_adjoint(
 ):
     """Adjoint of ``reduced_tensor_from_components`` for selected components."""
     from .su2_core import cg
-    from .su2_reduced_tensor import component_basis, group_multiplets, site_from_multiplets
+    from .su2_reduced_tensor import component_basis, group_multiplets, leg_from_multiplets
 
     groups = group_multiplets(multiplets)
-    site = site_from_multiplets(multiplets)
+    site = leg_from_multiplets(multiplets)
     basis_cache = {}
 
     def basis(irrep: Irrep, m2: int) -> np.ndarray:
@@ -2428,7 +2428,7 @@ def _expanded_operator_from_reduced_adjoint(
         if np.any(np.abs(block_adj) > 0.0):
             blocks[(bra_irrep, ket_irrep)] = block_adj
     return ReducedSU2Tensor(
-        IrrepTensor(template.site, template.site, template.op, blocks)
+        IrrepTensor(template.leg, template.leg, template.op, blocks)
     )
 
 
@@ -5127,7 +5127,7 @@ def _product_with_local_tangent(source_block, tensor, dtensor, local, rank2):
         if tensor is None:
             return None
         return _zero_reduced(
-            tensor.site,
+            tensor.leg,
             OpIrrep((tensor.op.charge[0] + local.op.charge[0], int(rank2))),
         )
     from .su2_three_site import reduced_product_tensor_irrep
@@ -8145,7 +8145,7 @@ def rotate_reduced_tensors_bilinear_adjoint_x(
         key = ("source", id(adjoint_tensor))
         cached = zero_cache.get(key)
         if cached is None:
-            cached = _zero_reduced(truncated.source.site, adjoint_tensor.op)
+            cached = _zero_reduced(truncated.source.leg, adjoint_tensor.op)
             zero_cache[key] = cached
         return cached
 

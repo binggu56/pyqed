@@ -23,7 +23,7 @@ import numpy as np
 
 from .cp_tying import _validated_dims, _validated_parent_sets
 from .frontier_tying import FrontierTiedLETTA
-from .vmc import LETTAVMC
+from .vmc import VMC
 
 
 @dataclass(frozen=True)
@@ -368,9 +368,8 @@ def sample_tie_signals(
     """Sample current-state tie signals without constructing a dense state."""
     if not isinstance(state, FrontierTiedLETTA):
         raise TypeError("state must be a FrontierTiedLETTA.")
-    vmc = LETTAVMC(
+    vmc = VMC(
         state,
-        state.hamiltonian,
         seed=seed,
         proposal=proposal,
         exchange_probability=exchange_probability,
@@ -486,6 +485,10 @@ def rank_tie_graph_proposals(
 def _constructor_options(state):
     return {
         "frontier_backend": state.frontier_backend,
+        "chunk_size": state.chunk_size,
+        "chunk_memory": state.chunk_memory,
+        "chunk_span": state.chunk_span,
+        "workers": state.workers,
         "path_optimizer": state.path_optimizer,
         "local_backend": state.local_backend,
         "local_rank": state.local_options["rank"],
@@ -500,6 +503,8 @@ def _constructor_options(state):
         "tt_absorption": state.tt_options["absorption"],
         "tt_norm_backend": state.tt_norm_backend,
         "tt_hermitize": state.tt_hermitize,
+        "tt_channels": state.tt_channels,
+        "tt_gauge": state.tt_gauge,
     }
 
 

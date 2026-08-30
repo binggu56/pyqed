@@ -173,7 +173,7 @@ def G(R1, R2, lamda, eps1, eps2, eps3, spacing):
 
 def G0_1D(z1, z2, k, eps):
     """
-    Green's function for 1D homogenous media
+    Green's function for 1D homogeneous media
 
     Parameters
     ----------
@@ -241,7 +241,7 @@ class Multilayer:
         
     def green0(self, k):
         """
-        Green's function for layers homogenous achiral media
+        Green's function for layers homogeneous achiral media
         
         .. math::
             

@@ -162,7 +162,7 @@ def _run_mps_d8(
     tolerance,
     verbose,
 ):
-    from pyqed.mps import DMRG, MPS, MPO
+    from pyqed.mps import DMRG, MPS
 
     nsites = len(hamiltonian.dims)
     max_bond_dim = 8
@@ -183,7 +183,7 @@ def _run_mps_d8(
         exact_state,
         exact_energy,
     )
-    mpo = MPO(list(hamiltonian.to_mpo().compress().tensors))
+    mpo = hamiltonian.to_mpo().compress()
     print(
         f"starting mps_d8 seed={seed} parameters={parameters} "
         f"E0={initial_diagnostics['energy']:.10f}",
@@ -208,7 +208,7 @@ def _run_mps_d8(
     ).run()
     optimization_seconds = perf_counter() - start
     diagnostics = _vector_diagnostics(
-        _mps_state_vector(solver.ground_state),
+        _mps_state_vector(solver.state),
         sparse_hamiltonian,
         exact_state,
         exact_energy,
@@ -243,7 +243,7 @@ def _run_mps_d8(
         "sweeps_completed": len(directional_history),
         "initial_energy": initial_diagnostics["energy"],
         **diagnostics,
-        "frontier_energy_discrepancy": diagnostics["energy"] - float(solver.e_tot),
+        "frontier_energy_discrepancy": diagnostics["energy"] - float(solver.energy),
         "setup_seconds": 0.0,
         "optimization_seconds": float(optimization_seconds),
         "seconds_per_sweep": float(

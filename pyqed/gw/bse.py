@@ -75,7 +75,14 @@ def _get_mo_eri(mf, mo_coeff, ao2mofn):
         )
 
     if ao2mofn is None:
-        raise ValueError("BSE dense ERI build requires native dense AO ERIs or factorized ERIs.")
+        try:
+            from pyscf import ao2mo
+        except ImportError as exc:
+            raise ValueError(
+                "BSE dense ERI build requires native dense AO ERIs, factorized "
+                "ERIs, an AO2MO callback, or PySCF."
+            ) from exc
+        ao2mofn = ao2mo.kernel
     nmo = len(mf.mo_energy)
     return ao2mofn(mf.mol, (mo_coeff, mo_coeff, mo_coeff, mo_coeff),
                    compact=False).reshape(nmo, nmo, nmo, nmo)
@@ -506,9 +513,14 @@ class BSE(object):
         if not use_qp or self.e_qp is None:
             self.e_qp = self.e_mf.copy()
 
+        excitation_dim = self.nocc * (self.nso - self.nocc)
         use_low_rank = (
             low_rank is True
-            or (low_rank == 'auto' and getattr(self, '_pair_factors', None) is not None)
+            or (
+                low_rank == 'auto'
+                and getattr(self, '_pair_factors', None) is not None
+                and excitation_dim > 256
+            )
         )
         if use_low_rank:
             self.bse_tda_low_rank(
@@ -550,9 +562,14 @@ class BSE(object):
         if not use_qp or self.e_qp is None:
             self.e_qp = self.e_mf.copy()
 
+        excitation_dim = self.nocc * (self.nso - self.nocc)
         use_low_rank = (
             low_rank is True
-            or (low_rank == 'auto' and getattr(self, '_pair_factors', None) is not None)
+            or (
+                low_rank == 'auto'
+                and getattr(self, '_pair_factors', None) is not None
+                and excitation_dim > 256
+            )
         )
         if use_low_rank:
             self.bse_full_low_rank(

@@ -2,9 +2,9 @@ import numpy as np
 import pytest
 
 from pyqed.letta import FrontierTiedLETTA
-from pyqed.letta.local_terms import LocalMPO
 from pyqed.letta.mpo_frontier import MPOFrontier
 from pyqed.letta.tt_frontier import (
+    TermwiseBlockMPOFrontier,
     TermwiseTTMPOFrontier,
     TTFrontier,
     TTMPOFrontier,
@@ -18,7 +18,7 @@ from tests.test_letta_mpo_frontier import _identity_mpo
 def _engines(state, mpo, *, paired_sites=None, **tt_options):
     arguments = (
         state.dims,
-        state.physical_sites,
+        state.physical_groups,
         [tensor.shape for tensor in state.tensors],
         mpo.tensors,
     )
@@ -132,7 +132,7 @@ def test_structured_hole_adjoint_is_exact_for_truncated_complex_messages():
     mpo_tensors[1] = np.array(
         [[1.0 + 0.2j, 0.7 - 0.4j], [-0.3 + 0.6j, 0.2 - 0.1j]]
     )[None, None]
-    mpo = LocalMPO(state.dims, mpo_tensors)
+    mpo = MPO(mpo_tensors, sites=state.sites)
     exact, tt = _engines(state, mpo, max_rank=2)
     site = 1
     rng = np.random.default_rng(923)
@@ -354,6 +354,52 @@ def test_frontier_tied_letta_tensor_train_backend_matches_exact_actions():
     assert tt.peak_frontier_elements <= exact.peak_frontier_elements
     assert tt.peak_compressed_frontier_elements > 0
     assert tt.tt_diagnostics is not None
+
+
+def test_term_grouped_tt_channels_are_exact_and_reduce_engine_count():
+    exact, _dense = _states(seed=229)
+    component = FrontierTiedLETTA(
+        exact.hamiltonian,
+        exact.dims,
+        exact.parent_sets,
+        bond_dim=exact.bond_dim,
+        tensors=[tensor.copy() for tensor in exact.tensors],
+        frontier_backend="tensor_train",
+        tt_channels="component",
+    )
+    grouped = FrontierTiedLETTA(
+        exact.hamiltonian,
+        exact.dims,
+        exact.parent_sets,
+        bond_dim=exact.bond_dim,
+        tensors=[tensor.copy() for tensor in exact.tensors],
+        frontier_backend="tensor_train",
+        tt_channels="term",
+    )
+
+    assert grouped.tt_channels == "term"
+    assert len(grouped._hamiltonian_frontier._engines) < len(
+        component._hamiltonian_frontier._engines
+    )
+    np.testing.assert_allclose(grouped.expectation(), exact.expectation(), atol=1e-12)
+    probe = np.linspace(-0.4, 0.7, grouped.tensors[1].size)
+    np.testing.assert_allclose(
+        grouped.hamiltonian_action(1, probe),
+        exact.hamiltonian_action(1, probe),
+        atol=2e-12,
+    )
+
+
+def test_tt_frontier_direct_sum_addition_is_exact():
+    rng = np.random.default_rng(230)
+    left_dense = rng.normal(size=(2, 3, 2))
+    right_dense = rng.normal(size=(2, 3, 2))
+    left = TTFrontier.from_dense(left_dense, labels=("a", "b", "c"))
+    right = TTFrontier.from_dense(right_dense, labels=("a", "b", "c"))
+
+    combined = left.add(right)
+
+    np.testing.assert_allclose(combined.to_dense(), left_dense + right_dense, atol=1e-13)
 
 
 def test_tensor_train_backend_tracks_approximation_and_matrix_free_guards():

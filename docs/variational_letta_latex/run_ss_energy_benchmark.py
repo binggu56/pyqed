@@ -23,7 +23,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from pyqed.letta import LETTA
 from pyqed.mps.dmrg import DMRG
-from pyqed.mps.mps import MPO, _mpo_to_dense_operator
+from pyqed.mps.mps import _mpo_to_dense_operator
+from pyqed.tn import MPO
 
 from compare_ss_orderings import dimer_first_order, snake_order, square_edges, ss_dimers
 

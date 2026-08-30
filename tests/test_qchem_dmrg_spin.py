@@ -1191,9 +1191,6 @@ def test_qchem_su2_block2_like_rejects_raw_boundary_fallback(monkeypatch):
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=2,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
         conv_tol=-1.0,
         require_convergence=False,
@@ -2107,9 +2104,6 @@ def test_su2_block2_policy_uses_cpp_reduced_davidson():
     dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
     dmrg.run(
         nsweeps=2,
-        local_basis_policy="block2_like",
-        orthonormalized_operator_dim=512,
-        max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
         require_convergence=False,
     )
@@ -2198,7 +2192,11 @@ def test_su2_reduced_boundary_pivots_match_component_identity_reference(
     assert owner["peak_borrowed_reduced_contextual_right_elements"] > 0
 
 
-def test_su2_block2_complementary_direct_projection_is_opt_in():
+def test_su2_reduced_boundary_pivots_match_component_identity_reference(
+    monkeypatch,
+):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
         unit="bohr",
@@ -2207,12 +2205,26 @@ def test_su2_block2_complementary_direct_projection_is_opt_in():
     _build_cpp_integrals(mol)
     mf = RHF(mol).run()
 
-    dmrg = DMRG(mf, ncas=4, nelecas=4, D=16, init_guess="cid", symmetry="su2", verbose=0)
-    dmrg.build()
-    families = dmrg._active_hamiltonian.complementary_operators
-    object.__setattr__(families, "prefer_recursive_operator_matvec", False)
-    object.__setattr__(families, "prefer_direct_orthonormal_projection", True)
-    try:
+    def solve(*, specialized):
+        if specialized:
+            monkeypatch.delenv(
+                "PYQED_SU2_SPECIALIZE_PIVOT_SCALE_REFRESH",
+                raising=False,
+            )
+        else:
+            monkeypatch.setenv(
+                "PYQED_SU2_SPECIALIZE_PIVOT_SCALE_REFRESH",
+                "0",
+            )
+        dmrg = DMRG(
+            mf,
+            ncas=4,
+            nelecas=4,
+            D=16,
+            init_guess="cid",
+            symmetry="su2",
+            verbose=0,
+        )
         dmrg.run(
             nsweeps=1,
             require_convergence=False,
@@ -2225,35 +2237,51 @@ def test_su2_block2_complementary_direct_projection_is_opt_in():
             su2_kernel_backend="python",
             su2_reference_complementary_families=True,
         )
-    finally:
-        object.__setattr__(families, "prefer_direct_orthonormal_projection", False)
-        object.__setattr__(families, "prefer_recursive_operator_matvec", True)
+        return dmrg
 
-    objectives = [
-        objective
-        for entry in dmrg.dmrg.history
-        for objective in entry.get("bond_objectives", [])
-    ]
-    table_stats = [
-        objective.get("renormalized_operator_table_stats")
-        for objective in objectives
-        if objective.get("renormalized_operator_table_stats") is not None
-    ]
-    assert any(stats.get("component_direct_kernel") is True for stats in table_stats)
-    assert any(
-        timing.get("component_direct_factorized_kernel", 0.0) > 0.0
-        or timing.get("component_recursive_parent_block_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_payload_tensor_kernel", 0.0) > 0.0
-        or timing.get("component_complementary_family_table_kernel", 0.0) > 0.0
-        for timing in (
-            objective.get("renormalized_operator_build_timing") or {}
-            for objective in objectives
-        )
+    component_reference = solve(specialized=False)
+    reduced = solve(specialized=True)
+
+    assert reduced.e_tot == pytest.approx(
+        component_reference.e_tot,
+        abs=1.0e-11,
     )
-    assert np.isfinite(float(dmrg.e_tot))
+    owner = reduced.dmrg.history[-1]["moving_environment_stats"][
+        "su2_moving_environment"
+    ]
+    assert owner["decomposed_action_plan_hits"] > 0
+    assert owner["peak_borrowed_reduced_contextual_right_elements"] > 0
 
 
-def test_su2_kernel_backend_python_fallback_records_reference_path():
+@pytest.mark.parametrize(
+    "removed_option,value,message",
+    [
+        ("su2_kernel_backend", "python", "was removed"),
+        ("su2_reference_complementary_families", True, "was removed"),
+        ("direct_orthonormal_dense_max_elements", 0, "was removed"),
+        ("family_kernel_backend", "python", "was removed"),
+        ("su2_force_family_table", True, "was removed"),
+        ("canonical_local_norm", False, "was removed"),
+        ("local_basis_policy", "block2_like", "was removed"),
+        ("orthonormalized_operator_dim", 512, "was removed"),
+        ("orthonormalize_generalized_dim", 512, "was removed"),
+        ("max_bond_mode", "per_sector", "was removed"),
+        ("record_post_update_energy", True, "C\\+\\+-only"),
+        ("state_average_root_environments", True, "C\\+\\+-only"),
+        ("state_average_spin_projector", True, "C\\+\\+-only"),
+        ("mixer_zero_block_noise_scale", 1.0e-6, "must be zero"),
+        (
+            "local_solver_kwargs",
+            {"dense_fallback_dim": 4096},
+            "local_solver_kwargs.*was removed",
+        ),
+    ],
+)
+def test_su2_production_rejects_removed_python_paths(
+    removed_option,
+    value,
+    message,
+):
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g")
     _build_cpp_integrals(mol)
     mf = RHF(mol).run()
@@ -2660,13 +2688,125 @@ def test_su2_block2_cpp_owner_avoids_transformed_kernel_build():
             davidson_max_iter=73,
             profile=True,
         )
-    finally:
-        object.__setattr__(families, "prefer_recursive_operator_matvec", True)
-        object.__setattr__(families, "prefer_complementary_payload_tensor_matvec", True)
+        owner = dmrg.dmrg.history[-1]["moving_environment_stats"][
+            "su2_moving_environment"
+        ]
+        return float(dmrg.e_tot), owner
 
+    batched_energy, batched = solve(False)
+    direct_energy, direct = solve(True)
+    assert direct_energy == pytest.approx(batched_energy, abs=1.0e-12)
+    assert batched["compact_right_panel_budget_bytes"] == 0
+    assert batched["compact_right_panel_registry_builds"] == 0
+    assert batched["compact_right_panel_value_bytes"] == 0
+    assert direct["direct_complementary_action_calls"] > 0
+    assert direct["direct_complementary_actions"] > 0
+    assert direct["raw_pointer_execution_matvec_calls"] > 0
+    assert direct["half_sweep_python_bond_callbacks"] == 0
+
+
+def test_su2_cpp_shared_right_panels_skip_partial_output_groups(monkeypatch):
+    if not su2_cpp_available():
+        pytest.skip("optional SU(2) C++ kernel is unavailable")
+    molecule = Molecule(
+        atom="; ".join(
+            f"H 0 0 {1.6 * site}" for site in range(10)
+        ),
+        unit="bohr",
+        basis="sto-3g",
+    )
+    molecule.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mean_field = RHF(molecule).run()
+    monkeypatch.delenv(
+        "PYQED_SU2_DISABLE_SHARED_RIGHT_PANELS",
+        raising=False,
+    )
+    monkeypatch.setenv(
+        "PYQED_SU2_COMPARE_SHARED_RIGHT_PANELS",
+        "1",
+    )
+    monkeypatch.setenv(
+        "PYQED_SU2_SHARED_RIGHT_COPY_BUDGET",
+        "1024",
+    )
+    dmrg = DMRG(
+        mean_field,
+        ncas=10,
+        nelecas=10,
+        D=32,
+        init_guess="cid",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.run(
+        nsweeps=1,
+        conv_tol=-1.0,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        mixer_nsweeps=0,
+        verify_returned_mps_energy=True,
+        profile=True,
+    )
+    owner = dmrg.dmrg.history[-1]["moving_environment_stats"][
+        "su2_moving_environment"
+    ]
+    assert owner["peak_raw_shared_right_panel_count"] == 0
+    assert owner["peak_raw_shared_right_binding_count"] == 0
+    assert owner["raw_shared_right_gemm_calls"] == 0
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert float(dmrg.e_tot) == pytest.approx(
+        dmrg.dmrg.history[-1]["returned_mps_energy"],
+        abs=1.0e-10,
+    )
+
+
+def test_su2_block2_cpp_owner_avoids_transformed_kernel_build():
+    mol = Molecule(
+        atom=(
+            "H 0 0 0; H 0 0 1.6; H 0 0 3.2; "
+            "H 0 0 4.8; H 0 0 6.4; H 0 0 8.0"
+        ),
+        unit="bohr",
+        basis="sto-3g",
+    )
+    mol.build(
+        eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mf = RHF(mol).run()
+
+    dmrg = DMRG(
+        mf,
+        ncas=6,
+        nelecas=6,
+        D=16,
+        init_guess="cid",
+        symmetry="su2",
+        spatial_site_basis="fully_reduced",
+        verbose=0,
+    )
+    dmrg.build()
+    assert dmrg.build_info["python_reduced_terms_materialized"] is False
+    assert all(not factor.reduced_terms for factor in dmrg.H)
+
+    dmrg.run(
+        nsweeps=1,
+        require_convergence=False,
+        mixer_zero_block_noise_scale=0.0,
+        davidson_tol=2.5e-9,
+        davidson_max_iter=73,
+        profile=True,
+    )
+
+    history = dmrg.dmrg.history
     objectives = [
         objective
-        for entry in dmrg.dmrg.history
+        for entry in history
         for objective in entry.get("bond_objectives", [])
     ]
     assert dmrg.dmrg.history[0]["local_solver_kwargs"]["tol"] == pytest.approx(
@@ -2728,28 +2868,7 @@ def test_su2_block2_cpp_owner_avoids_transformed_kernel_build():
         for timing in timings
     )
     assert all(
-        timing.get("component_factorized_kernel_materialize", 0.0) == 0.0
-        for timing in timings
-    )
-    assert all(
-        timing.get("component_factorized_kernel_transform", 0.0) == 0.0
-        for timing in timings
-    )
-    assert any(
-        (
-            (objective.get("renormalized_operator_table_stats") or {}).get(
-                "component_parent_block_kernel"
-            )
-            is True
-            or (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_payload_tensor_kernel"
-            )
-            is True
-            or (objective.get("renormalized_operator_table_stats") or {}).get(
-                "complementary_family_table_kernel"
-            )
-            is True
-        )
+        objective["cpp_davidson_kind"] == "cpp_su2_owned_half_sweep_bond"
         for objective in objectives
     )
     assert all(
@@ -2928,6 +3047,15 @@ def test_su2_block2_cpp_owner_avoids_transformed_kernel_build():
     )
 
 
+    owner = history[-1]["moving_environment_stats"]["su2_moving_environment"]
+    assert owner["owned_half_sweep_calls"] == 2
+    assert owner["owned_half_sweep_bonds"] == 10
+    assert owner["half_sweep_executor_calls"] == 0
+    assert owner["half_sweep_executor_bonds"] == 0
+    assert owner["half_sweep_python_bond_callbacks"] == 0
+    assert owner["active_bond_complementary_fallbacks"] == 0
+    assert owner["raw_factor_routes"] is False
+    assert np.isfinite(dmrg.e_tot)
 def test_su2_block2_operator_table_cache_reuses_same_environment_basis():
     mol = Molecule(
         atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
@@ -3168,8 +3296,6 @@ def test_su2_block2_state_average_supports_larger_active_spaces():
         nstates=2,
         weights=[0.5, 0.5],
         nsweeps=2,
-        local_basis_policy="block2_like",
-        max_bond_mode="per_sector",
         mixer_zero_block_noise_scale=0.0,
     )
 

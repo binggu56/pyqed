@@ -132,3 +132,37 @@ def test_generalized_davidson_uses_vector_actions_and_has_no_dense_fallback():
     assert diagnostics.metric_matvecs == 2
     assert seen_shapes and set(seen_shapes) == {(size,)}
     assert np.isfinite(energy)
+
+
+def test_generalized_davidson_uses_jacobi_and_block_batched_actions():
+    size = 18
+    diagonal = np.linspace(-3.0, 4.0, size)
+    batched = []
+    preconditioned = []
+
+    def actions(vectors):
+        batched.append(vectors.shape[0])
+        return vectors * diagonal[None, :]
+
+    def preconditioner(residual, energy):
+        preconditioned.append(float(energy))
+        denominator = diagonal - energy
+        denominator[np.abs(denominator) < 1.0e-8] = 1.0e-8
+        return residual / denominator
+
+    energy, _vector, diagnostics = lowest_generalized_davidson(
+        lambda vector: diagonal * vector,
+        lambda vector: vector,
+        np.ones(size),
+        hamiltonian_actions=actions,
+        metric_actions=lambda vectors: vectors.copy(),
+        preconditioner=preconditioner,
+        block_size=3,
+        max_subspace=size,
+        tol=1.0e-11,
+    )
+
+    assert diagnostics.converged
+    assert preconditioned
+    assert any(batch > 1 for batch in batched)
+    np.testing.assert_allclose(energy, diagonal[0], atol=1.0e-10)

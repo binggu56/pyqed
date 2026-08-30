@@ -6,8 +6,8 @@ from collections import defaultdict
 
 import numpy as np
 
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSet
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSet
 from pyqed.qchem.jordan_wigner.spinful import SpinHalfFermionOperators
 
 

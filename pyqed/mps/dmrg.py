@@ -8,13 +8,18 @@ Created on Wed Feb 11 17:15:58 2026
 
 from pyqed.mps import MPS, MPO, fDMRG_1site_GS_OBC, two_site_dmrg, dense_to_symmetric
 from pyqed.mps.mps import (
+    MPS,
     _abelian_data_factor_list,
     _expect_factors,
     initial_E,
     contract_from_left,
+    dense_to_symmetric,
+    expect_mps,
+    fDMRG_1site_GS_OBC,
+    initial_E,
+    two_site_dmrg,
     svd_symmetric,
     multiply_U_S,
-    multiply_S_V,
 )
 from pyqed.mps.abelian_direct import (
     AbelianSiteTensorData,
@@ -65,6 +70,22 @@ def _normalize_factors_in_place(factors):
         raise ValueError("cannot normalize a near-zero DMRG state.")
     factors[0] = factors[0] * (1.0 / np.sqrt(norm))
     return factors
+
+
+def _compatible_output_sites(factors, labels, sites):
+    """Keep physical-site descriptors only when they match output tensors."""
+
+    if sites is None:
+        return None
+    sites = tuple(sites)
+    factors = list(factors)
+    if len(sites) != len(factors):
+        return None
+    physical_axis = tuple(labels).index("p")
+    physical_dims = [int(factor.shape[physical_axis]) for factor in factors]
+    if [int(site.dim) for site in sites] != physical_dims:
+        return None
+    return sites
 
 
 def _right_canonicalize_symmetric_factors(factors, max_bond_dim=None):
@@ -200,6 +221,12 @@ def dmrg_matvec_options(policy="auto"):
                 "packed_local_family_flat_direct_matvec_backend": "renormalized_table",
                 "generator_table_packed_route_table": "raw_cython",
                 "generator_table_precompute_contextual_boundaries": False,
+                "generator_table_allow_planned_packed_contextual_entries": True,
+                "generator_table_allow_table_backed_planned_contextual_entries": (
+                    "auto"
+                ),
+                "generator_table_native_boundary_p_policy": "auto",
+                "generator_table_native_boundary_p_auto_max_terms": 1024,
                 "generator_table_exact_component_compression_fast_max_group_size": 1,
             }
         )
@@ -223,6 +250,7 @@ def dmrg_matvec_options(policy="auto"):
                 "moving_environment_cpp_compact_plan_matvec": True,
                 "moving_environment_cpp_compact_plan_bond_slots": True,
                 "moving_environment_cpp_state_owner": True,
+                "moving_environment_cpp_owner_local_optimize": True,
                 "moving_environment_operatorless_local_problem": True,
                 "moving_environment_cpp_site_split_owner": True,
                 "moving_environment_cpp_sweep_cursor": True,
@@ -258,6 +286,8 @@ def dmrg_matvec_options(policy="auto"):
                 "generator_table_validate_cpp_boundary_p_raw_table": False,
                 "generator_table_prebuild_same_side_native_p": True,
                 "generator_table_incremental_same_side_pair_prebuild": True,
+                "generator_table_native_boundary_p_policy": "auto",
+                "generator_table_native_boundary_p_auto_max_terms": 1024,
                 "generator_table_use_disjoint_same_side_native_p": False,
                 "generator_table_use_true_packed_identity_entries": False,
                 "generator_table_planned_native_p_identity_entries": True,
@@ -401,6 +431,13 @@ def resolve_abelian_matvec_options(performance="auto", overrides=None):
     options = dmrg_matvec_options(performance)
     if overrides:
         options.update(dict(overrides))
+    if (
+        bool(options.get("moving_environment_cpp_davidson", False))
+        or bool(options.get("moving_environment_cpp_matvec", False))
+    ):
+        options.setdefault("native_site_storage", True)
+        options.setdefault("moving_environment_cpp_state_owner", True)
+        options.setdefault("moving_environment_cpp_solve_site_update_owner", True)
     return options
 
 
@@ -413,7 +450,14 @@ class DMRG:
                 target_qn = None, sym_mgr = None, not_conv_err=True,
                 nstates=1, weights=None, verbose=0, sweep_callback=None,
                 sweep_tol=1e-6, davidson_tol=1e-5, davidson_max_iter=30,
+                davidson_restart_dim=12, adaptive_solver=False,
+                davidson_tol_initial=1e-3,
                 noise=1e-4, noise_decay=0.1, noise_cutoff=1e-9,
+                enrichment=None, enrichment_decay=None,
+                enrichment_cutoff=None, enrich_rank=32,
+                enrich_trigger=None,
+                enrich_rtol=1e-7, enrich_oversample=8, enrich_seed=0,
+                svd_cutoff=1e-14,
                 local_dense_max_dim=0, complementary_operator_families=None,
                 complementary_operator_mpos=None,
                 complementary_operator_term_maps=None,
@@ -436,6 +480,13 @@ class DMRG:
             Number of states for State-Averaged DMRG.
         weights : list
             Weights for state averaging.
+        enrich_rank : int or None
+            Global AMEn/3S residual rank cap. ``None`` forms the exact
+            full-rank enrichment; the default streams a rank-capped sketch.
+        enrich_rtol : float
+            Relative singular-value threshold for sketched enrichment.
+        enrich_oversample : int
+            Extra sketch columns used before residual compression.
         """
 
         if not isinstance(H, MPO):
@@ -451,9 +502,28 @@ class DMRG:
         self.sweep_tol = float(sweep_tol)
         self.davidson_tol = float(davidson_tol)
         self.davidson_max_iter = int(davidson_max_iter)
+        self.davidson_restart_dim = int(davidson_restart_dim)
+        self.adaptive_solver = bool(adaptive_solver)
+        self.davidson_tol_initial = float(davidson_tol_initial)
+        self.workers = resolve_workers(workers)
         self.noise = 0.0 if noise is None else float(noise)
         self.noise_decay = float(noise_decay)
         self.noise_cutoff = float(noise_cutoff)
+        self.enrichment = self.noise if enrichment is None else float(enrichment)
+        self.enrichment_decay = (
+            self.noise_decay if enrichment_decay is None else float(enrichment_decay)
+        )
+        self.enrichment_cutoff = (
+            self.noise_cutoff if enrichment_cutoff is None else float(enrichment_cutoff)
+        )
+        self.enrich_trigger = (
+            None if enrich_trigger is None else float(enrich_trigger)
+        )
+        self.enrich_rank = None if enrich_rank is None else int(enrich_rank)
+        self.enrich_rtol = float(enrich_rtol)
+        self.enrich_oversample = int(enrich_oversample)
+        self.enrich_seed = int(enrich_seed)
+        self.svd_cutoff = float(svd_cutoff)
         # Optional Abelian dense local solve cap; 0 keeps the Davidson path.
         self.local_dense_max_dim = local_dense_max_dim
         self.complementary_operator_families = complementary_operator_families
@@ -467,6 +537,13 @@ class DMRG:
         self.recenter_final = bool(recenter_final)
         self.final_expectation = bool(final_expectation)
         self.performance = str(performance or "auto")
+        symmetry_enabled = bool(
+            symmetry
+            or target_qn is not None
+            or sym_mgr is not None
+            or charge is not None
+            or spin is not None
+        )
         policy_key = self.performance.strip().lower().replace("_", "-")
         if policy_key in {"auto", "default"}:
             self.resolved_performance = (
@@ -481,19 +558,16 @@ class DMRG:
         self.opt = opt
 
         self.init_guess = init_guess
-        self.e_tot = None
-        self.U1 = self.symmetry = symmetry
+        self.energy = None
+        self.U1 = self.symmetry = symmetry_enabled
         
 
         self.nstates = nstates
         self.weights = weights if weights is not None else [1.0/nstates]*nstates
 
-        # Symmetry Logic
-        if target_qn is not None and (sym_mgr is None):
-            raise ValueError("Symmetry manager must be provided when target quantum number is specified.")
-        elif target_qn is None and sym_mgr is not None:
-            raise ValueError("Target quantum number must be specified when sym_mgr is given.")
-        elif (charge is not None) and (spin is not None):
+        # A labelled target sector is the canonical symmetry specification.
+        # Infer the small arithmetic helper instead of making callers repeat it.
+        if (charge is not None) and (spin is not None):
             sym_mgr = SymmetryManager(['charge', 'sz'])
             target_qn = sym_mgr.get_target_qn(charge, 2*spin)
         elif (charge is not None) and (spin is None):
@@ -502,12 +576,36 @@ class DMRG:
         elif (charge is None) and (spin is not None):
             sym_mgr = SymmetryManager(['sz'])
             target_qn = sym_mgr.get_target_qn(2*spin)
+        elif target_qn is not None and sym_mgr is None:
+            labels = tuple(getattr(target_qn, "labels", ()))
+            if not labels and site_qn_maps:
+                for qn_map in site_qn_maps:
+                    for sector in qn_map.values():
+                        labels = tuple(getattr(sector, "labels", ()))
+                        if labels:
+                            break
+                    if labels:
+                        break
+            if not labels and isinstance(symmetry, str) and symmetry.lower() not in {
+                "true", "u1", "abelian"
+            }:
+                labels = (symmetry,)
+            if not labels and isinstance(symmetry, (tuple, list)):
+                labels = tuple(str(label) for label in symmetry)
+            if not labels:
+                raise ValueError(
+                    "Cannot infer Abelian symmetry labels from target_qn; use a "
+                    "labelled AbelianSector or pass symmetry=('charge', 'sz')."
+                )
+            sym_mgr = SymmetryManager(labels)
+        elif target_qn is None and sym_mgr is not None:
+            raise ValueError("Target quantum number must be specified when sym_mgr is given.")
             
         self.charge = charge
         self.target_qn = target_qn 
         self.sym_mgr = sym_mgr
 
-        self.ground_state = None # Holds Root 0
+        self.state = None # Holds Root 0
         self.states = None       # Holds list of all Roots
         self.not_conv_err = not_conv_err
         self.converged = False
@@ -523,6 +621,11 @@ class DMRG:
         self.complementary_split_stats = None
         self.environment_profile = None
         self.resume_payload = None
+
+    @property
+    def ground_state(self):
+        """The lowest optimized root, using ``state`` as the sole owner."""
+        return self.state
 
     @staticmethod
     def _copy_factors(factors):
@@ -569,9 +672,21 @@ class DMRG:
                 "opt": self.opt,
                 "performance": self.performance,
                 "resolved_performance": self.resolved_performance,
+                "enrichment": float(self.enrichment),
+                "enrich_rank": self.enrich_rank,
+                "enrich_rtol": float(self.enrich_rtol),
+                "enrich_oversample": int(self.enrich_oversample),
+                "davidson_restart_dim": int(self.davidson_restart_dim),
+                "adaptive_solver": bool(self.adaptive_solver),
+                "davidson_tol_initial": float(self.davidson_tol_initial),
+                "enrich_trigger": self.enrich_trigger,
+                "workers": int(self.workers),
+                "minimize_mpo": bool(self.minimize_mpo),
                 "native_site_storage": bool(
                     self.abelian_matvec_options.get("native_site_storage", False)
-                ),
+                ) or str(self.opt).strip().lower().replace("_", "-") in {
+                    "1site", "1-site", "3s", "dmrg3s", "amen"
+                },
             },
         }
         tmp = path.with_name(path.name + ".tmp")
@@ -584,6 +699,7 @@ class DMRG:
 
         resume_history = []
         resume_sweep_offset = 0
+        sites = getattr(self.init_guess, "sites", None)
         if self.resume_from is not None:
             self.resume_payload = self.load_checkpoint(self.resume_from)
             if "mps" not in self.resume_payload:
@@ -627,9 +743,11 @@ class DMRG:
                 name: self._mpo_factors(mpo)
                 for name, mpo in self.complementary_operator_mpos.items()
             }
+        opt_key = str(self.opt).strip().lower().replace("_", "-")
+        one_site_3s = opt_key in {"1site", "1-site", "3s", "dmrg3s", "amen"}
         use_native_site_storage = bool(
             self.abelian_matvec_options.get("native_site_storage", False)
-        )
+        ) or one_site_3s
 
         if self.symmetry and isinstance(mps_list[0], AbelianSiteTensorData):
             mps_list = _right_canonicalize_symmetric_factors(mps_list, max_bond_dim=self.D)
@@ -681,11 +799,116 @@ class DMRG:
                 native_site_storage=True,
             )
 
-        if self.opt == '1site':
+        if one_site_3s:
+            if not self.symmetry:
+                raise ValueError("DMRG3S currently requires symmetry=True and an Abelian target_qn.")
+            if self.nstates != 1:
+                raise ValueError("DMRG3S currently supports one state at a time.")
+            if self.complementary_operator_families is not None:
+                raise ValueError("DMRG3S currently expects an explicit Abelian MPO, not complementary families.")
 
-            fDMRG_1site_GS_OBC(mpo_list, self.D, self.nsweeps)
+            from pyqed.mps._dmrg3s import one_site_dmrg3s
 
-        elif self.opt == '2site':
+            self.sweep_history = resume_history
+            hamiltonian_shift = getattr(self.H, "constant", 0.0)
+
+            def cb3s(**info):
+                row = dict(info)
+                if "sweep" in row:
+                    row["sweep"] = int(row["sweep"]) + resume_sweep_offset
+                if "energy" in row:
+                    row["energy"] = float(np.real(row["energy"] + hamiltonian_shift))
+                row.pop("mps", None)
+                self.sweep_history.append(row)
+                if (
+                    self.checkpoint_path is not None
+                    and (int(row.get("sweep", 0)) + 1) % self.checkpoint_interval == 0
+                ):
+                    self._write_checkpoint(
+                        factors=info["mps"],
+                        row=row,
+                        final=False,
+                        energy=row.get("energy"),
+                        gauge=row.get("gauge"),
+                    )
+                if self.sweep_callback is not None:
+                    callback_info = dict(info)
+                    callback_info["sweep"] = row.get("sweep", callback_info.get("sweep"))
+                    self.sweep_callback(**callback_info)
+
+            e_elec, mps_out, self.gauge, self.converged = one_site_dmrg3s(
+                mps_list,
+                mpo_list,
+                self.D,
+                self.nsweeps,
+                target_qn=self.target_qn,
+                conv=self.sweep_tol,
+                davidson_tol=self.davidson_tol,
+                adaptive_solver=self.adaptive_solver,
+                davidson_tol_initial=self.davidson_tol_initial,
+                davidson_max_iter=self.davidson_max_iter,
+                davidson_restart_dim=self.davidson_restart_dim,
+                enrichment=self.enrichment,
+                enrichment_decay=self.enrichment_decay,
+                enrichment_cutoff=self.enrichment_cutoff,
+                enrich_trigger=self.enrich_trigger,
+                enrich_rank=self.enrich_rank,
+                enrich_rtol=self.enrich_rtol,
+                enrich_oversample=self.enrich_oversample,
+                enrich_seed=self.enrich_seed,
+                svd_cutoff=self.svd_cutoff,
+                workers=self.workers,
+                not_conv_err=self.not_conv_err,
+                verbose=self.verbose,
+                sweep_callback=cb3s,
+            )
+            self.environment_profile = dict(one_site_dmrg3s.last_profile or {})
+            self.state = MPS(
+                mps_out,
+                labels=["lv", "rv", "p"],
+                center=0,
+                sites=_compatible_output_sites(
+                    mps_out,
+                    ["lv", "rv", "p"],
+                    sites,
+                ),
+            )
+            self.states = [self.state]
+            self.state.right_canonicalize()
+            _normalize_mps_state(self.state)
+            shift = hamiltonian_shift
+            if self.final_expectation:
+                self.energy = _normalized_mps_mpo_expectation(
+                    self.state.factors,
+                    mpo_list,
+                ) + shift
+            else:
+                self.energy = float(np.real(e_elec)) + shift
+            if not self.sweep_history:
+                self.sweep_history.append(
+                    {
+                        "sweep": 0,
+                        "direction": "both",
+                        "energy": float(np.real(self.energy)),
+                        "gauge": self.gauge,
+                        "algorithm": "dmrg3s",
+                        "local_tensor_rank": 3,
+                    }
+                )
+            else:
+                self.sweep_history[-1]["energy"] = float(np.real(self.energy))
+                self.sweep_history[-1]["post_truncation_energy"] = float(
+                    np.real(self.energy)
+                )
+            self._write_checkpoint(
+                factors=self.state.factors,
+                row=self.sweep_history[-1],
+                final=True,
+                energy=self.energy,
+                gauge=self.gauge,
+            )
+
+        elif opt_key in {"2site", "2-site"}:
             self.sweep_history = resume_history
 
             def cb(**info):
@@ -725,6 +948,9 @@ class DMRG:
                         if row.get("direction") != "h2-local":
                             row["energy"] = post_energy
                         row["post_truncation_energy"] = post_energy
+                        # ``energy`` describes the retained MPS, not the
+                        # untruncated two-site Ritz vector.
+                        row["energy"] = post_energy
                     except Exception as exc:
                         row["post_truncation_energy_error"] = str(exc)
                 # Keep history metadata light; checkpoints carry tensor data.
@@ -876,9 +1102,9 @@ class DMRG:
                         for energy in np.asarray(local_energy).reshape(-1)
                     ]
             if self.nstates == 1:
-                self.e_tot = state_energies[0]
+                self.energy = state_energies[0]
             else:
-                self.e_tot = state_energies
+                self.energy = state_energies
 
             if self.final_expectation and self.sweep_history:
                 final_row = self.sweep_history[-1]
@@ -891,18 +1117,21 @@ class DMRG:
                 else:
                     energies = [
                         float(np.real(np.asarray(energy).reshape(-1)[0]))
-                        for energy in np.asarray(self.e_tot).reshape(-1)
+                        for energy in np.asarray(self.energy).reshape(-1)
                     ]
-                    final_row["energy"] = energies
                     final_row["post_truncation_energy"] = energies
+                    final_row["energy"] = energies
 
             self._write_checkpoint(
-                factors=self.ground_state.factors,
+                factors=self.state.factors,
                 row=self.sweep_history[-1] if self.sweep_history else None,
                 final=True,
-                energy=self.e_tot if self.nstates == 1 else self.e_tot[0],
+                energy=self.energy if self.nstates == 1 else self.energy[0],
                 gauge=self.gauge,
             )
+
+        else:
+            raise ValueError("opt must be '2site' or '3s' (the '1site' alias also selects DMRG3S).")
 
         return self
     def expect(self, e_ops):
@@ -921,7 +1150,7 @@ class DMRG:
 
         """
 
-        psi = self.ground_state
+        psi = self.state
 
         return [_expect_factors(psi, e_op) for e_op in e_ops]
 
@@ -942,10 +1171,10 @@ class DMRG:
         np.ndarray
             A dense complex numpy array of shape `(L, L)` representing the global 1-RDM.
         """
-        # if self.ground_state is None:
+        # if self.state is None:
         #     raise ValueError("Run DMRG first to generate a ground state.")
             
-        return self.ground_state.make_rdm1(sym_mgr=self.sym_mgr)
+        return self.state.make_rdm1(sym_mgr=self.sym_mgr)
 
     def make_local_site_rdm(self, idx=None):
         """
@@ -966,7 +1195,7 @@ class DMRG:
             A dictionary mapping the requested site indices to their corresponding 
             $d \\times d$ local density matrices (as numpy arrays).
         """
-        return self.ground_state._calc_local_site_rdms(idx=idx)
+        return self.state._calc_local_site_rdms(idx=idx)
 
     def make_rdm2(self, idx_pairs=None):
         """
@@ -986,10 +1215,10 @@ class DMRG:
         np.ndarray
             A dense complex numpy array of shape `(L, L, L, L)`.
         """
-        # if self.ground_state is None:
+        # if self.state is None:
         #     raise ValueError("Run DMRG first to generate a ground state.")
             
-        return self.ground_state.make_rdm2(sym_mgr=self.sym_mgr)
+        return self.state.make_rdm2(sym_mgr=self.sym_mgr)
 
     def make_diagonal_rdm2(self, idx_pairs=None):
         """
@@ -1009,10 +1238,10 @@ class DMRG:
             A dictionary mapping each requested `(i, j)` tuple to its corresponding 
             dense reduced density matrix numpy array.
         """
-        # if self.ground_state is None:
+        # if self.state is None:
         #     raise ValueError("Run DMRG first to generate a ground state.")
             
-        return self.ground_state.make_diagonal_rdm2(idx_pairs=idx_pairs)
+        return self.state.make_diagonal_rdm2(idx_pairs=idx_pairs)
 
 
 if __name__ == '__main__':

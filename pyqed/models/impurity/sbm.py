@@ -85,10 +85,10 @@ from scipy import sparse
 #imports for mpo and dmrg calculation
 import logging
 from pyqed.mps import MPO
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSHO, BasisHalfSpin, BasisSpin
-from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.operator_mpo.model import Model
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSHO, BasisHalfSpin, BasisSpin
+from pyqed.operator_mpo.model_mpo import ModelMPO
 from pyqed.mps import DMRG as DMRG_Solver
 
 
@@ -435,7 +435,7 @@ class SBM:
 
         # 4. Generate MPO
         model = Model(basis=basis, ham_terms=ham_terms)
-        mpo_raw = Mpo(model, algo="qr")
+        mpo_raw = ModelMPO(model, algo="qr")
         
         # Transpose MPO from (L, s, t, R) -> (L, R, s, t)
         # Expected by mps.py contract_from_right

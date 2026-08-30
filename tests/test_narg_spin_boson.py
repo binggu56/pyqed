@@ -1225,7 +1225,8 @@ def test_spin_boson_exact_spectrum_is_same_in_fock_and_dvr_basis():
 
 
 def test_spin_boson_wilson_mpo_matches_dense_hamiltonian():
-    from pyqed.mps.mps import MPO, _mpo_to_dense_operator
+    from pyqed.mps.mps import _mpo_to_dense_operator
+    from pyqed.tn import MPO
 
     chain = log_discretized_spin_boson_wilson_chain(
         2,

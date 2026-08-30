@@ -1,5 +1,4 @@
-"""
-Convenience re-exports for :mod:`pyqed.mps`.
+"""Matrix-product-state algorithms over the canonical :mod:`pyqed.tn` types.
 
 The root namespace exposes the dense :class:`MPS` and :class:`MPO`.  Reduced
 non-Abelian owners use the explicit names :class:`NonabelianMPS` and

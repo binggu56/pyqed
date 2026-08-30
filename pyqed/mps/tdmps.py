@@ -60,6 +60,7 @@ class TDMPS:
         self,
         H_mpo,
         D=40,
+        cutoff=0.0,
         interaction_mpo=None,
         field=None,
         interaction_propagator_builder=None,
@@ -104,6 +105,9 @@ class TDMPS:
         self.normalize_each_step = bool(normalize)
         # self.dt = dt
         self.bond_dim = self.D = D
+        self.cutoff = float(cutoff)
+        if not np.isfinite(self.cutoff) or self.cutoff < 0.0:
+            raise ValueError("cutoff must be finite and nonnegative.")
         # self.order = order
         # self.scale = scale
         # self.time = 0.0
@@ -130,6 +134,7 @@ class TDMPS:
         self._last_step_pre_normalization_norms = ()
         self._last_step_pre_normalization_norm2 = ()
         self._last_step_tdvp_truncation_error = 0.0
+        self.last_step_info = None
         self._affine_hamiltonian_cache = {}
         self._tdvp_engine_cache = {}
         self._symmetric_observable_cache = {}
@@ -243,6 +248,7 @@ class TDMPS:
                 hamiltonian_cache_key,
                 integrator,
                 int(self.D),
+                float(self.cutoff),
                 int(krylov_dim),
                 float(krylov_tol),
                 str(krylov_method).lower().replace("_", "-"),
@@ -344,6 +350,7 @@ class TDMPS:
             )
         self._record_pre_normalization_norm2(info["pre_normalization_norm2"])
         self._last_step_tdvp_truncation_error += float(info.get("truncation_error", 0.0))
+        self.last_step_info = dict(info)
         return psi
 
     def _reset_tdvp_engines(self):
@@ -365,6 +372,7 @@ class TDMPS:
             local_sectors=self.local_sectors,
             target_sector=self.target_sector,
             max_bond=self.D,
+            cutoff=self.cutoff,
             projection_backend=sector_backend,
         )
         return projector.project(psi, normalize=True)
@@ -485,6 +493,8 @@ class TDMPS:
                     right_offset += rdim
                 shared[site] = merged
 
+            for tensor in shared[1:]:
+                tensor.setflags(write=False)
             template = {
                 "base_first": np.asarray(base_factors[0]),
                 "term_first": [np.asarray(factors[0]) for factors in term_factors],
@@ -732,6 +742,7 @@ class TDMPS:
         self._last_step_pre_normalization_norms = []
         self._last_step_pre_normalization_norm2 = []
         self._last_step_tdvp_truncation_error = 0.0
+        self.last_step_info = None
         if integrator in {"tdvp", "tdvp2"}:
             if dt is None:
                 raise ValueError("dt must be provided for TDVP time evolution.")
