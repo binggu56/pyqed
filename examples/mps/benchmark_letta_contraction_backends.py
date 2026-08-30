@@ -48,9 +48,10 @@ from examples.mps.adaptive_cp_letta_j1j2_square import (
 from examples.mps.frontier_tied_letta_j1j2_all_nn import (
     heisenberg_local_hamiltonian,
 )
-from pyqed.letta import FrontierTiedLETTA, LocalMPO, frontier_tensors_from_mps
+from pyqed.letta import FrontierTiedLETTA, frontier_tensors_from_mps
 from pyqed.letta.tt_frontier import TTMPOFrontier
-from pyqed.letta.vmc import LETTAVMC
+from pyqed.letta.vmc import VMC
+from pyqed.tn import MPO
 
 
 HERE = Path(__file__).resolve().parent
@@ -117,7 +118,7 @@ class BenchmarkCase:
         return self.hamiltonian.dims
 
     @property
-    def physical_sites(self):
+    def physical_groups(self):
         return tuple(
             (site,) + parents for site, parents in enumerate(self.parent_sets)
         )
@@ -497,7 +498,7 @@ def _tt_diagnostics(diagnostics, *, itemsize):
 def _tt_engine(case, mpo, *, paired_sites, max_rank, transfer_max_rank, args):
     return TTMPOFrontier(
         case.dims,
-        case.physical_sites,
+        case.sites,
         [tensor.shape for tensor in case.tensors],
         mpo.tensors,
         paired_sites=paired_sites,
@@ -522,8 +523,7 @@ def _benchmark_tt(
     repeats,
     args,
 ):
-    identity = LocalMPO(
-        case.dims,
+    identity = MPO(
         tuple(
             np.eye(dim, dtype=np.result_type(*[t.dtype for t in case.tensors]))[
                 None, None, :, :
@@ -724,13 +724,13 @@ def _benchmark_tt(
 def _benchmark_vmc(case, *, reference_energy, args):
     state_view = SimpleNamespace(
         tensors=case.tensors,
-        physical_sites=case.physical_sites,
+        physical_groups=case.physical_groups,
         dims=case.dims,
+        hamiltonian=case.hamiltonian,
     )
     vmc, setup = _timed(
-        lambda: LETTAVMC(
+        lambda: VMC(
             state_view,
-            case.hamiltonian,
             seed=args.seed + 17,
             proposal=args.vmc_proposal,
             exchange_probability=args.vmc_exchange_probability,
@@ -1027,7 +1027,7 @@ def _parser():
     parser.add_argument("--vmc-sweeps-between", type=int)
     parser.add_argument(
         "--vmc-proposal",
-        choices=("single_site", "exchange", "mixed"),
+        choices=("single_site", "exchange", "heat_bath", "mixed"),
     )
     parser.add_argument("--vmc-exchange-probability", type=float)
     parser.add_argument("--snapshot-4x4", type=Path, default=DEFAULT_SNAPSHOTS["4x4"])

@@ -1,0 +1,74 @@
+{
+  "model": "periodic Lieb-Liniger momentum-cutoff benchmark",
+  "ansatz": "Tr exp[Q + R a_0^dagger + sum_q K(q) rho_q] |0>",
+  "tie_operator": "rho_q=sum_k a_{k+q}^dagger a_k",
+  "particles": 4,
+  "length": 4.0,
+  "density": 1.0,
+  "coupling": 10.0,
+  "momentum_cutoff": 2,
+  "fixed_number_dimension": 70,
+  "exact_energy": 14.79179843477885,
+  "condensate_energy": 29.999999999999996,
+  "rows": [
+    {
+      "virtual_cutoff": 0,
+      "bond_dim": 1,
+      "energy": 29.999999999999996,
+      "error": 15.208201565221147,
+      "exact_fidelity": 0.622215266031673,
+      "success": true,
+      "parameters": [],
+      "maximum_commutator_norm": 0.0,
+      "rms_commutator_norm": 0.0
+    },
+    {
+      "energy": 18.190151236252127,
+      "success": true,
+      "nit": 46,
+      "nfev": 360,
+      "converged_restarts": 7,
+      "total_restarts": 8,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+      "virtual_cutoff": 1,
+      "bond_dim": 3,
+      "error": 3.398352801473278,
+      "exact_fidelity": 0.9098055337682542,
+      "parameters": [
+        -8.0,
+        -1.9329104615730273,
+        0.34453405106306606,
+        -4.195672796758507,
+        0.15444666465293816
+      ],
+      "maximum_commutator_norm": 2.044319449428318,
+      "rms_commutator_norm": 0.780019295418599
+    },
+    {
+      "energy": 14.791798434798919,
+      "success": true,
+      "nit": 249,
+      "nfev": 3370,
+      "converged_restarts": 8,
+      "total_restarts": 8,
+      "message": "CONVERGENCE: RELATIVE REDUCTION OF F <= FACTR*EPSMCH",
+      "virtual_cutoff": 2,
+      "bond_dim": 5,
+      "error": 2.006927957154403e-11,
+      "exact_fidelity": 0.9999999999995011,
+      "parameters": [
+        0.23403594315345028,
+        3.158698320093181,
+        0.24132093226358153,
+        2.383767055271175,
+        -0.7776270284703125,
+        -7.988634280628917,
+        -0.1254356949515837,
+        6.278679051326912,
+        3.325338678358648
+      ],
+      "maximum_commutator_norm": 42.83012193976916,
+      "rms_commutator_norm": 12.195008181841427
+    }
+  ]
+}

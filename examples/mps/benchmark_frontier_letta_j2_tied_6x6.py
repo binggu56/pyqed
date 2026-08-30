@@ -23,7 +23,6 @@ from examples.mps.scan_frontier_letta_vs_mps_j2_4x4 import (
 )
 from examples.mps.scan_frontier_letta_vs_mps_j2_8x4 import _optimize_mps
 from pyqed.letta import frontier_tied_letta_from_mps
-from pyqed.mps import MPO
 
 
 HERE = Path(__file__).resolve().parent
@@ -121,7 +120,7 @@ def run_benchmark(
     passes_per_cycle=2,
     tie_noise=1.0e-3,
     seed=7,
-    frontier_gauge_weighting="uniform",
+    gauge_weight="uniform",
     output=DEFAULT_OUTPUT,
     snapshot=None,
 ):
@@ -135,8 +134,7 @@ def run_benchmark(
     )
     hamiltonian = heisenberg_local_hamiltonian(nsites, weighted_bonds)
     parent_sets = parent_sets_from_edges(nsites, diagonals)
-    local_mpo = hamiltonian.to_mpo().compress()
-    mpo = MPO(list(local_mpo.tensors))
+    mpo = hamiltonian.to_mpo().compress()
 
     output = Path(output)
     snapshot = output.with_suffix(".npz") if snapshot is None else Path(snapshot)
@@ -172,8 +170,8 @@ def run_benchmark(
             "seed": int(seed),
             "frontier_backend": "identity_block",
             "local_solver": "direct",
-            "frontier_canonicalization": True,
-            "frontier_gauge_weighting": frontier_gauge_weighting,
+            "gauge": "frontier",
+            "gauge_weight": gauge_weight,
         },
         "results": {},
         "convergence": {},
@@ -262,7 +260,7 @@ def run_benchmark(
         "accepted_updates": 0,
         "site_updates": 0,
         "frontier_gauge": True,
-        "frontier_gauge_weighting": frontier_gauge_weighting,
+        "gauge_weight": gauge_weight,
         "frontier_gauge_bond_attempts": 0,
         "applied_frontier_gauges": 0,
         "maximum_frontier_imbalance_after": None,
@@ -292,8 +290,8 @@ def run_benchmark(
             solver="direct",
             eig_tol=tolerance,
             metric_tol=1.0e-12,
-            frontier_canonicalization=True,
-            frontier_gauge_weighting=frontier_gauge_weighting,
+            gauge="frontier",
+            gauge_weight=gauge_weight,
             verbose=True,
         )
         seconds = perf_counter() - start
@@ -377,7 +375,7 @@ def main():
     parser.add_argument("--tie-noise", type=float, default=1.0e-3)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
-        "--frontier-gauge-weighting",
+        "--gauge-weight",
         choices=("uniform", "probability"),
         default="uniform",
     )
@@ -397,7 +395,7 @@ def main():
         passes_per_cycle=args.passes_per_cycle,
         tie_noise=args.tie_noise,
         seed=args.seed,
-        frontier_gauge_weighting=args.frontier_gauge_weighting,
+        gauge_weight=args.gauge_weight,
         output=args.output,
         snapshot=args.snapshot,
     )

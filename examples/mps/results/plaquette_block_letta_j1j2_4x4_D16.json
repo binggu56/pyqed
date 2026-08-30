@@ -1,0 +1,106 @@
+{
+  "model": {
+    "shape": [
+      4,
+      4
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "target_two_sz": 0
+  },
+  "blocking": {
+    "shape": [
+      2,
+      2
+    ],
+    "nblocks": 4,
+    "blocks": [
+      [
+        0,
+        1,
+        7,
+        6
+      ],
+      [
+        2,
+        3,
+        5,
+        4
+      ],
+      [
+        10,
+        11,
+        13,
+        12
+      ],
+      [
+        8,
+        9,
+        15,
+        14
+      ]
+    ],
+    "block_dims": [
+      16,
+      16,
+      16,
+      16
+    ],
+    "unfused_physical_shape": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "parent_sets": [
+      [],
+      [],
+      [],
+      []
+    ],
+    "intra_block_ties": false,
+    "hamiltonian_mapping": "exact product-basis permutation",
+    "blocking_seconds": 0.010333167010685429
+  },
+  "solver": {
+    "bond_dims": [
+      1,
+      16,
+      16,
+      16,
+      1
+    ],
+    "solver": "matrix_free",
+    "frontier_backend": "identity_block",
+    "sweeps": 12,
+    "symmetry_parameters": 1520,
+    "dense_parameters": 8704,
+    "setup_seconds": 0.09660929099482019,
+    "sweep_seconds": 27.49965783400694,
+    "initial_energy": -0.8330326171681127,
+    "energy": -5.848564343452525,
+    "history": [
+      -5.366506018508123,
+      -5.718538488797905,
+      -5.806235678090507,
+      -5.8316440648639665,
+      -5.840685294985363,
+      -5.844869131310091,
+      -5.8467796003047825,
+      -5.847717872060318,
+      -5.848170976196789,
+      -5.848396681192106,
+      -5.848508297276007,
+      -5.848564343452525
+    ],
+    "peak_frontier_elements": 2897,
+    "cached_environment_elements": 8399
+  },
+  "exact": {
+    "energy": -7.505556950081064,
+    "seconds": 0.15045170800294727,
+    "energy_error": 1.6569926066285392,
+    "energy_error_per_site": 0.1035620379142837
+  }
+}

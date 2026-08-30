@@ -31,7 +31,6 @@ from examples.mps.frontier_tied_letta_j1j2_all_nn import (
     heisenberg_local_hamiltonian,
 )
 from pyqed.letta import FrontierTiedLETTA, abelian_frontier_tied_letta_from_mps
-from pyqed.mps import MPO
 
 
 HERE = Path(__file__).resolve().parent
@@ -125,8 +124,8 @@ def _run_stage(state, passes, *, frontier_gauge=True):
         nsweeps=int(passes),
         tol=0.0,
         solver="whitened",
-        frontier_canonicalization=bool(frontier_gauge),
-        frontier_gauge_weighting="probability",
+        gauge="frontier" if frontier_gauge else None,
+        gauge_weight="probability",
     )
     return _history_summary(
         state,
@@ -169,7 +168,7 @@ def _expand_to_parameter_target(state, target, *, maximum, scale, seed):
             count = int(
                 sum(
                     np.count_nonzero(mask)
-                    for mask in layout.local_masks(state.physical_sites)
+                    for mask in layout.local_masks(state.sites)
                 )
             )
             error = abs(target - count)
@@ -213,7 +212,7 @@ def benchmark(
     weighted = tuple((left, right, 1.0) for left, right in nearest)
     weighted += tuple((left, right, 0.5) for left, right in diagonals)
     hamiltonian = heisenberg_local_hamiltonian(nsites, weighted)
-    dense_mpo = MPO(list(hamiltonian.to_mpo().compress().tensors))
+    dense_mpo = hamiltonian.to_mpo().compress()
     parent_sets = parent_sets_from_edges(nsites, nearest)
     product = _neel_cores(nsites)
 

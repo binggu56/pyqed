@@ -3,10 +3,10 @@ import logging
 import time
 from pyqed import Molecule
 from pyqed.mps.mps import DMRG
-from pyqed.mps.autompo.model import Model
-from pyqed.mps.autompo.Operator import Op
-from pyqed.mps.autompo.basis import BasisSimpleElectron
-from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.operator_mpo.model import Model
+from pyqed.operator_mpo.operator import Op
+from pyqed.operator_mpo.basis import BasisSimpleElectron
+from pyqed.operator_mpo.model_mpo import ModelMPO
 
 # log info
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -153,7 +153,7 @@ def qc_dmrg_mpo(mf):
     # 3. Generate MPO
     basis_sites = [BasisSimpleElectron(i) for i in range(n_spin)]
     model = Model(basis=basis_sites, ham_terms=ham_terms)
-    mpo = Mpo(model, algo="qr")
+    mpo = ModelMPO(model, algo="qr")
 
     # get it transposed for solver in PyQED: (L, R, P, P) -> (L, P, R, P)
     mpo_dmrg = [w.transpose(0, 3, 1, 2) for w in mpo.matrices]
@@ -195,7 +195,7 @@ if __name__ == "__main__":
     solver.run()
 
     # 6. Report result
-    e_dmrg_total = solver.e_tot + mf.energy_nuc()
+    e_dmrg_total = solver.energy + mf.energy_nuc()
 
     print("RESULTS")
     print(f"  RHF Energy:         {mf.e_tot:.8f} Ha")

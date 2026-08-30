@@ -112,40 +112,39 @@ Implemented pieces:
 
 - `ReducedTensorOperator` for local irreducible spatial-orbital fermion tensors.
 - `RankCoupledMPO` virtual channels with optional Clebsch-Gordan recoupling.
-- `AutoMPO.add_reduced_string(...)` for explicit Wigner-Eckart coupled strings.
-- A general spin-free qchem two-body reduced-MPO builder that lowers ERI terms
-  to scalar-coupled reduced operators without the old dense symbolic fallback
-  for the covered spatial-orbital paths.
-- Canonical SU(2) qchem sweeps that keep mixed-canonical MPS gauges, use
-  matrix-free reduced packed/rank-coupled matvecs, and use reduced local block
-  preconditioners for both ground-state and state-averaged local Davidson
-  solves.
-- State-averaged SU(2) qchem sweeps that enforce the target spin sector inside
-  the local block Davidson/projector path instead of relying on final
-  `<S^2>` filtering or dense target-sector fallback.
+- `AutoMPO.add_reduced_string(...)` for explicit Wigner-Eckart strings used by
+  model Hamiltonians, LETTA, and reference tests.
+- A production quantum-chemistry Hamiltonian carrier with persistent
+  `S/R/A/P/B/Q` normal/complementary families built from the active-space
+  integrals.
+- A compiled moving environment that owns boundary propagation, complementary
+  local actions, reduced Davidson solves, and symmetry-preserving bond splits
+  for the complete half-sweep.
+- Fully reduced ground-state and state-averaged SU(2) sweeps with reduced
+  multiplet bond limits.
+- A strict public SU(2)-QCDMRG route: the compiled extension and compiled
+  integral builder are required, obsolete Python-backend controls are rejected,
+  and native-readiness failures raise instead of falling back to Python bond
+  callbacks.
+
+The generic `pyqed.mps.nonabelian` Python contractions remain available for
+model systems, LETTA, and exact validation. They are not a fallback for the
+production quantum-chemistry driver.
 
 Known limitations:
 
-- The reduced qchem MPO is still a scalar-coupled term builder, not a full
-  block2-style complementary-operator MPO with persistent `S/R/A/P/B/Q`
-  virtual families.
-- The transformed coupled local preconditioner is matrix-free and lazy, but its
-  self-blocks are still built by probing packed matvecs.  A compiled reduced
-  block kernel would be faster.
-- The reduced SVD/canonicalization layer has explicit `TwoSiteBasis` metadata,
-  but it is not yet a TensorKit-style fusion-tree object model throughout all
-  tensor factorizations.
+- SU(2)-QCDMRG has no pure-Python execution mode; a source-only installation
+  cannot run this backend.
+- The production route currently requires fully reduced spatial-orbital sites
+  and interprets `D` as a reduced multiplet limit.
+- The general reduced tensor layer is not yet a TensorKit-style fusion-tree
+  object model throughout every decomposition and canonicalization routine.
 
 ## Recommended Next Steps
 
-1. Promote all qchem one-body and two-body scalar-coupled terms to a single
-   documented Wigner-Eckart normalization table shared by the builder and tests.
-2. Add persistent rank-0/rank-1 local pair and particle-hole operator families.
-3. Build block2-style complementary operator families `S/R/A/P/B/Q` from `h1e`
-   and `eri`, then use those families as MPO virtual channels.
-4. Replace remaining per-integral four-operator string lowering with those
-   complementary operators.
-5. Move fully reduced SVD/canonicalization toward TensorKit-style explicit
-   fusion-tree metadata across all decomposition/canonicalization code paths.
-6. Move hot packed matvec, projected preconditioner, and reduced SVD kernels
-   out of Python loops into vectorized or compiled block kernels.
+1. Benchmark larger active spaces and thread counts against block2, including
+   peak memory and convergence by complete sweep cycles.
+2. Extend the compiled normal/complementary owner to additional non-Abelian
+   site models without weakening the strict production contract.
+3. Move the remaining general reduced tensor factorizations toward explicit
+   fusion-tree metadata.

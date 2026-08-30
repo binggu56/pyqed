@@ -28,7 +28,6 @@ from examples.mps.frontier_tied_letta_j1j2_all_nn import (
 )
 from examples.mps import scan_frontier_letta_vs_mps_j2_4x4 as scan4
 from examples.mps import scan_frontier_letta_vs_mps_j2_8x4 as scan8
-from pyqed.mps import MPO
 
 
 HERE = Path(__file__).resolve().parent
@@ -101,7 +100,7 @@ def _continuation_payload(
     target_tolerance,
     requested_additional_passes,
     chunk_passes,
-    gauge_weighting,
+    gauge_weight,
     continuation_seconds,
     final_diagnostics,
 ):
@@ -124,8 +123,8 @@ def _continuation_payload(
             "chunk_passes": int(chunk_passes),
             "frontier_backend": "compressed",
             "solver": "direct",
-            "frontier_canonicalization": True,
-            "frontier_gauge_weighting": str(gauge_weighting),
+            "gauge": "frontier",
+            "gauge_weight": str(gauge_weight),
             "state_snapshot": _portable_path(state_output),
             "snapshot_policy": "overwrite latest tensor state after each chunk",
             "snapshot_is_resumable_by_this_script": False,
@@ -171,7 +170,7 @@ def _continue_in_chunks(
     additional_passes,
     chunk_passes,
     target_tolerance,
-    gauge_weighting,
+    gauge_weight,
     diagnostics,
 ):
     trace = list(baseline_trace)
@@ -186,8 +185,8 @@ def _continue_in_chunks(
             sweep_offset=baseline_passes + completed,
             tol=target_tolerance,
             solver="direct",
-            frontier_canonicalization=True,
-            frontier_gauge_weighting=gauge_weighting,
+            gauge="frontier",
+            gauge_weight=gauge_weight,
         )
         elapsed = perf_counter() - start
         continuation_seconds += elapsed
@@ -211,7 +210,7 @@ def _continue_in_chunks(
             target_tolerance=target_tolerance,
             requested_additional_passes=additional_passes,
             chunk_passes=chunk_passes,
-            gauge_weighting=gauge_weighting,
+            gauge_weight=gauge_weight,
             continuation_seconds=continuation_seconds,
             final_diagnostics=final_diagnostics,
         )
@@ -276,7 +275,7 @@ def continue_4x4(
             pass_limit=40,
             tolerance=1.0e-10,
             frontier_gauge=True,
-            frontier_gauge_weighting="probability",
+            gauge_weight="probability",
             warm_mps_seconds=mps_record["optimization_seconds"],
         )
         previous_letta = state
@@ -335,7 +334,7 @@ def continue_4x4(
         additional_passes=additional_passes,
         chunk_passes=chunk_passes,
         target_tolerance=target_tolerance,
-        gauge_weighting="probability",
+        gauge_weight="probability",
         diagnostics=diagnostics,
     )
 
@@ -359,7 +358,7 @@ def continue_8x4(
         weighted += tuple((i, j, ratio) for i, j in diagonals)
         hamiltonian = heisenberg_local_hamiltonian(nsites, weighted)
         local_mpo = hamiltonian.to_mpo().compress()
-        mpo = MPO(list(local_mpo.tensors))
+        mpo = local_mpo
         current_mps = {}
         mps_records = {}
         for bond_dim in (2, 4):
@@ -400,7 +399,7 @@ def continue_8x4(
             pass_limit=80,
             tolerance=1.0e-9,
             frontier_gauge=True,
-            frontier_gauge_weighting="uniform",
+            gauge_weight="uniform",
             warm_mps_seconds=mps_records[4]["optimization_seconds"],
         )
         previous_letta = state
@@ -467,7 +466,7 @@ def continue_8x4(
         additional_passes=additional_passes,
         chunk_passes=chunk_passes,
         target_tolerance=target_tolerance,
-        gauge_weighting="uniform",
+        gauge_weight="uniform",
         diagnostics=diagnostics,
     )
 

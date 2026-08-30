@@ -17,13 +17,12 @@ from examples.mps.adaptive_cp_letta_j1j2_square import (
 from pyqed.letta import (
     DenseTiedLETTA,
     FrontierTiedLETTA,
-    LocalHamiltonian,
-    LocalTerm,
     heisenberg_block_frontier_profile,
     heisenberg_frontier_profile,
     optimize_heisenberg_block_order,
     optimize_heisenberg_order,
 )
+from pyqed.tn import LocalHamiltonian, LocalTerm
 
 
 HERE = Path(__file__).resolve().parent

@@ -131,8 +131,8 @@ def run_integrated_check(
         eig_tol=1.0e-10,
         maxiter=1600,
         max_subspace=96,
-        frontier_canonicalization=True,
-        frontier_gauge_weighting="uniform",
+        gauge="frontier",
+        gauge_weight="uniform",
         verbose=False,
     )
     control_seconds = perf_counter() - control_start
@@ -160,8 +160,8 @@ def run_integrated_check(
         eig_tol=1.0e-10,
         maxiter=1600,
         max_subspace=96,
-        frontier_canonicalization=True,
-        frontier_gauge_weighting="uniform",
+        gauge="frontier",
+        gauge_weight="uniform",
         verbose=True,
     )
     relaxation_seconds = perf_counter() - relaxation_start
@@ -190,7 +190,7 @@ def run_integrated_check(
             "selected_tie": list(edge),
             "relaxation_passes": 1,
             "solver": "whitened",
-            "frontier_canonicalization": "uniform",
+            "gauge": "frontier",
         },
         "expanded_state": {
             "bond_dims": list(expanded_bond_dims),
