@@ -1,132 +1,39 @@
+#!/usr/bin/env python3
+"""Build a spinless-fermion tight-binding Hamiltonian as an automatic MPO.
+
+``BasisSimpleElectron`` marks the local degrees of freedom as fermionic, so
+the MPO builder inserts the required Jordan--Wigner strings automatically.
 """
 
-
-Key Feature:
-------------
-The 'BasisSimpleElectron' has 'is_electron = True'. 
-The MPO class will automatically insert 'sigma_z' gates (Jordan-Wigner strings)
-to preserve fermionic anti-commutation relations.
-"""
-
-import logging
 import numpy as np
-from pyqed.mps.autompo.model import Model
+
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
+from pyqed.mps.autompo.model import Model
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger(__name__)
 
-def tight_binding(nsite, t, v):
-    """
-    Auto MPO Example: Fermionic Hopping Model (Tight-Binding)
+def tight_binding(nsite, hopping, onsite):
+    """Return the MPO for a disordered one-dimensional fermion chain."""
+    terms = []
+    for site in range(nsite - 1):
+        terms.append(
+            -hopping * Op(r"a^\dagger", site) * Op("a", site + 1)
+        )
+        terms.append(
+            -hopping * Op(r"a^\dagger", site + 1) * Op("a", site)
+        )
 
-    Hamiltonian Definition:
-    -----------------------
-    The Hamiltonian represents spinless fermions hopping on a 1D chain with 
-    disordered on-site potentials.
+    for site, potential in enumerate(onsite):
+        terms.append(Op("n", site, factor=potential))
 
-        H = -t * Σ (c†_i * c_{i+1} + c†_{i+1} * c_i)  +  Σ (v_i * n_i)
-                 i                                     i
+    basis = [BasisSimpleElectron(dof=site) for site in range(nsite)]
+    return Mpo(Model(basis=basis, ham_terms=terms), algo="qr")
 
-    Where:
-      - t       : Hopping amplitude
-      - v_i     : Random on-site potential
-      - c†, c   : Fermionic creation/annihilation operators (a^dag, a)
-      - n_i     : Number operator (n)
-
-    Parameters
-    ----------
-    nsite : TYPE
-        DESCRIPTION.
-    t : TYPE
-        DESCRIPTION.
-    v : TYPE
-        DESCRIPTION.
-
-    Returns
-    -------
-    None.
-
-    """
-    
-    logger.info(f"--- Building MPO for Fermionic Chain (N={nsite}) ---")
-
-    # ------------------------------------------------------------------
-    # 2. Build Hamiltonian Terms
-    # ------------------------------------------------------------------
-    ham_terms = []
-    
-    # Part A: Nearest Neighbor Hopping
-    # We use the explicit product syntax to ensure 'op_mat' receives 
-    # exactly "a^dagger" and "a" as defined in your class.
-    for i in range(nsite - 1):
-        # Forward hopping: -t * (a^dag_i * a_{i+1})
-        term_fwd = Op(r"a^\dagger", i) * Op("a", i+1) * (-t)
-        ham_terms.append(term_fwd)
-        
-        # Backward hopping (h.c.): -t * (a^dag_{i+1} * a_i)
-        # Note: (a^dag_i a_{i+1})^dagger = a^dag_{i+1} a_i
-        term_bwd = Op(r"a^\dagger", i+1) * Op("a", i) * (-t)
-        ham_terms.append(term_bwd)
-    
-    # Part B: On-site Random Potential
-    # We use "n" since your BasisSimpleElectron supports it directly.
-    for i in range(nsite):
-        v_i = v[i]
-        term_on_site = Op("n", i, factor=v_i)
-        ham_terms.append(term_on_site)
-
-    # ------------------------------------------------------------------
-    # 3. Initialize Basis and Model
-    # ------------------------------------------------------------------
-    # Use the custom BasisSimpleElectron that includes JW logic (is_electron=True)
-    basis = [BasisSimpleElectron(dof=i) for i in range(nsite)]
-    
-    model = Model(basis=basis, ham_terms=ham_terms)
-    
-    # ------------------------------------------------------------------
-    # 4. Generate MPO
-    # ------------------------------------------------------------------
-    logger.info("Generating Fermionic MPO (Automatic Jordan-Wigner)...")
-    
-    # 'algo="qr"' creates the MPO using QR decomposition
-    mpo = Mpo(model, algo="qr")
-    
-    return mpo
-    
-    # logger.info("MPO Successfully Created.")
-
-    # logger.info("\n--- Inspection ---")
-    # for site_idx, W in enumerate(mpo):
-    #     logger.info(f"Site {site_idx}: Tensor Shape {W.shape}")
-
-    # # Dense Verification (Small Systems Only)
-    # logger.info("\n--- Converting to Dense Matrix (Verification) ---")
-    
-    # H_dense = mpo.to_dense()
-    # logger.info(f"Dense Hamiltonian Shape: {H_dense.shape}")
-    
-    # # Check Ground State Energy
-    # eigvals = np.linalg.eigvalsh(H_dense)
-    # logger.info(f"Ground State Energy:   {eigvals[0]:.6f}")
-    # logger.info(f"First Excited Energy:  {eigvals[1]:.6f}")
 
 if __name__ == "__main__":
-    
-    # ------------------------------------------------------------------
-    # 1. Define Physics Parameters
-    # ------------------------------------------------------------------
-    nsite = 8       # System size
-    t = 1.0         # Hopping strength
-    
-    # Generate random potentials v_i
-    np.random.seed(42)
-    v = np.random.rand(nsite) * 0.5
-    
-    H = tight_binding(nsite, t, v)
-    
-    print(H)
-    
+    nsite = 8
+    rng = np.random.default_rng(42)
+    onsite = 0.5 * rng.random(nsite)
+    hamiltonian = tight_binding(nsite, hopping=1.0, onsite=onsite)
+    print(hamiltonian)

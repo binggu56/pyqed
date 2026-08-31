@@ -45,6 +45,22 @@ PRESETS = {
         "nelecas": 4,
         "rotation": (1, 4),
     },
+    "h6_631g": {
+        "atom": "; ".join(f"H 0 0 {0.8 * i:.1f}" for i in range(6)),
+        "unit": "angstrom",
+        "basis": "6-31g",
+        "ncas": 6,
+        "nelecas": 6,
+        "rotation": (3, 8),
+    },
+    "h8_631g": {
+        "atom": "; ".join(f"H 0 0 {0.8 * i:.1f}" for i in range(8)),
+        "unit": "angstrom",
+        "basis": "6-31g",
+        "ncas": 8,
+        "nelecas": 8,
+        "rotation": (3, 10),
+    },
     "ethylene22": {
         "atom": [
             ["C", 0.00000000, 0.00000000, 0.66796400],
