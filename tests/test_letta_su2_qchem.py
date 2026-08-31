@@ -70,6 +70,26 @@ def test_qchem_letta_constructs_su2_state_from_mean_field():
     state.close()
 
 
+def test_su2_letta_defaults_to_nearest_neighbor_ties_for_dense_integrals():
+    nsites = 4
+    h1e = np.full((nsites, nsites), -0.05)
+    np.fill_diagonal(h1e, np.linspace(-1.0, 0.5, nsites))
+    eri = np.full((nsites, nsites, nsites, nsites), 1.0e-3)
+
+    state = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        D=1,
+        seed=4,
+    )
+
+    assert state.graph == ((0, 1), (1, 2), (2, 3))
+    assert state.frontier_states == (1, 3, 3, 3, 1)
+    state.close()
+
+
 def _dense_vector_from_reduced_spatial_mps(sites):
     descriptor = SpatialOrbitalSite()
     state_sector = [None] * descriptor.d

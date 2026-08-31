@@ -8,6 +8,12 @@ reachable virtual sector.
 Construction
 ------------
 
+By default, SU(2)-LETTA ties only nearest-neighbor orbitals in their current
+order.  This keeps the frontier width bounded even though the quantum-chemistry
+Hamiltonian MPO retains every one- and two-electron coupling.  Pass ``graph``
+explicitly to use a different variational tie graph; the graph does not screen
+or modify the Hamiltonian.
+
 Build directly from a completed mean-field calculation through the qchem
 driver:
 

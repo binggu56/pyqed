@@ -21,7 +21,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, replace
-from itertools import combinations, product
+from itertools import product
 from numbers import Integral
 from pathlib import Path
 import os
@@ -381,22 +381,9 @@ def _canonical_graph(nsites, graph):
     return tuple(sorted(out))
 
 
-def _interaction_graph(h1e, eri, cutoff):
-    """Infer orbital pairs that share a screened Hamiltonian term."""
-    h1e = np.asarray(h1e)
-    nsites = int(h1e.shape[-1])
-    edges = set()
-    spatial_h1e = h1e if h1e.ndim == 2 else h1e[0]
-    for left, right in combinations(range(nsites), 2):
-        if abs(spatial_h1e[left, right]) > cutoff or abs(spatial_h1e[right, left]) > cutoff:
-            edges.add((left, right))
-    if eri is not None:
-        eri = np.asarray(eri)
-        spatial_eri = eri if eri.ndim == 4 else eri[0, 0]
-        for indices in zip(*np.nonzero(np.abs(spatial_eri) > cutoff)):
-            support = tuple(sorted(set(int(index) for index in indices)))
-            edges.update(combinations(support, 2))
-    return tuple(sorted(edges))
+def _nearest_neighbor_graph(nsites):
+    """Return the bounded-width default tie graph for an orbital chain."""
+    return tuple((site, site + 1) for site in range(int(nsites) - 1))
 
 
 def _frontiers(nsites, parents):
@@ -645,7 +632,12 @@ class NonAbelianFrontierLETTA:
         cutoff=1.0e-10,
         **kwargs,
     ):
-        """Build the fully reduced qchem MPO and its SU(2)-LETTA state."""
+        """Build the fully reduced qchem MPO and its SU(2)-LETTA state.
+
+        The default LETTA tie graph is the nearest-neighbor orbital chain.
+        Hamiltonian couplings remain complete in the reduced MPO; ``graph``
+        controls only variational tensor ties and may be supplied explicitly.
+        """
         from pyqed.qchem.dmrg.backends.reduced import (
             build_spatial_reduced_hamiltonian_mpo,
         )
@@ -663,7 +655,7 @@ class NonAbelianFrontierLETTA:
             ecore=ecore,
         )
         if graph is None:
-            graph = _interaction_graph(h1e, eri, cutoff)
+            graph = _nearest_neighbor_graph(np.asarray(h1e).shape[-1])
         state = cls(
             hamiltonian,
             nelec=nelec,
