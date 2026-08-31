@@ -91,6 +91,7 @@ docs = [
 test = [
     "build>=1.2",
     "matplotlib>=3.8",
+    "numba>=0.59",
     "pytest>=8",
     "twine>=5",
 ]
