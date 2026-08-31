@@ -56,13 +56,14 @@ def test_qchem_letta_constructs_su2_state_from_mean_field():
             return np.zeros((2, 2, 2, 2))
 
     mf = MeanField()
-    state = QChemLETTA(mf, D=1, graph=[(0, 1)], seed=4)
+    state = QChemLETTA(mf, D=2, graph=[(0, 1)], seed=4)
 
     assert isinstance(state, SU2LETTA)
     assert state.mf is mf
     assert state.ncas == 2
     assert state.nelecas == 2
     assert state.ncore == 0
+    assert state.D == 2
     assert state.is_native_su2
     state.run(nsweeps=1, algorithm="one_site", tol=0.0)
     assert np.isfinite(state.energy)

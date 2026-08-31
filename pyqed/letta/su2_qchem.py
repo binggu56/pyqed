@@ -135,10 +135,6 @@ def _unique(values):
     return tuple(dict.fromkeys(values))
 
 
-def _sector_multiplicity(qns, sector):
-    return sum(value == sector for value in qns)
-
-
 @dataclass(frozen=True)
 class _PairChannelEntry:
     key: tuple
@@ -702,7 +698,10 @@ class NonAbelianFrontierLETTA:
         sites = tuple(sites)
         multiplicities = [
             max(
-                (_sector_multiplicity(site.qns[2], sector) for sector in _unique(site.qns[2])),
+                (
+                    site.legs[2].sector_dim(sector)
+                    for sector in site.legs[2].sectors
+                ),
                 default=1,
             )
             for site in sites[:-1]
@@ -738,7 +737,7 @@ class NonAbelianFrontierLETTA:
                     f"base site {site_index} physical sectors do not match its MPO core."
                 )
             for sector in physical_sectors:
-                multiplicity = _sector_multiplicity(site.qns[1], sector)
+                multiplicity = site.legs[1].sector_dim(sector)
                 if multiplicity != core.phys_in_leg.sector_dim(sector):
                     raise ValueError(
                         f"base site {site_index} physical multiplicity for {sector!r} "
@@ -749,7 +748,10 @@ class NonAbelianFrontierLETTA:
                 "base MPS right boundary does not match the requested target_sector."
             )
         for left, right in zip(sites, sites[1:]):
-            if tuple(left.qns[2]) != tuple(right.qns[0]):
+            if (
+                left.legs[2].sectors != right.legs[0].sectors
+                or dict(left.legs[2].dims) != dict(right.legs[0].dims)
+            ):
                 raise ValueError("neighboring base MPS bond-sector layouts do not match.")
         return tuple(site.copy() for site in sites)
 
@@ -1008,8 +1010,8 @@ class NonAbelianFrontierLETTA:
     def _bond_sector_dims(self, site, axis):
         base = self._base_sites[site]
         return {
-            sector: _sector_multiplicity(base.qns[axis], sector)
-            for sector in _unique(base.qns[axis])
+            sector: base.legs[axis].sector_dim(sector)
+            for sector in base.legs[axis].sectors
         }
 
     def materialize_site(self, site):
