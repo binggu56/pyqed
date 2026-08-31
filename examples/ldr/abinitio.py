@@ -12,8 +12,8 @@ import numpy as np
 from scipy.sparse import csr_matrix
 from tqdm import tqdm
 
-from pyqed.dvr import SineDVR
-from pyqed.ldr.ldr import LDRN
+from pyqed.dvr import DVR, SineDVR
+from pyqed.ldr import LDR
 
 import scipy.sparse as sp
 from opt_einsum import contract
@@ -762,11 +762,12 @@ if __name__=='__main__':
     domains = [[-5.5, 5.5], [0, 11]] # Nuclear coordinate domains
     levels = [5, 5] # Discretization levels
 
-    ldr = LDRN(domains=domains, levels=levels, ndim=ndim, nstates=nstates, mass=mass)
+    grid = DVR(domains, [2**level - 1 for level in levels], mass=mass)
+    ldr = LDR(grid, nstates)
 
     # x, y = ldr.x
-    nx, ny = ldr.nx
-    npts = ldr.npts
+    nx, ny = ldr.shape
+    npts = ldr.ngrid
 
     # psi0 = initialize_wavepacket(ref_geom=ref_geom, idx0=32, idx1=10, a=30, A=overlap_matrix, target_state=1) # x[idx0], y[idx1]是波包初始位置的中心点
 
@@ -819,7 +820,7 @@ if __name__=='__main__':
 
     # build the global electronic overlap matrix
 
-    lpa = LPA(ci_list, dims=ldr.nx, nstates=nstates)
+    lpa = LPA(ci_list, dims=ldr.shape, nstates=nstates)
 
     links = lpa.link()
 
@@ -831,8 +832,8 @@ if __name__=='__main__':
 
     # load electronic structure data into the quantum dynamics solver
 
-    ldr.apes = v.reshape((nx, ny, nstates))
-    ldr.A = A
+    ldr.energies = v.reshape((nx, ny, nstates))
+    ldr.set_overlaps(overlaps=A)
 
 
     psi0 = np.zeros((nx, ny, nstates), dtype=complex)
@@ -842,6 +843,6 @@ if __name__=='__main__':
     # project it into the computational space using the overlap matrix
     psi0 = np.einsum('ijk,ij->ijk', A[:, :, :, 10, 10, 1], psi0[:,:,1])
 
-    ldr.run(psi0, dt=0.2, nt=1000)
+    ldr.run(psi0, dt=0.2, nsteps=1000)
 
     # result.dump('result')

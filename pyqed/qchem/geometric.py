@@ -110,8 +110,7 @@ def _build_cbasis_from_reference(mol):
 
     if getattr(mol, '_bas', None) is None:
         raise ValueError(
-            "Analytic geometric F/G terms require mol._bas. "
-            "Build the molecule with driver='builtin', 'gbasis', 'gbasis-pyscf', or 'pyscf'."
+            "Analytic geometric F/G terms require mol._bas. Build the molecule first."
         )
 
     coord_type = getattr(mol._bas[0], 'coord_type', None)
@@ -288,6 +287,10 @@ def _electron_nuclear_operator_derivatives_pyscf(mol):
     except Exception:
         return None
 
+    if hasattr(mol, "pyscf_ao_permutation"):
+        permutation = mol.pyscf_ao_permutation(pmol)
+        h1_cart = h1_cart[:, permutation][:, :, permutation]
+        h2_cart = h2_cart[:, :, permutation][:, :, :, permutation]
     return h1_cart, h2_cart
 
 
@@ -615,8 +618,8 @@ def _basis_derivative_integrals_mo(
     except Exception as exc:
         raise ValueError(
             "BO Hamiltonian derivatives require project-local derivative integrals. "
-            "Build the molecule with the builtin Gaussian driver, e.g. "
-            "mol.build(driver='builtin', eri='dense')."
+            "Build the molecule with native Gaussian integrals, e.g. "
+            "mol.build(eri='dense')."
         ) from exc
 
     h1_mo_explicit = _one_electron_ao_to_mo(h1_ao, mo)

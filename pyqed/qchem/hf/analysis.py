@@ -1,7 +1,7 @@
 import numpy as np
-from gbasis.evals.eval import evaluate_basis
 from pyqed.qchem.basis import ContractedGaussian as NativeContractedGaussian
 from pyqed.qchem.tools import cubegen
+from pyqed.units import au2angstrom
 
 from .rhf import (
     _cross_ao_overlap_matrix,
@@ -255,9 +255,8 @@ class RHFAnalysis:
         )
         result['orbital_index'] = None if orbital_index is None else int(orbital_index)
         result['coeff_source'] = 'custom' if coeff is not None else 'mo'
-        bohr_to_ang = 0.529177210903
-        result['origin_angstrom'] = tuple(float(v * bohr_to_ang) for v in result['origin_bohr'])
-        result['spacing_angstrom'] = tuple(float(v * bohr_to_ang) for v in result['spacing_bohr'])
+        result['origin_angstrom'] = tuple(float(v * au2angstrom) for v in result['origin_bohr'])
+        result['spacing_angstrom'] = tuple(float(v * au2angstrom) for v in result['spacing_bohr'])
         return result
 
     def sample_orbital_grid(
@@ -1108,8 +1107,16 @@ class RHFAnalysis:
 
     def _evaluate_ao_values(self, points, screen_basis=True, tol_screen=1e-8):
         basis = self._ao_basis_for_real_space()
-        if basis and isinstance(basis[0], NativeContractedGaussian):
-            cart_basis = getattr(self.mf.mol, '_bas_cart', None)
+        cart_basis = getattr(self.mf.mol, '_bas_cart', None)
+        native_basis = bool(basis) and (
+            isinstance(basis[0], NativeContractedGaussian)
+            or (
+                hasattr(basis[0], 'prim_weights')
+                and hasattr(basis[0], 'shell')
+                and hasattr(basis[0], 'exps')
+            )
+        )
+        if cart_basis is not None or native_basis:
             if cart_basis is None:
                 cart_basis = basis
             ao_values = self._evaluate_native_cartesian_basis(cart_basis, points)
@@ -1118,19 +1125,10 @@ class RHFAnalysis:
                 ao_values = np.asarray(transform, dtype=float).T @ ao_values
             return ao_values
 
-        try:
-            values = evaluate_basis(
-                basis,
-                points,
-                transform=None,
-                screen_basis=screen_basis,
-                tol_screen=float(tol_screen),
-            )
-        except TypeError as exc:
-            if "screen_basis" not in str(exc) and "tol_screen" not in str(exc):
-                raise
-            values = evaluate_basis(basis, points, transform=None)
-        return np.asarray(values, dtype=float)
+        pyscf_mol = self.mf.mol.topyscf().build()
+        evaluator = "GTOval_cart" if pyscf_mol.cart else "GTOval_sph"
+        values = pyscf_mol.eval_gto(evaluator, np.asarray(points, dtype=float))
+        return np.asarray(values, dtype=float).T
 
     def sample_mo(
         self,

@@ -14,10 +14,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from pyqed.qchem.gdvr import AtomicChain, RTTDHF
+from pyqed.units import au2fs, au2watt_per_centimeter_squared
 
 
-AU_TIME_FS = 0.02418884326505
-FIELD_TO_INTENSITY_W_CM2 = 3.50944506e16
+AU_TIME_FS = au2fs
+FIELD_TO_INTENSITY_W_CM2 = au2watt_per_centimeter_squared
 
 
 def optical_period(omega):

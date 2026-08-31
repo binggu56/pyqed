@@ -10,14 +10,14 @@ from pyqed.qchem.mcscf.nevpt2 import NEVPT2
 
 def _lih_cas22():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
     return direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
 
 
 def _lih_cas44():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
     return direct_ci.CASCI(mf, ncas=4, nelecas=4).run(nstates=1, method='direct_ci')
 

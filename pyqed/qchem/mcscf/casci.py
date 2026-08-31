@@ -3583,10 +3583,11 @@ def _prepare_biorthogonal_overlap(s, ncore_bra, ncore_ket, ncas_bra, ncas_ket, d
     scc_u, scc_sigma, scc_vh, scc_inv = _svd_inverse(scc)
     saa_eff = saa - sac @ scc_inv @ sca
     saa_u, saa_sigma, saa_vh, x_left, x_right = _biorthogonalize_active_overlap(saa_eff)
+    core_det = scc.item() if scc.shape == (1, 1) else np.linalg.det(scc)
 
     return _BiorthogonalOverlapPrep(
         s_mo=np.asarray(s, dtype=dtype),
-        core_factor=np.linalg.det(scc) ** 2,
+        core_factor=core_det ** 2,
         saa_eff=saa_eff,
         scc=scc,
         scc_u=scc_u,

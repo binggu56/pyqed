@@ -1,0 +1,411 @@
+{
+  "method": "open Kogut-Susskind gauge-invariant DMRG plus block-sparse TDVP",
+  "fidelity": "single finite-spacing/finite-volume point; channel masses are dominant matrix-pencil poles, not a continuum extrapolation",
+  "nsites": 80,
+  "chain_length": 159,
+  "bond_dim": 128,
+  "ground_half_sweeps": 16,
+  "vector_steps": 60,
+  "scalar_steps": 100,
+  "dt": 0.1,
+  "length": 20.0,
+  "gL": 20.0,
+  "coupling": 1.0,
+  "spacing": 0.25,
+  "x": 16.0,
+  "flux_cutoff": 3,
+  "lattice_mass_over_g": -0.03125,
+  "ground_energy": -99.31998111718677,
+  "scalar_elastic_mean": 4.119652320007818,
+  "gauss_law": "exact target-QN block structure on every matter/link site; no penalty Hamiltonian",
+  "M_V_over_g": 0.5826426670595651,
+  "M_S_over_g": 1.2101475326063134,
+  "M_V_pole_rank_mad": 0.000144157813827539,
+  "M_S_pole_rank_mad": 0.05553899434651999,
+  "scalar_precision_note": "finite-time scalar estimate; rank dependence is the quoted robust MAD and dominates its numerical uncertainty",
+  "continuum_M_V_over_g": 0.5641895835477563,
+  "continuum_M_S_over_g": 1.1283791670955126,
+  "M_V_relative_error": 0.03270723893158678,
+  "M_S_relative_error": 0.07246532716593435,
+  "vector_pole_audit": [
+    {
+      "rank": 6,
+      "candidates": [
+        {
+          "frequency": 0.5815634746201978,
+          "amplitude": 0.8718541591016713,
+          "root_modulus": 0.9987955346649195
+        },
+        {
+          "frequency": 0.6253778364873455,
+          "amplitude": 0.07334822411264574,
+          "root_modulus": 0.956480070500733
+        }
+      ],
+      "dominant": 0.5815634746201978
+    },
+    {
+      "rank": 8,
+      "candidates": [
+        {
+          "frequency": 0.5848240581014732,
+          "amplitude": 0.8512185954485506,
+          "root_modulus": 0.9990300881916935
+        },
+        {
+          "frequency": 0.7754423630140796,
+          "amplitude": 0.05982636914026712,
+          "root_modulus": 0.9629488796969683
+        }
+      ],
+      "dominant": 0.5848240581014732
+    },
+    {
+      "rank": 10,
+      "candidates": [
+        {
+          "frequency": 0.5820186467811704,
+          "amplitude": 0.8051423858669619,
+          "root_modulus": 0.9994769798118819
+        },
+        {
+          "frequency": 0.6980752790416759,
+          "amplitude": 0.09163346158438865,
+          "root_modulus": 0.9810322221348707
+        }
+      ],
+      "dominant": 0.5820186467811704
+    },
+    {
+      "rank": 12,
+      "candidates": [
+        {
+          "frequency": 0.5819855702815546,
+          "amplitude": 0.8022897785504501,
+          "root_modulus": 0.9995025409017578
+        },
+        {
+          "frequency": 0.698546021233611,
+          "amplitude": 0.09293518424316194,
+          "root_modulus": 0.9816491824263757
+        }
+      ],
+      "dominant": 0.5819855702815546
+    },
+    {
+      "rank": 14,
+      "candidates": [
+        {
+          "frequency": 0.5824978766723735,
+          "amplitude": 0.8047997896171337,
+          "root_modulus": 0.9994981242618076
+        },
+        {
+          "frequency": 0.7116362769350478,
+          "amplitude": 0.08802316104802178,
+          "root_modulus": 0.9813666160365271
+        }
+      ],
+      "dominant": 0.5824978766723735
+    },
+    {
+      "rank": 16,
+      "candidates": [
+        {
+          "frequency": 0.5825615604626129,
+          "amplitude": 0.8025641840830071,
+          "root_modulus": 0.9995222209092843
+        },
+        {
+          "frequency": 0.7137610441114847,
+          "amplitude": 0.08832025343971932,
+          "root_modulus": 0.9819720004163263
+        }
+      ],
+      "dominant": 0.5825615604626129
+    },
+    {
+      "rank": 18,
+      "candidates": [
+        {
+          "frequency": 0.5827861923000286,
+          "amplitude": 0.8082094232084591,
+          "root_modulus": 0.9994766309186138
+        },
+        {
+          "frequency": 0.7190069112679359,
+          "amplitude": 0.08480905783293949,
+          "root_modulus": 0.9806500142228408
+        }
+      ],
+      "dominant": 0.5827861923000286
+    },
+    {
+      "rank": 20,
+      "candidates": [
+        {
+          "frequency": 0.5827237736565174,
+          "amplitude": 0.8083120191181828,
+          "root_modulus": 0.999473209034879
+        },
+        {
+          "frequency": 0.7171696531322138,
+          "amplitude": 0.08524159899570985,
+          "root_modulus": 0.9805750989306522
+        }
+      ],
+      "dominant": 0.5827237736565174
+    },
+    {
+      "rank": 22,
+      "candidates": [
+        {
+          "frequency": 0.5827697631466376,
+          "amplitude": 0.8085827506982295,
+          "root_modulus": 0.9994722744784627
+        },
+        {
+          "frequency": 0.7184571914014244,
+          "amplitude": 0.08480373419071813,
+          "root_modulus": 0.9805371078408561
+        }
+      ],
+      "dominant": 0.5827697631466376
+    },
+    {
+      "rank": 24,
+      "candidates": [
+        {
+          "frequency": 0.5827626353836943,
+          "amplitude": 0.8084088467278572,
+          "root_modulus": 0.9994736864853235
+        },
+        {
+          "frequency": 0.7182563995403066,
+          "amplitude": 0.08491269551794532,
+          "root_modulus": 0.9805800464702699
+        }
+      ],
+      "dominant": 0.5827626353836943
+    }
+  ],
+  "scalar_pole_audit": [
+    {
+      "rank": 6,
+      "candidates": [
+        {
+          "frequency": 1.238646784118371,
+          "amplitude": 0.14437232106871348,
+          "root_modulus": 0.9833931509058058
+        },
+        {
+          "frequency": 1.4380515612765565,
+          "amplitude": 2.2246857192366543e-06,
+          "root_modulus": 1.0986969529712236
+        }
+      ],
+      "dominant": 1.238646784118371
+    },
+    {
+      "rank": 8,
+      "candidates": [
+        {
+          "frequency": 0.8098758628174633,
+          "amplitude": 0.0006060505540171897,
+          "root_modulus": 1.033775748659105
+        },
+        {
+          "frequency": 1.2133985645720704,
+          "amplitude": 0.15805416432857378,
+          "root_modulus": 0.9807245895156139
+        }
+      ],
+      "dominant": 1.2133985645720704
+    },
+    {
+      "rank": 10,
+      "candidates": [
+        {
+          "frequency": 1.2068965006405565,
+          "amplitude": 0.14982909491926838,
+          "root_modulus": 0.9825000997231482
+        }
+      ],
+      "dominant": 1.2068965006405565
+    },
+    {
+      "rank": 12,
+      "candidates": [
+        {
+          "frequency": 1.1898229933779658,
+          "amplitude": 0.16095175580394294,
+          "root_modulus": 0.9813212199598527
+        }
+      ],
+      "dominant": 1.1898229933779658
+    },
+    {
+      "rank": 14,
+      "candidates": [
+        {
+          "frequency": 1.155617500907149,
+          "amplitude": 0.13524381906907623,
+          "root_modulus": 0.9847660753244376
+        },
+        {
+          "frequency": 1.5892012199179018,
+          "amplitude": 0.09673433532854835,
+          "root_modulus": 0.93114578294263
+        }
+      ],
+      "dominant": 1.155617500907149
+    },
+    {
+      "rank": 16,
+      "candidates": [
+        {
+          "frequency": 1.1535995756124378,
+          "amplitude": 0.15338768874141423,
+          "root_modulus": 0.9827249327808059
+        },
+        {
+          "frequency": 1.3022215204834988,
+          "amplitude": 0.06987127391761574,
+          "root_modulus": 0.9252144353987147
+        }
+      ],
+      "dominant": 1.1535995756124378
+    },
+    {
+      "rank": 18,
+      "candidates": [
+        {
+          "frequency": 1.1015593052099233,
+          "amplitude": 0.08752888783024454,
+          "root_modulus": 0.9904652069502675
+        },
+        {
+          "frequency": 1.4209145279204773,
+          "amplitude": 0.08382749320782426,
+          "root_modulus": 0.9687137268618653
+        }
+      ],
+      "dominant": 1.1015593052099233
+    },
+    {
+      "rank": 20,
+      "candidates": [
+        {
+          "frequency": 1.0144169228677804,
+          "amplitude": 0.012056108460599874,
+          "root_modulus": 1.0102840641302855
+        },
+        {
+          "frequency": 1.2931704044934784,
+          "amplitude": 0.13190721852727172,
+          "root_modulus": 0.9783275381642742
+        }
+      ],
+      "dominant": 1.2931704044934784
+    },
+    {
+      "rank": 22,
+      "candidates": [
+        {
+          "frequency": 1.1120092905842254,
+          "amplitude": 0.006289548829098066,
+          "root_modulus": 1.0162271202968107
+        },
+        {
+          "frequency": 1.2902017131555004,
+          "amplitude": 0.13009676247175267,
+          "root_modulus": 0.9820919419634629
+        }
+      ],
+      "dominant": 1.2902017131555004
+    },
+    {
+      "rank": 24,
+      "candidates": [
+        {
+          "frequency": 1.1423153224266875,
+          "amplitude": 0.005921967601272905,
+          "root_modulus": 1.0168951157434651
+        },
+        {
+          "frequency": 1.289232421382677,
+          "amplitude": 0.13039948446922073,
+          "root_modulus": 0.9830170181011738
+        }
+      ],
+      "dominant": 1.289232421382677
+    }
+  ],
+  "setup_seconds": 19.545821249950677,
+  "ground_seconds": 35.855305958073586,
+  "vector_seconds": 1927.780122708762,
+  "scalar_seconds": 2982.779379375046,
+  "ground_history": [
+    {
+      "half_sweep": 1,
+      "direction": "lr",
+      "energy": -99.31998111718667,
+      "local_energy": -99.31934839411147,
+      "truncation": 0.0,
+      "states_kept": 2
+    },
+    {
+      "half_sweep": 2,
+      "direction": "rl",
+      "energy": -99.31998111718667,
+      "local_energy": 22.382813669837194,
+      "truncation": 0.0,
+      "states_kept": 2
+    },
+    {
+      "half_sweep": 3,
+      "direction": "lr",
+      "energy": -99.31998111718667,
+      "local_energy": -99.31997843999395,
+      "truncation": 0.0,
+      "states_kept": 2
+    },
+    {
+      "half_sweep": 4,
+      "direction": "rl",
+      "energy": -99.31998111718667,
+      "local_energy": -97.47311974618927,
+      "truncation": 0.0,
+      "states_kept": 2
+    },
+    {
+      "half_sweep": 5,
+      "direction": "lr",
+      "energy": -99.31998111718667,
+      "local_energy": -99.31998111718414,
+      "truncation": 0.0,
+      "states_kept": 2
+    },
+    {
+      "half_sweep": 6,
+      "direction": "rl",
+      "energy": -99.31998111718667,
+      "local_energy": -99.31998111718816,
+      "truncation": 0.0,
+      "states_kept": 2
+    },
+    {
+      "half_sweep": 17,
+      "direction": "recenter-right",
+      "energy": -99.31998111718677,
+      "local_energy": -99.31998111718671,
+      "truncation": 0.0,
+      "states_kept": 128
+    }
+  ],
+  "references": [
+    "https://doi.org/10.1103/PhysRevD.88.071503",
+    "https://doi.org/10.1103/PhysRevX.6.041040",
+    "https://doi.org/10.1103/PhysRevResearch.4.043133"
+  ]
+}

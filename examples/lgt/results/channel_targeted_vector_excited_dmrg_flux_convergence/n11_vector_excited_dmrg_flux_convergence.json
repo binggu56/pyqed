@@ -1,0 +1,55 @@
+{
+  "description": "Matched N=11, D=64 excited-DMRG vector flux-cutoff comparison",
+  "records": [
+    {
+      "flux_cutoff": 1,
+      "vector_excitation": 0.9609537125996486,
+      "vector_mass": 0.7270817434893231,
+      "vector_strength": 0.2993693437803339,
+      "wall_seconds": 276.60151762515306
+    },
+    {
+      "flux_cutoff": 2,
+      "vector_excitation": 0.9136376046301553,
+      "vector_mass": 0.6632868885714187,
+      "vector_strength": 0.15623603103461894,
+      "wall_seconds": 345.8095717499964
+    },
+    {
+      "flux_cutoff": 3,
+      "vector_excitation": 0.9042495865063245,
+      "vector_mass": 0.6502946552550501,
+      "vector_strength": 0.33353390344962575,
+      "wall_seconds": 349.1872939169407
+    },
+    {
+      "flux_cutoff": 4,
+      "vector_excitation": 0.8888071704790814,
+      "vector_mass": 0.628644581819852,
+      "vector_strength": 0.34548247073527705,
+      "wall_seconds": 340.6157284169458
+    }
+  ],
+  "continuum_vector_mass": 0.5641895835477563,
+  "continuum_finite_momentum_excitation": 0.8444489695815638,
+  "successive_mass_changes": [
+    {
+      "from_flux_cutoff": 1,
+      "to_flux_cutoff": 2,
+      "mass_change": -0.06379485491790438,
+      "relative_change": -0.08774096652702046
+    },
+    {
+      "from_flux_cutoff": 2,
+      "to_flux_cutoff": 3,
+      "mass_change": -0.012992233316368562,
+      "relative_change": -0.019587652854635974
+    },
+    {
+      "from_flux_cutoff": 3,
+      "to_flux_cutoff": 4,
+      "mass_change": -0.02165007343519809,
+      "relative_change": -0.03329271317277978
+    }
+  ]
+}

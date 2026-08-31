@@ -1,0 +1,370 @@
+{
+  "description": "N=13 flux-4 D=128 vector excited-DMRG spatial benchmark",
+  "parameters": {
+    "npts": 13,
+    "length": 10.0,
+    "spacing_length_over_n": 0.7692307692307693,
+    "flux_cutoff": 4,
+    "bond_dim": 128,
+    "half_sweeps": 12,
+    "weights": [
+      0.2,
+      0.2,
+      0.6
+    ],
+    "performance": "packed-compiled-fast"
+  },
+  "energies": [
+    -23.301451152783084,
+    -23.28186383681287,
+    -22.36766331169445
+  ],
+  "vector_strengths": [
+    1.942999820627514e-06,
+    6.60945474687096e-07,
+    0.024989735432549433
+  ],
+  "active_root": 2,
+  "vector_excitation": 0.933787841088634,
+  "vector_mass": 0.6907789488117003,
+  "continuum_vector_mass": 0.5641895835477563,
+  "ground_cutoff1_history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energy": -22.891434853902904
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energy": -23.27858046885684
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energy": -23.297012487964473
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energy": -23.301201051264805
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energy": -23.303110931088888
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energy": -23.3040124812795
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energy": -23.304470041605803
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energy": -23.304738797331805
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energy": -23.304912957759203
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energy": -23.30503135734037
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energy": -23.30511304434446
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energy": -23.305169995887532
+    },
+    {
+      "sweep": 12,
+      "direction": "lr",
+      "energy": -23.305210423627578
+    },
+    {
+      "sweep": 13,
+      "direction": "rl",
+      "energy": -23.305239951783843
+    },
+    {
+      "sweep": 14,
+      "direction": "lr",
+      "energy": -23.305262341637476
+    },
+    {
+      "sweep": 15,
+      "direction": "rl",
+      "energy": -23.30528004669518
+    },
+    {
+      "sweep": 16,
+      "direction": "lr",
+      "energy": -23.305294633664857
+    },
+    {
+      "sweep": 17,
+      "direction": "rl",
+      "energy": -23.305307059127173
+    },
+    {
+      "sweep": 18,
+      "direction": "lr",
+      "energy": -23.305317867547856
+    },
+    {
+      "sweep": 19,
+      "direction": "rl",
+      "energy": -23.305327338529615
+    },
+    {
+      "sweep": 20,
+      "direction": "recenter-right",
+      "energy": -23.305330371689116
+    }
+  ],
+  "ground_cutoff4_history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energy": -23.33393405945672
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energy": -23.333960031203087
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energy": -23.3339722276063
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energy": -23.333980935497753
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energy": -23.33398748253354
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energy": -23.333992478158866
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energy": -23.33399632717092
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energy": -23.33399932107903
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energy": -23.33400167510608
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energy": -23.334003547548946
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energy": -23.33400505496742
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energy": -23.33400628310796
+    },
+    {
+      "sweep": 12,
+      "direction": "lr",
+      "energy": -23.334007295331343
+    },
+    {
+      "sweep": 13,
+      "direction": "rl",
+      "energy": -23.334008138712697
+    },
+    {
+      "sweep": 14,
+      "direction": "lr",
+      "energy": -23.334008848509804
+    },
+    {
+      "sweep": 15,
+      "direction": "rl",
+      "energy": -23.3340094513704
+    },
+    {
+      "sweep": 16,
+      "direction": "lr",
+      "energy": -23.334009967636707
+    },
+    {
+      "sweep": 17,
+      "direction": "rl",
+      "energy": -23.334010413005462
+    },
+    {
+      "sweep": 18,
+      "direction": "lr",
+      "energy": -23.334010799718932
+    },
+    {
+      "sweep": 19,
+      "direction": "rl",
+      "energy": -23.334011137432547
+    },
+    {
+      "sweep": 20,
+      "direction": "recenter-right",
+      "energy": -23.334011263253977
+    }
+  ],
+  "excited_history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energies": [
+        -23.252395961996985,
+        -23.244251956174107,
+        -22.30329104352232
+      ]
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energies": [
+        -23.278292579688085,
+        -23.25290317591547,
+        -22.328558054449687
+      ]
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energies": [
+        -23.25861036532184,
+        -23.253560014529043,
+        -22.335166473256372
+      ]
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energies": [
+        -23.27355608302652,
+        -23.2562676793965,
+        -22.340274994844567
+      ]
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energies": [
+        -23.261222214151598,
+        -23.250583608030233,
+        -22.33971851326006
+      ]
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energies": [
+        -23.275078562519198,
+        -23.25791713768928,
+        -22.345855009258635
+      ]
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energies": [
+        -23.26325521440244,
+        -23.249181221921262,
+        -22.344100995416035
+      ]
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energies": [
+        -23.27684943498582,
+        -23.257605248488574,
+        -22.351236457764863
+      ]
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energies": [
+        -23.26550644818055,
+        -23.2481875505667,
+        -22.348253143528197
+      ]
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energies": [
+        -23.279086191250695,
+        -23.257027513291668,
+        -22.354943467725057
+      ]
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energies": [
+        -23.266271839128912,
+        -23.247482567619574,
+        -22.35102029757962
+      ]
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energies": [
+        -23.280371703576577,
+        -23.257063467835604,
+        -22.35662700479584
+      ]
+    },
+    {
+      "sweep": 12,
+      "direction": "recenter-right",
+      "energies": [
+        -23.301451152782988,
+        -23.281863836812725,
+        -22.367663311694418
+      ]
+    }
+  ],
+  "timing_seconds": {
+    "ground_cutoff1": 503.23639137507416,
+    "ground_cutoff4": 490.5548950419761,
+    "excited": 1612.4332149170805
+  },
+  "converged": false
+}

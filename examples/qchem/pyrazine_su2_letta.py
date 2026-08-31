@@ -1,4 +1,4 @@
-"""Pyrazine pi-active-space calculation with the reduced SU(2) FrontierLETTA backend."""
+"""Pyrazine pi-active-space calculation with the reduced SU(2) LETTA backend."""
 
 from __future__ import annotations
 
@@ -10,8 +10,7 @@ import time
 import numpy as np
 from pyscf import ao2mo, gto, mcscf, scf
 
-from pyqed.letta import FrontierLETTA
-from pyqed.qchem.dmrg.backends.reduced import build_spatial_reduced_hamiltonian_mpo
+from pyqed.letta import SU2LETTA
 
 
 def pyrazine_geometry():
@@ -127,26 +126,20 @@ def run(args):
     active, pi_weights = select_pi_active_orbitals(mol, mf, ncas=args.ncas)
     h1e, eri, ecore, exact_energy, nelecas = active_space_integrals(mol, mf, active)
     graph = tuple((site, site + 1) for site in range(args.ncas - 1))
-    hamiltonian = build_spatial_reduced_hamiltonian_mpo(
+    state = SU2LETTA.from_integrals(
         h1e,
-        eri=eri[None, None, ...],
-        fully_reduced=True,
+        eri,
         nelec=nelecas,
         spin=0,
-        ecore=ecore,
-        cutoff=args.integral_cutoff,
-    )
-
-    started = time.perf_counter()
-    state = FrontierLETTA(
-        hamiltonian,
         graph=graph,
         D=args.D,
-        adaptive_bond=args.adaptive_bond,
+        ecore=ecore,
+        cutoff=args.integral_cutoff,
         seed=args.seed,
         workers=args.workers,
         we_route_memory=args.route_memory,
     )
+    started = time.perf_counter()
     try:
         initial_energy = float(state.energy)
         state.run(
@@ -157,8 +150,8 @@ def run(args):
             truncation_tol=args.truncation_tol,
             consecutive_cycles=args.consecutive_cycles,
             max_local_parameters=args.max_local_parameters,
-            growth_truncation_tol=args.growth_truncation_tol,
-            bond_growth=args.bond_growth,
+            gauge=None if args.gauge == "none" else args.gauge,
+            reuse_environments=args.reuse_environments,
             verbose=args.verbose,
         )
         elapsed = time.perf_counter() - started
@@ -177,18 +170,30 @@ def run(args):
             "su2_letta_energy": float(state.energy),
             "su2_letta_error": float(state.energy - exact_energy),
             "D": int(args.D),
-            "adaptive_bond": bool(args.adaptive_bond),
-            "bond_multiplicities": [
-                {
-                    f"N={sector.charge},2S={sector.irrep.two_j}": int(value)
-                    for sector, value in state.reduced_bond_multiplicities(bond).items()
-                }
-                for bond in range(state.nsites - 1)
-            ],
+            "nparameters": int(state.nparameters),
+            "storage_nbytes": int(state.storage_nbytes),
             "tie_graph": [list(edge) for edge in graph],
             "frontier_states": list(state.frontier_states),
+            "gauge": args.gauge,
+            "reuse_environments": bool(args.reuse_environments),
             "elapsed_s": float(elapsed),
             "convergence": state.convergence_summary,
+            "cycle_diagnostics": [
+                {
+                    "cycle": int(row["sweep"]),
+                    "elapsed_s": float(row.get("elapsed_s", 0.0)),
+                    "environment_build_s": float(
+                        row.get("environment_build_s", 0.0)
+                    ),
+                    "update_s": float(
+                        sum(update.get("elapsed", 0.0) for update in row["updates"])
+                    ),
+                    "conditional_gauge_applied": int(
+                        row.get("conditional_gauge_applied", 0)
+                    ),
+                }
+                for row in state.history
+            ],
         }
     finally:
         state.close()
@@ -210,9 +215,6 @@ def main():
         help="Validated half-filled pi active-space size.",
     )
     parser.add_argument("--D", type=int, default=2)
-    parser.add_argument("--adaptive-bond", action="store_true")
-    parser.add_argument("--growth-truncation-tol", type=float, default=5.0e-2)
-    parser.add_argument("--bond-growth", type=int, default=1)
     parser.add_argument("--cycles", type=int, default=4)
     parser.add_argument("--algorithm", choices=("one_site", "two_site"), default="two_site")
     parser.add_argument("--workers", type=int, default=1)
@@ -224,6 +226,14 @@ def main():
     parser.add_argument("--consecutive-cycles", type=int, default=2)
     parser.add_argument("--max-local-parameters", type=int, default=4096)
     parser.add_argument("--route-memory", type=float, default=256.0)
+    parser.add_argument(
+        "--gauge", choices=("conditional", "none"), default="conditional"
+    )
+    parser.add_argument(
+        "--reuse-environments",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--output", type=Path)
     run(parser.parse_args())

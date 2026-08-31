@@ -84,6 +84,371 @@ The core LDR solver pieces are split across ``pyqed.ldr`` and
 * ``pyqed.namd.liquid_ldr``: liquid-driven and solvent-embedded LDR workflows,
   diagnostics, convergence checks, and readiness gates.
 
+Periodic SSH-Holstein Benchmark
+--------------------------------
+
+``pyqed.ldr.PeriodicSSHHolsteinGQD`` is the first periodic model benchmark for
+the GQD solver.  It retains one Bloch sector of a two-sublattice chain and one
+quantized optical coordinate ``Q``.  The electronic Hamiltonian is
+
+.. math::
+
+   h_k(Q) =
+   \begin{pmatrix}
+   \Delta + gQ & -\left[t_1(Q)+t_2(Q)e^{-ik}\right] \\
+   -\left[t_1(Q)+t_2(Q)e^{ik}\right] & -\Delta-gQ
+   \end{pmatrix},
+
+with alternating SSH-modulated bonds
+
+.. math::
+
+   t_1(Q)=t+\delta+\alpha Q,
+   \qquad
+   t_2(Q)=t-\delta-\alpha Q.
+
+The full local vibronic potential includes the harmonic phonon energy,
+
+.. math::
+
+   V_k(Q)=h_k(Q)+\frac{1}{2}\omega^2Q^2 I.
+
+After diagonalizing ``V_k`` at every DVR point, neighboring electronic frames
+define overlap links
+
+.. math::
+
+   A_{IJ}^{ab}
+   =\langle\Phi_I(Q_a)|\Phi_J(Q_b)\rangle,
+   \qquad
+   U^{ab}=\operatorname{polar}\!\left(A^{ab}\right).
+
+The GQD Hamiltonian is then
+
+.. math::
+
+   H^{\mathrm{GQD}}_{aI,bJ}
+   =T_{ab}U^{ab}_{IJ}
+   +\delta_{ab}\delta_{IJ}E_I(Q_a).
+
+The benchmark independently constructs the exact diabatic DVR Hamiltonian
+
+.. math::
+
+   H^{\mathrm{dia}}
+   =T_Q\otimes I
+   +\sum_a |Q_a\rangle\langle Q_a|\otimes V_k(Q_a).
+
+Because the complete two-state electronic space is retained, the two
+Hamiltonians must satisfy
+
+.. math::
+
+   H^{\mathrm{GQD}}
+   =\mathcal U^\dagger H^{\mathrm{dia}}\mathcal U,
+   \qquad
+   \mathcal U=\bigoplus_a \Phi(Q_a).
+
+This makes the model a strict validation of overlap-dressed kinetic transport,
+wavepacket propagation, and local electronic phase-gauge covariance.  Run the
+calculation and generate its PDF/PNG diagnostics with
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/ldr/periodic_ssh_holstein_gqd.py \
+     --output /private/tmp/periodic_ssh_holstein_gqd.pdf
+
+The script also writes an NPZ data bundle and a JSON validation summary.  This
+benchmark is a fixed-``k`` periodic electron-phonon model; extending it to
+finite phonon momentum, coupled Bloch sectors, and ab initio periodic
+electronic scans is a subsequent step toward solid-state nonadiabatic
+dynamics.
+
+Finite-Momentum Extension
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``pyqed.ldr.PeriodicSSHHolsteinMomentumGQD`` retains all two-sublattice
+states on a commensurate ``N``-point Bloch mesh.  A real standing-wave phonon
+has the cell profile
+
+.. math::
+
+   u_R(Q_q)=Q_q f_R,
+   \qquad
+   f_R=
+   \frac{\cos(qR+\phi)}
+   {\sqrt{N^{-1}\sum_{R'}\cos^2(qR'+\phi)}},
+   \qquad
+   q=\frac{2\pi m}{N}.
+
+It modulates the local SSH bonds and Holstein energy according to
+
+.. math::
+
+   t_{1,R}=t+\delta+\alpha u_R,
+   \qquad
+   t_{2,R}=t-\delta-\alpha u_R,
+   \qquad
+   \epsilon_R=\Delta+g u_R.
+
+The electronic Hamiltonian is first assembled in the periodic real-space
+supercell,
+
+.. math::
+
+   H_e(Q_q)=
+   -\sum_R\left[
+   t_{1,R}a_R^\dagger b_R
+   +t_{2,R}a_{R+1}^\dagger b_R
+   +\mathrm{h.c.}\right]
+   +\sum_R\epsilon_R
+   \left(a_R^\dagger a_R-b_R^\dagger b_R\right),
+
+and then transformed with
+
+.. math::
+
+   c_{R\sigma}
+   =\frac{1}{\sqrt N}\sum_k e^{ikR}c_{k\sigma}.
+
+This construction produces the finite-momentum selection rule directly:
+
+.. math::
+
+   \left\langle k'\left|
+   \frac{\partial H_e}{\partial Q_q}
+   \right|k\right\rangle\ne 0
+   \quad\Longrightarrow\quad
+   k'=k\pm q\pmod{2\pi}.
+
+The complete ``2N``-state electronic space is diagonalized at every phonon
+DVR point and propagated with the same overlap-dressed GQD Hamiltonian.  The
+benchmark also constructs the independent diabatic supercell Hamiltonian and
+compares wavefunctions and momentum populations throughout the propagation.
+Run it with
+
+.. code-block:: bash
+
+   PYTHONPATH=. python \
+     examples/ldr/periodic_ssh_holstein_finite_q_gqd.py \
+     --ncells 4 --q-index 1 \
+     --output /private/tmp/periodic_ssh_holstein_finite_q_gqd.pdf
+
+The generated NPZ bundle contains ``P_k(t)``, band-resolved momentum
+populations, the phonon density, coupling-block norms, and exact-reference
+errors.  This remains a one-electron, one-standing-wave benchmark.  A
+production solid-state method still needs occupied many-electron states,
+multiple phonon coordinates, an ab initio periodic scan provider, and a
+controlled electronic active-space truncation.
+
+Continuum-Embedded Projector GQD
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A discrete set of isolated Born-Oppenheimer surfaces is not generally a
+controlled electronic representation for a solid.  In the thermodynamic
+limit, band, electron-hole, and excitonic scattering states form continua.
+``pyqed.ldr.FeshbachEmbedding`` provides the general projected-resolvent
+engine.  Its ``from_ldr`` adapter partitions a complete overlap-dressed GQD
+Hamiltonian with an active projector :math:`P` and its complement
+:math:`Q=1-P`:
+
+.. math::
+
+   H =
+   \begin{pmatrix}
+   H_{PP} & H_{PQ} \\
+   H_{QP} & H_{QQ}
+   \end{pmatrix}.
+
+Eliminating the continuum gives the retarded active-space Green function
+
+.. math::
+
+   G_P^R(E)
+   =
+   \left[
+   E+i\eta-H_{PP}-\Sigma^R(E)
+   \right]^{-1},
+
+with the Feshbach self-energy
+
+.. math::
+
+   \Sigma^R(E)
+   =
+   H_{PQ}
+   \left[E+i\eta-H_{QQ}\right]^{-1}
+   H_{QP}.
+
+The corresponding continuum hybridization is
+
+.. math::
+
+   \Gamma(E)
+   =
+   i\left[\Sigma^R(E)-\Sigma^R(E)^\dagger\right]
+   =-2\operatorname{Im}\Sigma^R(E),
+
+and the active projected spectrum is
+
+.. math::
+
+   A_P(E)
+   =
+   -\frac{1}{\pi}
+   \operatorname{Im}\operatorname{Tr}G_P^R(E).
+
+``FeshbachEmbedding.from_ldr`` performs this partition *after* constructing
+the complete geometric kinetic operator.  Consequently, :math:`H_{PQ}` retains
+the active-to-continuum coupling caused by electronic-frame rotation along
+the nuclear coordinates.  If the active overlap block on a neighboring-grid
+edge is
+
+.. math::
+
+   S_P^{ab}
+   =
+   P_a U^{ab}P_b,
+
+its singular values are the cosines of the principal angles between the two
+active subspaces.  Values below one measure projector leakage into the
+eliminated sector.  Unitarizing :math:`S_P^{ab}` while discarding
+:math:`H_{PQ}` would remove this physical coupling; the embedded construction
+instead retains it through :math:`\Sigma^R(E)`.
+
+Two continuum backends are provided.  ``MatrixElectronicContinuum`` evaluates
+the resolvent of a finite dense or sparse :math:`H_{QQ}`.  The diagonal
+quadrature backend ``DiagonalElectronicContinuum`` evaluates
+
+.. math::
+
+   \Sigma^R(E)
+   =
+   \sum_c
+   \frac{w_c V_cV_c^\dagger}
+        {E+i\eta-\epsilon_c},
+
+where :math:`\epsilon_c`, :math:`w_c`, and :math:`V_c` may eventually be
+supplied by Brillouin-zone integration, GW/BSE electron-hole states, or an
+interpolated band continuum.  It also exposes the exact finite-bath memory
+kernel
+
+.. math::
+
+   K(t)
+   =
+   \sum_c w_c V_cV_c^\dagger e^{-i\epsilon_ct}.
+
+The implementation is an exact Feshbach reduction for the finite Hamiltonian
+or quadrature supplied to it, following H. Feshbach, *Annals of Physics* 5,
+357-390 (1958), DOI `10.1016/0003-4916(58)90007-1
+<https://doi.org/10.1016/0003-4916(58)90007-1>`_.  Its use with overlap-link
+GQD is an adaptation.  It does not yet construct a thermodynamic-limit
+continuum, dynamical electronic screening, multiphonon bath, or scalable
+time-domain tensor-network propagation.  Exact factorization has separately
+established a first-principles nonadiabatic and geometric framework for
+periodic solids; see *Nonadiabaticity from First Principles:
+Exact-Factorization Approach for Solids*, *Physical Review B* 112, 075102
+(2025), `APS article
+<https://journals.aps.org/prb/abstract/10.1103/dmpv-zqdh>`_.
+
+Run the finite-continuum validation with
+
+.. code-block:: bash
+
+   PYTHONPATH=. python \
+     examples/ldr/periodic_ssh_holstein_continuum_gqd.py \
+     --output /private/tmp/periodic_ssh_holstein_continuum_gqd.pdf
+
+The embedded projected spectrum is compared against the active block of the
+complete two-surface GQD resolvent.  The comparison is an exact finite-model
+identity and tests the embedding implementation; it is not evidence that the
+SSH-Holstein model reproduces a material electronic continuum.
+
+Half-Filled Independent Mode Scans
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``pyqed.ldr.PeriodicSSHHolsteinHalfFilledScan`` constructs the complete real
+normal-mode basis of the supercell.  For four cells, the profiles are
+
+.. math::
+
+   Q_0,
+   \qquad
+   Q_{\pi/2}^{\cos},
+   \qquad
+   Q_{\pi/2}^{\sin},
+   \qquad
+   Q_\pi,
+
+and satisfy
+
+.. math::
+
+   \frac{1}{N}\sum_R
+   f_{\lambda R}f_{\mu R}
+   =\delta_{\lambda\mu}.
+
+Each scan varies one coordinate while holding the other three at zero.  This
+requires only four one-dimensional electronic scans; it does not construct an
+``npts**4`` direct-product nuclear grid.
+
+The current benchmark is spinless.  Half filling of the four-cell,
+two-sublattice supercell therefore means
+
+.. math::
+
+   N_{\mathrm{orb}}=2N=8,
+   \qquad
+   N_e=N=4,
+   \qquad
+   N_{\mathrm{det}}=\binom{8}{4}=70.
+
+At each displacement, the scanner diagonalizes the one-particle Hamiltonian,
+
+.. math::
+
+   h(Q_\lambda)C_n(Q_\lambda)
+   =\epsilon_n(Q_\lambda)C_n(Q_\lambda),
+
+and generates every noninteracting determinant energy from its occupied
+orbital set,
+
+.. math::
+
+   E_{\mathcal I}(Q_\lambda)
+   =\sum_{n\in\mathcal I}\epsilon_n(Q_\lambda).
+
+The instantaneous many-body excitations shown in the scan figure are
+
+.. math::
+
+   \Omega_I(Q_\lambda)
+   =E_I(Q_\lambda)-E_0(Q_\lambda).
+
+For this independent-electron Hamiltonian, the first excitation equals the
+fundamental particle-hole gap,
+
+.. math::
+
+   \Omega_1
+   =\epsilon_{N_e+1}-\epsilon_{N_e}.
+
+Run all mode scans and write the PDF/PNG figure, complete NPZ arrays, and JSON
+summary with
+
+.. code-block:: bash
+
+   PYTHONPATH=. python \
+     examples/ldr/periodic_ssh_holstein_half_filled_scan.py \
+     --output /private/tmp/periodic_ssh_holstein_half_filled_scan.pdf
+
+The NPZ bundle retains all 70 determinant energies, all 16 single
+particle-hole energies, orbital momentum weights, harmonic vibronic surfaces,
+and mode profiles.  These are independent-particle excitations, not excitons;
+electron-electron interactions require a correlated electronic solver or a
+fermionic MPS representation.
+
 Liquid-Phase LDR Workflow
 -------------------------
 
@@ -350,6 +715,96 @@ For fixed-angle triatomic coordinates, for example, the G-matrix contains
 off-diagonal kinetic couplings between bond coordinates. PyQED's curvilinear
 LDR implementation combines this kinetic operator with electronic-state
 overlap matrices in split-operator propagation.
+
+The coordinate chart and nuclear grid are separate:
+
+.. code-block:: python
+
+   from pyqed.ldr import Coord, LDR, keo
+
+   coord = Coord(
+       to_cartesian=geometry,
+       bounds=((r1_min, r1_max), (r2_min, r2_max)),
+   )
+
+   ldr = LDR(
+       mc,
+       grid=grid,
+       coord=coord,
+       states=(1, 2),
+       keo=keo.podolsky(),
+   ).build()
+
+Here ``mc.mol`` supplies the atomic masses. ``keo.podolsky()`` differentiates
+``geometry(q)`` with JAX, samples the inverse vibrational metric and the
+Podolsky pseudopotential, and builds active-axis MPO components without a
+global nuclear matrix. Set ``pseudopotential=False`` or ``None`` to omit the
+pseudopotential, or pass its sampled grid values explicitly. This is an
+adaptation of Eq. (21) in E. Mátyus,
+G. Czakó, and A. G. Császár, *J. Chem. Phys.* **130**, 134112 (2009),
+`doi:10.1063/1.3076742 <https://doi.org/10.1063/1.3076742>`_. The automatic
+path is limited to smooth, nonredundant, nonsingular molecular charts and
+``J=0`` vibrational dynamics. It does not add constrained-coordinate,
+linear-molecule, rotational, or Coriolis corrections, and the Cartesian map
+must be JAX differentiable. Grid points must avoid coordinate singularities.
+
+Tensor-Network Ab Initio LDR
+----------------------------
+
+The tensor-network driver separates the electronic sampling grid from the
+nuclear dynamics DVR:
+
+.. code-block:: python
+
+   from pyqed.ldr import AbInitioFit, Coord, keo
+   from pyqed.namd import TNLDR
+
+   coord = Coord(
+       to_cartesian=geometry,
+       bounds=((r1_min, r1_max), (r2_min, r2_max)),
+   )
+
+   fit = AbInitioFit(
+       mc,
+       coord=coord,
+       states=(1, 2),
+   ).build()
+
+   tnldr = TNLDR(
+       fit,
+       grid=dynamics_grid,
+       coord=coord,
+       keo=keo.podolsky(),
+   ).build()
+
+``coord`` supplies the shared generalized-coordinate convention, Cartesian
+map, and fitting domain. ``dynamics_grid`` supplies only the nuclear basis and
+KEO discretization. ``AbInitioFit`` always samples adaptively. It constructs a
+Chebyshev candidate grid over the coordinate intervals, starts from
+one-dimensional coordinate fibers through the anchor geometry, and adds
+geometries selected by the current synchronized-feature defect and their
+distance from previous samples. The candidate pool is bounded and the maximum
+number of electronic-structure calls grows only linearly with the coordinate
+dimension. The completed fit can be reused with multiple dynamics grids.
+
+Links for the dynamics DVR are formed from continuous feature cores at
+neighboring endpoints, so the electronic sampling nodes need not equal the
+DVR nodes. Energy, feature, and KEO cores are combined directly into split MPO
+components; no full electronic field, link grid, overlap fiber, or vibronic
+Hamiltonian is evaluated on ``dynamics_grid``. Advanced studies that need a
+custom sampling design can use ``AbInitioFit`` directly.
+
+Every native electronic fit automatically creates a persistent
+``ElectronicDatabase`` for the molecular identity. Each geometry is keyed by
+its Cartesian coordinates and a protocol fingerprint containing the atomic
+species, charge, spin, basis, electronic driver, mean-field method, active
+space, roots, selected states, integral representation, and reference orbital
+hashes. A repeated calculation therefore restores electronic frames and raw
+overlap blocks before calling the quantum-chemistry scanner. The database path
+and current-run statistics are available as ``tnldr.database_path`` and
+``tnldr.database_info``. Set ``PYQED_ELECTRONIC_CACHE_DIR`` to place the
+databases on project or cluster storage; otherwise PyQED uses the operating
+system's persistent user-cache directory.
 
 Born-Oppenheimer Hamiltonian Derivatives
 ----------------------------------------

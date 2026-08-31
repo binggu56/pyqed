@@ -50,12 +50,12 @@ def run_point(mf, r_bohr: float, ncas: int, nelecas: int, nstates: int):
 
 def build_scanner(first_r: float, basis: str):
     mol0 = Molecule(atom=f"Li 0 0 0; F 0 0 {first_r}", unit="bohr", basis=basis)
-    mol0.build(driver="pyscf")
+    mol0.build()
     mf0 = mol0.RHF()
     mf0.max_cycle = 200
     with redirect_stdout(io.StringIO()):
         mf0.run(init_guess="hcore", max_cycle=200, tol=1.0e-9)
-    return mf0.as_scanner(build_driver="pyscf")
+    return mf0.as_scanner()
 
 
 def main():
@@ -87,7 +87,7 @@ def main():
                 mf = scanner.mf
             else:
                 mol = Molecule(atom=f"Li 0 0 0; F 0 0 {r_bohr}", unit="bohr", basis=args.basis)
-                mol.build(driver="pyscf")
+                mol.build()
                 with redirect_stdout(io.StringIO()):
                     scanner(mol)
                 mf = scanner.mf

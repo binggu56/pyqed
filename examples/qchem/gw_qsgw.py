@@ -5,12 +5,13 @@ Run from the repository root:
     PYTHONPATH=. python examples/qchem/gw_qsgw.py
 """
 
+from pyqed.units import au2ev
 from pyqed.gw.gw import GW
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf import RHF
 
 
-AU2EV = 27.211386245988
+AU2EV = au2ev
 
 
 mol = Molecule(
@@ -18,7 +19,7 @@ mol = Molecule(
     basis="sto-3g",
     unit="angstrom",
 )
-mol.build(driver="builtin", eri="dense")
+mol.build(eri="dense")
 
 mf = RHF(mol).run(verbose=0)
 print(f"RHF total energy = {mf.e_tot:.12f} Ha")

@@ -16,11 +16,9 @@ import scipy
 import numba 
 import sys 
 
+from pyqed.units import au2wavenumber
 
-
-
-bohr_angstrom = 0.52917721092
-hartree_wavenumber = 219474.63 
+hartree_wavenumber = au2wavenumber
 
 #hartree_wavenumber = scipy.constants.value(u'hartree-inverse meter relationship') / 1e2 
 

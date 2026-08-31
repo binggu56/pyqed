@@ -37,13 +37,11 @@ def test_local_hamiltonian_accepts_ordered_sites_metadata():
         constant=0.037,
     )
     assert hamiltonian.sites == sites
-    assert hamiltonian.physical_legs == tuple(
-        site.physical_leg for site in hamiltonian.sites
-    )
+    assert hamiltonian.legs == tuple(site.leg for site in hamiltonian.sites)
     assert hamiltonian.local_charges == tuple(site.local_charges for site in hamiltonian.sites)
 
 
-def test_frontier_graph_letta_consumes_physical_legs_from_hamiltonian():
+def test_frontier_graph_letta_consumes_legs_from_hamiltonian():
     hamiltonian = _conserving_spin_half_hamiltonian()
     parent_sets = ((1, 2), (2,), ())
     frontier = FrontierTiedLETTA(
@@ -53,7 +51,7 @@ def test_frontier_graph_letta_consumes_physical_legs_from_hamiltonian():
         seed=4,
     )
     assert frontier.sites == hamiltonian.sites
-    assert frontier.physical_legs == hamiltonian.physical_legs
+    assert frontier.legs == hamiltonian.legs
     assert frontier.symmetry is None
 
 

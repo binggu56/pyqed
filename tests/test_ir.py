@@ -154,7 +154,7 @@ def test_ir_plot_mode_requires_coordinates():
 
 def test_ir_accepts_native_rhf_method_backend():
     mol = Molecule(atom="H 0 0 -0.7; H 0 0 0.7", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
 
     ir = IR(mf, hessian_step=2.0e-3, dipole_step=2.0e-3).run()
@@ -169,7 +169,7 @@ def test_ir_accepts_native_rhf_method_backend():
 
 def test_ir_from_method_accepts_native_rks_method_backend():
     mol = Molecule(atom="H 0 0 -0.7; H 0 0 0.7", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     grid = AOGrid.atom_centered(mol, n_radial=4, n_angular=6, with_grad=False)
     mf = RKS(mol, grid=grid, xc="svwn")
     mf.max_cycle = 30

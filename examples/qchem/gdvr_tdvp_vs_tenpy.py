@@ -323,7 +323,7 @@ def run_case(nz, args):
         "hilbert_dim": dim,
         "state_overlap_computed": bool(return_state),
         "mpo_max_bond": int(max(np.asarray(W).shape[1] for W in H.factors)),
-        "gdvr_terms": int(td._active_integral_build_info["symbolic_terms"]),
+        "gdvr_terms": int(td.build_info["symbolic_terms"]),
         "rhf_energy": float(mf.e_tot),
         "dt": args.dt,
         "steps": args.steps,

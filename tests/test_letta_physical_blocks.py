@@ -180,6 +180,31 @@ def test_component_solver_finds_an_unoccupied_lower_component():
     assert diagnostics.positive_metric_components == 2
 
 
+def test_component_solver_verifies_only_the_retained_metric_range():
+    metric = np.diag([1.0, 1.0e-14])
+    hamiltonian = np.array([[2.0, 3.0e-6], [3.0e-6, 0.0]])
+    problem = PhysicalBlockGeneralizedProblem.from_dense(
+        metric,
+        hamiltonian,
+        (1, 2, 1),
+        hamiltonian_pairs=((0, 0),),
+        omitted_atol=0.0,
+    )
+
+    energy, vector, diagnostics = problem.solve(
+        np.array([1.0, 0.0]),
+        tol=1.0e-10,
+        metric_tol=1.0e-12,
+    )
+
+    np.testing.assert_allclose(energy, 2.0, atol=1.0e-14)
+    np.testing.assert_allclose(vector, [1.0, 0.0], atol=1.0e-14)
+    assert diagnostics.converged, diagnostics.message
+    assert diagnostics.residual_norm < 1.0e-14
+    assert diagnostics.reconstructed_residual_norm < 1.0e-14
+    np.testing.assert_allclose(diagnostics.full_residual_norm, 3.0e-6)
+
+
 @pytest.mark.parametrize("frontier_backend", ["compressed", "identity_block"])
 def test_frontier_block_problem_matches_dense_without_calling_hole_matrix(
     monkeypatch,

@@ -138,7 +138,7 @@ def _run_block_mps(mpo, *, bond_dim, sweeps, tolerance):
         davidson_max_iter=200,
         noise=0.0,
         recenter_final=False,
-        performance="generic",
+        performance="reference",
     ).run()
     rows = _directional_history(solver)
     factors = solver.ground_state.to_order(["lv", "p", "rv"]).factors

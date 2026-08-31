@@ -11,7 +11,7 @@ def test_rmp2_matches_pyscf_on_h2o_sto3g():
     atom = 'O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587'
 
     mol = Molecule(atom=atom, basis='sto3g', unit='angstrom')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
     mymp = MP2(mf).run()
 
@@ -37,7 +37,7 @@ def test_ump2_matches_pyscf_on_li_sto3g():
     atom = 'Li 0 0 0'
 
     mol = Molecule(atom=atom, basis='sto3g', unit='angstrom', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
     mf = UHF(mol).run()
     mymp = UMP2(mf).run()
 
@@ -66,7 +66,7 @@ def test_comp2_runs_and_preserves_rhf_constraints():
     atom = 'O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587'
 
     mol = Molecule(atom=atom, basis='sto3g', unit='angstrom')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
     comp2 = COMP2(mf, max_cycle=4, optimizer_max_steps=20).run()
 
@@ -94,14 +94,12 @@ def test_rmp2_factor_backend_matches_dense_builtin():
     atom = 'O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587'
 
     dense_mol = Molecule(atom=atom, basis='sto3g', unit='angstrom')
-    dense_mol.build(driver='builtin', options={'coord_type': 'spherical', 'eri_representation': 'dense', 'aosym': 's1'})
+    dense_mol.build(options={'coord_type': 'spherical', 'eri_representation': 'dense', 'aosym': 's1'})
     dense_mf = RHF(dense_mol).run()
     dense_mp2 = MP2(dense_mf).run()
 
     factor_mol = Molecule(atom=atom, basis='sto3g', unit='angstrom')
-    factor_mol.build(
-        driver='builtin',
-        options={'coord_type': 'spherical', 'eri_representation': 'factors', 'low_rank_tol': 1e-8},
+    factor_mol.build(options={'coord_type': 'spherical', 'eri_representation': 'factors', 'low_rank_tol': 1e-8},
     )
     factor_mf = RHF(factor_mol).run()
     factor_mp2 = MP2(factor_mf).run()
@@ -126,14 +124,12 @@ def test_ump2_factor_backend_matches_dense_builtin():
     atom = 'Li 0 0 0'
 
     dense_mol = Molecule(atom=atom, basis='sto3g', unit='angstrom', spin=1)
-    dense_mol.build(driver='builtin', options={'coord_type': 'spherical', 'eri_representation': 'dense', 'aosym': 's1'})
+    dense_mol.build(options={'coord_type': 'spherical', 'eri_representation': 'dense', 'aosym': 's1'})
     dense_mf = UHF(dense_mol).run()
     dense_mp2 = UMP2(dense_mf).run()
 
     factor_mol = Molecule(atom=atom, basis='sto3g', unit='angstrom', spin=1)
-    factor_mol.build(
-        driver='builtin',
-        options={'coord_type': 'spherical', 'eri_representation': 'dense+factors', 'aosym': 's1', 'low_rank_tol': 1e-8},
+    factor_mol.build(options={'coord_type': 'spherical', 'eri_representation': 'dense+factors', 'aosym': 's1', 'low_rank_tol': 1e-8},
     )
     factor_mf = UHF(factor_mol).run()
     factor_mp2 = UMP2(factor_mf).run()
@@ -159,14 +155,12 @@ def test_comp2_factor_backend_matches_dense_builtin():
     atom = 'O 0 0 0; H 0 -0.757 0.587; H 0 0.757 0.587'
 
     dense_mol = Molecule(atom=atom, basis='sto3g', unit='angstrom')
-    dense_mol.build(driver='builtin', options={'coord_type': 'spherical', 'eri_representation': 'dense', 'aosym': 's1'})
+    dense_mol.build(options={'coord_type': 'spherical', 'eri_representation': 'dense', 'aosym': 's1'})
     dense_mf = RHF(dense_mol).run()
     dense_comp2 = COMP2(dense_mf, max_cycle=4, optimizer_max_steps=20).run()
 
     factor_mol = Molecule(atom=atom, basis='sto3g', unit='angstrom')
-    factor_mol.build(
-        driver='builtin',
-        options={'coord_type': 'spherical', 'eri_representation': 'factors', 'low_rank_tol': 1e-8},
+    factor_mol.build(options={'coord_type': 'spherical', 'eri_representation': 'factors', 'low_rank_tol': 1e-8},
     )
     factor_mf = RHF(factor_mol).run()
     factor_comp2 = COMP2(factor_mf, max_cycle=4, optimizer_max_steps=20).run()

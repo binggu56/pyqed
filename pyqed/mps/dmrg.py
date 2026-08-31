@@ -422,7 +422,7 @@ class DMRG:
                 checkpoint_interval=1, recenter_final=True,
                 final_expectation=True, performance="auto",
                 abelian_matvec_options=None,
-                converge_on_full_sweeps=False):
+                converge_on_full_sweeps=False, n_threads=None):
         """
         Parameters
         ----------
@@ -436,6 +436,9 @@ class DMRG:
             Number of states for State-Averaged DMRG.
         weights : list
             Weights for state averaging.
+        n_threads : int or None
+            Shared-memory threads for native OpenMP and Numba contraction
+            kernels. ``None`` preserves the process-wide runtime settings.
         """
 
         if not isinstance(H, MPO):
@@ -467,6 +470,10 @@ class DMRG:
         self.recenter_final = bool(recenter_final)
         self.final_expectation = bool(final_expectation)
         self.performance = str(performance or "auto")
+        if n_threads is not None and int(n_threads) < 1:
+            raise ValueError("n_threads must be positive or None.")
+        self.n_threads = None if n_threads is None else int(n_threads)
+        self.threading_info = {}
         policy_key = self.performance.strip().lower().replace("_", "-")
         if policy_key in {"auto", "default"}:
             self.resolved_performance = (
@@ -477,6 +484,13 @@ class DMRG:
         self.abelian_matvec_options = resolve_abelian_matvec_options(
             self.resolved_performance,
             abelian_matvec_options,
+        )
+        self._configure_shared_memory_threads(
+            backend_was_overridden=bool(
+                abelian_matvec_options
+                and "moving_environment_dense_cpp_davidson_backend"
+                in abelian_matvec_options
+            )
         )
         self.opt = opt
 
@@ -524,6 +538,46 @@ class DMRG:
         self.environment_profile = None
         self.resume_payload = None
 
+    def _configure_shared_memory_threads(self, *, backend_was_overridden):
+        if self.n_threads is None:
+            return
+        native_info = {"available": False, "threads": 1}
+        try:
+            from pyqed.mps import cpp_davidson
+
+            setter = getattr(cpp_davidson, "set_num_threads", None)
+            if callable(setter):
+                setter(self.n_threads)
+            info = getattr(cpp_davidson, "openmp_info", None)
+            if callable(info):
+                native_info = dict(info())
+        except Exception as exc:
+            native_info["error"] = str(exc)
+        self.threading_info["native_openmp"] = native_info
+
+        numba_info = {"available": False, "threads": 1}
+        try:
+            from numba import get_num_threads, set_num_threads
+
+            set_num_threads(self.n_threads)
+            numba_info = {
+                "available": True,
+                "threads": int(get_num_threads()),
+            }
+        except Exception as exc:
+            numba_info["error"] = str(exc)
+        self.threading_info["numba"] = numba_info
+
+        if (
+            not backend_was_overridden
+            and self.n_threads > 1
+            and bool(native_info.get("available", False))
+            and str(self.resolved_performance).strip().lower() == "dense"
+        ):
+            self.abelian_matvec_options[
+                "moving_environment_dense_cpp_davidson_backend"
+            ] = "openmp"
+
     @staticmethod
     def _copy_factors(factors):
         out = []
@@ -569,6 +623,7 @@ class DMRG:
                 "opt": self.opt,
                 "performance": self.performance,
                 "resolved_performance": self.resolved_performance,
+                "n_threads": self.n_threads,
                 "native_site_storage": bool(
                     self.abelian_matvec_options.get("native_site_storage", False)
                 ),
@@ -830,6 +885,11 @@ class DMRG:
                 self.environment_profile = self.sweep_history[-1].get(
                     "environment_profile"
                 )
+                self.sweep_history[-1]["threading"] = dict(self.threading_info)
+                if isinstance(self.environment_profile, dict):
+                    self.environment_profile["threading"] = dict(
+                        self.threading_info
+                    )
 
             shift = getattr(self.H, 'constant', 0.0)
             

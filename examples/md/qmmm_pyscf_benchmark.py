@@ -250,7 +250,7 @@ def qm_method(positions, symbols, method="rhf", xc="svwn"):
         for symbol, (x, y, z) in zip(symbols, positions)
     )
     mol = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin")
+    mol.build()
     if method == "rhf":
         return mol.RHF()
     if method == "rks":

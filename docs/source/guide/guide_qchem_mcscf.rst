@@ -61,7 +61,7 @@ Basic CASSCF
    from pyqed.qchem import CASSCF, Molecule
 
    mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-   mol.build(driver="builtin", eri="factors")
+   mol.build(eri="factors")
 
    mf = mol.RHF().run()
    mc = CASSCF(mf, ncas=2, nelecas=2).run()
@@ -110,8 +110,8 @@ mean-field object:
    mc = CASSCF(mf, ncas=ncas, nelecas=nelecas).run(mo_coeff=mo_avas)
 
 The default ``minao="minao"`` reference uses PyQED's bundled minimal ANO-R0
-basis. The primary molecule can use the builtin/native or gbasis integral
-driver; AVAS does not require PySCF.
+basis. The primary molecule and AVAS use native integrals and do not require
+PySCF.
 
 First-Order CASSCF
 ------------------
@@ -179,7 +179,7 @@ CASSCF can use factorized AO ERIs from the RHF reference:
 
 .. code-block:: python
 
-   mol.build(driver="builtin", eri="factors")
+   mol.build(eri="factors")
    mf = mol.RHF().run()
    mc = SecondOrderCASSCF(mf, ncas=4, nelecas=4).run()
 

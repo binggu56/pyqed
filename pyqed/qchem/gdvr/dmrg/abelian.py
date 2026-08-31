@@ -870,9 +870,14 @@ def run_gdvr_dmrg_loop(
             w[np.abs(w) < 1e-10] = 0.0
 
         if abelian_symmetry:
-            final_H = dense_to_symmetric_mpo(mpo_dmrg, site_qn_maps)
+            dense_H = mpo_dmrg if isinstance(mpo_dmrg, mps_lib.MPO) else mps_lib.MPO(mpo_dmrg)
+            final_H = mps_lib.MPO(
+                dense_to_symmetric_mpo(dense_H.factors, site_qn_maps),
+                sites=dense_H.sites,
+                input_sites=dense_H.input_sites,
+            )
         else:
-            final_H = mpo_dmrg
+            final_H = mpo_dmrg if isinstance(mpo_dmrg, mps_lib.MPO) else mps_lib.MPO(mpo_dmrg)
 
         if last_mps_tensors is None:
             if abelian_symmetry:
@@ -885,6 +890,13 @@ def run_gdvr_dmrg_loop(
             mps_guess = [t.copy() for t in last_mps_tensors]
 
         logger.info(f"  3. Running DMRG (D={dmrg_bond_dim})...")
+
+        if not isinstance(mps_guess, mps_lib.MPS):
+            mps_guess = mps_lib.MPS(
+                mps_guess,
+                labels=["lv", "rv", "p"] if abelian_symmetry else ["lv", "p", "rv"],
+                sites=final_H.input_sites,
+            )
 
         if abelian_symmetry:
             solver = dmrg_lib.DMRG(
@@ -910,13 +922,13 @@ def run_gdvr_dmrg_loop(
         solver.run()
 
         try:
-            psi_tensors = solver.ground_state.Bs
-            e_elec = mps_lib.expect_mps(psi_tensors, solver.H, psi_tensors)
+            psi_tensors = solver.ground_state.factors
+            e_elec = mps_lib._expect_factors(psi_tensors, solver.H, psi_tensors)
             e_dmrg = np.real(e_elec) + Enuc
         except Exception:
             e_dmrg = solver.e_tot + Enuc
 
-        last_mps_tensors = solver.ground_state.Bs
+        last_mps_tensors = solver.ground_state.factors
         final_dmrg_energy = e_dmrg
 
         logger.info(f"     -> Final Cycle Energy: {e_dmrg:.8f} Ha")

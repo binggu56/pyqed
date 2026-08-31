@@ -35,7 +35,7 @@ def run_casci_point(coordinates, *, basis="sto-3g"):
         charge=1,
         spin=0,
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = mol.RHF().run()
     return CASCI(mf, ncas=3, nelecas=2).run(nstates=3)
 
@@ -323,7 +323,7 @@ def build_dvr(npts):
         basis="sto-3g",
         charge=1,
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mass = float(mol.atom_mass_list()[0]) * amu_to_au
     return DVR(
         domains=((-0.40, 0.80), (-0.20, 0.20), (-0.20, 0.20)),

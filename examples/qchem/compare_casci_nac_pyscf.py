@@ -92,7 +92,7 @@ def build_pyqed(case):
         spin=case.spin,
         unit="bohr",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.RHF(verbose=0).run(max_cycle=100)
     mc = CASCI(mf, ncas=case.ncas, nelecas=case.nelecas, verbose=0).run(
         nstates=case.nroots,

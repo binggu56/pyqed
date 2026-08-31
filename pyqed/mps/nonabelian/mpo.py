@@ -873,6 +873,12 @@ class RankCoupledMPO:
         repr=False,
         compare=False,
     )
+    _environment_reduced_block_cache: dict[tuple, dict] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
     _block_cache: dict[tuple[Sector, Sector], np.ndarray | None] = field(
         default_factory=dict,
         init=False,
@@ -1700,6 +1706,30 @@ def compress_rank_coupled_mpo_chain(
         "sector_ranks": tuple(reversed(sector_ranks)),
     }
     return (factors, info) if return_info else factors
+
+
+def expand_rank_coupled_mpo(core):
+    """Expand visible SU(2) virtual components into an ordinary block MPO.
+
+    Physical state tensors remain fully reduced.  This compatibility view is
+    used only by the projected local LETTA fallback; native Wigner--Eckart
+    contractions continue to consume the rank-coupled core directly.
+    """
+    if isinstance(core, MPO):
+        return core
+    if not isinstance(core, RankCoupledMPO):
+        raise TypeError("expand_rank_coupled_mpo expects an MPO or RankCoupledMPO core.")
+    blocks = {}
+    for q_out in core.phys_out_leg.sectors:
+        for q_in in core.phys_in_leg.sectors:
+            block = core.block(q_out, q_in)
+            if block is not None:
+                blocks[(q_out, q_in)] = block
+    return MPO(
+        blocks=blocks,
+        phys_out_leg=core.phys_out_leg,
+        phys_in_leg=core.phys_in_leg,
+    )
 
 
 def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):

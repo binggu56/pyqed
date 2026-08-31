@@ -117,7 +117,7 @@ def _optimized_mps_d4(
         davidson_max_iter=100,
         noise=0.0,
         recenter_final=False,
-        performance="generic",
+        performance="reference",
     ).run()
     ordered_state = solver.ground_state.to_order(["lv", "p", "rv"])
     ordered_factors = tuple(

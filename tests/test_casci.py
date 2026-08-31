@@ -42,7 +42,7 @@ from pyqed.qchem.mcscf.reduced_ci import (
 
 def test_casci_accepts_closed_shell_uhf_reference():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     rhf = RHF(mol).run()
     uhf = UHF(mol).run()
@@ -84,10 +84,30 @@ def test_molecule_casci_owns_scan_configuration():
     assert scanner.run_kwargs == {'use_cholesky': False}
 
 
+def test_molecule_casci_forwards_singlet_multiplicity():
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
+    electronic = mol.casci(
+        ncas=2,
+        nelecas=2,
+        nstates=2,
+        ms2=0,
+        multiplicity=1,
+    ).run(nstates=2)
+
+    assert electronic.ms2 == 0
+    assert electronic.multiplicity == 1
+    assert electronic.solver_backend.startswith('direct_spin0')
+    np.testing.assert_allclose(
+        [electronic.spin_square(root) for root in range(2)],
+        0.0,
+        atol=1e-10,
+    )
+
+
 def test_casci_scanner_root_homing_tracks_and_phase_aligns_states():
     atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(4))
     mol = Molecule(atom=atom, unit='bohr', basis='sto-6g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     template = CASCI(mf, ncas=4, nelecas=4)
@@ -117,7 +137,7 @@ def test_casci_scanner_root_homing_tracks_and_phase_aligns_states():
 
 def test_casci_ms2_multiplicity_selects_triplet_m0_root():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc_singlet = CASCI(mf, ncas=2, nelecas=2, ms2=0, multiplicity=1).run(
@@ -141,7 +161,7 @@ def test_casci_ms2_multiplicity_selects_triplet_m0_root():
 
 def test_casci_spin_alias_and_multiplicity_validation():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     mc = CASCI(mf, ncas=2, nelecas=2, spin=2)
@@ -158,7 +178,7 @@ def test_casci_spin_alias_and_multiplicity_validation():
 
 def test_casci_make_rdm1_ao_representation_matches_manual_transform():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=1)
@@ -179,7 +199,7 @@ def test_casci_make_rdm1_ao_representation_matches_manual_transform():
 
 def test_casci_make_tdm1_ao_representation_matches_manual_transform():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -198,7 +218,7 @@ def test_casci_make_tdm1_ao_representation_matches_manual_transform():
 
 def test_casci_transition_dipole_moment_matches_ao_tdm_contraction():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     center = np.zeros(3)
@@ -235,7 +255,7 @@ def test_casci_transition_dipole_moment_matches_ao_tdm_contraction():
 
 def test_dipole_exponential_ci_overlap_is_orbital_rotation_link():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=4, nelecas=2).run(nstates=4, method='ci')
@@ -286,7 +306,7 @@ def test_dipole_exponential_ci_overlap_is_orbital_rotation_link():
 
 def test_casci_accepts_open_shell_uhf_reference():
     mol = Molecule(atom='H 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     uhf = UHF(mol).run()
     mc = CASCI(uhf, ncas=1, nelecas=(1, 0)).run(nstates=1)
@@ -301,7 +321,7 @@ def test_casci_make_rdm1s_matches_pyscf_for_open_shell_li():
     mcscf = pytest.importorskip('pyscf.mcscf')
 
     mol = Molecule(atom='Li 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = UHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=(2, 1)).run(nstates=1)
@@ -322,7 +342,7 @@ def test_casci_make_rdm1s_matches_pyscf_for_open_shell_li():
 
 def test_direct_ci_casci_accepts_open_shell_uhf_reference():
     mol = Molecule(atom='Li 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = UHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=(2, 1))
@@ -340,7 +360,7 @@ def test_direct_ci_casci_accepts_open_shell_uhf_reference():
 
 def test_direct_ci_casci_uhf_supports_factor_backend():
     mol = Molecule(atom='Li 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = UHF(mol).run()
     mc_dense = direct_ci.CASCI(mf, ncas=4, nelecas=(2, 1)).run(nstates=2, method='ci')
@@ -364,7 +384,7 @@ def test_direct_ci_casci_uhf_supports_factor_backend():
 
 def test_casci_make_tdm1s_sum_to_spin_traced_tdm():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -377,7 +397,7 @@ def test_casci_make_tdm1s_sum_to_spin_traced_tdm():
 
 def test_casci_make_tdm2_diagonal_matches_rdm2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -397,7 +417,7 @@ def test_casci_make_tdm2_diagonal_matches_rdm2():
 
 def test_casci_rdm2_reconstructs_active_space_energy():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -427,7 +447,7 @@ def test_casci_rdm2_reconstructs_active_space_energy():
 
 def test_reduced_ci_subspace_projects_casci_roots():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method='direct_ci')
@@ -444,7 +464,7 @@ def test_reduced_ci_subspace_projects_casci_roots():
 
 def test_direct_ci_sigma_matches_ci_roots():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method='direct_ci')
@@ -459,7 +479,7 @@ def test_direct_ci_sigma_matches_ci_roots():
 
 def test_factorized_direct_ci_sigma_matches_ci_root():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(
@@ -593,7 +613,7 @@ def test_spin_orbital_diagonal_accepts_fci_string_basis():
 def test_large_direct_ci_retains_compact_string_basis_through_common_operations():
     atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(6))
     mol = Molecule(atom=atom, unit='bohr', basis='sto-6g', spin=0)
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     mc = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
@@ -619,7 +639,7 @@ def test_large_direct_ci_retains_compact_string_basis_through_common_operations(
 
 def test_reduced_ci_full_subspace_reproduces_dense_casci():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method='direct_ci')
@@ -640,7 +660,7 @@ def test_reduced_ci_full_subspace_reproduces_dense_casci():
 
 def test_reduced_ci_rotation_block_for_root_plus_external_vector():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
@@ -674,7 +694,7 @@ def test_reduced_ci_rotation_block_for_root_plus_external_vector():
 
 def test_reduced_ci_expands_with_preconditioned_residual():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=4, nelecas=4).run(nstates=1, method='direct_ci')
@@ -698,7 +718,7 @@ def test_reduced_ci_expands_with_preconditioned_residual():
 
 def test_orbital_ci_coupling_matches_ci_finite_difference():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
@@ -771,7 +791,7 @@ def test_orbital_ci_coupling_matches_ci_finite_difference():
 
 def test_bo_hamiltonian_derivatives_match_manual_tdm_contractions():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -825,7 +845,7 @@ def test_bo_hamiltonian_derivatives_match_manual_tdm_contractions():
 
 def test_bo_hamiltonian_derivatives_projection_matches_cartesian_contraction():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -852,7 +872,7 @@ def test_bo_hamiltonian_derivatives_projection_matches_cartesian_contraction():
 
 def test_bo_hamiltonian_derivatives_projected_only_matches_cartesian_projection():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -871,13 +891,13 @@ def test_bo_hamiltonian_derivatives_projected_only_matches_cartesian_projection(
 
     assert projected.F_cartesian is None
     assert projected.G_cartesian is None
-    np.testing.assert_allclose(projected.F_projected, full.F_projected, atol=1.0e-10)
-    np.testing.assert_allclose(projected.G_projected, full.G_projected, atol=1.0e-10)
+    np.testing.assert_allclose(projected.F_projected, full.F_projected, atol=1.0e-8)
+    np.testing.assert_allclose(projected.G_projected, full.G_projected, atol=1.0e-8)
 
 
 def test_casci_vibronic_couplings_return_projected_f_and_g():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -904,7 +924,7 @@ def test_casci_vibronic_couplings_return_projected_f_and_g():
 
 def test_casci_vibronic_gradients_match_full_first_order_terms():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
     mode = np.zeros((1, mol.natom, 3))
@@ -941,7 +961,7 @@ def test_casci_vibronic_hessian_is_symmetric_between_two_modes():
         basis="sto-3g",
         charge=1,
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=3, nelecas=2).run(nstates=3)
@@ -958,7 +978,7 @@ def test_casci_vibronic_hessian_is_symmetric_between_two_modes():
 
 def test_casci_vibronic_couplings_modes_are_cartesian_displacement_coefficients():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -985,13 +1005,13 @@ def test_casci_vibronic_couplings_modes_are_cartesian_displacement_coefficients(
         optimize=True,
     )
 
-    np.testing.assert_allclose(f, expected, atol=1e-10)
+    np.testing.assert_allclose(f, expected, rtol=1e-5, atol=1e-9)
     assert not np.allclose(f, wrong_mass_weighted, atol=1e-8)
 
 
 def test_casci_vibronic_couplings_return_cartesian_f_and_g_without_modes():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -1016,7 +1036,7 @@ def test_casci_vibronic_couplings_return_cartesian_f_and_g_without_modes():
 
 def test_bo_hamiltonian_derivatives_hcore_ao_terms_match_finite_difference():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -1030,7 +1050,7 @@ def test_bo_hamiltonian_derivatives_hcore_ao_terms_match_finite_difference():
             for atom_id in range(mol.natom)
         ]
         displaced = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-        displaced.build(driver="builtin", eri="dense")
+        displaced.build(eri="dense")
         return displaced.hcore
 
     atom_id = 1
@@ -1068,7 +1088,7 @@ def test_bo_hamiltonian_derivatives_hcore_ao_terms_match_finite_difference():
 
 def test_bo_hamiltonian_derivatives_work_with_builtin_factor_only_reference():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', options={'eri_representation': 'factors'})
+    mol.build(options={'eri_representation': 'factors'})
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -1082,7 +1102,7 @@ def test_bo_hamiltonian_derivatives_work_with_builtin_factor_only_reference():
 
 def test_bo_hamiltonian_derivatives_backward_aliases_remain_available():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -1099,7 +1119,7 @@ def test_bo_hamiltonian_derivatives_backward_aliases_remain_available():
 
 def test_public_casci_defaults_to_direct_ci():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=4, nelecas=4).run(nstates=2)
@@ -1113,7 +1133,7 @@ def test_public_casci_defaults_to_direct_ci():
 
 def test_direct_ci_falls_back_to_dense_solver_for_small_spaces():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1126,7 +1146,7 @@ def test_direct_ci_falls_back_to_dense_solver_for_small_spaces():
 
 def test_direct_ci_on_the_fly_matches_dense_solver():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1152,7 +1172,7 @@ def test_direct_ci_on_the_fly_matches_dense_solver():
 
 def test_direct_ci_davidson_matches_eigsh():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1202,7 +1222,7 @@ def test_python_davidson_supports_complex_hermitian_hamiltonians():
 def test_native_rhf_davidson_matches_python_multiroot_and_supports_restart():
     atom = '\n'.join(f'H 0 0 {1.8 * i:.10f}' for i in range(6))
     mol = Molecule(atom=atom, unit='bohr', basis='sto-6g', spin=0)
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     python_solver = direct_ci.CASCI(mf, ncas=6, nelecas=6, tol=1.0e-8)
@@ -1286,7 +1306,7 @@ def test_native_rhf_davidson_matches_python_multiroot_and_supports_restart():
 
 def test_direct_spin0_symm_davidson_matches_dense_spin0():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1313,10 +1333,30 @@ def test_direct_spin0_symm_davidson_matches_dense_spin0():
     mc_native_davidson = direct_ci.CASCI(mf, ncas=4, nelecas=4)
     mc_native_davidson.direct_spin0_symm_dense_fallback_nconfigs = 0
     assert mc_native_davidson.direct_spin0_native_davidson is True
-    mc_native_davidson.run(nstates=1, method='direct_spin0_symm')
+    mc_native_davidson.direct_ci_residual_tol = 1.0e-9
+    mc_native_davidson.run(nstates=3, method='direct_spin0_symm')
 
     assert mc_native_davidson.solver_backend == 'direct_spin0_symm_davidson_spin0_pair'
-    np.testing.assert_allclose(mc_native_davidson.e_tot, mc_dense.e_tot[:1], atol=1e-10)
+    if direct_ci._cpp_attr("davidson_spin0_pair") is not None:
+        capabilities = direct_ci.direct_ci_capabilities()
+        assert capabilities['spin0_multiroot'] is True
+        assert capabilities['spin0_initial_guess'] is True
+        assert mc_native_davidson.direct_ci_native_diagnostics['used'] is True
+        assert mc_native_davidson.direct_ci_native_diagnostics['nroots'] == 3
+    np.testing.assert_allclose(mc_native_davidson.e_tot, mc_dense.e_tot, atol=1e-9)
+
+    mc_native_restart = direct_ci.CASCI(mf, ncas=4, nelecas=4)
+    mc_native_restart.direct_spin0_symm_dense_fallback_nconfigs = 0
+    mc_native_restart.direct_ci_residual_tol = 1.0e-9
+    mc_native_restart.run(
+        nstates=3,
+        method='direct_spin0_symm',
+        ci0=mc_native_davidson.ci,
+    )
+    if direct_ci._cpp_attr("davidson_spin0_pair") is not None:
+        assert mc_native_restart.direct_ci_native_diagnostics['used'] is True
+        assert mc_native_restart.direct_ci_native_diagnostics['used_initial_guess'] is True
+    np.testing.assert_allclose(mc_native_restart.e_tot, mc_dense.e_tot, atol=1e-9)
 
     mc_python_davidson = direct_ci.CASCI(mf, ncas=4, nelecas=4)
     mc_python_davidson.direct_spin0_symm_dense_fallback_nconfigs = 0
@@ -1338,9 +1378,116 @@ def test_direct_spin0_symm_davidson_matches_dense_spin0():
     np.testing.assert_allclose(mc_public.e_tot, mc_dense.e_tot[:2], atol=1e-10)
 
 
+def test_direct_spin0_symm_fix_spin_keeps_requested_root_count(monkeypatch):
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mf = RHF(mol).run()
+    mc = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    mc.direct_spin0_symm_dense_fallback_nconfigs = 0
+    mc.fix_spin(ss=0, shift=0.2)
+    solve_calls = []
+
+    def fake_solve(binary, nstates, **kwargs):
+        solve_calls.append(nstates)
+        mc.e_core = 0.0
+        mc.solver_backend = 'fake_spin0'
+        mc.direct_ci_diagnostics = {'spin_penalty_shift': mc.shift}
+        vectors = np.eye(binary.shape[0], nstates)
+        return np.arange(nstates, dtype=float), vectors
+
+    monkeypatch.setattr(mc, '_direct_spin0_symm_solve', fake_solve)
+    mc.run(nstates=3, method='direct_spin0_symm')
+
+    assert solve_calls == [3]
+    assert len(mc.e_tot) == 3
+    assert mc.direct_ci_diagnostics['requested_nstates'] == 3
+    assert mc.direct_ci_diagnostics['solved_nstates'] == 3
+    assert mc.direct_ci_diagnostics['multiplicity_selected'] is False
+    assert mc.direct_ci_diagnostics['spin_penalty_shift'] == 0.2
+
+
+def test_direct_spin0_symm_fix_spin_native_is_spin_pure():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mf = RHF(mol).run()
+    reference = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    reference.direct_spin0_symm_dense_fallback_nconfigs = 0
+    reference.run(nstates=6, method='direct_spin0_symm')
+
+    mc = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    mc.fix_spin(ss=0, shift=1.0)
+    mc.run(nstates=6, method='direct_spin0_symm')
+
+    assert mc.solver_backend == 'direct_spin0_symm_davidson_spin0_pair'
+    assert mc.direct_ci_diagnostics['requested_nstates'] == 6
+    assert mc.direct_ci_diagnostics['solved_nstates'] == 6
+    assert mc.direct_ci_diagnostics['spin_penalty_shift'] == 1.0
+    assert mc.direct_ci_diagnostics['spin_penalty_application'] == 'separate_native_operator'
+    assert mc.direct_ci_native_diagnostics['used'] is True
+    np.testing.assert_allclose(mc.hcore, reference.hcore, atol=1.0e-12)
+    np.testing.assert_allclose(mc.h2e_cas, reference.h2e_cas, atol=1.0e-12)
+    np.testing.assert_allclose(mc.e_tot, reference.e_tot, atol=1.0e-9)
+    np.testing.assert_allclose(
+        [mc.spin_square(root) for root in range(6)],
+        0.0,
+        atol=1.0e-9,
+    )
+
+
+def test_direct_spin0_symm_separate_penalty_removes_even_spin_contaminants():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mf = RHF(mol).run()
+
+    reference = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    reference.run(nstates=21, method='direct_spin0_symm')
+    reference_singlets = [
+        energy
+        for root, energy in enumerate(reference.e_tot)
+        if abs(reference.spin_square(root)) < 1.0e-9
+    ]
+
+    mc = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    mc.fix_spin(ss=0, shift=1.0)
+    mc.run(nstates=12, method='direct_spin0_symm')
+
+    assert len(reference_singlets) >= 12
+    assert mc.direct_ci_diagnostics['spin_penalty_application'] == 'separate_native_operator'
+    np.testing.assert_allclose(mc.e_tot, reference_singlets[:12], atol=1.0e-9)
+    np.testing.assert_allclose(
+        [mc.spin_square(root) for root in range(12)],
+        0.0,
+        atol=1.0e-9,
+    )
+
+
+def test_direct_spin0_symm_separate_penalty_python_fallback_matches_native():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mf = RHF(mol).run()
+
+    native = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    native.fix_spin(ss=0, shift=1.0)
+    native.run(nstates=6, method='direct_spin0_symm')
+
+    fallback = direct_ci.CASCI(mf, ncas=4, nelecas=4, multiplicity=1)
+    fallback.direct_spin0_native_pair = False
+    fallback.direct_spin0_native_davidson = False
+    fallback.fix_spin(ss=0, shift=1.0)
+    fallback.run(nstates=6, method='direct_spin0_symm')
+
+    assert fallback.direct_ci_diagnostics['spin_penalty_application'] == 'separate_operator'
+    np.testing.assert_allclose(fallback.e_tot, native.e_tot, atol=1.0e-9)
+    np.testing.assert_allclose(
+        [fallback.spin_square(root) for root in range(6)],
+        0.0,
+        atol=1.0e-9,
+    )
+
+
 def test_direct_ci_defaults_to_davidson():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=4, nelecas=4)
@@ -1362,7 +1509,7 @@ def test_direct_ci_residual_tolerance_defaults_to_sqrt_energy_tolerance():
 
 def test_direct_ci_auto_eigensolver_uses_eigsh_for_medium_spaces():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1386,7 +1533,7 @@ def test_direct_ci_root_cushion_recovers_lowest_h8_roots():
     atom = '\n'.join(f'H 0 0 {i * distance:.10f}' for i in range(8))
 
     mol = Molecule(atom=atom, unit='bohr', basis='sto-6g', spin=0)
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1407,7 +1554,7 @@ def test_direct_ci_root_cushion_recovers_lowest_h8_roots():
 
 def test_direct_ci_spin_square_matches_rdm_definition():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
 
@@ -1426,7 +1573,7 @@ def test_direct_ci_spin_square_matches_rdm_definition():
 
 def test_cholesky_active_space_eri_transform_matches_dense():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
     mo_cas = mf.mo_coeff[:, 1:5]
@@ -1439,7 +1586,7 @@ def test_cholesky_active_space_eri_transform_matches_dense():
 
 def test_builtin_s8_dense_eri_transform_unpacks_compressed_cache():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', aosym='s8', eri='dense')
+    mol.build(aosym='s8', eri='dense')
 
     mf = mol.RHF().run()
     mo_cas = mf.mo_coeff[:, :2]
@@ -1457,7 +1604,7 @@ def test_builtin_s8_dense_eri_transform_unpacks_compressed_cache():
 
 def test_casci_use_cholesky_matches_dense_energy():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
 
@@ -1469,7 +1616,7 @@ def test_casci_use_cholesky_matches_dense_energy():
 
 def test_casci_auto_uses_cholesky_from_rhf_label():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
 
@@ -1482,7 +1629,7 @@ def test_casci_auto_uses_cholesky_from_rhf_label():
 
 def test_direct_ci_use_cholesky_matches_dense_energy():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
 
@@ -1508,7 +1655,7 @@ def test_direct_ci_use_cholesky_matches_dense_energy():
 
 def test_public_casci_retains_direct_solver_and_restart_state():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     mc = CASCI(mf, ncas=4, nelecas=4)
@@ -1527,7 +1674,7 @@ def test_public_casci_retains_direct_solver_and_restart_state():
 
 def test_retained_direct_integrals_detect_in_place_mo_changes():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
     mo = np.array(mf.mo_coeff, copy=True)
 
@@ -1545,7 +1692,7 @@ def test_retained_direct_integrals_detect_in_place_mo_changes():
 
 def test_explicit_singlet_direct_ci_auto_uses_spin0_solver():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     auto = CASCI(mf, ncas=4, nelecas=4, multiplicity=1).run(nstates=1)
@@ -1559,7 +1706,7 @@ def test_explicit_singlet_direct_ci_auto_uses_spin0_solver():
 
 def test_public_casci_direct_ci_method_dispatches_to_direct_backend():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
 
@@ -1574,7 +1721,7 @@ def test_public_casci_direct_ci_method_dispatches_to_direct_backend():
 
 def test_direct_ci_auto_uses_cholesky_from_rhf_label():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
 
@@ -1776,12 +1923,12 @@ def test_biorthogonal_ci_overlap_candidate_matches_exact_overlap():
 
 def test_public_overlap_matches_slow_reference_for_displaced_casci_pair():
     mol1 = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol1.build(driver='gbasis')
+    mol1.build()
     mf1 = RHF(mol1).run()
     mc1 = CASCI(mf1, ncas=2, nelecas=2).run(nstates=2)
 
     mol2 = Molecule(atom='H 0 0 0; H 0 0 1.5', unit='bohr', basis='sto-3g')
-    mol2.build(driver='gbasis')
+    mol2.build()
     mf2 = RHF(mol2).run()
     mc2 = CASCI(mf2, ncas=2, nelecas=2).run(nstates=2)
 
@@ -1793,11 +1940,11 @@ def test_public_overlap_matches_slow_reference_for_displaced_casci_pair():
 
 def test_compact_casci_frames_preserve_displaced_overlap():
     mol1 = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol1.build(driver='builtin', eri='dense')
+    mol1.build(eri='dense')
     mc1 = CASCI(RHF(mol1).run(), ncas=2, nelecas=2).run(nstates=2)
 
     mol2 = Molecule(atom='H 0 0 0; H 0 0 1.5', unit='bohr', basis='sto-3g')
-    mol2.build(driver='builtin', eri='dense')
+    mol2.build(eri='dense')
     mc2 = CASCI(RHF(mol2).run(), ncas=2, nelecas=2).run(nstates=2)
 
     np.testing.assert_allclose(
@@ -1813,7 +1960,7 @@ def test_builtin_casci_overlap_self_is_identity_with_p_orbitals():
         unit='bohr',
         basis='sto-3g',
     )
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
 

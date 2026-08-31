@@ -10,6 +10,7 @@ active local support.
 
 from __future__ import annotations
 
+from copy import deepcopy
 import pickle
 from pathlib import Path
 
@@ -247,9 +248,28 @@ class NNNLETTA:
         return psi
 
     def norm(self) -> float:
-        psi = self.state_vector()
-        value = np.vdot(psi, psi).real
+        value = self._identity_matrix_element().real
         return float(0.0 if -1.0e-12 < value < 0.0 else value)
+
+    def copy(self) -> "NNNLETTA":
+        """Return an exact copy without normalizing or forming a dense state."""
+        out = object.__new__(type(self))
+        out.dims = self.dims
+        out.bond_dim = self.bond_dim
+        out.rng = np.random.default_rng()
+        out.rng.bit_generator.state = deepcopy(self.rng.bit_generator.state)
+        out.tensors = [tensor.copy() for tensor in self.tensors]
+        out.local_masks = (
+            None
+            if self.local_masks is None
+            else [mask.copy() for mask in self.local_masks]
+        )
+        out.history = list(self.history)
+        out.converged = self.converged
+        out.energy = self.energy
+        if hasattr(self, "state_metadata"):
+            out.state_metadata = deepcopy(self.state_metadata)
+        return out
 
     def normalize(self):
         norm = np.sqrt(self.norm())
@@ -259,6 +279,8 @@ class NNNLETTA:
         return self
 
     def _validate_mpo(self, mpo) -> list[np.ndarray]:
+        if hasattr(mpo, "factors"):
+            mpo = mpo.factors
         mpo = [np.asarray(site) for site in mpo]
         if len(mpo) != self.nsites:
             raise ValueError("MPO length must match dims.")

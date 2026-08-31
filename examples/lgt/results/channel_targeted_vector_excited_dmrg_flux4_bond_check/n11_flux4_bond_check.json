@@ -1,0 +1,31 @@
+{
+  "description": "N=11, flux-cutoff-4 excited-DMRG bond check",
+  "records": [
+    {
+      "bond_dim": 64,
+      "vector_excitation": 0.8888071704790814,
+      "vector_mass": 0.628644581819852,
+      "vector_strength": 0.34548247073527705,
+      "wall_seconds": 340.6157284169458
+    },
+    {
+      "bond_dim": 96,
+      "vector_excitation": 0.8714260287613111,
+      "vector_mass": 0.6038204597056439,
+      "vector_strength": 0.31307786209057814,
+      "wall_seconds": 606.932598290965
+    },
+    {
+      "bond_dim": 128,
+      "vector_excitation": 0.8684426761076285,
+      "vector_mass": 0.5995068853994965,
+      "vector_strength": 0.32305756893794185,
+      "wall_seconds": 990.1336045002099
+    }
+  ],
+  "continuum_vector_mass": 0.5641895835477563,
+  "bond_64_to_96_mass_change": -0.024824122114208147,
+  "bond_64_to_96_relative_change": -0.03948832588733245,
+  "bond_96_to_128_mass_change": -0.004313574306147427,
+  "bond_96_to_128_relative_change": -0.007143802825512487
+}

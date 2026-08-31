@@ -14,10 +14,11 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from pyqed.units import au2ev
 from pyqed.qchem.gdvr import AtomicChain, Molecule, local_ecp_terms_from_pyscf
 
 
-AU_ENERGY_EV = 27.211386245988
+AU_ENERGY_EV = au2ev
 
 
 def _parse_r_values(args):

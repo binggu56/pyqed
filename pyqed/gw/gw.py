@@ -17,6 +17,8 @@ from scipy.optimize import newton
 
 from functools import reduce
 
+from pyqed.units import au2ev
+
 
 class _LoggerFallback:
     NOTE = 3
@@ -1135,4 +1137,4 @@ if __name__ == '__main__':
 
     nocc = mol.nelectron//2
     ehomo = egw[nocc-1]
-    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo*27.211, "eV")
+    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")

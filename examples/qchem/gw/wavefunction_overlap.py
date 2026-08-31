@@ -20,7 +20,7 @@ def rhf(delta=0.0):
         f"H 0  0.757 0.587"
     )
     mol = Molecule(atom=atom, basis="sto-3g", unit="angstrom")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     return RHF(mol).run(verbose=0)
 
 

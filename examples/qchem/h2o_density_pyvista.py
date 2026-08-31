@@ -28,7 +28,7 @@ def main():
         basis="6-31g",
         unit="angstrom",
     )
-    mol.build(driver="builtin")
+    mol.build()
 
     mf = mol.RHF().run()
 

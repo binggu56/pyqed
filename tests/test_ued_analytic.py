@@ -12,7 +12,7 @@ def test_analytic_density_ft_q_zero_recovers_electron_count():
         basis="sto-3g",
         spin=0,
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     mf = mol.RHF().run(tol=1e-10, conv_tol_dm=1e-8, max_cycle=80)
 
     dm = mf.make_rdm1()
@@ -45,7 +45,7 @@ def test_ao_density_fourier_q_zero_matches_overlap_contraction():
         basis="sto-3g",
         spin=0,
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
 
     mf = mol.RHF().run(tol=1e-10, conv_tol_dm=1e-8, max_cycle=80)
     dm = mf.make_rdm1()
@@ -102,7 +102,7 @@ def test_h2o_ao_density_ft_compiled_paths_agree():
         basis="sto-3g",
         spin=0,
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
 
     mf = mol.RHF().run(tol=1e-10, conv_tol_dm=1e-8, max_cycle=80)
     dm = mf.make_rdm1()
@@ -170,7 +170,7 @@ def test_batched_ao_pair_ft_matrices_match_scalar_integrals():
         basis="sto-3g",
         spin=0,
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     basis, transform = mol._cart_basis()
     assert transform is None
 
@@ -202,7 +202,7 @@ def test_ao_ft_plan_batch_matches_single_geometry_contracts():
         basis="sto-3g",
         spin=0,
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     plan = AOPairFTPlan.from_molecule(mol)
     dm = np.eye(mol.nao, dtype=complex)
     dm1 = np.stack([dm, 0.5 * dm])

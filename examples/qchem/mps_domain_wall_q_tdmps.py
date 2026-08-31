@@ -177,7 +177,7 @@ def measure_q_and_entropy(psi, q_diag):
     psi_c = psi.copy().right_canonicalize()
     q_expect = np.real_if_close(psi_c.site_expectation_value(q_diag)).astype(float)
 
-    if psi_c.Ss is None:
+    if psi_c.singular_values is None:
         smax = 0.0
     else:
         ent = psi_c.entanglement_entropy()

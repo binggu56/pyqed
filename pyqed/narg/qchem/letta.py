@@ -43,6 +43,26 @@ class LETTA:
     qn_info: object = None
 
     @classmethod
+    def from_integrals(
+        cls,
+        h1e,
+        eri=None,
+        *,
+        symmetry="su2",
+        **kwargs,
+    ):
+        """Build a native reduced qchem LETTA state from active-space integrals."""
+        key = str(symmetry).lower().replace("-", "").replace("_", "")
+        if key != "su2":
+            raise NotImplementedError(
+                "LETTA.from_integrals implements symmetry='su2'; initialize "
+                "the generic LETTA adapter from a NARG state for other symmetries."
+            )
+        from pyqed.letta import SU2LETTA
+
+        return SU2LETTA.from_integrals(h1e, eri=eri, **kwargs)
+
+    @classmethod
     def from_narg(
         cls,
         narg,

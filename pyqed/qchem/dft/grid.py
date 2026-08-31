@@ -9,46 +9,12 @@ from periodictable import elements
 from scipy.integrate._lebedev import get_lebedev_sphere
 
 from pyqed.qchem.basis import ContractedGaussian
+from pyqed.units import au2angstrom
 
 
-BOHR_TO_ANGSTROM = 0.529177249
+BOHR_TO_ANGSTROM = au2angstrom
 DEFAULT_N_RADIAL = 50
 DEFAULT_N_ANGULAR = 110
-
-
-def _evaluate_basis_compat(basis, coords, screen_basis=True, tol_screen=1e-8):
-    """
-    Compatibility wrapper for different ``gbasis`` evaluator signatures.
-    """
-    from gbasis.evals.eval import evaluate_basis
-
-    try:
-        return evaluate_basis(
-            basis,
-            coords,
-            screen_basis=screen_basis,
-            tol_screen=tol_screen,
-        )
-    except TypeError:
-        return evaluate_basis(basis, coords)
-
-
-def _evaluate_deriv_basis_compat(basis, coords, orders, screen_basis=True, tol_screen=1e-8):
-    """
-    Compatibility wrapper for different ``gbasis`` derivative-evaluator signatures.
-    """
-    from gbasis.evals.eval_deriv import evaluate_deriv_basis
-
-    try:
-        return evaluate_deriv_basis(
-            basis,
-            coords,
-            orders,
-            screen_basis=screen_basis,
-            tol_screen=tol_screen,
-        )
-    except TypeError:
-        return evaluate_deriv_basis(basis, coords, orders)
 
 
 def _is_native_basis(basis):
@@ -173,25 +139,7 @@ def _evaluate_ao_derivatives(mol, coords, orders_list, screen_basis=True, tol_sc
             for values in _evaluate_native_basis_derivatives(basis, coords, orders_list)
         ]
 
-    out = []
-    for orders in orders_list:
-        if tuple(int(order) for order in orders) == (0, 0, 0):
-            values = _evaluate_basis_compat(
-                basis,
-                coords,
-                screen_basis=screen_basis,
-                tol_screen=tol_screen,
-            ).T
-        else:
-            values = _evaluate_deriv_basis_compat(
-                basis,
-                coords,
-                np.asarray(orders, dtype=int),
-                screen_basis=screen_basis,
-                tol_screen=tol_screen,
-            ).T
-        out.append(values)
-    return out
+    raise ValueError("AO-grid evaluation requires a built molecule.")
 
 
 class AOGrid:

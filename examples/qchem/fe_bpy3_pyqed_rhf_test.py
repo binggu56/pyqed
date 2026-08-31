@@ -81,7 +81,6 @@ def build_parser():
     parser.add_argument("--basis", default="sto-3g")
     parser.add_argument("--charge", type=int, default=2)
     parser.add_argument("--spin", type=int, default=0)
-    parser.add_argument("--driver", default="builtin")
     parser.add_argument(
         "--eri",
         choices=("auto", "dense", "s4", "s8", "direct", "factors", "ri"),
@@ -150,7 +149,7 @@ def main(argv=None):
 
     print("Model:", "XYZ input" if args.xyz else "repaired generated [Fe(bpy)3]2+")
     print(f"Atoms={len(atoms)}, charge={args.charge}, spin={args.spin}, basis={args.basis}")
-    print(f"PyQED build: driver={args.driver}, eri={args.eri}, auxbasis={args.auxbasis}")
+    print(f"PyQED native build: eri={args.eri}, auxbasis={args.auxbasis}")
 
     mol = Molecule(
         atom=atom_string(atoms),
@@ -173,48 +172,28 @@ def main(argv=None):
     }
     build_options = {key: value for key, value in build_options.items() if value is not None}
 
-    if args.rhf_density_fit:
-        def prepare_pyscf_metadata():
-            pmol = mol.topyscf()
-            pmol.build(verbose=0)
-            mol.nao = pmol.nao
-            mol.nmo = pmol.nao
-            mol.nbas = pmol.nbas
-            mol.cart = pmol.cart
-            mol._atm = pmol._atm
-            mol._bas = pmol._bas
-            mol._env = pmol._env
-            return pmol
-
-        pmol, build_seconds = timed("PySCF metadata build for PyQED DF-RHF", prepare_pyscf_metadata)
-        print(f"Electrons={mol.nelec}, AOs={mol.nao}")
-        eri_factors = None
-        ri_info = {}
-        build_timings = {}
-    else:
-        _, build_seconds = timed(
-            "PyQED integral build",
-            lambda: mol.build(
-                driver=args.driver,
-                eri=args.eri,
-                auxbasis=args.auxbasis,
-                options=build_options,
-            ),
+    _, build_seconds = timed(
+        "PyQED integral build",
+        lambda: mol.build(
+            eri=args.eri,
+            auxbasis=args.auxbasis,
+            options=build_options,
+        ),
+    )
+    print(f"Electrons={mol.nelec}, AOs={mol.nao}")
+    eri_factors = getattr(mol, "eri_factors", None)
+    build_info = getattr(mol, "_builtin_build_info", {}) or {}
+    ri_info = dict(build_info.get("ri", {}) or {})
+    build_timings = dict(build_info.get("timings", {}) or {})
+    if eri_factors is not None:
+        print(f"RI/low-rank factors: rank={eri_factors.shape[0]}")
+    if ri_info:
+        print(
+            "RI diagnostics: "
+            f"builder={ri_info.get('tensor_builder')}, "
+            f"workers={ri_info.get('workers')}, "
+            f"cache_hit={ri_info.get('cache_hit')}"
         )
-        print(f"Electrons={mol.nelec}, AOs={mol.nao}")
-        eri_factors = getattr(mol, "eri_factors", None)
-        build_info = getattr(mol, "_builtin_build_info", {}) or {}
-        ri_info = dict(build_info.get("ri", {}) or {})
-        build_timings = dict(build_info.get("timings", {}) or {})
-        if eri_factors is not None:
-            print(f"RI/low-rank factors: rank={eri_factors.shape[0]}")
-        if ri_info:
-            print(
-                "RI diagnostics: "
-                f"builder={ri_info.get('tensor_builder')}, "
-                f"workers={ri_info.get('workers')}, "
-                f"cache_hit={ri_info.get('cache_hit')}"
-            )
 
     if args.build_only:
         summary = {
@@ -223,7 +202,7 @@ def main(argv=None):
             "charge": args.charge,
             "spin": args.spin,
             "basis": args.basis,
-            "driver": args.driver,
+            "integral_engine": "native",
             "eri": args.eri,
             "auxbasis": args.auxbasis,
             "rhf_density_fit": bool(args.rhf_density_fit),
@@ -295,7 +274,7 @@ def main(argv=None):
         "charge": args.charge,
         "spin": args.spin,
         "basis": args.basis,
-        "driver": args.driver,
+        "integral_engine": "native",
         "eri": args.eri,
         "auxbasis": args.auxbasis,
         "rhf_density_fit": bool(args.rhf_density_fit),

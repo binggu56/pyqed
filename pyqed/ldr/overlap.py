@@ -166,11 +166,29 @@ def between(bra, ket, links, *, nstates=None, average_paths=False):
     return value / len(paths)
 
 
-def phase_gauge(shape, links, *, state=0, anchor=None, threshold=1.0e-10):
+def phase_gauge(
+    shape,
+    links,
+    *,
+    state=0,
+    anchor=None,
+    threshold=1.0e-10,
+    support=None,
+):
     """Return coefficients that phase-align one adiabatic state to an anchor."""
 
     shape = tuple(int(n) for n in shape)
-    state = int(state)
+    state = np.asarray(state, dtype=int)
+    if state.ndim == 0:
+        scalar_state = int(state)
+        state_labels = None
+    elif state.shape == shape:
+        scalar_state = None
+        state_labels = state
+        if np.any(state_labels < 0):
+            raise ValueError("state labels must be nonnegative")
+    else:
+        raise ValueError(f"state-label shape {state.shape} != {shape}")
     if anchor is None:
         anchor = tuple(n // 2 for n in shape)
     anchor = tuple(int(i) for i in anchor)
@@ -179,12 +197,89 @@ def phase_gauge(shape, links, *, state=0, anchor=None, threshold=1.0e-10):
     ):
         raise ValueError("anchor is outside the product grid")
 
+    if support is not None or state_labels is not None:
+        if support is None:
+            support = np.ones(shape, dtype=bool)
+        support = np.asarray(support, dtype=bool)
+        if support.shape != shape:
+            raise ValueError(f"support shape {support.shape} != {shape}")
+        if not support[anchor]:
+            raise ValueError("anchor must lie inside the phase-gauge support")
+        values = np.ones(shape, dtype=complex)
+        visited = np.zeros(shape, dtype=bool)
+        visited[anchor] = True
+        frontier = [anchor]
+        while frontier:
+            index = frontier.pop()
+            for axis, size in enumerate(shape):
+                if index[axis] + 1 < size:
+                    neighbor = list(index)
+                    neighbor[axis] += 1
+                    neighbor = tuple(neighbor)
+                    key = (axis, index)
+                    direction = 1
+                    candidates = ((neighbor, key, direction),)
+                else:
+                    candidates = ()
+                if index[axis] > 0:
+                    neighbor = list(index)
+                    neighbor[axis] -= 1
+                    neighbor = tuple(neighbor)
+                    candidates += ((neighbor, (axis, neighbor), -1),)
+                for neighbor, key, direction in candidates:
+                    if visited[neighbor] or not support[neighbor]:
+                        continue
+                    block = np.asarray(links[key], dtype=complex)
+                    left = index if direction > 0 else neighbor
+                    right = neighbor if direction > 0 else index
+                    left_state = (
+                        scalar_state
+                        if state_labels is None
+                        else int(state_labels[left])
+                    )
+                    right_state = (
+                        scalar_state
+                        if state_labels is None
+                        else int(state_labels[right])
+                    )
+                    if (
+                        block.ndim != 2
+                        or left_state < 0
+                        or right_state < 0
+                        or left_state >= block.shape[0]
+                        or right_state >= block.shape[1]
+                    ):
+                        raise ValueError(
+                            "state is incompatible with the overlap-link blocks"
+                        )
+                    link = complex(block[left_state, right_state])
+                    magnitude = abs(link)
+                    if magnitude < threshold:
+                        continue
+                    phase = link / magnitude
+                    values[neighbor] = values[index] * (
+                        phase.conjugate() if direction > 0 else phase
+                    )
+                    visited[neighbor] = True
+                    frontier.append(neighbor)
+        missing = support & ~visited
+        if np.any(missing):
+            first = tuple(int(value) for value in np.argwhere(missing)[0])
+            raise ValueError(
+                f"phase-gauge support is disconnected at grid index {first}"
+            )
+        return values
+
     scalar_links = {}
     for key, block in links.items():
         block = np.asarray(block, dtype=complex)
-        if block.ndim != 2 or state < 0 or state >= min(block.shape):
+        if (
+            block.ndim != 2
+            or scalar_state < 0
+            or scalar_state >= min(block.shape)
+        ):
             raise ValueError("state is incompatible with the overlap-link blocks")
-        value = complex(block[state, state])
+        value = complex(block[scalar_state, scalar_state])
         magnitude = abs(value)
         if magnitude < threshold:
             raise ValueError(

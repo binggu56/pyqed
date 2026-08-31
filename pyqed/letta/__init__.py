@@ -94,6 +94,29 @@ from .ordering import (
     optimize_heisenberg_block_order,
     optimize_heisenberg_order,
 )
+from .tdvp import (
+    LETTATDVPEngine,
+    NumPyTDVP,
+    Window2Hamiltonian,
+    letta_structural_rank_caps,
+    nearest_neighbor_hamiltonian,
+    one_site_tdvp_step,
+    two_site_tdvp_step,
+    window2_hamiltonian_from_mpo,
+    window2_product_state,
+)
+from .dynamics import LETTAEvolution, TDVP, resolve_letta_backend
+from .nnn_tdvp import (
+    NNNLETTATDVPEngine,
+    nnn_product_state,
+    nnn_structural_rank_caps,
+    one_site_nnn_tdvp_step,
+)
+from .observables import (
+    nnn_system_reduced_density_matrix,
+    site_reduced_density_matrix,
+    system_reduced_density_matrix,
+)
 from .adaptive_graph import (
     AdaptiveTieGraphRun,
     AdaptiveTieGraphStep,
@@ -114,13 +137,39 @@ from .adaptive_graph import (
     tie_frontier_cost,
 )
 
+
+def __getattr__(name):
+    if name in {"NonAbelianFrontierLETTA", "SU2LETTA"}:
+        from . import su2_qchem
+
+        return getattr(su2_qchem, name)
+    torch_exports = {
+        "TorchLETTATDVPEngine",
+        "TorchTDVP",
+        "TorchWindow2Hamiltonian",
+        "TorchWindow2State",
+        "torch_one_site_tdvp_step",
+        "torch_backend_capabilities",
+        "torch_site_reduced_density_matrix",
+        "torch_system_reduced_density_matrix",
+        "torch_two_site_tdvp_step",
+    }
+    if name in torch_exports:
+        from . import torch_tdvp
+
+        return getattr(torch_tdvp, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 __all__ = [
     "AdaptiveTieGraphRun",
     "AdaptiveTieGraphStep",
     "LETTA",
     "LETTAOperatorPackage",
+    "NonAbelianFrontierLETTA",
     "SequentialLETTA",
+    "SU2LETTA",
     "NNNLETTA",
+    "NNNLETTATDVPEngine",
     "CPBlockUpdate",
     "BlockFrontierMessage",
     "BlockMPOFrontier",
@@ -150,10 +199,16 @@ __all__ = [
     "LETTAProductCache",
     "LETTAVMC",
     "LETTAWavefunction",
+    "LETTATDVPEngine",
+    "NumPyTDVP",
+    "LETTAEvolution",
+    "TDVP",
+    "resolve_letta_backend",
     "LocalHamiltonian",
     "LocalMPO",
     "LocalMPOProduct",
     "LocalTerm",
+    "Window2Hamiltonian",
     "local_charges_from_sites",
     "LocalHamiltonianActions",
     "MetropolisDiagnostics",
@@ -206,13 +261,25 @@ __all__ = [
     "heisenberg_frontier_profile",
     "lowest_generalized_davidson",
     "lowest_recycled_block_davidson",
+    "letta_structural_rank_caps",
+    "nearest_neighbor_hamiltonian",
+    "nnn_system_reduced_density_matrix",
+    "nnn_product_state",
+    "nnn_structural_rank_caps",
+    "one_site_nnn_tdvp_step",
+    "one_site_tdvp_step",
     "optimize_heisenberg_block_order",
     "optimize_heisenberg_order",
     "rank_tie_graph_proposals",
     "renormalized_operator_mpo",
     "sample_tie_signals",
+    "site_reduced_density_matrix",
     "state_with_tie_graph_proposal",
+    "system_reduced_density_matrix",
     "tie_edges",
     "tie_frontier_cost",
+    "two_site_tdvp_step",
     "validate_charge_conservation",
+    "window2_hamiltonian_from_mpo",
+    "window2_product_state",
 ]

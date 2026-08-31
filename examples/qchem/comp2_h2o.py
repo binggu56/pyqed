@@ -10,7 +10,7 @@ BASIS = "6-31g"
 
 def main():
     mol = Molecule(atom=ATOM, basis=BASIS, unit="angstrom")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mp2 = MP2(mf).run()

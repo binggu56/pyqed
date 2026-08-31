@@ -20,8 +20,10 @@ def test_spatial_npdm_rdm2_matches_reference_paths():
     dmrg = SimpleNamespace(
         ncas=nsites,
         ncore=0,
+        spatial_site_basis="block2_like",
         dmrg=SimpleNamespace(ground_state=state),
     )
+    dmrg._dense_site_qn_maps = lambda: None
     dmrg._get_state_for_rdm = DMRG._get_state_for_rdm.__get__(dmrg)
     dmrg._make_spatial_site_rdm2 = DMRG._make_spatial_site_rdm2.__get__(dmrg)
 

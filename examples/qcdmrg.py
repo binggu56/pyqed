@@ -28,7 +28,7 @@ print(z)
 mol = atomic_chain(natom, z)
 # mol.basis = 'ccpvdz'
 mol.basis = '631g'
-mol.build(driver='pyscf')
+mol.build()
 
 mf = mol.RHF().run()
 

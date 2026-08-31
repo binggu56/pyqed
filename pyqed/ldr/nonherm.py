@@ -14,7 +14,6 @@ from pyqed import transform, dag, isunitary, rk4, isdiag, sinc, sort, isherm, in
     cartesian_product, discretize, norm2
 
 from pyqed.wpd import ResultSPO2, SPO2
-from pyqed.ldr.ldr import LDR2
 from pyqed.nonherm import eig
 import warnings
 
@@ -28,7 +27,11 @@ from scipy.linalg import inv
 from scipy.sparse import kron, eye
 from scipy.linalg import eigh
 
+from ._legacy import warn_legacy_module
+
 from copy import copy
+
+warn_legacy_module("pyqed.ldr.nonherm")
 
 # try:
 #     import proplot as plt
@@ -160,7 +163,7 @@ from copy import copy
 
 
 
-class NHLDR2(LDR2):
+class NHLDR2:
     """
     N-state two-mode non-Hermitian conical intersection dynamics
 

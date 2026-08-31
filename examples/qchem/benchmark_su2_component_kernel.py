@@ -234,9 +234,7 @@ def main():
 
     case = PRESETS[args.system]
     mol = Molecule(atom=case["atom"], unit="bohr", basis=args.basis)
-    mol.build(
-        driver="builtin",
-        eri="dense",
+    mol.build(eri="dense",
         aosym="s1",
         options={"eri_backend": "cpp"},
     )

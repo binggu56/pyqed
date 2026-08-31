@@ -9,12 +9,12 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pyqed.mps.mps import expect_mps
 from pyqed.qchem.gdvr import AtomicChain, RTTDHF as GDVRRTTDHF
 from pyqed.qchem.rttdhf import gaussian_pulse
+from pyqed.units import au2fs
 
 
-AU_TIME_FS = 0.02418884326505
+AU_TIME_FS = au2fs
 
 
 def optical_period(omega):
@@ -172,7 +172,7 @@ def main(argv=None):
 
     psi0 = td.default_initial_condition() if args.skip_dmrg else td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
-    mu0_dmrg = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
+    mu0_dmrg = float(np.real(psi0.expectation(mu_mpo)))
     td.run(
         psi0=psi0,
         dt=args.dt,
@@ -318,7 +318,7 @@ def main(argv=None):
         and np.any(np.isfinite(td.static_energies))
     ):
         print(f"Initial <H0>:    {np.real(td.static_energies[0]):.12f} Ha")
-    print(f"GDVR MPO terms:  {td._active_integral_build_info['symbolic_terms']}")
+    print(f"GDVR MPO terms:  {td.build_info['symbolic_terms']}")
     print(f"max |dmu_TDHF|:  {np.max(np.abs(mu_tdhf - mu_tdhf[0])):.6e}")
     print(f"max |dmu_DMRG|:  {np.max(np.abs(mu_dmrg - mu_dmrg[0])):.6e}")
     print(f"max |Npre - 1|:  {np.nanmax(norm_error):.6e}")

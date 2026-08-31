@@ -44,7 +44,7 @@ METHODS = {
         "open_marker": False,
     },
     "letta_d4": {
-        "label": r"$U(1)$-LETTA $D=4$ (4,008)",
+        "label": r"LETTA $D=4$ (4,008)",
         "color": "#D55E00",
         "linestyle": "-",
         "marker": "s",
@@ -206,20 +206,6 @@ def _plot_method(axis, rows, method, field):
             )
 
 
-def _panel_label(axis, label):
-    axis.text(
-        -0.10,
-        1.055,
-        label,
-        transform=axis.transAxes,
-        fontsize=10.0,
-        fontweight="bold",
-        ha="left",
-        va="bottom",
-        zorder=8,
-    )
-
-
 def plot_scan(rows, output_stem):
     plt.rcParams.update(
         {
@@ -237,49 +223,28 @@ def plot_scan(rows, output_stem):
             "savefig.facecolor": "white",
         }
     )
-    figure, (energy_axis, offset_axis) = plt.subplots(
-        1,
-        2,
-        figsize=(5.9, 2.55),
-        constrained_layout=False,
+    figure, energy_axis = plt.subplots(
+        1, 1, figsize=(3.55, 2.65), constrained_layout=False
     )
     figure.subplots_adjust(
-        left=0.10,
-        right=0.90,
-        bottom=0.33,
-        top=0.88,
-        wspace=0.34,
+        left=0.17,
+        right=0.98,
+        bottom=0.34,
+        top=0.97,
     )
 
     for method in METHODS:
         _plot_method(energy_axis, rows, method, "energy_per_site")
-        if method != "mps_d32":
-            _plot_method(offset_axis, rows, method, "energy_above_mps_d32_per_site")
 
-    common = {
-        "xlabel": r"$J_2/J_1$",
-        "xlim": (-0.04, 1.04),
-        "xticks": (0.0, 0.25, 0.5, 0.75, 1.0),
-        "grid": False,
-    }
-    for axis in (energy_axis, offset_axis):
-        axis.set_xlabel(common["xlabel"])
-        axis.set_xlim(*common["xlim"])
-        axis.set_xticks(common["xticks"])
+    energy_axis.set_xlabel(r"$J_2/J_1$")
+    energy_axis.set_xlim(-0.04, 1.04)
+    energy_axis.set_xticks((0.0, 0.25, 0.5, 0.75, 1.0))
     energy_axis.set_ylabel(r"$E/N$")
-    offset_axis.set_ylabel(r"$[E-E_{\mathrm{MPS}\,D=32}]/N$")
-    offset_axis.axhline(0.0, color="#202020", linewidth=0.8, linestyle=":")
-    offset_axis.set_ylim(-0.008, 0.043)
-    offset_axis.set_yticks((-0.006, 0.0, 0.01, 0.02, 0.03, 0.04))
-    for axis in (energy_axis, offset_axis):
-        axis.yaxis.set_label_position("left")
-        axis.yaxis.tick_left()
-        axis.tick_params(axis="y", labelleft=True, labelright=False)
-        axis.grid(color="#dddddd", linewidth=0.48, which="major")
-        axis.tick_params(which="both", direction="out")
-    offset_axis.yaxis.set_label_position("right")
-    for label, axis in zip("ab", (energy_axis, offset_axis)):
-        _panel_label(axis, label)
+    energy_axis.yaxis.set_label_position("left")
+    energy_axis.yaxis.tick_left()
+    energy_axis.tick_params(axis="y", labelleft=True, labelright=False)
+    energy_axis.grid(color="#dddddd", linewidth=0.48, which="major")
+    energy_axis.tick_params(which="both", direction="out")
 
     handles = [
         Line2D(
@@ -296,30 +261,17 @@ def plot_scan(rows, output_stem):
         )
         for style in METHODS.values()
     ]
-    if any(row["method"] == "letta_d4" and not row["converged"] for row in rows):
-        handles.append(
-            Line2D(
-                [0],
-                [0],
-                color="#8c2d04",
-                linestyle="None",
-                marker="x",
-                markersize=4.8,
-                markeredgewidth=1.2,
-                label=r"LETTA reached 200-pass cap",
-            )
-        )
-        # Matplotlib fills multi-row legends column-first: keep all MPS
-        # entries on the first row and the LETTA entries on the second.
-        handles = [handles[0], handles[3], handles[1], handles[4], handles[2]]
+    # Matplotlib fills multi-row legends column-first. This ordering keeps
+    # increasing MPS dimensions on the first row and MPS/LETTA on the second.
+    handles = [handles[0], handles[2], handles[1], handles[3]]
     figure.legend(
         handles,
         [handle.get_label() for handle in handles],
         loc="lower center",
-        bbox_to_anchor=(0.5, 0.015),
-        ncol=3,
+        bbox_to_anchor=(0.5, 0.02),
+        ncol=2,
         frameon=False,
-        columnspacing=1.5,
+        columnspacing=1.2,
         handlelength=2.4,
     )
 

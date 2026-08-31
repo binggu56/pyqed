@@ -27,7 +27,7 @@ Basic usage:
    from pyqed.qchem.mp.mp2 import MP2
 
    mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="angstrom", basis="sto-3g")
-   mol.build(driver="builtin", eri="factors")
+   mol.build(eri="factors")
 
    mf = mol.RHF().run()
    mp = MP2(mf).run()
@@ -57,7 +57,7 @@ Recommended setup:
 
 .. code-block:: python
 
-   mol.build(driver="builtin", eri="factors")
+   mol.build(eri="factors")
    mf = mol.RHF().run()
    mp = MP2(mf).run()
    print(mp.eri_backend)

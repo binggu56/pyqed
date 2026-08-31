@@ -10,7 +10,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pyqed.mps.mps import expect_mps
 from pyqed.mps.tdmps import TDMPS
 from pyqed.qchem.gdvr import AtomicChain
 from pyqed.qchem.gdvr.tddmrg import (
@@ -171,7 +170,7 @@ def _run_split(td, psi0, mu_mpo, mu0, pulse, args):
         step_norms.append(norm)
 
         times.append((step + 1) * dt)
-        delta_mu.append(float(np.real(expect_mps(psi.factors, mu_mpo.factors))) - mu0)
+        delta_mu.append(float(np.real(psi.expectation(mu_mpo))) - mu0)
         norm_errors.append(abs(step_norms[-1] - 1.0))
         static_energies.append(TDMPS(td._get_td_hamiltonian(), D=bond_dim).static_energy(psi))
 
@@ -217,7 +216,7 @@ def main(argv=None):
 
     psi0 = td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
-    mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
+    mu0 = float(np.real(psi0.expectation(mu_mpo)))
 
     ref_start = time.perf_counter()
     td.run(
@@ -280,8 +279,8 @@ def main(argv=None):
 
     print(f"RHF energy:       {mf.e_tot:.12f} Ha")
     print(f"DMRG energy:      {td.e_tot:.12f} Ha")
-    print(f"GDVR MPO terms:   {td._active_integral_build_info['symbolic_terms']}")
-    print(f"max MPO bond:     {td._active_integral_build_info['mpo_max_bond']}")
+    print(f"GDVR MPO terms:   {td.build_info['symbolic_terms']}")
+    print(f"max MPO bond:     {td.build_info['mpo_max_bond']}")
     print(f"{ref_label} runtime:    {ref_runtime:.2f} s")
     print(f"density method:   {args.density_method}")
     if split["density_fit"] is not None:

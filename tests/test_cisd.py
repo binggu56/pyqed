@@ -9,7 +9,7 @@ from pyqed.qchem.hf import RHF, UHF
 
 def test_restricted_cisd_matches_fci_for_minimal_h2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     cisd = CISD(mf).run()
@@ -21,7 +21,7 @@ def test_restricted_cisd_matches_fci_for_minimal_h2():
 
 def test_restricted_cisd_make_rdm12_matches_individual_calls():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     cisd = CISD(mf).run()
@@ -38,7 +38,7 @@ def test_restricted_cisd_direct_sigma_backend_matches_default_energy():
         unit='angstrom',
         basis='sto-3g',
     )
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     ref = CISD(mf).run()
@@ -59,7 +59,7 @@ def test_ucisd_uses_spin_resolved_occupations_for_open_shell_uhf():
         basis='6-31g',
         spin=2,
     )
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = UHF(mol).run(max_cycle=50)
     ucisd = UCISD(mf)

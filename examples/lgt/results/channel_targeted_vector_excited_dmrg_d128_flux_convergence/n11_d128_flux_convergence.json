@@ -1,0 +1,22 @@
+{
+  "description": "Matched N=11, D=128 flux-4/5 excited-DMRG convergence",
+  "records": [
+    {
+      "flux_cutoff": 4,
+      "vector_excitation": 0.8684426761076285,
+      "vector_mass": 0.5995068853994965,
+      "vector_strength": 0.32305756893794185,
+      "wall_seconds": 990.1336045002099
+    },
+    {
+      "flux_cutoff": 5,
+      "vector_excitation": 0.8684431304072984,
+      "vector_mass": 0.5995075434955373,
+      "vector_strength": 0.3220677270575376,
+      "wall_seconds": 990.2843459160067
+    }
+  ],
+  "continuum_vector_mass": 0.5641895835477563,
+  "flux_4_to_5_mass_change": 6.580960407731595e-07,
+  "flux_4_to_5_relative_change": 1.0977289115447284e-06
+}

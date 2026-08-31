@@ -7,7 +7,7 @@ from pyqed.qchem.hf import RHF, UHF
 
 def test_uhf_open_shell_li_smoke():
     mol = Molecule(atom='Li 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = UHF(mol).run()
 
@@ -29,7 +29,7 @@ def test_uhf_open_shell_li_smoke():
 
 def test_rhf_to_uhf_preserves_closed_shell_reference():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     rhf = RHF(mol).run()
     uhf = rhf.to_uhf()
@@ -44,7 +44,7 @@ def test_uhf_matches_pyscf_for_open_shell_li():
     pyscf = pytest.importorskip('pyscf')
 
     mol = Molecule(atom='Li 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = UHF(mol).run()
 
@@ -57,7 +57,7 @@ def test_uhf_matches_pyscf_for_open_shell_li():
 
 def test_uhf_accepts_explicit_initial_occupations():
     mol = Molecule(atom='Li 0 0 0', unit='bohr', basis='sto-3g', spin=1)
-    mol.build(driver='gbasis')
+    mol.build()
 
     occ_a = np.array([1.0, 0.0, 1.0, 0.0, 0.0])
     occ_b = np.array([1.0, 0.0, 0.0, 0.0, 0.0])
@@ -81,7 +81,7 @@ def test_uhf_accepts_explicit_initial_occupations():
 
 def test_uhf_atom_config_guess_builtin_single_atom():
     mol = Molecule(atom='O 0 0 0', unit='bohr', basis='sto-3g', spin=2)
-    mol.build(driver='builtin')
+    mol.build()
 
     mf = UHF(mol).run(init_guess='atom_config')
 
@@ -102,7 +102,7 @@ def test_uhf_atom_config_guess_builtin_single_atom():
 
 def test_uhf_atom_config_with_mom_builtin_single_atom():
     mol = Molecule(atom='O 0 0 0', unit='bohr', basis='sto-3g', spin=2)
-    mol.build(driver='builtin')
+    mol.build()
 
     mf = UHF(mol).run(init_guess='atom_config', mom=True)
 

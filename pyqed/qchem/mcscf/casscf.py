@@ -5503,6 +5503,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     fallback_step=diag_step,
                 )
                 orbital_fallback_step_vec = np.asarray(step_vec, dtype=float).copy()
+                step_hessian_action = None
                 coupled_ci_guess = None
                 coupled_info = None
                 if self.coupling == "partial":
@@ -5565,6 +5566,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         fallback_step=diag_step,
                         return_info=True,
                     )
+                    step_hessian_action = ah_info.get("hessian_step")
                     micro_record.update(
                         {
                             "ah_converged": bool(ah_info["converged"]),
@@ -5601,9 +5603,15 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         return limit_step_trust_radius(candidate, step_trust_radius), None
                     return limit_step_norm(candidate, step_limit), step_limit
 
-                def evaluate_micro_candidate(label, raw_step, ci_guess):
+                def evaluate_micro_candidate(
+                    label,
+                    raw_step,
+                    ci_guess,
+                    raw_hessian_step=None,
+                ):
                     candidate_step, candidate_limit = limited_candidate(raw_step)
                     exact_tail_retry = False
+                    model_hvp_reused = False
                     kappa = self._unpack_orbitals(
                         candidate_step,
                         mc.ncore,
@@ -5665,7 +5673,34 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             else float(predicted)
                         )
                     else:
-                        step_hv = np.asarray(hessian_action(candidate_step), dtype=float)
+                        step_hv = None
+                        if raw_hessian_step is not None:
+                            raw_step_array = np.asarray(raw_step, dtype=float)
+                            raw_hessian_step = np.asarray(
+                                raw_hessian_step,
+                                dtype=float,
+                            )
+                            norm2 = float(np.dot(raw_step_array, raw_step_array))
+                            if (
+                                raw_hessian_step.shape == candidate_step.shape
+                                and norm2 > 1.0e-30
+                            ):
+                                scale = float(
+                                    np.dot(raw_step_array, candidate_step) / norm2
+                                )
+                                residual = candidate_step - scale * raw_step_array
+                                tolerance = 1.0e-12 * max(
+                                    1.0,
+                                    float(np.linalg.norm(candidate_step)),
+                                )
+                                if np.linalg.norm(residual) <= tolerance:
+                                    step_hv = scale * raw_hessian_step
+                                    model_hvp_reused = True
+                        if step_hv is None:
+                            step_hv = np.asarray(
+                                hessian_action(candidate_step),
+                                dtype=float,
+                            )
                         model_linear = float(np.dot(grad_vec, candidate_step))
                         model_quadratic = float(np.dot(candidate_step, step_hv))
                         predicted = -(model_linear + 0.5 * model_quadratic)
@@ -5773,6 +5808,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         ),
                         "active_overlap_accepted": bool(trial_active_ok),
                         "exact_tail_retry": bool(exact_tail_retry),
+                        "model_hvp_reused": bool(model_hvp_reused),
                     }
 
                 coupled_mode = self.coupling in {"partial", "full"}
@@ -5787,6 +5823,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     primary_label,
                     step_vec,
                     primary_ci,
+                    step_hessian_action,
                 )
                 chosen_result = primary_result
                 fallback_result = None
@@ -5923,6 +5960,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     else 0.0
                 )
                 micro_record["ah_predicted_reduction"] = predicted_reduction
+                micro_record["ah_model_hvp_reused"] = bool(
+                    chosen_result.get("model_hvp_reused", False)
+                )
                 micro_record["exact_tail_retry"] = bool(
                     chosen_result.get("exact_tail_retry", False)
                 )

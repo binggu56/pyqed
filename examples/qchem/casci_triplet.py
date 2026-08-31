@@ -17,7 +17,7 @@ mol = Molecule(
 )
 
 # Fast builtin integral path
-mol.build(driver="builtin", options={"eri_representation": "factors"})
+mol.build(options={"eri_representation": "factors"})
 
 mf = mol.RHF().run()
 

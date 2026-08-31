@@ -62,18 +62,19 @@ class PeriodicTDABlockGroup:
 
 
 class PeriodicTDAOperator:
-    """Hermitian q=0 TDA-BSE operator without a global dense matrix."""
+    """Hermitian finite-momentum TDA-BSE operator without a dense matrix."""
 
     def __init__(
         self,
         space,
+        screening_space,
         q_index,
         transition_energy,
         direct_vectors,
         channels,
         block_groups,
         storage,
-        nchannels,
+        transfer_q_indices,
         direct_scale,
         exchange_scale,
         screened_exchange_scale,
@@ -83,7 +84,9 @@ class PeriodicTDAOperator:
         build_seconds,
     ):
         self.space = space
+        self.screening_space = screening_space
         self.q_index = int(q_index)
+        self.qvec = np.asarray(space.qpts[self.q_index], dtype=float)
         self.transition_energy = np.asarray(transition_energy, dtype=float)
         self.transition_weights = np.asarray(
             space.transition_weights(self.q_index),
@@ -95,6 +98,7 @@ class PeriodicTDAOperator:
         self.channels = tuple(channels)
         self.block_groups = tuple(block_groups)
         self.storage = str(storage)
+        self.transfer_q_indices = tuple(int(index) for index in transfer_q_indices)
         self.direct_scale = float(direct_scale)
         self.exchange_scale = float(exchange_scale)
         self.screened_exchange_scale = float(screened_exchange_scale)
@@ -113,8 +117,9 @@ class PeriodicTDAOperator:
             "solver": "matrix_free_tda",
             "pbc": True,
             "q_index": self.q_index,
+            "qvec": tuple(float(value) for value in self.qvec),
             "dimension": int(self.shape[0]),
-            "nchannels": int(nchannels),
+            "nchannels": int(len(self.transfer_q_indices)),
             "storage": self.storage,
             "block_groups": int(len(self.block_groups)),
             "direct_rank": int(self.direct_vectors.shape[1]),
@@ -242,9 +247,32 @@ class PeriodicTDAOperator:
         )
 
     def absorption(self, **kwargs):
+        zero_index = self.space.find_qpoint_index(np.zeros(3))
+        if self.q_index != zero_index:
+            raise ValueError("Optical absorption requires the q=0 TDA block.")
         from .optics import periodic_tda_haydock
 
         return periodic_tda_haydock(self, **kwargs)
+
+    def projected_continuum(
+        self,
+        coupling,
+        *,
+        excluded_vectors=None,
+        **kwargs,
+    ):
+        """Return a pole-subtracted matrix-free continuum backend."""
+
+        from .embedding import ProjectedTDAContinuum
+
+        if excluded_vectors is None:
+            excluded_vectors = np.zeros((self.shape[0], 0), dtype=np.complex128)
+        return ProjectedTDAContinuum(
+            self,
+            excluded_vectors,
+            coupling,
+            **kwargs,
+        )
 
     def eigensolve(
         self,
@@ -669,7 +697,7 @@ def periodic_tda_operator(
     storage="transition_blocks",
     block_dtype="complex128",
 ):
-    """Build a q=0 TDA-BSE matrix-vector operator.
+    """Build a finite-momentum TDA-BSE matrix-vector operator.
 
     ``storage="transition_blocks"`` packs the Hermitian upper triangle into
     small occupied-virtual blocks. ``storage="factorized"`` retains the
@@ -680,9 +708,6 @@ def periodic_tda_operator(
     if not isinstance(space, KPointTransitionSpace):
         space = KPointTransitionSpace(space)
     q_index = space.normalize_q_index(q_index)
-    zero_index = space.find_qpoint_index(np.zeros(3))
-    if q_index != zero_index or np.linalg.norm(space.qpts[q_index]) > 1.0e-10:
-        raise NotImplementedError("Matrix-free optical TDA currently requires q=0.")
     screening_space = _screening_space(
         space,
         screening_space=screening_space,
@@ -817,13 +842,14 @@ def periodic_tda_operator(
     )
     return PeriodicTDAOperator(
         space=space,
+        screening_space=screening_space,
         q_index=q_index,
         transition_energy=transition_energy,
         direct_vectors=direct_vectors,
         channels=channels,
         block_groups=block_groups,
         storage=storage,
-        nchannels=len(transfer_q_indices),
+        transfer_q_indices=transfer_q_indices,
         direct_scale=direct_scale,
         exchange_scale=exchange_scale,
         screened_exchange_scale=screened_exchange_scale,

@@ -588,7 +588,9 @@ def spin_boson_wilson_mpo(
     symmetric_displacement: bool = True,
     dvr_qmax: float = 8.0,
 ):
-    """Return an MPO factor list for the finite spin-boson Wilson chain."""
+    """Return the finite spin-boson Wilson-chain Hamiltonian as an MPO."""
+    from pyqed.mps.mps import MPO
+
     nboson = int(nboson)
     if nboson < 1:
         raise ValueError("nboson must be positive.")
@@ -621,18 +623,20 @@ def spin_boson_wilson_mpo(
         )
     if not chain.nmodes:
         local_terms[0] = local_terms[0] + 0.0 * identity_spin
-    return _nearest_neighbor_mpo(local_terms, bond_channels)
+    return MPO(_nearest_neighbor_mpo(local_terms, bond_channels))
 
 
 def spin_boson_sigma_z_mpo(chain: SpinBosonWilsonChain, nboson: int):
     """Return a product MPO for the impurity ``sigma_z`` operator."""
+    from pyqed.mps.mps import MPO
+
     _, _, _, z = spin_operators()
     dims = [2] + [int(nboson)] * chain.nmodes
     factors = []
     for site, dim in enumerate(dims):
         operator = z if site == 0 else np.eye(dim, dtype=complex)
         factors.append(operator.reshape(1, 1, dim, dim))
-    return factors
+    return MPO(factors)
 
 
 def spin_boson_product_mps(
@@ -691,7 +695,6 @@ def spin_boson_wilson_dmrg(
 ):
     """Run finite two-site DMRG on a spin-boson Wilson-chain MPO."""
     from pyqed.mps.dmrg import DMRG
-    from pyqed.mps.mps import expect_mps
 
     mpo = spin_boson_wilson_mpo(
         chain,
@@ -728,7 +731,7 @@ def spin_boson_wilson_dmrg(
         noise_decay=float(noise_decay),
     ).run()
     sigma_z_mpo = spin_boson_sigma_z_mpo(chain, nboson)
-    magnetization = expect_mps(solver.ground_state, sigma_z_mpo)
+    magnetization = solver.ground_state.expectation(sigma_z_mpo)
     energies = np.asarray(solver.e_tot if isinstance(solver.e_tot, list) else [solver.e_tot], dtype=float)
     return SpinBosonWilsonDMRGResult(
         energies=energies,

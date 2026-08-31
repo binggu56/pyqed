@@ -132,13 +132,12 @@ def run_casci_point(
     geometry,
     *,
     basis="sto-3g",
-    driver="gbasis",
     eri="factors",
     nstates=3,
     orbital_reference=None,
 ):
     """Run an independent RHF/CASCI(4e,4o) point calculation."""
-    mol = build_pyrazine(basis, driver, eri, coords=geometry)
+    mol = build_pyrazine(basis, eri, coords=geometry)
     mf = mol.RHF().run()
     mo_coeff = None
     if orbital_reference is not None:
@@ -158,20 +157,9 @@ def run_casci_point(
 
 
 def asymmetric_ao_overlap(left_mol, right_mol):
-    try:
-        from gbasis.integrals.overlap_asymm import (
-            overlap_integral_asymmetric,
-        )
+    from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 
-        return overlap_integral_asymmetric(left_mol._bas, right_mol._bas)
-    except (ImportError, AttributeError, TypeError):
-        from pyscf import gto
-
-        left = left_mol.topyscf()
-        right = right_mol.topyscf()
-        left.build()
-        right.build()
-        return gto.intor_cross("int1e_ovlp", left, right)
+    return _cross_ao_overlap_matrix(left_mol, right_mol)
 
 
 def match_orbitals(reference_coeff, current_coeff, cross_ao_overlap):
@@ -226,7 +214,6 @@ def track_casci_states(reference, point):
 def _initialize_casci_worker(
     geometry,
     basis,
-    driver,
     eri,
     root_window,
 ):
@@ -234,13 +221,11 @@ def _initialize_casci_worker(
     _CASCI_WORKER_REFERENCE = run_casci_point(
         geometry,
         basis=basis,
-        driver=driver,
         eri=eri,
         nstates=root_window,
     )
     _CASCI_WORKER_OPTIONS = {
         "basis": basis,
-        "driver": driver,
         "eri": eri,
         "nstates": root_window,
     }
@@ -608,7 +593,6 @@ def scan_casci_grid(
     modes,
     *,
     basis="sto-3g",
-    driver="gbasis",
     eri="factors",
     unitarize_overlaps=False,
     orbital_reference=None,
@@ -637,7 +621,6 @@ def scan_casci_grid(
             point = run_casci_point(
                 geometry,
                 basis=basis,
-                driver=driver,
                 eri=eri,
                 nstates=root_window,
                 orbital_reference=orbital_reference,
@@ -650,7 +633,7 @@ def scan_casci_grid(
         with ProcessPoolExecutor(
             max_workers=int(workers),
             initializer=_initialize_casci_worker,
-            initargs=(reference, basis, driver, eri, root_window),
+            initargs=(reference, basis, eri, root_window),
         ) as executor:
             futures = [
                 executor.submit(_run_casci_worker, task)
@@ -682,7 +665,6 @@ def scan_casci_subset(
     indices,
     *,
     basis="sto-3g",
-    driver="gbasis",
     eri="factors",
     orbital_reference=None,
     root_window=6,
@@ -711,7 +693,6 @@ def scan_casci_subset(
             point = run_casci_point(
                 geometry,
                 basis=basis,
-                driver=driver,
                 eri=eri,
                 nstates=root_window,
                 orbital_reference=orbital_reference,
@@ -725,7 +706,7 @@ def scan_casci_subset(
         with ProcessPoolExecutor(
             max_workers=int(workers),
             initializer=_initialize_casci_worker,
-            initargs=(reference, basis, driver, eri, root_window),
+            initargs=(reference, basis, eri, root_window),
         ) as executor:
             futures = [
                 executor.submit(_run_casci_worker, task)
@@ -1205,7 +1186,6 @@ def compare_dynamics(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--basis", default="sto-3g")
-    parser.add_argument("--driver", default="gbasis", choices=("gbasis", "builtin"))
     parser.add_argument(
         "--eri",
         default="factors",
@@ -1280,7 +1260,6 @@ def main():
     reference = run_casci_point(
         geometry,
         basis=args.basis,
-        driver=args.driver,
         eri=args.eri,
         nstates=args.root_window,
     )
@@ -1345,7 +1324,6 @@ def main():
                 geometry,
                 selected.displacements,
                 basis=args.basis,
-                driver=args.driver,
                 eri=args.eri,
                 unitarize_overlaps=args.unitarize_overlaps,
                 orbital_reference=reference,
@@ -1392,7 +1370,6 @@ def main():
                 selected.displacements,
                 expansion_indices,
                 basis=args.basis,
-                driver=args.driver,
                 eri=args.eri,
                 orbital_reference=reference,
                 root_window=args.root_window,

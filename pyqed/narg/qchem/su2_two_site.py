@@ -20,6 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.sparse.linalg import LinearOperator, gmres
 
 from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, spin_label
 from .su2_core import (
@@ -313,6 +314,476 @@ def truncate_to_D(
     transform = IrrepTensor(narg.site, site, OpIrrep((0, 0)), transform_blocks)
     hamiltonian = IrrepTensor(site, site, OpIrrep((0, 0)), blocks)
     return TruncatedSU2NARG(narg, kept, site, bases, transform, hamiltonian)
+
+
+def future_coupling_metric_blocks(tensors, site):
+    r"""Build scalar importance blocks from weighted future couplings.
+
+    For reduced coupling tensors :math:`O_\mu`, the metric
+
+    .. math::
+
+        G = \sum_\mu O_\mu^\dagger O_\mu
+
+    is positive and block diagonal in ``(Ne, j2)``.  It measures how strongly
+    each grown-block direction can couple to orbitals that have not yet been
+    added, without expanding magnetic components.
+    """
+    blocks = {
+        irrep: np.zeros(
+            (site.sector_dim(irrep), site.sector_dim(irrep)),
+            dtype=complex,
+        )
+        for irrep in site.irreps
+    }
+    for tensor in tensors.values():
+        for (_bra_irrep, ket_irrep), block in tensor.blocks.items():
+            if ket_irrep in blocks and block.size:
+                blocks[ket_irrep] += block.conj().T @ block
+    return {
+        irrep: 0.5 * (block + block.conj().T)
+        for irrep, block in blocks.items()
+        if np.any(np.abs(block) > 0.0)
+    }
+
+
+def dress_truncation_with_future_couplings(
+    truncated: TruncatedSU2NARG,
+    tensors,
+    *,
+    level_shift: float = 0.1,
+    response_tol: float = 1.0e-10,
+    max_responses: int | None = None,
+    strength: float = 0.1,
+):
+    r"""Rotate retained multiplets by a discarded-space future response.
+
+    The ordinary truncation diagonalizes the current grown Hamiltonian, hence
+    ``Q H_current P`` vanishes.  The nonzero source here is the scalar future
+    coupling metric ``G``.  In each SU(2) multiplicity block we solve
+
+    .. math::
+
+        Q(H_{\rm current}-E_i+\Delta)Q t_i
+        = +Q\widetilde G P c_i,
+
+    where ``G_tilde = G / sqrt(||G||_2)`` has energy units and enters as a
+    negative second-order environment self-energy.  Entire
+    multiplets are rotated together; no determinant or magnetic-component
+    projector is constructed.
+    """
+    response_tol = float(response_tol)
+    level_shift = float(level_shift)
+    strength = float(strength)
+    if response_tol < 0.0:
+        raise ValueError("response_tol must be non-negative")
+    if level_shift < 0.0:
+        raise ValueError("level_shift must be non-negative")
+    if strength < 0.0:
+        raise ValueError("strength must be non-negative")
+    if max_responses is not None and int(max_responses) < 1:
+        raise ValueError("max_responses must be positive when provided")
+
+    metrics = future_coupling_metric_blocks(tensors, truncated.source.site)
+    grouped = {}
+    for root in truncated.kept_roots:
+        grouped.setdefault(root.irrep, []).append(root)
+
+    diagnostics = {
+        "source_norm": 0.0,
+        "discarded_source_norm": 0.0,
+        "response_rank": 0,
+        "response_mixing": 0.0,
+        "maximum_response_residual": 0.0,
+        "iterative_iterations": 0,
+        "iterative_fallbacks": 0,
+        "local_energy_increase": 0.0,
+    }
+    new_roots = []
+    transform_blocks = {}
+    hamiltonian_blocks = {}
+    bases = {}
+    dims = {}
+    mixing_sum = 0.0
+    mixing_count = 0
+
+    for irrep, roots in grouped.items():
+        p = np.column_stack([root.vector for root in roots])
+        h = truncated.source.hamiltonian.block(irrep, irrep)
+        metric = metrics.get(irrep)
+        if metric is None or h.shape[0] <= p.shape[1] or strength == 0.0:
+            dressed = p
+        else:
+            metric_norm = float(np.linalg.norm(metric, ord=2))
+            diagnostics["source_norm"] = max(
+                diagnostics["source_norm"],
+                float(np.sqrt(max(metric_norm, 0.0))),
+            )
+            if metric_norm <= response_tol**2:
+                dressed = p
+            else:
+                source = metric / np.sqrt(metric_norm)
+
+                def q_project(vectors):
+                    return vectors - p @ (p.conj().T @ vectors)
+
+                h_pp = p.conj().T @ (h @ p)
+                h_pp = 0.5 * (h_pp + h_pp.conj().T)
+                energies, coefficients = np.linalg.eigh(h_pp)
+                responses = np.zeros_like(p, dtype=np.result_type(p, h, complex))
+                for state, energy in enumerate(energies):
+                    pstate = p @ coefficients[:, state]
+                    # The eliminated environment produces a negative
+                    # second-order self-energy, so the effective perturbation
+                    # is ``-G_tilde`` rather than ``+G_tilde``.
+                    residual = -q_project(source @ pstate)
+                    residual_norm = float(np.linalg.norm(residual))
+                    diagnostics["discarded_source_norm"] = float(
+                        np.hypot(diagnostics["discarded_source_norm"], residual_norm)
+                    )
+                    if residual_norm <= response_tol:
+                        continue
+
+                    shift = level_shift - float(energy)
+
+                    def action(vector):
+                        qvector = q_project(vector)
+                        return q_project(h @ qvector + shift * qvector) + p @ (
+                            p.conj().T @ vector
+                        )
+
+                    diagonal = np.real(np.diag(h)) + shift
+                    scale = max(1.0, float(np.max(np.abs(diagonal))))
+                    safe = np.where(
+                        np.abs(diagonal) > 1.0e-10 * scale,
+                        diagonal,
+                        np.where(diagonal < 0.0, -1.0, 1.0) * 1.0e-10 * scale,
+                    )
+
+                    def precondition(vector):
+                        return q_project(vector / safe) + p @ (p.conj().T @ vector)
+
+                    operator = LinearOperator(
+                        h.shape,
+                        matvec=action,
+                        dtype=np.result_type(h, p, complex),
+                    )
+                    preconditioner = LinearOperator(
+                        h.shape,
+                        matvec=precondition,
+                        dtype=operator.dtype,
+                    )
+                    iterations = [0]
+
+                    def count_iteration(_residual):
+                        iterations[0] += 1
+
+                    amplitude, info = gmres(
+                        operator,
+                        -residual,
+                        M=preconditioner,
+                        rtol=max(response_tol, 1.0e-12),
+                        atol=0.0,
+                        restart=min(80, h.shape[0]),
+                        maxiter=max(20, 4 * h.shape[0]),
+                        callback=count_iteration,
+                        callback_type="pr_norm",
+                    )
+                    amplitude = q_project(amplitude)
+                    equation_residual = q_project(action(amplitude) + residual)
+                    relative_residual = float(
+                        np.linalg.norm(equation_residual) / max(residual_norm, 1.0e-30)
+                    )
+                    diagnostics["iterative_iterations"] += iterations[0]
+                    if info != 0 or relative_residual > max(1.0e-8, 10.0 * response_tol):
+                        diagnostics["iterative_fallbacks"] += 1
+                        complete, _singular, _adjoint = np.linalg.svd(
+                            p, full_matrices=True
+                        )
+                        q = complete[:, p.shape[1] :]
+                        h_qq = q.conj().T @ (h @ q)
+                        rhs = q.conj().T @ residual
+                        amplitude = q @ np.linalg.lstsq(
+                            h_qq + shift * np.eye(q.shape[1]),
+                            -rhs,
+                            rcond=1.0e-12,
+                        )[0]
+                        equation_residual = q_project(action(amplitude) + residual)
+                        relative_residual = float(
+                            np.linalg.norm(equation_residual) / max(residual_norm, 1.0e-30)
+                        )
+                    diagnostics["maximum_response_residual"] = max(
+                        diagnostics["maximum_response_residual"], relative_residual
+                    )
+                    responses[:, state] = amplitude
+
+                singular = np.linalg.svd(responses, compute_uv=False)
+                if singular.size and singular[0] > response_tol:
+                    rank = int(np.count_nonzero(singular > response_tol * singular[0]))
+                    if max_responses is not None:
+                        rank = min(rank, int(max_responses))
+                    if rank < responses.shape[1]:
+                        left, _singular, _right = np.linalg.svd(
+                            responses, full_matrices=False
+                        )
+                        responses = left[:, :rank] @ (left[:, :rank].conj().T @ responses)
+                    diagnostics["response_rank"] += rank
+                candidate = p @ coefficients + strength * responses
+                dressed, _upper = np.linalg.qr(candidate, mode="reduced")
+                mixing_sum += float(
+                    np.linalg.norm(q_project(dressed), ord="fro") ** 2
+                )
+                mixing_count += dressed.shape[1]
+
+        h_retained = dressed.conj().T @ (h @ dressed)
+        h_retained = 0.5 * (h_retained + h_retained.conj().T)
+        values, rotation = np.linalg.eigh(h_retained)
+        transform = dressed @ rotation
+        dims[irrep] = transform.shape[1]
+        transform_blocks[(irrep, irrep)] = transform
+        hamiltonian_blocks[(irrep, irrep)] = np.diag(values)
+        source_basis = truncated.source.bases.get(irrep)
+        if source_basis is not None:
+            bases[irrep] = source_basis @ transform
+        old_energy = sum(float(root.energy) for root in roots)
+        diagnostics["local_energy_increase"] += float(np.sum(values) - old_energy)
+        for local_index, energy in enumerate(values):
+            new_roots.append(
+                SectorRoot(
+                    energy=float(np.real(energy)),
+                    irrep=irrep,
+                    local_index=local_index,
+                    vector=transform[:, local_index].copy(),
+                )
+            )
+
+    site = IrrepSite(su2_product_symmetry(), dims)
+    truncated.kept_roots = sorted(
+        new_roots,
+        key=lambda root: (root.energy, root.irrep.charge, root.local_index),
+    )
+    truncated.site = site
+    truncated.bases = bases
+    truncated.transform = IrrepTensor(
+        truncated.source.site,
+        site,
+        OpIrrep((0, 0)),
+        transform_blocks,
+    )
+    truncated.hamiltonian = IrrepTensor(
+        site,
+        site,
+        OpIrrep((0, 0)),
+        hamiltonian_blocks,
+    )
+    diagnostics["response_mixing"] = mixing_sum / max(mixing_count, 1)
+    truncated._su2_future_cc_diagnostics = diagnostics
+    return truncated
+
+
+def dress_truncation_with_cc(
+    truncated: TruncatedSU2NARG,
+    *,
+    level_shift: float = 0.0,
+    response_tol: float = 1.0e-10,
+    max_responses: int | None = None,
+):
+    r"""Dress a non-eigen SU(2) projector with discarded-multiplet responses.
+
+    In every retained ``(Ne, j2)`` sector this solves
+
+    .. math::
+
+        Q(H-E_i+\Delta)Q t_i = -QHPc_i
+
+    with projected GMRES, then Ritz-compresses ``span(P, QT)`` back to the
+    original retained multiplet count.  The solve never expands magnetic
+    components or determinant states.
+    """
+    response_tol = float(response_tol)
+    level_shift = float(level_shift)
+    if response_tol < 0.0:
+        raise ValueError("response_tol must be non-negative")
+    if level_shift < 0.0:
+        raise ValueError("level_shift must be non-negative")
+    if max_responses is not None and int(max_responses) < 1:
+        raise ValueError("max_responses must be positive when provided")
+
+    diagnostics = {
+        "discarded_residual_norm": 0.0,
+        "response_rank": 0,
+        "transition_mixing": 0.0,
+        "sector_energy_gain": 0.0,
+        "iterative_iterations": 0,
+        "iterative_fallbacks": 0,
+        "maximum_response_residual": 0.0,
+    }
+    transform_blocks = {}
+    hamiltonian_blocks = {}
+    bases = {}
+    dims = {}
+    roots = []
+    grouped = {}
+    for root in truncated.kept_roots:
+        grouped.setdefault(root.irrep, []).append(root)
+
+    for irrep, sector_roots in grouped.items():
+        p = np.column_stack([root.vector for root in sector_roots])
+        h = truncated.source.hamiltonian.block(irrep, irrep)
+        h_pp = p.conj().T @ (h @ p)
+        h_pp = 0.5 * (h_pp + h_pp.conj().T)
+        p_energy, p_coeff = np.linalg.eigh(h_pp)
+
+        def q_project(vectors):
+            return vectors - p @ (p.conj().T @ vectors)
+
+        responses = np.zeros_like(p, dtype=np.result_type(p, h, complex))
+        residual_sq = 0.0
+        if h.shape[0] > p.shape[1]:
+            for state, energy in enumerate(p_energy):
+                pstate = p @ p_coeff[:, state]
+                residual = q_project(h @ pstate)
+                residual_norm = float(np.linalg.norm(residual))
+                residual_sq += residual_norm**2
+                if residual_norm <= response_tol:
+                    continue
+                shift = level_shift - float(energy)
+
+                def action(vector):
+                    qvector = q_project(vector)
+                    return q_project(h @ qvector + shift * qvector) + p @ (
+                        p.conj().T @ vector
+                    )
+
+                diagonal = np.real(np.diag(h)) + shift
+                scale = max(1.0, float(np.max(np.abs(diagonal))))
+                safe = np.where(
+                    np.abs(diagonal) > 1.0e-10 * scale,
+                    diagonal,
+                    np.where(diagonal < 0.0, -1.0, 1.0) * 1.0e-10 * scale,
+                )
+
+                def precondition(vector):
+                    return q_project(vector / safe) + p @ (p.conj().T @ vector)
+
+                operator = LinearOperator(
+                    h.shape,
+                    matvec=action,
+                    dtype=np.result_type(h, p, complex),
+                )
+                preconditioner = LinearOperator(
+                    h.shape,
+                    matvec=precondition,
+                    dtype=operator.dtype,
+                )
+                iterations = [0]
+
+                def count_iteration(_residual):
+                    iterations[0] += 1
+
+                amplitude, info = gmres(
+                    operator,
+                    -residual,
+                    M=preconditioner,
+                    rtol=max(response_tol, 1.0e-12),
+                    atol=0.0,
+                    restart=min(80, h.shape[0]),
+                    maxiter=max(20, 4 * h.shape[0]),
+                    callback=count_iteration,
+                    callback_type="pr_norm",
+                )
+                amplitude = q_project(amplitude)
+                equation_residual = q_project(action(amplitude) + residual)
+                relative_residual = float(
+                    np.linalg.norm(equation_residual) / max(residual_norm, 1.0e-30)
+                )
+                diagnostics["iterative_iterations"] += iterations[0]
+                if info != 0 or relative_residual > max(1.0e-8, 10.0 * response_tol):
+                    diagnostics["iterative_fallbacks"] += 1
+                    complete, _singular, _adjoint = np.linalg.svd(p, full_matrices=True)
+                    q = complete[:, p.shape[1] :]
+                    h_qq = q.conj().T @ (h @ q)
+                    rhs = q.conj().T @ residual
+                    amplitude = q @ np.linalg.lstsq(
+                        h_qq + shift * np.eye(q.shape[1]),
+                        -rhs,
+                        rcond=1.0e-12,
+                    )[0]
+                    equation_residual = q_project(action(amplitude) + residual)
+                    relative_residual = float(
+                        np.linalg.norm(equation_residual) / max(residual_norm, 1.0e-30)
+                    )
+                diagnostics["maximum_response_residual"] = max(
+                    diagnostics["maximum_response_residual"], relative_residual
+                )
+                responses[:, state] = amplitude
+        diagnostics["discarded_residual_norm"] = float(
+            np.hypot(diagnostics["discarded_residual_norm"], np.sqrt(residual_sq))
+        )
+
+        left, singular, _right = np.linalg.svd(responses, full_matrices=False)
+        rank = 0
+        if singular.size and singular[0] > response_tol:
+            rank = int(np.count_nonzero(singular > response_tol * singular[0]))
+            if max_responses is not None:
+                rank = min(rank, int(max_responses))
+        diagnostics["response_rank"] += rank
+        if rank:
+            response_basis = left[:, :rank]
+            trial = np.column_stack((p, response_basis))
+            h_trial = trial.conj().T @ (h @ trial)
+            h_trial = 0.5 * (h_trial + h_trial.conj().T)
+            values, coefficients = np.linalg.eigh(h_trial)
+            selected = coefficients[:, : p.shape[1]]
+            transform = trial @ selected
+            diagnostics["sector_energy_gain"] += float(
+                np.sum(p_energy) - np.sum(values[: p.shape[1]])
+            )
+            diagnostics["transition_mixing"] += float(
+                np.sum(np.abs(selected[p.shape[1] :, :]) ** 2)
+            )
+        else:
+            values = p_energy
+            transform = p @ p_coeff
+
+        dims[irrep] = transform.shape[1]
+        transform_blocks[(irrep, irrep)] = transform
+        hamiltonian_blocks[(irrep, irrep)] = np.diag(values[: transform.shape[1]])
+        source_basis = truncated.source.bases.get(irrep)
+        if source_basis is not None:
+            bases[irrep] = source_basis @ transform
+        roots.extend(
+            SectorRoot(
+                energy=float(np.real(values[local_index])),
+                irrep=irrep,
+                local_index=local_index,
+                vector=transform[:, local_index].copy(),
+            )
+            for local_index in range(transform.shape[1])
+        )
+
+    site = IrrepSite(su2_product_symmetry(), dims)
+    truncated.kept_roots = sorted(
+        roots,
+        key=lambda root: (root.energy, root.irrep.charge, root.local_index),
+    )
+    truncated.site = site
+    truncated.bases = bases
+    truncated.transform = IrrepTensor(
+        truncated.source.site,
+        site,
+        OpIrrep((0, 0)),
+        transform_blocks,
+    )
+    truncated.hamiltonian = IrrepTensor(
+        site,
+        site,
+        OpIrrep((0, 0)),
+        hamiltonian_blocks,
+    )
+    diagnostics["transition_mixing"] /= max(len(roots), 1)
+    truncated._su2_cc_diagnostics = diagnostics
+    return truncated
 
 
 def root_branch_weights(narg: TwoSiteSU2NARG, root: SectorRoot) -> dict[str, float]:

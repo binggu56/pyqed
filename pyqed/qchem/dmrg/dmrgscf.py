@@ -1,5 +1,7 @@
 """Density-matrix-renormalization-group self-consistent field."""
 
+import copy
+
 import numpy as np
 
 from pyqed.qchem.dmrg.dmrg import QCDMRG
@@ -63,8 +65,8 @@ class _DMRGFirstOrderCASSCF(FirstOrderCASSCF):
         return mc
 
 
-class _DMRGSecondOrderCASSCF(SecondOrderCASSCF):
-    """One-keyframe augmented-Hessian CASSCF backed by reduced DMRG."""
+class _SecondOrder(SecondOrderCASSCF):
+    """Keyframe augmented-Hessian CASSCF backed by reduced DMRG."""
 
     def __init__(self, prototype, dmrg_options, **kwargs):
         super().__init__(prototype.mf, prototype.ncas, prototype.nelecas, **kwargs)
@@ -74,12 +76,16 @@ class _DMRGSecondOrderCASSCF(SecondOrderCASSCF):
         self.spin_purification = prototype.spin_purification
         self.ss = prototype.ss
         self.shift = prototype.shift
+        self.dmrg_solve_count = 0
+        self.rdm_build_count = 0
+        self.fixed_mps_trial_count = 0
 
     _copy_ci_guess = staticmethod(_DMRGFirstOrderCASSCF._copy_ci_guess)
     _objective_energy = _DMRGFirstOrderCASSCF._objective_energy
     _effective_rdms = _DMRGFirstOrderCASSCF._effective_rdms
 
     def _run_dmrg(self, mean_field, mo_coeff, nstates, ci0):
+        self.dmrg_solve_count += 1
         mc = _fresh_casci_like(self.prototype, solver_cls=QCDMRG)
         mc.mf = mean_field
         mc.mol = mean_field.mol
@@ -113,6 +119,127 @@ class _DMRGSecondOrderCASSCF(SecondOrderCASSCF):
     ):
         frozen = self._FrozenIntegralRHF(self.mf, h1_mo, eri_mo, mo_coeff)
         return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0)
+
+    @staticmethod
+    def _root_rdm_cache(mc):
+        cache = getattr(mc, "_dmrgscf_root_rdms_occ", None)
+        if cache is None:
+            cache = {}
+            mc._dmrgscf_root_rdms_occ = cache
+        return cache
+
+    def _root_rdms_occ(self, mc, state_id):
+        cache = self._root_rdm_cache(mc)
+        state_id = int(state_id)
+        if state_id not in cache:
+            self.rdm_build_count += 1
+            cache[state_id] = (
+                np.asarray(mc.make_rdm1(state_id, with_core=True)),
+                np.asarray(mc.make_rdm2(state_id, with_core=True)),
+            )
+        return cache[state_id]
+
+    def _effective_rdms_occ(self, mc, state_id):
+        """Build each DMRG 2-RDM once and reuse it through the keyframe."""
+        if self.weights is None:
+            return self._root_rdms_occ(mc, state_id)
+
+        cached = getattr(mc, "_dmrgscf_effective_rdms_occ", None)
+        if cached is not None:
+            return cached
+        dm1 = None
+        dm2 = None
+        for root, weight in enumerate(np.asarray(self.weights, dtype=float)):
+            if weight == 0.0:
+                continue
+            self.rdm_build_count += 1
+            root_dm1 = np.asarray(mc.make_rdm1(root, with_core=True))
+            root_dm2 = np.asarray(mc.make_rdm2(root, with_core=True))
+            if dm1 is None:
+                dm1 = weight * root_dm1
+                dm2 = weight * root_dm2
+            else:
+                dm1 += weight * root_dm1
+                dm2 += weight * root_dm2
+        if dm1 is None:
+            raise ValueError("State-average DMRGSCF requires a nonzero weight.")
+        mc._dmrgscf_effective_rdms_occ = (dm1, dm2)
+        return mc._dmrgscf_effective_rdms_occ
+
+    def _rdm_energy(self, h1_mo, dm1, dm2, *, eri_mo=None, pair_factors=None):
+        nocc = dm1.shape[0]
+        one_body = np.einsum(
+            "pq,qp->",
+            np.asarray(h1_mo)[:nocc, :nocc],
+            dm1,
+            optimize=True,
+        )
+        if pair_factors is None:
+            two_body = 0.5 * np.einsum(
+                "pqrs,pqrs->",
+                np.asarray(eri_mo)[:nocc, :nocc, :nocc, :nocc],
+                dm2,
+                optimize=True,
+            )
+        else:
+            pair_occ = np.asarray(pair_factors)[:, :nocc, :nocc]
+            two_body = 0.5 * np.einsum(
+                "Ppq,Prs,pqrs->",
+                pair_occ,
+                pair_occ,
+                dm2,
+                optimize=True,
+            )
+        return float(np.real(self.mf.energy_nuc() + one_body + two_body))
+
+    def _fixed_rdm_trial(self, template_mc, h1_mo, *, eri_mo=None, pair_factors=None):
+        """Evaluate a fixed MPS from its cached RDMs without determinant expansion."""
+        self.fixed_mps_trial_count = getattr(self, "fixed_mps_trial_count", 0) + 1
+        trial_mc = copy.copy(template_mc)
+        trial_mc._dmrgscf_root_rdms_occ = self._root_rdm_cache(template_mc)
+        effective_rdms = getattr(template_mc, "_dmrgscf_effective_rdms_occ", None)
+        if effective_rdms is not None:
+            trial_mc._dmrgscf_effective_rdms_occ = effective_rdms
+        energies = np.asarray(template_mc.e_tot, dtype=float).reshape(-1).copy()
+        if self.weights is None:
+            root = int(self.state_id)
+            dm1, dm2 = self._root_rdms_occ(template_mc, root)
+            energies[root] = self._rdm_energy(
+                h1_mo,
+                dm1,
+                dm2,
+                eri_mo=eri_mo,
+                pair_factors=pair_factors,
+            )
+        else:
+            dm1, dm2 = self._effective_rdms_occ(template_mc, self.state_id)
+            trial_mc._dmrgscf_effective_rdms_occ = (
+                template_mc._dmrgscf_effective_rdms_occ
+            )
+            objective = self._rdm_energy(
+                h1_mo,
+                dm1,
+                dm2,
+                eri_mo=eri_mo,
+                pair_factors=pair_factors,
+            )
+            weights = np.asarray(self.weights, dtype=float)
+            energies += objective - float(np.dot(weights, energies))
+
+        trial_mc.e_tot = energies
+        trial_mc.nstates = len(energies)
+        trial_mc.solver_backend = "fixed_dmrg_rdm_keyframe"
+        return trial_mc
+
+    def _fixed_ci_trial(self, template_mc, h1_mo, eri_mo, ci0):
+        return self._fixed_rdm_trial(template_mc, h1_mo, eri_mo=eri_mo)
+
+    def _fixed_factor_ci_trial(self, template_mc, h1_mo, pair_factors, ci0):
+        return self._fixed_rdm_trial(
+            template_mc,
+            h1_mo,
+            pair_factors=pair_factors,
+        )
 
 
 def _ao_overlap(mf):
@@ -220,7 +347,16 @@ class DMRGSCF(QCDMRG):
         self.macro_converged = False
         self.solver_converged = False
         self.macro_iterations = 0
+        self.micro_history = []
+        self.dmrg_solve_count = 0
+        self.rdm_build_count = 0
+        self.fixed_mps_trial_count = 0
+
     def run(self, nstates=1, weights=None, require_conv=True, mo_coeff=None, **kwargs):
+        self.micro_history = []
+        self.dmrg_solve_count = 0
+        self.rdm_build_count = 0
+        self.fixed_mps_trial_count = 0
         mf = self.mf
         orbital_driver = str(kwargs.pop("orbital_driver", "constrained")).lower().replace(
             "-", "_"
@@ -241,9 +377,12 @@ class DMRGSCF(QCDMRG):
             "diis_start": kwargs.pop("diis_start", 2),
             "ci_method": kwargs.pop("ci_method", "direct_ci"),
         }
-        orbital_micro_cycles = int(kwargs.pop("orbital_micro_cycles", 1))
+        # One exact DMRG keyframe followed by fixed-MPS AH steps amortizes the
+        # sweep and 2-RDM costs while retaining an exact solve each macrocycle.
+        orbital_micro_cycles = int(kwargs.pop("orbital_micro_cycles", 4))
         if orbital_micro_cycles < 1:
             raise ValueError("orbital_micro_cycles must be positive.")
+        micro_ci_mode = str(kwargs.pop("micro_ci_mode", "keyframe")).lower()
         rej = kwargs.pop("reject_macro_energy", True)
         rise = kwargs.pop("macro_energy_rise_tol", 1.0e-8)
         rmax = kwargs.pop("macro_reject_max", 8)
@@ -274,9 +413,15 @@ class DMRGSCF(QCDMRG):
         else:
             self.nstates = nstates
         if weights is not None:
-            self.weights = weights
-            if nstates != len(self.weights):
+            weights = np.asarray(weights, dtype=float)
+            if weights.ndim != 1 or nstates != len(weights):
                 raise ValueError("nstates must match the number of state-average weights.")
+            if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+                raise ValueError("State-average weights must be finite and nonnegative.")
+            total_weight = float(np.sum(weights))
+            if total_weight <= 0.0:
+                raise ValueError("State-average weights must have a positive sum.")
+            self.weights = weights / total_weight
 
         nmo = self.mf.nao
         ncas = self.ncas
@@ -308,12 +453,12 @@ class DMRGSCF(QCDMRG):
                 verbose=getattr(self, "verbose", 0),
             )
             if orbital_driver == "second_order":
-                driver = _DMRGSecondOrderCASSCF(
+                driver = _SecondOrder(
                     self,
                     kwargs,
                     max_micro_cycle=orbital_micro_cycles,
                     coupling="qn",
-                    micro_ci_mode="full",
+                    micro_ci_mode=micro_ci_mode,
                     optimizer="AH",
                     diis=False,
                     auto_active_restarts=False,
@@ -346,6 +491,12 @@ class DMRGSCF(QCDMRG):
             self.e_tot = mc.e_tot
             self.ci = mc.ci
             self.e_history = [row["energy"] for row in driver.history]
+            self.micro_history = list(getattr(driver, "micro_history", ()))
+            self.dmrg_solve_count = int(getattr(driver, "dmrg_solve_count", 0))
+            self.rdm_build_count = int(getattr(driver, "rdm_build_count", 0))
+            self.fixed_mps_trial_count = int(
+                getattr(driver, "fixed_mps_trial_count", 0)
+            )
             self.macro_diagnostics = []
             previous = None
             for row in driver.history:
@@ -491,6 +642,14 @@ class DMRGSCF(QCDMRG):
         return self
 
     def state_average(self, weights):
+        weights = np.asarray(weights, dtype=float)
+        if weights.ndim != 1 or weights.size == 0:
+            raise ValueError("weights must be a non-empty one-dimensional array.")
+        if not np.all(np.isfinite(weights)) or np.any(weights < 0.0):
+            raise ValueError("weights must be finite and nonnegative.")
+        total_weight = float(np.sum(weights))
+        if total_weight <= 0.0:
+            raise ValueError("weights must have a positive sum.")
         self.nstates = len(weights)
-        self.weights = weights
+        self.weights = weights / total_weight
         return self

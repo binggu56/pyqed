@@ -1,0 +1,117 @@
+{
+  "description": "Exact zero-amplitude flux-4 to flux-5 MPS lift followed by DMRG",
+  "source_flux_cutoff": 4,
+  "flux_cutoff": 5,
+  "bond_dim": 128,
+  "initial_energy": -16.372862510006247,
+  "final_energy": -16.401803674546017,
+  "wall_seconds": 429.348207749892,
+  "converged": false,
+  "history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energy": -16.39703192904796
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energy": -16.39981562168053
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energy": -16.40068145949853
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energy": -16.40111743807993
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energy": -16.401394804788712
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energy": -16.401572205873602
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energy": -16.401672974661928
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energy": -16.4017230454483
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energy": -16.40174870422873
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energy": -16.401764496784125
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energy": -16.40177539071956
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energy": -16.4017830217107
+    },
+    {
+      "sweep": 12,
+      "direction": "lr",
+      "energy": -16.40178829203264
+    },
+    {
+      "sweep": 13,
+      "direction": "rl",
+      "energy": -16.40179191882727
+    },
+    {
+      "sweep": 14,
+      "direction": "lr",
+      "energy": -16.401794518883058
+    },
+    {
+      "sweep": 15,
+      "direction": "rl",
+      "energy": -16.401796537578345
+    },
+    {
+      "sweep": 16,
+      "direction": "lr",
+      "energy": -16.40179827968726
+    },
+    {
+      "sweep": 17,
+      "direction": "rl",
+      "energy": -16.40179995336349
+    },
+    {
+      "sweep": 18,
+      "direction": "lr",
+      "energy": -16.401801696316312
+    },
+    {
+      "sweep": 19,
+      "direction": "rl",
+      "energy": -16.40180359586215
+    },
+    {
+      "sweep": 20,
+      "direction": "recenter-right",
+      "energy": -16.401803674546077
+    }
+  ]
+}

@@ -12,9 +12,7 @@ from pyqed.narg.qchem.orbopt import (
 
 
 def _build_cpp_integrals(molecule):
-    molecule.build(
-        driver="builtin",
-        eri="dense",
+    molecule.build(eri="dense",
         aosym="s1",
         options={"eri_backend": "cpp"},
     )
@@ -368,6 +366,39 @@ def test_nargscf_rdm_gradient_lowers_core_active_distortion():
             ncas=mc.ncas,
             nmo=mc.nmo,
         )
+    )
+
+
+def test_nargscf_uses_detached_cc_state_rdms():
+    mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
+    _build_cpp_integrals(mol)
+    mf = mol.RHF().run()
+
+    mc = NARGSCF(
+        mf,
+        ncas=4,
+        nelecas=2,
+        symmetry="abelian",
+        D=2,
+        chi=12,
+        n0=2,
+        growth_sites=1,
+        dressing="detached_cc",
+        optimizer="lbfgs",
+        max_cycle=1,
+        max_step=0.02,
+    ).run()
+
+    assert mc.history[0]["gradient_kind"] == "rdm"
+    assert mc.history[0]["accepted"] is True
+    assert mc.e_tot[0] < mc.trials[0].energy
+    assert mc.narg.tensors is not None
+    assert mc.narg.detached_history
+    assert mc.narg.dressing_history
+    np.testing.assert_allclose(
+        np.trace(mc.make_rdm1(with_core=True, with_vir=True)),
+        np.sum(mf.nelec),
+        atol=1.0e-10,
     )
 
 

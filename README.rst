@@ -76,7 +76,7 @@ This native, small-basis RHF calculation does not require PySCF:
        unit="angstrom",
        basis="sto-3g",
    )
-   mol.build(driver="builtin", eri="auto")
+   mol.build(eri="auto")
    mf = mol.RHF().run()
 
    print("converged:", mf.converged)
@@ -85,6 +85,34 @@ This native, small-basis RHF calculation does not require PySCF:
 Continue with the `quickstart
 <https://docs.pyqed.org/en/latest/quickstart.html>`_ and the `examples gallery
 <https://docs.pyqed.org/en/latest/examples.html>`_.
+
+Lattice-gauge pilot
+-------------------
+
+``pyqed.lgt`` contains a one-dimensional Schwinger-model pilot with compact
+quantum links and Wilson-line-dressed Fourier-DVR hopping.  The alternating
+matter/link MPS represents every local Gauss law as a component of one
+additive vector quantum number, so the symmetric DMRG calculation needs no
+finite penalty.  Reproduce the ED/MPS comparison and scaling figures with:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/lgt/alternating_wilson_dvr_mps.py
+
+The channel-targeted real-time calculation extracts ``M_V`` and ``M_S``
+without a multiroot state-averaged sweep:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/lgt/channel_targeted_mv_ms_mps.py
+
+The Gauss-resolved MPO is rounded sector by sector before DMRG/TDVP, avoiding
+the redundant sum-of-products bond without mixing gauge sectors.  For the
+larger ``N=7`` physical-ED flux-convergence reference, run:
+
+.. code-block:: bash
+
+   PYTHONPATH=. python examples/lgt/dynamical_schwinger_dvr.py --npts 7
 
 Development
 -----------

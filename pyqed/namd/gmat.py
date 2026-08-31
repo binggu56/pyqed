@@ -10,6 +10,7 @@ Compute the G-matrix
 
 
 from pyqed.coordinates import readxyz, eckart
+from pyqed.units import au2angstrom
 from numpy import sqrt
 from scipy.linalg import inv
 
@@ -148,13 +149,13 @@ def buildG_curvilinear(reference, geom, ndim=2, frame='eckart'):
 
 s0min,mass = readxyz('s0min.xyz',2)
 
-s0min = s0min/0.5291772083
+s0min = s0min / au2angstrom
 
 s2min = readXyz('s2min.xyz',2)
-s2min = eckart(s0min,s2min,mass[1,:])/0.5291772083
+s2min = eckart(s0min, s2min, mass[1, :]) / au2angstrom
 
 coin = readxyz('s2s1coin.xyz',2)
-coin = eckart(s0min,coin,mass[1,:])/0.5291772083;
+coin = eckart(s0min, coin, mass[1, :]) / au2angstrom
 
 v1 = coin - s0min
 v1 = v1 / sqrt( sum(sum(v1*v1)) )
@@ -172,8 +173,8 @@ gmatu = BuildGmatND(s0min,mass(1,:),coord)
 
 
 # Points necessary in each dimension
-# q1 = (-0.5:0.1:1)./0.5291772083;
-# q2 = (-0.5:0.1:0.5)./0.5291772083;
+# q1 = (-0.5:0.1:1)./au2angstrom;
+# q2 = (-0.5:0.1:0.5)./au2angstrom;
 
 # Tmax = 3.5 ;                % potential energy gained by the wp [eV] x 1.5
 # Tmax = Tmax / 27.21;        % [eV] to [au]

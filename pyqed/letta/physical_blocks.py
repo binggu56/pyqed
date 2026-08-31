@@ -28,7 +28,15 @@ except Exception:  # pragma: no cover - depends on optional build artifacts.
 
 @dataclass(frozen=True)
 class PhysicalBlockSolveDiagnostics:
-    """Convergence and sparsity information for a componentwise solve."""
+    """Convergence and sparsity information for a componentwise solve.
+
+    ``residual_norm`` is the fresh residual of the stored whitened component
+    operator used by Davidson.  Reapplying the unwhitened blocks and projecting
+    back through an ill-conditioned metric basis changes the multiplication
+    order, so that diagnostic is retained separately as
+    ``reconstructed_residual_norm``.  ``full_residual_norm`` additionally
+    includes harmless components along discarded metric-null directions.
+    """
 
     converged: bool
     message: str
@@ -50,6 +58,8 @@ class PhysicalBlockSolveDiagnostics:
     stored_elements: int
     component_dimensions: tuple[int, ...] = ()
     dense_components: tuple[bool, ...] = ()
+    reconstructed_residual_norm: float = 0.0
+    full_residual_norm: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -861,15 +871,27 @@ class PhysicalBlockGeneralizedProblem:
         h_vector = self.hamiltonian.matvec(vector)
         n_vector = self.metric.matvec(vector)
         metric_norm = float(np.real(np.vdot(vector, n_vector)))
-        residual_norm = float(np.linalg.norm(h_vector - energy * n_vector))
-        residual_scale = max(
-            float(np.linalg.norm(h_vector)),
-            abs(energy) * float(np.linalg.norm(n_vector)),
-            np.finfo(float).tiny,
+        full_residual = h_vector - energy * n_vector
+        full_residual_norm = float(np.linalg.norm(full_residual))
+        projected_h_vector = np.concatenate(
+            [
+                basis.T.conj()
+                @ h_vector[self.layout.block_indices[block]]
+                for block, _start, _stop, basis in selected_layout
+            ]
         )
-        converged = residual_norm <= (
-            absolute_tolerance + tolerance * residual_scale
+        projected_n_vector = np.concatenate(
+            [
+                basis.T.conj()
+                @ n_vector[self.layout.block_indices[block]]
+                for block, _start, _stop, basis in selected_layout
+            ]
         )
+        reconstructed_residual_norm = float(
+            np.linalg.norm(projected_h_vector - energy * projected_n_vector)
+        )
+        residual_norm = float(selected.residual_norm)
+        converged = bool(selected.converged)
         diagnostics = PhysicalBlockSolveDiagnostics(
             converged=bool(converged),
             message=(
@@ -878,8 +900,7 @@ class PhysicalBlockGeneralizedProblem:
                     f"component(s); selected component {selected_index}"
                 )
                 if converged
-                else "fresh full residual exceeds tolerance after metric-range "
-                "reconstruction"
+                else "stored whitened-component residual exceeds tolerance"
             ),
             iterations=total_iterations,
             hamiltonian_matvecs=total_hamiltonian_matvecs + 1,
@@ -899,6 +920,8 @@ class PhysicalBlockGeneralizedProblem:
             stored_elements=self.stored_elements,
             component_dimensions=tuple(component_dimensions),
             dense_components=tuple(dense_components),
+            reconstructed_residual_norm=reconstructed_residual_norm,
+            full_residual_norm=full_residual_norm,
         )
         return energy, vector, diagnostics
 

@@ -7,6 +7,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pyqed.units import au2ev
+
 pyscf = pytest.importorskip("pyscf")
 
 
@@ -130,7 +132,7 @@ def test_bse_accepts_chainable_gw_object():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     gw = GW(mf, screening="TDH", eta=1e-3).run()
@@ -164,7 +166,7 @@ def test_bse_and_tda_as_scanner_return_pes_arrays():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     gw = GW(mf, screening="TDH", eta=1e-3).run()
 
@@ -200,7 +202,7 @@ def test_scgw_imaginary_axis_prototype_h2_shapes_are_finite():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     scgw = SCGW(mf, nfreq=7, wmax=8.0).run(max_cycle=2, damping=0.5)
@@ -245,7 +247,7 @@ def test_scgw0_uses_fixed_screened_interaction():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     scgw0 = SCGW(mf, nfreq=7, wmax=8.0).scgw0(max_cycle=2, damping=0.5)
@@ -269,7 +271,7 @@ def test_gw_driver_exposes_scgw_and_scgw0():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     gw0 = GW(mf, screening="TDH", eta=1e-8).scgw0(
@@ -315,7 +317,7 @@ def test_scgw_uses_factorized_backend_when_available():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
 
     scgw = SCGW(mf, nfreq=5, wmax=6.0).scgw0(max_cycle=1, damping=0.5)
@@ -342,7 +344,7 @@ def test_scgw_gm_and_lw_energy_components_are_consistent():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     scgw = SCGW(mf, nfreq=7, wmax=8.0).scgw0(max_cycle=1, damping=0.5)
@@ -372,7 +374,7 @@ def test_scgw_frequency_convergence_scan_reports_grid_deltas():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     rows = frequency_convergence(
@@ -415,7 +417,7 @@ def test_scgw_matsubara_density_matches_static_limit():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     scgw = SCGW(mf, nfreq=7, wmax=8.0, beta=100.0, density_nfreq=1601)
@@ -521,7 +523,7 @@ def test_gw_rpa_correlation_energy_factorized_matches_dense_lih():
             basis="sto-3g",
             unit="angstrom",
         )
-        mol.build(driver="builtin", eri=eri)
+        mol.build(eri=eri)
         mf = RHF(mol).run(
             verbose=0,
             cholesky_jk=(eri == "factors"),
@@ -547,7 +549,7 @@ def test_spin_orbital_g0w0_accepts_native_rhf_h2():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
 
     egw = GW(mf, screening="TDH").run()
@@ -574,7 +576,7 @@ def test_spin_orbital_g0w0_factorized_matches_dense_lih():
             basis="sto-3g",
             unit="angstrom",
         )
-        mol.build(driver="builtin", eri=eri)
+        mol.build(eri=eri)
         mf = RHF(mol).run(
             verbose=0,
             cholesky_jk=(eri == "factors"),
@@ -596,13 +598,12 @@ def test_native_ri_g0w0_h2_matches_molgw_cartesian_ri_reference():
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
-    au2ev = 27.211386245988
     mol = Molecule(
         atom="H 0 0 0; H 0 0 0.74",
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
     mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
     gw = GW(mf, screening="TDH", eta=1e-3)
 
@@ -649,9 +650,8 @@ def test_native_ri_g0w0_larger_molecules_match_molgw_cartesian_ri_reference(
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
-    au2ev = 27.211386245988
     mol = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-    mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
     mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
     gw = GW(mf, screening="TDH", eta=1e-3)
 
@@ -733,13 +733,12 @@ def test_spin_orbital_qsgw_h2_matches_molgw_reference():
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
-    au2ev = 27.211386245988
     mol = Molecule(
         atom="H 0 0 0; H 0 0 0.74",
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     gw = GW(mf, screening="TDH", eta=1e-2)
 
@@ -762,13 +761,12 @@ def test_spin_orbital_qsgw_lih_matches_molgw_reference():
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
-    au2ev = 27.211386245988
     mol = Molecule(
         atom="Li 0 0 0; H 0 0 1.6",
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     gw = GW(mf, screening="TDH", eta=1e-2)
 
@@ -797,7 +795,7 @@ def test_spin_orbital_qsgw_factorized_matches_dense_lih():
             basis="sto-3g",
             unit="angstrom",
         )
-        mol.build(driver="builtin", eri=eri)
+        mol.build(eri=eri)
         mf = RHF(mol).run(
             verbose=0,
             cholesky_jk=(eri == "factors"),
@@ -870,7 +868,7 @@ def test_bse_accepts_native_rhf_h2():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     native_mf = RHF(mol).run(verbose=0)
     native_out = run_bse(native_mf)
 
@@ -889,7 +887,7 @@ def test_bse_tda_wavefunction_overlap_same_geometry_identity():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     tda = TDA(mf, screening="TDH", eta=1e-3).run(
         use_qp=False,
@@ -925,7 +923,7 @@ def test_bse_tda_wavefunction_overlap_nearby_geometries():
             basis="sto-3g",
             unit="angstrom",
         )
-        mol.build(driver="builtin", eri="dense")
+        mol.build(eri="dense")
         mf = RHF(mol).run(verbose=0)
         tda = TDA(mf, screening="TDH", eta=1e-3).run(
             use_qp=False,
@@ -955,7 +953,7 @@ def test_bse_full_wavefunction_overlap_uses_stored_xy():
             basis="sto-3g",
             unit="angstrom",
         )
-        mol.build(driver="builtin", eri="dense")
+        mol.build(eri="dense")
         mf = RHF(mol).run(verbose=0)
         bse = BSE(mf, screening="TDH", eta=1e-3)
         bse.e_qp = bse.e_mf.copy()
@@ -1002,7 +1000,7 @@ def test_bse_full_same_geometry_overlap_is_identity_for_degenerate_roots():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     bse = BSE(mf, screening="TDH", eta=1e-3).run(
         use_qp=False,
@@ -1024,7 +1022,6 @@ def test_dense_bse_matches_molgw_no_ri_lih_sto3g():
     _use_source_tree_pyqed()
     from pyqed.gw.bse import BSE
 
-    au2ev = 27.211386245988
     mol = gto.M(
         atom="Li 0 0 0; H 0 0 1.6",
         basis="sto-3g",
@@ -1059,13 +1056,12 @@ def test_native_ri_direct_bse_matches_molgw_lih_ccpvdz():
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
-    au2ev = 27.211386245988
     mol = Molecule(
         atom="Li 0 0 0; H 0 0 1.6",
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
     mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
     gw = BSE(mf, screening="TDH", eta=1e-3)
     assert gw.eri is None

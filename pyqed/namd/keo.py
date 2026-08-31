@@ -9,6 +9,7 @@ Kinetic Energy Operator (KEO) Calculation using Vibrojet and JAX
 from numpy import kron
 
 from pyqed.dvr.dvr_1d import SineDVR
+from pyqed.units import au2wavenumber
 
 try:
     from opt_einsum import contract
@@ -20,14 +21,12 @@ import operator
 import jax
 from jax import numpy as jnp
 
-jax.config.update("jax_enable_x64", True)
-
 EPS = jnp.array(
     [
         [[int((i - j) * (j - k) * (k - i) * 0.5) for k in range(3)] for j in range(3)]
         for i in range(3)
     ],
-    dtype=jnp.float64,
+    dtype=jnp.int8,
 )
 
 import functools
@@ -762,9 +761,6 @@ def _expm_taylor_squaring(a):
     return at
 
 
-jax.config.update("jax_enable_x64", True)
-
-
 class EckartMethod(Enum):
     exp_kappa = "exp(-kappa) method from https://doi.org/10.1063/1.4923039"
     quaternion = "quaternion algebra method from https://doi.org/10.1063/1.4870936"
@@ -1301,8 +1297,34 @@ def calculate_exact_keo(dvrs, masses, internal_to_cartesian, mode='vib', J_val=0
         G_vib = G_all[:, :n_dim, :n_dim]
         T_vib = np.zeros((n_tot, n_tot), dtype=np.complex128)
 
+        def local_operator(site, operator):
+            factors = [
+                operator if axis == site else Ids[axis]
+                for axis in range(n_dim)
+            ]
+            return reduce(np.kron, factors)
+
+        def axis_independent(field, axis):
+            reference = np.expand_dims(np.take(field, 0, axis=axis), axis)
+            return np.allclose(field, reference, rtol=1.0e-12, atol=1.0e-14)
+
         for i in range(n_dim):
             for j in range(n_dim):
+                field = G_vib[:, i, j].reshape(
+                    *(dvr.npts for dvr in dvrs)
+                )
+                if (
+                    i == j
+                    and isinstance(dvrs[i], SineDVR)
+                    and axis_independent(field, i)
+                ):
+                    unit_kinetic = np.asarray(dvrs[i].t()) * float(
+                        dvrs[i].mass
+                    )
+                    T_vib += np.diag(G_vib[:, i, i]) @ local_operator(
+                        i, unit_kinetic
+                    )
+                    continue
                 ops_i = [D1s[k] if k == i else Ids[k] for k in range(n_dim)]
                 D_i_full = reduce(np.kron, ops_i)
 
@@ -1410,7 +1432,7 @@ def calc_single_point(X_current):
 
 
 if __name__ == "__main__":
-    cm_inv = 219474.63
+    cm_inv = au2wavenumber
     MASS_O = 29156.946
     MASS_H = 1836.153
     masses = [MASS_O, MASS_H, MASS_H]

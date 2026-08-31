@@ -14,8 +14,10 @@ from scipy.optimize import linear_sum_assignment
 
 from pyqed.dvr import DVR
 
+from . import keo as keo_tools
 from . import kinetic as kinetic_tools
 from . import overlap as overlap_tools
+from .coord import Coord
 
 
 _LDR_ELECTRONIC_SCANNER = None
@@ -115,11 +117,15 @@ class LDR:
 
     The nuclear coordinates come from a product DVR. With nearest-neighbor
     links, structured axis descriptors drive the prefix-FFT backend without
-    constructing the global product-grid kinetic matrix. Local electronic
-    frames are represented by either full overlaps or links. An ab initio
-    calculation can be attached as ``LDR(mc, grid=grid, geometry=geometry,
-    states=(...))``; calling ``build()`` scans its electronic frames and retains
-    their nearest-neighbor overlaps.
+    constructing the global product-grid kinetic matrix. ``keo`` owns the
+    backend-independent nuclear kinetic specification; its default is a lazy
+    product-coordinate KEO, while curvilinear calculations can supply
+    :func:`pyqed.ldr.keo.podolsky`. Local electronic frames are represented by
+    either full overlaps or links. An ab initio calculation can be attached as
+    ``LDR(mc, grid=grid, coord=Coord(to_cartesian=geometry, bounds=...),
+    states=(...))``;
+    calling ``build()`` scans its electronic frames and retains their
+    nearest-neighbor overlaps.
     """
 
     def __init__(
@@ -128,8 +134,9 @@ class LDR:
         nstates=None,
         *,
         grid=None,
-        geometry=None,
+        coord=None,
         states=None,
+        keo=None,
         kinetic=None,
         energies=None,
         overlap=None,
@@ -142,12 +149,18 @@ class LDR:
         kinetic_backend="auto",
     ):
         if isinstance(source, DVR):
-            if grid is not None or geometry is not None or states is not None:
+            if grid is not None or coord is not None or states is not None:
                 raise ValueError(
-                    "grid, geometry, and states are only valid when the first "
+                    "grid, coord, and states are only valid when the first "
                     "argument is an electronic driver"
                 )
             dvr = source
+            coord = Coord(
+                bounds=tuple(
+                    (float(np.min(axis)), float(np.max(axis)))
+                    for axis in dvr.x
+                )
+            )
             if nstates is None:
                 raise TypeError("nstates is required with a precomputed DVR")
             state_indices = None
@@ -161,12 +174,15 @@ class LDR:
                 raise TypeError(
                     "do not pass nstates with an electronic driver; use states="
                 )
-            if not isinstance(grid, DVR):
-                raise TypeError("grid must be a pyqed.dvr.DVR product grid")
-            if not callable(geometry):
-                raise TypeError("geometry must map grid coordinates to a geometry")
+            if not isinstance(coord, Coord):
+                raise TypeError("coord must be a pyqed.ldr.Coord")
+            if coord.to_cartesian is None:
+                raise ValueError("electronic LDR coordinates need to_cartesian")
             electronic = source
+            if grid is None:
+                raise ValueError("an electronic LDR calculation requires grid")
             dvr = grid
+            coord.validate_grid(dvr)
             if states is None:
                 electronic_nstates = getattr(electronic, "nstates", None)
                 if electronic_nstates is None:
@@ -180,8 +196,7 @@ class LDR:
                 raise ValueError("states must not contain duplicates")
             nstates = len(state_indices)
 
-        if not isinstance(dvr, DVR):
-            raise TypeError("dvr must be a pyqed.dvr.DVR product grid")
+        self.coord = coord
         self.dvr = dvr
         self.nstates = int(nstates)
         if self.nstates <= 0:
@@ -206,8 +221,11 @@ class LDR:
         self.points = dvr.points
         self.ngrid = dvr.size
         self.size = self.ngrid * self.nstates
+        if keo is not None and kinetic is not None:
+            raise ValueError("provide keo or kinetic, not both")
         self.axis_kinetics = None
-        if kinetic is None:
+        self._keo_spec = None
+        if keo is None and kinetic is None:
             axis_kinetics = []
             for dvr_axis in dvr.axes:
                 axis_descriptor = getattr(dvr_axis, "kinetic_descriptor", None)
@@ -221,14 +239,33 @@ class LDR:
             self.axis_kinetics = tuple(axis_kinetics)
             if dvr.ndim == 1:
                 kinetic = self.axis_kinetics[0]
+            self.keo = keo_tools.product(dvr.axes)
+        elif keo is None:
+            self.keo = keo_tools.matrix(kinetic)
+        else:
+            bind = getattr(keo, "bind", None)
+            if callable(bind) and getattr(keo, "shape", None) is None:
+                self._keo_spec = keo
+                self.keo = None
+            elif callable(bind):
+                keo = bind(
+                    coord,
+                    grid=dvr,
+                    molecule=getattr(electronic, "mol", None),
+                )
+            if self._keo_spec is None:
+                self.keo = keo
+                self._validate_keo_shape(keo)
+                if isinstance(keo, keo_tools.Matrix):
+                    kinetic = keo.matrix
         self.kinetic = kinetic
-        if self.kinetic is None:
+        if self.kinetic is None and self.axis_kinetics is not None:
             axis_sizes = tuple(map(_kinetic_size, self.axis_kinetics))
             if axis_sizes != self.shape:
                 raise ValueError(
                     f"axis kinetic sizes {axis_sizes} != grid shape {self.shape}"
                 )
-        else:
+        elif self.kinetic is not None:
             kinetic_size = _kinetic_size(self.kinetic)
             kinetic_shape = (
                 (kinetic_size, kinetic_size)
@@ -249,7 +286,6 @@ class LDR:
             )
         self.electronic = electronic
         self.scan_provider = scan_provider
-        self.geometry = geometry
         self.state_indices = state_indices
         self.overlap_mode = overlap_mode
         self.kinetic_backend = kinetic_backend
@@ -277,6 +313,27 @@ class LDR:
         self.success = None
         self.message = None
 
+    def _validate_keo_shape(self, keo):
+        keo_shape = getattr(keo, "shape", None)
+        if keo_shape is None:
+            raise TypeError("keo must expose its global nuclear shape")
+        if tuple(keo_shape) != (self.ngrid, self.ngrid):
+            raise ValueError(
+                f"keo shape {tuple(keo_shape)} != {(self.ngrid, self.ngrid)}"
+            )
+
+    def _bind_keo(self):
+        if self._keo_spec is None:
+            return self.keo
+        self.keo = self._keo_spec.bind(
+            self.coord,
+            grid=self.dvr,
+            molecule=getattr(self.electronic, "mol", None),
+        )
+        self._validate_keo_shape(self.keo)
+        self._keo_spec = None
+        return self.keo
+
     @staticmethod
     def _electronic_frame(result):
         frame = getattr(result, "frame", None)
@@ -296,7 +353,7 @@ class LDR:
             [self.x[axis][index[axis]] for axis in range(self.ndim)],
             dtype=float,
         )
-        value = self.geometry(coordinates)
+        value = self.coord.cartesian(coordinates)
         if template_mol is None or not isinstance(value, (list, tuple, np.ndarray)):
             return value
         cartesian = np.asarray(value, dtype=float)
@@ -397,7 +454,7 @@ class LDR:
                     [self.x[axis][index[axis]] for axis in range(self.ndim)],
                     dtype=float,
                 )
-                tasks.append((index, self.geometry(coordinates)))
+                tasks.append((index, self.coord.cartesian(coordinates)))
             worker_count = min(n_workers, self.ngrid)
             base, extra = divmod(len(tasks), worker_count)
             chunks = []
@@ -447,7 +504,7 @@ class LDR:
 
         if self.electronic is None:
             raise RuntimeError("No electronic driver is attached.")
-        if self.geometry is not None:
+        if self.coord.to_cartesian is not None:
             return self._scan_electronic(
                 nroots=nroots,
                 n_workers=n_workers,
@@ -518,13 +575,14 @@ class LDR:
     ):
         """Scan an electronic driver and build its nearest-neighbor LDR links."""
 
+        self._bind_keo()
         self.scan(
             nroots=nroots,
             n_workers=n_workers,
             worker_threads=worker_threads,
             progress=progress,
         )
-        if self.geometry is not None:
+        if self.coord.to_cartesian is not None:
             self.build_links()
         return self
 
@@ -609,7 +667,17 @@ class LDR:
 
     def _kinetic_matrix_data(self):
         if self.kinetic is None:
-            return self.dvr.kinetic()
+            if self.axis_kinetics is not None:
+                return self.dvr.kinetic()
+            if self.keo is None and self._keo_spec is not None:
+                raise RuntimeError("call LDR.build() to construct the configured KEO")
+            to_sparse = getattr(self.keo, "to_sparse", None)
+            if callable(to_sparse):
+                return to_sparse()
+            to_dense = getattr(self.keo, "to_dense", None)
+            if callable(to_dense):
+                return to_dense()
+            raise TypeError("this structured KEO has no direct LDR representation")
         descriptor = _toeplitz_descriptor(self.kinetic)
         if descriptor is not None:
             return scipy.linalg.toeplitz(*descriptor)
@@ -674,13 +742,22 @@ class LDR:
         if backend in self._kinetic_operators:
             self.kinetic_info = dict(self._kinetic_operator_info[backend])
             return self._kinetic_operators[backend]
+        if isinstance(self.keo, keo_tools.MPOComponents) and backend == "auto":
+            raise NotImplementedError(
+                "matrix-free curvilinear KEO propagation uses TNLDR.from_ldr(); "
+                "request kinetic_backend='generic' to materialize it explicitly"
+            )
 
         linked = (
             self.links is not None
             and self.overlaps is None
             and not self.average_paths
         )
-        eligible_1d = linked and self.ndim == 1
+        eligible_1d = (
+            linked
+            and self.ndim == 1
+            and (self.axis_kinetics is not None or self.kinetic is not None)
+        )
         eligible_nd = linked and self.ndim > 1 and self.axis_kinetics is not None
         if backend == "prefix-fft" and not (eligible_1d or eligible_nd):
             raise ValueError(
@@ -752,7 +829,7 @@ class LDR:
         return self.kinetic_matrix() + np.diag(diagonal)
 
     def _trace(self, time=0.0):
-        if self.kinetic is None:
+        if self.kinetic is None and self.axis_kinetics is not None:
             kinetic_trace = sum(
                 _kinetic_trace(axis_kinetic) * (self.ngrid // axis_size)
                 for axis_kinetic, axis_size in zip(
@@ -760,8 +837,10 @@ class LDR:
                     self.shape,
                 )
             )
-        else:
+        elif self.kinetic is not None:
             kinetic_trace = _kinetic_trace(self.kinetic)
+        else:
+            kinetic_trace = _kinetic_trace(self._kinetic_matrix_data())
         return self.nstates * kinetic_trace + np.sum(self._energies(time))
 
     @staticmethod
@@ -782,8 +861,17 @@ class LDR:
             return state.copy()
         raise ValueError(f"state shape {state.shape} != {expected} or {(self.size,)}")
 
-    def wavepacket(self, envelope, state=0, *, anchor=None, normalize=True):
-        """Build a gauge-consistent packet in one local adiabatic state."""
+    def wavepacket(
+        self,
+        envelope,
+        state=0,
+        *,
+        anchor=None,
+        normalize=True,
+        support_threshold=None,
+        energy_order=True,
+    ):
+        """Build a gauge-consistent packet in one energy-ordered adiabatic state."""
 
         envelope = np.asarray(envelope, dtype=complex)
         if envelope.shape != self.shape:
@@ -796,33 +884,65 @@ class LDR:
         else:
             anchor = tuple(int(index) for index in anchor)
 
+        if energy_order and self.energies is not None:
+            labels = np.argsort(self._energies(), axis=-1)[..., state]
+        else:
+            labels = np.full(self.shape, state, dtype=int)
+
+        support = None
+        if support_threshold is not None:
+            support_threshold = float(support_threshold)
+            if support_threshold < 0.0:
+                raise ValueError("support_threshold must be nonnegative")
+            scale = float(np.max(np.abs(envelope)))
+            if scale == 0.0:
+                raise ValueError("wavepacket envelope has zero norm")
+            support = np.abs(envelope) > support_threshold * scale
+            envelope = np.where(support, envelope, 0.0)
+
         if self.links is not None:
             gauge = overlap_tools.phase_gauge(
                 self.shape,
                 self.links,
-                state=state,
+                state=labels,
                 anchor=anchor,
+                support=support,
             )
         elif self.overlaps is not None:
-            anchor_flat = np.ravel_multi_index(anchor, self.shape)
             blocks = self.overlaps.reshape(
                 self.ngrid,
                 self.nstates,
                 self.ngrid,
                 self.nstates,
             )
-            values = blocks[anchor_flat, state, :, state]
-            magnitudes = np.abs(values)
-            if np.any(magnitudes < 1.0e-10):
-                raise ValueError(
-                    "direct anchor overlaps are too small for phase transport"
-                )
-            gauge = (values.conj() / magnitudes).reshape(self.shape)
+            links = {}
+            for left in np.ndindex(self.shape):
+                left_flat = np.ravel_multi_index(left, self.shape)
+                for axis, size in enumerate(self.shape):
+                    if left[axis] + 1 >= size:
+                        continue
+                    right = list(left)
+                    right[axis] += 1
+                    right = tuple(right)
+                    right_flat = np.ravel_multi_index(right, self.shape)
+                    links[(axis, left)] = blocks[
+                        left_flat, :, right_flat, :
+                    ]
+            gauge = overlap_tools.phase_gauge(
+                self.shape,
+                links,
+                state=labels,
+                anchor=anchor,
+                support=support,
+            )
         else:
             gauge = np.ones(self.shape, dtype=complex)
 
         packet = np.zeros((*self.shape, self.nstates), dtype=complex)
-        packet[..., state] = envelope * gauge
+        flat_packet = packet.reshape(self.ngrid, self.nstates)
+        flat_packet[np.arange(self.ngrid), labels.reshape(-1)] = (
+            envelope * gauge
+        ).reshape(-1)
         if normalize:
             norm = np.linalg.norm(packet)
             if norm == 0.0:
@@ -840,11 +960,66 @@ class LDR:
         t0=0.0,
         matrix_free=True,
         method="expm_multiply",
+        absorber=None,
     ):
-        """Propagate a wavepacket in real time and return this solver."""
+        r"""Propagate a wavepacket, optionally with $H\to H-iW$."""
 
         dt, nsteps, nout = self._validate_steps(dt, nsteps, nout)
         vector = self._state_vector(state)
+        initial_norm = float(np.vdot(vector, vector).real)
+        absorber_diagonal = None
+        if absorber is not None:
+            absorber = np.asarray(absorber, dtype=float)
+            if absorber.shape == self.shape:
+                absorber = np.repeat(absorber.reshape(-1), self.nstates)
+            elif absorber.shape == (*self.shape, self.nstates):
+                absorber = absorber.reshape(-1)
+            elif absorber.shape != (self.size,):
+                raise ValueError(
+                    "absorber must match the nuclear grid or vibronic state"
+                )
+            if not np.all(np.isfinite(absorber)):
+                raise ValueError("absorber values must be finite")
+            if np.any(absorber < 0.0):
+                raise ValueError("absorber values must be nonnegative")
+            absorber_diagonal = absorber
+
+        def effective_hamiltonian(time):
+            operator = self.hamiltonian(
+                time, matrix_free=matrix_free, sparse=not matrix_free
+            )
+            if absorber_diagonal is None:
+                return operator
+            if matrix_free:
+                def matvec(value):
+                    shape = np.asarray(value).shape
+                    value = np.asarray(value).reshape(-1)
+                    result = operator @ value - 1j * absorber_diagonal * value
+                    return np.asarray(result).reshape(shape)
+
+                def rmatvec(value):
+                    shape = np.asarray(value).shape
+                    value = np.asarray(value).reshape(-1)
+                    result = (
+                        operator.rmatvec(value)
+                        + 1j * absorber_diagonal * value
+                    )
+                    return np.asarray(result).reshape(shape)
+
+                return sla.LinearOperator(
+                    operator.shape,
+                    matvec=matvec,
+                    rmatvec=rmatvec,
+                    dtype=np.result_type(operator.dtype, complex),
+                )
+            return operator - 1j * sp.diags(absorber_diagonal, format="csr")
+
+        def effective_trace(time=0.0):
+            trace = self._trace(time)
+            if absorber_diagonal is not None:
+                trace -= 1j * np.sum(absorber_diagonal)
+            return trace
+
         states = [vector.reshape(*self.shape, self.nstates).copy()]
         times = [float(t0)]
 
@@ -855,7 +1030,7 @@ class LDR:
             and nsteps % nout == 0
         )
         if static_interval:
-            hamiltonian = self.hamiltonian(matrix_free=matrix_free, sparse=not matrix_free)
+            hamiltonian = effective_hamiltonian(float(t0))
             flat_states = sla.expm_multiply(
                 -1j * hamiltonian,
                 vector,
@@ -863,7 +1038,7 @@ class LDR:
                 stop=nsteps * dt,
                 num=nsteps // nout + 1,
                 endpoint=True,
-                traceA=-1j * self._trace(),
+                traceA=-1j * effective_trace(float(t0)),
             )
             states = [
                 value.reshape(*self.shape, self.nstates).copy()
@@ -875,18 +1050,16 @@ class LDR:
             for step in range(1, nsteps + 1):
                 midpoint = float(t0) + (step - 0.5) * dt
                 if method == "expm_multiply":
-                    hamiltonian = self.hamiltonian(
-                        midpoint,
-                        sparse=not matrix_free,
-                        matrix_free=matrix_free,
-                    )
+                    hamiltonian = effective_hamiltonian(midpoint)
                     vector = sla.expm_multiply(
                         -1j * dt * hamiltonian,
                         vector,
-                        traceA=-1j * dt * self._trace(midpoint),
+                        traceA=-1j * dt * effective_trace(midpoint),
                     )
                 elif method == "expm":
                     hamiltonian = self.hamiltonian(midpoint)
+                    if absorber_diagonal is not None:
+                        hamiltonian -= 1j * np.diag(absorber_diagonal)
                     vector = scipy.linalg.expm(-1j * dt * hamiltonian) @ vector
                 else:
                     raise ValueError("method must be 'expm_multiply' or 'expm'")
@@ -901,6 +1074,7 @@ class LDR:
         self.norm = np.asarray(
             [np.vdot(value, value).real for value in self.states.reshape(len(states), -1)]
         )
+        self.absorbed_probability = initial_norm - self.norm
         self.energy = self.expectation(self.state, time=self.times[-1]).real
         self.success = True
         self.message = "real-time propagation completed"

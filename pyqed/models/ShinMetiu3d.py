@@ -21,7 +21,7 @@ from pyqed import discretize, sort, dagger
 
 from pyqed.davidson import davidson_solver
 
-from pyqed.ldr.ldr import kinetic
+from pyqed.dvr import kinetic
 
 
 # def kinetic_energy(L, npts, mass=1):
@@ -335,7 +335,6 @@ if __name__=='__main__':
     # from matplotlib.ticker import MaxNLocator, NullLocator
     # from mpl_toolkits.mplot3d import Axes3D
     # import time
-    # from pyqed.ldr.ldr import LDRN, LDR2
     # from pyqed.phys import gwp
     # from pyqed.units import au2fs
     
@@ -610,7 +609,6 @@ if __name__=='__main__':
     # ax.zaxis.set_rotate_label(False)
      
     # pplt.show()
-
 
 
 

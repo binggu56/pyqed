@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pyqed.units import au2ev
 from pyqed import au2angstrom
 from pyqed.namd.triatomic import Triatom
 from pyqed.qchem.fourier import AOPairFTPlan, has_compiled_ao_ft
@@ -36,7 +37,7 @@ def build_h2o(coords: np.ndarray, basis: str) -> Molecule:
         for sym, xyz in zip(SYMBOLS, coords)
     )
     mol = Molecule(atom=atom, unit="bohr", basis=basis, spin=0)
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     return mol
 
 
@@ -156,7 +157,7 @@ def plot_results(path, triatom, sx, sy, pes, chi, intensity):
 
     fig, axes = plt.subplots(1, 3, figsize=(13.2, 3.9), dpi=200)
 
-    pes_slice = (pes[:, :, theta_mid] - pes.min()) * 27.211386245988
+    pes_slice = (pes[:, :, theta_mid] - pes.min()) * au2ev
     im0 = axes[0].imshow(
         pes_slice.T,
         origin="lower",

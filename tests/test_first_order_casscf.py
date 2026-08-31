@@ -11,6 +11,7 @@ from pyqed.qchem import (
     SecondOrderCASSCF,
 )
 from pyqed.qchem.mcscf.direct_ci import CASCI
+from pyqed.qchem.ci.fci import FCIStringBasis
 from pyqed.qchem.mcscf.casci import (
     _get_mf_cholesky_factors,
     transform_eri_factors_to_mo_pair,
@@ -26,7 +27,7 @@ from pyqed.qchem.mcscf.orbopt import (
 
 def _distorted_lih_reference(angle=0.12):
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -45,7 +46,7 @@ def _distorted_ethylene44_reference(angle=0.08):
         ["H", 0.54030916, -0.92288300, -0.86462045],
     ]
     mol = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -85,7 +86,7 @@ def test_casscf_overlap_delegates_to_final_casci_overlap():
     drivers = []
     for bond in (1.35, 1.45):
         mol = Molecule(atom=f"H 0 0 0; H 0 0 {bond}", unit="bohr", basis="sto-3g")
-        mol.build(driver="gbasis")
+        mol.build()
         mf = mol.RHF().run()
         drivers.append(
             SecondOrderCASSCF(
@@ -104,9 +105,47 @@ def test_casscf_overlap_delegates_to_final_casci_overlap():
     assert np.asarray(got).shape == (1, 1)
 
 
+@pytest.mark.parametrize("driver_cls", [FirstOrderCASSCF, SecondOrderCASSCF])
+def test_casscf_run_accepts_ci_restart(driver_cls):
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    mol.build()
+    mf = mol.RHF().run()
+
+    first = driver_cls(mf, ncas=2, nelecas=2, max_cycle=2, verbose=0).run(
+        nstates=2
+    )
+    restarted = driver_cls(mf, ncas=2, nelecas=2, max_cycle=2, verbose=0).run(
+        nstates=2,
+        mo_coeff=first.mo_coeff,
+        ci0=first.ci,
+    )
+
+    assert len(restarted.ci) == 2
+    np.testing.assert_allclose(restarted.e_tot, first.e_tot, atol=1.0e-9)
+
+
+@pytest.mark.parametrize("driver_cls", [FirstOrderCASSCF, SecondOrderCASSCF])
+def test_casscf_propagates_target_multiplicity_to_casci(driver_cls):
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    mol.build()
+    mf = mol.RHF().run()
+
+    result = driver_cls(
+        mf,
+        ncas=2,
+        nelecas=2,
+        multiplicity=1,
+        max_cycle=2,
+        verbose=0,
+    ).run(nstates=2)
+
+    assert result.casci.multiplicity == 1
+    assert result.casci.solver_backend.startswith("direct_spin0_symm")
+
+
 def test_casscf_verbose_one_suppresses_internal_casci_root_spam(capsys):
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     SecondOrderCASSCF(
@@ -178,6 +217,7 @@ def test_davidson_augmented_hessian_can_return_diagnostics():
     assert info["subspace_dim"] >= 1
     assert np.isfinite(info["residual_norm"])
     assert info["used_fallback"] is False
+    np.testing.assert_allclose(info["hessian_step"], hdiag * step, atol=1.0e-12)
 
 
 def test_shifted_hessian_trust_step_respects_norm_radius():
@@ -206,7 +246,7 @@ def test_shifted_hessian_trust_step_respects_norm_radius():
 
 def test_second_order_internal_preopt_lowers_core_active_distortion():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -247,7 +287,7 @@ def test_second_order_internal_preopt_lowers_core_active_distortion():
 
 def test_second_order_internal_preopt_can_use_all_nonredundant_rotations():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mc = SecondOrderCASSCF(
@@ -278,7 +318,7 @@ def test_second_order_internal_preopt_can_use_all_nonredundant_rotations():
 
 def test_second_order_full_internal_optimization_converges_internal_loop():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -322,7 +362,7 @@ def test_second_order_full_internal_optimization_converges_internal_loop():
 
 def test_second_order_internal_optimization_can_use_davidson_solver():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -379,7 +419,7 @@ def test_second_order_internal_preopt_can_use_coupled_ci_response(
     orbital_hessian,
 ):
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -446,7 +486,7 @@ def test_second_order_internal_preopt_guard_rejects_worse_preview():
     assert record["guard_accepted"] is False
 
 
-def test_second_order_pspace_reaches_lower_ethylene44_stationary_point():
+def test_second_order_pspace_converges_ethylene44_after_rejected_step_rollback():
     mf, mo_guess = _distorted_ethylene44_reference(angle=0.08)
 
     mc = SecondOrderCASSCF(
@@ -463,13 +503,14 @@ def test_second_order_pspace_reaches_lower_ethylene44_stationary_point():
         auto_active_restarts=False,
     ).run(mo_coeff=mo_guess)
 
-    assert mc.e_tot[0] < -76.97215
+    assert mc.e_tot[0] < -76.9716
+    assert mc.history[-1]["gradient_norm"] < 1.0e-5
     assert mc.history[-1]["gradient_norm"] < 1.0e-5
 
 
 def test_first_order_casscf_lih_lowers_initial_casci_energy():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -499,7 +540,7 @@ def test_first_order_casscf_lih_lowers_initial_casci_energy():
 
 def test_first_order_casscf_diis_path_runs_on_lih():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mc0 = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -523,7 +564,7 @@ def test_first_order_casscf_diis_path_runs_on_lih():
 
 def test_first_order_casscf_lbfgs_path_runs_on_lih():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mc0 = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -547,7 +588,7 @@ def test_first_order_casscf_lbfgs_path_runs_on_lih():
 
 def test_first_order_casscf_ah_path_runs_on_lih():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mc0 = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -572,7 +613,7 @@ def test_first_order_casscf_ah_path_runs_on_lih():
 
 def test_second_order_casscf_path_runs_on_lih():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -676,7 +717,7 @@ def test_casscf_can_reorder_explicit_active_orbitals():
 
 def test_second_order_casscf_accepts_uncoupled_path():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mc = SecondOrderCASSCF(
@@ -693,7 +734,7 @@ def test_second_order_casscf_accepts_uncoupled_path():
 
 def test_second_order_casscf_relaxed_fd_path_runs_on_lih():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -729,7 +770,7 @@ def test_second_order_casscf_relaxed_fd_path_runs_on_lih():
 
 def test_second_order_casscf_partial_coupled_path_runs_on_lih():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     kappa = np.zeros((mf.mo_coeff.shape[1], mf.mo_coeff.shape[1]))
@@ -816,7 +857,7 @@ def test_second_order_full_coupled_path_runs_on_lih():
 
 def test_second_order_casscf_no_core_full_active_space_runs_on_h2():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
 
     mf = mol.RHF().run()
     mc0 = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -839,9 +880,9 @@ def test_second_order_casscf_no_core_full_active_space_runs_on_h2():
 def test_second_order_casscf_factorized_qn_matches_dense_on_lih():
     atom = "Li 0 0 0; H 0 0 1.6"
     mol_dense = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol_dense.build(driver="gbasis-pyscf")
+    mol_dense.build()
     mol_factor = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol_factor.build(driver="gbasis-pyscf")
+    mol_factor.build()
 
     mf_dense = mol_dense.RHF().run()
     mf_factor = mol_factor.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
@@ -863,13 +904,14 @@ def test_second_order_casscf_factorized_qn_matches_dense_on_lih():
     assert not dense.use_cholesky_integrals
     assert factor.use_cholesky_integrals
     assert factor.casci.use_cholesky_integrals
-    assert str(factor.casci.solver_backend).startswith("direct_ci_factor_conn")
+    assert factor.casci.solver_backend in {"ci_dense_fallback", "direct_ci_spin_string"}
+    assert factor.casci.direct_connectivity is None
     np.testing.assert_allclose(factor.e_tot[0], dense.e_tot[0], atol=1.0e-6)
 
 
 def test_second_order_casscf_factorized_qn_avoids_dense_mo_eri(monkeypatch):
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis-pyscf")
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
@@ -900,9 +942,9 @@ def test_second_order_casscf_factorized_qn_avoids_dense_mo_eri(monkeypatch):
 def test_second_order_casscf_factorized_full_matches_dense_on_lih():
     atom = "Li 0 0 0; H 0 0 1.6"
     mol_dense = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol_dense.build(driver="gbasis-pyscf")
+    mol_dense.build()
     mol_factor = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol_factor.build(driver="gbasis-pyscf")
+    mol_factor.build()
 
     mf_dense = mol_dense.RHF().run()
     mf_factor = mol_factor.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
@@ -923,13 +965,14 @@ def test_second_order_casscf_factorized_full_matches_dense_on_lih():
 
     assert factor.use_cholesky_integrals
     assert factor.coupling == "full"
-    assert str(factor.casci.solver_backend).startswith("direct_ci_factor_conn")
+    assert factor.casci.solver_backend in {"ci_dense_fallback", "direct_ci_spin_string"}
+    assert factor.casci.direct_connectivity is None
     np.testing.assert_allclose(factor.e_tot[0], dense.e_tot[0], atol=1.0e-8)
 
 
 def test_second_order_casscf_factorized_default_avoids_dense_mo_eri(monkeypatch):
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis-pyscf")
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
@@ -959,9 +1002,9 @@ def test_second_order_casscf_factorized_default_avoids_dense_mo_eri(monkeypatch)
 def test_second_order_casscf_factorized_state_average_matches_dense_on_h4():
     atom = "H 0 0 0; H 0 0 0.9; H 0 0 1.8; H 0 0 2.7"
     mol_dense = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol_dense.build(driver="gbasis-pyscf")
+    mol_dense.build()
     mol_factor = Molecule(atom=atom, unit="angstrom", basis="sto-3g")
-    mol_factor.build(driver="gbasis-pyscf")
+    mol_factor.build()
 
     mf_dense = mol_dense.RHF().run()
     mf_factor = mol_factor.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
@@ -989,7 +1032,8 @@ def test_second_order_casscf_factorized_state_average_matches_dense_on_h4():
 
     assert factor.use_cholesky_integrals
     assert factor.coupling == "qn"
-    assert str(factor.casci.solver_backend).startswith("direct_ci_factor_conn")
+    assert factor.casci.solver_backend in {"ci_dense_fallback", "direct_ci_spin_string"}
+    assert factor.casci.direct_connectivity is None
     np.testing.assert_allclose(factor.e_tot, dense.e_tot, atol=1.0e-8)
 
 
@@ -1241,7 +1285,7 @@ def test_second_order_exact_orbital_gradient_matches_energy_finite_difference():
 
 def test_second_order_factorized_fock_gradient_matches_exact_gradient():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
     driver = SecondOrderCASSCF(mf, ncas=2, nelecas=2, coupling="qn")
     driver.nstates = 1
@@ -1277,3 +1321,212 @@ def test_second_order_factorized_fock_gradient_matches_exact_gradient():
     )
 
     np.testing.assert_allclose(fock_grad, exact_grad, atol=1.0e-10)
+
+
+def test_second_order_factorized_state_average_gradient_matches_finite_difference():
+    mf, mo_guess = _distorted_lih_reference(angle=0.08)
+    driver = SecondOrderCASSCF(
+        mf,
+        ncas=4,
+        nelecas=4,
+        multiplicity=1,
+        coupling="qn",
+    )
+    driver.state_average([0.5, 0.5])
+    driver.nstates = 2
+    driver.state_id = 0
+    driver.use_cholesky_integrals = True
+    driver.mo_coeff_ref = mo_guess
+
+    h1_mo = mf.get_hcore_mo(mo_guess)
+    pair_factors = transform_eri_factors_to_mo_pair(
+        _get_mf_cholesky_factors(mf),
+        mo_guess,
+    )
+    casci = driver._make_factor_integral_casci(
+        h1_mo,
+        pair_factors,
+        mo_guess,
+        2,
+    )
+    dm1, dm2 = driver._effective_rdms_occ(casci, 0)
+    nocc_like = casci.ncore + casci.ncas
+    fock = generalized_fock_from_factors(
+        h1_mo,
+        pair_factors[:, :, :nocc_like],
+        dm1,
+        dm2,
+    )
+    grad_vec = pack_nonredundant(
+        orbital_gradient(fock),
+        casci.ncore,
+        casci.ncas,
+        mf.nmo,
+    )
+    direction = np.linspace(0.2, 1.0, grad_vec.size)
+    direction /= np.linalg.norm(direction)
+    kappa = driver._unpack_orbitals(
+        direction,
+        casci.ncore,
+        casci.ncas,
+        mf.nmo,
+    )
+    eps = 1.0e-5
+    energies = []
+    for sign in (1.0, -1.0):
+        unitary = driver._orbital_unitary(sign * eps * kappa)
+        h1_trial, pair_trial = driver._transform_frozen_factor_integrals(
+            h1_mo,
+            pair_factors,
+            unitary,
+        )
+        trial = driver._make_factor_integral_casci(
+            h1_trial,
+            pair_trial,
+            mo_guess,
+            2,
+            ci0=casci.ci,
+        )
+        energies.append(driver._objective_energy(trial, 0))
+    finite_difference = (energies[0] - energies[1]) / (2.0 * eps)
+
+    np.testing.assert_allclose(
+        np.dot(grad_vec, direction),
+        finite_difference,
+        atol=2.0e-7,
+        rtol=2.0e-6,
+    )
+
+
+def test_second_order_active_projector_overlap_detects_external_leakage():
+    mf, mo_guess = _distorted_lih_reference(angle=0.0)
+    driver = SecondOrderCASSCF(
+        mf,
+        ncas=2,
+        nelecas=2,
+        active_overlap_floor=0.9,
+    )
+    driver.active_reference_mo = np.array(mo_guess, copy=True)
+    ncore = 1
+    kappa = np.zeros((mf.nmo, mf.nmo))
+    kappa[ncore + 1, ncore + 2] = 0.5
+    kappa[ncore + 2, ncore + 1] = -0.5
+    trial_mo = mo_guess @ expm(kappa)
+
+    accepted, singular = driver._active_overlap_ok(trial_mo, ncore, driver.ncas)
+
+    assert not accepted
+    np.testing.assert_allclose(np.min(singular), np.cos(0.5), atol=1.0e-12)
+
+
+def test_second_order_rejected_micro_step_is_rolled_back(monkeypatch):
+    mf, mo_guess = _distorted_lih_reference(angle=0.12)
+    driver = SecondOrderCASSCF(
+        mf,
+        ncas=2,
+        nelecas=2,
+        max_cycle=2,
+        max_micro_cycle=1,
+        keyframe_interval=0,
+        auto_active_restarts=False,
+    )
+    seen_mo = []
+    original_hcore = mf.get_hcore_mo
+
+    def tracked_hcore(mo_coeff=None):
+        seen_mo.append(np.array(mo_coeff, copy=True))
+        return original_hcore(mo_coeff)
+
+    original_search = driver._micro_line_search
+
+    def rejected_search(*args, **kwargs):
+        _, trial_u, trial_energy, trial_mc, scale = original_search(*args, **kwargs)
+        return False, trial_u, trial_energy, trial_mc, scale
+
+    monkeypatch.setattr(mf, "get_hcore_mo", tracked_hcore)
+    monkeypatch.setattr(driver, "_micro_line_search", rejected_search)
+
+    with pytest.raises(RuntimeError, match="repeated zero-step plateau"):
+        driver.run(nstates=1, mo_coeff=mo_guess)
+
+    assert len(seen_mo) >= 2
+    np.testing.assert_allclose(seen_mo[1], seen_mo[0], atol=1.0e-12)
+    assert driver.micro_history[0]["rejected_step_rolled_back"]
+
+
+def test_second_order_keyframe_ci_matches_full_state_average_with_fewer_solves():
+    mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
+    mol.build()
+    mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
+    kappa = np.zeros((mf.nmo, mf.nmo))
+    kappa[1, 3] = 0.08
+    kappa[3, 1] = -0.08
+    mo_guess = mf.mo_coeff @ expm(kappa)
+
+    results = {}
+    counts = {}
+    for mode in ("full", "keyframe"):
+        driver = SecondOrderCASSCF(
+            mf,
+            ncas=2,
+            nelecas=2,
+            multiplicity=1,
+            max_cycle=15,
+            max_micro_cycle=4,
+            max_step=0.05,
+            micro_ci_mode=mode,
+            ah_max_cycle=6,
+            ah_conv_tol=1.0e-5,
+            use_cholesky=True,
+        )
+        driver.state_average([0.5, 0.5])
+        calls = 0
+        original = driver._make_factor_integral_casci
+
+        def counted(*args, _original=original, **kwargs):
+            nonlocal calls
+            calls += 1
+            return _original(*args, **kwargs)
+
+        driver._make_factor_integral_casci = counted
+        results[mode] = driver.run(nstates=2, mo_coeff=mo_guess)
+        counts[mode] = calls
+
+    full_average = float(np.mean(results["full"].e_tot))
+    keyframe_average = float(np.mean(results["keyframe"].e_tot))
+    np.testing.assert_allclose(keyframe_average, full_average, atol=1.0e-7)
+    np.testing.assert_allclose(
+        results["keyframe"].e_tot,
+        results["full"].e_tot,
+        atol=1.0e-5,
+    )
+    assert counts["keyframe"] < counts["full"]
+    assert any(not row["ci_relaxed"] for row in results["keyframe"].micro_history)
+
+
+def test_factor_fixed_ci_trial_preserves_spin_string_backend():
+    mf = SimpleNamespace(mol=SimpleNamespace(nao=2), nmo=2)
+    driver = SecondOrderCASSCF(mf, ncas=2, nelecas=2)
+    occupations = np.eye(2, dtype=np.int8)
+    template = SimpleNamespace(
+        binary=FCIStringBasis(occupations, occupations),
+        direct_connectivity=None,
+        _direct_H_diag=np.ones(4),
+        _spin_string_alpha_cross_diag=np.ones((2, 2)),
+        _spin_string_beta_cross_diag=np.ones((2, 2)),
+        _direct_rhf_blas_matvec=object(),
+    )
+    h1 = np.array([[-1.0, 0.1], [0.1, 0.4]])
+    pair = np.arange(12, dtype=float).reshape(3, 2, 2) / 10.0
+
+    sigma = driver._make_active_factor_sigma_casci(template, h1, pair)
+
+    assert sigma.binary is template.binary
+    np.testing.assert_allclose(
+        sigma.h2e_cas,
+        np.einsum("Ppq,Prs->pqrs", pair, pair, optimize=True),
+    )
+    assert sigma._direct_H_diag is None
+    assert sigma._spin_string_alpha_cross_diag is None
+    assert sigma._spin_string_beta_cross_diag is None
+    assert sigma._direct_rhf_blas_matvec is None

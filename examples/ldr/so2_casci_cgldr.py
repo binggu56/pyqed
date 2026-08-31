@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""SO2 CASCI CGLDR benchmark with one secondary vibrational coordinate.
+"""SO2 CASCI CGLDR benchmark with selected secondary coordinates.
 
 The cached SO2 linked-LDR scans in ``examples/namd`` use valence coordinates
 ``(r1, r2, theta)``.  This script turns such a scan into CGLDR data with either
 ``r1`` and ``r2`` as primary sampled coordinates and ``theta`` as the secondary
 expanded coordinate, or with ``q_s = (r1 + r2) / sqrt(2)`` and ``theta`` as
 primary sampled coordinates and ``q_a = (r1 - r2) / sqrt(2)`` as the secondary
-expanded coordinate.
+expanded coordinate. A sparse one-primary/two-secondary model instead samples
+only ``q_s`` and uses axial three-anchor expansions for ``(theta, q_a)``.
 
 For a matched ``(q_s, q_a, theta)`` grid, the electronic Hamiltonian along
 theta is represented in one theta-center CASCI reference frame using analytic
@@ -20,6 +21,13 @@ their overlaps are calculated with the same CASCI model.  The older cached-scan
 fit remains available only for legacy valence-coordinate scans.  The default
 CAS(6e,6o) space keeps the near-degenerate occupied and virtual SO2 orbitals on
 the same side of each active-space boundary.
+
+For an expanded ``q_a``, the default is the same single-center quadratic
+model.  Selecting multiple odd-numbered anchors evaluates relaxed-PT ``H/F/G``
+at bracketing nodes and the central ``q_a`` node, transports the side matrices
+into the central electronic frame, and constructs a piecewise-quintic
+interpolant. Inner anchor stencils use the outer anchors' quadratic
+continuation beyond the interpolation interval.
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
+import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -105,6 +114,21 @@ def so2_theta_modes(qs, qa, theta):
     return np.stack((tangent, curvature))
 
 
+def so2_theta_qa_modes(qs, qa, theta):
+    """Return first and second geometry derivatives for ``(theta, q_a)``."""
+    theta_tangent, theta_curvature = so2_theta_modes(qs, qa, theta)
+    first = np.stack((theta_tangent, so2_qa_mode(theta)))
+    curvature = np.zeros((2, 2, 3, 3), dtype=float)
+    curvature[0, 0] = theta_curvature
+    mixed = np.zeros((3, 3), dtype=float)
+    mixed[2, :2] = (
+        np.sin(theta) / SQRT2,
+        -np.cos(theta) / SQRT2,
+    )
+    curvature[0, 1] = curvature[1, 0] = mixed
+    return first, curvature
+
+
 def theta_vibronic_couplings(
     point,
     state_ids,
@@ -128,6 +152,39 @@ def theta_vibronic_couplings(
         backend=backend,
     )
     return first[..., 0], second[..., 0, 0] + first[..., 1]
+
+
+def theta_qa_vibronic_couplings(
+    point,
+    state_ids,
+    qs,
+    qa,
+    theta,
+    *,
+    moving_basis="rhf-relaxed-pt",
+    backend="native",
+):
+    r"""Return analytical coordinate ``F`` and ``G`` for ``(theta, q_a)``."""
+    first_modes, curvature = so2_theta_qa_modes(qs, qa, theta)
+    modes = np.concatenate(
+        (
+            first_modes,
+            curvature[0, 0][None, ...],
+            curvature[0, 1][None, ...],
+        )
+    )
+    raw_first, raw_second = point.vibronic_couplings(
+        state_ids=state_ids,
+        modes=modes,
+        moving_basis=moving_basis,
+        backend=backend,
+    )
+    first = np.asarray(raw_first[..., :2])
+    second = np.array(raw_second[..., :2, :2], copy=True)
+    second[..., 0, 0] += raw_first[..., 2]
+    second[..., 0, 1] += raw_first[..., 3]
+    second[..., 1, 0] += raw_first[..., 3]
+    return first, second
 
 
 def infer_sine_domain(nodes):
@@ -539,6 +596,9 @@ def casci_reference_point(
     scf_max_cycle,
     multiplicity=None,
     eri_workers=1,
+    spin_root_cushion=8,
+    direct_ci_eigensolver=None,
+    direct_ci_auto_spin0=None,
 ):
     from pyqed import Molecule
     from pyqed.qchem.hf.rhf import RHF
@@ -558,7 +618,7 @@ def casci_reference_point(
         mol.builtin_parallel = True
         mol.builtin_parallel_min_nao = 0
         mol.builtin_eri_workers = eri_workers
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol, verbose=0).run(
         tol=scf_tol,
         max_cycle=scf_max_cycle,
@@ -571,7 +631,12 @@ def casci_reference_point(
         multiplicity=multiplicity,
         verbose=0,
     )
-    casci.run(nstates=nstates)
+    casci.spin_root_cushion = int(spin_root_cushion)
+    if direct_ci_eigensolver is not None:
+        casci.direct_ci_eigensolver = str(direct_ci_eigensolver)
+    if direct_ci_auto_spin0 is not None:
+        casci.direct_ci_auto_spin0 = bool(direct_ci_auto_spin0)
+    casci.run(nstates=nstates, spin_root_cushion=spin_root_cushion)
     return casci
 
 
@@ -630,8 +695,10 @@ def _build_qa_casci_anchor(task):
     (
         i,
         j,
+        anchor_index,
         qs_value,
         theta_value,
+        qa_value,
         state_ids,
         basis,
         ncas,
@@ -645,7 +712,7 @@ def _build_qa_casci_anchor(task):
         derivative_workers,
     ) = task
     point = casci_reference_point(
-        so2_qs_theta_body_frame(qs_value, theta_value),
+        so2_qs_theta_body_frame(qs_value, theta_value, qa_value),
         basis=basis,
         charge=0,
         spin=0,
@@ -668,7 +735,64 @@ def _build_qa_casci_anchor(task):
         moving_basis=moving_basis,
         backend=derivative_backend,
     )
-    return i, j, point, energies, first[..., 0], second[..., 0, 0]
+    return (
+        i,
+        j,
+        anchor_index,
+        point.frame(),
+        energies,
+        first[..., 0],
+        second[..., 0, 0],
+    )
+
+
+def _build_qs_casci_anchor(task):
+    (
+        i,
+        anchor_index,
+        qs_value,
+        theta_value,
+        qa_value,
+        state_ids,
+        basis,
+        ncas,
+        nelecas,
+        casci_nstates,
+        scf_tol,
+        scf_max_cycle,
+        multiplicity,
+        moving_basis,
+        derivative_backend,
+        derivative_workers,
+    ) = task
+    point = casci_reference_point(
+        so2_qs_theta_body_frame(qs_value, theta_value, qa_value),
+        basis=basis,
+        charge=0,
+        spin=0,
+        unit="bohr",
+        ncas=ncas,
+        nelecas=nelecas,
+        nstates=casci_nstates,
+        scf_tol=scf_tol,
+        scf_max_cycle=scf_max_cycle,
+        multiplicity=multiplicity,
+        eri_workers=derivative_workers,
+    )
+    if _uses_relaxed_orbitals(moving_basis):
+        require_smooth_active_space(point)
+    state_indices = np.asarray(state_ids, dtype=int)
+    energies = np.asarray(point.e_tot, dtype=float)[state_indices]
+    first, second = theta_qa_vibronic_couplings(
+        point,
+        state_ids,
+        qs_value,
+        qa_value,
+        theta_value,
+        moving_basis=moving_basis,
+        backend=derivative_backend,
+    )
+    return i, anchor_index, point.frame(), energies, first, second
 
 
 def _build_theta_casci_anchor(task):
@@ -717,7 +841,7 @@ def _build_theta_casci_anchor(task):
         moving_basis=moving_basis,
         backend=derivative_backend,
     )
-    return i, j, point, energies, first, second
+    return i, j, point.frame(), energies, first, second
 
 
 def build_theta_cgldr_from_casci(
@@ -958,6 +1082,8 @@ def build_qa_cgldr_from_casci(
     qs_indices=None,
     theta_indices=None,
     qa_npts=None,
+    qa_anchor_count=1,
+    qa_anchor_indices=None,
     max_rank=64,
     energy_reference="minimum",
     basis="sto-3g",
@@ -977,6 +1103,8 @@ def build_qa_cgldr_from_casci(
     kinetic_svd_tol=0.0,
     polar_overlap=False,
     electronic_data=None,
+    anchor_cache_dir=None,
+    reuse_anchor_cache=False,
 ):
     if not isinstance(workers, (int, np.integer)) or workers <= 0:
         raise ValueError("workers must be a positive integer")
@@ -993,6 +1121,49 @@ def build_qa_cgldr_from_casci(
     )
     theta = scan.theta[np.asarray(theta_indices, dtype=int)]
     qa_axis = qa_axis_from_scan(scan, qa_npts, half_width=qa_half_width)
+    qa_anchor_count = int(qa_anchor_count)
+    if qa_anchor_count != 1 and (
+        qa_anchor_count < 3 or qa_anchor_count % 2 == 0
+    ):
+        raise ValueError("qa_anchor_count must be 1 or an odd integer >= 3")
+    if qa_anchor_count > qa_axis.npts:
+        raise ValueError("qa_anchor_count cannot exceed the q_a grid size")
+    qa_center_index = int(np.argmin(np.abs(qa_axis.x)))
+    if qa_anchor_indices is None:
+        if qa_anchor_count == 1:
+            qa_anchor_indices = np.array([qa_center_index], dtype=int)
+        else:
+            qa_anchor_indices = np.rint(
+                np.linspace(0, qa_axis.npts - 1, qa_anchor_count)
+            ).astype(int)
+    else:
+        qa_anchor_indices = np.asarray(
+            parse_grid_indices(
+                qa_anchor_indices,
+                qa_axis.npts,
+                name="qa_anchor_indices",
+            ),
+            dtype=int,
+        )
+    if qa_anchor_indices.size != qa_anchor_count:
+        raise ValueError(
+            "qa_anchor_indices must contain qa_anchor_count entries"
+        )
+    if np.any(np.diff(qa_anchor_indices) <= 0):
+        raise ValueError("qa_anchor_indices must be strictly increasing")
+    center_matches = np.flatnonzero(qa_anchor_indices == qa_center_index)
+    if center_matches.size != 1:
+        raise ValueError("qa_anchor_indices must include the central q_a node")
+    center_anchor = int(center_matches[0])
+    if qa_anchor_count > 1 and center_anchor != qa_anchor_count // 2:
+        raise ValueError("q_a anchors must symmetrically bracket the central node")
+    qa_anchors = np.asarray(qa_axis.x[qa_anchor_indices], dtype=float)
+    qa_extrapolation = (
+        "error"
+        if qa_anchor_indices[0] == 0
+        and qa_anchor_indices[-1] == qa_axis.npts - 1
+        else "quadratic"
+    )
 
     dvr = DVR.from_axes(
         (
@@ -1039,17 +1210,26 @@ def build_qa_cgldr_from_casci(
     nqs = len(qs)
     ntheta = len(theta)
     nactive = len(state_ids)
-    points = np.empty((nqs, ntheta), dtype=object)
-    energies = np.empty((nqs, ntheta, nactive), dtype=float)
-    gradients = np.empty((nqs, ntheta, 1, nactive, nactive), dtype=complex)
-    hessians = np.empty((nqs, ntheta, 1, 1, nactive, nactive), dtype=complex)
+    nanchors = len(qa_anchors)
+    points = np.empty((nqs, ntheta, nanchors), dtype=object)
+    anchor_energies = np.empty(
+        (nqs, ntheta, nanchors, nactive),
+        dtype=float,
+    )
+    anchor_gradients = np.empty(
+        (nqs, ntheta, nanchors, nactive, nactive),
+        dtype=complex,
+    )
+    anchor_hessians = np.empty_like(anchor_gradients)
 
     tasks = [
         (
             i,
             j,
+            anchor_index,
             float(qs_value),
             float(theta_value),
+            float(qa_value),
             tuple(state_ids),
             basis,
             int(ncas),
@@ -1064,30 +1244,74 @@ def build_qa_cgldr_from_casci(
         )
         for i, qs_value in enumerate(qs)
         for j, theta_value in enumerate(theta)
+        for anchor_index, qa_value in enumerate(qa_anchors)
     ]
     total = len(tasks)
+
+    cache_dir = None
+    if anchor_cache_dir is not None:
+        cache_dir = Path(anchor_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def cache_path(task):
+        i, j, anchor_index = task[:3]
+        qa_index = int(qa_anchor_indices[anchor_index])
+        return cache_dir / f"anchor_{i}_{j}_qa{qa_index}.pkl"
+
+    def save_result(task, result):
+        if cache_dir is None:
+            return
+        path = cache_path(task)
+        temporary = path.with_suffix(".tmp")
+        with temporary.open("wb") as stream:
+            pickle.dump(result, stream, pickle.HIGHEST_PROTOCOL)
+        temporary.replace(path)
+
+    def assign_result(result, task=None):
+        i, j, anchor_index, point, point_energies, first, second = result
+        if task is not None:
+            expected_i, expected_j, anchor_index = task[:3]
+            if (i, j) != (expected_i, expected_j):
+                raise ValueError("Cached q_a anchor has incompatible sampled indices")
+        points[i, j, anchor_index] = point
+        anchor_energies[i, j, anchor_index] = point_energies
+        anchor_gradients[i, j, anchor_index] = first
+        anchor_hessians[i, j, anchor_index] = second
+
+    pending = []
+    completed = 0
+    for task in tasks:
+        path = cache_path(task) if cache_dir is not None else None
+        if reuse_anchor_cache and path.is_file():
+            with path.open("rb") as stream:
+                assign_result(pickle.load(stream), task=task)
+            completed += 1
+        else:
+            pending.append(task)
+    if completed:
+        print(
+            f"[CASCI q_a derivatives] restored {completed}/{total} anchors",
+            flush=True,
+        )
+
     if workers == 1:
-        for count, task in enumerate(tasks, start=1):
-            i, j, point, point_energies, first, second = _build_qa_casci_anchor(
-                task
-            )
-            points[i, j] = point
-            energies[i, j] = point_energies
-            gradients[i, j, 0] = first
-            hessians[i, j, 0, 0] = second
+        for count, task in enumerate(pending, start=completed + 1):
+            result = _build_qa_casci_anchor(task)
+            assign_result(result)
+            save_result(task, result)
             print(f"[CASCI q_a derivatives] {count}/{total}", flush=True)
-    else:
-        with ProcessPoolExecutor(max_workers=min(workers, total)) as executor:
-            futures = [
-                executor.submit(_build_qa_casci_anchor, task)
-                for task in tasks
-            ]
-            for count, future in enumerate(as_completed(futures), start=1):
-                i, j, point, point_energies, first, second = future.result()
-                points[i, j] = point
-                energies[i, j] = point_energies
-                gradients[i, j, 0] = first
-                hessians[i, j, 0, 0] = second
+    elif pending:
+        with ProcessPoolExecutor(max_workers=min(workers, len(pending))) as executor:
+            futures = {
+                executor.submit(_build_qa_casci_anchor, task): task
+                for task in pending
+            }
+            for count, future in enumerate(
+                as_completed(futures), start=completed + 1
+            ):
+                result = future.result()
+                assign_result(result)
+                save_result(futures[future], result)
                 print(
                     f"[CASCI q_a derivatives] {count}/{total} "
                     f"({workers} workers)",
@@ -1095,14 +1319,71 @@ def build_qa_cgldr_from_casci(
                 )
 
     if energy_reference in {"minimum", "theta-center-minimum"}:
-        energy_shift = float(np.nanmin(energies))
+        energy_shift = float(np.nanmin(anchor_energies))
     elif energy_reference == "zero":
         energy_shift = 0.0
     else:
         raise ValueError(
             "energy_reference must be 'minimum', 'theta-center-minimum', or 'zero'"
         )
-    energies -= energy_shift
+    shifted_anchor_energies = anchor_energies - energy_shift
+    energies = shifted_anchor_energies[..., center_anchor, :]
+    gradients = anchor_gradients[..., center_anchor, None, :, :]
+    hessians = anchor_hessians[..., center_anchor, None, None, :, :]
+
+    separable_hamiltonian = None
+    if qa_anchor_count > 1:
+        anchor_hamiltonians = np.empty_like(anchor_gradients)
+        transported_gradients = np.empty_like(anchor_gradients)
+        transported_hessians = np.empty_like(anchor_hessians)
+        for index in np.ndindex(nqs, ntheta):
+            reference = points[index + (center_anchor,)]
+            for anchor_index in range(nanchors):
+                if anchor_index == center_anchor:
+                    transport = np.eye(nactive, dtype=complex)
+                else:
+                    transport = casci_overlap_active(
+                        reference,
+                        points[index + (anchor_index,)],
+                        state_ids,
+                        polar=True,
+                    )
+                local_hamiltonian = np.diag(
+                    shifted_anchor_energies[index + (anchor_index,)]
+                )
+                anchor_hamiltonians[index + (anchor_index,)] = (
+                    transport @ local_hamiltonian @ transport.conj().T
+                )
+                transported_gradients[index + (anchor_index,)] = (
+                    transport
+                    @ anchor_gradients[index + (anchor_index,)]
+                    @ transport.conj().T
+                )
+                transported_hessians[index + (anchor_index,)] = (
+                    transport
+                    @ anchor_hessians[index + (anchor_index,)]
+                    @ transport.conj().T
+                )
+        anchor_hamiltonians = 0.5 * (
+            anchor_hamiltonians
+            + anchor_hamiltonians.swapaxes(-1, -2).conj()
+        )
+        transported_gradients = 0.5 * (
+            transported_gradients
+            + transported_gradients.swapaxes(-1, -2).conj()
+        )
+        transported_hessians = 0.5 * (
+            transported_hessians
+            + transported_hessians.swapaxes(-1, -2).conj()
+        )
+        separable_hamiltonian = SeparableHamiltonian.quintic_hermite(
+            qa_axis.x,
+            qa_anchors,
+            anchor_hamiltonians,
+            transported_gradients,
+            transported_hessians,
+            extrapolation=qa_extrapolation,
+        )
 
     overlaps = np.empty(
         (nqs, ntheta, nactive, nqs, ntheta, nactive),
@@ -1117,7 +1398,10 @@ def build_qa_cgldr_from_casci(
     for bra_pos, bra in enumerate(flat):
         for ket in flat[bra_pos + 1:]:
             block = casci_overlap_active(
-                points[bra], points[ket], state_ids, polar=polar_overlap
+                points[bra + (center_anchor,)],
+                points[ket + (center_anchor,)],
+                state_ids,
+                polar=polar_overlap,
             )
             overlaps[bra + (slice(None),) + ket + (slice(None),)] = block
             overlaps[ket + (slice(None),) + bra + (slice(None),)] = block.conj().T
@@ -1135,6 +1419,15 @@ def build_qa_cgldr_from_casci(
         "qa_npts": int(qa_axis.npts),
         "qa_half_width": float(qa_axis.xmax),
         "qa_grid": qa_axis.x.tolist(),
+        "qa_model": (
+            "single-reference-quadratic"
+            if qa_anchor_count == 1
+            else f"{qa_anchor_count}-anchor-relaxed-pt-quintic"
+        ),
+        "qa_anchor_count": qa_anchor_count,
+        "qa_anchor_indices": qa_anchor_indices.tolist(),
+        "qa_anchor_values": qa_anchors.tolist(),
+        "qa_extrapolation": qa_extrapolation,
         "energy_shift": energy_shift,
         "derivative_source": "CASCI.vibronic_couplings:basis_derivatives+RDM",
         "moving_basis": moving_basis,
@@ -1159,8 +1452,374 @@ def build_qa_cgldr_from_casci(
         overlaps=overlaps,
         hamiltonian_gradients=gradients,
         hamiltonian_hessians=hessians,
+        separable_hamiltonian=separable_hamiltonian,
         reactive_grids=(qs, theta),
         expanded_grids=(qa_axis.x,),
+        metadata=metadata,
+    )
+    dynamics.set_electronic_data(data, tolerance=1.0e-6)
+    return dynamics, data
+
+
+def build_qs_cgldr_from_casci(
+    scan: SO2LinkedScan,
+    *,
+    state_ids=None,
+    qs_indices=None,
+    qa_npts=None,
+    theta_anchor_indices=None,
+    qa_anchor_indices=None,
+    max_rank=64,
+    energy_reference="minimum",
+    basis="sto-3g",
+    ncas=DEFAULT_NCAS,
+    nelecas=DEFAULT_NELECAS,
+    multiplicity=1,
+    scf_tol=1.0e-8,
+    scf_max_cycle=80,
+    workers=1,
+    moving_basis="rhf-relaxed-pt",
+    derivative_backend="native",
+    derivative_workers=1,
+    qa_half_width=None,
+    kinetic_model="valence",
+    kinetic_exp_order=10,
+    kinetic_exp_scale=1,
+    kinetic_svd_tol=0.0,
+    polar_overlap=False,
+    electronic_data=None,
+):
+    """Build SO2 CGLDR data with ``q_s`` sampled and ``(theta, q_a)`` expanded."""
+    if not isinstance(workers, (int, np.integer)) or workers <= 0:
+        raise ValueError("workers must be a positive integer")
+    workers = int(workers)
+    if int(derivative_workers) <= 0:
+        raise ValueError("derivative_workers must be positive")
+    state_ids = parse_state_ids(state_ids, scan.solver.nstates)
+    casci_nstates = max(state_ids) + 1
+    qs, qs_indices = symmetric_stretch_nodes(scan, qs_indices)
+    theta = np.asarray(scan.theta, dtype=float)
+    qa_axis = qa_axis_from_scan(scan, qa_npts, half_width=qa_half_width)
+    qa = np.asarray(qa_axis.x, dtype=float)
+    theta_center_index = nearest_index(theta, np.deg2rad(REFERENCE_THETA_DEG))
+    qa_center_index = nearest_index(qa, 0.0)
+
+    if theta_anchor_indices is None:
+        theta_anchor_indices = (
+            theta_center_index - 1,
+            theta_center_index,
+            theta_center_index + 1,
+        )
+    if qa_anchor_indices is None:
+        stride = max(1, min(3, qa_center_index, len(qa) - qa_center_index - 1))
+        qa_anchor_indices = (
+            qa_center_index - stride,
+            qa_center_index,
+            qa_center_index + stride,
+        )
+
+    def validate_anchors(indices, size, center_index, name):
+        indices = np.asarray(
+            parse_grid_indices(indices, size, name=name),
+            dtype=int,
+        )
+        if indices.size != 3 or np.any(np.diff(indices) <= 0):
+            raise ValueError(f"{name} must contain three increasing indices")
+        if indices[1] != center_index:
+            raise ValueError(f"{name} must bracket the central DVR node")
+        return indices
+
+    theta_anchor_indices = validate_anchors(
+        theta_anchor_indices,
+        len(theta),
+        theta_center_index,
+        "theta_anchor_indices",
+    )
+    qa_anchor_indices = validate_anchors(
+        qa_anchor_indices,
+        len(qa),
+        qa_center_index,
+        "qa_anchor_indices",
+    )
+    theta_anchors = theta[theta_anchor_indices]
+    qa_anchors = qa[qa_anchor_indices]
+    centers = (theta[theta_center_index], qa[qa_center_index])
+    extrapolation = (
+        "error"
+        if theta_anchor_indices[0] == 0
+        and theta_anchor_indices[-1] == len(theta) - 1
+        else "quadratic",
+        "error"
+        if qa_anchor_indices[0] == 0
+        and qa_anchor_indices[-1] == len(qa) - 1
+        else "quadratic",
+    )
+
+    dvr = DVR.from_axes(
+        (
+            SineDVR(*infer_sine_domain(qs), len(qs)),
+            LegendreDVR(*infer_legendre_domain(theta), len(theta)),
+            qa_axis,
+        ),
+        names=("qs", "theta", "qa"),
+    )
+    partition = ElectronicPartition(
+        sampled=("qs",),
+        expanded=("theta", "qa"),
+        center=centers,
+    )
+    kinetic_model = str(kinetic_model).lower().replace("_", "-")
+    if kinetic_model == "valence":
+        nuclear_kinetic_mpo = scan.solver.buildK_qsqa_mpo(
+            dvr.axes,
+            max_rank=None,
+            symmetrize=True,
+            svd_tol=kinetic_svd_tol,
+        )
+        kinetic_label = "transformed-valence"
+    elif kinetic_model in {"product", "product-dvr", "dvr"}:
+        nuclear_kinetic_mpo = None
+        kinetic_label = "product-dvr"
+    else:
+        raise ValueError("kinetic_model must be 'valence' or 'product-dvr'")
+    dynamics = CGLDR(
+        dvr,
+        partition,
+        state_ids=state_ids,
+        tt_options={"max_rank": max_rank},
+        nuclear_kinetic_mpo=nuclear_kinetic_mpo,
+        kinetic_exponential_options={
+            "order": kinetic_exp_order,
+            "scale": kinetic_exp_scale,
+        },
+    )
+    if electronic_data is not None:
+        dynamics.set_electronic_data(electronic_data, tolerance=1.0e-6)
+        return dynamics, electronic_data
+
+    anchor_coordinates = [
+        (centers[0], centers[1]),
+        (theta_anchors[0], centers[1]),
+        (theta_anchors[2], centers[1]),
+        (centers[0], qa_anchors[0]),
+        (centers[0], qa_anchors[2]),
+    ]
+    nqs = len(qs)
+    nactive = len(state_ids)
+    nanchor_points = len(anchor_coordinates)
+    points = np.empty((nqs, nanchor_points), dtype=object)
+    anchor_energies = np.empty((nqs, nanchor_points, nactive), dtype=float)
+    anchor_gradients = np.empty(
+        (nqs, nanchor_points, nactive, nactive, 2),
+        dtype=complex,
+    )
+    anchor_hessians = np.empty(
+        (nqs, nanchor_points, nactive, nactive, 2, 2),
+        dtype=complex,
+    )
+    tasks = [
+        (
+            i,
+            anchor_index,
+            float(qs_value),
+            float(theta_value),
+            float(qa_value),
+            tuple(state_ids),
+            basis,
+            int(ncas),
+            int(nelecas),
+            int(casci_nstates),
+            float(scf_tol),
+            int(scf_max_cycle),
+            multiplicity,
+            moving_basis,
+            derivative_backend,
+            int(derivative_workers),
+        )
+        for i, qs_value in enumerate(qs)
+        for anchor_index, (theta_value, qa_value) in enumerate(anchor_coordinates)
+    ]
+    total = len(tasks)
+
+    def save_anchor(result):
+        i, anchor_index, point, point_energies, first, second = result
+        points[i, anchor_index] = point
+        anchor_energies[i, anchor_index] = point_energies
+        anchor_gradients[i, anchor_index] = first
+        anchor_hessians[i, anchor_index] = second
+
+    if workers == 1:
+        for count, task in enumerate(tasks, start=1):
+            save_anchor(_build_qs_casci_anchor(task))
+            print(f"[CASCI q_s | theta,q_a anchors] {count}/{total}", flush=True)
+    else:
+        with ProcessPoolExecutor(max_workers=min(workers, total)) as executor:
+            futures = [
+                executor.submit(_build_qs_casci_anchor, task)
+                for task in tasks
+            ]
+            for count, future in enumerate(as_completed(futures), start=1):
+                save_anchor(future.result())
+                print(
+                    f"[CASCI q_s | theta,q_a anchors] {count}/{total} "
+                    f"({workers} workers)",
+                    flush=True,
+                )
+
+    if energy_reference in {"minimum", "theta-center-minimum"}:
+        energy_shift = float(np.nanmin(anchor_energies))
+    elif energy_reference == "zero":
+        energy_shift = 0.0
+    else:
+        raise ValueError(
+            "energy_reference must be 'minimum', 'theta-center-minimum', or 'zero'"
+        )
+    anchor_energies -= energy_shift
+    center_hamiltonian = np.empty((nqs, nactive, nactive), dtype=complex)
+    axial_hamiltonians = (
+        np.empty((nqs, 3, nactive, nactive), dtype=complex),
+        np.empty((nqs, 3, nactive, nactive), dtype=complex),
+    )
+    axial_gradients = tuple(np.empty_like(values) for values in axial_hamiltonians)
+    axial_hessians = tuple(np.empty_like(values) for values in axial_hamiltonians)
+    center_gradients = np.empty((nqs, 2, nactive, nactive), dtype=complex)
+    center_hessians = np.empty(
+        (nqs, 2, 2, nactive, nactive),
+        dtype=complex,
+    )
+    theta_records = (1, 0, 2)
+    qa_records = (3, 0, 4)
+    for i in range(nqs):
+        reference = points[i, 0]
+        transported_h = []
+        transported_f = []
+        transported_g = []
+        for anchor_index in range(nanchor_points):
+            transport = (
+                np.eye(nactive, dtype=complex)
+                if anchor_index == 0
+                else casci_overlap_active(
+                    reference,
+                    points[i, anchor_index],
+                    state_ids,
+                    polar=True,
+                )
+            )
+            transported_h.append(
+                transport
+                @ np.diag(anchor_energies[i, anchor_index])
+                @ transport.conj().T
+            )
+            transported_f.append(np.stack([
+                transport
+                @ anchor_gradients[i, anchor_index, :, :, axis]
+                @ transport.conj().T
+                for axis in range(2)
+            ]))
+            transported_g.append(np.stack([
+                np.stack([
+                    transport
+                    @ anchor_hessians[i, anchor_index, :, :, first, second]
+                    @ transport.conj().T
+                    for second in range(2)
+                ])
+                for first in range(2)
+            ]))
+        transported_h = np.asarray(transported_h)
+        transported_f = np.asarray(transported_f)
+        transported_g = np.asarray(transported_g)
+        transported_h = 0.5 * (
+            transported_h + transported_h.swapaxes(-1, -2).conj()
+        )
+        transported_f = 0.5 * (
+            transported_f + transported_f.swapaxes(-1, -2).conj()
+        )
+        transported_g = 0.5 * (
+            transported_g + transported_g.swapaxes(-1, -2).conj()
+        )
+        transported_g = 0.5 * (
+            transported_g + transported_g.swapaxes(1, 2)
+        )
+        center_hamiltonian[i] = transported_h[0]
+        center_gradients[i] = transported_f[0]
+        center_hessians[i] = transported_g[0]
+        for axis, records in enumerate((theta_records, qa_records)):
+            axial_hamiltonians[axis][i] = transported_h[list(records)]
+            axial_gradients[axis][i] = transported_f[list(records), axis]
+            axial_hessians[axis][i] = transported_g[list(records), axis, axis]
+
+    separable_hamiltonian = SeparableHamiltonian.axial_quintic_hermite(
+        (theta, qa),
+        (theta_anchors, qa_anchors),
+        axial_hamiltonians,
+        axial_gradients,
+        axial_hessians,
+        center_hamiltonian=center_hamiltonian,
+        centers=centers,
+        mixed_hessians=center_hessians,
+        extrapolation=extrapolation,
+    )
+    overlaps = np.empty(
+        (nqs, nactive, nqs, nactive),
+        dtype=complex,
+    )
+    for bra in range(nqs):
+        overlaps[bra, :, bra, :] = np.eye(nactive, dtype=complex)
+        for ket in range(bra + 1, nqs):
+            block = casci_overlap_active(
+                points[bra, 0],
+                points[ket, 0],
+                state_ids,
+                polar=polar_overlap,
+            )
+            overlaps[bra, :, ket, :] = block
+            overlaps[ket, :, bra, :] = block.conj().T
+
+    metadata = {
+        "molecule": "SO2",
+        "source": "live CASCI axial theta/q_a derivative grid",
+        "source_meta": scan.meta,
+        "sampled_coordinates": ["qs"],
+        "expanded_coordinates": ["theta", "qa"],
+        "state_ids": list(state_ids),
+        "qs_indices": list(qs_indices),
+        "theta_grid_degrees": np.rad2deg(theta).tolist(),
+        "qa_grid": qa.tolist(),
+        "theta_anchor_indices": theta_anchor_indices.tolist(),
+        "theta_anchor_degrees": np.rad2deg(theta_anchors).tolist(),
+        "qa_anchor_indices": qa_anchor_indices.tolist(),
+        "qa_anchor_values": qa_anchors.tolist(),
+        "secondary_model": "axial-three-anchor-relaxed-pt-quintic",
+        "anchor_geometry_count_per_qs": nanchor_points,
+        "mixed_hessian": "analytical center G_theta_qa",
+        "extrapolation": list(extrapolation),
+        "energy_shift": energy_shift,
+        "derivative_source": "CASCI.vibronic_couplings:basis_derivatives+RDM",
+        "moving_basis": moving_basis,
+        "anchor_transport": "polar",
+        "overlap_form": "polar" if polar_overlap else "raw",
+        "basis": basis,
+        "ncas": int(ncas),
+        "nelecas": int(nelecas),
+        "active_gap_threshold": MIN_ACTIVE_GAP,
+        "multiplicity": multiplicity,
+        "workers": workers,
+        "derivative_workers": int(derivative_workers),
+        "derivative_backend": derivative_backend,
+        "kinetic_model": kinetic_label,
+        "kinetic_coordinates": ["qs", "theta", "qa"],
+        "kinetic_exp_order": int(kinetic_exp_order),
+        "kinetic_exp_scale": int(kinetic_exp_scale),
+        "kinetic_svd_tol": float(kinetic_svd_tol),
+    }
+    data = CGLDRElectronicData(
+        energies=anchor_energies[:, 0],
+        overlaps=overlaps,
+        hamiltonian_gradients=center_gradients,
+        hamiltonian_hessians=center_hessians,
+        separable_hamiltonian=separable_hamiltonian,
+        reactive_grids=(qs,),
+        expanded_grids=(theta, qa),
         metadata=metadata,
     )
     dynamics.set_electronic_data(data, tolerance=1.0e-6)
@@ -1395,7 +2054,7 @@ def default_initial_packet_spec(secondary_mode, coordinates="valence"):
             f"{REFERENCE_THETA_WIDTH_DEG}",
             (2,),
         )
-    if secondary_mode == "qa":
+    if secondary_mode in {"qa", "theta-qa"}:
         # The r1/r2 -> q_s/q_a transform is orthogonal, so the Gaussian width
         # remains 0.16 bohr on both q_s and q_a.
         return (
@@ -1411,7 +2070,7 @@ def default_initial_packet_spec(secondary_mode, coordinates="valence"):
             f"{REFERENCE_THETA_WIDTH_DEG}",
             (2,),
         )
-    raise ValueError("secondary_mode must be 'theta' or 'qa'")
+    raise ValueError("secondary_mode must be 'theta', 'qa', or 'theta-qa'")
 
 
 def main():
@@ -1421,9 +2080,12 @@ def main():
     parser.add_argument("--max-rank", type=int, default=64)
     parser.add_argument(
         "--secondary-mode",
-        choices=("theta", "qa"),
+        choices=("theta", "qa", "theta-qa"),
         default="theta",
-        help="Expanded coordinate: bend theta or antisymmetric stretch q_a.",
+        help=(
+            "Expanded coordinates: theta, q_a, or both with only q_s "
+            "sampled."
+        ),
     )
     parser.add_argument(
         "--state-ids",
@@ -1445,6 +2107,11 @@ def main():
         default="single-reference",
     )
     parser.add_argument("--theta-anchor-count", type=int, default=3)
+    parser.add_argument(
+        "--theta-anchors",
+        default=None,
+        help="Three comma-separated theta DVR indices for theta-qa mode.",
+    )
     parser.add_argument(
         "--theta-derivatives",
         choices=("linked-fit", "analytic"),
@@ -1477,6 +2144,23 @@ def main():
     parser.add_argument("--qa-indices", default="all")
     parser.add_argument("--theta-indices", default="all")
     parser.add_argument("--qa-npts", type=int, default=None)
+    parser.add_argument(
+        "--qa-anchor-count",
+        type=int,
+        default=1,
+        help=(
+            "Use one relaxed-PT q_a anchor with a quadratic expansion, or "
+            "an odd center-containing stencil with piecewise-quintic interpolation."
+        ),
+    )
+    parser.add_argument(
+        "--qa-anchors",
+        default=None,
+        help=(
+            "Comma-separated q_a DVR anchor indices. Examples include "
+            "'1,4,7' and the center-dense five-anchor stencil '1,3,4,5,7'."
+        ),
+    )
     parser.add_argument(
         "--qa-half-width",
         type=float,
@@ -1536,6 +2220,11 @@ def main():
         help="Reuse so2_cgldr_electronic_data.npz from --outdir.",
     )
     parser.add_argument(
+        "--reuse-anchor-cache",
+        action="store_true",
+        help="Resume completed q_a CASCI anchors from the output directory.",
+    )
+    parser.add_argument(
         "--electronic-data",
         type=Path,
         default=None,
@@ -1550,19 +2239,20 @@ def main():
         path_average=not args.no_path_average,
     )
     state_ids = parse_state_ids(args.state_ids, scan.solver.nstates)
-    if args.secondary_mode == "qa":
+    if args.secondary_mode == "theta-qa":
         electronic_data = None
         electronic_data_path = args.outdir / "so2_cgldr_electronic_data.npz"
         if args.electronic_data is not None:
             electronic_data = CGLDRElectronicData.from_npz(args.electronic_data)
         elif args.reuse_electronic_data:
             electronic_data = CGLDRElectronicData.from_npz(electronic_data_path)
-        dynamics, data = build_qa_cgldr_from_casci(
+        dynamics, data = build_qs_cgldr_from_casci(
             scan,
             state_ids=state_ids,
             qs_indices=args.qs_indices,
-            theta_indices=args.theta_indices,
             qa_npts=args.qa_npts,
+            theta_anchor_indices=args.theta_anchors,
+            qa_anchor_indices=args.qa_anchors,
             qa_half_width=args.qa_half_width,
             max_rank=args.max_rank,
             energy_reference=args.energy_reference,
@@ -1582,6 +2272,45 @@ def main():
             kinetic_svd_tol=args.kinetic_svd_tol,
             polar_overlap=args.polar_overlap,
             electronic_data=electronic_data,
+        )
+        sampled_grids = data.reactive_grids
+        secondary_label = "theta"
+    elif args.secondary_mode == "qa":
+        electronic_data = None
+        electronic_data_path = args.outdir / "so2_cgldr_electronic_data.npz"
+        if args.electronic_data is not None:
+            electronic_data = CGLDRElectronicData.from_npz(args.electronic_data)
+        elif args.reuse_electronic_data:
+            electronic_data = CGLDRElectronicData.from_npz(electronic_data_path)
+        dynamics, data = build_qa_cgldr_from_casci(
+            scan,
+            state_ids=state_ids,
+            qs_indices=args.qs_indices,
+            theta_indices=args.theta_indices,
+            qa_npts=args.qa_npts,
+            qa_anchor_count=args.qa_anchor_count,
+            qa_anchor_indices=args.qa_anchors,
+            qa_half_width=args.qa_half_width,
+            max_rank=args.max_rank,
+            energy_reference=args.energy_reference,
+            basis=args.casci_basis,
+            ncas=args.ncas,
+            nelecas=args.nelecas,
+            multiplicity=args.multiplicity,
+            scf_tol=args.scf_tol,
+            scf_max_cycle=args.scf_max_cycle,
+            workers=args.workers,
+            moving_basis=args.moving_basis,
+            derivative_backend=args.derivative_backend,
+            derivative_workers=args.derivative_workers,
+            kinetic_model=args.kinetic_model,
+            kinetic_exp_order=args.kinetic_exp_order,
+            kinetic_exp_scale=args.kinetic_exp_scale,
+            kinetic_svd_tol=args.kinetic_svd_tol,
+            polar_overlap=args.polar_overlap,
+            electronic_data=electronic_data,
+            anchor_cache_dir=args.outdir / "qa_anchor_cache",
+            reuse_anchor_cache=args.reuse_anchor_cache,
         )
         sampled_grids = data.reactive_grids
         secondary_label = "q_a"
@@ -1670,10 +2399,24 @@ def main():
             "[cgldr] theta anchor degrees = "
             f"{np.array2string(np.asarray(data.metadata['theta_anchor_degrees']), precision=4)}"
         )
-    else:
+    elif args.secondary_mode == "qa":
         print(
             "[cgldr] sampled theta degrees = "
             f"{np.array2string(np.asarray(data.metadata['theta_degrees']), precision=4)}"
+        )
+        print(
+            "[cgldr] q_a anchors = "
+            f"{np.array2string(np.asarray(data.metadata['qa_anchor_values']), precision=6)} "
+            f"({data.metadata['qa_model']})"
+        )
+    else:
+        print(
+            "[cgldr] theta anchors / deg = "
+            f"{np.array2string(np.asarray(data.metadata['theta_anchor_degrees']), precision=4)}"
+        )
+        print(
+            "[cgldr] q_a anchors / bohr = "
+            f"{np.array2string(np.asarray(data.metadata['qa_anchor_values']), precision=6)}"
         )
     global_theta_range = secondary_hessian_eigenvalue_range(data)
     if global_theta_range is not None:

@@ -26,10 +26,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from pyqed.md import atoms_from_openmm_pdb_system  # noqa: E402
-from pyqed.units import au2angstrom  # noqa: E402
+from pyqed.units import au2angstrom, au2kjmol  # noqa: E402
 
 
-HARTREE_TO_KJMOL = 2625.4996394799
+HARTREE_TO_KJMOL = au2kjmol
 BOHR_TO_NM = au2angstrom * 0.1
 FORCEFIELD_FILES = ("charmm36.xml", "charmm36/water.xml")
 SUPPORTED_FORCE_TERMS = {

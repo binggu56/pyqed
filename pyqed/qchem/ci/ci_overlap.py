@@ -12,8 +12,7 @@ geometries).
 from functools import reduce
 import numpy as np
 
-
-from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
+from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 
 
 
@@ -79,8 +78,7 @@ def overlap_ao(mol, mol2):
         DESCRIPTION.
 
     """
-    s = overlap_integral_asymmetric(mol._bas, mol2._bas)
-    return s
+    return _cross_ao_overlap_matrix(mol, mol2)
 
 def overlap_mo(mf, mf2, s=None):
     """
@@ -153,10 +151,6 @@ def nonadiabatic_coupling(mol, mode_id):
 
 
 if __name__=='__main__':
-
-    from gbasis.parsers import parse_gbs, make_contractions
-    from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
     from pyqed import Molecule
     from pyscf import gto, scf, ci
 
@@ -222,7 +216,7 @@ if __name__=='__main__':
     # print(f"Number of shells in 6-31G basis: {len(ao_basis)}", end="\n\n")
 
     # compute overlap of two different basis sets
-    int1e_overlap_basis = overlap_integral_asymmetric(mol._bas, mol2._bas)
+    int1e_overlap_basis = overlap_ao(mol, mol2)
     # s = reduce(np.dot, (hf.mo_coeff.T, int1e_overlap_basis, hf2.mo_coeff))
 
     print(f"Shape of overlap matrix: {int1e_overlap_basis.shape}")

@@ -119,7 +119,7 @@ def _parse_active_orbitals(text):
 
 def _make_molecule(case, basis):
     mol = Molecule(atom=case["atom"], unit=case["unit"], basis=basis or case["basis"])
-    mol.build(driver="gbasis")
+    mol.build()
     return mol
 
 

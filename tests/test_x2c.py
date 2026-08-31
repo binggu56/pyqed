@@ -11,7 +11,7 @@ def test_x2c1e_hcore_matches_pyscf_no_uncontract():
     from pyscf.x2c import sfx2c1e
 
     mol = Molecule(atom="H 0 0 0; F 0 0 1.7", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
 
     hcore = x2c1e_hcore(mol)
     helper = sfx2c1e.SpinFreeX2CHelper(mol.topyscf())
@@ -23,7 +23,7 @@ def test_x2c1e_hcore_matches_pyscf_no_uncontract():
 
 def test_rhf_run_x2c_uses_scalar_x2c_hcore_and_restores_molecule():
     mol = Molecule(atom="H 0 0 0; F 0 0 1.7", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     nonrel_hcore = mol.hcore.copy()
     x2c_hcore = x2c1e_hcore(mol)
 
@@ -39,7 +39,7 @@ def test_builtin_x2c_aligns_segmented_spherical_ordering():
     from pyscf.x2c import sfx2c1e
 
     mol = Molecule(atom="H 0 0 0; Cl 0 0 2.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", options={"coord_type": "spherical", "eri_representation": "s8"})
+    mol.build(options={"coord_type": "spherical", "eri_representation": "s8"})
 
     helper = sfx2c1e.SpinFreeX2CHelper(mol.topyscf())
     helper.xuncontract = False

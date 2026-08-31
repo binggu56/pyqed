@@ -115,6 +115,18 @@ def _dmrg_states(solver):
     return [solver.dmrg.ground_state]
 
 
+def _has_fully_reduced_su2_states(solver):
+    if not hasattr(solver, "dmrg"):
+        return False
+    try:
+        states = _dmrg_states(solver)
+    except ValueError:
+        return False
+    from pyqed.mps.nonabelian.orbital_transform import is_fully_reduced_su2_mps
+
+    return bool(states) and all(is_fully_reduced_su2_mps(state) for state in states)
+
+
 def _normalize_state_ids(state_ids, nstates):
     if state_ids is None:
         return list(range(nstates))
@@ -644,11 +656,21 @@ def _relative_tensor_error(reference, candidate, tol=1e-14):
 def overlap(bra, ket, bra_state_ids=None, ket_state_ids=None, s=None):
     """Overlap between active-space CI-like and DMRG/MPS-backed states.
 
-    DMRG/QCDMRG states are converted exactly to active-space determinant
-    amplitudes and then contracted with the shared CAS biorthogonal overlap.
-    This is intended for small active spaces where full coefficient recovery is
-    feasible.
+    Two fully reduced SU(2) DMRG states use the sector-preserving
+    biorthogonal circuit and never recover determinant amplitudes. Its default
+    intermediate-MPS compression is practical rather than formally exact;
+    call :func:`su2_biorthogonal_overlap` with ``cutoff=0, max_bond=None`` for
+    the untruncated route. Other combinations use the determinant-space bridge
+    and are intended for small active spaces.
     """
+    if _has_fully_reduced_su2_states(bra) and _has_fully_reduced_su2_states(ket):
+        return su2_biorthogonal_overlap(
+            bra,
+            ket,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            s=s,
+        )
     bra_state = _as_overlap_state(bra, bra_state_ids)
     ket_state = _as_overlap_state(ket, ket_state_ids)
     return _factorized_ci_overlap(bra_state, ket_state, s=s)
@@ -676,6 +698,132 @@ def _structured_biorthogonal_overlap(
     exact_bra_ci = _transformed_ci_tensors_from_overlap_state(bra_state, prep.x_left, dtype)
     exact_ket_ci = _transformed_ci_tensors_from_overlap_state(ket_state, prep.x_right, dtype)
     return prep.core_factor * np.einsum("Xab,Yab->XY", exact_bra_ci.conj(), exact_ket_ci)
+
+
+def _select_reduced_su2_states(obj, state_ids):
+    from pyqed.mps.nonabelian.orbital_transform import is_fully_reduced_su2_mps
+
+    states = _dmrg_states(obj)
+    ids = _normalize_state_ids(state_ids, len(states))
+    selected = [states[index] for index in ids]
+    if not all(is_fully_reduced_su2_mps(state) for state in selected):
+        raise TypeError("The SU(2) overlap backend requires fully reduced SU(2) MPS states.")
+    return selected
+
+
+def _reduced_su2_overlap_matrix(bra_states, ket_states):
+    from pyqed.mps.nonabelian.environment import contract_chain_expectation
+    from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
+
+    out = np.empty((len(bra_states), len(ket_states)), dtype=complex)
+    for i, bra_state in enumerate(bra_states):
+        bra_sites = list(getattr(bra_state, "sites", bra_state))
+        for j, ket_state in enumerate(ket_states):
+            ket_sites = list(getattr(ket_state, "sites", ket_state))
+            if len(bra_sites) != len(ket_sites):
+                raise ValueError("Bra and ket reduced MPS lengths do not match.")
+            identity = _identity_mpo_factors_for_sites_and_mpo(
+                ket_sites, [None] * len(ket_sites)
+            )
+            out[i, j] = contract_chain_expectation(
+                ket_sites,
+                identity,
+                bra_sites=bra_sites,
+            )
+    return out
+
+
+def su2_biorthogonal_overlap(
+    bra,
+    ket,
+    bra_state_ids=None,
+    ket_state_ids=None,
+    s=None,
+    *,
+    cutoff=1.0e-10,
+    max_bond="auto",
+    return_info=False,
+):
+    """Cross-geometry overlap in the fully reduced SU(2) representation.
+
+    The active-space biorthogonalization follows Malmqvist, Int. J. Quantum
+    Chem. 30, 479 (1986), https://doi.org/10.1002/qua.560300404.  Its MPS
+    realization follows the nonorthogonal MPS state-interaction strategy of
+    Knecht et al., J. Chem. Theory Comput. 12, 5881 (2016),
+    https://doi.org/10.1021/acs.jctc.6b00889.  PyQED applies the resulting
+    one-particle maps as adjacent Gaussian gates directly to reduced SU(2)
+    channels.  Thus the route is sector preserving and determinant free.
+
+    The defaults ``cutoff=1e-10`` and ``max_bond="auto"`` compress intermediate
+    MPSs for practical polynomial-style scaling. Use ``cutoff=0`` and
+    ``max_bond=None`` for an untruncated result exact up to floating-point
+    roundoff. Exact arbitrary maps can still cause exponential MPS bond growth;
+    the method avoids the unconditional ``4**ncas`` storage of determinant
+    recovery but cannot remove that fundamental worst case.
+    """
+    if not hasattr(bra, "dmrg") or not hasattr(ket, "dmrg"):
+        raise TypeError("The SU(2) overlap backend supports DMRG-backed objects only.")
+    if bra.ncas != ket.ncas or bra.ncore != ket.ncore:
+        raise ValueError(
+            "SU(2) overlap requires matching active-space definitions: "
+            f"(ncore, ncas)=({bra.ncore}, {bra.ncas}) vs "
+            f"({ket.ncore}, {ket.ncas})."
+        )
+    bra_states = _select_reduced_su2_states(bra, bra_state_ids)
+    ket_states = _select_reduced_su2_states(ket, ket_state_ids)
+    s_mo = _compute_full_mo_overlap(bra, ket, s=s)
+    prep = _prepare_biorthogonal_overlap(
+        s_mo,
+        bra.ncore,
+        ket.ncore,
+        bra.ncas,
+        ket.ncas,
+        np.dtype(np.result_type(s_mo, complex)),
+    )
+
+    from pyqed.mps.nonabelian.orbital_transform import apply_spatial_orbital_transform
+
+    transformed_bra = []
+    transformed_ket = []
+    transform_info = {"bra": [], "ket": []}
+    for state in bra_states:
+        transformed, info = apply_spatial_orbital_transform(
+            state,
+            prep.x_left,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            return_info=True,
+        )
+        transformed_bra.append(transformed)
+        transform_info["bra"].append(info)
+    for state in ket_states:
+        transformed, info = apply_spatial_orbital_transform(
+            state,
+            prep.x_right,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            return_info=True,
+        )
+        transformed_ket.append(transformed)
+        transform_info["ket"].append(info)
+    value = prep.core_factor * _reduced_su2_overlap_matrix(
+        transformed_bra, transformed_ket
+    )
+    if not return_info:
+        return value
+    return value, {
+        "backend": "su2",
+        "exact": all(
+            info["exact"]
+            for side in transform_info.values()
+            for info in side
+        ),
+        "sector_preserving": True,
+        "determinant_expansion": False,
+        "component_expansion": False,
+        "core_factor": prep.core_factor,
+        "transforms": transform_info,
+    }
 
 
 def _mpo_biorthogonal_overlap(
@@ -786,28 +934,67 @@ def biorthogonal_overlap(
     scale=1,
     identity_tol=1e-10,
     phase_align_tol=1e-14,
-    backend="structured",
+    backend="auto",
+    cutoff=1.0e-10,
+    max_bond="auto",
+    return_info=False,
 ):
     """Biorthogonal overlap for DMRG states.
 
-    `backend="structured"` applies the exact determinant-space biorthogonal
-    transform recovered from the DMRG coefficients and is the current correct
-    path for small active spaces.
+    ``backend="auto"`` selects the sector-preserving circuit when both inputs
+    contain fully reduced SU(2) MPSs, and otherwise selects the exact
+    small-active-space determinant route.
 
-    `backend="mpo"` applies the nonunitary transforms as MPOs and remains
+    ``backend="su2"`` applies nonunitary transforms directly to reduced charge
+    x SU(2) tensors. Its practical defaults are ``cutoff=1e-10`` and an
+    adaptive ``max_bond="auto"`` cap. With ``cutoff=0`` and ``max_bond=None``
+    it performs no truncation and does not construct determinants or spin
+    components.
+
+    ``backend="structured"`` applies the exact determinant-space
+    biorthogonal transform recovered from DMRG coefficients and is intended
+    for small active spaces.
+
+    ``backend="mpo"`` applies the nonunitary transforms as MPOs and remains
     experimental.
     """
     backend = backend.lower()
+    if backend == "auto":
+        backend = (
+            "su2"
+            if _has_fully_reduced_su2_states(bra)
+            and _has_fully_reduced_su2_states(ket)
+            else "structured"
+        )
+    if backend == "su2":
+        return su2_biorthogonal_overlap(
+            bra,
+            ket,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            s=s,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            return_info=return_info,
+        )
     if backend == "structured":
-        return _structured_biorthogonal_overlap(
+        value = _structured_biorthogonal_overlap(
             bra,
             ket,
             bra_state_ids=bra_state_ids,
             ket_state_ids=ket_state_ids,
             s=s,
         )
+        if return_info:
+            return value, {
+                "backend": "structured",
+                "exact": True,
+                "sector_preserving": False,
+                "determinant_expansion": True,
+            }
+        return value
     if backend == "mpo":
-        return _mpo_biorthogonal_overlap(
+        value = _mpo_biorthogonal_overlap(
             bra,
             ket,
             bra_state_ids=bra_state_ids,
@@ -820,6 +1007,13 @@ def biorthogonal_overlap(
             identity_tol=identity_tol,
             phase_align_tol=phase_align_tol,
         )
+        if return_info:
+            return value, {
+                "backend": "mpo",
+                "exact": False,
+                "sector_preserving": False,
+            }
+        return value
     raise ValueError(f"Unsupported biorthogonal overlap backend: {backend!r}.")
 
 

@@ -32,10 +32,8 @@ from .finite_size import (
 )
 from .integrals import (
     full_ewald_orbital_pair_coupling,
-    gdf_orbital_pair_coupling,
     prebuild_gdf_q_ao_stores,
     gdf_transition_factors,
-    pyscf_gdf_orbital_pair_coupling,
     pyscf_gdf_transition_factors,
     reciprocal_orbital_pair_factors,
 )
@@ -515,13 +513,27 @@ def _prebuild_screened_interactions(
     return summaries
 
 
-def _cached_transition_factors(cache, space, q_index, g2_tol):
-    key = (_space_cache_id(space), int(q_index), float(g2_tol))
+def _cached_transition_factors(
+    cache,
+    space,
+    q_index,
+    g2_tol,
+    coulomb_component=RECIPROCAL_EWALD_LR,
+):
+    component = normalize_coulomb_component(coulomb_component)
+    key = (_space_cache_id(space), int(q_index), component, float(g2_tol))
     if key not in cache.transition_factors:
-        cache.transition_factors[key] = space.reciprocal_factors(
-            q_index,
-            g2_tol=g2_tol,
-        )
+        if is_pyscf_gdf_component(component):
+            factors = pyscf_gdf_transition_factors(space, q_index=q_index)
+        elif is_gdf_component(component):
+            factors = gdf_transition_factors(
+                space,
+                q_index=q_index,
+                g2_tol=g2_tol,
+            )
+        else:
+            factors = space.reciprocal_factors(q_index, g2_tol=g2_tol)
+        cache.transition_factors[key] = factors
     return cache.transition_factors[key]
 
 
@@ -561,27 +573,44 @@ def _cached_bare_coupling(
             right_band=right_band,
         )
     elif is_pyscf_gdf_component(coulomb_component):
-        bare_coupling = pyscf_gdf_orbital_pair_coupling(
-            space,
-            q_index=q_index,
-            k_index=k_index,
-            kq_index=kq_index,
-            left_band=left_band,
-            right_band=right_band,
+        if transition_factors is None:
+            transition_factors = _cached_transition_factors(
+                cache,
+                space,
+                q_index,
+                g2_tol,
+                coulomb_component,
+            )
+        bare_coupling = transition_factors.orbital_pair_coupling(
+            k_index,
+            kq_index,
+            left_band,
+            right_band,
         )
     elif is_gdf_component(coulomb_component):
-        bare_coupling = gdf_orbital_pair_coupling(
-            space,
-            q_index=q_index,
-            k_index=k_index,
-            kq_index=kq_index,
-            left_band=left_band,
-            right_band=right_band,
-            g2_tol=g2_tol,
+        if transition_factors is None:
+            transition_factors = _cached_transition_factors(
+                cache,
+                space,
+                q_index,
+                g2_tol,
+                coulomb_component,
+            )
+        bare_coupling = transition_factors.orbital_pair_coupling(
+            k_index,
+            kq_index,
+            left_band,
+            right_band,
         )
     else:
         if transition_factors is None:
-            transition_factors = _cached_transition_factors(cache, space, q_index, g2_tol)
+            transition_factors = _cached_transition_factors(
+                cache,
+                space,
+                q_index,
+                g2_tol,
+                coulomb_component,
+            )
         pair_key = (
             _space_cache_id(space),
             int(q_index),
@@ -774,6 +803,65 @@ def _gdf_prebuild_info(
 ):
     if not prebuild_gdf or not is_gdf_component(coulomb_component):
         return {}
+    backend = getattr(space.reference._pbc_mf, "with_df", None)
+    persistent_protocol = (
+        "cderi",
+        "metric_info",
+        "find_qpoint_index",
+        "pair_keys",
+    )
+    if backend is not None and all(
+        hasattr(backend, name) for name in persistent_protocol
+    ):
+        normalized_q = (
+            list(range(len(space.qpts)))
+            if q_indices is None
+            else [space.normalize_q_index(q_index) for q_index in q_indices]
+        )
+        normalized_q = list(dict.fromkeys(normalized_q))
+        worker_count = min(
+            _screening_workers(prebuild_gdf_workers),
+            max(1, len(normalized_q)),
+        )
+
+        def build_one(q_index):
+            t0 = time.perf_counter()
+            factors = gdf_transition_factors(
+                space,
+                q_index=q_index,
+                g2_tol=g2_tol,
+            )
+            timings = dict(factors.build_timings)
+            timings.update(
+                {
+                    "prebuild": True,
+                    "prebuild_workers": int(worker_count),
+                    "prebuild_parallel": bool(worker_count > 1),
+                    "total_seconds": float(time.perf_counter() - t0),
+                }
+            )
+            return {
+                "q_index": int(q_index),
+                "q_vector": np.asarray(space.qpts[q_index], dtype=float).tolist(),
+                "auxbasis": factors.auxbasis,
+                "aux_coord_type": factors.aux_coord_type,
+                "naux_cart": int(factors.naux_cart),
+                "metric_rank": int(factors.metric_rank),
+                "pair_blocks": int(len(factors.pair_blocks)),
+                "timings": timings,
+            }
+
+        t0 = time.perf_counter()
+        if worker_count <= 1 or len(normalized_q) <= 1:
+            summaries = [build_one(q_index) for q_index in normalized_q]
+        else:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                summaries = list(executor.map(build_one, normalized_q))
+        return {
+            "gdf_prebuild": summaries,
+            "gdf_prebuild_backend": "persistent_ao",
+            "gdf_prebuild_seconds": float(time.perf_counter() - t0),
+        }
     summaries = prebuild_gdf_q_ao_stores(
         space,
         q_indices=q_indices,
@@ -1252,8 +1340,14 @@ def diagonal_correlation_self_energy(
         if poles.nmodes == 0:
             continue
         transition_factors = None
-        if poles.coulomb_component == RECIPROCAL_EWALD_LR:
-            transition_factors = _cached_transition_factors(cache, space, q_index, g2_tol)
+        if poles.coulomb_component in (RECIPROCAL_EWALD_LR, GDF, PYSCF_GDF):
+            transition_factors = _cached_transition_factors(
+                cache,
+                space,
+                q_index,
+                g2_tol,
+                poles.coulomb_component,
+            )
 
         q_sigma = np.zeros_like(omega_eval, dtype=np.complex128)
         weights_rows = []

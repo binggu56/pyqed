@@ -84,7 +84,7 @@ from scipy import sparse
 
 #imports for mpo and dmrg calculation
 import logging
-from pyqed.mps import MPO
+from pyqed.mps import MPO, MPS
 from pyqed.mps.autompo.model import Model
 from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSHO, BasisHalfSpin, BasisSpin
@@ -474,8 +474,13 @@ class SBM:
             init_mps.append(A_boson)
 
         # 6. Return DMRG Object
-        return DMRG_Solver(self.H, D=D, nsweeps=nsweeps, \
-                               init_guess=init_mps, not_conv_err=True)
+        return DMRG_Solver(
+            self.H,
+            D=D,
+            nsweeps=nsweeps,
+            init_guess=MPS(init_mps, sites=self.H.input_sites),
+            not_conv_err=True,
+        )
         
 
 

@@ -8,7 +8,7 @@ import pyqed.mps.nonabelian.update as update_mod
 from pyqed.mps.nonabelian import (
     FullyReducedSpatialOrbitalSite,
     MPO,
-    PhysicalLeg,
+    Leg,
     RankCoupledMPO,
     SiteOperator,
     AutoMPO,
@@ -169,8 +169,8 @@ def test_explicit_basis_descriptors_recover_tensor_axis_layouts():
     assert left.dims == {vac: 2, spin: 1}
     assert left.direction == -1
     assert left.slices()[vac] == slice(0, 2)
-    assert phys.as_physical_leg().dim(spin) == 3
-    assert phys.as_physical_leg().dim(vac) == 4
+    assert phys.as_physical_leg().sector_dim(spin) == 3
+    assert phys.as_physical_leg().sector_dim(vac) == 4
 
 
 def test_two_site_basis_wraps_current_packed_layout_exactly():
@@ -1924,11 +1924,11 @@ def _site_operator_mpo_for_sites(sites):
         dims = {}
         for key, block in site.data.items():
             dims.setdefault(key[1], block.shape[1])
-        phys_leg = PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+        phys_leg = Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
         op_blocks = {}
         offset = 0
         for sector in phys_leg.sectors:
-            dim = phys_leg.dim(sector)
+            dim = phys_leg.sector_dim(sector)
             op_blocks[(sector, sector)] = np.diag(np.arange(offset, offset + dim, dtype=float))
             offset += dim
         site_op = SiteOperator(
@@ -1946,7 +1946,7 @@ def _identity_mpo_for_sites(sites):
         dims = {}
         for key, block in site.data.items():
             dims.setdefault(key[1], block.shape[1])
-        phys_leg = PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+        phys_leg = Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
         mpo.append(MPO.from_site_operator(identity_operator(phys_leg)))
     return mpo
 
@@ -1955,11 +1955,11 @@ def _number_operator_for_site(site):
     dims = {}
     for key, block in site.data.items():
         dims.setdefault(key[1], block.shape[1])
-    phys_leg = PhysicalLeg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
+    phys_leg = Leg.from_dims(dims, sectors=tuple(dict.fromkeys(site.qns[1])))
     blocks = {}
     offset = 0
     for sector in phys_leg.sectors:
-        dim = phys_leg.dim(sector)
+        dim = phys_leg.sector_dim(sector)
         blocks[(sector, sector)] = np.diag(np.arange(offset, offset + dim, dtype=float))
         offset += dim
     return SiteOperator(blocks=blocks, phys_out_leg=phys_leg, phys_in_leg=phys_leg)
@@ -2036,7 +2036,7 @@ def test_block_sparse_mpo_core_carries_intrinsic_physical_leg_metadata():
     dense_core = _three_site_dense_mpo()[0]
     sparse_core = _block_sparse_mpo_for_sites([A], [dense_core])[0]
 
-    assert isinstance(sparse_core.phys_out_leg, PhysicalLeg)
+    assert isinstance(sparse_core.phys_out_leg, Leg)
     assert sparse_core.phys_out_leg == sparse_core.phys_in_leg
     assert sparse_core.phys_out_leg.sectors == tuple(dict.fromkeys(A.qns[1]))
     assert sparse_core.phys_out_leg.total_dim == dense_core.shape[2]
@@ -2045,7 +2045,7 @@ def test_block_sparse_mpo_core_carries_intrinsic_physical_leg_metadata():
 
 def test_block_sparse_site_operator_builds_mpo_core_directly():
     A, _, _ = _three_site_chain()
-    phys_leg = PhysicalLeg.from_dims({A.qns[1][0]: 2}, sectors=(A.qns[1][0],))
+    phys_leg = Leg.from_dims({A.qns[1][0]: 2}, sectors=(A.qns[1][0],))
     site_op = SiteOperator(
         blocks={(A.qns[1][0], A.qns[1][0]): np.diag([0.0, 1.0])},
         phys_out_leg=phys_leg,
@@ -3939,6 +3939,50 @@ def test_reduced_truncation_ranks_multiplets_by_weighted_norm():
 
     assert tuple(truncation.singular_values_by_sector()) == (triplet,)
     assert truncation.trunc_err == pytest.approx(1.0 / (1.0 + 3.0 * 0.7**2))
+
+
+def test_reduced_svd_truncation_error_includes_cutoff_discarded_weight():
+    singlet = _charge_spin_sector(0, 0)
+    key = ((singlet,), (2,), 0)
+    pipe = FusionPipe.from_entries(
+        child_legs=(0,),
+        child_sector_lists=((singlet,),),
+        child_dirs=(1,),
+        fused_sectors=(singlet,),
+        entries=(
+            FusionPipeEntry(
+                child_sectors=(singlet,),
+                fused_sector=singlet,
+                slot=0,
+                offset=0,
+                local_dim=2,
+                selected_shape=(2,),
+            ),
+        ),
+        orientation=1,
+        coupling="left",
+    )
+    projection = ReducedProjectedSector(
+        sector=singlet,
+        left_pipe=pipe,
+        right_pipe=pipe,
+        left_basis_map={key: np.eye(2)},
+        right_basis_map={key: np.eye(2)},
+        blocks={(key, key): np.diag([1.0, 1.0e-3])},
+        dtype=float,
+    )
+    svd = projection.svd(full_matrices=False)
+
+    truncation = truncate_reduced_svds(
+        {singlet: svd},
+        cutoff=1.0e-2,
+        max_bond=None,
+        mode="reduced",
+    )
+
+    assert truncation.kept == 1
+    assert truncation.full_sq_norm == pytest.approx(1.0 + 1.0e-6)
+    assert truncation.trunc_err == pytest.approx(1.0e-6 / (1.0 + 1.0e-6))
 
 
 def test_combine_and_split_legs_round_trip():

@@ -1,12 +1,12 @@
 rdir = 'D:\uci_files\thio-uracil\';
 
 [s0min,mass] = ReadXyz([rdir 's0min.xyz'],2);
-s0min = s0min./0.5291772083;
+s0min = s0min./0.529177210544;
 s2min = ReadXyz([rdir 's2min.xyz'],2);
-s2min = SatisfyEckart(s0min,s2min,mass(1,:))./0.5291772083;
+s2min = SatisfyEckart(s0min,s2min,mass(1,:))./0.529177210544;
 % s2min = SatisfyEckart(s0min,s2min,mass(1,:));
 coin = ReadXyz([rdir 's2s1coin.xyz'],2);
-coin = SatisfyEckart(s0min,coin,mass(1,:))./0.5291772083;
+coin = SatisfyEckart(s0min,coin,mass(1,:))./0.529177210544;
 % coin = SatisfyEckart(s0min,coin,mass(1,:));
 
 v1 = coin - s0min;
@@ -25,8 +25,8 @@ gmatu = BuildGmatND(s0min,mass(1,:),coord);
 
 
 %% Points necessary in each dimension
-q1 = (-0.5:0.1:1)./0.5291772083;
-q2 = (-0.5:0.1:0.5)./0.5291772083;
+q1 = (-0.5:0.1:1)./0.529177210544;
+q2 = (-0.5:0.1:0.5)./0.529177210544;
 
 Tmax = 3.5 ;                % potential energy gained by the wp [eV] x 1.5
 Tmax = Tmax / 27.21;        % [eV] to [au]

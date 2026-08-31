@@ -29,6 +29,98 @@ _LAZY_IMPORTS = {
         "pyqed.pbc.gw.bse_operator",
         "periodic_tda_operator",
     ),
+    "ProjectedTDAContinuum": (
+        "pyqed.pbc.gw.embedding",
+        "ProjectedTDAContinuum",
+    ),
+    "ExcitonPhononChannel": (
+        "pyqed.pbc.gw.embedding",
+        "ExcitonPhononChannel",
+    ),
+    "ExcitonPhononContinuum": (
+        "pyqed.pbc.gw.embedding",
+        "ExcitonPhononContinuum",
+    ),
+    "ExcitonPhononCoupling": (
+        "pyqed.pbc.gw.embedding",
+        "ExcitonPhononCoupling",
+    ),
+    "TotalMomentumSector": (
+        "pyqed.pbc.gw.embedding",
+        "TotalMomentumSector",
+    ),
+    "bose_occupation": (
+        "pyqed.pbc.gw.embedding",
+        "bose_occupation",
+    ),
+    "PeriodicTDAElectronPhononDerivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "PeriodicTDAElectronPhononDerivative",
+    ),
+    "analytic_tda_electron_phonon_coupling": (
+        "pyqed.pbc.gw.electron_phonon",
+        "analytic_tda_electron_phonon_coupling",
+    ),
+    "commensurate_tda_electron_phonon_coupling": (
+        "pyqed.pbc.gw.electron_phonon",
+        "commensurate_tda_electron_phonon_coupling",
+    ),
+    "commensurate_gdf_bare_tda_kernel_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "commensurate_gdf_bare_tda_kernel_derivative",
+    ),
+    "CommensurateGDFScreenedInteractionDerivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "CommensurateGDFScreenedInteractionDerivative",
+    ),
+    "GDFQDerivativeFactors": (
+        "pyqed.pbc.gw.electron_phonon",
+        "GDFQDerivativeFactors",
+    ),
+    "gdf_q_derivative_factors": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gdf_q_derivative_factors",
+    ),
+    "commensurate_gdf_screened_tda_kernel_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "commensurate_gdf_screened_tda_kernel_derivative",
+    ),
+    "validate_commensurate_gdf_screened_tda_kernel_derivative": (
+        "pyqed.pbc.gw.derivative_validation",
+        "validate_commensurate_gdf_screened_tda_kernel_derivative",
+    ),
+    "electron_phonon_mo_couplings": (
+        "pyqed.pbc.gw.electron_phonon",
+        "electron_phonon_mo_couplings",
+    ),
+    "gamma_tda_electron_phonon_coupling": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gamma_tda_electron_phonon_coupling",
+    ),
+    "gamma_gdf_bare_tda_kernel_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gamma_gdf_bare_tda_kernel_derivative",
+    ),
+    "GammaGDFScreenedInteractionDerivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "GammaGDFScreenedInteractionDerivative",
+    ),
+    "gamma_gdf_screened_interaction_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gamma_gdf_screened_interaction_derivative",
+    ),
+    "gamma_gdf_screened_tda_kernel_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gamma_gdf_screened_tda_kernel_derivative",
+    ),
+    "gamma_gdf_diagonal_self_energy_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gamma_gdf_diagonal_self_energy_derivative",
+    ),
+    "gamma_gdf_g0w0_energy_derivative": (
+        "pyqed.pbc.gw.electron_phonon",
+        "gamma_gdf_g0w0_energy_derivative",
+    ),
     "COULOMB_BACKGROUND": ("pyqed.pbc.gw.coulomb", "COULOMB_BACKGROUND"),
     "FULL_EWALD": ("pyqed.pbc.gw.coulomb", "FULL_EWALD"),
     "GDF": ("pyqed.pbc.gw.coulomb", "GDF"),
@@ -103,6 +195,7 @@ _LAZY_IMPORTS = {
         "gdf_orbital_pair_coupling",
     ),
     "gdf_orbital_pair_metric": ("pyqed.pbc.gw.integrals", "gdf_orbital_pair_metric"),
+    "gdf_mo_jk": ("pyqed.pbc.gw.integrals", "gdf_mo_jk"),
     "gdf_transition_factors": ("pyqed.pbc.gw.integrals", "gdf_transition_factors"),
     "attach_pyscf_gdf_context": (
         "pyqed.pbc.gw.integrals",

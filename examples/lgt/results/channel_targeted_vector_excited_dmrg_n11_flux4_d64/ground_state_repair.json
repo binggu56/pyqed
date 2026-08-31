@@ -1,0 +1,117 @@
+{
+  "description": "Single-state repair of metastable high-flux vacuum",
+  "flux_cutoff": 4,
+  "bond_dim": 128,
+  "half_sweeps": 20,
+  "initial_energy": -16.226231626103754,
+  "final_energy": -16.353435932059913,
+  "wall_seconds": 60.90237016696483,
+  "converged": false,
+  "history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energy": -16.320702712163097
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energy": -16.335399400709086
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energy": -16.344066925617735
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energy": -16.348464458120144
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energy": -16.31128326255837
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energy": -16.352404354521997
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energy": -16.35321767317003
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energy": -16.353727152557607
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energy": -16.35409331941806
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energy": -16.3543547335569
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energy": -16.354527904566755
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energy": -16.341413697890353
+    },
+    {
+      "sweep": 12,
+      "direction": "lr",
+      "energy": -16.354337162989594
+    },
+    {
+      "sweep": 13,
+      "direction": "rl",
+      "energy": -16.354660693557605
+    },
+    {
+      "sweep": 14,
+      "direction": "lr",
+      "energy": -16.35478291732211
+    },
+    {
+      "sweep": 15,
+      "direction": "rl",
+      "energy": -16.35485557165678
+    },
+    {
+      "sweep": 16,
+      "direction": "lr",
+      "energy": -16.353096987481628
+    },
+    {
+      "sweep": 17,
+      "direction": "rl",
+      "energy": -16.335646060609257
+    },
+    {
+      "sweep": 18,
+      "direction": "lr",
+      "energy": -16.352570367226193
+    },
+    {
+      "sweep": 19,
+      "direction": "rl",
+      "energy": -16.31172966432536
+    },
+    {
+      "sweep": 20,
+      "direction": "recenter-right",
+      "energy": -16.35343593206
+    }
+  ]
+}

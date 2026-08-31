@@ -8,6 +8,7 @@ Heisenberg model
 @author: Shuoyi Hu, Bing Gu (gubing at westlake dot edu dot cn)
 """
 from pyqed.mps import TDMPS, MPO, MPS
+from pyqed.lattice import Site
 import numpy as np
 import logging
 
@@ -19,6 +20,7 @@ class Heisenberg:
         self.L = L
         self.d = 2 # local dim
         self.J = J
+        self.sites = tuple(Site.spin_half() for _ in range(self.L))
 
         ####DO NOT MODIFY###
         self.H = None
@@ -49,7 +51,7 @@ class Heisenberg:
 
         # Construct full list
         H_factors = [Wfirst] + ([W] * (N - 2)) + [Wlast]
-        self.H = MPO(H_factors)
+        self.H = MPO(H_factors, sites=self.sites, input_sites=self.sites)
         return self.H
 
     def build_neel_state(self):
@@ -68,7 +70,7 @@ class Heisenberg:
             else:
                 B[0, 1, 0] = 1.0 # Down
             factors.append(B)
-        return MPS(factors, labels=['lv', 'p', 'rv'])
+        return MPS(factors, labels=['lv', 'p', 'rv'], sites=self.sites)
 
     def build_ferromagnetic_state(self):
         """
@@ -82,7 +84,7 @@ class Heisenberg:
             B = np.zeros((1, 2, 1))
             B[0, 0, 0] = 1.0 # Up
             factors.append(B)
-        return MPS(factors, labels=['lv', 'p', 'rv'])
+        return MPS(factors, labels=['lv', 'p', 'rv'], sites=self.sites)
 
     def TDDMRG(self, D=20, **kwargs):
         """
@@ -143,7 +145,7 @@ class Heisenberg:
 
 class XYZ:
     def __init__(self, L=12, L0=4, Jx=1, Jy=1, Jz=1):
-        """
+        r"""
         NRG for Heisenberg XYZ model
 
         .. math::
@@ -185,7 +187,7 @@ class XYZ:
 
 
 def _XYZ_NRG(L=12, L0=4, JX=1, JY=1, JZ=1):
-    """
+    r"""
     NRG for Heisenberg XYZ model
 
     .. math::

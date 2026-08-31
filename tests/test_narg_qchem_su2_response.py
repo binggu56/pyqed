@@ -79,9 +79,7 @@ from pyqed.qchem.mcscf.orbopt import rotate_orbitals
 
 
 def _build_cpp_integrals(molecule):
-    molecule.build(
-        driver="builtin",
-        eri="dense",
+    molecule.build(eri="dense",
         aosym="s1",
         options={"eri_backend": "cpp"},
     )

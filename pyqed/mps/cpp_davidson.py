@@ -21,6 +21,10 @@ dense_environment_update_left = None
 dense_environment_update_right = None
 DenseDavidsonWorkspace = None
 DenseSweepWorkspace = None
+openmp_available = None
+set_num_threads = None
+get_num_threads = None
+openmp_info = None
 lapack_svd = None
 lapack_qr = None
 abelian_two_site_svd_from_permuted_data = None
@@ -143,6 +147,49 @@ def _darwin_compile_setup():
     return cxx, flags
 
 
+def _openmp_build_setup():
+    """Return compiler/linker flags for optional native DMRG OpenMP."""
+    requested = os.environ.get("PYQED_MPS_OPENMP", "auto").strip().lower()
+    if requested in {"0", "false", "no", "off"}:
+        return [], [], "disabled"
+    if sys.platform == "win32":
+        return ["/openmp"], [], "msvc"
+    if sys.platform != "darwin":
+        return ["-fopenmp"], ["-fopenmp"], "gnu"
+
+    prefixes = []
+    explicit = os.environ.get("PYQED_OPENMP_PREFIX")
+    if explicit:
+        prefixes.append(Path(explicit))
+    prefixes.extend((Path("/opt/homebrew/opt/libomp"), Path("/usr/local/opt/libomp")))
+    prefixes.extend(
+        Path(value)
+        for value in (sys.prefix, os.environ.get("CONDA_PREFIX"))
+        if value
+    )
+    prefixes = list(dict.fromkeys(prefixes))
+    for prefix in prefixes:
+        include = prefix / "include"
+        library = prefix / "lib"
+        dylib = library / "libomp.dylib"
+        archive = library / "libomp.a"
+        runtime = dylib if dylib.exists() else archive
+        if (include / "omp.h").exists() and runtime.exists():
+            link_flags = [str(runtime)]
+            if runtime.suffix == ".dylib":
+                link_flags.append("-Wl,-rpath," + str(library))
+            return (
+                ["-Xpreprocessor", "-fopenmp", "-I" + str(include)],
+                link_flags,
+                str(prefix),
+            )
+    if requested in {"1", "true", "yes", "on", "required"}:
+        raise RuntimeError(
+            "OpenMP was requested but libomp was not found; set PYQED_OPENMP_PREFIX"
+        )
+    return [], [], "unavailable"
+
+
 def _compile_extension():
     global CPP_DAVIDSON_BUILD_ERROR
 
@@ -168,6 +215,13 @@ def _compile_extension():
     fail_stamp_path = build_dir / "_cpp_davidson.failed"
     source_mtime = str(source.stat().st_mtime_ns)
     core_mtime = str(core_header.stat().st_mtime_ns) if core_header.exists() else "missing"
+    try:
+        openmp_compile_flags, openmp_link_flags, openmp_signature = (
+            _openmp_build_setup()
+        )
+    except Exception as exc:
+        CPP_DAVIDSON_BUILD_ERROR = str(exc)
+        return None
     compile_signature = "|".join(
         [
             source.name,
@@ -178,6 +232,7 @@ def _compile_extension():
             sysconfig.get_config_var("CXX") or "",
             os.environ.get("CXX", ""),
             "mcpu=native" if sys.platform == "darwin" else "generic-cpu",
+            "openmp=" + openmp_signature,
         ]
     )
     force_rebuild = _enabled(
@@ -215,12 +270,14 @@ def _compile_extension():
             "-shared",
             "-fPIC",
             *darwin_flags,
+            *openmp_compile_flags,
             "-I" + sysconfig.get_paths()["include"],
             "-I" + pybind11.get_include(),
             "-I" + np.get_include(),
             str(source),
             "-o",
             str(ext_path),
+            *openmp_link_flags,
         ]
     )
     if sys.platform == "darwin":
@@ -267,6 +324,10 @@ def _initialize():
     global dense_environment_update_right
     global DenseDavidsonWorkspace
     global DenseSweepWorkspace
+    global openmp_available
+    global set_num_threads
+    global get_num_threads
+    global openmp_info
     global lapack_svd
     global lapack_qr
     global abelian_two_site_svd_from_permuted_data
@@ -396,6 +457,10 @@ def _initialize():
     )
     DenseDavidsonWorkspace = getattr(module, "DenseDavidsonWorkspace", None)
     DenseSweepWorkspace = getattr(module, "DenseSweepWorkspace", None)
+    openmp_available = getattr(module, "openmp_available", None)
+    set_num_threads = getattr(module, "set_num_threads", None)
+    get_num_threads = getattr(module, "get_num_threads", None)
+    openmp_info = getattr(module, "openmp_info", None)
     lapack_svd = getattr(module, "lapack_svd", None)
     lapack_qr = getattr(module, "lapack_qr", None)
     abelian_two_site_svd_from_permuted_data = getattr(

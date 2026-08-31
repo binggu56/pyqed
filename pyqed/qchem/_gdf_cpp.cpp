@@ -712,6 +712,34 @@ bool validate_product_factor_ids(
     return true;
 }
 
+inline bool cached_product_factor_is_zero(
+    npy_int64 factor_id,
+    const std::vector<double>* factor_real,
+    const std::vector<double>* factor_imag,
+    const std::vector<npy_intp>* factor_seen = nullptr,
+    npy_intp current_stamp = 0) {
+    if (factor_id < 0 || factor_real == nullptr || factor_imag == nullptr) {
+        return false;
+    }
+    const size_t index = static_cast<size_t>(factor_id);
+    if (index >= factor_real->size() || index >= factor_imag->size()) {
+        return false;
+    }
+    if (factor_seen != nullptr
+        && (index >= factor_seen->size() || (*factor_seen)[index] != current_stamp)) {
+        return false;
+    }
+    return (*factor_real)[index] == 0.0 && (*factor_imag)[index] == 0.0;
+}
+
+inline double positive_integer_power(double base, npy_int64 exponent) {
+    double value = 1.0;
+    for (npy_int64 order = 0; order < exponent; ++order) {
+        value *= base;
+    }
+    return value;
+}
+
 template <typename AccumulateImage>
 inline void for_each_image_group_sum(
     npy_intp pair_idx,
@@ -771,6 +799,16 @@ inline void for_each_image_group_sum(
             if (product < 0 || product >= nproduct) {
                 continue;
             }
+            const npy_int64 factor_id =
+                product_factor_id_ptr == nullptr ? -1 : product_factor_id_ptr[product];
+            if (cached_product_factor_is_zero(
+                    factor_id,
+                    product_factor_real,
+                    product_factor_imag,
+                    product_factor_seen,
+                    product_factor_current_stamp)) {
+                continue;
+            }
             accumulate_product_group(
                 product_term_start_ptr[product],
                 product_term_stop_ptr[product],
@@ -793,7 +831,7 @@ inline void for_each_image_group_sum(
                 gz_power_imag,
                 image_sum_real,
                 image_sum_imag,
-                product_factor_id_ptr == nullptr ? -1 : product_factor_id_ptr[product],
+                factor_id,
                 product_factor_seen,
                 product_factor_real,
                 product_factor_imag,
@@ -862,6 +900,14 @@ inline void for_each_image_group_sum_zero_power(
             double factor_imag = 0.0;
             const npy_int64 product_factor_id =
                 product_factor_id_ptr == nullptr ? -1 : product_factor_id_ptr[product];
+            if (cached_product_factor_is_zero(
+                    product_factor_id,
+                    product_factor_real,
+                    product_factor_imag,
+                    product_factor_seen,
+                    product_factor_current_stamp)) {
+                continue;
+            }
             const bool use_product_factor_cache =
                 product_factor_real != nullptr
                 && product_factor_imag != nullptr
@@ -1636,12 +1682,13 @@ PyObject* periodic_pair_ft_primitive_sum_many(PyObject*, PyObject* args) {
     PyObject* phases_obj = nullptr;
     int nleft = 0;
     int nright = 0;
+    double factor_screen_tol = 0.0;
     int plane_z_int = 0;
     int explicit_threads = 0;
 
     if (!PyArg_ParseTuple(
             args,
-            "OOOiiOOOOOOOOOOOOOOOOp|i",
+            "OOOiiOOOOOOOOOOOOOOOOdp|i",
             &gvecs_obj,
             &pair_p_obj,
             &pair_q_obj,
@@ -1663,12 +1710,17 @@ PyObject* periodic_pair_ft_primitive_sum_many(PyObject*, PyObject* args) {
             &product_term_stop_obj,
             &product_factor_id_obj,
             &phases_obj,
+            &factor_screen_tol,
             &plane_z_int,
             &explicit_threads)) {
         return nullptr;
     }
     if (nleft < 0 || nright < 0) {
         PyErr_SetString(PyExc_ValueError, "nleft and nright must be non-negative.");
+        return nullptr;
+    }
+    if (!std::isfinite(factor_screen_tol) || factor_screen_tol < 0.0) {
+        PyErr_SetString(PyExc_ValueError, "factor_screen_tol must be non-negative and finite.");
         return nullptr;
     }
 
@@ -1860,17 +1912,38 @@ PyObject* periodic_pair_ft_primitive_sum_many(PyObject*, PyObject* args) {
         max_power_z = std::max(max_power_z, std::max<npy_int64>(0, power_ptr[3 * term + 2]));
     }
     std::vector<double> product_coeff_sum(static_cast<size_t>(nproduct), 0.0);
+    std::vector<double> factor_coeff_abs_sum(static_cast<size_t>(nfactor), 0.0);
+    std::vector<npy_int64> factor_max_power_x(static_cast<size_t>(nfactor), 0);
+    std::vector<npy_int64> factor_max_power_y(static_cast<size_t>(nfactor), 0);
+    std::vector<npy_int64> factor_max_power_z(static_cast<size_t>(nfactor), 0);
     for (npy_intp product = 0; product < nproduct; ++product) {
         const npy_int64 term_begin = product_term_start_ptr[product];
         const npy_int64 term_end = product_term_stop_ptr[product];
+        const npy_int64 factor_id = product_factor_id_ptr[product];
         double coeff_sum = 0.0;
         for (npy_int64 term = term_begin; term < term_end; ++term) {
             if (term >= 0 && term < nterm) {
                 coeff_sum += coeff_ptr[term];
+                if (factor_id >= 0 && factor_id < nfactor) {
+                    const size_t factor_index = static_cast<size_t>(factor_id);
+                    factor_coeff_abs_sum[factor_index] += std::abs(coeff_ptr[term]);
+                    factor_max_power_x[factor_index] = std::max(
+                        factor_max_power_x[factor_index],
+                        std::max<npy_int64>(0, power_ptr[3 * term + 0]));
+                    factor_max_power_y[factor_index] = std::max(
+                        factor_max_power_y[factor_index],
+                        std::max<npy_int64>(0, power_ptr[3 * term + 1]));
+                    factor_max_power_z[factor_index] = std::max(
+                        factor_max_power_z[factor_index],
+                        std::max<npy_int64>(0, power_ptr[3 * term + 2]));
+                }
             }
         }
         product_coeff_sum[static_cast<size_t>(product)] = coeff_sum;
     }
+    const double per_factor_screen_tol = nfactor > 0
+        ? factor_screen_tol / static_cast<double>(nfactor)
+        : 0.0;
     std::vector<unsigned char> pair_has_power(static_cast<size_t>(npair), 0);
     if (!all_zero_powers) {
         for (npy_intp pair_idx = 0; pair_idx < npair; ++pair_idx) {
@@ -1963,17 +2036,34 @@ PyObject* periodic_pair_ft_primitive_sum_many(PyObject*, PyObject* args) {
                         continue;
                     }
                     const size_t factor_index = static_cast<size_t>(factor);
-                    gaussian_product_plane_factor_values(
-                        product_factor_center_x[factor_index],
-                        product_factor_center_y[factor_index],
-                        product_factor_center_z[factor_index],
-                        product_factor_inv_4p[factor_index],
-                        gxv,
-                        gyv,
-                        gzv,
-                        g2,
-                        product_factor_real[factor_index],
-                        product_factor_imag[factor_index]);
+                    const double scale = std::exp(
+                        -g2 * product_factor_inv_4p[factor_index]);
+                    if (per_factor_screen_tol > 0.0) {
+                        double bound = scale * factor_coeff_abs_sum[factor_index];
+                        bound *= positive_integer_power(
+                            std::max(1.0, std::abs(gxv)),
+                            factor_max_power_x[factor_index]);
+                        bound *= positive_integer_power(
+                            std::max(1.0, std::abs(gyv)),
+                            factor_max_power_y[factor_index]);
+                        bound *= positive_integer_power(
+                            std::max(1.0, std::abs(gzv)),
+                            factor_max_power_z[factor_index]);
+                        if (bound <= per_factor_screen_tol) {
+                            product_factor_real[factor_index] = 0.0;
+                            product_factor_imag[factor_index] = 0.0;
+                            continue;
+                        }
+                    }
+                    const double phase_arg =
+                        gxv * product_factor_center_x[factor_index]
+                        + gyv * product_factor_center_y[factor_index]
+                        + gzv * product_factor_center_z[factor_index];
+                    double sin_phase = 0.0;
+                    double cos_phase = 0.0;
+                    sincos_values(phase_arg, sin_phase, cos_phase);
+                    product_factor_real[factor_index] = scale * cos_phase;
+                    product_factor_imag[factor_index] = -scale * sin_phase;
                 }
             }
             if (use_power_product_cache) {

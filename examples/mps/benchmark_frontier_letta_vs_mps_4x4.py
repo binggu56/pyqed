@@ -204,7 +204,7 @@ def _run_mps_d8(
         davidson_max_iter=100,
         noise=0.0,
         recenter_final=False,
-        performance="generic",
+        performance="reference",
     ).run()
     optimization_seconds = perf_counter() - start
     diagnostics = _vector_diagnostics(

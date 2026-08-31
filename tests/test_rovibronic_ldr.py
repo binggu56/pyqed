@@ -33,11 +33,10 @@ def _prefer_source_package():
 
 def test_rovibronic_modules_import():
     _prefer_source_package()
-    from pyqed.namd.triatom import Triatom as LegacyTriatom
-    from pyqed.namd.triatomic import Triatom
+    from pyqed.namd import Triatomic
+    from pyqed.namd.triatomic import Triatomic as DirectTriatomic
 
-    assert Triatom is not None
-    assert LegacyTriatom is not None
+    assert Triatomic is DirectTriatomic
 
 
 def test_triatomic_normalizes_uam1_meci_aliases():
@@ -194,6 +193,49 @@ def test_triatomic_quadrature_normalized_conversion():
 
     np.testing.assert_allclose(mol.from_quadrature_normalized(coeffs), psi_values)
     np.testing.assert_allclose(mol.norm(coeffs) ** 2, np.sum(mol.grid_weights))
+
+
+def test_triatomic_generic_a_bc_jacobi_coordinates():
+    _prefer_source_package()
+    from pyqed.namd.triatomic import Triatom
+
+    atom = [
+        ["C", (1.0, 0.0, 0.0)],
+        ["O", (0.0, 0.0, 0.0)],
+        ["H", (0.0, 1.0, 0.0)],
+    ]
+    mol = Triatom(
+        atom,
+        nstates=1,
+        charge=1,
+        spin=0,
+        unit="bohr",
+        coordinates="jacobi",
+        jacobi_atoms=(2, 0, 1),
+    )
+
+    r, R, gamma = 1.4, 2.1, 1.0
+    xyz = mol.internal_to_xyz(r, R, gamma)
+
+    masses = mol.mass
+    m_b, m_c = [masses[i] for i in (0, 1)]
+    expected = np.zeros((3, 3), dtype=float)
+    expected[2] = np.array([R * np.cos(gamma), R * np.sin(gamma), 0.0])
+    expected[0] = np.array([-m_c / (m_b + m_c) * r, 0.0, 0.0])
+    expected[1] = np.array([m_b / (m_b + m_c) * r, 0.0, 0.0])
+
+    np.testing.assert_allclose(xyz, expected)
+
+    r1, r2, theta = 1.8, 1.3, 0.9
+    jacobi = mol.valence_to_jacobi(r1, r2, theta)
+    bc_axis = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=float)
+    bc_com = m_c / (m_b + m_c) * r2 * bc_axis
+    rvec = np.array([r1, 0.0, 0.0], dtype=float) - bc_com
+    expected_gamma = float(np.arccos(np.dot(bc_axis, rvec) / np.linalg.norm(rvec)))
+
+    np.testing.assert_allclose(jacobi[0], r2)
+    np.testing.assert_allclose(jacobi[1], np.linalg.norm(rvec))
+    np.testing.assert_allclose(jacobi[2], expected_gamma)
 
 
 def test_triatomic_linked_product_overlap_1d():
@@ -1124,141 +1166,229 @@ def test_triatomic_ldr_overlap_kinetic_step_is_unitary():
     np.testing.assert_allclose(mol.norm(result["psilist"][-1]), 1.0, atol=1e-10)
 
 
-def test_ttldr_diagonal_and_mpo_operators_apply_exactly():
-    _prefer_source_package()
-    from pyqed.namd.ttldr import Diagonal, MPO, ProductTerm
-
-    values = np.arange(12, dtype=float).reshape(3, 4) + 1.0
-    state = np.ones((3, 4), dtype=complex)
-    diag = Diagonal.from_values(values)
-    np.testing.assert_allclose(diag.to_tensor(), values)
-    np.testing.assert_allclose(diag.apply(state), values * state)
-
-    matrix = np.arange(16, dtype=float).reshape(4, 4)
-    mpo = MPO.from_dense_matrix(matrix, (2, 2))
-    np.testing.assert_allclose(mpo.to_dense_matrix(), matrix, atol=1e-12)
-    np.testing.assert_allclose(mpo.apply(np.ones((2, 2))), (matrix @ np.ones(4)).reshape(2, 2))
-
-    term = ProductTerm(
-        factors=(np.array([[1.0, 2.0], [3.0, 4.0]]), np.eye(3)),
-        coefficient=0.5,
-        label="test-product",
-    )
-    np.testing.assert_allclose(
-        term.to_mpo().to_dense_matrix(),
-        0.5 * np.kron(term.factors[0], term.factors[1]),
-    )
-
-
-def test_triatomic_build_ttldr_bundle_uses_apes_and_overlap():
-    _prefer_source_package()
-    from pyqed.namd.ttldr import LinkedOverlap, MPO
+def _small_jacobi_ttldr_model():
     from pyqed.namd.triatomic import Triatom
 
     atom = [
-        ["H", (1.0, 0.0, 0.0)],
-        ["H", (0.0, 0.0, 0.0)],
-        ["H", (0.0, 1.0, 0.0)],
+        ["H", (3.0, 0.0, 0.0)],
+        ["H", (-0.75, 0.0, 0.0)],
+        ["H", (0.75, 0.0, 0.0)],
     ]
-    mol = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr")
-    mol.ndim = 1
-    mol.nx = [3]
-    mol.apes = np.arange(6, dtype=float).reshape(3, 2)
-    mol.overlap_matrix = np.zeros((3, 2, 3, 2), dtype=complex)
-    for i in range(3):
-        mol.overlap_matrix[i, :, i, :] = np.eye(2)
-
-    bundle = mol.build_ttldr_bundle(prefer_links=False)
-    assert bundle.site_dims == (3, 2)
-    np.testing.assert_allclose(bundle.potential.to_tensor(), mol.apes, atol=1e-12)
-    assert isinstance(bundle.overlap, MPO)
-    np.testing.assert_allclose(bundle.overlap.to_dense_matrix(), np.eye(6), atol=1e-12)
-
-    mol.overlap_matrix = None
-    mol.overlap_links = {
-        (0, (0,)): np.eye(2),
-        (0, (1,)): np.eye(2),
-    }
-    bundle = mol.build_ttldr_bundle()
-    assert isinstance(bundle.overlap, LinkedOverlap)
-    assert bundle.overlap.site_dims == (3, 2)
-
-
-def test_ttldr_action_matches_dense_full_overlap():
-    _prefer_source_package()
-    from pyqed.namd.triatomic import Triatom
-
-    atom = [
-        ["H", (1.0, 0.0, 0.0)],
-        ["H", (0.0, 0.0, 0.0)],
-        ["H", (0.0, 1.0, 0.0)],
-    ]
-    mol = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr")
-    mol.ndim = 1
-    mol.nx = [3]
-    mol.apes = np.arange(6, dtype=float).reshape(3, 2) * 0.01
-
-    scalar_overlap = np.array(
+    mol = Triatom(
+        atom,
+        nstates=2,
+        charge=1,
+        spin=0,
+        unit="bohr",
+        coordinates="jacobi",
+        dvr_type=["sine", "sine", "legendre"],
+    )
+    mol.set_dvr(
+        domains=[[1.0, 2.0], [2.0, 3.0], [0.8, 1.6]],
+        npts=[2, 2, 2],
+        dvr_type=["sine", "sine", "legendre"],
+    )
+    ngrid = int(np.prod(mol.nx))
+    mol.apes = np.arange(ngrid * mol.nstates, dtype=float).reshape(
+        *mol.nx, mol.nstates
+    ) * 0.01
+    angles = np.linspace(0.0, 0.4, ngrid)
+    frames = np.asarray(
         [
-            [1.0, 0.2, -0.1],
-            [0.2, 1.0, 0.3],
-            [-0.1, 0.3, 1.0],
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+            for angle in angles
         ],
         dtype=complex,
     )
-    overlap = np.einsum("ij,ab->iajb", scalar_overlap, np.eye(mol.nstates))
-    mol.overlap_matrix = overlap.reshape(3, mol.nstates, 3, mol.nstates)
-
-    T = np.array(
-        [
-            [2.0, -0.4, 0.1],
-            [-0.4, 1.5, -0.2],
-            [0.1, -0.2, 1.7],
-        ],
-        dtype=complex,
-    )
-    psi = (np.arange(6) + 1j * np.arange(6, 12)).reshape(3, 2)
-    action = mol.build_ttldr_action(T_total=T, prefer_links=False)
-
-    K = mol._build_flat_kinetic_matrix(T)
-    V = np.diag(mol.apes.reshape(-1))
-    np.testing.assert_allclose(action.k(psi).reshape(-1), K @ psi.reshape(-1))
-    np.testing.assert_allclose(action.v(psi), mol.apes * psi, atol=1e-12)
-    np.testing.assert_allclose(action.h(psi).reshape(-1), (K + V) @ psi.reshape(-1))
-    np.testing.assert_allclose(action.linear("h") @ psi.reshape(-1), action.h(psi).reshape(-1))
+    overlap = np.empty((ngrid, mol.nstates, ngrid, mol.nstates), dtype=complex)
+    for i in range(ngrid):
+        for j in range(ngrid):
+            overlap[i, :, j, :] = frames[i].conj().T @ frames[j]
+    mol.overlap_matrix = overlap
+    return mol
 
 
-def test_ttldr_action_matches_linked_overlap_sparse_kinetic():
+def test_triatom_ldr_builds_unified_solver_from_ab_initio_fields():
     _prefer_source_package()
-    import scipy.sparse as sp
-    from pyqed.namd.triatomic import Triatom
+    import pytest
 
-    atom = [
-        ["H", (1.0, 0.0, 0.0)],
-        ["H", (0.0, 0.0, 0.0)],
-        ["H", (0.0, 1.0, 0.0)],
-    ]
-    mol = Triatom(atom, nstates=2, charge=1, spin=0, unit="bohr")
-    mol.ndim = 1
-    mol.nx = [3]
-    mol.apes = np.zeros((3, 2))
+    from pyqed.dvr import LegendreDVR, SineDVR
+    from pyqed.ldr import LDR
+    from pyqed.ldr.overlap import layout
+    from pyqed.namd import Triatom
+
+    mol = Triatom(
+        [["H", (3.0, 0.0, 0.0)], ["H", (-0.7, 0.0, 0.0)], ["H", (0.7, 0.0, 0.0)]],
+        basis="sto-3g",
+        nstates=2,
+        charge=1,
+        unit="bohr",
+    )
+    dvrs = (
+        SineDVR(1.0, 2.0, 2),
+        SineDVR(2.0, 3.0, 2),
+        LegendreDVR(0.8, 1.6, 2),
+    )
+    with pytest.raises(ValueError, match="jacobi_atoms"):
+        mol.ldr(coordinates="jacobi", dvrs=dvrs)
+    shape = (2, 2, 2)
+    ngrid = int(np.prod(shape))
+    energies = np.arange(ngrid * mol.nstates, dtype=float).reshape(
+        *shape, mol.nstates
+    ) * 0.01
+    overlaps = (
+        np.ones((ngrid, 1, ngrid, 1), dtype=complex)
+        * np.eye(mol.nstates, dtype=complex)[None, :, None, :]
+    )
+    _indices, _flat, edges = layout(shape)
     links = {
-        (0, (0,)): np.array([[0.9, 0.1], [-0.1, 0.9]], dtype=complex),
-        (0, (1,)): np.array([[0.8, -0.2], [0.2, 0.8]], dtype=complex),
+        (axis, idx): overlaps[i, :, j, :]
+        for axis, idx, i, j in edges
     }
-    mol.overlap_links = links
+    electronic = type(
+        "FakeCASCI",
+        (),
+        {"nstates": mol.nstates, "ncas": 3, "nelecas": 2},
+    )()
 
-    T = np.array(
-        [
-            [1.0, -0.3, 0.0],
-            [-0.3, 1.2, -0.4],
-            [0.0, -0.4, 1.4],
-        ],
-        dtype=complex,
+    def scan_pes(**kwargs):
+        assert kwargs["driver"] is electronic
+        mol.apes = energies
+        mol.electronic_data = {"coordinates": mol.coordinates}
+        if kwargs["overlap_method"] == "link-only":
+            mol.overlap_links = links
+            mol.overlap_matrix = None
+            overlap_data = links
+        else:
+            assert kwargs["overlap_method"] == "full"
+            mol.overlap_links = None
+            mol.overlap_matrix = overlaps
+            overlap_data = overlaps
+        return energies, overlap_data, mol.electronic_data
+
+    mol.scan_pes = scan_pes
+    linked_solver = mol.ldr(
+        coordinates="jacobi",
+        jacobi_atoms=(0, (1, 2)),
+        dvrs=dvrs,
+        electronic=electronic,
     )
-    psi = (np.arange(6) - 1j * np.arange(6, 12)).reshape(3, 2)
-    action = mol.build_ttldr_action(T_total=sp.csr_matrix(T))
+    assert linked_solver.scan() is linked_solver
 
-    K = mol._build_linked_flat_kinetic_matrix(T, links)
-    np.testing.assert_allclose(action.k(psi).reshape(-1), K @ psi.reshape(-1))
-    np.testing.assert_allclose(action.linear("k") @ psi.reshape(-1), K @ psi.reshape(-1))
+    assert isinstance(linked_solver, LDR)
+    assert linked_solver.dvr.names == ("r", "R", "gamma")
+    assert mol._jacobi_atoms == (0, 1, 2)
+    assert linked_solver.links is links
+    np.testing.assert_allclose(linked_solver.energies, energies)
+
+    full_solver = mol.ldr(
+        coordinates="jacobi",
+        jacobi_atoms=(0, (1, 2)),
+        dvrs=dvrs,
+        electronic=electronic,
+        overlap="full",
+    )
+    full_solver.scan()
+    np.testing.assert_allclose(full_solver.overlaps, overlaps)
+    np.testing.assert_allclose(
+        linked_solver.hamiltonian(),
+        full_solver.hamiltonian(),
+        atol=1.0e-12,
+    )
+
+
+def test_ttldr_mpo_and_mps_match_dense_ldr():
+    _prefer_source_package()
+    mol = _small_jacobi_ttldr_model()
+    kinetic = mol.buildK(sparse=False)
+    reference = mol._build_flat_kinetic_matrix(kinetic)
+    reference += np.diag(mol.apes.reshape(-1))
+
+    tt = mol.ttldr(
+        overlap_method="dense",
+        overlap_rank=64,
+        operator_rank=None,
+        potential_rank=64,
+        gauge_sync=False,
+    )
+    np.testing.assert_allclose(tt.hamiltonian.to_dense(), reference, atol=1.0e-12)
+
+    rng = np.random.default_rng(12)
+    values = rng.normal(size=tt.dims) + 1j * rng.normal(size=tt.dims)
+    values /= np.linalg.norm(values)
+    state = tt.state(values, max_rank=64)
+    np.testing.assert_allclose(tt.dense(state), values, atol=1.0e-12)
+
+
+def test_ttldr_gauge_sync_is_covariant_to_dense_ldr():
+    _prefer_source_package()
+    from scipy.linalg import block_diag
+
+    mol = _small_jacobi_ttldr_model()
+    kinetic = mol.buildK(sparse=False)
+    reference = mol._build_flat_kinetic_matrix(kinetic)
+    reference += np.diag(mol.apes.reshape(-1))
+    tt = mol.ttldr(
+        overlap_method="dense",
+        overlap_rank=64,
+        operator_rank=None,
+        potential_rank=64,
+        gauge_sync=True,
+    )
+
+    gauge = block_diag(*tt.gauges.reshape(-1, mol.nstates, mol.nstates))
+    synchronized = gauge.conj().T @ reference @ gauge
+    np.testing.assert_allclose(tt.hamiltonian.to_dense(), synchronized, atol=1.0e-12)
+
+    rng = np.random.default_rng(19)
+    values = rng.normal(size=tt.dims) + 1j * rng.normal(size=tt.dims)
+    values /= np.linalg.norm(values)
+    state = tt.state(values, max_rank=64)
+    np.testing.assert_allclose(tt.dense(state), values, atol=1.0e-12)
+    expected = np.sum(np.abs(values) ** 2, axis=(0, 1, 2))
+    actual = np.asarray([state.expectation(item) for item in tt.projectors()]).real
+    np.testing.assert_allclose(actual, expected, atol=1.0e-12)
+
+
+def test_ttldr_cross_and_tdvp_match_dense_reference():
+    _prefer_source_package()
+    from scipy.linalg import expm
+
+    mol = _small_jacobi_ttldr_model()
+    kinetic = mol.buildK(sparse=False)
+    reference = mol._build_flat_kinetic_matrix(kinetic)
+    reference += np.diag(mol.apes.reshape(-1))
+    tt = mol.ttldr(
+        overlap_method="cross",
+        overlap_rank=4,
+        overlap_sweeps=5,
+        overlap_rtol=1.0e-11,
+        overlap_validation=128,
+        operator_rank=64,
+        potential_rank=16,
+        seed=3,
+        gauge_sync=False,
+    )
+    hamiltonian = tt.hamiltonian.to_dense()
+    np.testing.assert_allclose(hamiltonian, reference, atol=1.0e-11)
+    np.testing.assert_allclose(hamiltonian, hamiltonian.conj().T, atol=1.0e-12)
+    assert tt.overlap_info["validation_error"] < 1.0e-11
+
+    rng = np.random.default_rng(21)
+    values = rng.normal(size=tt.dims) + 1j * rng.normal(size=tt.dims)
+    values /= np.linalg.norm(values)
+    state = tt.state(values, max_rank=64)
+    dt = 0.01
+    tt.run(
+        state,
+        dt=dt,
+        steps=1,
+        max_bond=64,
+        integrator="tdvp2",
+        cutoff=0.0,
+        progress=False,
+    )
+    exact = expm(-1j * dt * reference) @ values.reshape(-1)
+    actual = tt.dense(tt.final_state).reshape(-1)
+    np.testing.assert_allclose(abs(np.vdot(exact, actual)), 1.0, atol=1.0e-11)
+    np.testing.assert_allclose(tt.populations.sum(axis=1), 1.0, atol=1.0e-11)

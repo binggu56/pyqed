@@ -16,6 +16,7 @@ import pyscf.ao2mo
 import pyscf
 from functools import reduce
 
+from pyqed.units import au2ev
 
 from lime.phys import eig_asymm, is_positive_def
 
@@ -340,4 +341,4 @@ if __name__ == '__main__':
 
     nocc = mol.nelectron//2
     ehomo = egw[nocc-1]
-    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo*27.211, "eV")
+    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")

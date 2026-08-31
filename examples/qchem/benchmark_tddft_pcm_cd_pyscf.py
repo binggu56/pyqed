@@ -59,7 +59,7 @@ def main():
     )
 
     mol = Molecule(atom=ATOM, unit="angstrom", basis="sto-3g")
-    mol.build(driver="pyscf")
+    mol.build()
     mf = pyqed_reference_from_pyscf(pmf, mol, pmol)
 
     pcm = PCM(mol)

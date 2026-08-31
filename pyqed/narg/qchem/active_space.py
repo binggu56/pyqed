@@ -7,8 +7,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from pyqed.qchem.mcscf.casci import (
+    _get_mf_cholesky_factors,
     _normalize_active_electrons,
     h1e_for_cas,
+    mo_pair_factors,
     transform_spatial_eri_to_mo,
 )
 
@@ -94,6 +96,26 @@ def _slice_core_active(mo_coeff, ncore, ncas):
     return mo_coeff[:, :ncore], mo_coeff[:, ncore:ncore + ncas]
 
 
+def _available_eri_factors(mf):
+    factors = getattr(mf, "eri_factors", None)
+    if factors is None:
+        factors = getattr(getattr(mf, "mol", None), "eri_factors", None)
+    if factors is None:
+        source = getattr(mf, "eri", None)
+        if source is not None and np.ndim(source) in (2, 3):
+            factors = source
+    return factors
+
+
+def _transform_available_pair_factors(mf, mo_coeff, *, build=False):
+    factors = _available_eri_factors(mf)
+    if factors is None and build:
+        factors = _get_mf_cholesky_factors(mf)
+    if factors is None:
+        return None
+    return mo_pair_factors(factors, mo_coeff)
+
+
 def prepare_active_space(
     mf,
     mol,
@@ -106,8 +128,13 @@ def prepare_active_space(
     mo_coeff=None,
     spin=None,
     use_cholesky=None,
+    prefer_factors=False,
 ):
-    """Return NARG integrals and a mol-like object for optional CAS calculations."""
+    """Return NARG integrals and a mol-like object for optional CAS calculations.
+
+    When ``prefer_factors`` is true, existing AO Cholesky/RI factors are
+    transformed directly to three-index MO pair factors.
+    """
 
     cas_requested = any(
         value is not None for value in (ncas, nelecas, ncore, mo_coeff)
@@ -118,7 +145,14 @@ def prepare_active_space(
         if h1e is None:
             h1e = mf.get_hcore_mo()
         if eri is None:
-            eri = mf.get_eri_mo()
+            if prefer_factors:
+                eri = _transform_available_pair_factors(
+                    mf,
+                    _as_mo_coeff(mf, None),
+                    build=bool(use_cholesky),
+                )
+            if eri is None:
+                eri = mf.get_eri_mo()
         return h1e, eri, mol, None
 
     if ncas is None:
@@ -173,19 +207,34 @@ def prepare_active_space(
 
     if h1e is None:
         h1e = h1_cas
-        eri = transform_spatial_eri_to_mo(
-            mf,
-            mo_cas,
-            use_cholesky=bool(use_cholesky) if use_cholesky is not None else False,
+        eri = (
+            _transform_available_pair_factors(
+                mf,
+                mo_cas,
+                build=bool(use_cholesky),
+            )
+            if prefer_factors
+            else None
         )
+        if eri is None:
+            eri = transform_spatial_eri_to_mo(
+                mf,
+                mo_cas,
+                use_cholesky=bool(use_cholesky) if use_cholesky is not None else False,
+            )
     else:
         h1e = np.asarray(h1e)
         eri = np.asarray(eri)
         if h1e.shape != (ncas, ncas):
             raise ValueError(f"Explicit CAS h1e has shape {h1e.shape}, expected {(ncas, ncas)}.")
-        if eri.shape != (ncas, ncas, ncas, ncas):
+        valid_eri_shape = eri.shape == (ncas, ncas, ncas, ncas) or (
+            eri.ndim == 3 and eri.shape[1:] == (ncas, ncas)
+        )
+        if not valid_eri_shape:
             raise ValueError(
-                f"Explicit CAS eri has shape {eri.shape}, expected {(ncas, ncas, ncas, ncas)}."
+                "Explicit CAS eri must be a dense tensor with shape "
+                f"{(ncas, ncas, ncas, ncas)} or pair factors with trailing shape "
+                f"{(ncas, ncas)}; got {eri.shape}."
             )
 
     active_space = ActiveSpace(

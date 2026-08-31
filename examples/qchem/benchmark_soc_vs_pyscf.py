@@ -17,9 +17,10 @@ from pyqed.qchem.soc import (
     soc_1e_prefactor,
     spatial_soc_to_spin_orbital,
 )
+from pyqed.units import au2wavenumber
 
 
-AU2CM = 219474.6313705
+AU2CM = au2wavenumber
 
 
 @dataclass(frozen=True)
@@ -255,7 +256,7 @@ def pyscf_reference(case, soc_model="1e"):
 
 def pyqed_workflow(case, soc_model="1e"):
     mol = Molecule(atom=case.atom, unit="angstrom", basis=case.basis)
-    mol.build(driver="gbasis-pyscf")
+    mol.build()
 
     # SOC matrix elements are sensitive to small occupied/virtual rotations.
     mf = mol.RHF().run(tol=1e-12, conv_tol_dm=1e-10)

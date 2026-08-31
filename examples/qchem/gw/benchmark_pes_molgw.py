@@ -30,7 +30,7 @@ def build_h2_ccpvdz():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
     mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
     return mol, mf
 

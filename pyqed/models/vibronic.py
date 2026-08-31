@@ -305,7 +305,6 @@ class Vibronic2:
         return SPO2(nstates=self.nstates, mass=self.mass, x=self.x, y=self.y)
     
     def LDR(self):
-        # return SincDVR2()
         pass
 
 
@@ -1262,4 +1261,3 @@ if __name__ == '__main__':
     fig, ax = plt.subplots()
     for n in range(4):
         ax.plot(x, va[:, n])
-    

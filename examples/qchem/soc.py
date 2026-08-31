@@ -15,7 +15,7 @@ H  0.000000  1.229000  0.958000
 H  0.000000 -1.229000  0.958000
 ''', unit='angstrom', basis='sto-3g', spin=0)
 
-mol.build(driver='gbasis')
+mol.build()
 
 mf = mol.RHF().run()
 

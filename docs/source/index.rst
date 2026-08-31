@@ -51,12 +51,18 @@ to its current documentation, examples, and tests.
    guide/guide
    backends
    qchem
+   caspt2
    hf_analysis
    mp2_comp2
    gw_bse
    periodic_gw_bse
+   periodic_cphf
+   periodic_phonons
+   mace_ldr
    tddft_ehrenfest
    mps
+   su2_letta
+   peps
    dvr
    geometric_quantum_dynamics
    pyqed.floquet

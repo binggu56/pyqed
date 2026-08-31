@@ -2050,15 +2050,20 @@ class LETTA:
         return self
 
     def copy(self):
+        tensors = [tensor.copy() for tensor in self.tensors]
         out = LETTA(
             None if self.hamiltonian is None else self.hamiltonian.copy(),
             self.dims,
             bond_dim=self.bond_dim,
             overlap=None if self.overlap is None else self.overlap.copy(),
-            tensors=[tensor.copy() for tensor in self.tensors],
+            tensors=tensors,
             local_masks=[None if mask is None else mask.copy() for mask in self.local_masks],
             abelian_layout=self.abelian_layout,
         )
+        # Construction normalizes variational guesses.  A copy must retain the
+        # raw scale as well as the represented ray, especially during
+        # real-time propagation where norm drift is a diagnostic.
+        out.tensors = tensors
         out.history = list(self.history)
         out.converged = bool(self.converged)
         out.energy = self.energy
@@ -2103,6 +2108,7 @@ class LETTA:
             local_masks=payload.get("local_masks"),
             abelian_layout=payload.get("abelian_layout"),
         )
+        out.tensors = [np.asarray(tensor).copy() for tensor in payload["tensors"]]
         out.history = list(payload.get("history", []))
         out.converged = bool(payload.get("converged", False))
         out.energy = payload.get("energy")

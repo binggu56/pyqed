@@ -16,7 +16,7 @@ from pyqed.mps.fermion import SpinHalfFermionChain
 from pyqed import SpinHalfFermionOperators, eigh, sort
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, create
 
-from scipy.sparse.linalg import eigsh
+from scipy.sparse.linalg import ArpackNoConvergence, LinearOperator, eigsh, gmres
 from scipy.sparse import kron, eye, csr_matrix, coo_matrix, issparse
 
 from opt_einsum import contract
@@ -998,6 +998,7 @@ def supersite_kernel(
     """
     h1e = np.asarray(h1e)
     eri = np.asarray(eri)
+    validate_eri_representation(eri, h1e.shape[0])
     groups = [tuple(int(i) for i in group) for group in groups]
     if not groups or any(len(group) < 1 for group in groups):
         raise ValueError("groups must contain at least one non-empty supersite.")
@@ -1016,7 +1017,7 @@ def supersite_kernel(
         raise ValueError("D must be positive.")
 
     h = h1e[np.ix_(order, order)]
-    v = eri[np.ix_(order, order, order, order)]
+    v = eri_subspace(eri, order)
     prefix = 0
     basis = np.ones((1, 1), dtype=np.result_type(h, v, complex))
     basis_qn = np.zeros((1, LOCAL_QN.shape[1]), dtype=int)
@@ -1028,7 +1029,8 @@ def supersite_kernel(
         local_norb = len(group)
         local_dim = len(LOCAL_QN) ** local_norb
         next_prefix = prefix + local_norb
-        model = SpinHalfFermionChain(h[:next_prefix, :next_prefix], v[:next_prefix, :next_prefix, :next_prefix, :next_prefix])
+        prefix_eri = eri_to_dense(eri_subspace(v, range(next_prefix)))
+        model = SpinHalfFermionChain(h[:next_prefix, :next_prefix], prefix_eri)
         full_h = model.jordan_wigner()
         projector = kron(csr_matrix(basis), eye(local_dim, format="csr", dtype=basis.dtype), format="csr")
         projected = projector.conj().T @ (full_h @ projector)
@@ -1105,6 +1107,7 @@ def reduced_supersite_kernel(
     """
     h1e = np.asarray(h1e)
     eri = np.asarray(eri)
+    validate_eri_representation(eri, h1e.shape[0])
     groups = [tuple(int(i) for i in group) for group in groups]
     if not groups or any(len(group) < 1 for group in groups):
         raise ValueError("groups must contain at least one non-empty supersite.")
@@ -1137,7 +1140,7 @@ def reduced_supersite_kernel(
         if use_irrep_blocks is False:
             use_irrep_blocks = True
     if sparse_operator_table == 'auto':
-        sparse_operator_table = bool(fast)
+        sparse_operator_table = True
     else:
         sparse_operator_table = bool(sparse_operator_table)
     if use_sparse_operator_projection == 'auto':
@@ -1146,12 +1149,13 @@ def reduced_supersite_kernel(
         use_sparse_operator_projection = bool(use_sparse_operator_projection)
 
     h = h1e[np.ix_(order, order)]
-    v = eri[np.ix_(order, order, order, order)]
+    v = eri_subspace(eri, order)
     pair_terms, triple_terms = precompute_integral_terms(v, eri_cutoff, use_numba=use_numba_terms)
 
     first = groups[0]
     prefix = len(first)
-    model = SpinHalfFermionChain(h[:prefix, :prefix], v[:prefix, :prefix, :prefix, :prefix], nelec=nelec)
+    initial_eri = eri_to_dense(eri_subspace(v, range(prefix)))
+    model = SpinHalfFermionChain(h[:prefix, :prefix], initial_eri, nelec=nelec)
     model.jordan_wigner(forward=False)
     primitive_qn = primitive_charge_labels(prefix)
     nroots = min(D, model.H.shape[0])
@@ -1383,7 +1387,7 @@ class HierBlock:
 def _restricted_integrals(h1e, eri, orbitals):
     orbitals = tuple(int(i) for i in orbitals)
     h = h1e[np.ix_(orbitals, orbitals)]
-    v = eri[np.ix_(orbitals, orbitals, orbitals, orbitals)]
+    v = eri_to_dense(eri_subspace(eri, orbitals))
     return h, v
 
 
@@ -1474,6 +1478,7 @@ def tree_nrg_kernel(
     h1e = np.asarray(h1e)
     eri = np.asarray(eri)
     norb = h1e.shape[0]
+    validate_eri_representation(eri, norb)
     if order is None:
         order = tuple(range(norb))
     else:
@@ -1639,7 +1644,7 @@ def _merge_hier_blocks(left, right, h1e, eri, keep, target_qn, total_sites, max_
                 for s in orbitals:
                     if _same_child((p, q, r, s), left_orbs, right_orbs):
                         continue
-                    coeff = 0.5 * eri[p, q, r, s]
+                    coeff = 0.5 * eri_value(eri, p, q, r, s)
                     if coeff == 0:
                         continue
                     H += coeff * (
@@ -1704,6 +1709,7 @@ def hierarchical_kernel(
     h1e = np.asarray(h1e)
     eri = np.asarray(eri)
     norb = h1e.shape[0]
+    validate_eri_representation(eri, norb)
     if order is None:
         order = tuple(range(norb))
     else:
@@ -2011,6 +2017,45 @@ SINGLE_PATTERNS = (
 PAIR_PATTERNS = tuple((left[0], right[0]) for left in SINGLE_PATTERNS for right in SINGLE_PATTERNS)
 
 OPERATOR_PATTERNS = SINGLE_PATTERNS + PAIR_PATTERNS
+
+
+def is_pair_factor_eri(eri):
+    return np.ndim(eri) == 3
+
+
+def validate_eri_representation(eri, norb):
+    shape = np.shape(eri)
+    dense_shape = (norb, norb, norb, norb)
+    if shape == dense_shape:
+        return
+    if len(shape) == 3 and shape[1:] == (norb, norb):
+        return
+    raise ValueError(
+        f"eri must have shape {dense_shape} or (naux, {norb}, {norb}); got {shape}."
+    )
+
+
+def eri_value(eri, p, q, r, s):
+    if is_pair_factor_eri(eri):
+        factors = np.asarray(eri)
+        return np.dot(factors[:, p, q], factors[:, r, s])
+    return eri[p, q, r, s]
+
+
+def eri_subspace(eri, orbitals):
+    orbitals = np.asarray(tuple(int(i) for i in orbitals), dtype=int)
+    if is_pair_factor_eri(eri):
+        factors = np.asarray(eri)
+        return factors[:, orbitals][:, :, orbitals]
+    return np.asarray(eri)[np.ix_(orbitals, orbitals, orbitals, orbitals)]
+
+
+def eri_to_dense(eri):
+    if is_pair_factor_eri(eri):
+        factors = np.asarray(eri)
+        return np.einsum("Ppq,Prs->pqrs", factors, factors, optimize=True)
+    return np.asarray(eri)
+
 
 
 def required_operator_entries(pair_terms, triple_terms, total_sites, nsites):
@@ -2486,6 +2531,7 @@ def extend_operator_table_projector(
     output_qn=None,
     required=None,
     sparse_output=False,
+    consume=False,
 ):
     """Project one-site composite operators through a general isometry."""
     old_dim, local_dim, out_dim = projector.shape
@@ -2497,6 +2543,39 @@ def extend_operator_table_projector(
     identity_site = np.eye(local_dim)
     local = {"Cu": cu, "Cd": cd, "Cdu": cdu, "Cdd": cdd}
     new_table = {}
+
+    source_uses = {}
+    if consume:
+        for pattern in patterns:
+            index_iter = (
+                np.ndindex((int(new_site) + 1,) * len(pattern))
+                if required is None
+                else sorted(required.get(pattern, ()))
+            )
+            for indices in index_iter:
+                old_pattern = tuple(
+                    name
+                    for name, index in zip(pattern, indices)
+                    if int(index) != int(new_site)
+                )
+                old_indices = tuple(
+                    int(index) for index in indices if int(index) != int(new_site)
+                )
+                if old_pattern:
+                    key = (old_pattern, old_indices)
+                    source_uses[key] = source_uses.get(key, 0) + 1
+        for pattern, entries in table.items():
+            for indices in tuple(entries):
+                if (pattern, indices) not in source_uses:
+                    entries.pop(indices)
+
+    def release_source(pattern, indices):
+        if not consume or not pattern:
+            return
+        key = (pattern, indices)
+        source_uses[key] -= 1
+        if source_uses[key] == 0:
+            table[pattern].pop(indices, None)
 
     for pattern in patterns:
         entries = {}
@@ -2546,7 +2625,10 @@ def extend_operator_table_projector(
                     projector,
                     sparse_output=sparse_output,
                 )
+            release_source(tuple(old_pattern), tuple(old_indices))
         new_table[pattern] = entries
+    if consume:
+        table.clear()
     return new_table
 
 
@@ -2842,27 +2924,71 @@ def _empty_integral_terms(L):
 
 
 def _precompute_integral_terms_python(eri, cutoff=0.0):
-    L = eri.shape[0]
+    L = eri.shape[1] if is_pair_factor_eri(eri) else eri.shape[0]
     pair_terms, triple_terms = _empty_integral_terms(L)
     for q in range(L):
         for i in range(q):
             for j in range(q):
-                coeff = eri[i, j, q, q]
+                coeff = eri_value(eri, i, j, q, q)
                 if keep_integral(coeff, cutoff):
                     pair_terms[q]['density'].append((i, j, coeff))
 
-                coeff = eri[i, q, q, j]
+                coeff = eri_value(eri, i, q, q, j)
                 if keep_integral(coeff, cutoff):
                     pair_terms[q]['exchange'].append((i, j, coeff))
 
-                coeff = eri[q, i, q, j]
+                coeff = eri_value(eri, q, i, q, j)
                 if keep_integral(coeff, cutoff):
                     pair_terms[q]['v2b'].append((i, j, 0.5 * coeff))
 
                 for k in range(q):
-                    coeff = eri[k, q, j, i]
+                    coeff = eri_value(eri, k, q, j, i)
                     if keep_integral(coeff, cutoff):
                         triple_terms[q].append((i, j, k, coeff))
+    return pair_terms, triple_terms
+
+
+def _precompute_integral_terms_factors(pair_factors, cutoff=0.0):
+    pair_factors = np.asarray(pair_factors)
+    L = pair_factors.shape[1]
+    pair_terms, triple_terms = _empty_integral_terms(L)
+    cutoff = float(cutoff)
+    for q in range(L):
+        old = slice(0, q)
+        diagonal = pair_factors[:, q, q]
+        density = np.einsum(
+            "Pij,P->ij",
+            pair_factors[:, old, old],
+            diagonal,
+            optimize=True,
+        )
+        exchange = np.einsum(
+            "Pi,Pj->ij",
+            pair_factors[:, old, q],
+            pair_factors[:, q, old],
+            optimize=True,
+        )
+        pair = np.einsum(
+            "Pi,Pj->ij",
+            pair_factors[:, q, old],
+            pair_factors[:, q, old],
+            optimize=True,
+        )
+        triples = np.einsum(
+            "Pk,Pji->ijk",
+            pair_factors[:, old, q],
+            pair_factors[:, old, old],
+            optimize=True,
+        )
+
+        for i, j in np.argwhere(np.abs(density) > cutoff):
+            pair_terms[q]["density"].append((int(i), int(j), density[i, j]))
+        for i, j in np.argwhere(np.abs(exchange) > cutoff):
+            pair_terms[q]["exchange"].append((int(i), int(j), exchange[i, j]))
+        for i, j in np.argwhere(np.abs(pair) > cutoff):
+            pair_terms[q]["v2b"].append((int(i), int(j), 0.5 * pair[i, j]))
+        for i, j, k in np.argwhere(np.abs(triples) > cutoff):
+            triple_terms[q].append((int(i), int(j), int(k), triples[i, j, k]))
     return pair_terms, triple_terms
 
 
@@ -2895,6 +3021,8 @@ def _precompute_integral_terms_numba(eri, cutoff=0.0):
 
 
 def precompute_integral_terms(eri, cutoff=0.0, use_numba='auto'):
+    if is_pair_factor_eri(eri):
+        return _precompute_integral_terms_factors(eri, cutoff)
     if use_numba == 'auto':
         use_numba = eri.shape[0] >= 12
     if (
@@ -3005,7 +3133,7 @@ def single_site_hamiltonian_from_integrals(h1e, eri, site_id):
     site_id = int(site_id)
     return (
         h1e[site_id, site_id] * (cdu @ cu + cdd @ cd)
-        + eri[site_id, site_id, site_id, site_id] * Nu @ Nd
+        + eri_value(eri, site_id, site_id, site_id, site_id) * Nu @ Nd
     )
 
 
@@ -3041,7 +3169,7 @@ def _compressed_superblock_one_site_lloo(
     identity_site = np.eye(local_dim)
     h_site = single_site_hamiltonian_from_integrals(h1e, eri, site_id)
     pair_sums = build_pair_sums(table, pair_terms, site_id)
-    dtype = np.result_type(H0, h1e, eri, complex)
+    dtype = np.result_type(H0, h1e, getattr(eri, "dtype", eri), complex)
     h_full = np.kron(dense_operator(H0), identity_site).astype(dtype, copy=False)
     h_full += np.kron(identity_block, h_site)
     h_full += np.kron(dense_operator(pair_sums["density"]), Ntot)
@@ -3071,10 +3199,10 @@ def _compressed_superblock_one_site_lloo(
     v3u = zero_like_operator(H0)
     v3d = zero_like_operator(H0)
     for index in range(site_id):
-        v3u += eri[index, site_id, site_id, site_id] * dense_operator(
+        v3u += eri_value(eri, index, site_id, site_id, site_id) * dense_operator(
             op_lists["Cdu"][index]
         )
-        v3d += eri[index, site_id, site_id, site_id] * dense_operator(
+        v3d += eri_value(eri, index, site_id, site_id, site_id) * dense_operator(
             op_lists["Cdd"][index]
         )
     add_hermitian(v3u, JW @ Nd @ cu)
@@ -3090,6 +3218,130 @@ def _compressed_superblock_one_site_lloo(
     return h_lloo, primitive_qn
 
 
+class OneSiteHamiltonianAction:
+    """Matrix-free sum of old-block/local-site Kronecker terms."""
+
+    def __init__(self, old_dim, local_dim, dtype=complex):
+        self.old_dim = int(old_dim)
+        self.local_dim = int(local_dim)
+        self.dtype = np.dtype(np.result_type(dtype, complex))
+        self.terms = []
+
+    def add(self, block_op, local_op, coefficient=1.0, *, hermitian=False):
+        if abs(coefficient) == 0 or is_zero_operator(block_op) or is_zero_operator(local_op):
+            return
+        self.terms.append(
+            (block_op, np.asarray(local_op), coefficient, bool(hermitian))
+        )
+
+    def diagonal_block(self, local_state):
+        local_state = int(local_state)
+        block = np.zeros((self.old_dim, self.old_dim), dtype=self.dtype)
+        for block_op, local_op, coefficient, hermitian in self.terms:
+            local_value = local_op[local_state, local_state]
+            if local_value == 0:
+                continue
+            dense = dense_operator(block_op)
+            value = coefficient * local_value
+            block += value * dense
+            if hermitian:
+                block += np.conjugate(value) * dense.T.conj()
+        return 0.5 * (block + block.T.conj())
+
+    def diagonal(self):
+        """Return the product-basis diagonal without materializing the action."""
+        diagonal = np.zeros(
+            (self.old_dim, self.local_dim),
+            dtype=self.dtype,
+        )
+        for block_op, local_op, coefficient, hermitian in self.terms:
+            block_diagonal = np.asarray(block_op.diagonal()).reshape(-1)
+            local_diagonal = np.diag(local_op)
+            value = coefficient * block_diagonal[:, None] * local_diagonal[None, :]
+            diagonal += value
+            if hermitian:
+                diagonal += value.conj()
+        return diagonal.reshape(-1)
+
+    def matmat(self, vectors):
+        vectors = np.asarray(vectors)
+        was_vector = vectors.ndim == 1
+        if was_vector:
+            vectors = vectors[:, None]
+        states = vectors.reshape(self.old_dim, self.local_dim, -1)
+        result = np.zeros_like(states, dtype=np.result_type(states, self.dtype))
+        for block_op, local_op, coefficient, hermitian in self.terms:
+            rows, cols = np.nonzero(local_op)
+            for row, col in zip(rows, cols):
+                value = coefficient * local_op[row, col]
+                result[:, row, :] += value * (block_op @ states[:, col, :])
+                if hermitian:
+                    result[:, col, :] += np.conjugate(value) * (
+                        block_op.T.conj() @ states[:, row, :]
+                    )
+        flattened = result.reshape(self.old_dim * self.local_dim, -1)
+        return flattened[:, 0] if was_vector else flattened
+
+
+def _compressed_superblock_one_site_action(
+    H0,
+    input_qn,
+    table,
+    residuals,
+    site_id,
+    h1e,
+    eri,
+    pair_terms,
+):
+    """Matrix-free retained-block-plus-orbital Hamiltonian."""
+    site_id = int(site_id)
+    old_dim = H0.shape[0]
+    local_dim = len(LOCAL_QN)
+    identity_block = np.eye(old_dim)
+    identity_site = np.eye(local_dim)
+    action = OneSiteHamiltonianAction(
+        old_dim,
+        local_dim,
+        dtype=np.result_type(H0, h1e, getattr(eri, "dtype", eri), complex),
+    )
+    action.add(H0, identity_site)
+    action.add(identity_block, single_site_hamiltonian_from_integrals(h1e, eri, site_id))
+    pair_sums = build_pair_sums(table, pair_terms, site_id)
+    action.add(pair_sums["density"], Ntot)
+    action.add(pair_sums["exchange_u"], Nu, -1.0)
+    action.add(pair_sums["exchange_d"], Nd, -1.0)
+
+    op_lists = operator_lists(table)
+    v1u = zero_like_operator(H0)
+    v1d = zero_like_operator(H0)
+    for index in range(site_id):
+        v1u += h1e[index, site_id] * dense_operator(op_lists["Cdu"][index])
+        v1d += h1e[index, site_id] * dense_operator(op_lists["Cdd"][index])
+    if site_id in residuals:
+        v1u += residuals[site_id][0]
+        v1d += residuals[site_id][1]
+    action.add(v1u, JW @ cu, hermitian=True)
+    action.add(v1d, JW @ cd, hermitian=True)
+    action.add(pair_sums["v2a"], cdu @ cd, hermitian=True)
+    action.add(pair_sums["v2b"], cdu @ cdd, hermitian=True)
+
+    v3u = zero_like_operator(H0)
+    v3d = zero_like_operator(H0)
+    for index in range(site_id):
+        v3u += eri_value(eri, index, site_id, site_id, site_id) * dense_operator(
+            op_lists["Cdu"][index]
+        )
+        v3d += eri_value(eri, index, site_id, site_id, site_id) * dense_operator(
+            op_lists["Cdd"][index]
+        )
+    action.add(v3u, JW @ Nd @ cu, hermitian=True)
+    action.add(v3d, JW @ Nu @ cd, hermitian=True)
+    primitive_qn = (
+        qn_array(input_qn)[:, None, :] + LOCAL_QN[None, :, :]
+    ).reshape((-1, LOCAL_QN.shape[1]))
+    return action, primitive_qn
+
+
 def detached_frame_transition_projector(
     h_lloo,
     input_qn,
@@ -3103,30 +3355,40 @@ def detached_frame_transition_projector(
     max_frame_rank=None,
     expand_dim=1,
 ):
-    r"""Construct a one-site isometry from mutually orthogonal detached frames.
+    r"""Construct a nested one-site isometry from detached conditional frames.
 
-    The conditional frames satisfy
-
-    .. math::
-
-        W_s^\dagger W_t = \delta_{st} I,
-
-    while the retained state uses all frame/occupation combinations,
+    The ordinary conditional branches are first combined into a common frame
+    ``W`` without changing their joint span.  The detached candidate space is
 
     .. math::
 
-        \Omega = (W \otimes I_d) C.
+        \mathcal V_{\rm det} = \operatorname{span}(W) \otimes \mathbb C^d.
 
-    Frames are built sequentially in Abelian sectors by diagonalizing each
-    diagonal occupation block in the complement of all earlier frames.
+    It contains the matched ordinary NARG space
+
+    .. math::
+
+        \mathcal V_{\rm std}
+        = \operatorname{span}\{W_{s,a} \otimes |s\rangle\}.
+
+    The matched branch columns are retained as anchors; additional columns are
+    selected from low-energy detached eigenvectors.  Thus the retained space
+    remains a variational enlargement of the ordinary conditional space.
     """
-    h_lloo = np.asarray(h_lloo)
+    matrix_free = isinstance(h_lloo, OneSiteHamiltonianAction)
     input_qn = qn_array(input_qn)
-    local_dim, local_dim_ket, old_dim, old_dim_ket = h_lloo.shape
-    if local_dim != local_dim_ket or old_dim != old_dim_ket:
-        raise ValueError(
-            "h_lloo must have shape (local_dim, local_dim, old_dim, old_dim)."
-        )
+    if matrix_free:
+        local_dim = local_dim_ket = h_lloo.local_dim
+        old_dim = old_dim_ket = h_lloo.old_dim
+        h_dtype = h_lloo.dtype
+    else:
+        h_lloo = np.asarray(h_lloo)
+        local_dim, local_dim_ket, old_dim, old_dim_ket = h_lloo.shape
+        h_dtype = h_lloo.dtype
+        if local_dim != local_dim_ket or old_dim != old_dim_ket:
+            raise ValueError(
+                "h_lloo must have shape (local_dim, local_dim, old_dim, old_dim)."
+            )
     if local_dim != len(LOCAL_QN) or len(input_qn) != old_dim:
         raise ValueError("detached frames are incompatible with the local or block labels.")
     frame_dim = int(frame_dim)
@@ -3155,61 +3417,181 @@ def detached_frame_transition_projector(
         for charge in sorted({qn_key(row) for row in input_qn[valid]})
         if allowed_frames is None or charge in allowed_frames
     }
-    occupied = {}
     frames = []
     frame_labels = []
     branch_ranks = []
+    output_charges = (
+        None
+        if allowed_output_qn is None
+        else {qn_key(qn) for qn in allowed_output_qn}
+    )
 
     for local_state in range(local_dim):
+        branch_allowed = allowed_frames
+        if output_charges is not None:
+            local_charge = LOCAL_QN[local_state]
+            branch_allowed = {
+                qn_key(np.asarray(charge) - local_charge)
+                for charge in output_charges
+            }
+            if allowed_frames is not None:
+                branch_allowed &= allowed_frames
+        branch_h = (
+            h_lloo.diagonal_block(local_state)
+            if matrix_free
+            else h_lloo[local_state, local_state]
+        )
+        branch_h = 0.5 * (branch_h + branch_h.T.conj())
         candidates = []
         for charge, rows in sectors.items():
-            used = occupied.get(charge)
-            if used is None:
-                complement = np.eye(rows.size)
-            else:
-                rank = used.shape[1]
-                if rank >= rows.size:
-                    continue
-                complement = np.linalg.qr(used, mode="complete")[0][:, rank:]
-            h_sector = h_lloo[local_state, local_state][np.ix_(rows, rows)]
-            h_reduced = complement.conj().T @ (h_sector @ complement)
-            h_reduced = 0.5 * (h_reduced + h_reduced.T.conj())
-            energies, vectors = np.linalg.eigh(h_reduced)
-            vectors = complement @ vectors
+            if branch_allowed is not None and charge not in branch_allowed:
+                continue
+            h_sector = branch_h[np.ix_(rows, rows)]
+            energies, vectors = np.linalg.eigh(h_sector)
             candidates.extend(
                 (float(np.real(energy)), charge, rows, vectors[:, column])
                 for column, energy in enumerate(energies)
             )
-
         candidates.sort(key=lambda item: item[0])
         selected = candidates[:frame_dim]
         branch = np.zeros(
             (old_dim, len(selected)),
-            dtype=np.result_type(h_lloo, complex),
+            dtype=np.result_type(h_dtype, complex),
         )
         labels = np.empty((len(selected), input_qn.shape[1]), dtype=int)
-        additions = {}
         for column, (_energy, charge, rows, vector) in enumerate(selected):
             branch[rows, column] = vector
             labels[column] = charge
-            additions.setdefault(charge, []).append(vector)
-        for charge, vectors in additions.items():
-            new = np.column_stack(vectors)
-            occupied[charge] = (
-                new if charge not in occupied else np.column_stack((occupied[charge], new))
-            )
         frames.append(branch)
         frame_labels.append(labels)
-        branch_ranks.append(len(selected))
+        branch_ranks.append(branch.shape[1])
 
-    frame_basis = np.column_stack(frames)
-    frame_qn = np.concatenate(frame_labels, axis=0)
-    frame_rank = frame_basis.shape[1]
-    if frame_rank == 0:
+    joint_columns = {}
+    for branch, labels in zip(frames, frame_labels):
+        for column, charge in enumerate(labels):
+            joint_columns.setdefault(qn_key(charge), []).append(branch[:, column])
+    common_frames = []
+    common_labels = []
+    for charge in sorted(joint_columns):
+        matrix = np.column_stack(joint_columns[charge])
+        rows = sectors[charge]
+        left, singular_values, _right = np.linalg.svd(
+            matrix[rows],
+            full_matrices=False,
+        )
+        if singular_values.size == 0:
+            continue
+        threshold = (
+            np.finfo(singular_values.dtype).eps
+            * max(matrix.shape)
+            * singular_values[0]
+        )
+        rank = int(np.count_nonzero(singular_values > threshold))
+        if rank:
+            sector_frame = np.zeros(
+                (old_dim, rank),
+                dtype=np.result_type(matrix, complex),
+            )
+            sector_frame[rows] = left[:, :rank]
+            common_frames.append(sector_frame)
+            common_labels.extend([charge] * rank)
+    if not common_frames:
         raise ValueError("no feasible detached-frame states were found.")
-    h_full = np.ascontiguousarray(
-        h_lloo.transpose(2, 0, 3, 1)
-    ).reshape(old_dim * local_dim, old_dim * local_dim)
+    frame_basis = np.column_stack(common_frames)
+    frame_qn = np.asarray(common_labels, dtype=int)
+    frame_rank = frame_basis.shape[1]
+    h_full = None
+    if not matrix_free:
+        h_full = np.ascontiguousarray(
+            h_lloo.transpose(2, 0, 3, 1)
+        ).reshape(old_dim * local_dim, old_dim * local_dim)
+
+    def apply_full(vectors):
+        if matrix_free:
+            return h_lloo.matmat(vectors)
+        return h_full @ np.asarray(vectors)
+
+    def diagonalize_projected_basis(basis, basis_qn, nroots):
+        """Lowest charge-resolved Ritz pairs without a full projected matrix."""
+        basis_qn = qn_array(basis_qn)
+        allowed = (
+            None
+            if allowed_output_qn is None
+            else {qn_key(charge) for charge in allowed_output_qn}
+        )
+        roots = []
+        for charge in sorted({qn_key(row) for row in basis_qn}):
+            if allowed is not None and charge not in allowed:
+                continue
+            columns = np.flatnonzero(
+                np.all(basis_qn == np.asarray(charge), axis=1)
+            )
+            sector_basis = basis[:, columns]
+            keep = min(int(nroots), columns.size)
+
+            def sector_action(vector):
+                return sector_basis.conj().T @ apply_full(sector_basis @ vector)
+
+            if columns.size <= 64 or keep >= columns.size - 1:
+                block = sector_basis.conj().T @ apply_full(sector_basis)
+                block = 0.5 * (block + block.T.conj())
+                values, vectors = np.linalg.eigh(block)
+            else:
+                operator = LinearOperator(
+                    (columns.size, columns.size),
+                    matvec=sector_action,
+                    matmat=sector_action,
+                    dtype=np.result_type(h_dtype, basis, complex),
+                )
+                try:
+                    values, vectors = eigsh(
+                        operator,
+                        k=keep,
+                        which="SA",
+                        tol=1.0e-12,
+                        maxiter=max(1000, 20 * columns.size),
+                    )
+                except ArpackNoConvergence:
+                    block = sector_basis.conj().T @ apply_full(sector_basis)
+                    block = 0.5 * (block + block.T.conj())
+                    values, vectors = np.linalg.eigh(block)
+                order = np.argsort(values)
+                values = values[order]
+                vectors = vectors[:, order]
+            roots.extend(
+                (float(np.real(value)), charge, columns, vectors[:, column])
+                for column, value in enumerate(values[:keep])
+            )
+        roots.sort(key=lambda item: item[0])
+        selected = roots[: min(int(nroots), len(roots))]
+        energies = np.asarray([item[0] for item in selected], dtype=float)
+        vectors = np.zeros(
+            (basis.shape[1], len(selected)),
+            dtype=np.result_type(h_dtype, basis, complex),
+        )
+        labels = np.empty((len(selected), basis_qn.shape[1]), dtype=int)
+        for column, (_energy, charge, rows, vector) in enumerate(selected):
+            vectors[rows, column] = vector
+            labels[column] = charge
+        return energies, vectors, labels
+
+    anchor_rank = sum(branch_ranks)
+    anchor = np.zeros(
+        (old_dim, local_dim, anchor_rank),
+        dtype=np.result_type(h_dtype, complex),
+    )
+    anchor_qn = np.empty((anchor_rank, input_qn.shape[1]), dtype=int)
+    offset = 0
+    for local_state, (branch, labels) in enumerate(zip(frames, frame_labels)):
+        width = branch.shape[1]
+        columns = slice(offset, offset + width)
+        anchor[:, local_state, columns] = branch
+        anchor_qn[columns] = labels + LOCAL_QN[local_state]
+        offset += width
+    anchor_matrix = anchor.reshape(old_dim * local_dim, anchor_rank)
+    h_anchor = anchor_matrix.conj().T @ apply_full(anchor_matrix)
+    h_anchor = 0.5 * (h_anchor + h_anchor.T.conj())
+    anchor_lowest_energy = float(np.linalg.eigvalsh(h_anchor)[0])
 
     def solve(current_basis, current_qn):
         current_rank = current_basis.shape[1]
@@ -3231,30 +3613,227 @@ def detached_frame_transition_projector(
         base_matrix = base.reshape(
             old_dim * local_dim, local_dim * current_rank
         )
-        h_detached = base_matrix.conj().T @ (h_full @ base_matrix)
-        h_detached = 0.5 * (h_detached + h_detached.T.conj())
-        energies, coefficients, output_qn = diagonalize_by_qn(
-            h_detached,
-            detached_qn,
-            min(bond_dim, h_detached.shape[0]),
-            allowed_qn=allowed_output_qn,
-            use_irrep_tensor=use_irrep_tensor,
-            allow_empty=True,
+        anchor_coefficients = base_matrix.conj().T @ anchor_matrix
+        anchor_error = float(
+            np.linalg.norm(
+                anchor_matrix - base_matrix @ anchor_coefficients,
+                ord="fro",
+            )
         )
-        if coefficients.shape[1] == 0:
+        if anchor_error > 1.0e-8:
+            raise RuntimeError("detached frame does not contain the standard NARG anchor.")
+
+        search_roots = min(
+            base_matrix.shape[1],
+            bond_dim + anchor_rank,
+        )
+        _trial_energies, trial_vectors, trial_qn = diagonalize_projected_basis(
+            base_matrix,
+            detached_qn,
+            search_roots,
+        )
+        anchor_by_charge = {}
+        for column, charge in enumerate(anchor_qn):
+            anchor_by_charge.setdefault(qn_key(charge), []).append(
+                anchor_coefficients[:, column]
+            )
+        retained_sectors = []
+        retained_labels = []
+        for charge in sorted(anchor_by_charge):
+            matrix = np.column_stack(anchor_by_charge[charge])
+            rows = np.flatnonzero(
+                np.all(
+                    detached_qn == np.asarray(charge, dtype=int),
+                    axis=1,
+                )
+            )
+            left, singular_values, _right = np.linalg.svd(
+                matrix[rows],
+                full_matrices=False,
+            )
+            threshold = (
+                np.finfo(singular_values.dtype).eps
+                * max(matrix.shape)
+                * singular_values[0]
+            )
+            rank = int(np.count_nonzero(singular_values > threshold))
+            sector_basis = np.zeros(
+                (matrix.shape[0], rank),
+                dtype=np.result_type(matrix, complex),
+            )
+            sector_basis[rows] = left[:, :rank]
+            retained_sectors.append(sector_basis)
+            retained_labels.extend([charge] * rank)
+        retained_basis = np.column_stack(retained_sectors)
+        retained_labels = list(retained_labels)
+        target_rank = min(bond_dim, base_matrix.shape[1])
+        for column, charge in enumerate(trial_qn):
+            if retained_basis.shape[1] >= target_rank:
+                break
+            vector = trial_vectors[:, column].copy()
+            for _ in range(2):
+                vector -= retained_basis @ (retained_basis.conj().T @ vector)
+            norm = np.linalg.norm(vector)
+            if norm <= 1.0e-12:
+                continue
+            retained_basis = np.column_stack(
+                (retained_basis, vector / norm)
+            )
+            retained_labels.append(qn_key(charge))
+        retained_labels = np.asarray(retained_labels, dtype=int)
+        retained_label_corrections = 0
+        detached_sectors = {
+            charge: np.flatnonzero(
+                np.all(
+                    detached_qn == np.asarray(charge, dtype=int),
+                    axis=1,
+                )
+            )
+            for charge in sorted({qn_key(row) for row in detached_qn})
+        }
+        for column in range(retained_basis.shape[1]):
+            weights = {
+                charge: float(
+                    np.linalg.norm(retained_basis[rows, column]) ** 2
+                )
+                for charge, rows in detached_sectors.items()
+            }
+            charge, weight = max(weights.items(), key=lambda item: item[1])
+            leakage = max(0.0, sum(weights.values()) - weight)
+            if leakage > 1.0e-8:
+                raise RuntimeError(
+                    "detached retained basis mixes Abelian sectors: "
+                    f"column={column}, leakage={leakage:.3e}."
+                )
+            retained_label_corrections += int(
+                qn_key(retained_labels[column]) != charge
+            )
+            retained_labels[column] = charge
+        for charge in sorted({qn_key(row) for row in retained_labels}):
+            columns = np.flatnonzero(
+                np.all(
+                    retained_labels == np.asarray(charge, dtype=int),
+                    axis=1,
+                )
+            )
+            rows = np.flatnonzero(
+                np.all(
+                    detached_qn == np.asarray(charge, dtype=int),
+                    axis=1,
+                )
+            )
+            sector = retained_basis[np.ix_(rows, columns)]
+            overlap = sector.conj().T @ sector
+            overlap = 0.5 * (overlap + overlap.T.conj())
+            values, vectors = np.linalg.eigh(overlap)
+            if values.size and values[0] <= 1.0e-12:
+                raise RuntimeError(
+                    "detached retained basis lost rank during sector cleanup."
+                )
+            inverse_sqrt = (
+                vectors * (1.0 / np.sqrt(values))[None, :]
+            ) @ vectors.T.conj()
+            retained_basis[:, columns] = 0.0
+            retained_basis[np.ix_(rows, columns)] = sector @ inverse_sqrt
+        retained_physical = base_matrix @ retained_basis
+        energies, rotation, output_qn = diagonalize_projected_basis(
+            retained_physical,
+            retained_labels,
+            retained_basis.shape[1],
+        )
+        if rotation.shape[1] == 0:
             raise ValueError(
                 "no feasible output states remain in the detached-frame space."
             )
-        projector = (base_matrix @ coefficients).reshape(
-            old_dim, local_dim, coefficients.shape[1]
+        projector = (retained_physical @ rotation).reshape(
+            old_dim, local_dim, rotation.shape[1]
         )
-        h_new = coefficients.conj().T @ (h_detached @ coefficients)
+        primitive_qn = (
+            input_qn[:, None, :] + LOCAL_QN[None, :, :]
+        ).reshape(old_dim * local_dim, -1)
+        flat_projector = projector.reshape(old_dim * local_dim, -1)
+        inferred_qn = np.empty_like(output_qn)
+        label_corrections = retained_label_corrections
+        maximum_sector_leakage = 0.0
+        primitive_sectors = {
+            charge: np.flatnonzero(
+                np.all(
+                    primitive_qn == np.asarray(charge, dtype=int),
+                    axis=1,
+                )
+            )
+            for charge in sorted({qn_key(row) for row in primitive_qn})
+        }
+        for column in range(flat_projector.shape[1]):
+            weights = {
+                charge: float(
+                    np.linalg.norm(flat_projector[rows, column]) ** 2
+                )
+                for charge, rows in primitive_sectors.items()
+            }
+            charge, weight = max(weights.items(), key=lambda item: item[1])
+            leakage = max(0.0, sum(weights.values()) - weight)
+            maximum_sector_leakage = max(maximum_sector_leakage, leakage)
+            if leakage > 1.0e-8:
+                raise RuntimeError(
+                    "detached projector mixes Abelian output sectors: "
+                    f"column={column}, leakage={leakage:.3e}."
+                )
+            inferred_qn[column] = charge
+            label_corrections += int(
+                qn_key(output_qn[column]) != charge
+            )
+        output_qn = inferred_qn
+        for charge in sorted({qn_key(row) for row in output_qn}):
+            columns = np.flatnonzero(
+                np.all(
+                    output_qn == np.asarray(charge, dtype=int),
+                    axis=1,
+                )
+            )
+            rows = primitive_sectors[charge]
+            sector = flat_projector[np.ix_(rows, columns)]
+            overlap = 0.5 * (
+                sector.conj().T @ sector
+                + (sector.conj().T @ sector).T.conj()
+            )
+            values, vectors = np.linalg.eigh(overlap)
+            if values.size and values[0] <= 1.0e-12:
+                raise RuntimeError(
+                    "detached projector lost rank during sector cleanup."
+                )
+            inverse_sqrt = (
+                vectors * (1.0 / np.sqrt(values))[None, :]
+            ) @ vectors.T.conj()
+            flat_projector[:, columns] = 0.0
+            flat_projector[np.ix_(rows, columns)] = sector @ inverse_sqrt
+        projector = flat_projector.reshape(old_dim, local_dim, -1)
+        h_new = flat_projector.conj().T @ apply_full(flat_projector)
         h_new = 0.5 * (h_new + h_new.T.conj())
-        return h_new, projector, output_qn, energies
+        retained_matrix = projector.reshape(old_dim * local_dim, -1)
+        retained_anchor_error = float(
+            np.linalg.norm(
+                anchor_matrix
+                - retained_matrix @ (retained_matrix.conj().T @ anchor_matrix),
+                ord="fro",
+            )
+        )
+        if retained_anchor_error > 1.0e-8:
+            raise RuntimeError("retained detached space lost the standard NARG anchor.")
+        return (
+            h_new,
+            projector,
+            output_qn,
+            energies,
+            anchor_error,
+            retained_anchor_error,
+            label_corrections,
+            maximum_sector_leakage,
+        )
 
     def residual_expansion(current_basis, projector, output_qn):
         nstate = projector.shape[2]
-        action = (h_full @ projector.reshape(old_dim * local_dim, nstate)).reshape(
+        action = apply_full(projector.reshape(old_dim * local_dim, nstate)).reshape(
             old_dim, local_dim, nstate
         )
         grouped = {}
@@ -3293,7 +3872,16 @@ def detached_frame_transition_projector(
     residual_history = []
     adapt_iterations = 0
     while True:
-        h_new, projector, output_qn, energies = solve(frame_basis, frame_qn)
+        (
+            h_new,
+            projector,
+            output_qn,
+            energies,
+            anchor_error,
+            retained_anchor_error,
+            label_corrections,
+            maximum_sector_leakage,
+        ) = solve(frame_basis, frame_qn)
         residual_norm, candidates = residual_expansion(
             frame_basis, projector, output_qn
         )
@@ -3339,6 +3927,12 @@ def detached_frame_transition_projector(
     diagnostics = {
         "frame_dim": frame_dim,
         "branch_ranks": tuple(branch_ranks),
+        "anchor_rank": anchor_rank,
+        "anchor_inclusion_error": anchor_error,
+        "retained_anchor_error": retained_anchor_error,
+        "sector_label_corrections": label_corrections,
+        "maximum_sector_leakage": maximum_sector_leakage,
+        "anchor_lowest_energy": anchor_lowest_energy,
         "frame_rank": frame_rank,
         "initial_frame_rank": initial_frame_rank,
         "adapted_rank": frame_rank - initial_frame_rank,
@@ -3349,6 +3943,7 @@ def detached_frame_transition_projector(
         "frame_residual_norm": residual_history[-1],
         "frame_residual_history": tuple(residual_history),
         "lowest_energy": float(energies[0]),
+        "detached_improvement": anchor_lowest_energy - float(energies[0]),
     }
     return h_new, projector, output_qn, diagnostics
 
@@ -3359,7 +3954,7 @@ def _compressed_superblock_two_site_lloo(H0, input_qn, table, residuals, first_s
     old_dim = H0.shape[0]
     d = len(LOCAL_QN)
     local_dim = d * d
-    dtype = np.result_type(H0, h1e, eri, complex)
+    dtype = np.result_type(H0, h1e, getattr(eri, "dtype", eri), complex)
     Hpair4 = np.zeros((local_dim, local_dim, old_dim, old_dim), dtype=dtype)
     H0_dense = dense_operator(H0).astype(dtype, copy=False)
     for local_id in range(local_dim):
@@ -3412,7 +4007,7 @@ def _compressed_superblock_two_site_lloo(H0, input_qn, table, residuals, first_s
         for q_idx in range(second_site + 1):
             for r_idx in range(second_site + 1):
                 for s_idx in range(second_site + 1):
-                    coeff = 0.5 * eri[p_idx, q_idx, r_idx, s_idx]
+                    coeff = 0.5 * eri_value(eri, p_idx, q_idx, r_idx, s_idx)
                     accumulate_term(coeff, ('Cdu', 'Cdu', 'Cu', 'Cu'), (p_idx, r_idx, s_idx, q_idx))
                     accumulate_term(coeff, ('Cdu', 'Cdd', 'Cd', 'Cu'), (p_idx, r_idx, s_idx, q_idx))
                     accumulate_term(coeff, ('Cdd', 'Cdu', 'Cu', 'Cd'), (p_idx, r_idx, s_idx, q_idx))
@@ -3515,7 +4110,7 @@ def conditional_cc_transition_projector(
     response_tol=1.0e-10,
     max_responses=None,
 ):
-    r"""Dress a rolling two-site projector with symmetry-preserving responses.
+    r"""Dress a retained projector with symmetry-preserving responses.
 
     For every retained Abelian sector, this constructs first-order discarded
     responses
@@ -3525,20 +4120,38 @@ def conditional_cc_transition_projector(
         (H_{QQ} - E_i + \Delta)t_i = -H_{QP}c_i,
 
     and Ritz-compresses ``span(P, Q T)`` back to the original number of
-    retained states.  The resulting isometry is general in the two-site branch
+    retained states.  The resulting isometry is general in the local branch
     labels, so it carries the cross-branch amplitudes ``T^{st}`` missing from a
-    branch-local conditional rotation.
+    branch-local conditional rotation. Both dense local-major Hamiltonians and
+    matrix-free one-site actions are supported.
     """
-    Hpair4 = np.asarray(Hpair4)
     primitive_qn = qn_array(primitive_qn)
     output_qn = qn_array(output_qn)
     projector = np.asarray(projector)
     old_dim, local_dim, out_dim = projector.shape
     full_dim = old_dim * local_dim
-    if Hpair4.shape != (local_dim, local_dim, old_dim, old_dim):
-        raise ValueError(
-            "Hpair4 must have shape (local_dim, local_dim, old_dim, old_dim)."
+    matrix_free = isinstance(Hpair4, OneSiteHamiltonianAction)
+    if matrix_free:
+        if Hpair4.old_dim != old_dim or Hpair4.local_dim != local_dim:
+            raise ValueError("Hamiltonian action is incompatible with the projector dimensions.")
+        h_dtype = Hpair4.dtype
+
+        def apply_full(vectors):
+            return Hpair4.matmat(vectors)
+    else:
+        Hpair4 = np.asarray(Hpair4)
+        if Hpair4.shape != (local_dim, local_dim, old_dim, old_dim):
+            raise ValueError(
+                "Hpair4 must have shape (local_dim, local_dim, old_dim, old_dim)."
+            )
+        h_dtype = Hpair4.dtype
+        h_full = np.ascontiguousarray(Hpair4.transpose(2, 0, 3, 1)).reshape(
+            full_dim, full_dim
         )
+        h_full = 0.5 * (h_full + h_full.T.conj())
+
+        def apply_full(vectors):
+            return h_full @ np.asarray(vectors)
     if len(primitive_qn) != full_dim or len(output_qn) != out_dim:
         raise ValueError("quantum-number labels are inconsistent with projector dimensions.")
     if float(response_tol) < 0.0:
@@ -3546,21 +4159,30 @@ def conditional_cc_transition_projector(
     if max_responses is not None and int(max_responses) < 1:
         raise ValueError("max_responses must be positive when provided.")
 
-    h_full = np.ascontiguousarray(Hpair4.transpose(2, 0, 3, 1)).reshape(
-        full_dim, full_dim
-    )
-    h_full = 0.5 * (h_full + h_full.T.conj())
     plain = projector.reshape(full_dim, out_dim)
-    dressed = np.array(plain, copy=True)
+    dressed = np.array(
+        plain,
+        dtype=np.result_type(plain, h_dtype, complex),
+        copy=True,
+    )
     valid = valid_qn_mask(output_qn)
     diagnostics = {
         "discarded_residual_norm": 0.0,
         "response_rank": 0,
         "transition_mixing": 0.0,
         "sector_energy_gain": 0.0,
+        "iterative_solves": 0,
+        "iterative_iterations": 0,
+        "iterative_fallbacks": 0,
+        "maximum_response_residual": 0.0,
     }
     mixing_weight = 0.0
     mixing_states = 0
+    full_diagonal = (
+        Hpair4.diagonal()
+        if matrix_free
+        else np.real(np.diag(h_full))
+    )
 
     for charge in sorted({qn_key(row) for row in output_qn[valid]}):
         charge_array = np.asarray(charge, dtype=int)
@@ -3572,43 +4194,192 @@ def conditional_cc_transition_projector(
         p_sector = plain[np.ix_(rows, pcols)]
         overlap = p_sector.conj().T @ p_sector
         if not np.allclose(overlap, np.eye(pcols.size), atol=1.0e-9):
-            raise ValueError("retained rolling projector is not sector-orthonormal.")
-        h_sector = h_full[np.ix_(rows, rows)]
-        h_pp = p_sector.conj().T @ (h_sector @ p_sector)
+            sector_error = float(
+                np.linalg.norm(overlap - np.eye(pcols.size), ord=np.inf)
+            )
+            leakage_rows = np.flatnonzero(
+                ~np.all(primitive_qn == charge_array, axis=1)
+            )
+            leakage = float(
+                np.linalg.norm(plain[np.ix_(leakage_rows, pcols)], ord="fro")
+            )
+            actual_sectors = []
+            for actual_charge in sorted(
+                {qn_key(row) for row in primitive_qn}
+            ):
+                actual_rows = np.flatnonzero(
+                    np.all(
+                        primitive_qn == np.asarray(actual_charge, dtype=int),
+                        axis=1,
+                    )
+                )
+                weight = float(
+                    np.linalg.norm(
+                        plain[np.ix_(actual_rows, pcols)],
+                        ord="fro",
+                    )
+                    ** 2
+                )
+                if weight > 1.0e-12:
+                    actual_sectors.append((actual_charge, weight))
+            raise ValueError(
+                "retained rolling projector is not sector-orthonormal: "
+                f"charge={charge}, error={sector_error:.3e}, "
+                f"cross-sector leakage={leakage:.3e}, "
+                f"actual sector weights={actual_sectors}."
+            )
+        def sector_apply(vectors):
+            vectors = np.asarray(vectors)
+            was_vector = vectors.ndim == 1
+            if was_vector:
+                vectors = vectors[:, None]
+            embedded = np.zeros(
+                (full_dim, vectors.shape[1]),
+                dtype=np.result_type(h_dtype, projector, vectors, complex),
+            )
+            embedded[rows] = vectors
+            result = apply_full(embedded)[rows]
+            return result[:, 0] if was_vector else result
+
+        hp = sector_apply(p_sector)
+        h_pp = p_sector.conj().T @ hp
         h_pp = 0.5 * (h_pp + h_pp.T.conj())
         p_energy, p_coeff = np.linalg.eigh(h_pp)
 
-        complete, _singular, _adjoint = np.linalg.svd(
-            p_sector, full_matrices=True
-        )
-        q_sector = complete[:, pcols.size :]
-        if q_sector.shape[1] == 0:
+        qdim = rows.size - pcols.size
+        if qdim == 0:
             continue
-        h_qp = q_sector.conj().T @ (h_sector @ p_sector)
-        h_qq = q_sector.conj().T @ (h_sector @ q_sector)
-        h_qq = 0.5 * (h_qq + h_qq.T.conj())
-
-        response = np.zeros(
-            (q_sector.shape[1], pcols.size),
-            dtype=np.result_type(h_sector, projector, complex),
+        response_vectors = np.zeros(
+            (rows.size, pcols.size),
+            dtype=np.result_type(h_dtype, projector, complex),
         )
         sector_residual_sq = 0.0
+        use_iterative = qdim > 64
+        q_sector = None
+        h_qq = None
+        h_qp = None
+        if not use_iterative:
+            complete, _singular, _adjoint = np.linalg.svd(
+                p_sector, full_matrices=True
+            )
+            q_sector = complete[:, pcols.size :]
+            h_qp = q_sector.conj().T @ hp
+            h_qq = q_sector.conj().T @ sector_apply(q_sector)
+            h_qq = 0.5 * (h_qq + h_qq.T.conj())
+
+        def q_project(vectors):
+            return vectors - p_sector @ (p_sector.conj().T @ vectors)
+
         for state in range(pcols.size):
-            residual = h_qp @ p_coeff[:, state]
-            sector_residual_sq += float(np.vdot(residual, residual).real)
-            if np.linalg.norm(residual) <= float(response_tol):
+            hp_state = hp @ p_coeff[:, state]
+            residual = q_project(hp_state)
+            residual_norm = float(np.linalg.norm(residual))
+            sector_residual_sq += residual_norm**2
+            if residual_norm <= float(response_tol):
                 continue
-            shifted = h_qq + (
-                float(level_shift) - float(p_energy[state])
-            ) * np.eye(h_qq.shape[0])
-            response[:, state] = np.linalg.lstsq(
-                shifted, -residual, rcond=1.0e-12
-            )[0]
+            energy = float(p_energy[state])
+            if not use_iterative:
+                rhs = h_qp @ p_coeff[:, state]
+                shifted = h_qq + (
+                    float(level_shift) - energy
+                ) * np.eye(h_qq.shape[0])
+                amplitudes = np.linalg.lstsq(shifted, -rhs, rcond=1.0e-12)[0]
+                response_vectors[:, state] = q_sector @ amplitudes
+                equation_residual = shifted @ amplitudes + rhs
+                relative_residual = float(
+                    np.linalg.norm(equation_residual) / max(residual_norm, 1.0e-30)
+                )
+            else:
+                shift = float(level_shift) - energy
+
+                def response_action(vector):
+                    qvector = q_project(vector)
+                    return q_project(sector_apply(qvector) + shift * qvector) + (
+                        p_sector @ (p_sector.conj().T @ vector)
+                    )
+
+                diagonal = np.asarray(full_diagonal)[rows] + shift
+                scale = max(1.0, float(np.max(np.abs(diagonal))))
+                safe = np.where(
+                    np.abs(diagonal) > 1.0e-10 * scale,
+                    diagonal,
+                    np.where(np.real(diagonal) < 0.0, -1.0, 1.0) * 1.0e-10 * scale,
+                )
+
+                def precondition(vector):
+                    return q_project(vector / safe) + p_sector @ (
+                        p_sector.conj().T @ vector
+                    )
+
+                operator = LinearOperator(
+                    (rows.size, rows.size),
+                    matvec=response_action,
+                    dtype=np.result_type(h_dtype, projector, complex),
+                )
+                preconditioner = LinearOperator(
+                    (rows.size, rows.size),
+                    matvec=precondition,
+                    dtype=operator.dtype,
+                )
+                iterations = [0]
+
+                def count_iteration(_residual):
+                    iterations[0] += 1
+
+                amplitude, info = gmres(
+                    operator,
+                    -residual,
+                    M=preconditioner,
+                    rtol=max(float(response_tol), 1.0e-12),
+                    atol=0.0,
+                    restart=min(80, rows.size),
+                    maxiter=max(20, 4 * rows.size),
+                    callback=count_iteration,
+                    callback_type="pr_norm",
+                )
+                amplitude = q_project(amplitude)
+                equation_residual = response_action(amplitude) + residual
+                relative_residual = float(
+                    np.linalg.norm(q_project(equation_residual))
+                    / max(residual_norm, 1.0e-30)
+                )
+                diagnostics["iterative_solves"] += 1
+                diagnostics["iterative_iterations"] += iterations[0]
+                if info != 0 or relative_residual > max(1.0e-8, 10.0 * float(response_tol)):
+                    diagnostics["iterative_fallbacks"] += 1
+                    sector_basis = np.zeros(
+                        (full_dim, rows.size),
+                        dtype=np.result_type(h_dtype, projector, complex),
+                    )
+                    sector_basis[rows, np.arange(rows.size)] = 1.0
+                    h_sector = apply_full(sector_basis)[rows]
+                    h_sector = 0.5 * (h_sector + h_sector.T.conj())
+                    complete, _singular, _adjoint = np.linalg.svd(
+                        p_sector, full_matrices=True
+                    )
+                    q_ref = complete[:, pcols.size :]
+                    h_qp_ref = q_ref.conj().T @ (h_sector @ p_sector)
+                    h_qq_ref = q_ref.conj().T @ (h_sector @ q_ref)
+                    rhs_ref = h_qp_ref @ p_coeff[:, state]
+                    shifted_ref = h_qq_ref + shift * np.eye(q_ref.shape[1])
+                    amplitudes = np.linalg.lstsq(
+                        shifted_ref, -rhs_ref, rcond=1.0e-12
+                    )[0]
+                    amplitude = q_ref @ amplitudes
+                    relative_residual = float(
+                        np.linalg.norm(shifted_ref @ amplitudes + rhs_ref)
+                        / max(residual_norm, 1.0e-30)
+                    )
+                response_vectors[:, state] = amplitude
+            diagnostics["maximum_response_residual"] = max(
+                diagnostics["maximum_response_residual"],
+                relative_residual,
+            )
         diagnostics["discarded_residual_norm"] = float(
             np.hypot(diagnostics["discarded_residual_norm"], np.sqrt(sector_residual_sq))
         )
 
-        left, singular, _right = np.linalg.svd(response, full_matrices=False)
+        left, singular, _right = np.linalg.svd(response_vectors, full_matrices=False)
         if singular.size == 0 or singular[0] <= float(response_tol):
             continue
         rank = int(np.count_nonzero(singular > float(response_tol) * singular[0]))
@@ -3616,9 +4387,9 @@ def conditional_cc_transition_projector(
             rank = min(rank, int(max_responses))
         if rank == 0:
             continue
-        response_basis = q_sector @ left[:, :rank]
+        response_basis = left[:, :rank]
         trial = np.column_stack((p_sector, response_basis))
-        h_trial = trial.conj().T @ (h_sector @ trial)
+        h_trial = trial.conj().T @ sector_apply(trial)
         h_trial = 0.5 * (h_trial + h_trial.T.conj())
         trial_energy, trial_coeff = np.linalg.eigh(h_trial)
         selected = trial_coeff[:, : pcols.size]
@@ -3635,7 +4406,7 @@ def conditional_cc_transition_projector(
         mixing_weight / mixing_states if mixing_states else 0.0
     )
     dressed_projector = dressed.reshape(old_dim, local_dim, out_dim)
-    h_dressed = dressed.conj().T @ (h_full @ dressed)
+    h_dressed = dressed.conj().T @ apply_full(dressed)
     h_dressed = 0.5 * (h_dressed + h_dressed.T.conj())
     return h_dressed, dressed_projector, diagnostics
 
@@ -3774,8 +4545,8 @@ def _append_one_site_reduced(
     v3u = zero_like_operator(H0)
     v3d = zero_like_operator(H0)
     for i in range(site_id):
-        v3u += eri[i, site_id, site_id, site_id] * dense_operator(Cdu[i])
-        v3d += eri[i, site_id, site_id, site_id] * dense_operator(Cdd[i])
+        v3u += eri_value(eri, i, site_id, site_id, site_id) * dense_operator(Cdu[i])
+        v3d += eri_value(eri, i, site_id, site_id, site_id) * dense_operator(Cdd[i])
     V3 = (
         rotate_symmetry(v3u, JW @ Nd @ cu, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
         + rotate_symmetry(v3d, JW @ Nu @ cd, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
@@ -4161,6 +4932,7 @@ def extend_operator_table(
     plan=None,
     required=None,
     sparse_output=False,
+    consume=False,
 ):
     """Project full composite operators when adding one spatial orbital."""
     old_dim = next(iter(table[('Cu',)].values())).shape[0]
@@ -4173,6 +4945,35 @@ def extend_operator_table(
         'Cdd': cdd,
     }
     new_table = {}
+
+    source_uses = {}
+    if consume:
+        for pattern in patterns:
+            index_iter = (
+                np.ndindex((new_site + 1,) * len(pattern))
+                if required is None
+                else sorted(required.get(pattern, ()))
+            )
+            for indices in index_iter:
+                old_pattern = tuple(
+                    name for name, idx in zip(pattern, indices) if idx != new_site
+                )
+                old_indices = tuple(idx for idx in indices if idx != new_site)
+                if old_pattern:
+                    key = (old_pattern, old_indices)
+                    source_uses[key] = source_uses.get(key, 0) + 1
+        for pattern, entries in table.items():
+            for indices in tuple(entries):
+                if (pattern, indices) not in source_uses:
+                    entries.pop(indices)
+
+    def release_source(pattern, indices):
+        if not consume or not pattern:
+            return
+        key = (pattern, indices)
+        source_uses[key] -= 1
+        if source_uses[key] == 0:
+            table[pattern].pop(indices, None)
 
     for pattern in patterns:
         entries = {}
@@ -4210,8 +5011,11 @@ def extend_operator_table(
                 entries[indices] = rotate_symmetry(
                     block_op, local_op, U, output_qn, shift, use_irrep_blocks, plan, sparse_output=sparse_output
                 )
+            release_source(tuple(old_pattern), tuple(old_indices))
         new_table[pattern] = entries
 
+    if consume:
+        table.clear()
     return new_table
 
 
@@ -4284,6 +5088,7 @@ def kernel(
     
     # eri = mol.eri
     L = h1e.shape[-1]
+    validate_eri_representation(eri, L)
     if fast:
         if use_numba_terms == 'auto':
             use_numba_terms = True
@@ -4330,12 +5135,19 @@ def kernel(
         "detached_frames",
     }:
         dressing_key = "detached_frames"
+    elif dressing_key in {
+        "detached+cc",
+        "detached_cc",
+        "detached_frames_cc",
+        "cc_detached",
+    }:
+        dressing_key = "detached_cc"
     else:
         raise ValueError(
-            "dressing must be None, 'conditional_cc', or 'detached_frames'."
+            "dressing must be None, 'conditional_cc', 'detached_frames', or 'detached_cc'."
         )
     if (
-        dressing_key != "none"
+        dressing_key == "conditional_cc"
         and growth_sites in {2, "auto"}
         and two_site_mode == "supersite"
     ):
@@ -4343,15 +5155,15 @@ def kernel(
             "conditional_cc with paired supersite growth is not implemented; "
             "use growth_sites=1 or two_site_mode='rolling'."
         )
-    if dressing_key == "detached_frames":
+    if dressing_key in {"detached_frames", "detached_cc"}:
         if growth_sites != 1:
-            raise ValueError("detached_frames currently requires growth_sites=1.")
+            raise ValueError("detached dressing currently requires growth_sites=1.")
         frame_space = len(LOCAL_QN) * int(D)
         detached_space = len(LOCAL_QN) * frame_space
         chi = 2 * frame_space if chi is None else int(chi)
         if not frame_space < chi <= detached_space:
             raise ValueError(
-                f"detached_frames requires {frame_space} < chi <= {detached_space} "
+                f"detached dressing requires {frame_space} < chi <= {detached_space} "
                 f"for D={int(D)}."
             )
         if frame_adapt_tol is not None and float(frame_adapt_tol) < 0.0:
@@ -4367,13 +5179,13 @@ def kernel(
         if frame_expand_dim < 1:
             raise ValueError("frame_expand_dim must be positive.")
     elif chi is not None:
-        raise ValueError("chi is only used with dressing='detached_frames'.")
+        raise ValueError("chi is only used with detached dressing.")
     elif (
         frame_adapt_tol is not None
         or frame_max_dim is not None
         or int(frame_expand_dim) != 1
     ):
-        raise ValueError("frame adaptation options require dressing='detached_frames'.")
+        raise ValueError("frame adaptation options require detached dressing.")
     cc_response_tol = float(cc_response_tol)
     if cc_response_tol < 0.0:
         raise ValueError("cc_response_tol must be non-negative.")
@@ -4404,13 +5216,12 @@ def kernel(
         )
     if two_site_mode == "rolling" and need_spin:
         raise NotImplementedError("rolling two-site qchem NARG does not yet support spin observables.")
-    if (two_site_mode == "rolling" or dressing_key != "none") and return_tensors:
+    if two_site_mode == "rolling" and return_tensors:
         raise NotImplementedError(
-            "general-projector qchem NARG does not yet return reconstructable "
-            "branch-local NARG tensors."
+            "rolling two-site qchem NARG does not yet return reconstructable tensors."
         )
     if sparse_operator_table == 'auto':
-        sparse_operator_table = bool(fast)
+        sparse_operator_table = True
     else:
         sparse_operator_table = bool(sparse_operator_table)
     if use_block_sparse_hamiltonian == 'auto':
@@ -4429,59 +5240,25 @@ def kernel(
     
     # initiate the block with l0 Spin-Orbitals
     nstart = n0
-    model = SpinHalfFermionChain(h1e[:nstart, :nstart], v[:nstart, :nstart, :nstart, :nstart],
-                                 nelec=mol.nelec)
+    initial_eri = eri_to_dense(eri_subspace(v, range(nstart)))
+    model = SpinHalfFermionChain(
+        h1e[:nstart, :nstart],
+        initial_eri,
+        nelec=mol.nelec,
+    )
     # model.fix_nelec(s=2)
     
     model.jordan_wigner(forward=False)
     
     # D = 160 # retained adiabatic eigenstates
     block_qn = primitive_charge_labels(nstart)
-    E0, U0, qn0 = diagonalize_by_qn(
-        model.H, block_qn, D, allowed_qn=branch_allowed(nstart, 0),
-        use_irrep_tensor=use_irrep_tensor, allow_empty=True
-    )
-    
-    # E0 = model.e_tot
-    # U0 = model.X
-    
-    maybe_print(verbose, 'Initial block energy = ', E0)
-    
     H0 = model.H
-    
-    
-    def single_site_hamiltonian(n):
-        """
-        Hamiltonian for a single spin-orbital
-    
-        Parameters
-        ----------
-        n : TYPE
-            orbital ID. Starting from zero.
-    
-        Returns
-        -------
-        TYPE
-            DESCRIPTION.
-    
-        """
-    
-        return h1e[n,n] * (cdu @ cu + cdd @ cd) + eri[n, n, n, n] * Nu @ Nd
-    
-    
-    
-    p = nstart
-    # add the pth site
-    h = single_site_hamiltonian(p)
-    # assert(isdiag(h))
-    maybe_print(verbose, 'site', p, ' H = ', np.diag(h))
-    
-    # the adaibatic states at |\uparrow>
-    # psi = np.array([0, 1., 0, 0])
-    
-    # nu = obs(psi, Nu) # expect 1
-    # nd = obs(psi, Nd) # expect 0
-    
+    d = len(LOCAL_QN)
+    scalar_shift = (0, 0)
+
+    def single_site_hamiltonian(site_id):
+        return single_site_hamiltonian_from_integrals(h1e, eri, site_id)
+
     required_entries = (
         required_operator_entries(pair_terms, triple_terms, L, nstart)
         if sparse_operator_table
@@ -4489,361 +5266,44 @@ def kernel(
     )
     if need_spin:
         required_entries = add_initial_spin_entries(required_entries, nstart)
+    initial_operators = {
+        "Cdu": model.Cdu,
+        "Cdd": model.Cdd,
+        "Cu": model.Cu,
+        "Cd": model.Cd,
+    }
     op_table = make_operator_table(
-        {
-            'Cdu': model.Cdu,
-            'Cdd': model.Cdd,
-            'Cu': model.Cu,
-            'Cd': model.Cd,
-        },
+        initial_operators,
         OPERATOR_PATTERNS,
         nstart,
         required=required_entries,
     )
-    irrep_op_table = irrep_operator_table(op_table, block_qn) if use_irrep_operator_table else None
+    irrep_op_table = (
+        irrep_operator_table(op_table, block_qn)
+        if use_irrep_operator_table
+        else None
+    )
     op_table_qn = block_qn
     triple_residuals = build_initial_triple_residuals(
-        {
-            'Cdu': model.Cdu,
-            'Cdd': model.Cdd,
-            'Cu': model.Cu,
-            'Cd': model.Cd,
-        },
+        initial_operators,
         nstart,
         range(nstart, L),
         triple_terms,
     )
-    irrep_triple_residuals = None
-    if use_irrep_operator_table:
-        irrep_triple_residuals = build_initial_triple_residuals_irrep(
+    irrep_triple_residuals = (
+        build_initial_triple_residuals_irrep(
             irrep_op_table,
             nstart,
             range(nstart, L),
             triple_terms,
         )
-    op_lists = operator_lists(op_table)
-    Cdu = op_lists['Cdu']
-    Cdd = op_lists['Cdd']
-    Cu = op_lists['Cu']
-    Cd = op_lists['Cd']
+        if use_irrep_operator_table
+        else None
+    )
     spin_ops = initial_spin_operators(op_table) if need_spin else None
-    
-    nu = 1
-    nd = 0
-    
-    ### add all interaction between previous sites (0,1,...n-1) and the new site (n)
-    
-    # two-operator \sum_{i, j < p} v[i,j,p,p] - v[i, p, p, j] * (nu + nd)
-    pair_sums = build_pair_sums(op_table, pair_terms, p)
-    if use_block_sparse_hamiltonian and not use_irrep_tensor:
-        E1, U1, qn1 = branch_diagonalize_block_sparse(
-            H0, pair_sums, nu, nd, block_qn, D, allowed_qn=branch_allowed(nstart, 1), allow_empty=True
-        )
-    else:
-        H = branch_hamiltonian(H0, pair_sums, nu, nd)
-        E1, U1, qn1 = diagonalize_by_qn(
-            H, block_qn, D, allowed_qn=branch_allowed(nstart, 1),
-            use_irrep_tensor=use_irrep_tensor, allow_empty=True
-        )
-    # print(E1)
-    
-    # the adaibatic states at |\downarrow>
-    nd = 1
-    nu = 0
-    
-    if use_block_sparse_hamiltonian and not use_irrep_tensor:
-        E2, U2, qn2 = branch_diagonalize_block_sparse(
-            H0, pair_sums, nu, nd, block_qn, D, allowed_qn=branch_allowed(nstart, 2), allow_empty=True
-        )
-    else:
-        H2 = branch_hamiltonian(H0, pair_sums, nu, nd)
-        E2, U2, qn2 = diagonalize_by_qn(
-            H2, block_qn, D, allowed_qn=branch_allowed(nstart, 2),
-            use_irrep_tensor=use_irrep_tensor, allow_empty=True
-        )
-    # print(E2)
-    
-    # the adaibatic states at |\uparrow \downarrow>
-    nu = 1
-    nd = 1
-    
-    if use_block_sparse_hamiltonian and not use_irrep_tensor:
-        E3, U3, qn3 = branch_diagonalize_block_sparse(
-            H0, pair_sums, nu, nd, block_qn, D, allowed_qn=branch_allowed(nstart, 3), allow_empty=True
-        )
-    else:
-        H3 = branch_hamiltonian(H0, pair_sums, nu, nd)
-        E3, U3, qn3 = diagonalize_by_qn(
-            H3, block_qn, D, allowed_qn=branch_allowed(nstart, 3),
-            use_irrep_tensor=use_irrep_tensor, allow_empty=True
-        )
-    # print(E3)
+    narg_tensors = []
+    tensor_qns = []
 
-    d = 4 # local dim
-    initial_width = min(D, d**nstart)
-    E0, U0, qn0 = pad_branch(E0, U0, qn0, initial_width)
-    E1, U1, qn1 = pad_branch(E1, U1, qn1, initial_width)
-    E2, U2, qn2 = pad_branch(E2, U2, qn2, initial_width)
-    E3, U3, qn3 = pad_branch(E3, U3, qn3, initial_width)
-    
-    
-    E = np.zeros((d, initial_width))
-    U = np.zeros((d**nstart, initial_width, d), dtype=np.result_type(U0, U1, U2, U3))
-    
-    E[0, :] = E0 + h[0, 0]
-    E[1, :] = E1 + h[1, 1]
-    E[2, :] = E2 + h[2, 2]
-    E[3, :] = E3 + h[3, 3]
-    
-    # print('E = ', E)
-    
-    U[:, :, 0] = U0
-    U[:, :, 1] = U1
-    U[:, :, 2] = U2
-    U[:, :, 3] = U3
-    htot_qn = np.concatenate((qn0 + LOCAL_QN[0], qn1 + LOCAL_QN[1], qn2 + LOCAL_QN[2], qn3 + LOCAL_QN[3]))
-    narg_tensors = [U.copy()]
-    tensor_qns = [
-        {
-            "row_qn": block_qn.copy(),
-            "right_qn_by_next": np.stack((qn0, qn1, qn2, qn3), axis=0).copy(),
-        }
-    ]
-    
-    
-    # build total Hamiltonian for 123 + 4
-    
-    # adiabatic H + diagonal part of h4
-    # S = contract('ibm,  ian -> mbna', U.conj(), U)
-    
-    # residual interactions including a_p, a_p^dag a_p a_p
-    
-    Htot = np.diag(E.reshape((initial_width * d))).astype(np.result_type(U, complex))
-    
-    # c_p V1, V2, V3
-    v1u = zero_like_operator(H0)
-    v1d = zero_like_operator(H0)
-    
-    
-    for i in range(nstart):
-    
-        v1u = v1u + h1e[i, p] * dense_operator(Cdu[i])
-        v1d = v1d + h1e[i, p] * dense_operator(Cdd[i])
-    
-    # print('v1u', v1u, v1d)
-    
-    v1u += triple_residuals[p][0]
-    v1d += triple_residuals[p][1]
-    
-    # jw_string = tensor([JW, ] * n0)
-    
-    
-    # V1u =  contract('ibm, ij, jan -> mbna', U.conj(), (v1u @ jw_string).toarray() , U)
-    # V1d =  contract('ibm, ij, jan -> mbna', U.conj(), (v1d @ jw_string).toarray(), U)
-    
-    scalar_shift = (0, 0)
-    initial_plan = RotationPlan(U, htot_qn) if use_irrep_blocks else None
-    V1 = (
-        rotate_symmetry(v1u, JW @ cu, U, htot_qn, scalar_shift, use_irrep_blocks, initial_plan)
-        + rotate_symmetry(v1d, JW @ cd, U, htot_qn, scalar_shift, use_irrep_blocks, initial_plan)
-    )
-    
-    # print('V1', V1)
-    
-    Htot += V1 + dag(V1) # this is not correct? I have to consider the JW string for Cp!
-    
-    # V2 term
-    v2a = pair_sums['v2a']
-    v2b = pair_sums['v2b']
-    
-    # print(dag(U) @ (Cdd+ Cd) @ U)
-    
-    H2a = rotate_symmetry(v2a, cdu @ cd, U, htot_qn, scalar_shift, use_irrep_blocks, initial_plan)
-    H2b = rotate_symmetry(v2b, cdu @ cdd, U, htot_qn, scalar_shift, use_irrep_blocks, initial_plan)
-    
-    # print('V2', H2a, H2b)
-    Htot += H2a + dag(H2a) + H2b + dag(H2b)
-    
-    
-    ## V3 (V3 can be combined with V1)
-    v3u = zero_like_operator(H0)
-    v3d = zero_like_operator(H0)
-    for i in range(n0):
-        v3u += eri[i, p, p, p] * dense_operator(Cdu[i])
-        v3d += eri[i, p, p, p] * dense_operator(Cdd[i])
-    
-    H3 = (
-        rotate_symmetry(v3u, JW @ Nd @ cu, U, htot_qn, scalar_shift, use_irrep_blocks, initial_plan)
-        + rotate_symmetry(v3d, JW @ Nu @ cd, U, htot_qn, scalar_shift, use_irrep_blocks, initial_plan)
-    )
-    
-    Htot += H3 + dag(H3)
-    
-    # print(Htot)
-    # nroots = 10
-    
-    ######################
-    # add the next orbital
-    ######################
-    
-    # E0, U0 = eigsh(Htot, k=D, which='SA')
-    
-    # # print(E0)
-    # log.info('\nTotal energy for {} orbitals = {}'.format(p+1, E0 + mol.energy_nuc()))
-    
-    
-    
-    # # l = nstart + 1
-    # p += 1 # site id for the new orbital
-    # print('\n--- adding the {}th orbital ---'.format(p+1))
-    # print('p = ', p)
-    
-    # # the annihilation are operators \sigma_i Z_{i+1}......Z_l
-    
-    # H0 = Htot.copy()
-    
-    # Iblock = eye(d**n0) # block identity
-    # Isite = eye(d) # site identity
-    
-    
-    # Cu = [rotate(op, JW, U) for op in Cu] + [rotate(Iblock,  cu, U)]
-    # Cd = [rotate(op, JW, U) for op in Cd] + [rotate(Iblock, cd, U)]
-    # Cdu = [rotate(op, JW, U) for op in Cdu] + [rotate(Iblock, cdu, U)]
-    # Cdd = [rotate(op, JW, U) for op in Cdd] + [rotate(Iblock, cdd, U)]
-    
-    
-    # # print('Cu', Cu)
-    # ### add all interaction between previous sites (0,1,...p-1) and the new site (p)
-    
-    # nu = 1
-    # nd = 0
-    
-    # # two-operator \sum_{i, j < p} v[i,j,p,p] - v[i, p, p, j] * (nu + nd)
-    # H1 = H0.copy()
-    # for i in range(p):
-    #     for j in range(p):
-    #         H1 += v[i,j,p,p] * (nu + nd) * (Cdu[i] @ Cu[j] + Cdd[i] @  Cd[j])
-    #         H1 -= v[i, p, p, j] * (nu * Cdu[i] @ Cu[j] + nd * Cdd[i] @  Cd[j])
-    
-    # E1, U1 = eigh(H1, k=D)
-    # # print(E1)
-    
-    # # the adaibatic states at |\downarrow>
-    # nu = 0
-    # nd = 1
-    
-    # H2 = H0.copy()
-    # for i in range(p):
-    #     for j in range(p):
-    #         H2 += v[i,j,p,p] * (nu + nd) * (Cdu[i] @ Cu[j] + Cdd[i] @  Cd[j])
-    #         H2 -= v[i, p, p, j] * (nu * Cdu[i] @ Cu[j] + nd * Cdd[i] @  Cd[j])
-    
-    # E2, U2 = eigh(H2, k=D)
-    # # print(r'adiabatic states corresponding to |\uparrow> = \n', E2)
-    
-    # # the adaibatic states at |\uparrow \downarrow>
-    # nu = 1
-    # nd = 1
-    
-    # H3 = H0.copy()
-    # for i in range(p):
-    #     for j in range(p):
-    #         H3 += v[i,j,p,p] * (nu + nd) * (Cdu[i] @ Cu[j] + Cdd[i] @  Cd[j])
-    #         H3 -= v[i, p, p, j] * (nu * Cdu[i] @ Cu[j] + nd * Cdd[i] @  Cd[j])
-    
-    # E3, U3 = eigh(H3, k=D)
-    # # print(E3)
-    
-    
-    # # build the total H for the superblock of l_0 + 1 + 1 sites
-    
-    
-    # E = np.zeros((d, D))
-    # U = np.zeros((D * d, D, d))
-    
-    # h = single_site_hamiltonian(p)
-    # log.info('site', p, 'H = ', np.diag(h))
-    
-    # E[0, :] = E0 + h[0, 0]
-    # E[1, :] = E1 + h[1, 1]
-    # E[2, :] = E2 + h[2, 2]
-    # E[3, :] = E3 + h[3, 3]
-    
-    # # print('Enew = ', E)
-    
-    # U[:, :, 0] = U0
-    # U[:, :, 1] = U1
-    # U[:, :, 2] = U2
-    # U[:, :, 3] = U3
-    
-    # # add residual interactions including a_p, a_p^dag a_p a_p
-    
-    # Htot = np.diag(E.reshape((D * d))).astype(np.result_type(U, complex))
-    
-    # # c_p V1
-    # v1u = 0
-    # v1d = 0
-    
-    # for i in range(p):
-    #     v1u += h1e[i, p] * Cdu[i]
-    #     v1d += h1e[i, p] * Cdd[i]
-    
-    
-    # for i in range(p):
-    #     for j in range(p):
-    #         for k in range(p):
-    #             v1u += eri[k,p,j,i] * Cdu[k] @ (Cdu[j] @ Cu[i] + Cdd[j] @ Cd[i])
-    #             v1d += eri[k,p,j,i] * Cdd[k] @ (Cdu[j] @ Cu[i] + Cdd[j] @ Cd[i])
-    
-    # # jw_string = tensor([JW, ] * n0)
-    
-    # # V1u =  contract('ibm, ij, jan -> mbna', U.conj(), v1u.toarray() , U)
-    # # V1d =  contract('ibm, ij, jan -> mbna', U.conj(), v1d.toarray(), U)
-    
-    # V1 = rotate(v1u, JW @ cu, U) + rotate(v1d, JW @ cd, U)
-    
-    
-    # Htot += V1 + dag(V1)
-    
-    # v2a = 0
-    # for i in range(p):
-    #     for j in range(p):
-    #         v2a += -eri[i, p, p, j] * Cdd[i] @ Cu[j]
-    
-    # v2b = 0
-    # for i in range(p):
-    #     for j in range(p):
-    #         v2b += 0.5 * eri[p,i,p,j] * (Cd[i] @ Cu[j] - Cu[i] @ Cd[j])
-    
-    
-    # # V2 = contract('ibm, ij, jan -> mbna', U.conj(), v2a.toarray(), U)
-    # # H2a = contract('mbna, mn -> mbna', V2, cdu @ cd).reshape((d*D, d*D))
-    # V2a = rotate(v2a, cdu @ cd, U)
-    # # V2b = contract('ibm, ij, jan -> mbna', U.conj(), v2b.toarray(), U)
-    # # H2b = contract('mbna, mn -> mbna', V2b, cdu @ cdd).reshape((d*D, d*D))
-    # V2b = rotate(v2b, cdu @ cdd, U)
-    
-    # V2 = V2a + V2b
-    
-    # Htot += V2 + dag(V2)
-    
-    
-    # ## V3 (V3 can be combined with V1)
-    # v3u = 0
-    # v3d = 0
-    # for i in range(p):
-    #     v3u += eri[i, p, p, p] * Cdu[i]
-    #     v3d += eri[i, p, p, p] * Cdd[i]
-    
-    # # V3u =  contract('ibm, ij, jan -> mbna', U.conj(), v3u.toarray(), U)
-    # # V3d =  contract('ibm, ij, jan -> mbna', U.conj(), v3d.toarray(), U)
-    
-    # # H3 = contract('mbna, mn -> mbna', V3u, JW @ Nd @ cu).reshape((d*D, d*D)) + \
-    # #     contract('mbna, mn -> mbna', V3d, JW @ Nu @ cd).reshape((d*D, d*D))
-    
-    # V3 = rotate(v3u, JW @ Nd @ cu, U) + rotate(v3d, JW @ Nu @ cd, U)
-    # Htot += V3 + dag(V3)
-    
     def extend_current_block(
         table, irrep_table, table_qn, residuals, irrep_residuals, spins, basis_tensor, site_id, output_qn
     ):
@@ -4883,6 +5343,7 @@ def kernel(
             plan,
             required=required_entries,
             sparse_output=use_sparse_operator_projection,
+            consume=True,
         )
         return table, irrep_table, table_qn, residuals, irrep_residuals, spins
 
@@ -5024,8 +5485,8 @@ def kernel(
 
     def append_one_site(H0, H0_irrep, input_qn, table, irrep_table, residuals, irrep_residuals, site_id, keep):
         keep = min(int(keep), H0.shape[0])
-        if dressing_key == "detached_frames":
-            h_grown, _primitive_qn = _compressed_superblock_one_site_lloo(
+        if dressing_key in {"detached_frames", "detached_cc"}:
+            h_grown, primitive_qn = _compressed_superblock_one_site_action(
                 H0,
                 input_qn,
                 table,
@@ -5041,7 +5502,7 @@ def kernel(
                 for output_charge in output_allowed
                 for local_charge in LOCAL_QN
             }
-            Hnew, projector, output_qn, diagnostics = (
+            Hnew, projector, output_qn, detached_diagnostics = (
                 detached_frame_transition_projector(
                     h_grown,
                     input_qn,
@@ -5055,10 +5516,25 @@ def kernel(
                     expand_dim=frame_expand_dim,
                 )
             )
+            diagnostics = detached_diagnostics
+            if dressing_key == "detached_cc":
+                Hnew, projector, cc_diagnostics = conditional_cc_transition_projector(
+                    h_grown,
+                    primitive_qn,
+                    projector,
+                    output_qn,
+                    level_shift=cc_level_shift,
+                    response_tol=cc_response_tol,
+                    max_responses=cc_max_responses,
+                )
+                diagnostics = {
+                    "detached_diagnostics": detached_diagnostics,
+                    "cc_diagnostics": cc_diagnostics,
+                }
             return (
                 Hnew,
                 None,
-                None,
+                projector.transpose(0, 2, 1).copy(),
                 output_qn,
                 None,
                 projector,
@@ -5154,12 +5630,12 @@ def kernel(
             v3u = sum_tensor_terms(
                 site,
                 OPERATOR_QN_SHIFT['Cdu'],
-                [(eri[i, site_id, site_id, site_id], irrep_table[(('Cdu',), (i,))]) for i in range(site_id)],
+                [(eri_value(eri, i, site_id, site_id, site_id), irrep_table[(('Cdu',), (i,))]) for i in range(site_id)],
             )
             v3d = sum_tensor_terms(
                 site,
                 OPERATOR_QN_SHIFT['Cdd'],
-                [(eri[i, site_id, site_id, site_id], irrep_table[(('Cdd',), (i,))]) for i in range(site_id)],
+                [(eri_value(eri, i, site_id, site_id, site_id), irrep_table[(('Cdd',), (i,))]) for i in range(site_id)],
             )
             V3u = rotate_irrep_tensor_product(
                 v3u, JW @ Nd @ cu, branch_tensor, input_qn, output_qn, OPERATOR_QN_SHIFT['Cu']
@@ -5207,8 +5683,8 @@ def kernel(
             v3u = zero_like_operator(H0)
             v3d = zero_like_operator(H0)
             for i in range(site_id):
-                v3u += eri[i, site_id, site_id, site_id] * dense_operator(Cdu[i])
-                v3d += eri[i, site_id, site_id, site_id] * dense_operator(Cdd[i])
+                v3u += eri_value(eri, i, site_id, site_id, site_id) * dense_operator(Cdu[i])
+                v3d += eri_value(eri, i, site_id, site_id, site_id) * dense_operator(Cdd[i])
             V3 = (
                 rotate_symmetry(v3u, JW @ Nd @ cu, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
                 + rotate_symmetry(v3d, JW @ Nu @ cd, branch_tensor, output_qn, scalar_shift, use_irrep_blocks, plan)
@@ -5246,6 +5722,7 @@ def kernel(
                 max_responses=cc_max_responses,
             )
             Hnew_irrep = None
+            branch_tensor = projector.transpose(0, 2, 1).copy()
         return (
             Hnew,
             Hnew_irrep,
@@ -5362,6 +5839,7 @@ def kernel(
                     qn,
                     required=required_entries,
                     sparse_output=use_sparse_operator_projection,
+                    consume=True,
                 )
                 self.table_qn = qn
                 self.irrep_table = None
@@ -5371,12 +5849,20 @@ def kernel(
             meta = {}
             if cc_diagnostics is not None:
                 meta["dressing"] = dressing_key
-                diagnostics_key = (
-                    "cc_diagnostics"
-                    if dressing_key == "conditional_cc"
-                    else "detached_diagnostics"
-                )
-                meta[diagnostics_key] = dict(cc_diagnostics)
+                if dressing_key == "detached_cc":
+                    meta["detached_diagnostics"] = dict(
+                        cc_diagnostics["detached_diagnostics"]
+                    )
+                    meta["cc_diagnostics"] = dict(
+                        cc_diagnostics["cc_diagnostics"]
+                    )
+                else:
+                    diagnostics_key = (
+                        "cc_diagnostics"
+                        if dressing_key == "conditional_cc"
+                        else "detached_diagnostics"
+                    )
+                    meta[diagnostics_key] = dict(cc_diagnostics)
                 meta["general_projector"] = True
             return Step(
                 site=site,
@@ -5498,16 +5984,16 @@ def kernel(
                 meta=meta,
             )
 
-    Htot_irrep = labeled_irrep_tensor(Htot, htot_qn, op=(0, 0)) if use_irrep_operator_table else None
+    Htot_irrep = labeled_irrep_tensor(H0, block_qn, op=(0, 0)) if use_irrep_operator_table else None
     growth = AbelianGrowth(
         op_table, irrep_op_table, op_table_qn, Htot_irrep, triple_residuals, irrep_triple_residuals, spin_ops, nstart
     )
-    block = Block(h=Htot, qn=htot_qn, tensor=U)
-    for step in growth.grow_range(block, p + 1, L - 1):
-        block = step.block
-        narg_tensors.append(step.tensor)
-        tensor_qns.append(step.meta)
-        p = step.site.idx + step.meta["growth_sites"] - 1
+    block = Block(h=H0, qn=block_qn, tensor=None)
+    for first_site, last_site in ((nstart, nstart), (nstart + 1, L - 1)):
+        for step in growth.grow_range(block, first_site, last_site):
+            block = step.block
+            narg_tensors.append(step.tensor)
+            tensor_qns.append(step.meta)
 
     Htot = block.h
     htot_qn = block.qn
@@ -5719,6 +6205,7 @@ class NARG:
             self.mol,
             h1e=self.h1e,
             eri=self.eri,
+            prefer_factors=True,
             **cas_options,
         )
         return h1e, eri
@@ -5759,6 +6246,7 @@ class NARG:
             self.mol,
             h1e=h1e,
             eri=eri,
+            prefer_factors=True,
             **cas_options,
         )
         self.h1e = h1e
@@ -5793,9 +6281,7 @@ class NARG:
                 raise ValueError("store_tensors must be True, False, or 'auto'.")
             mode = str(opts.get("two_site_mode", "supersite")).lower().replace("-", "_")
             store_tensors = (
-                not dressing_requested
-                and mode
-                not in {
+                mode not in {
                     "rolling",
                     "two_site",
                     "true_two_site",

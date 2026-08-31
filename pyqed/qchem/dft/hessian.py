@@ -181,7 +181,7 @@ class Hessian:
     def _evaluate_gradient(self, coords):
         mol = _copy_molecule(self.mol)
         mol.set_geom(coords)
-        mol.build(driver='gbasis')
+        mol.build()
 
         grid = _build_grid(self.base, mol)
         step_mf = self.base.__class__(mol, grid=grid, xc=self.base.xc, init_guess=self.base.init_guess)

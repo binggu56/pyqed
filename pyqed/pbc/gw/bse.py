@@ -126,6 +126,7 @@ def _transition_table(space, q_index, transition_energy):
 
 
 def _screening_space(space, screening_space=None, screening_energy=None):
+    inherit_pyscf_context = screening_space is None
     if screening_space is None:
         screening_space = KPointTransitionSpace(
             space.reference,
@@ -138,6 +139,12 @@ def _screening_space(space, screening_space=None, screening_energy=None):
 
     if screening_energy is not None:
         screening_space = screening_space.with_mo_energy(screening_energy)
+    if inherit_pyscf_context:
+        context = getattr(space, "_pyscf_gdf_context", None)
+        context_key = getattr(space, "_pyscf_gdf_context_key", None)
+        if context is not None and context_key is not None:
+            screening_space._pyscf_gdf_context = context
+            screening_space._pyscf_gdf_context_key = context_key
     return screening_space
 
 

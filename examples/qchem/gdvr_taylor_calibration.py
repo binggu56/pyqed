@@ -10,7 +10,6 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
-from pyqed.mps.mps import expect_mps
 from pyqed.mps.tdmps import TDMPS
 from pyqed.qchem.gdvr import AtomicChain
 from pyqed.qchem.rttdhf import gaussian_pulse
@@ -123,7 +122,7 @@ def main(argv=None):
 
     psi0 = td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
-    mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
+    mu0 = float(np.real(psi0.expectation(mu_mpo)))
 
     reference = _run_case(td, psi0, mu0, mu_mpo, pulse, args, integrator="tdvp2", order=max(orders))
     results = [reference]
@@ -214,8 +213,8 @@ def main(argv=None):
 
     print(f"RHF energy:      {mf.e_tot:.12f} Ha")
     print(f"DMRG energy:     {td.e_tot:.12f} Ha")
-    print(f"GDVR MPO terms:  {td._active_integral_build_info['symbolic_terms']}")
-    print(f"max MPO bond:    {td._active_integral_build_info['mpo_max_bond']}")
+    print(f"GDVR MPO terms:  {td.build_info['symbolic_terms']}")
+    print(f"max MPO bond:    {td.build_info['mpo_max_bond']}")
     print("case        runtime(s)   max|dmu-ref|   rms|dmu-ref|   max|Npre-1|   max|dE|      TR error     state err")
     for row in rows:
         print(

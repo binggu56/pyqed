@@ -17,6 +17,7 @@ from scipy.linalg import eigh
 
 
 ROTATION_BATCH_MIN_BLOCKS = int(os.environ.get("SU2_NARG_ROTATION_BATCH_MIN_BLOCKS", "8"))
+NATIVE_ROTATION_MIN_WORK = int(os.environ.get("SU2_NARG_NATIVE_ROTATION_MIN_WORK", "32768"))
 
 
 def _as_hermitian(block) -> np.ndarray:
@@ -31,6 +32,7 @@ class SU2NARGCapabilities:
     sector_matvec: bool = False
     davidson: bool = False
     operator_projection: str = "batched-blas"
+    openmp: bool = False
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,15 @@ class SU2NARGBackend:
 
     name = "python"
     capabilities = SU2NARGCapabilities()
+
+    def configure_threads(self, threads: int | None = None) -> int:
+        if threads is None:
+            threads = 1
+        threads = int(threads)
+        if threads < 1:
+            raise ValueError("SU2-NARG threads must be positive.")
+        self.threads = threads
+        return threads
 
     def sector_matvec(self, block, vector) -> np.ndarray:
         return np.asarray(block) @ np.asarray(vector)
@@ -102,6 +113,8 @@ class SU2NARGBackend:
             "sector_matvec": self.capabilities.sector_matvec,
             "davidson": self.capabilities.davidson,
             "operator_projection": self.capabilities.operator_projection,
+            "openmp": self.capabilities.openmp,
+            "threads": int(getattr(self, "threads", 1)),
         }
 
 
@@ -119,6 +132,7 @@ class CompiledSU2NARGBackend(SU2NARGBackend):
         davidson_max_iter: int = 80,
         davidson_restart_dim: int = 24,
         accept_unconverged: bool = False,
+        threads: int | None = None,
     ):
         self.davidson_min_dim = int(davidson_min_dim)
         self.davidson_tol = float(davidson_tol)
@@ -126,10 +140,33 @@ class CompiledSU2NARGBackend(SU2NARGBackend):
         self.davidson_restart_dim = int(davidson_restart_dim)
         self.accept_unconverged = bool(accept_unconverged)
         self._cpp = self._load_cpp(require=require)
+        self._native = self._load_native()
+        self.threads = 1
+        self.configure_threads(threads)
+        native_openmp = bool(
+            self._native is not None
+            and getattr(self._native, "openmp_available", None) is not None
+            and self._native.openmp_available()
+        )
+        davidson_openmp = bool(
+            self._cpp is not None
+            and getattr(self._cpp, "openmp_available", None) is not None
+            and self._cpp.openmp_available()
+        )
         self.capabilities = SU2NARGCapabilities(
             sector_matvec=self._cpp is not None,
             davidson=self._cpp is not None,
-            operator_projection="batched-blas",
+            operator_projection=(
+                "openmp-native"
+                if native_openmp
+                else (
+                    "native-batch"
+                    if self._native is not None
+                    and getattr(self._native, "rotate_operator_blocks", None) is not None
+                    else "batched-blas"
+                )
+            ),
+            openmp=native_openmp or davidson_openmp,
         )
 
     @staticmethod
@@ -146,6 +183,29 @@ class CompiledSU2NARGBackend(SU2NARGBackend):
                 raise ImportError(f"compiled SU2-NARG backend unavailable: {detail}")
             return None
         return cpp_davidson
+
+    @staticmethod
+    def _load_native():
+        try:
+            from . import su2_native
+        except Exception:
+            return None
+        if getattr(su2_native, "rotate_operator_blocks", None) is None:
+            return None
+        return su2_native
+
+    def configure_threads(self, threads: int | None = None) -> int:
+        if threads is None:
+            threads = int(os.environ.get("PYQED_NARG_NUM_THREADS", "1"))
+        threads = super().configure_threads(threads)
+        actual = []
+        for module in (getattr(self, "_cpp", None), getattr(self, "_native", None)):
+            setter = getattr(module, "set_num_threads", None)
+            if setter is not None:
+                actual.append(int(setter(threads)))
+        if actual:
+            self.threads = max(actual)
+        return self.threads
 
     def _block_table(self, block):
         if self._cpp is None:
@@ -198,30 +258,81 @@ class CompiledSU2NARGBackend(SU2NARGBackend):
                 return result
         return super().diagonalize_sector(block, nroots=nroots)
 
+    def rotate_operator_blocks(self, block_specs) -> list[tuple[Any, np.ndarray]]:
+        block_specs = list(block_specs)
+        native_rotate = getattr(self._native, "rotate_operator_blocks", None)
+        if native_rotate is None or len(block_specs) < 4:
+            return super().rotate_operator_blocks(block_specs)
+        work = sum(
+            np.asarray(spec[1]).shape[1]
+            * np.asarray(spec[2]).shape[1]
+            * (np.asarray(spec[2]).shape[0] + np.asarray(spec[3]).shape[1])
+            for spec in block_specs
+        )
+        if work < NATIVE_ROTATION_MIN_WORK:
+            return super().rotate_operator_blocks(block_specs)
+        keys = [spec[0] for spec in block_specs]
+        native_specs = [
+            (
+                np.ascontiguousarray(spec[1], dtype=np.complex128),
+                np.ascontiguousarray(spec[2], dtype=np.complex128),
+                np.ascontiguousarray(spec[3], dtype=np.complex128),
+            )
+            for spec in block_specs
+        ]
+        rotated = native_rotate(native_specs)
+        return [
+            (key, np.asarray(block))
+            for key, block in zip(keys, rotated)
+        ]
+
+    def summary(self) -> dict[str, Any]:
+        out = super().summary()
+        native_info = getattr(self._native, "openmp_info", None)
+        davidson_info = getattr(self._cpp, "openmp_info", None)
+        out["native_openmp"] = native_info() if native_info is not None else None
+        out["davidson_openmp"] = (
+            davidson_info() if davidson_info is not None else None
+        )
+        return out
+
 
 _PYTHON_BACKEND = SU2NARGBackend()
 _COMPILED_BACKEND: CompiledSU2NARGBackend | None = None
 
 
-def resolve_su2_narg_backend(backend=None) -> SU2NARGBackend:
+def resolve_su2_narg_backend(backend=None, *, threads: int | None = None) -> SU2NARGBackend:
     """Resolve a backend spec into an object with SU2-NARG numeric hooks."""
     global _COMPILED_BACKEND
 
     if isinstance(backend, SU2NARGBackend):
+        if threads is not None:
+            backend.configure_threads(threads)
         return backend
     if backend is None:
         backend = os.environ.get("SU2_NARG_BACKEND", "auto")
     key = str(backend).strip().lower().replace("-", "_")
     if key in {"python", "dense", "numpy", "blas"}:
+        if threads is not None:
+            _PYTHON_BACKEND.configure_threads(threads)
         return _PYTHON_BACKEND
     if key in {"compiled", "cpp", "native"}:
         if _COMPILED_BACKEND is None or not _COMPILED_BACKEND.capabilities.davidson:
             _COMPILED_BACKEND = CompiledSU2NARGBackend(require=True)
+        if threads is not None:
+            _COMPILED_BACKEND.configure_threads(threads)
         return _COMPILED_BACKEND
     if key == "auto":
         if _COMPILED_BACKEND is None:
             _COMPILED_BACKEND = CompiledSU2NARGBackend(require=False)
-        return _COMPILED_BACKEND if _COMPILED_BACKEND.capabilities.davidson else _PYTHON_BACKEND
+        resolved = (
+            _COMPILED_BACKEND
+            if _COMPILED_BACKEND.capabilities.davidson
+            else _PYTHON_BACKEND
+        )
+        if threads is not None:
+            resolved.configure_threads(threads)
+        return resolved
     raise ValueError("SU2-NARG backend must be 'auto', 'python', or 'compiled'.")
 
 

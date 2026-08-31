@@ -98,7 +98,7 @@ builtin AO builder must provide `mol.eri`.
   Same pattern as `gw.py`.
 
 These are downstream full-integral consumers, but they are not blocked on
-the builtin `mol.build(driver="builtin")` path producing `mol.eri` specifically.
+the native `mol.build()` path producing `mol.eri` specifically.
 
 ### Out of scope for the AO builtin ERI discussion
 

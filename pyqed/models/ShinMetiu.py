@@ -25,7 +25,7 @@ from pyqed.dvr import SineDVR
 from pyqed.davidson import davidson
 from pyqed import au2ev, au2angstrom
 
-from pyqed.ldr.ldr import kinetic
+from pyqed.dvr import kinetic
 
 from pyqed.units import au2tesla, au2volt_per_angstrom
 
@@ -1115,7 +1115,6 @@ def loop(center=(0,0), radius=1, npts=10):
 
 if __name__=='__main__':
     import time
-    from pyqed.ldr.ldr import LDRN
     
     # import proplot as plt
     import matplotlib.pyplot as plt
@@ -1220,13 +1219,6 @@ if __name__=='__main__':
     # ######################
     # ## Quantum Dynamics ##
     # ######################
-    
-    # sol = LDRN(domains=domains, levels=levels)
-    # sol.A = A
-    # sol.apes = E
-    
-    # sol.run(dt=0.01, mass=[1827,])
-    
     
     # e = np.allclose(u_exact[0], u_da[0])
 
@@ -1374,8 +1366,6 @@ if __name__=='__main__':
     # ax.zaxis.set_rotate_label(False)
      
     # pplt.show()
-
-
 
 
 

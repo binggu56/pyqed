@@ -208,7 +208,7 @@ def test_am1_uses_am1_atomic_reference_energy():
     heat, _e_tot, _mf = _run_heat(
         "O 0.0 0.0 0.0; H 0.75695 0.0 0.58588; H -0.75695 0.0 0.58588"
     )
-    np.testing.assert_allclose(heat, -59.26702070792, atol=1.0e-8)
+    np.testing.assert_allclose(heat, -59.262482223829466, atol=1.0e-8)
 
 
 def test_am1_eri_tensor_reproduces_scf_jk():

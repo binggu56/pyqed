@@ -8,7 +8,7 @@ from importlib import import_module
 
 import numpy as np
 
-from pyqed.qchem.basis import E, _cart_shell_blocks
+from pyqed.qchem.basis import E, _basis_cy, _cart_shell_blocks
 
 try:
     from numba import njit, prange
@@ -1249,6 +1249,7 @@ class AOBlockPairFTPlan:
         right_origins_batch,
         image_pair_mask=None,
         coeff_tol=0.0,
+        compiled=True,
     ):
         left_origins = np.ascontiguousarray(left_origins, dtype=float)
         right_origins_batch = np.ascontiguousarray(right_origins_batch, dtype=float)
@@ -1273,6 +1274,33 @@ class AOBlockPairFTPlan:
                     "image_pair_mask must have shape "
                     f"(nimage, {npair})."
                 )
+
+        if compiled and hasattr(_basis_cy, "compute_periodic_pair_ft_primitive_terms"):
+            try:
+                result = _basis_cy.compute_periodic_pair_ft_primitive_terms(
+                    np.ascontiguousarray(self.shells, dtype=np.int64),
+                    left_origins,
+                    right_origins_batch,
+                    np.ascontiguousarray(self.pair_p, dtype=np.int64),
+                    np.ascontiguousarray(self.pair_q, dtype=np.int64),
+                    self.nleft,
+                    np.ascontiguousarray(self.prim_start, dtype=np.int64),
+                    np.ascontiguousarray(self.prim_alpha, dtype=float),
+                    np.ascontiguousarray(self.prim_beta, dtype=float),
+                    np.ascontiguousarray(self.prim_alpha_over_p, dtype=float),
+                    np.ascontiguousarray(self.prim_beta_over_p, dtype=float),
+                    np.ascontiguousarray(self.prim_inv_4p, dtype=float),
+                    np.ascontiguousarray(self.prim_prefactor, dtype=float),
+                    np.ascontiguousarray(image_pair_mask, dtype=np.uint8),
+                    float(coeff_tol),
+                )
+            except NotImplementedError:
+                pass
+            else:
+                result["builder_backend"] = "compiled"
+                return result
+        if compiled not in (False, None, True):
+            raise ValueError("compiled must be True or False.")
 
         starts = [0]
         image_group_starts = [0]
@@ -1364,7 +1392,7 @@ class AOBlockPairFTPlan:
             starts.append(len(images))
             image_group_starts.append(len(image_group_images))
 
-        return {
+        result = {
             "pair_term_starts": np.ascontiguousarray(starts, dtype=np.int64),
             "term_image": np.ascontiguousarray(images, dtype=np.int64),
             "term_center": np.ascontiguousarray(centers, dtype=float).reshape(-1, 3),
@@ -1409,6 +1437,8 @@ class AOBlockPairFTPlan:
             ),
             "product_group_factor_count": int(len(product_factor_ids)),
         }
+        result["builder_backend"] = "python"
+        return result
 
     def periodic_product_terms(
         self,
@@ -1956,6 +1986,12 @@ class AOBlockPairFTPlan:
         )
         if weighted_aux is not None:
             args.append(np.ascontiguousarray(weighted_aux, dtype=np.complex128))
+        if (
+            include_image_groups
+            and weighted_aux is None
+            and np.asarray(phases).ndim == 2
+        ):
+            args.append(float(primitive_terms.get("factor_screen_tol", 0.0)))
         args.append(bool(plane_z))
         if threads is not None:
             args.append(int(threads))

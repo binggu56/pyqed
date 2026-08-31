@@ -636,10 +636,15 @@ def run_one_active(args, active: int, *, initial_factors=None) -> tuple[dict, li
     )
 
     start = perf_counter()
+    hamiltonian = MPO(symmetric_mpo)
     dmrg = DMRG(
-        MPO(symmetric_mpo),
+        hamiltonian,
         D=int(args.bond_dim),
-        init_guess=initial,
+        init_guess=MPS(
+            initial,
+            labels=["lv", "p", "rv"],
+            sites=hamiltonian.input_sites,
+        ),
         nsweeps=int(args.sweeps),
         opt="2site",
         symmetry=True,

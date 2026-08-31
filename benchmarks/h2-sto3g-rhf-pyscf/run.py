@@ -55,9 +55,7 @@ def main() -> int:
             charge=system["charge"],
             spin=system["spin"],
         )
-        molecule.build(
-            driver=method["pyqed_integral_driver"],
-            options={
+        molecule.build(options={
                 "eri_representation": method["pyqed_eri_representation"],
                 "eri_backend": method["pyqed_eri_backend"],
                 "aosym": method["pyqed_ao_symmetry"],
@@ -113,7 +111,7 @@ def main() -> int:
         "implementations": {
             "pyqed": {
                 "version": pyqed.__version__,
-                "integral_driver": method["pyqed_integral_driver"],
+                "integral_engine": "native",
                 "eri_representation": method["pyqed_eri_representation"],
                 "eri_backend": molecule._builtin_build_info["eri_backend"],
                 "dense_builder": molecule._builtin_build_info["dense_builder"],

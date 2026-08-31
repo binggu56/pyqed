@@ -36,6 +36,8 @@ from pyqed.mps.mps import (
     AbelianComplementaryBoundaryActionTable,
     AbelianRenormalizedOperatorActionTable,
     AbelianSparseComplementaryBoundaryActionTable,
+    MPS,
+    MPO,
     dense_to_symmetric_mpo,
     multiply_S_V,
     multiply_U_S,
@@ -194,10 +196,8 @@ def test_spatial_family_environment_backend_block2_aliases_use_family_mpos():
         _normalize_spatial_family_environment_backend("operator_table")
         == "block2_table"
     )
-    assert (
+    with pytest.raises(ValueError, match="not variationally exact"):
         _normalize_spatial_family_environment_backend("generator_table")
-        == "generator_table"
-    )
     assert _normalize_spatial_family_environment_backend("autompo") == "block2"
     assert (
         _normalize_spatial_family_environment_backend("native_generators")
@@ -225,7 +225,7 @@ def test_spatial_native_p_grouping_aliases():
     assert _normalize_spatial_native_p_grouping("full_site_order") == "site_order"
 
 
-def test_qchem_spatial_abelian_auto_defaults_to_block2_carrier_when_possible():
+def test_qchem_spatial_abelian_auto_defaults_to_compiled_channel_mpo():
     class Mol:
         spin = 0
 
@@ -235,8 +235,8 @@ def test_qchem_spatial_abelian_auto_defaults_to_block2_carrier_when_possible():
 
     dmrg = DMRG(MF(), ncas=2, nelecas=2, D=4, site="spatial", symmetry="sz")
 
-    assert dmrg.spatial_abelian_mpo == "spatial"
-    assert dmrg.spatial_family_environment_backend == "block2_table"
+    assert dmrg.spatial_abelian_mpo == "direct"
+    assert dmrg.spatial_family_environment_backend == "none"
     assert dmrg.spatial_block2_table_p_split_metric == "auto"
     assert dmrg.spatial_block2_table_p_split_groups == "auto"
     assert dmrg.spatial_block2_table_native_p is False
@@ -255,20 +255,46 @@ def test_qchem_spatial_abelian_auto_defaults_to_block2_carrier_when_possible():
     assert dmrg.spatial_reduced_mpo is False
     assert dmrg._can_use_spatial_block2_carrier() is True
 
-    explicit_grouped = DMRG(
+    with pytest.raises(ValueError, match="reference_grouped"):
+        DMRG(
+            MF(),
+            ncas=2,
+            nelecas=2,
+            D=4,
+            site="spatial",
+            symmetry="sz",
+            spatial_abelian_mpo="grouped",
+        )
+
+    reference_grouped = DMRG(
         MF(),
         ncas=2,
         nelecas=2,
         D=4,
         site="spatial",
         symmetry="sz",
-        spatial_abelian_mpo="grouped",
+        spatial_abelian_mpo="reference_grouped",
     )
-    assert explicit_grouped.spatial_abelian_mpo == "grouped"
+    assert reference_grouped.spatial_abelian_mpo == "reference_grouped"
 
     dense = DMRG(MF(), ncas=2, nelecas=2, D=4, site="spatial", symmetry=None)
-    assert dense.spatial_abelian_mpo == "grouped"
+    assert dense.spatial_abelian_mpo == "direct"
     assert dense._can_use_spatial_block2_carrier() is False
+
+    production = DMRG(MF(), ncas=2, nelecas=2, D=4)
+    assert production.symmetry == ["charge", "su2"]
+    assert production.site == "spatial"
+    assert production.spatial_site_basis == "fully_reduced"
+    assert production.spatial_reduced_mpo is True
+    with pytest.raises(ValueError, match="one production representation"):
+        DMRG(
+            MF(),
+            ncas=2,
+            nelecas=2,
+            D=4,
+            symmetry="su2",
+            spatial_reduced_mpo=False,
+        )
 
 
 def test_spatial_block2_carrier_is_d4_scaffold_not_grouped_spin_orbital():
@@ -284,7 +310,7 @@ def test_spatial_block2_carrier_is_d4_scaffold_not_grouped_spin_orbital():
 def test_spatial_block2_carrier_uses_family_sweep_energy_for_qchem():
     geom = "; ".join(f"H 0 0 {1.8 * i}" for i in range(4))
     mol = Molecule(atom=geom, unit="b", basis="sto3g")
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     solver = DMRG(
@@ -312,7 +338,7 @@ def test_spatial_block2_carrier_uses_family_sweep_energy_for_qchem():
 
     assert solver.e_tot == pytest.approx(-2.1754111431673824, abs=1.0e-8)
     assert low.e_tot == pytest.approx(low.sweep_history[-1]["energy"], abs=1.0e-12)
-    info = solver._active_integral_build_info
+    info = solver.build_info
     assert info["representation"] == "spatial_block2_table_carrier_mpo"
     assert info["carrier_only_sweep_energy_final"] is True
     assert info["carrier_only_forced_family_flat_csr"] is True
@@ -368,7 +394,7 @@ def test_spatial_block2_carrier_uses_family_sweep_energy_for_qchem():
 def test_spatial_block2_carrier_fused_compact_chain_projects_plan():
     geom = "; ".join(f"H 0 0 {1.8 * i}" for i in range(4))
     mol = Molecule(atom=geom, unit="b", basis="sto3g")
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     solver = DMRG(
@@ -446,7 +472,7 @@ def test_spatial_block2_carrier_grouped_matvec_backends_match_qchem(backend):
 
     geom = "; ".join(f"H 0 0 {1.8 * i}" for i in range(4))
     mol = Molecule(atom=geom, unit="b", basis="sto3g")
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     solver = DMRG(
@@ -528,7 +554,7 @@ def test_spatial_block2_carrier_grouped_matvec_backends_match_qchem(backend):
 def test_spatial_moving_environment_matches_old_local_operator_energy():
     geom = "; ".join(f"H 0 0 {1.8 * i}" for i in range(4))
     mol = Molecule(atom=geom, unit="b", basis="sto3g")
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     def _run(use_moving_environment):
@@ -592,7 +618,7 @@ def test_spatial_moving_environment_cpp_davidson_matches_python():
 
     geom = "; ".join(f"H 0 0 {1.8 * i}" for i in range(4))
     mol = Molecule(atom=geom, unit="b", basis="sto3g")
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     def _run(use_cpp):
@@ -652,7 +678,7 @@ def test_spatial_moving_environment_cpp_matvec_matches_cython_matvec():
 
     geom = "; ".join(f"H 0 0 {1.8 * i}" for i in range(4))
     mol = Molecule(atom=geom, unit="b", basis="sto3g")
-    mol.build(driver="builtin", eri="factors")
+    mol.build(eri="factors")
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1.0e-10)
 
     def _run(use_cpp_matvec):
@@ -984,8 +1010,13 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
             captured["kwargs"] = kwargs
             self.abelian_matvec_options = {"native_site_storage": True}
             self.ground_state = DummyState()
+            self.states = [self.ground_state]
             self.e_tot = 0.0
             self.converged = True
+            self.success = True
+            self.message = "converged"
+            self.ncompleted = 1
+            self.ncompleted_half_sweeps = 2
             self.sweep_history = []
 
         def run(self):
@@ -998,7 +1029,7 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
     dmrg.verbose = 0
     dmrg.D = 4
     dmrg.tol = 1.0e-6
-    dmrg.dmrg_performance = "block2-like"
+    dmrg.dmrg_performance = "symmetric"
     dmrg.abelian_matvec_options = None
     dmrg.saved_symmetry_list = ["charge"]
     dmrg.symmetry = ["charge"]
@@ -1013,7 +1044,7 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
     ident = np.eye(4, dtype=complex)
     dmrg.H = [ident.reshape(1, 1, 4, 4), ident.reshape(1, 1, 4, 4)]
     dmrg._symmetric_mpo_cache = {}
-    dmrg._active_integral_build_info = {"build_timings": {}}
+    dmrg.build_info = {"build_timings": {}}
     dmrg.complementary_operator_mpos = None
     dmrg.complementary_operator_term_maps = None
     dmrg.complementary_operator_generator_entries = None
@@ -1027,13 +1058,24 @@ def test_qchem_default_run_passes_native_mpo_and_guess_to_tensor_dmrg(monkeypatc
     assert captured["run_called"] is True
     assert captured["kwargs"]["nsweeps"] == 2
     assert captured["kwargs"]["converge_on_full_sweeps"] is True
-    assert all(isinstance(site, AbelianSiteTensorData) for site in captured["H"])
-    assert not any(isinstance(site, BlockTensor) for site in captured["H"])
+    assert isinstance(captured["H"], MPO)
+    assert all(
+        isinstance(site, AbelianSiteTensorData)
+        for site in captured["H"].factors
+    )
+    assert not any(
+        isinstance(site, BlockTensor) for site in captured["H"].factors
+    )
     init_guess = captured["kwargs"]["init_guess"]
-    assert all(isinstance(site, AbelianSiteTensorData) for site in init_guess)
-    assert not any(isinstance(site, BlockTensor) for site in init_guess)
-    assert dmrg._active_integral_build_info["native_symmetric_mpo_storage"] is True
-    assert dmrg._active_integral_build_info["native_initial_guess_storage"] is True
+    assert isinstance(init_guess, MPS)
+    assert all(
+        isinstance(site, AbelianSiteTensorData) for site in init_guess.factors
+    )
+    assert not any(
+        isinstance(site, BlockTensor) for site in init_guess.factors
+    )
+    assert dmrg.build_info["native_symmetric_mpo_storage"] is True
+    assert dmrg.build_info["native_initial_guess_storage"] is True
 
 
 def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch):
@@ -1052,8 +1094,13 @@ def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch)
             captured.append({"H": H, "kwargs": kwargs})
             self.abelian_matvec_options = {"native_site_storage": True}
             self.ground_state = DummyState()
+            self.states = [self.ground_state]
             self.e_tot = 0.0
             self.converged = True
+            self.success = True
+            self.message = "converged"
+            self.ncompleted = 1
+            self.ncompleted_half_sweeps = 2
             self.sweep_history = []
 
         def run(self):
@@ -1066,7 +1113,7 @@ def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch)
         dmrg.verbose = 0
         dmrg.D = 4
         dmrg.tol = 1.0e-6
-        dmrg.dmrg_performance = "block2-like"
+        dmrg.dmrg_performance = "symmetric"
         dmrg.abelian_matvec_options = None
         dmrg.saved_symmetry_list = ["charge"]
         dmrg.symmetry = ["charge"]
@@ -1083,7 +1130,7 @@ def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch)
         dmrg.H = dense_mpo
         dmrg._hamiltonian_mpo_cache_key = ("unit-test-native-cache",)
         dmrg._symmetric_mpo_cache = {}
-        dmrg._active_integral_build_info = {"build_timings": {}}
+        dmrg.build_info = {"build_timings": {}}
         dmrg.complementary_operator_mpos = {"R": dense_mpo}
         dmrg.complementary_operator_term_maps = None
         dmrg.complementary_operator_generator_entries = None
@@ -1099,15 +1146,24 @@ def test_qchem_global_symmetric_mpo_cache_reuses_native_family_mpos(monkeypatch)
     first.run(nsweeps=1, symmetry="charge")
     second.run(nsweeps=1, symmetry="charge")
 
-    first_timings = first._active_integral_build_info["build_timings"]
-    second_timings = second._active_integral_build_info["build_timings"]
+    first_timings = first.build_info["build_timings"]
+    second_timings = second.build_info["build_timings"]
     assert first_timings["symmetric_mpo_global_cache_stores"] == 1
     assert second_timings["symmetric_mpo_global_cache_hits"] == 1
     assert "symmetric_family_convert_s" not in second_timings
     assert len(captured) == 2
     first_family = captured[0]["kwargs"]["complementary_operator_mpos"]["R"]
     second_family = captured[1]["kwargs"]["complementary_operator_mpos"]["R"]
-    assert first_family is second_family
+    assert isinstance(first_family, MPO)
+    assert isinstance(second_family, MPO)
+    assert all(
+        first_site is second_site
+        for first_site, second_site in zip(
+            first_family.factors,
+            second_family.factors,
+            strict=True,
+        )
+    )
 
 
 def test_native_exact_pattern_table_is_exposed_in_family_stats():
@@ -4924,7 +4980,7 @@ def test_fresh_casci_like_preserves_spatial_block2_table_settings():
         spatial_reduced_mpo=True,
         symmetry=("u1",),
         spatial_site_basis="canonical",
-        integral_backend="dense",
+        integral_backend_override="dense",
         spatial_abelian_mpo="direct",
         spatial_abelian_symbolic_algo="optimal_bipartite",
         spatial_family_environment_backend="block2_table",
@@ -4984,7 +5040,7 @@ def test_fresh_casci_like_preserves_spatial_block2_table_settings():
     assert fresh.orb_sym == (0, 1, 0, 1)
 
 
-def test_fresh_casci_like_defaults_to_block2_like_dmrg_performance():
+def test_fresh_casci_like_defaults_to_auto_dmrg_performance():
     class DummyDMRG:
         def __init__(self, mf, **kwargs):
             self.mf = mf
@@ -5003,7 +5059,7 @@ def test_fresh_casci_like_defaults_to_block2_like_dmrg_performance():
 
     fresh = _fresh_casci_like(source)
 
-    assert fresh.dmrg_performance == "block2-like"
+    assert fresh.dmrg_performance == "auto"
 
 
 def test_spatial_complementary_operator_families_group_integrals():
@@ -5218,11 +5274,50 @@ def test_fully_reduced_spatial_reduced_hamiltonian_builds_four_distinct_eri_stri
     eri = np.zeros((2, 2, 4, 4, 4, 4))
     eri[:, :, 0, 1, 2, 3] = 0.1
 
-    result = build_spatial_reduced_hamiltonian_mpo(h1, eri=eri, fully_reduced=True)
+    result = build_spatial_reduced_hamiltonian_mpo(
+        h1,
+        eri=eri,
+        fully_reduced=True,
+        n_elec=4,
+        spin=0,
+    )
 
     assert result.info["spatial_site_basis"] == "fully_reduced_su2"
     assert result.info["two_body"] is True
-    assert result.info["two_body_reduced_string_terms"] > 0
+    assert result.info["normal_complementary_production"] is True
+    assert result.info["python_reduced_terms_materialized"] is False
+    assert result.info["normal_complementary_routes"]["transition_count"] > 0
+
+
+def test_fully_reduced_spatial_hamiltonian_reuses_cpp_runtime_for_new_integrals():
+    h1 = np.diag([-0.3, -0.1, 0.2, 0.4])
+    eri = np.zeros((2, 2, 4, 4, 4, 4))
+    eri[:, :, 0, 1, 2, 3] = 0.1
+    first = build_spatial_reduced_hamiltonian_mpo(
+        h1,
+        eri=eri,
+        fully_reduced=True,
+        n_elec=4,
+        spin=0,
+        ecore=-0.7,
+    )
+
+    second = build_spatial_reduced_hamiltonian_mpo(
+        h1 + np.diag([0.01, -0.01, 0.02, -0.02]),
+        eri=1.1 * eri,
+        fully_reduced=True,
+        n_elec=4,
+        spin=0,
+        ecore=-0.65,
+        reuse=first,
+    )
+
+    assert second.moving_environment is first.moving_environment
+    assert [id(factor) for factor in second.factors] == [
+        id(factor) for factor in first.factors
+    ]
+    assert second.info["su2_runtime_reused"] is True
+    assert second.moving_environment.system_stats["ecore"] == pytest.approx(-0.65)
 
 
 def test_fully_reduced_spatial_reduced_hamiltonian_builds_diagonal_density_eri_terms():

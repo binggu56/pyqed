@@ -8,7 +8,8 @@ from pyscf import ao2mo, scf
 from scipy.linalg import eigh, sqrtm
 from scipy.sparse.linalg import eigsh
 
-AU2EV = 27.211386245988
+from pyqed.units import au2ev as AU2EV
+
 au2ev = AU2EV
 
 

@@ -7,8 +7,9 @@ Created on Fri Sep 16 13:11:40 2016
 import numpy as np 
 import numba
 
-bohr_angstrom = 0.52917721092
-hartree_wavenumber = 219474.63 
+from pyqed.units import au2angstrom, au2wavenumber
+
+hartree_wavenumber = au2wavenumber
 
 Vmin = -24.2288 
 
@@ -21,7 +22,7 @@ def vpot(r):
     re = 3.47005
     De = 24.2288 
 	
-    r = r * bohr_angstrom 
+    r = r * au2angstrom
     
     beta_inf = np.log(2.0 * De / u_LR(re)) 
     

@@ -6,9 +6,15 @@ matplotlib.use("Agg", force=True)
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf import RHF, RHFAnalysis
-from pyqed.qchem.hf.rhf import _rhf_initial_density, get_or_build_low_rank_eri_factors, get_jk
+from pyqed.qchem.hf.rhf import (
+    _rhf_hcore_initial_density,
+    _rhf_initial_density,
+    get_jk,
+    get_or_build_low_rank_eri_factors,
+)
 from pyqed.qchem.solvent import PCM
 from pyqed.qchem.tools import cubegen
+from pyqed.units import au2angstrom
 
 try:
     import pyvista as _pv
@@ -20,7 +26,7 @@ _HAS_PYVISTA_PLOTTING = bool(_pv is not None and _pv.system_supports_plotting())
 
 def test_rhf_verbose_zero_is_clean_and_verbose_one_reports_energy(capsys):
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     capsys.readouterr()
 
     mol.RHF().run()
@@ -34,9 +40,36 @@ def test_rhf_verbose_zero_is_clean_and_verbose_one_reports_energy(capsys):
     assert "E(HF)" in verbose.out
 
 
+def test_rhf_default_minao_is_forwarded_to_solver():
+    mol = Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g')
+    mol.build()
+
+    mf = RHF(mol).run(stability_analysis=False)
+
+    assert mf.init_guess == 'minao'
+    assert mf.scf_info["init_guess"] == 'minao'
+
+
+def test_rhf_hcore_guess_is_an_ao_density():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mo_occ = np.zeros(mol.nao)
+    mo_occ[:mol.nelec // 2] = 2.0
+
+    dm = _rhf_hcore_initial_density(mol.hcore, mol.overlap, mo_occ)
+
+    assert np.einsum('ij,ji->', dm, mol.overlap) == pytest.approx(mol.nelec)
+    np.testing.assert_allclose(
+        dm @ mol.overlap @ dm,
+        2.0 * dm,
+        atol=2.0e-11,
+        rtol=2.0e-11,
+    )
+
+
 def test_rhf_level_shift_decay_is_reported():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run(
         max_cycle=4,
@@ -74,12 +107,40 @@ def test_rhf_level_shift_decay_is_reported():
 
 def test_rhf_energy_diis_modes_run():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     for mode in ('ediis', 'adiis'):
         mf = RHF(mol).run(max_cycle=5, scf_diis=mode, diis_start_cycle=1)
         assert mf.scf_info["scf_diis"] == mode
         assert mf.e_tot is not None
+
+
+def test_rhf_stability_restart_follows_square_h4_lower_branch():
+    side = 1.25
+    mol = Molecule(
+        atom=(
+            f'H {-side} {-side} 0; H {side} {-side} 0; '
+            f'H {side} {side} 0; H {-side} {side} 0'
+        ),
+        unit='angstrom',
+        basis='6-31g',
+    )
+    mol.build()
+
+    mf = RHF(mol).run()
+
+    assert mf.converged
+    assert mf.e_tot == pytest.approx(-1.70364006231, abs=5e-9)
+    assert mf.scf_info["stability_restart_accepted"] is True
+    assert mf.scf_info["stability_restarts_attempted"] >= 1
+    assert mf.scf_info["stability_energy_lowering"] > 0.05
+    unstable = [
+        item for item in mf.scf_info["stability_directions"]
+        if item["curvature"] < 0.0
+    ]
+    assert unstable
+    assert unstable[0]["occupied"] == 1
+    assert unstable[0]["virtual"] == 2
 
 
 def test_native_rhf_pcm_is_self_consistent_in_scf_loop():
@@ -88,7 +149,7 @@ def test_native_rhf_pcm_is_self_consistent_in_scf_loop():
         unit='angstrom',
         basis='sto-3g',
     )
-    mol.build(driver='builtin', eri='s8')
+    mol.build(eri='s8')
 
     mf_gas = RHF(mol).run(max_cycle=40, tol=1e-10, conv_tol_grad=1e-7)
 
@@ -139,7 +200,7 @@ def test_native_rhf_pcm_matches_pyscf_h2o():
     e_pcm_ref = pmf_pcm.kernel(dm0=pmf_gas.make_rdm1())
 
     mol = Molecule(atom=atom, unit='angstrom', basis='sto-3g')
-    mol.build(driver='pyscf')
+    mol.build()
     mf_gas = RHF(mol).run(max_cycle=80, tol=1e-10, conv_tol_grad=1e-7)
 
     pcm = PCM(mol)
@@ -167,7 +228,7 @@ def test_native_rhf_pcm_matches_pyscf_h2o():
 
 def test_native_minao_fe2_keeps_3d_shell_populated():
     mol = Molecule(atom='Fe 0 0 0', unit='angstrom', basis='sto-3g', charge=2, spin=0)
-    mol.build(driver='builtin', eri='direct')
+    mol.build(eri='direct')
 
     dm = _rhf_initial_density(mol, 'minao')
     labels = mol.ao_labels()
@@ -183,7 +244,7 @@ def test_native_minao_fe2_keeps_3d_shell_populated():
 
 def test_native_charged_minao_fe2_assigns_charge_before_shell_fill():
     mol = Molecule(atom='Fe 0 0 0', unit='angstrom', basis='sto-3g', charge=2, spin=0)
-    mol.build(driver='builtin', eri='direct')
+    mol.build(eri='direct')
 
     dm = _rhf_initial_density(mol, 'charged_minao')
     labels = mol.ao_labels()
@@ -199,7 +260,7 @@ def test_native_charged_minao_fe2_assigns_charge_before_shell_fill():
 
 def test_native_huckel_guess_has_correct_electron_count():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='builtin', eri='direct')
+    mol.build(eri='direct')
 
     dm = _rhf_initial_density(mol, 'huckel')
 
@@ -211,7 +272,7 @@ def test_rhf_density_fit_matches_conventional_energy_and_jk():
     scf = pytest.importorskip('pyscf.scf')
 
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf_df = RHF(mol).run(density_fit=True)
     mf_direct = RHF(mol).run()
@@ -238,7 +299,7 @@ def test_rhf_density_fit_matches_conventional_energy_and_jk():
 
 def test_rhf_localize_orbitals_ibo_occ():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     c_ibo, occ_idx, info = mf.localize_orbitals(
@@ -261,16 +322,16 @@ def test_rhf_localize_orbitals_ibo_occ():
 
 def test_rhf_localize_orbitals_rejects_unsupported_space():
     mol = Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     with pytest.raises(ValueError, match="space='occ'"):
         mf.localize_orbitals(method='ibo', space='vir')
 
 
-def test_rhf_localize_orbitals_ibo_custom_coeff_native_gbasis():
+def test_rhf_localize_orbitals_ibo_custom_coeff_native_builtin():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     coeff = mf.mo_coeff[:, :mf.nocc]
@@ -289,9 +350,9 @@ def test_rhf_localize_orbitals_ibo_custom_coeff_native_gbasis():
     np.testing.assert_allclose(c_ibo.T @ s @ c_ibo, np.eye(mf.nocc), atol=1e-8)
 
 
-def test_rhf_localize_orbitals_lm_custom_coeff_native_gbasis():
+def test_rhf_localize_orbitals_lm_custom_coeff_native_builtin():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     coeff = mf.mo_coeff[:, :mf.nocc]
@@ -312,9 +373,9 @@ def test_rhf_localize_orbitals_lm_custom_coeff_native_gbasis():
     np.testing.assert_allclose(c_lm.T @ s @ c_lm, np.eye(mf.nocc), atol=1e-8)
 
 
-def test_rhf_localize_orbitals_pm_custom_coeff_native_gbasis():
+def test_rhf_localize_orbitals_pm_custom_coeff_native_builtin():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     coeff = mf.mo_coeff[:, :mf.nocc]
@@ -335,9 +396,9 @@ def test_rhf_localize_orbitals_pm_custom_coeff_native_gbasis():
     np.testing.assert_allclose(c_pm.T @ s @ c_pm, np.eye(mf.nocc), atol=1e-8)
 
 
-def test_rhf_localize_orbitals_pipek_mezey_alias_native_gbasis():
+def test_rhf_localize_orbitals_pipek_mezey_alias_native_builtin():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     coeff = mf.mo_coeff[:, :mf.nocc]
@@ -353,9 +414,9 @@ def test_rhf_localize_orbitals_pipek_mezey_alias_native_gbasis():
     assert info['population_metric'] == 'mulliken'
 
 
-def test_rhf_localize_orbitals_boys_custom_coeff_native_gbasis():
+def test_rhf_localize_orbitals_boys_custom_coeff_native_builtin():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     coeff = mf.mo_coeff[:, :mf.nocc]
@@ -387,7 +448,7 @@ def test_rhf_localize_orbitals_boys_custom_coeff_native_gbasis():
 
 def test_cholesky_jk_factors_reproduce_dense_jk_for_tight_tolerance():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = RHF(mol).run()
     factors = get_or_build_low_rank_eri_factors(mol, tol=1e-12)
@@ -401,7 +462,7 @@ def test_cholesky_jk_factors_reproduce_dense_jk_for_tight_tolerance():
 
 def test_rhf_cholesky_jk_matches_direct_energy():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf_direct = RHF(mol).run()
     mf_lr = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
@@ -418,15 +479,13 @@ def test_rhf_cholesky_jk_matches_direct_energy():
 
 def test_rhf_auto_prefers_prebuilt_dense_plus_factors():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(
-        driver='builtin',
-        options={'eri_representation': 'dense+factors', 'low_rank_tol': 1e-10},
+    mol.build(options={'eri_representation': 'dense+factors', 'low_rank_tol': 1e-10},
     )
 
     mf_auto = RHF(mol).run()
     mf_explicit = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
 
-    assert mol.eri is not None
+    assert mol.eri_s8 is not None
     assert mol.eri_factors is not None
     assert mf_auto.cholesky_jk
     assert mf_auto.low_rank_jk
@@ -436,7 +495,7 @@ def test_rhf_auto_prefers_prebuilt_dense_plus_factors():
 
 def test_low_rank_aliases_match_cholesky_options():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf_alias = RHF(mol).run(low_rank_jk=True, low_rank_tol=1e-10)
 
@@ -447,12 +506,12 @@ def test_low_rank_aliases_match_cholesky_options():
 
 def test_low_rank_factor_cache_reuses_exact_geometry_after_rebuild():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     factors_first = get_or_build_low_rank_eri_factors(mol, tol=1e-10)
     assert mol._low_rank_eri_last_info['mode'] == 'cold'
 
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
     factors_second = get_or_build_low_rank_eri_factors(mol, tol=1e-10)
 
     assert factors_second is factors_first
@@ -461,15 +520,15 @@ def test_low_rank_factor_cache_reuses_exact_geometry_after_rebuild():
 
 def test_low_rank_factor_cache_warm_starts_after_geometry_change():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     factors_first = get_or_build_low_rank_eri_factors(mol, tol=1e-10)
     assert mol._low_rank_eri_last_info['mode'] == 'cold'
 
     coords = mol.atom_coords().copy()
-    coords[1, 2] += 0.1 / 0.52917721092
+    coords[1, 2] += 0.1 / au2angstrom
     mol.set_geom(coords)
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     factors_second = get_or_build_low_rank_eri_factors(mol, tol=1e-10)
     assert factors_second is not factors_first
@@ -484,17 +543,17 @@ def test_low_rank_factor_cache_warm_starts_after_geometry_change():
 
 def test_low_rank_scanner_reuses_density_and_factor_history():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf0 = RHF(mol).run(cholesky_jk=True, cholesky_tol=1e-10)
     scanner = mf0.as_scanner()
 
     coords = mol.atom_coords().copy()
-    coords[1, 2] += 0.05 / 0.52917721092
+    coords[1, 2] += 0.05 / au2angstrom
     e_scan = scanner(coords)
 
     mol_ref = Molecule(atom='Li 0 0 0; H 0 0 1.65', unit='angstrom', basis='sto-3g')
-    mol_ref.build(driver='gbasis-pyscf')
+    mol_ref.build()
     e_ref = RHF(mol_ref).run(cholesky_jk=True, cholesky_tol=1e-10).e_tot
 
     np.testing.assert_allclose(e_scan, e_ref, atol=1e-8)
@@ -505,7 +564,7 @@ def test_low_rank_scanner_reuses_density_and_factor_history():
 
 def test_builtin_ao_labels_are_available_without_pyscf():
     mol = Molecule(atom='O 0 0 0; H 0 0 1.8', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
 
     labels = mol.ao_labels()
 
@@ -522,7 +581,7 @@ def test_builtin_ao_labels_are_available_without_pyscf():
 
 def test_rhf_mo_components_builtin_h2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     analysis = mf.mo_components(mo_indices=0, metric='mulliken')
@@ -541,7 +600,7 @@ def test_rhf_mo_components_builtin_h2():
 
 def test_rhf_print_mo_components_builtin_h2(capsys):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
     capsys.readouterr()
 
@@ -562,7 +621,7 @@ def test_rhf_print_mo_components_limits_to_main_ao_components(capsys):
         unit='bohr',
         basis='sto-3g',
     )
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
     capsys.readouterr()
 
@@ -577,7 +636,7 @@ def test_rhf_print_mo_components_limits_to_main_ao_components(capsys):
 
 def test_rhf_analyze_returns_rhfanalysis():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     analysis = mf.analyze()
@@ -587,7 +646,7 @@ def test_rhf_analyze_returns_rhfanalysis():
 
 def test_rhf_mulliken_charges_builtin_h2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     data = mf.mulliken_charges()
@@ -603,7 +662,7 @@ def test_rhf_mulliken_charges_builtin_h2o():
         unit='bohr',
         basis='sto-3g',
     )
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     data = mf.mulliken_charges()
@@ -617,7 +676,7 @@ def test_rhf_mulliken_charges_builtin_h2o():
 
 def test_rhf_print_mulliken_charges_builtin_h2(capsys):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
     capsys.readouterr()
 
@@ -633,7 +692,7 @@ def test_rhf_print_mulliken_charges_builtin_h2(capsys):
 
 def test_rhf_lowdin_charges_builtin_h2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     data = mf.lowdin_charges()
@@ -645,7 +704,7 @@ def test_rhf_lowdin_charges_builtin_h2():
 
 def test_rhf_mayer_bond_orders_builtin_h2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     data = mf.mayer_bond_orders()
@@ -657,7 +716,7 @@ def test_rhf_mayer_bond_orders_builtin_h2():
 
 def test_rhf_wiberg_bond_orders_builtin_h2(capsys):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     data = mf.wiberg_bond_orders()
@@ -680,7 +739,7 @@ def test_rhf_mo_composition_atom_shell_builtin_h2o():
         unit='bohr',
         basis='sto-3g',
     )
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     analysis = mf.mo_composition(mo_indices=4, metric='mulliken', group_by='atom+shell')
@@ -695,14 +754,14 @@ def test_rhf_mo_composition_atom_shell_builtin_h2o():
 
 def test_rhf_mo_overlap_identity_and_nearby_geometry():
     mol1 = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol1.build(driver='builtin')
+    mol1.build()
     mf1 = RHF(mol1).run()
 
     s11 = mf1.mo_overlap(mf1)
     np.testing.assert_allclose(s11, np.eye(2), atol=1e-8)
 
     mol2 = Molecule(atom='H 0 0 0; H 0 0 1.5', unit='bohr', basis='sto-3g')
-    mol2.build(driver='builtin')
+    mol2.build()
     mf2 = RHF(mol2).run()
 
     s12 = mf1.mo_overlap(mf2)
@@ -712,7 +771,7 @@ def test_rhf_mo_overlap_identity_and_nearby_geometry():
 
 def test_rhf_sample_mo_grid_and_plot_3d_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     grid = mf.analyze().sample_mo_grid(0, nx=16, ny=15, nz=14, margin=2.0)
@@ -733,7 +792,7 @@ def test_rhf_sample_mo_grid_and_plot_3d_builtin_h2(tmp_path):
 
 def test_rhf_plot_mo_3d_accepts_frontier_aliases_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     grid = mf.sample_mo_grid('homo', nx=12, ny=12, nz=12, margin=2.0)
@@ -750,7 +809,7 @@ def test_rhf_plot_mo_3d_accepts_frontier_aliases_builtin_h2(tmp_path):
 
 def test_rhf_plot_mo_defaults_to_homo_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_default_homo.png'
@@ -764,7 +823,7 @@ def test_rhf_plot_mo_defaults_to_homo_builtin_h2(tmp_path):
 
 def test_rhf_plot_mo_accepts_orbital_lists_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_frontier.png'
@@ -780,7 +839,7 @@ def test_rhf_plot_mo_accepts_orbital_lists_builtin_h2(tmp_path):
 
 def test_rhf_orbital_cube_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_mo0.cube'
@@ -805,7 +864,7 @@ def test_rhf_orbital_cube_builtin_h2(tmp_path):
 
 def test_rhf_orbital_cube_custom_coeff_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_custom.cube'
@@ -822,7 +881,7 @@ def test_rhf_orbital_cube_custom_coeff_builtin_h2(tmp_path):
 
 def test_cubegen_orbital_module_function_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_module_orbital.cube'
@@ -836,7 +895,7 @@ def test_cubegen_orbital_module_function_builtin_h2(tmp_path):
 
 def test_cubegen_density_module_function_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_density.cube'
@@ -855,7 +914,7 @@ def test_cubegen_density_module_function_builtin_h2(tmp_path):
 
 def test_rhf_electron_density_grid_and_plot_density_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     grid = mf.electron_density_grid(nx=14, ny=13, nz=12, margin=2.0)
@@ -877,7 +936,7 @@ def test_rhf_electron_density_grid_and_plot_density_builtin_h2(tmp_path):
 
 def test_rhf_plot_frontier_mos_3d_publication_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_frontier.png'
@@ -899,7 +958,7 @@ def test_rhf_plot_frontier_mos_3d_publication_builtin_h2(tmp_path):
 @pytest.mark.skipif(not _HAS_PYVISTA_PLOTTING, reason="pyvista plotting is not supported")
 def test_rhf_plot_mo_3d_pyvista_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_mo0_pyvista.png'
@@ -923,7 +982,7 @@ def test_rhf_plot_mo_3d_pyvista_builtin_h2(tmp_path):
 @pytest.mark.skipif(not _HAS_PYVISTA_PLOTTING, reason="pyvista plotting is not supported")
 def test_rhf_plot_density_pyvista_builtin_h2(tmp_path):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
     mf = RHF(mol).run()
 
     out = tmp_path / 'h2_density_pyvista.png'

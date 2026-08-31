@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark H3+ AM1/MECI TT-LDR action against dense LDR.
-
-The grid is deliberately tiny by default so that a full pairwise LDR overlap
-matrix and dense kinetic matrix can be used as the reference.
-"""
+"""Benchmark genuine H3+ TT-LDR/TDVP dynamics against dense LDR."""
 
 from __future__ import annotations
 
@@ -19,7 +15,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-import scipy.linalg
 from scipy.sparse.linalg import expm_multiply
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -30,7 +25,7 @@ from pyqed.namd.triatomic import Triatom
 from pyqed.units import au2fs
 
 
-def h3plus_body_frame(r: float = 1.65, theta: float = np.pi / 3.0):
+def h3plus_body_frame(r=1.65, theta=np.pi / 3.0):
     return [
         ["H", (float(r), 0.0, 0.0)],
         ["H", (0.0, 0.0, 0.0)],
@@ -39,7 +34,7 @@ def h3plus_body_frame(r: float = 1.65, theta: float = np.pi / 3.0):
 
 
 @contextlib.contextmanager
-def pushd(path: Path):
+def pushd(path):
     old = Path.cwd()
     path.mkdir(parents=True, exist_ok=True)
     os.chdir(path)
@@ -73,100 +68,59 @@ def build_solver(args):
 
 def load_or_scan(solver, args):
     apes_path = args.outdir / "apes.npz"
-    overlap_path = args.outdir / "overlap_matrix.npz"
+    overlap_path = args.outdir / "overlap_links.npz"
     if args.reuse_cache and apes_path.exists() and overlap_path.exists():
         solver.apes = np.load(apes_path)["data"]
-        solver.overlap_matrix = np.load(overlap_path)["data"]
-        solver.overlap_links = None
+        packed = np.load(overlap_path)
+        solver.overlap_links = solver._unpack_overlap_links(
+            packed["axes"], packed["indices"], packed["data"]
+        )
+        solver.overlap_matrix = None
         return "cache", 0.0
-
-    t0 = time.perf_counter()
+    start = time.perf_counter()
     with pushd(args.outdir):
         solver.scan_pes(
             electronic_method="am1/meci",
             nstates=args.nstates,
             ncas=args.ncas,
             nelecas=2,
-            overlap_method="full",
+            overlap_method="link-only",
+            unitarize_overlap_links=False,
             n_workers=args.n_workers,
             worker_threads=1,
-            scf_tol=args.scf_tol,
-            max_cycle=args.max_cycle,
-            damping=args.damping,
         )
-    return "scan", time.perf_counter() - t0
+    return "scan", time.perf_counter() - start
 
 
-def initial_packet(solver: Triatom, state: int, width: float):
+def initial_packet(solver, state, width):
     values = np.zeros((*solver.nx, solver.nstates), dtype=complex)
-    center = np.array([axis[len(axis) // 2] for axis in solver.x])
-    for idx in np.ndindex(*solver.nx):
-        q = np.array([solver.x[axis][idx[axis]] for axis in range(solver.ndim)])
-        values[idx + (state,)] = np.exp(-width * np.sum((q - center) ** 2))
-    psi = solver.to_quadrature_normalized(values)
-    norm = solver.norm(psi)
-    if norm == 0:
-        raise RuntimeError("Initial packet norm is zero.")
-    return psi / norm
+    center = np.asarray([axis[len(axis) // 2] for axis in solver.x])
+    for index in np.ndindex(*solver.nx):
+        point = np.asarray([solver.x[axis][index[axis]] for axis in range(solver.ndim)])
+        values[index + (state,)] = np.exp(-width * np.sum((point - center) ** 2))
+    values = solver.to_quadrature_normalized(values)
+    return values / solver.norm(values)
 
 
-def populations(states, nstates):
-    return np.array(
-        [np.sum(np.abs(psi) ** 2, axis=tuple(range(psi.ndim - 1))) for psi in states]
+def dense_propagate(state, hamiltonian, dt, steps, interval, nstates):
+    states = [state.reshape(-1)]
+    current = states[0]
+    for step in range(1, steps + 1):
+        current = expm_multiply(-1j * dt * hamiltonian, current)
+        if step % interval == 0 or step == steps:
+            states.append(current.copy())
+    populations = np.asarray(
+        [np.sum(np.abs(item.reshape(*state.shape)) ** 2, axis=(0, 1, 2)) for item in states]
     ).reshape(len(states), nstates)
+    return states, populations
 
 
-def dense_split_propagate(psi0, K_dense, apes, dt, nt, nout):
-    exp_t = scipy.linalg.expm(-1j * K_dense * dt)
-    exp_v_half = np.exp(-0.5j * apes * dt)
-    states = [psi0.copy()]
-    times = [0.0]
-    psi = psi0.copy()
-    for step in range(1, nt + 1):
-        psi = exp_v_half * psi
-        psi = (exp_t @ psi.reshape(-1)).reshape(psi0.shape)
-        psi = exp_v_half * psi
-        if step % nout == 0:
-            states.append(psi.copy())
-            times.append(step * dt)
-    return np.asarray(times), states
-
-
-def ttldr_split_propagate(psi0, action, apes, dt, nt, nout, trace_k):
-    exp_v_half = np.exp(-0.5j * apes * dt)
-    k_op = action.linear("k")
-    states = [psi0.copy()]
-    times = [0.0]
-    psi = psi0.copy()
-    for step in range(1, nt + 1):
-        psi = exp_v_half * psi
-        psi = expm_multiply(-1j * dt * k_op, psi.reshape(-1), traceA=-1j * dt * trace_k)
-        psi = psi.reshape(psi0.shape)
-        psi = exp_v_half * psi
-        if step % nout == 0:
-            states.append(psi.copy())
-            times.append(step * dt)
-    return np.asarray(times), states
-
-
-def plot_population_overlay(times_fs, dense_pops, tt_pops, outpath: Path):
+def plot_populations(times, dense, tensor, outpath):
     fig, ax = plt.subplots(figsize=(6.0, 3.8), constrained_layout=True)
-    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
-    for state in range(dense_pops.shape[1]):
-        color = colors[state % len(colors)]
-        ax.plot(times_fs, dense_pops[:, state], color=color, lw=2.0, label=f"dense S{state}")
-        ax.plot(
-            times_fs,
-            tt_pops[:, state],
-            color=color,
-            lw=1.7,
-            ls="--",
-            label=f"TT-LDR S{state}",
-        )
-    ax.set_xlabel("time / fs")
-    ax.set_ylabel("population")
-    ax.set_ylim(-0.04, 1.04)
-    ax.set_title("H3+ AM1/MECI dense LDR vs TT-LDR")
+    for state in range(dense.shape[1]):
+        line = ax.plot(times, dense[:, state], lw=2.0, label=f"dense S{state}")[0]
+        ax.plot(times, tensor[:, state], "--", color=line.get_color(), label=f"TT S{state}")
+    ax.set(xlabel="time / fs", ylabel="population", ylim=(-0.04, 1.04))
     ax.legend(ncol=2, fontsize=8)
     fig.savefig(outpath, dpi=220)
     plt.close(fig)
@@ -183,135 +137,82 @@ def main():
     parser.add_argument("--nstates", type=int, default=3)
     parser.add_argument("--ncas", type=int, default=3)
     parser.add_argument("--n-workers", type=int, default=1)
-    parser.add_argument("--scf-tol", type=float, default=1.0e-9)
-    parser.add_argument("--max-cycle", type=int, default=120)
-    parser.add_argument("--damping", type=float, default=0.0)
     parser.add_argument("--initial-state", type=int, default=2)
     parser.add_argument("--packet-width", type=float, default=80.0)
     parser.add_argument("--dt-fs", type=float, default=0.02)
-    parser.add_argument("--nt", type=int, default=10)
-    parser.add_argument("--nout", type=int, default=1)
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--reuse-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--interval", type=int, default=1)
+    parser.add_argument("--overlap-method", choices=("cross", "dense"), default="cross")
+    parser.add_argument("--overlap-rank", type=int, default=8)
+    parser.add_argument("--operator-rank", type=int, default=64)
+    parser.add_argument("--state-rank", type=int, default=32)
     parser.add_argument(
-        "--outdir",
-        type=Path,
-        default=Path("/private/tmp/h3plus_ttldr_vs_dense_ldr"),
+        "--gauge-sync", action=argparse.BooleanOptionalAction, default=True
     )
+    parser.add_argument("--reuse-cache", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--outdir", type=Path, default=Path("/private/tmp/h3plus_ttldr_vs_dense_ldr"))
     args = parser.parse_args()
-
     args.outdir.mkdir(parents=True, exist_ok=True)
+
     solver = build_solver(args)
     source, scan_time = load_or_scan(solver, args)
-
-    t0 = time.perf_counter()
-    T = solver.buildK(sparse=False)
-    T = 0.5 * (T + T.conj().T)
-    K_dense = solver._build_flat_kinetic_matrix(T)
-    H_dense = K_dense + np.diag(solver.apes.reshape(-1))
-    action = solver.build_ttldr_action(T_total=T, prefer_links=False)
-    build_time = time.perf_counter() - t0
-
-    rng = np.random.default_rng(args.seed)
-    psi_rand = rng.normal(size=action.shape) + 1j * rng.normal(size=action.shape)
-    psi_rand = psi_rand / np.linalg.norm(psi_rand.reshape(-1))
-
-    dense_k = K_dense @ psi_rand.reshape(-1)
-    dense_h = H_dense @ psi_rand.reshape(-1)
-    tt_k = action.k(psi_rand).reshape(-1)
-    tt_h = action.h(psi_rand).reshape(-1)
-    k_abs = float(np.max(np.abs(tt_k - dense_k)))
-    h_abs = float(np.max(np.abs(tt_h - dense_h)))
-    k_rel = float(np.linalg.norm(tt_k - dense_k) / np.linalg.norm(dense_k))
-    h_rel = float(np.linalg.norm(tt_h - dense_h) / np.linalg.norm(dense_h))
-
-    psi0 = initial_packet(
-        solver,
-        state=min(args.initial_state, args.nstates - 1),
-        width=args.packet_width,
-    )
+    psi0 = initial_packet(solver, min(args.initial_state, args.nstates - 1), args.packet_width)
     dt = args.dt_fs / au2fs
-    trace_k = solver._kinetic_trace_from_nuclear_operator(T)
 
-    t0 = time.perf_counter()
-    dense_times, dense_states = dense_split_propagate(
-        psi0, K_dense, solver.apes, dt, args.nt, args.nout
+    start = time.perf_counter()
+    tt = solver.ttldr(
+        overlap_method=args.overlap_method,
+        overlap_rank=args.overlap_rank,
+        operator_rank=args.operator_rank,
+        gauge_sync=args.gauge_sync,
     )
-    dense_prop_time = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    tt_times, tt_states = ttldr_split_propagate(
-        psi0, action, solver.apes, dt, args.nt, args.nout, trace_k
+    tt_build = time.perf_counter() - start
+    state = tt.state(psi0, max_rank=args.state_rank)
+    start = time.perf_counter()
+    tt.run(
+        state,
+        dt=dt,
+        steps=args.steps,
+        interval=args.interval,
+        max_bond=args.state_rank,
+        integrator="tdvp2",
+        progress=False,
     )
-    tt_prop_time = time.perf_counter() - t0
+    tt_time = time.perf_counter() - start
 
-    dense_pops = populations(dense_states, args.nstates)
-    tt_pops = populations(tt_states, args.nstates)
-    state_diffs = np.asarray(
-        [
-            np.linalg.norm((tt - dense).reshape(-1))
-            for tt, dense in zip(tt_states, dense_states)
-        ]
+    kinetic = solver.buildK(sparse=False)
+    dense_h = solver._build_flat_kinetic_matrix(kinetic)
+    dense_h += np.diag(solver.apes.reshape(-1))
+    start = time.perf_counter()
+    dense_states, dense_populations = dense_propagate(
+        psi0, dense_h, dt, args.steps, args.interval, args.nstates
     )
-    pop_max_abs = float(np.max(np.abs(tt_pops - dense_pops)))
-    final_l2 = float(state_diffs[-1])
+    dense_time = time.perf_counter() - start
+    dense_final = dense_states[-1] / np.linalg.norm(dense_states[-1])
+    tt_final = tt.dense(tt.final_state).reshape(-1)
+    fidelity = float(abs(np.vdot(dense_final, tt_final)) ** 2)
+    population_error = float(np.max(np.abs(dense_populations - tt.populations)))
 
-    times_fs = dense_times * au2fs
-    pop_png = args.outdir / "h3plus_ttldr_vs_dense_ldr_populations.png"
-    plot_population_overlay(times_fs, dense_pops, tt_pops, pop_png)
-
-    data_path = args.outdir / "h3plus_ttldr_vs_dense_ldr_results.npz"
+    times_fs = tt.times * au2fs
+    plot_path = args.outdir / "h3plus_ttldr_vs_dense_ldr_populations.png"
+    plot_populations(times_fs, dense_populations, tt.populations, plot_path)
     np.savez(
-        data_path,
-        times_au=dense_times,
+        args.outdir / "h3plus_ttldr_vs_dense_ldr_results.npz",
         times_fs=times_fs,
-        dense_pops=dense_pops,
-        tt_pops=tt_pops,
-        state_l2_diffs=state_diffs,
-        apes=solver.apes,
-        overlap_matrix=solver.overlap_matrix,
-        nx=np.asarray(solver.nx),
-        metrics=np.array(
-            [
-                k_abs,
-                k_rel,
-                h_abs,
-                h_rel,
-                pop_max_abs,
-                final_l2,
-                scan_time,
-                build_time,
-                dense_prop_time,
-                tt_prop_time,
-            ]
-        ),
-        metric_names=np.array(
-            [
-                "k_max_abs",
-                "k_rel_l2",
-                "h_max_abs",
-                "h_rel_l2",
-                "population_max_abs",
-                "final_state_l2",
-                "scan_time_s",
-                "build_time_s",
-                "dense_split_time_s",
-                "tt_split_time_s",
-            ]
-        ),
+        dense_populations=dense_populations,
+        tt_populations=tt.populations,
+        fidelity=fidelity,
+        population_error=population_error,
+        operator_ranks=np.asarray(tt.operator_ranks),
     )
-
-    print(f"[grid] nx={solver.nx}, ngrid={int(np.prod(solver.nx))}, dim={action.size}")
+    print(f"[grid] nx={solver.nx}, dim={int(np.prod(tt.dims))}")
     print(f"[scan] source={source}, time={scan_time:.3f} s")
-    print(f"[build] dense+TT action time={build_time:.3f} s")
-    print(f"[action] K max abs={k_abs:.3e}, rel L2={k_rel:.3e}")
-    print(f"[action] H max abs={h_abs:.3e}, rel L2={h_rel:.3e}")
-    print(f"[prop] dense split time={dense_prop_time:.3f} s")
-    print(f"[prop] TT-LDR split time={tt_prop_time:.3f} s")
-    print(f"[prop] population max abs diff={pop_max_abs:.3e}")
-    print(f"[prop] final state L2 diff={final_l2:.3e}")
-    print(f"[plot] {pop_png}")
-    print(f"[data] {data_path}")
+    print(f"[TT] build={tt_build:.3f} s, propagate={tt_time:.3f} s, ranks={tt.operator_ranks}")
+    print(f"[gauge] {tt.gauge_info}")
+    print(f"[TT-cross] {tt.overlap_info}")
+    print(f"[dense] propagate={dense_time:.3f} s")
+    print(f"[error] final fidelity={fidelity:.12f}, population max={population_error:.3e}")
+    print(f"[plot] {plot_path}")
 
 
 if __name__ == "__main__":

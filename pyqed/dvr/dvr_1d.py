@@ -1264,9 +1264,11 @@ class LegendreDVR(_DVR1D):
 
     def t(self, hc=1.0, mc2=None):
         D = self._differentiation_matrix()
-        D2 = D @ D
-        self._D2 = D2
-        T = -0.5 / self.mass * D2
+        self._D2 = D @ D
+        # The Gauss-Legendre grid has no boundary nodes, so constructing
+        # ``-D @ D`` and symmetrizing leaves spurious negative edge modes.
+        # The quadrature weak form is Hermitian and non-negative by design.
+        T = 0.5 / self.mass * (D.conj().T @ D)
         if hc != 1.0 or mc2 is not None:
             scale = hc ** 2
             if mc2 is not None:
@@ -1289,6 +1291,215 @@ class LegendreDVR(_DVR1D):
             denom = np.prod(self.x[j] - roots)
             basis[:, j] = np.prod(x[:, None] - roots[None, :], axis=1) / denom / np.sqrt(self.w[j])
         return basis
+
+
+class JacobiDVR(_DVR1D):
+    r"""Endpoint-adapted Jacobi-polynomial DVR on a finite interval.
+
+    The finite basis is
+
+    .. math::
+
+        \phi_n(q) \propto
+        \sin^{\alpha+1/2}(q/2)\cos^{\beta+1/2}(q/2)
+        P_n^{(\alpha,\beta)}(\cos q),
+
+    where q = pi * (x - xmin) / (xmax - xmin). Every basis function has
+    the endpoint powers selected by alpha and beta, and the grid is obtained
+    from Gauss--Jacobi nodes in cos(q).
+
+    The t() method returns the ordinary Cartesian kinetic operator in this
+    basis.
+    The exactly represented Poschl--Teller reference potential and
+    Hamiltonian are available through reference_potential() and
+    reference_hamiltonian().
+
+    This is intentionally distinct from LegendreDVR, which maps
+    Gauss--Legendre nodes linearly onto the requested coordinate interval.
+    """
+
+    def __init__(self, xmin, xmax, npts, alpha=0.0, beta=0.0, mass=1.0):
+        if not isinstance(npts, (int, np.integer)) or npts < 1:
+            raise ValueError("npts must be a positive integer.")
+        if not np.isfinite(xmin) or not np.isfinite(xmax) or xmax <= xmin:
+            raise ValueError("xmax must be finite and larger than xmin.")
+        if not np.isfinite(alpha) or alpha <= -0.5:
+            raise ValueError("alpha must be finite and larger than -1/2.")
+        if not np.isfinite(beta) or beta <= -0.5:
+            raise ValueError("beta must be finite and larger than -1/2.")
+        if not np.isfinite(mass) or mass <= 0.0:
+            raise ValueError("mass must be finite and positive.")
+
+        self.npts = int(npts)
+        self.xmin = float(xmin)
+        self.xmax = float(xmax)
+        self.L = self.xmax - self.xmin
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self._mass = float(mass)
+        self.n = np.arange(self.npts)
+
+        y, jacobi_weights = scipy.special.roots_jacobi(
+            self.npts, self.alpha, self.beta
+        )
+        # roots_jacobi orders y from -1 to 1, whereas arccos(y) decreases.
+        self.y = y[::-1]
+        self.jacobi_weights = jacobi_weights[::-1]
+        self.q = np.arccos(self.y)
+        self.x = self.xmin + self.L * self.q / np.pi
+
+        endpoint_weight = (
+            (1.0 - self.y) ** self.alpha
+            * (1.0 + self.y) ** self.beta
+        )
+        self.w = (
+            self.L
+            / np.pi
+            * self.jacobi_weights
+            / (endpoint_weight * np.sqrt(1.0 - self.y**2))
+        )
+        self.dx = float(np.mean(self.w))
+        self.k_max = None
+        self.T = None
+        self.U = self._build_transform()
+
+    @property
+    def mass(self):
+        return self._mass
+
+    @mass.setter
+    def mass(self, value):
+        value = float(value)
+        if not np.isfinite(value) or value <= 0.0:
+            raise ValueError("mass must be finite and positive.")
+        self._mass = value
+        self.T = None
+
+    def _jacobi_norms(self):
+        n = self.n.astype(float)
+        log_norm = (
+            (self.alpha + self.beta + 1.0) * np.log(2.0)
+            - np.log(2.0 * n + self.alpha + self.beta + 1.0)
+            + scipy.special.gammaln(n + self.alpha + 1.0)
+            + scipy.special.gammaln(n + self.beta + 1.0)
+            - scipy.special.gammaln(n + 1.0)
+            - scipy.special.gammaln(n + self.alpha + self.beta + 1.0)
+        )
+        return np.exp(log_norm)
+
+    def _build_transform(self):
+        polynomials = np.vstack(
+            [
+                scipy.special.eval_jacobi(n, self.alpha, self.beta, self.y)
+                for n in self.n
+            ]
+        )
+        return (
+            polynomials
+            * np.sqrt(self.jacobi_weights)[None, :]
+            / np.sqrt(self._jacobi_norms())[:, None]
+        )
+
+    def fbr2dvr(self):
+        """Return the orthogonal FBR-to-DVR transformation matrix."""
+        return self.U
+
+    def _reference_energies(self, mass=None):
+        if mass is None:
+            mass = self.mass
+        offset = 0.5 * (self.alpha + self.beta + 1.0)
+        scale = (np.pi / self.L) ** 2 / (2.0 * mass)
+        return scale * (self.n + offset) ** 2
+
+    def reference_potential(self, x=None, mass=None):
+        r"""Return the endpoint-singular Poschl--Teller reference potential."""
+        if mass is None:
+            mass = self.mass
+        if x is None:
+            q = self.q
+        else:
+            x = np.asarray(x, dtype=float)
+            q = np.pi * (x - self.xmin) / self.L
+        with np.errstate(divide="ignore", invalid="ignore"):
+            potential = (
+                (self.alpha**2 - 0.25) / (4.0 * np.sin(0.5 * q) ** 2)
+                + (self.beta**2 - 0.25) / (4.0 * np.cos(0.5 * q) ** 2)
+            )
+        return (np.pi / self.L) ** 2 * potential / (2.0 * mass)
+
+    def reference_hamiltonian(self):
+        """Return the exactly diagonalizable Poschl--Teller Hamiltonian."""
+        return self.U.T @ np.diag(self._reference_energies()) @ self.U
+
+    def t(self, hc=1.0, mc2=None):
+        mass = self.mass if mc2 is None else float(mc2)
+        if not np.isfinite(mass) or mass <= 0.0:
+            raise ValueError("mc2 must be finite and positive.")
+        reference = self.U.T @ np.diag(self._reference_energies(mass)) @ self.U
+        potential = self.reference_potential(mass=mass)
+        self.T = hc**2 * (reference - np.diag(potential))
+        self.T = 0.5 * (self.T + self.T.conj().T)
+        return self.T
+
+    def momentum(self):
+        """Return the Hermitian projected momentum operator."""
+        kinetic = self.t()
+        coordinate = np.diag(self.x)
+        momentum = 1j * self.mass * (
+            kinetic @ coordinate - coordinate @ kinetic
+        )
+        return 0.5 * (momentum + momentum.conj().T)
+
+    def _fbr_values(self, x):
+        x = np.asarray(x, dtype=float)
+        q = np.pi * (x - self.xmin) / self.L
+        y = np.cos(q)
+        prefactor = (
+            np.sin(0.5 * q) ** (self.alpha + 0.5)
+            * np.cos(0.5 * q) ** (self.beta + 0.5)
+        )
+        normalization = np.sqrt(
+            np.pi
+            * 2.0 ** (self.alpha + self.beta + 1.0)
+            / (self.L * self._jacobi_norms())
+        )
+        polynomials = np.column_stack(
+            [
+                scipy.special.eval_jacobi(n, self.alpha, self.beta, y)
+                for n in self.n
+            ]
+        )
+        return prefactor[:, None] * polynomials * normalization[None, :]
+
+    def f(self, x=None):
+        """Return quadrature-normalized Jacobi DVR cardinal functions."""
+        if x is None:
+            x = self.x
+        x = np.atleast_1d(np.asarray(x, dtype=float))
+        return self._fbr_values(x) @ self.U
+
+    basis = f
+
+
+class PTDVR(JacobiDVR):
+    r"""Poschl--Teller-named interface to JacobiDVR.
+
+    For an associated-Legendre angular problem, use equal endpoint parameters
+    alpha = beta = abs(m) or the associated_legendre() constructor.
+    """
+
+    @classmethod
+    def associated_legendre(cls, xmin, xmax, npts, m, mass=1.0):
+        """Construct the symmetric Poschl--Teller DVR for angular index m."""
+        order = abs(float(m))
+        return cls(
+            xmin,
+            xmax,
+            npts,
+            alpha=order,
+            beta=order,
+            mass=mass,
+        )
 
 
 class HermiteDVR(_DVR1D):

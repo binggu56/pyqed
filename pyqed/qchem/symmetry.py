@@ -1013,6 +1013,28 @@ def determinant_irrep_ids(binary, orbital_irrep_ids, point_group) -> tuple[int, 
     """
 
     group = _resolve_point_group(point_group)
+    if hasattr(binary, "alpha_occ") and hasattr(binary, "beta_occ"):
+        alpha_occ = np.asarray(binary.alpha_occ, dtype=np.int8)
+        beta_occ = np.asarray(binary.beta_occ, dtype=np.int8)
+        orbital_ids = np.asarray(orbital_irrep_ids, dtype=int)
+        if orbital_ids.shape != (alpha_occ.shape[1],):
+            raise ValueError(
+                f"orbital_irrep_ids must contain one entry per active orbital; "
+                f"got {orbital_ids.shape[0]} for ncas={alpha_occ.shape[1]}."
+            )
+        alpha_ids = [
+            irrep_product_id(group, orbital_ids[np.flatnonzero(occupation)])
+            for occupation in alpha_occ
+        ]
+        beta_ids = [
+            irrep_product_id(group, orbital_ids[np.flatnonzero(occupation)])
+            for occupation in beta_occ
+        ]
+        return tuple(
+            irrep_product_id(group, np.asarray((alpha_id, beta_id), dtype=int))
+            for alpha_id in alpha_ids
+            for beta_id in beta_ids
+        )
     dets = np.asarray(binary, dtype=np.int8)
     if dets.ndim != 3 or dets.shape[1] != 2:
         raise ValueError("binary must have shape (ndet, 2, ncas).")
@@ -1035,6 +1057,18 @@ def determinant_linear_momenta(binary, orbital_irrep_ids, point_group) -> tuple[
     group = _resolve_point_group(point_group)
     if not group.linear:
         return None
+    if hasattr(binary, "alpha_occ") and hasattr(binary, "beta_occ"):
+        orbital_ids = np.asarray(orbital_irrep_ids, dtype=int)
+        momenta = np.asarray(
+            [linear_irrep_momentum(irrep_id) for irrep_id in orbital_ids], dtype=int
+        )
+        alpha_momenta = np.asarray(binary.alpha_occ, dtype=int) @ momenta
+        beta_momenta = np.asarray(binary.beta_occ, dtype=int) @ momenta
+        return tuple(
+            int(alpha_value + beta_value)
+            for alpha_value in alpha_momenta
+            for beta_value in beta_momenta
+        )
     dets = np.asarray(binary, dtype=np.int8)
     orbital_ids = np.asarray(orbital_irrep_ids, dtype=int)
     momenta = np.asarray([linear_irrep_momentum(irrep_id) for irrep_id in orbital_ids], dtype=int)

@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -14,6 +15,10 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <dlfcn.h>
@@ -556,7 +561,7 @@ std::size_t factorized_output_work_limit() noexcept {
         const char* value =
             std::getenv("PYQED_SU2_FACTORIZED_OUTPUT_WORK");
         if (value == nullptr || value[0] == '\0') {
-            return std::size_t{65'536};
+            return std::size_t{0};
         }
         char* end = nullptr;
         const unsigned long long parsed =
@@ -564,7 +569,7 @@ std::size_t factorized_output_work_limit() noexcept {
         return (
             end != value && end != nullptr && end[0] == '\0'
             ? static_cast<std::size_t>(parsed)
-            : std::size_t{65'536}
+            : std::size_t{0}
         );
     }();
     return limit;
@@ -596,6 +601,55 @@ std::size_t complementary_execution_cache_elements() noexcept {
         return 12'000'000;
     }
     return static_cast<std::size_t>(parsed);
+}
+
+std::size_t private_output_workspace_budget_bytes() noexcept {
+    const char* value =
+        std::getenv("PYQED_SU2_PRIVATE_OUTPUT_BYTES");
+    if (value == nullptr || value[0] == '\0') {
+        return std::size_t{128} << 20;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end != value && end != nullptr && end[0] == '\0'
+        ? static_cast<std::size_t>(parsed)
+        : std::size_t{128} << 20;
+}
+
+int adaptive_openmp_thread_count(
+    int requested_threads,
+    std::size_t group_count,
+    std::uint64_t work
+) noexcept {
+    constexpr std::uint64_t minimum_parallel_work = 100'000;
+    constexpr std::uint64_t target_work_per_thread = 50'000;
+    if (
+        requested_threads <= 1
+        || group_count < 2
+        || work < minimum_parallel_work
+    ) {
+        return 1;
+    }
+    const std::uint64_t work_threads =
+        1 + (work - 1) / target_work_per_thread;
+    return std::max<int>(
+        2,
+        std::min<int>({
+            requested_threads,
+            static_cast<int>(std::min<std::uint64_t>(
+                work_threads,
+                static_cast<std::uint64_t>(
+                    std::numeric_limits<int>::max()
+                )
+            )),
+            static_cast<int>(std::min<std::size_t>(
+                group_count,
+                static_cast<std::size_t>(
+                    std::numeric_limits<int>::max()
+                )
+            )),
+        })
+    );
 }
 
 std::size_t direct_complementary_term_limit() noexcept {
@@ -3289,6 +3343,45 @@ MovingEnvironment::MovingEnvironment(const System* system) : system_(system) {
     }
     split_site_owner_revision_ =
         split_site_owner_clock.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
+void MovingEnvironment::set_num_threads(int n_threads) {
+    if (n_threads < 1) {
+        throw std::invalid_argument("n_threads must be a positive integer.");
+    }
+#ifdef _OPENMP
+    n_threads_ = n_threads;
+#else
+    n_threads_ = 1;
+#endif
+}
+
+int MovingEnvironment::num_threads() const noexcept {
+    return n_threads_;
+}
+
+bool MovingEnvironment::openmp_available() const noexcept {
+#ifdef _OPENMP
+    return true;
+#else
+    return false;
+#endif
+}
+
+int MovingEnvironment::openmp_version() const noexcept {
+#ifdef _OPENMP
+    return _OPENMP;
+#else
+    return 0;
+#endif
+}
+
+std::uint64_t MovingEnvironment::openmp_parallel_regions() const noexcept {
+    return openmp_parallel_regions_;
+}
+
+std::uint64_t MovingEnvironment::openmp_tasks() const noexcept {
+    return openmp_tasks_;
 }
 
 std::string MovingEnvironment::boundary_key(
@@ -8699,6 +8792,14 @@ void MovingEnvironment::local_matvec(
     }
     std::fill(output, output + dimension, Complex{0.0, 0.0});
     for (const LocalBlock& block : local_blocks_) {
+#ifdef _OPENMP
+        const bool parallel = n_threads_ > 1 && block.rows > 1;
+        if (parallel) {
+            ++openmp_parallel_regions_;
+            openmp_tasks_ += static_cast<std::uint64_t>(block.rows);
+        }
+#pragma omp parallel for schedule(static) num_threads(n_threads_) if(parallel)
+#endif
         for (std::int64_t row = 0; row < block.rows; ++row) {
             Complex value = 0.0;
             const Complex* matrix_row = block.values + row * block.cols;
@@ -9759,6 +9860,9 @@ void MovingEnvironment::build_raw_route_groups() {
 void MovingEnvironment::build_dense_pair_kernels() {
     dense_pair_kernels_.clear();
     dense_pair_executions_.clear();
+    dense_pair_wave_offsets_.clear();
+    dense_pair_wave_indices_.clear();
+    dense_pair_max_wave_width_ = 0;
     dense_pair_kernels_built_ = 0;
     dense_pair_kernel_elements_ = 0;
     dense_pair_routes_ = 0;
@@ -10150,6 +10254,9 @@ void MovingEnvironment::build_dense_pair_executions() {
     const bool shared_input = by_input.size() <= by_output.size();
     const auto& groups = shared_input ? by_input : by_output;
     dense_pair_executions_.clear();
+    dense_pair_wave_offsets_.clear();
+    dense_pair_wave_indices_.clear();
+    dense_pair_max_wave_width_ = 0;
     dense_pair_executions_.reserve(groups.size());
     for (const auto& [key, indices] : groups) {
         DensePairExecution execution;
@@ -10232,6 +10339,100 @@ void MovingEnvironment::build_dense_pair_executions() {
     }
     dense_pair_kernels_built_ = dense_pair_kernels_.size();
     std::vector<DensePairKernel>().swap(dense_pair_kernels_);
+    std::size_t schedule_dimension = 0;
+    for (
+        std::size_t entry = 0;
+        entry < raw_basis_offsets_.size();
+        ++entry
+    ) {
+        const std::int64_t* shape = raw_basis_shapes_.data() + 4 * entry;
+        const std::int64_t size = shape[0] * shape[1] * shape[2] * shape[3];
+        schedule_dimension = std::max(
+            schedule_dimension,
+            static_cast<std::size_t>(raw_basis_offsets_[entry] + size)
+        );
+    }
+    std::vector<std::int64_t> last_output_wave(schedule_dimension, -1);
+    std::vector<std::vector<std::size_t>> waves;
+    const auto visit_output_indices = [](
+        const DensePairExecution& execution,
+        const auto& visitor
+    ) {
+        if (execution.shared_input) {
+            for (
+                std::size_t segment = 0;
+                segment < execution.offsets.size();
+                ++segment
+            ) {
+                for (
+                    std::int64_t index = 0;
+                    index < execution.sizes[segment];
+                    ++index
+                ) {
+                    visitor(execution.offsets[segment] + index);
+                }
+            }
+            return;
+        }
+        for (std::int64_t index = 0; index < execution.rows; ++index) {
+            visitor(execution.common_offset + index);
+        }
+    };
+    for (
+        std::size_t execution_index = 0;
+        execution_index < dense_pair_executions_.size();
+        ++execution_index
+    ) {
+        const DensePairExecution& execution =
+            dense_pair_executions_[execution_index];
+        std::size_t wave = 0;
+        visit_output_indices(execution, [&](std::int64_t output_index) {
+            if (
+                output_index < 0
+                || static_cast<std::size_t>(output_index)
+                    >= schedule_dimension
+            ) {
+                throw std::runtime_error(
+                    "Dense-pair execution output "
+                    + std::to_string(output_index)
+                    + " exceeds reduced basis dimension "
+                    + std::to_string(schedule_dimension)
+                    + "."
+                );
+            }
+            wave = std::max(
+                wave,
+                static_cast<std::size_t>(
+                    last_output_wave[static_cast<std::size_t>(output_index)]
+                    + 1
+                )
+            );
+        });
+        if (waves.size() <= wave) {
+            waves.resize(wave + 1);
+        }
+        waves[wave].push_back(execution_index);
+        visit_output_indices(execution, [&](std::int64_t output_index) {
+            last_output_wave[static_cast<std::size_t>(output_index)] =
+                static_cast<std::int64_t>(wave);
+        });
+    }
+    dense_pair_wave_offsets_.reserve(waves.size() + 1);
+    dense_pair_wave_offsets_.push_back(0);
+    for (const auto& wave : waves) {
+        dense_pair_max_wave_width_ = std::max(
+            dense_pair_max_wave_width_,
+            wave.size()
+        );
+        dense_pair_wave_indices_.insert(
+            dense_pair_wave_indices_.end(),
+            wave.begin(),
+            wave.end()
+        );
+        dense_pair_wave_offsets_.push_back(
+            dense_pair_wave_indices_.size()
+        );
+    }
 }
 
 void MovingEnvironment::build_fused_factor_aggregates() {
@@ -10606,6 +10807,7 @@ void MovingEnvironment::build_raw_execution_groups() {
         }
         raw_pointer_action_arena_ = raw_execution_action_arena_;
         build_raw_input_superchannels();
+        build_direct_execution_waves();
         peak_raw_execution_groups_ = std::max(
             peak_raw_execution_groups_,
             raw_execution_groups_.size()
@@ -10819,6 +11021,7 @@ void MovingEnvironment::build_raw_execution_groups() {
         );
     }
     build_raw_input_superchannels();
+    build_direct_execution_waves();
     peak_raw_execution_groups_ = std::max(
         peak_raw_execution_groups_,
         raw_execution_groups_.size()
@@ -10831,6 +11034,74 @@ void MovingEnvironment::build_raw_execution_groups() {
         peak_raw_input_superchannel_batches_,
         raw_input_superchannel_batches_
     );
+}
+
+void MovingEnvironment::build_direct_execution_waves() {
+    direct_execution_wave_offsets_.clear();
+    direct_execution_wave_indices_.clear();
+    direct_execution_max_wave_width_ = 0;
+    if (raw_execution_groups_.empty()) {
+        return;
+    }
+    const auto output_interval = [this](std::size_t index) {
+        const RawExecutionGroup& execution = raw_execution_groups_[index];
+        const std::int64_t rows = execution.dims[0] * execution.dims[2];
+        const std::int64_t cols = execution.dims[6] * execution.dims[4];
+        return std::array<std::int64_t, 2>{
+            execution.output_offset,
+            execution.output_offset + rows * cols,
+        };
+    };
+    std::vector<std::vector<std::size_t>> waves;
+    std::unordered_map<
+        std::int64_t,
+        std::array<std::int64_t, 2>
+    > output_states;
+    output_states.reserve(raw_execution_groups_.size());
+    for (
+        std::size_t execution = 0;
+        execution < raw_execution_groups_.size();
+        ++execution
+    ) {
+        const auto interval = output_interval(execution);
+        std::size_t required_wave = 0;
+        const auto found = output_states.find(interval[0]);
+        if (found == output_states.end()) {
+            output_states.emplace(
+                interval[0],
+                std::array<std::int64_t, 2>{interval[1], 0}
+            );
+        } else {
+            if (found->second[0] != interval[1]) {
+                throw std::logic_error(
+                    "Direct complementary output block shape changed."
+                );
+            }
+            required_wave = static_cast<std::size_t>(
+                ++found->second[1]
+            );
+        }
+        if (waves.size() <= required_wave) {
+            waves.resize(required_wave + 1);
+        }
+        waves[required_wave].push_back(execution);
+    }
+    direct_execution_wave_offsets_.reserve(waves.size() + 1);
+    direct_execution_wave_offsets_.push_back(0);
+    for (const auto& wave : waves) {
+        direct_execution_max_wave_width_ = std::max(
+            direct_execution_max_wave_width_,
+            wave.size()
+        );
+        direct_execution_wave_indices_.insert(
+            direct_execution_wave_indices_.end(),
+            wave.begin(),
+            wave.end()
+        );
+        direct_execution_wave_offsets_.push_back(
+            direct_execution_wave_indices_.size()
+        );
+    }
 }
 
 void MovingEnvironment::build_raw_input_superchannels() {
@@ -13537,6 +13808,9 @@ void MovingEnvironment::stash_reduced_contextual_execution_schedule() {
         std::move(raw_combined_left_terms_);
     schedule.superchannels = std::move(raw_input_superchannels_);
     schedule.output_waves = std::move(raw_output_fusion_waves_);
+    direct_execution_wave_offsets_.clear();
+    direct_execution_wave_indices_.clear();
+    direct_execution_max_wave_width_ = 0;
     schedule.local_actions = std::move(complementary_local_actions_);
     schedule.local_terms = std::move(complementary_local_terms_);
     schedule.compact_right_panels = std::move(compact_right_panels_);
@@ -13619,11 +13893,194 @@ bool MovingEnvironment::restore_reduced_contextual_execution_schedule(
         plan.execution.reset();
         return false;
     }
+    build_direct_execution_waves();
     active_reduced_contextual_execution_schedule_ = plan.execution;
     ++complementary_execution_graph_hits_;
     contextual_compiled_schedule_restore_seconds_ +=
         wall_seconds() - started;
     return true;
+}
+
+void MovingEnvironment::pack_cached_complementary_execution_slab() {
+    constexpr std::size_t no_offset =
+        std::numeric_limits<std::size_t>::max();
+    complementary_pack_tasks_.clear();
+    long double pack_work = 0.0L;
+    for (
+        std::size_t channel_index = 0;
+        channel_index < raw_input_superchannels_.size();
+        ++channel_index
+    ) {
+        const RawInputSuperchannel& channel =
+            raw_input_superchannels_[channel_index];
+        if (channel.cached_unique_left_offset != no_offset) {
+            if (
+                channel.unique_left_actions.size()
+                    != channel.unique_left_row_offsets.size()
+            ) {
+                throw std::logic_error(
+                    "Channel unique-left schedule is inconsistent."
+                );
+            }
+            if (!channel.unique_left_actions.empty()) {
+                complementary_pack_tasks_.push_back({
+                    0,
+                    channel_index,
+                    0,
+                });
+                pack_work += static_cast<long double>(
+                    channel.unique_left_rows * channel.kb
+                );
+            }
+        }
+        for (
+            std::size_t batch_index = 0;
+            batch_index < channel.batches.size();
+            ++batch_index
+        ) {
+            const RawExecutionBatch& batch = channel.batches[batch_index];
+            if (
+                batch.cached_left_offset == no_offset
+                && batch.cached_right_offset == no_offset
+            ) {
+                continue;
+            }
+            complementary_pack_tasks_.push_back({
+                1,
+                channel_index,
+                batch_index,
+            });
+            if (batch.cached_left_offset != no_offset) {
+                pack_work += static_cast<long double>(
+                    batch.packed_left_rows * channel.kb
+                );
+            }
+            if (batch.cached_right_offset != no_offset) {
+                pack_work += static_cast<long double>(
+                    batch.total_right_elements
+                );
+            }
+        }
+    }
+    if (complementary_pack_tasks_.empty()) {
+        return;
+    }
+#ifdef _OPENMP
+    const std::uint64_t integral_pack_work = static_cast<std::uint64_t>(
+        std::min<long double>(
+            pack_work,
+            static_cast<long double>(
+                std::numeric_limits<std::uint64_t>::max()
+            )
+        )
+    );
+    const int pack_threads = adaptive_openmp_thread_count(
+        n_threads_,
+        complementary_pack_tasks_.size(),
+        integral_pack_work
+    );
+    const bool parallel_pack = pack_threads > 1;
+#else
+    constexpr int pack_threads = 1;
+#endif
+    complementary_panel_thread_scratch_.resize(
+        static_cast<std::size_t>(pack_threads)
+    );
+    std::atomic<bool> failed{false};
+    std::exception_ptr parallel_error;
+#ifdef _OPENMP
+    if (parallel_pack) {
+        ++openmp_parallel_regions_;
+        openmp_tasks_ += static_cast<std::uint64_t>(
+            complementary_pack_tasks_.size()
+        );
+    }
+#pragma omp parallel for schedule(dynamic, 1) \
+    num_threads(pack_threads) if(parallel_pack)
+#endif
+    for (
+        std::int64_t task_index = 0;
+        task_index < static_cast<std::int64_t>(
+            complementary_pack_tasks_.size()
+        );
+        ++task_index
+    ) {
+        if (failed.load(std::memory_order_relaxed)) {
+            continue;
+        }
+#ifdef _OPENMP
+        const std::size_t thread_id = static_cast<std::size_t>(
+            omp_get_thread_num()
+        );
+#else
+        constexpr std::size_t thread_id = 0;
+#endif
+        try {
+            const auto& task = complementary_pack_tasks_[
+                static_cast<std::size_t>(task_index)
+            ];
+            RawInputSuperchannel& channel =
+                raw_input_superchannels_[task[1]];
+            std::vector<double>& panel_scratch =
+                complementary_panel_thread_scratch_[thread_id];
+            if (task[0] == 0) {
+                for (
+                    std::size_t unique_index = 0;
+                    unique_index < channel.unique_left_actions.size();
+                    ++unique_index
+                ) {
+                    const RawExecutionAction& action =
+                        raw_execution_action_arena_[
+                            channel.unique_left_actions[unique_index]
+                        ];
+                    const std::int64_t w =
+                        complementary_local_actions_[action.group].dims[2];
+                    pack_raw_execution_action_into(
+                        action,
+                        w,
+                        0,
+                        complementary_execution_slab_.data()
+                            + channel.cached_unique_left_offset
+                            + channel.unique_left_row_offsets[unique_index]
+                                * channel.kb,
+                        nullptr,
+                        false,
+                        0,
+                        0,
+                        &panel_scratch
+                    );
+                }
+                continue;
+            }
+            RawExecutionBatch& batch = channel.batches[task[2]];
+            pack_raw_execution_batch(
+                channel,
+                batch,
+                batch.cached_left_offset == no_offset
+                    ? nullptr
+                    : complementary_execution_slab_.data()
+                        + batch.cached_left_offset,
+                batch.cached_right_offset == no_offset
+                    ? nullptr
+                    : complementary_execution_slab_.data()
+                        + batch.cached_right_offset,
+                &panel_scratch
+            );
+        } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(pyqed_su2_complementary_pack_error)
+#endif
+            {
+                if (!parallel_error) {
+                    parallel_error = std::current_exception();
+                }
+            }
+            failed.store(true, std::memory_order_relaxed);
+        }
+    }
+    if (parallel_error) {
+        std::rethrow_exception(parallel_error);
+    }
 }
 
 void MovingEnvironment::refresh_complementary_execution_slab() {
@@ -13685,57 +14142,8 @@ void MovingEnvironment::refresh_complementary_execution_slab() {
     select_direct_complementary_tiles();
     compact_selected_direct_right_layout();
     refresh_compact_right_panels();
-    for (RawInputSuperchannel& channel : raw_input_superchannels_) {
-        if (channel.cached_unique_left_offset == no_offset) {
-            continue;
-        }
-        for (
-            std::size_t unique_index = 0;
-            unique_index < channel.unique_left_actions.size();
-            ++unique_index
-        ) {
-            const RawExecutionAction& action =
-                raw_execution_action_arena_.at(
-                    channel.unique_left_actions[unique_index]
-                );
-            const std::int64_t w =
-                complementary_local_actions_.at(
-                    action.group
-                ).dims[2];
-            pack_raw_execution_action_into(
-                action,
-                w,
-                0,
-                complementary_execution_slab_.data()
-                    + channel.cached_unique_left_offset
-                    + channel.unique_left_row_offsets[unique_index]
-                        * channel.kb,
-                nullptr
-            );
-        }
-    }
-    for (RawInputSuperchannel& channel : raw_input_superchannels_) {
-        for (RawExecutionBatch& batch : channel.batches) {
-            if (
-                batch.cached_left_offset == no_offset
-                && batch.cached_right_offset == no_offset
-            ) {
-                continue;
-            }
-            pack_raw_execution_batch(
-                channel,
-                batch,
-                batch.cached_left_offset == no_offset
-                    ? nullptr
-                    : complementary_execution_slab_.data()
-                        + batch.cached_left_offset,
-                batch.cached_right_offset == no_offset
-                    ? nullptr
-                    : complementary_execution_slab_.data()
-                        + batch.cached_right_offset
-            );
-        }
-    }
+    build_persistent_output_group_schedule();
+    pack_cached_complementary_execution_slab();
     prepare_output_fusion_right_slab();
     raw_execution_pack_seconds_ += wall_seconds() - started;
 }
@@ -13744,7 +14152,8 @@ void MovingEnvironment::pack_raw_execution_batch(
     const RawInputSuperchannel& channel,
     const RawExecutionBatch& batch,
     double* left_values,
-    double* right_values
+    double* right_values,
+    std::vector<double>* panel_scratch
 ) {
     if (
         left_values != nullptr
@@ -13854,7 +14263,8 @@ void MovingEnvironment::pack_raw_execution_batch(
                 action.direct_preferred ? nullptr : right_target,
                 batch.right_first,
                 batch.total_w,
-                batch_w_offset + w_offset
+                batch_w_offset + w_offset,
+                panel_scratch
             );
             w_offset += w;
         }
@@ -14090,6 +14500,8 @@ void MovingEnvironment::apply_persistent_output_groups_real(
 #endif
 
 void MovingEnvironment::prepare_output_fusion_right_slab() {
+    constexpr std::size_t no_offset =
+        std::numeric_limits<std::size_t>::max();
     std::size_t right_elements = 0;
     for (RawOutputFusionWave& wave : raw_output_fusion_waves_) {
         wave.persistent_right_offset = right_elements;
@@ -14098,9 +14510,27 @@ void MovingEnvironment::prepare_output_fusion_right_slab() {
             + wave.shared_left_right_elements
             + wave.grouped_product_right_elements;
     }
+    for (RawPersistentOutputGroup& scheduled :
+         persistent_output_groups_) {
+        scheduled.right_offset = no_offset;
+        if (
+            !scheduled.combined
+            || dynamic_persistent_output_right_
+        ) {
+            continue;
+        }
+        const std::size_t elements = static_cast<std::size_t>(
+            scheduled.total_k * scheduled.dq
+        );
+        if (right_elements > no_offset - elements) {
+            throw std::overflow_error(
+                "Persistent output-group right slab is too large."
+            );
+        }
+        scheduled.right_offset = right_elements;
+        right_elements += elements;
+    }
     raw_persistent_output_right_.resize(right_elements);
-    constexpr std::size_t no_offset =
-        std::numeric_limits<std::size_t>::max();
     for (const RawOutputFusionWave& wave : raw_output_fusion_waves_) {
         for (const RawOutputFusionBatch& scheduled : wave.batches) {
             const RawInputSuperchannel& channel =
@@ -14274,6 +14704,75 @@ void MovingEnvironment::prepare_output_fusion_right_slab() {
             }
         }
     }
+    for (const RawPersistentOutputGroup& scheduled :
+         persistent_output_groups_) {
+        if (!scheduled.combined || scheduled.right_offset == no_offset) {
+            continue;
+        }
+        for (
+            std::size_t reference_index = scheduled.reference_start;
+            reference_index < scheduled.reference_stop;
+            ++reference_index
+        ) {
+            const RawPersistentOutputReference& reference =
+                persistent_output_references_.at(reference_index);
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(reference.wave);
+            const RawOutputFusionGroup& group =
+                wave.groups.at(reference.group);
+            if (group.la != scheduled.la || group.dq != scheduled.dq) {
+                throw std::logic_error(
+                    "Persistent output-group right shape changed."
+                );
+            }
+            for (
+                std::size_t binding_reference = reference.binding_start;
+                binding_reference < reference.binding_stop;
+                ++binding_reference
+            ) {
+                const RawPersistentOutputBinding& selected =
+                    persistent_output_bindings_.at(binding_reference);
+                const RawOutputFusionBatch& batch =
+                    wave.batches.at(selected.batch);
+                const RawInputSuperchannel& channel =
+                    raw_input_superchannels_.at(batch.channel);
+                const RawOutputFusionBinding& binding =
+                    wave.bindings.at(selected.binding);
+                const RawExecutionTile& tile =
+                    channel.tiles.at(binding.tile);
+                double* target = raw_persistent_output_right_.data()
+                    + scheduled.right_offset
+                    + (
+                        reference.group_k_offset
+                        + binding.group_k_offset
+                    ) * scheduled.dq;
+                std::int64_t w_offset = 0;
+                for (
+                    std::size_t action_index = tile.action_start;
+                    action_index < tile.action_stop;
+                    ++action_index
+                ) {
+                    const RawExecutionAction& action =
+                        raw_execution_action_arena_.at(action_index);
+                    pack_raw_execution_action_into(
+                        action,
+                        tile.total_w,
+                        w_offset,
+                        nullptr,
+                        target
+                    );
+                    w_offset += complementary_local_actions_.at(
+                        action.group
+                    ).dims[2];
+                }
+                if (w_offset != tile.total_w) {
+                    throw std::logic_error(
+                        "Persistent output-group packed width changed."
+                    );
+                }
+            }
+        }
+    }
 }
 
 const double* MovingEnvironment::expand_raw_execution_batch_left_real(
@@ -14284,6 +14783,7 @@ const double* MovingEnvironment::expand_raw_execution_batch_left_real(
     if (batch.packed_left_rows >= batch.total_left_rows) {
         return packed_temporary;
     }
+    const double expand_started = wall_seconds();
     raw_batch_temporary_real_.resize(
         static_cast<std::size_t>(
             batch.total_left_rows * channel.cr
@@ -14356,6 +14856,7 @@ const double* MovingEnvironment::expand_raw_execution_batch_left_real(
             "Complementary left reuse schedule is inconsistent."
         );
     }
+    raw_batch_expand_seconds_ += wall_seconds() - expand_started;
     return raw_batch_temporary_real_.data();
 }
 
@@ -14365,8 +14866,10 @@ MovingEnvironment::expand_raw_execution_batch_channel_left_real(
     const RawExecutionBatch& batch,
     const double* channel_temporary,
     const RawOutputFusionWave& wave,
-    const RawOutputFusionBatch& scheduled
+    const RawOutputFusionBatch& scheduled,
+    bool skip_persistent_output
 ) {
+    const double expand_started = wall_seconds();
     raw_batch_temporary_real_.resize(
         static_cast<std::size_t>(
             batch.total_left_rows * channel.cr
@@ -14394,11 +14897,17 @@ MovingEnvironment::expand_raw_execution_batch_channel_left_real(
         const RawOutputFusionGroup& output_group = wave.groups.at(
             wave.bindings.at(binding_index).group
         );
-        const bool direct_to_fusion =
-            direct_channel_output_fusion()
-            && output_group.temporary_offset
-                != std::numeric_limits<std::size_t>::max()
-            && !tile.direct_preferred;
+        const bool direct_to_fusion = !tile.direct_preferred && (
+            (
+                direct_channel_output_fusion()
+                && output_group.temporary_offset
+                    != std::numeric_limits<std::size_t>::max()
+            )
+            || (
+                skip_persistent_output
+                && output_group.persistent_output
+            )
+        );
         const RawExecutionGroup& execution =
             raw_execution_groups_[tile.execution];
         const std::int64_t la =
@@ -14469,6 +14978,7 @@ MovingEnvironment::expand_raw_execution_batch_channel_left_real(
             "Channel left schedule is inconsistent."
         );
     }
+    raw_batch_expand_seconds_ += wall_seconds() - expand_started;
     return raw_batch_temporary_real_.data();
 }
 
@@ -14496,8 +15006,9 @@ const double* MovingEnvironment::prepare_raw_execution_batch_right_real(
         nullptr,
         raw_batch_right_.data()
     );
-    raw_execution_pack_seconds_ +=
-        wall_seconds() - pack_started;
+    const double pack_seconds = wall_seconds() - pack_started;
+    raw_execution_pack_seconds_ += pack_seconds;
+    raw_batch_right_prepare_seconds_ += pack_seconds;
     return raw_batch_right_.data();
 }
 
@@ -14765,15 +15276,38 @@ bool MovingEnvironment::apply_compact_complementary_products_real(
     }
     for (const RawCompactOutputProduct& product :
          batch.compact_output_products) {
+        if (product.tile >= channel.tiles.size()) {
+            return false;
+        }
+        const RawExecutionTile& tile = channel.tiles.at(product.tile);
+        const RawExecutionGroup& execution =
+            raw_execution_groups_.at(tile.execution);
         if (
-            product.tile >= channel.tiles.size()
-            || !channel.tiles[product.tile].requires_right
+            !tile.requires_right
             || (
                 product.panel != no_panel
                 && product.panel >= compact_right_panels_.size()
             )
         ) {
             return false;
+        }
+        if (product.panel != no_panel) {
+            const RawCompactRightPanel& panel =
+                compact_right_panels_.at(product.panel);
+            const std::int64_t inner = tile.total_w * channel.cr;
+            const std::int64_t cols =
+                execution.dims[6] * execution.dims[4];
+            if (
+                panel.rows != inner
+                || panel.cols != cols
+                || panel.value_offset
+                    + static_cast<std::size_t>(inner * cols)
+                    > compact_right_panel_values_.size()
+            ) {
+                throw std::logic_error(
+                    "Compact complementary product shape changed."
+                );
+            }
         }
     }
     const double started = wall_seconds();
@@ -14801,6 +15335,157 @@ bool MovingEnvironment::apply_compact_complementary_products_real(
             batch.compact_output_wave_offsets[wave_index - 1];
         const std::size_t product_stop =
             batch.compact_output_wave_offsets[wave_index];
+        if (function == nullptr) {
+            std::size_t persistent_products = 0;
+            long double persistent_work = 0.0L;
+            for (
+                std::size_t product_index = product_start;
+                product_index < product_stop;
+                ++product_index
+            ) {
+                const RawCompactOutputProduct& product =
+                    batch.compact_output_products[product_index];
+                if (product.panel == no_panel) continue;
+                const RawExecutionTile& tile =
+                    channel.tiles[product.tile];
+                const RawExecutionGroup& execution =
+                    raw_execution_groups_[tile.execution];
+                persistent_work +=
+                    static_cast<long double>(
+                        execution.dims[0] * execution.dims[2]
+                    )
+                    * static_cast<long double>(
+                        execution.dims[6] * execution.dims[4]
+                    )
+                    * static_cast<long double>(
+                        tile.total_w * channel.cr
+                    );
+                ++persistent_products;
+            }
+#ifdef _OPENMP
+            const int compact_threads = std::min<int>(
+                n_threads_,
+                std::max<int>(
+                    1,
+                    static_cast<int>(persistent_products)
+                )
+            );
+            const bool parallel_products =
+                compact_threads > 1
+                && persistent_work >= 100'000.0L;
+            if (parallel_products) {
+                ++openmp_parallel_regions_;
+                openmp_tasks_ += static_cast<std::uint64_t>(
+                    persistent_products
+                );
+            }
+#pragma omp parallel for schedule(dynamic, 4) \
+    num_threads(compact_threads) if(parallel_products)
+#endif
+            for (
+                std::int64_t product_index =
+                    static_cast<std::int64_t>(product_start);
+                product_index < static_cast<std::int64_t>(product_stop);
+                ++product_index
+            ) {
+                const RawCompactOutputProduct& product =
+                    batch.compact_output_products[
+                        static_cast<std::size_t>(product_index)
+                    ];
+                if (product.panel == no_panel) continue;
+                const RawExecutionTile& tile =
+                    channel.tiles[product.tile];
+                const RawExecutionGroup& execution =
+                    raw_execution_groups_[tile.execution];
+                const std::int64_t rows =
+                    execution.dims[0] * execution.dims[2];
+                const std::int64_t cols =
+                    execution.dims[6] * execution.dims[4];
+                const std::int64_t inner =
+                    tile.total_w * channel.cr;
+                const RawCompactRightPanel& panel =
+                    compact_right_panels_[product.panel];
+                accumulate_raw_output_product(
+                    rows,
+                    cols,
+                    inner,
+                    temporary_values
+                        + product.temporary_row_offset * channel.cr,
+                    compact_right_panel_values_.data()
+                        + panel.value_offset,
+                    output + execution.output_offset
+                );
+#ifdef _OPENMP
+                if (omp_in_parallel()) {
+#pragma omp atomic update
+                    ++raw_factor_gemm_calls_;
+                } else
+#endif
+                {
+                    ++raw_factor_gemm_calls_;
+                }
+            }
+            for (
+                std::size_t product_index = product_start;
+                product_index < product_stop;
+                ++product_index
+            ) {
+                const RawCompactOutputProduct& product =
+                    batch.compact_output_products[product_index];
+                if (product.panel != no_panel) continue;
+                const RawExecutionTile& tile =
+                    channel.tiles[product.tile];
+                const RawExecutionGroup& execution =
+                    raw_execution_groups_[tile.execution];
+                const std::int64_t rows =
+                    execution.dims[0] * execution.dims[2];
+                const std::int64_t cols =
+                    execution.dims[6] * execution.dims[4];
+                const std::int64_t inner =
+                    tile.total_w * channel.cr;
+                raw_batch_right_.resize(static_cast<std::size_t>(
+                    inner * cols
+                ));
+                const double pack_started = wall_seconds();
+                std::int64_t w_offset = 0;
+                for (
+                    std::size_t action_index = tile.action_start;
+                    action_index < tile.action_stop;
+                    ++action_index
+                ) {
+                    const RawExecutionAction& action =
+                        raw_execution_action_arena_[action_index];
+                    pack_raw_execution_action_into(
+                        action,
+                        tile.total_w,
+                        w_offset,
+                        nullptr,
+                        raw_batch_right_.data()
+                    );
+                    w_offset += complementary_local_actions_[
+                        action.group
+                    ].dims[2];
+                }
+                if (w_offset != tile.total_w) {
+                    throw std::logic_error(
+                        "Compact complementary scratch width changed."
+                    );
+                }
+                raw_execution_pack_seconds_ +=
+                    wall_seconds() - pack_started;
+                accumulate_raw_output_product(
+                    rows,
+                    cols,
+                    inner,
+                    temporary_values
+                        + product.temporary_row_offset * channel.cr,
+                    raw_batch_right_.data(),
+                    output + execution.output_offset
+                );
+                ++raw_factor_gemm_calls_;
+            }
+            continue;
+        }
         for (
             std::size_t product_index = product_start;
             product_index < product_stop;
@@ -15205,10 +15890,14 @@ bool MovingEnvironment::apply_shared_left_output_products(
     ) {
         return false;
     }
-    std::size_t products = 0;
+    const std::size_t group_start =
+        scheduled.shared_left_group_start;
+    const std::size_t group_stop =
+        scheduled.shared_left_group_stop;
+    long double total_work = 0.0L;
     for (
-        std::size_t group_index = scheduled.shared_left_group_start;
-        group_index < scheduled.shared_left_group_stop;
+        std::size_t group_index = group_start;
+        group_index < group_stop;
         ++group_index
     ) {
         const RawSharedLeftOutputGroup& shared =
@@ -15217,7 +15906,6 @@ bool MovingEnvironment::apply_shared_left_output_products(
             wave.bindings.at(shared.reference_binding);
         const RawExecutionTile& reference_tile =
             channel.tiles.at(reference.tile);
-        const double* shared_temporary = temporary_values;
         if (shared.channel_level) {
             if (
                 channel_temporary_values == nullptr
@@ -15231,7 +15919,6 @@ bool MovingEnvironment::apply_shared_left_output_products(
                     "Channel shared-left output source changed."
                 );
             }
-            shared_temporary = channel_temporary_values;
         }
         if (
             (!shared.channel_level && (
@@ -15248,12 +15935,6 @@ bool MovingEnvironment::apply_shared_left_output_products(
                 "Shared-left output group shape changed."
             );
         }
-        const double* packed_right = raw_persistent_output_right_.data()
-            + wave.persistent_right_offset
-            + wave.right_elements
-            + shared.right_offset;
-        double* packed_output = raw_shared_left_output_real_.data()
-            + shared.output_offset;
         for (
             std::size_t entry = shared.binding_start;
             entry < shared.binding_stop;
@@ -15287,6 +15968,48 @@ bool MovingEnvironment::apply_shared_left_output_products(
                 );
             }
         }
+        total_work += static_cast<long double>(shared.rows)
+            * static_cast<long double>(shared.total_columns)
+            * static_cast<long double>(shared.inner);
+    }
+#ifdef _OPENMP
+    const std::size_t group_count = group_stop - group_start;
+    const int shared_left_threads = std::min<int>(
+        n_threads_,
+        std::max<int>(1, static_cast<int>(group_count))
+    );
+    const bool parallel_shared_left =
+        shared_left_threads > 1
+        && total_work >= 100'000.0L;
+    if (parallel_shared_left) {
+        ++openmp_parallel_regions_;
+        openmp_tasks_ += static_cast<std::uint64_t>(group_count);
+    }
+#pragma omp parallel for schedule(dynamic, 4) \
+    num_threads(shared_left_threads) if(parallel_shared_left)
+#endif
+    for (
+        std::int64_t local_group = 0;
+        local_group < static_cast<std::int64_t>(group_stop - group_start);
+        ++local_group
+    ) {
+        const RawSharedLeftOutputGroup& shared =
+            wave.shared_left_groups[
+                group_start + static_cast<std::size_t>(local_group)
+            ];
+        const RawOutputFusionBinding& reference =
+            wave.bindings[shared.reference_binding];
+        const double* shared_temporary = (
+            shared.channel_level
+            ? channel_temporary_values
+            : temporary_values
+        );
+        const double* packed_right = raw_persistent_output_right_.data()
+            + wave.persistent_right_offset
+            + wave.right_elements
+            + shared.right_offset;
+        double* packed_output = raw_shared_left_output_real_.data()
+            + shared.output_offset;
         raw_dgemm(
             false,
             false,
@@ -15308,6 +16031,17 @@ bool MovingEnvironment::apply_shared_left_output_products(
             packed_output,
             shared.total_columns
         );
+    }
+    std::size_t products = 0;
+    for (
+        std::size_t group_index = group_start;
+        group_index < group_stop;
+        ++group_index
+    ) {
+        const RawSharedLeftOutputGroup& shared =
+            wave.shared_left_groups[group_index];
+        const double* packed_output = raw_shared_left_output_real_.data()
+            + shared.output_offset;
         for (
             std::size_t entry = shared.binding_start;
             entry < shared.binding_stop;
@@ -15872,6 +16606,1719 @@ void MovingEnvironment::select_direct_complementary_tiles() {
     }
 }
 
+void MovingEnvironment::build_persistent_output_group_schedule() {
+    constexpr std::size_t no_offset =
+        std::numeric_limits<std::size_t>::max();
+#ifdef _OPENMP
+    const bool full_output_schedule = n_threads_ > 1;
+#else
+    constexpr bool full_output_schedule = false;
+#endif
+    std::size_t batch_count = 0;
+    std::size_t task_count = 0;
+    dynamic_persistent_output_right_ = false;
+    persistent_output_groups_.clear();
+    persistent_output_references_.clear();
+    persistent_output_bindings_.clear();
+    persistent_output_bundles_.clear();
+    persistent_output_bundle_groups_.clear();
+    persistent_output_tasks_.clear();
+    persistent_output_thread_outputs_.clear();
+    persistent_product_cache_.clear();
+    persistent_product_cache_elements_ = 0;
+    for (RawInputSuperchannel& channel : raw_input_superchannels_) {
+        channel.persistent_product_slots.assign(
+            channel.unique_left_actions.size(),
+            -1
+        );
+    }
+    for (RawOutputFusionWave& wave : raw_output_fusion_waves_) {
+        wave.channel_fusion_tasks.clear();
+        wave.channel_fusion_work = 0.0L;
+        wave.channel_left_ready = !wave.batches.empty();
+        for (RawOutputFusionGroup& group : wave.groups) {
+            group.persistent_output = false;
+        }
+        for (RawOutputFusionBatch& scheduled : wave.batches) {
+            scheduled.direct_channel_fusion = false;
+            scheduled.persistent_output_only = false;
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_.at(scheduled.channel);
+            if (
+                channel.cached_unique_left_offset == no_offset
+                || channel.unique_left_rows == 0
+            ) {
+                wave.channel_left_ready = false;
+            }
+        }
+        if (!wave.channel_left_ready || !direct_channel_output_fusion()) {
+            continue;
+        }
+        wave.channel_fusion_tasks.reserve(wave.bindings.size());
+        for (
+            std::size_t scheduled_index = 0;
+            scheduled_index < wave.batches.size();
+            ++scheduled_index
+        ) {
+            RawOutputFusionBatch& scheduled =
+                wave.batches[scheduled_index];
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_.at(scheduled.channel);
+            bool direct =
+                scheduled.shared_left_group_start
+                    == scheduled.shared_left_group_stop
+                && scheduled.grouped_product_start
+                    == scheduled.grouped_product_stop
+                && !scheduled.shared_right_panels
+                && !scheduled.deferred_outputs;
+            for (
+                std::size_t binding_index = scheduled.binding_start;
+                direct && binding_index < scheduled.binding_stop;
+                ++binding_index
+            ) {
+                const RawOutputFusionBinding& binding =
+                    wave.bindings.at(binding_index);
+                const RawExecutionTile& tile =
+                    channel.tiles.at(binding.tile);
+                const RawOutputFusionGroup& group =
+                    wave.groups.at(binding.group);
+                direct =
+                    group.temporary_offset != no_offset
+                    && !tile.direct_preferred
+                    && binding.shared_right_start
+                        == binding.shared_right_stop;
+            }
+            if (!direct) {
+                continue;
+            }
+            scheduled.direct_channel_fusion = true;
+            std::size_t channel_action_offset = 0;
+            for (
+                std::size_t binding_index = scheduled.binding_start;
+                binding_index < scheduled.binding_stop;
+                ++binding_index
+            ) {
+                const RawOutputFusionBinding& binding =
+                    wave.bindings.at(binding_index);
+                const RawExecutionTile& tile =
+                    channel.tiles.at(binding.tile);
+                if (
+                    scheduled_index
+                        > std::numeric_limits<std::uint32_t>::max()
+                    || binding_index
+                        > std::numeric_limits<std::uint32_t>::max()
+                    || channel_action_offset
+                        > std::numeric_limits<std::uint32_t>::max()
+                ) {
+                    throw std::overflow_error(
+                        "Persistent output-group schedule is too large."
+                    );
+                }
+                const RawOutputFusionGroup& group =
+                    wave.groups.at(binding.group);
+                wave.channel_fusion_tasks.push_back(
+                    RawChannelFusionTask{
+                        static_cast<std::uint32_t>(scheduled_index),
+                        static_cast<std::uint32_t>(binding_index),
+                        static_cast<std::uint32_t>(
+                            channel_action_offset
+                        ),
+                    }
+                );
+                ++task_count;
+                wave.channel_fusion_work +=
+                    static_cast<long double>(group.la)
+                    * static_cast<long double>(tile.total_w)
+                    * static_cast<long double>(channel.cr);
+                channel_action_offset +=
+                    tile.action_stop - tile.action_start;
+            }
+        }
+    }
+    using GroupOccurrence = std::pair<std::size_t, std::size_t>;
+    std::map<std::int64_t, std::vector<GroupOccurrence>> by_output;
+    std::vector<std::vector<std::uint8_t>> candidate_bindings;
+    candidate_bindings.reserve(raw_output_fusion_waves_.size());
+    for (
+        std::size_t wave_index = 0;
+        wave_index < raw_output_fusion_waves_.size();
+        ++wave_index
+    ) {
+        const RawOutputFusionWave& wave =
+            raw_output_fusion_waves_[wave_index];
+        candidate_bindings.emplace_back(wave.bindings.size(), 0);
+        std::vector<std::uint8_t> specialized_bindings(
+            wave.bindings.size(),
+            0
+        );
+        for (const std::uint32_t binding :
+             wave.grouped_product_bindings) {
+            specialized_bindings.at(binding) = 1;
+        }
+        for (const RawSharedLeftOutputBinding& binding :
+             wave.shared_left_bindings) {
+            specialized_bindings.at(binding.binding) = 1;
+        }
+        for (const RawOutputFusionBatch& scheduled : wave.batches) {
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_.at(scheduled.channel);
+            const RawExecutionBatch& batch =
+                channel.batches.at(scheduled.batch);
+            if (
+                !full_output_schedule
+                && (
+                    channel.cached_unique_left_offset == no_offset
+                    || channel.unique_left_rows == 0
+                )
+            ) {
+                continue;
+            }
+            std::size_t action_offset = 0;
+            for (
+                std::size_t binding_index = scheduled.binding_start;
+                binding_index < scheduled.binding_stop;
+                ++binding_index
+            ) {
+                const RawOutputFusionBinding& binding =
+                    wave.bindings.at(binding_index);
+                const RawExecutionTile& tile =
+                    channel.tiles.at(binding.tile);
+                const std::size_t action_count =
+                    tile.action_stop - tile.action_start;
+                const bool deferred =
+                    !wave.shared_right_deferred_output_offsets.empty()
+                    && wave.shared_right_deferred_output_offsets.at(
+                        binding_index
+                    ) != no_offset;
+                if (
+                    action_offset + action_count
+                        <= batch.channel_left_indices.size()
+                    && (
+                        full_output_schedule
+                        || (
+                            !tile.direct_preferred
+                            && binding.shared_right_start
+                                == binding.shared_right_stop
+                            && !deferred
+                            && specialized_bindings.at(binding_index) == 0
+                        )
+                    )
+                ) {
+                    candidate_bindings.back().at(binding_index) = 1;
+                }
+                action_offset += action_count;
+            }
+        }
+        for (
+            std::size_t group_index = 0;
+            group_index < wave.groups.size();
+            ++group_index
+        ) {
+            by_output[wave.groups[group_index].output_offset].emplace_back(
+                wave_index,
+                group_index
+            );
+        }
+    }
+    for (const auto& [output_offset, occurrences] : by_output) {
+        bool eligible = !occurrences.empty();
+        bool combined = false;
+        std::size_t binding_count = 0;
+        std::int64_t la = 0;
+        std::int64_t dq = 0;
+        std::int64_t total_k = 0;
+        for (const auto [wave_index, group_index] : occurrences) {
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(wave_index);
+            const RawOutputFusionGroup& group =
+                wave.groups.at(group_index);
+            if (la == 0 && dq == 0) {
+                la = group.la;
+                dq = group.dq;
+            } else if (group.la != la || group.dq != dq) {
+                eligible = false;
+                break;
+            }
+            combined = combined || group.temporary_offset == no_offset;
+            total_k += group.total_k;
+            std::size_t group_bindings = 0;
+            for (const RawOutputFusionBatch& scheduled : wave.batches) {
+                for (
+                    std::size_t binding_index = scheduled.binding_start;
+                    binding_index < scheduled.binding_stop;
+                    ++binding_index
+                ) {
+                    if (wave.bindings[binding_index].group != group_index) {
+                        continue;
+                    }
+                    ++group_bindings;
+                    if (
+                        candidate_bindings[wave_index][binding_index] == 0
+                    ) {
+                        eligible = false;
+                    }
+                }
+            }
+            binding_count += group_bindings;
+            if (group_bindings == 0 || !eligible) {
+                break;
+            }
+        }
+        if (!eligible || binding_count == 0) {
+            continue;
+        }
+        if (!full_output_schedule && combined) {
+            const long double copied_elements =
+                static_cast<long double>(la + dq)
+                * static_cast<long double>(total_k);
+            const long double copy_budget =
+                static_cast<long double>(output_fusion_copy_budget())
+                * static_cast<long double>(binding_count - 1);
+            if (binding_count < 2 || copied_elements > copy_budget) {
+                continue;
+            }
+        }
+        if (
+            persistent_output_references_.size()
+                + occurrences.size()
+                    > std::numeric_limits<std::uint32_t>::max()
+            || persistent_output_bindings_.size() + binding_count
+                    > std::numeric_limits<std::uint32_t>::max()
+        ) {
+            throw std::overflow_error(
+                "Persistent output-group arena is too large."
+            );
+        }
+        RawPersistentOutputGroup scheduled_group;
+        scheduled_group.output_offset = output_offset;
+        scheduled_group.la = la;
+        scheduled_group.dq = dq;
+        scheduled_group.total_k = total_k;
+        scheduled_group.combined = combined;
+        scheduled_group.reference_start = static_cast<std::uint32_t>(
+            persistent_output_references_.size()
+        );
+        std::int64_t reference_k_offset = 0;
+        for (const auto [wave_index, group_index] : occurrences) {
+            RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(wave_index);
+            RawOutputFusionGroup& group = wave.groups.at(group_index);
+            group.persistent_output = true;
+            RawPersistentOutputReference reference;
+            reference.wave = static_cast<std::uint32_t>(wave_index);
+            reference.group = static_cast<std::uint32_t>(group_index);
+            reference.group_k_offset = reference_k_offset;
+            reference_k_offset += group.total_k;
+            reference.binding_start = static_cast<std::uint32_t>(
+                persistent_output_bindings_.size()
+            );
+            for (
+                std::size_t batch_index = 0;
+                batch_index < wave.batches.size();
+                ++batch_index
+            ) {
+                const RawOutputFusionBatch& batch =
+                    wave.batches[batch_index];
+                const RawInputSuperchannel& channel =
+                    raw_input_superchannels_.at(batch.channel);
+                std::size_t channel_action_offset = 0;
+                for (
+                    std::size_t binding_index = batch.binding_start;
+                    binding_index < batch.binding_stop;
+                    ++binding_index
+                ) {
+                    const RawOutputFusionBinding& binding =
+                        wave.bindings[binding_index];
+                    const RawExecutionTile& tile =
+                        channel.tiles.at(binding.tile);
+                    const std::size_t action_count =
+                        tile.action_stop - tile.action_start;
+                    if (binding.group != group_index) {
+                        channel_action_offset += action_count;
+                        continue;
+                    }
+                    if (
+                        channel_action_offset
+                        > std::numeric_limits<std::uint32_t>::max()
+                    ) {
+                        throw std::overflow_error(
+                            "Persistent output-group action arena is too large."
+                        );
+                    }
+                    persistent_output_bindings_.push_back(
+                        RawPersistentOutputBinding{
+                            static_cast<std::uint32_t>(wave_index),
+                            static_cast<std::uint32_t>(batch_index),
+                            static_cast<std::uint32_t>(binding_index),
+                            static_cast<std::uint32_t>(
+                                channel_action_offset
+                            ),
+                        }
+                    );
+                    channel_action_offset += action_count;
+                }
+            }
+            reference.binding_stop = static_cast<std::uint32_t>(
+                persistent_output_bindings_.size()
+            );
+            persistent_output_references_.push_back(reference);
+        }
+        scheduled_group.reference_stop = static_cast<std::uint32_t>(
+            persistent_output_references_.size()
+        );
+        long double group_work =
+            static_cast<long double>(scheduled_group.la)
+            * static_cast<long double>(scheduled_group.total_k)
+            * static_cast<long double>(scheduled_group.dq);
+        for (
+            std::size_t reference_index =
+                scheduled_group.reference_start;
+            reference_index < scheduled_group.reference_stop;
+            ++reference_index
+        ) {
+            const RawPersistentOutputReference& reference =
+                persistent_output_references_[reference_index];
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_[reference.wave];
+            const RawOutputFusionGroup& group =
+                wave.groups[reference.group];
+            for (
+                std::size_t binding_reference = reference.binding_start;
+                binding_reference < reference.binding_stop;
+                ++binding_reference
+            ) {
+                const RawPersistentOutputBinding& selected =
+                    persistent_output_bindings_[binding_reference];
+                const RawOutputFusionBatch& batch =
+                    wave.batches[selected.batch];
+                const RawInputSuperchannel& channel =
+                    raw_input_superchannels_[batch.channel];
+                const RawOutputFusionBinding& binding =
+                    wave.bindings[selected.binding];
+                const RawExecutionTile& tile =
+                    channel.tiles[binding.tile];
+                const bool cached_left =
+                    channel.cached_unique_left_offset != no_offset;
+                for (
+                    std::size_t action_index = tile.action_start;
+                    action_index < tile.action_stop;
+                    ++action_index
+                ) {
+                    const RawExecutionAction& action =
+                        raw_execution_action_arena_[action_index];
+                    const std::int64_t w =
+                        complementary_local_actions_[action.group]
+                            .dims[2];
+                    const std::size_t terms =
+                        action.right_grouped
+                        ? 1
+                        : action.factor_stop
+                            - static_cast<std::size_t>(action.factor);
+                    const long double rows =
+                        static_cast<long double>(group.la)
+                        * static_cast<long double>(w);
+                    group_work += rows
+                        * static_cast<long double>(channel.cr)
+                        * static_cast<long double>(
+                            cached_left ? 1 : channel.kb
+                        );
+                    group_work += static_cast<long double>(w)
+                        * static_cast<long double>(channel.cr)
+                        * static_cast<long double>(group.dq)
+                        * static_cast<long double>(terms);
+                }
+            }
+        }
+        scheduled_group.work = static_cast<std::uint64_t>(
+            std::min<long double>(
+                group_work,
+                static_cast<long double>(
+                    std::numeric_limits<std::uint64_t>::max()
+                )
+            )
+        );
+        persistent_output_groups_.push_back(scheduled_group);
+        (void) output_offset;
+    }
+    std::stable_sort(
+        persistent_output_groups_.begin(),
+        persistent_output_groups_.end(),
+        [](const RawPersistentOutputGroup& first,
+           const RawPersistentOutputGroup& second) {
+            if (first.work != second.work) {
+                return first.work > second.work;
+            }
+            return first.output_offset < second.output_offset;
+        }
+    );
+    task_count = persistent_output_bindings_.size();
+    batch_count = 0;
+    for (
+        std::size_t wave_index = 0;
+        wave_index < raw_output_fusion_waves_.size();
+        ++wave_index
+    ) {
+        RawOutputFusionWave& wave =
+            raw_output_fusion_waves_[wave_index];
+        for (RawOutputFusionBatch& batch : wave.batches) {
+            batch.persistent_output_only = std::all_of(
+                wave.bindings.begin() + batch.binding_start,
+                wave.bindings.begin() + batch.binding_stop,
+                [&wave, &candidate_bindings, wave_index](
+                    const RawOutputFusionBinding& binding
+                ) {
+                    const std::size_t binding_index =
+                        static_cast<std::size_t>(
+                            &binding - wave.bindings.data()
+                        );
+                    return wave.groups.at(binding.group).persistent_output
+                        && candidate_bindings[wave_index][binding_index]
+                            != 0;
+                }
+            );
+            batch_count += batch.persistent_output_only ? 1 : 0;
+            if (!batch.direct_channel_fusion) {
+                continue;
+            }
+            batch.direct_channel_fusion = std::all_of(
+                wave.bindings.begin() + batch.binding_start,
+                wave.bindings.begin() + batch.binding_stop,
+                [&wave](const RawOutputFusionBinding& binding) {
+                    const RawOutputFusionGroup& group =
+                        wave.groups.at(binding.group);
+                    return group.persistent_output
+                        || group.temporary_offset
+                            != std::numeric_limits<std::size_t>::max();
+                }
+            );
+        }
+    }
+#ifdef _OPENMP
+    std::uint64_t persistent_work = 0;
+    for (const RawPersistentOutputGroup& group :
+         persistent_output_groups_) {
+        persistent_work += group.work;
+    }
+    const int persistent_threads = adaptive_openmp_thread_count(
+        n_threads_,
+        persistent_output_groups_.size(),
+        persistent_work
+    );
+    const bool persistent_output_executor = persistent_threads > 1;
+    dynamic_persistent_output_right_ =
+        full_output_schedule && persistent_output_executor;
+    const bool compact_persistent_right = persistent_output_executor;
+#else
+    constexpr int persistent_threads = 1;
+    constexpr bool compact_persistent_right = false;
+#endif
+    if (dynamic_persistent_output_right_) {
+        struct ProductCandidate {
+            std::uint32_t channel = 0;
+            std::uint32_t unique = 0;
+            std::uint32_t action = 0;
+            std::int64_t rows = 0;
+            std::int64_t cols = 0;
+            std::size_t elements = 0;
+            long double score = 0.0L;
+        };
+        std::vector<std::vector<std::uint32_t>> use_counts;
+        use_counts.reserve(raw_input_superchannels_.size());
+        for (const RawInputSuperchannel& channel :
+             raw_input_superchannels_) {
+            use_counts.emplace_back(channel.unique_left_actions.size(), 0);
+        }
+        for (const RawPersistentOutputBinding& selected :
+             persistent_output_bindings_) {
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(selected.wave);
+            const RawOutputFusionBatch& scheduled =
+                wave.batches.at(selected.batch);
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_.at(scheduled.channel);
+            if (channel.cached_unique_left_offset != no_offset) {
+                continue;
+            }
+            const RawExecutionBatch& batch =
+                channel.batches.at(scheduled.batch);
+            const RawOutputFusionBinding& binding =
+                wave.bindings.at(selected.binding);
+            const RawExecutionTile& tile =
+                channel.tiles.at(binding.tile);
+            std::size_t channel_action = selected.channel_action_offset;
+            for (
+                std::size_t action_index = tile.action_start;
+                action_index < tile.action_stop;
+                ++action_index, ++channel_action
+            ) {
+                const std::uint16_t unique =
+                    batch.channel_left_indices.at(channel_action);
+                ++use_counts.at(scheduled.channel).at(unique);
+            }
+        }
+        std::vector<ProductCandidate> candidates;
+        for (
+            std::size_t channel_index = 0;
+            channel_index < raw_input_superchannels_.size();
+            ++channel_index
+        ) {
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_[channel_index];
+            if (
+                channel.cached_unique_left_offset != no_offset
+                || channel_index
+                    > std::numeric_limits<std::uint32_t>::max()
+            ) {
+                continue;
+            }
+            for (
+                std::size_t unique = 0;
+                unique < channel.unique_left_actions.size();
+                ++unique
+            ) {
+                const std::uint32_t uses =
+                    use_counts[channel_index][unique];
+                if (
+                    uses <= static_cast<std::uint32_t>(
+                        persistent_threads
+                    )
+                    || unique > std::numeric_limits<std::uint32_t>::max()
+                ) {
+                    continue;
+                }
+                const std::uint32_t action_index =
+                    channel.unique_left_actions[unique];
+                const RawExecutionAction& action =
+                    raw_execution_action_arena_.at(action_index);
+                const ComplementaryLocalAction& local =
+                    complementary_local_actions_.at(action.group);
+                const std::int64_t rows =
+                    local.dims[0] * local.dims[3] * local.dims[2];
+                const std::size_t elements = static_cast<std::size_t>(
+                    rows * channel.cr
+                );
+                if (rows <= 0 || channel.cr <= 0 || elements == 0) {
+                    continue;
+                }
+                const long double saved_work =
+                    static_cast<long double>(
+                        uses - static_cast<std::uint32_t>(
+                            persistent_threads
+                        )
+                    )
+                    * static_cast<long double>(rows)
+                    * static_cast<long double>(channel.kb)
+                    * static_cast<long double>(channel.cr);
+                candidates.push_back(ProductCandidate{
+                    static_cast<std::uint32_t>(channel_index),
+                    static_cast<std::uint32_t>(unique),
+                    action_index,
+                    rows,
+                    channel.cr,
+                    elements,
+                    saved_work / static_cast<long double>(elements),
+                });
+            }
+        }
+        std::stable_sort(
+            candidates.begin(),
+            candidates.end(),
+            [](const ProductCandidate& first,
+               const ProductCandidate& second) {
+                if (first.score != second.score) {
+                    return first.score > second.score;
+                }
+                return first.elements < second.elements;
+            }
+        );
+        constexpr std::size_t product_budget_elements = 1'000'000;
+        for (const ProductCandidate& candidate : candidates) {
+            if (
+                candidate.elements
+                    > product_budget_elements
+                        - persistent_product_cache_elements_
+                || persistent_product_cache_.size()
+                    >= static_cast<std::size_t>(
+                        std::numeric_limits<std::int32_t>::max()
+                    )
+            ) {
+                continue;
+            }
+            const std::int32_t slot = static_cast<std::int32_t>(
+                persistent_product_cache_.size()
+            );
+            raw_input_superchannels_[candidate.channel]
+                .persistent_product_slots[candidate.unique] = slot;
+            persistent_product_cache_.push_back(
+                RawPersistentProductCacheEntry{
+                    candidate.channel,
+                    candidate.action,
+                    candidate.rows,
+                    candidate.cols,
+                    persistent_product_cache_elements_,
+                }
+            );
+            persistent_product_cache_elements_ += candidate.elements;
+        }
+    }
+    build_persistent_right_action_cache();
+    build_persistent_output_bundles(persistent_threads);
+    build_persistent_output_tasks();
+    if (compact_persistent_right) {
+        for (
+            std::size_t wave_index = 0;
+            wave_index < raw_output_fusion_waves_.size();
+            ++wave_index
+        ) {
+            RawOutputFusionWave& wave =
+                raw_output_fusion_waves_[wave_index];
+            for (RawOutputFusionBatch& scheduled : wave.batches) {
+                RawInputSuperchannel& channel =
+                    raw_input_superchannels_.at(scheduled.channel);
+                RawExecutionBatch& batch =
+                    channel.batches.at(scheduled.batch);
+                if (batch.cached_right_offset != no_offset) {
+                    continue;
+                }
+                std::size_t right_elements = 0;
+                for (
+                    std::size_t binding_index = scheduled.binding_start;
+                    binding_index < scheduled.binding_stop;
+                    ++binding_index
+                ) {
+                    RawOutputFusionBinding& binding =
+                        wave.bindings.at(binding_index);
+                    RawExecutionTile& tile =
+                        channel.tiles.at(binding.tile);
+                    if (
+                        wave.groups.at(binding.group).persistent_output
+                        && candidate_bindings[wave_index][binding_index]
+                            != 0
+                    ) {
+                        tile.requires_right = false;
+                    }
+                    binding.right_offset = right_elements;
+                    if (!tile.requires_right) {
+                        continue;
+                    }
+                    const RawExecutionGroup& execution =
+                        raw_execution_groups_.at(tile.execution);
+                    const std::int64_t dq =
+                        execution.dims[6] * execution.dims[4];
+                    right_elements += static_cast<std::size_t>(
+                        tile.total_w * channel.cr * dq
+                    );
+                }
+                batch.total_right_elements = right_elements;
+                batch.requires_right = right_elements != 0;
+            }
+        }
+    }
+    if (dynamic_persistent_output_right_) {
+        for (RawOutputFusionWave& wave : raw_output_fusion_waves_) {
+            std::size_t right_elements = 0;
+            for (RawOutputFusionGroup& group : wave.groups) {
+                if (group.persistent_output) {
+                    group.right_offset = no_offset;
+                    continue;
+                }
+                if (group.right_offset == no_offset) {
+                    continue;
+                }
+                group.right_offset = right_elements;
+                right_elements += static_cast<std::size_t>(
+                    group.total_k * group.dq
+                );
+            }
+            wave.right_elements = right_elements;
+        }
+
+    }
+    peak_persistent_output_batches_ = std::max(
+        peak_persistent_output_batches_,
+        batch_count
+    );
+    peak_persistent_output_tasks_ = std::max(
+        peak_persistent_output_tasks_,
+        task_count
+    );
+    peak_persistent_output_groups_ = std::max(
+        peak_persistent_output_groups_,
+        persistent_output_groups_.size()
+    );
+}
+
+void MovingEnvironment::build_persistent_right_action_cache() {
+    persistent_right_action_slots_.assign(
+        raw_execution_action_arena_.size(),
+        -1
+    );
+    persistent_right_cache_.clear();
+    persistent_right_cache_values_.clear();
+    if (!dynamic_persistent_output_right_) {
+        return;
+    }
+    std::vector<std::uint32_t> use_counts(
+        raw_execution_action_arena_.size(),
+        0
+    );
+    for (const RawPersistentOutputBinding& selected :
+         persistent_output_bindings_) {
+        const RawOutputFusionWave& wave =
+            raw_output_fusion_waves_.at(selected.wave);
+        const RawOutputFusionBatch& scheduled =
+            wave.batches.at(selected.batch);
+        const RawInputSuperchannel& channel =
+            raw_input_superchannels_.at(scheduled.channel);
+        const RawOutputFusionBinding& binding =
+            wave.bindings.at(selected.binding);
+        const RawExecutionTile& tile = channel.tiles.at(binding.tile);
+        for (
+            std::size_t action_index = tile.action_start;
+            action_index < tile.action_stop;
+            ++action_index
+        ) {
+            ++use_counts.at(action_index);
+        }
+    }
+    struct RightCandidate {
+        std::uint32_t action = 0;
+        std::int64_t rows = 0;
+        std::int64_t cols = 0;
+        std::size_t elements = 0;
+        long double score = 0.0L;
+        std::size_t terms = 0;
+    };
+    std::vector<RightCandidate> candidates;
+    for (
+        std::size_t action_index = 0;
+        action_index < raw_execution_action_arena_.size();
+        ++action_index
+    ) {
+        const std::uint32_t uses = use_counts[action_index];
+        if (
+            uses == 0
+            || action_index > std::numeric_limits<std::uint32_t>::max()
+        ) {
+            continue;
+        }
+        const RawExecutionAction& action =
+            raw_execution_action_arena_[action_index];
+        if (action.right_grouped || action.factor < 0) {
+            continue;
+        }
+        const ComplementaryLocalAction& local =
+            complementary_local_actions_.at(action.group);
+        const std::size_t start = static_cast<std::size_t>(action.factor);
+        const std::size_t stop =
+            static_cast<std::size_t>(action.factor_stop);
+        if (
+            start < local.term_start
+            || start >= stop
+            || stop > local.term_stop
+        ) {
+            throw std::logic_error(
+                "Persistent right-action cache range changed."
+            );
+        }
+        const std::size_t terms = stop - start;
+        const bool scaled_single =
+            terms == 1
+            && complementary_local_terms_.at(start).scale != 1.0;
+        if (terms == 1 && !scaled_single) {
+            continue;
+        }
+        const std::int64_t rows =
+            local.dims[2] * local.dims[6] * local.dims[8];
+        const std::int64_t cols = local.dims[7] * local.dims[5];
+        if (rows <= 0 || cols <= 0) {
+            continue;
+        }
+        const std::size_t elements = static_cast<std::size_t>(rows * cols);
+        const long double arithmetic = static_cast<long double>(
+            terms + (scaled_single ? 1 : 0)
+        );
+        candidates.push_back(RightCandidate{
+            static_cast<std::uint32_t>(action_index),
+            rows,
+            cols,
+            elements,
+            static_cast<long double>(uses) * arithmetic,
+            terms,
+        });
+    }
+    std::stable_sort(
+        candidates.begin(),
+        candidates.end(),
+        [](const RightCandidate& first, const RightCandidate& second) {
+            if (first.score != second.score) {
+                return first.score > second.score;
+            }
+            return first.elements < second.elements;
+        }
+    );
+    constexpr std::size_t right_cache_budget_elements = 2'000'000;
+    std::size_t selected_elements = 0;
+    std::uint64_t pack_work = 0;
+    for (const RightCandidate& candidate : candidates) {
+        if (
+            candidate.elements
+                > right_cache_budget_elements - selected_elements
+            || persistent_right_cache_.size()
+                >= static_cast<std::size_t>(
+                    std::numeric_limits<std::int32_t>::max()
+                )
+        ) {
+            continue;
+        }
+        const std::int32_t slot = static_cast<std::int32_t>(
+            persistent_right_cache_.size()
+        );
+        persistent_right_action_slots_[candidate.action] = slot;
+        persistent_right_cache_.push_back(RawPersistentRightCacheEntry{
+            candidate.action,
+            candidate.rows,
+            candidate.cols,
+            selected_elements,
+        });
+        selected_elements += candidate.elements;
+        const long double candidate_work =
+            static_cast<long double>(candidate.elements)
+            * static_cast<long double>(candidate.terms);
+        pack_work += static_cast<std::uint64_t>(
+            std::min<long double>(
+                candidate_work,
+                static_cast<long double>(
+                    std::numeric_limits<std::uint64_t>::max() - pack_work
+                )
+            )
+        );
+    }
+    persistent_right_cache_values_.resize(selected_elements);
+    if (persistent_right_cache_.empty()) {
+        return;
+    }
+#ifdef _OPENMP
+    const int pack_threads = adaptive_openmp_thread_count(
+        n_threads_,
+        persistent_right_cache_.size(),
+        pack_work
+    );
+    const bool parallel_pack = pack_threads > 1;
+#else
+    constexpr int pack_threads = 1;
+#endif
+    complementary_panel_thread_scratch_.resize(
+        static_cast<std::size_t>(pack_threads)
+    );
+    std::atomic<bool> failed{false};
+    std::exception_ptr parallel_error;
+#ifdef _OPENMP
+    if (parallel_pack) {
+        ++openmp_parallel_regions_;
+        openmp_tasks_ += static_cast<std::uint64_t>(
+            persistent_right_cache_.size()
+        );
+    }
+#pragma omp parallel for schedule(dynamic, 1) \
+    num_threads(pack_threads) if(parallel_pack)
+#endif
+    for (
+        std::int64_t slot = 0;
+        slot < static_cast<std::int64_t>(persistent_right_cache_.size());
+        ++slot
+    ) {
+        if (failed.load(std::memory_order_relaxed)) {
+            continue;
+        }
+#ifdef _OPENMP
+        const std::size_t thread_index = static_cast<std::size_t>(
+            omp_get_thread_num()
+        );
+#else
+        constexpr std::size_t thread_index = 0;
+#endif
+        try {
+            const RawPersistentRightCacheEntry& entry =
+                persistent_right_cache_[static_cast<std::size_t>(slot)];
+            const RawExecutionAction& action =
+                raw_execution_action_arena_.at(entry.action);
+            const std::int64_t w =
+                complementary_local_actions_.at(action.group).dims[2];
+            pack_raw_execution_action_into(
+                action,
+                w,
+                0,
+                nullptr,
+                persistent_right_cache_values_.data()
+                    + entry.value_offset,
+                false,
+                0,
+                0,
+                &complementary_panel_thread_scratch_[thread_index]
+            );
+        } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(pyqed_su2_persistent_right_cache_error)
+#endif
+            {
+                if (!parallel_error) {
+                    parallel_error = std::current_exception();
+                }
+            }
+            failed.store(true, std::memory_order_relaxed);
+        }
+    }
+    if (parallel_error) {
+        std::rethrow_exception(parallel_error);
+    }
+}
+
+void MovingEnvironment::build_persistent_output_bundles(
+    int thread_count
+) {
+    persistent_output_bundles_.clear();
+    persistent_output_bundle_groups_.clear();
+    if (
+        thread_count <= 1
+        || persistent_product_cache_.empty()
+        || persistent_output_groups_.size() < 2
+    ) {
+        return;
+    }
+    const auto saturated_add = [](
+        std::uint64_t first,
+        std::uint64_t second
+    ) {
+        return second > std::numeric_limits<std::uint64_t>::max() - first
+            ? std::numeric_limits<std::uint64_t>::max()
+            : first + second;
+    };
+    std::map<std::int64_t, std::vector<std::uint32_t>> affinity_groups;
+    std::uint64_t total_work = 0;
+    bool shared_affinity = false;
+    for (
+        std::size_t group_index = 0;
+        group_index < persistent_output_groups_.size();
+        ++group_index
+    ) {
+        const RawPersistentOutputGroup& group =
+            persistent_output_groups_[group_index];
+        total_work = saturated_add(total_work, group.work);
+        std::map<std::int32_t, std::uint64_t> slot_work;
+        for (
+            std::size_t reference_index = group.reference_start;
+            reference_index < group.reference_stop;
+            ++reference_index
+        ) {
+            const RawPersistentOutputReference& reference =
+                persistent_output_references_.at(reference_index);
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(reference.wave);
+            for (
+                std::size_t binding_reference = reference.binding_start;
+                binding_reference < reference.binding_stop;
+                ++binding_reference
+            ) {
+                const RawPersistentOutputBinding& selected =
+                    persistent_output_bindings_.at(binding_reference);
+                const RawOutputFusionBatch& scheduled =
+                    wave.batches.at(selected.batch);
+                const RawInputSuperchannel& channel =
+                    raw_input_superchannels_.at(scheduled.channel);
+                const RawExecutionBatch& batch =
+                    channel.batches.at(scheduled.batch);
+                const RawOutputFusionBinding& binding =
+                    wave.bindings.at(selected.binding);
+                const RawExecutionTile& tile =
+                    channel.tiles.at(binding.tile);
+                std::size_t channel_action =
+                    selected.channel_action_offset;
+                for (
+                    std::size_t action_index = tile.action_start;
+                    action_index < tile.action_stop;
+                    ++action_index, ++channel_action
+                ) {
+                    const std::uint16_t unique =
+                        batch.channel_left_indices.at(channel_action);
+                    if (channel.persistent_product_slots.empty()) {
+                        continue;
+                    }
+                    const std::int32_t slot =
+                        channel.persistent_product_slots.at(unique);
+                    if (slot < 0) {
+                        continue;
+                    }
+                    const RawPersistentProductCacheEntry& entry =
+                        persistent_product_cache_.at(
+                            static_cast<std::size_t>(slot)
+                        );
+                    const long double product_work =
+                        static_cast<long double>(entry.rows)
+                        * static_cast<long double>(channel.kb)
+                        * static_cast<long double>(channel.cr);
+                    const std::uint64_t bounded_work =
+                        static_cast<std::uint64_t>(
+                            std::min<long double>(
+                                product_work,
+                                static_cast<long double>(
+                                    std::numeric_limits<std::uint64_t>::max()
+                                )
+                            )
+                        );
+                    slot_work[slot] = saturated_add(
+                        slot_work[slot],
+                        bounded_work
+                    );
+                }
+            }
+        }
+        std::int64_t affinity = -1
+            - static_cast<std::int64_t>(group_index);
+        std::uint64_t best_work = 0;
+        for (const auto& [slot, work] : slot_work) {
+            if (work > best_work) {
+                affinity = slot;
+                best_work = work;
+            }
+        }
+        auto& bucket = affinity_groups[affinity];
+        shared_affinity = shared_affinity
+            || (affinity >= 0 && !bucket.empty());
+        bucket.push_back(static_cast<std::uint32_t>(group_index));
+    }
+    if (!shared_affinity) {
+        return;
+    }
+    const std::uint64_t target_work = std::max<std::uint64_t>(
+        100'000,
+        total_work / static_cast<std::uint64_t>(thread_count * 8)
+    );
+    struct BundleData {
+        std::vector<std::uint32_t> groups;
+        std::uint64_t work = 0;
+    };
+    std::vector<BundleData> bundles;
+    for (auto& [affinity, groups] : affinity_groups) {
+        std::stable_sort(
+            groups.begin(),
+            groups.end(),
+            [this](std::uint32_t first, std::uint32_t second) {
+                return persistent_output_groups_[first].work
+                    > persistent_output_groups_[second].work;
+            }
+        );
+        BundleData current;
+        for (const std::uint32_t group_index : groups) {
+            if (!current.groups.empty() && current.work >= target_work) {
+                bundles.push_back(std::move(current));
+                current = BundleData{};
+            }
+            current.groups.push_back(group_index);
+            current.work = saturated_add(
+                current.work,
+                persistent_output_groups_[group_index].work
+            );
+        }
+        if (!current.groups.empty()) {
+            bundles.push_back(std::move(current));
+        }
+        (void) affinity;
+    }
+    if (bundles.size() >= persistent_output_groups_.size()) {
+        return;
+    }
+    std::stable_sort(
+        bundles.begin(),
+        bundles.end(),
+        [](const BundleData& first, const BundleData& second) {
+            return first.work > second.work;
+        }
+    );
+    persistent_output_bundle_groups_.reserve(
+        persistent_output_groups_.size()
+    );
+    persistent_output_bundles_.reserve(bundles.size());
+    for (const BundleData& bundle : bundles) {
+        if (
+            persistent_output_bundle_groups_.size()
+                + bundle.groups.size()
+            > std::numeric_limits<std::uint32_t>::max()
+        ) {
+            throw std::overflow_error(
+                "Persistent output affinity schedule is too large."
+            );
+        }
+        RawPersistentOutputBundle scheduled;
+        scheduled.group_start = static_cast<std::uint32_t>(
+            persistent_output_bundle_groups_.size()
+        );
+        persistent_output_bundle_groups_.insert(
+            persistent_output_bundle_groups_.end(),
+            bundle.groups.begin(),
+            bundle.groups.end()
+        );
+        scheduled.group_stop = static_cast<std::uint32_t>(
+            persistent_output_bundle_groups_.size()
+        );
+        scheduled.work = bundle.work;
+        persistent_output_bundles_.push_back(scheduled);
+    }
+}
+
+void MovingEnvironment::build_persistent_output_tasks() {
+    persistent_output_tasks_.clear();
+    persistent_output_tasks_.reserve(persistent_output_references_.size());
+    for (
+        std::size_t group_index = 0;
+        group_index < persistent_output_groups_.size();
+        ++group_index
+    ) {
+        const RawPersistentOutputGroup& scheduled =
+            persistent_output_groups_[group_index];
+        if (scheduled.combined) {
+            persistent_output_tasks_.push_back(RawPersistentOutputTask{
+                static_cast<std::uint32_t>(group_index),
+                scheduled.reference_start,
+                scheduled.reference_stop,
+                scheduled.work,
+                true,
+            });
+            continue;
+        }
+        for (
+            std::size_t reference_index = scheduled.reference_start;
+            reference_index < scheduled.reference_stop;
+            ++reference_index
+        ) {
+            const RawPersistentOutputReference& reference =
+                persistent_output_references_.at(reference_index);
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(reference.wave);
+            const RawOutputFusionGroup& group =
+                wave.groups.at(reference.group);
+            const long double fraction = scheduled.total_k > 0
+                ? static_cast<long double>(group.total_k)
+                    / static_cast<long double>(scheduled.total_k)
+                : 0.0L;
+            const std::uint64_t work = std::max<std::uint64_t>(
+                1,
+                static_cast<std::uint64_t>(
+                    std::min<long double>(
+                        static_cast<long double>(scheduled.work) * fraction,
+                        static_cast<long double>(
+                            std::numeric_limits<std::uint64_t>::max()
+                        )
+                    )
+                )
+            );
+            persistent_output_tasks_.push_back(RawPersistentOutputTask{
+                static_cast<std::uint32_t>(group_index),
+                static_cast<std::uint32_t>(reference_index),
+                static_cast<std::uint32_t>(reference_index + 1),
+                work,
+                false,
+            });
+        }
+    }
+    std::stable_sort(
+        persistent_output_tasks_.begin(),
+        persistent_output_tasks_.end(),
+        [](const RawPersistentOutputTask& first,
+           const RawPersistentOutputTask& second) {
+            return first.work > second.work;
+        }
+    );
+    peak_private_output_tasks_ = std::max(
+        peak_private_output_tasks_,
+        persistent_output_tasks_.size()
+    );
+}
+
+std::uint64_t MovingEnvironment::apply_persistent_channel_fusion_task(
+    const RawOutputFusionWave& wave,
+    const RawChannelFusionTask& task
+) {
+    const RawOutputFusionBatch& scheduled = wave.batches.at(task.batch);
+    const RawInputSuperchannel& channel =
+        raw_input_superchannels_.at(scheduled.channel);
+    const RawExecutionBatch& batch = channel.batches.at(scheduled.batch);
+    const RawOutputFusionBinding& binding = wave.bindings.at(task.binding);
+    const RawExecutionTile& tile = channel.tiles.at(binding.tile);
+    const RawOutputFusionGroup& group = wave.groups.at(binding.group);
+    const double* channel_temporary = raw_channel_temporary_real_.data()
+        + raw_channel_temporary_offsets_.at(scheduled.channel);
+    double* fused_temporary = raw_output_fusion_temporary_real_.data()
+        + group.temporary_offset;
+    std::size_t channel_action = task.channel_action_offset;
+    std::int64_t w_offset = 0;
+    for (
+        std::size_t action_index = tile.action_start;
+        action_index < tile.action_stop;
+        ++action_index, ++channel_action
+    ) {
+        const RawExecutionAction& action =
+            raw_execution_action_arena_.at(action_index);
+        const std::int64_t w =
+            complementary_local_actions_.at(action.group).dims[2];
+        const std::uint16_t unique_index =
+            batch.channel_left_indices.at(channel_action);
+        const std::int64_t source_row =
+            channel.unique_left_row_offsets.at(unique_index);
+        for (
+            std::int64_t left_axis = 0;
+            left_axis < group.la;
+            ++left_axis
+        ) {
+            std::copy_n(
+                channel_temporary
+                    + (source_row + left_axis * w) * channel.cr,
+                static_cast<std::size_t>(w * channel.cr),
+                fused_temporary
+                    + left_axis * group.total_k
+                    + binding.group_k_offset
+                    + w_offset * channel.cr
+            );
+        }
+        w_offset += w;
+    }
+    if (w_offset != tile.total_w) {
+        throw std::logic_error(
+            "Persistent output-group width changed."
+        );
+    }
+    return static_cast<std::uint64_t>(
+        group.la * tile.total_w * channel.cr
+    );
+}
+
+std::uint64_t MovingEnvironment::apply_persistent_output_group(
+    const RawPersistentOutputGroup& scheduled,
+    double* output,
+    std::vector<double>& left_workspace,
+    std::vector<double>& operator_workspace,
+    std::vector<double>& right_workspace,
+    std::vector<double>& product_workspace,
+    std::vector<std::uint8_t>& product_valid,
+    std::size_t reference_start,
+    std::size_t reference_stop,
+    bool combine_references
+) {
+    if (
+        reference_start < scheduled.reference_start
+        || reference_stop > scheduled.reference_stop
+        || reference_start >= reference_stop
+    ) {
+        throw std::logic_error(
+            "Persistent output reference range changed."
+        );
+    }
+    std::uint64_t copied_elements = 0;
+    const auto fill_reference = [
+        this,
+        &left_workspace,
+        &operator_workspace,
+        &product_workspace,
+        &product_valid,
+        &copied_elements
+    ](
+        const RawPersistentOutputReference& reference,
+        const RawOutputFusionGroup& group,
+        std::int64_t row_stride,
+        std::int64_t reference_k_offset
+    ) {
+        const RawOutputFusionWave& wave =
+            raw_output_fusion_waves_.at(reference.wave);
+        for (
+            std::size_t binding_reference = reference.binding_start;
+            binding_reference < reference.binding_stop;
+            ++binding_reference
+        ) {
+            const RawPersistentOutputBinding& scheduled_binding =
+                persistent_output_bindings_.at(binding_reference);
+            const RawOutputFusionBatch& scheduled_batch =
+                wave.batches.at(scheduled_binding.batch);
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_.at(scheduled_batch.channel);
+            const RawExecutionBatch& batch =
+                channel.batches.at(scheduled_batch.batch);
+            const RawOutputFusionBinding& binding =
+                wave.bindings.at(scheduled_binding.binding);
+            const RawExecutionTile& tile =
+                channel.tiles.at(binding.tile);
+            const bool cached_channel_left =
+                channel.cached_unique_left_offset
+                    != std::numeric_limits<std::size_t>::max()
+                && channel.unique_left_rows > 0;
+            const double* channel_temporary = (
+                cached_channel_left
+                ? raw_channel_temporary_real_.data()
+                    + raw_channel_temporary_offsets_.at(
+                        scheduled_batch.channel
+                    )
+                : nullptr
+            );
+            std::size_t channel_action =
+                scheduled_binding.channel_action_offset;
+            std::int64_t w_offset = 0;
+            for (
+                std::size_t action_index = tile.action_start;
+                action_index < tile.action_stop;
+                ++action_index, ++channel_action
+            ) {
+                const RawExecutionAction& action =
+                    raw_execution_action_arena_.at(action_index);
+                const std::int64_t w =
+                    complementary_local_actions_.at(action.group).dims[2];
+                const std::uint16_t unique_index =
+                    batch.channel_left_indices.at(channel_action);
+                if (cached_channel_left) {
+                    const std::int64_t source_row =
+                        channel.unique_left_row_offsets.at(unique_index);
+                    for (
+                        std::int64_t left_axis = 0;
+                        left_axis < group.la;
+                        ++left_axis
+                    ) {
+                        std::copy_n(
+                            channel_temporary
+                                + (source_row + left_axis * w)
+                                    * channel.cr,
+                            static_cast<std::size_t>(w * channel.cr),
+                            left_workspace.data()
+                                + left_axis * row_stride
+                                + reference_k_offset
+                                + binding.group_k_offset
+                                + w_offset * channel.cr
+                        );
+                    }
+                } else {
+                    const std::size_t left_elements =
+                        static_cast<std::size_t>(
+                            group.la * w * channel.kb
+                        );
+                    const std::size_t product_elements =
+                        static_cast<std::size_t>(
+                            group.la * w * channel.cr
+                        );
+                    const std::int32_t product_slot =
+                        channel.persistent_product_slots.empty()
+                        ? -1
+                        : channel.persistent_product_slots.at(
+                            unique_index
+                        );
+                    const double* product = nullptr;
+                    if (product_slot >= 0) {
+                        const std::size_t slot =
+                            static_cast<std::size_t>(product_slot);
+                        const RawPersistentProductCacheEntry& entry =
+                            persistent_product_cache_.at(slot);
+                        if (
+                            entry.channel != scheduled_batch.channel
+                            || entry.action
+                                != channel.unique_left_actions.at(
+                                    unique_index
+                                )
+                            || entry.rows != group.la * w
+                            || entry.cols != channel.cr
+                            || entry.value_offset + product_elements
+                                > product_workspace.size()
+                            || slot >= product_valid.size()
+                        ) {
+                            throw std::logic_error(
+                                "Persistent action-product cache changed."
+                            );
+                        }
+                        double* cached_product =
+                            product_workspace.data() + entry.value_offset;
+                        if (product_valid[slot] == 0) {
+                            operator_workspace.resize(left_elements);
+                            pack_raw_execution_action_into(
+                                action,
+                                w,
+                                0,
+                                operator_workspace.data(),
+                                nullptr
+                            );
+                            raw_dgemm(
+                                false,
+                                false,
+                                group.la * w,
+                                channel.cr,
+                                channel.kb,
+                                1.0,
+                                operator_workspace.data(),
+                                channel.kb,
+                                raw_packed_input_real_.data()
+                                    + channel.input_offset,
+                                channel.cr,
+                                0.0,
+                                cached_product,
+                                channel.cr
+                            );
+                            product_valid[slot] = 1;
+                        }
+                        product = cached_product;
+                    } else {
+                        operator_workspace.resize(
+                            left_elements + product_elements
+                        );
+                        pack_raw_execution_action_into(
+                            action,
+                            w,
+                            0,
+                            operator_workspace.data(),
+                            nullptr
+                        );
+                        double* temporary_product =
+                            operator_workspace.data() + left_elements;
+                        raw_dgemm(
+                            false,
+                            false,
+                            group.la * w,
+                            channel.cr,
+                            channel.kb,
+                            1.0,
+                            operator_workspace.data(),
+                            channel.kb,
+                            raw_packed_input_real_.data()
+                                + channel.input_offset,
+                            channel.cr,
+                            0.0,
+                            temporary_product,
+                            channel.cr
+                        );
+                        product = temporary_product;
+                    }
+                    for (
+                        std::int64_t left_axis = 0;
+                        left_axis < group.la;
+                        ++left_axis
+                    ) {
+                        std::copy_n(
+                            product + left_axis * w * channel.cr,
+                            static_cast<std::size_t>(w * channel.cr),
+                            left_workspace.data()
+                                + left_axis * row_stride
+                                + reference_k_offset
+                                + binding.group_k_offset
+                                + w_offset * channel.cr
+                        );
+                    }
+                }
+                w_offset += w;
+            }
+            if (w_offset != tile.total_w) {
+                throw std::logic_error(
+                    "Persistent output binding width changed."
+                );
+            }
+            copied_elements += static_cast<std::uint64_t>(
+                group.la * tile.total_w * channel.cr
+            );
+        }
+    };
+    const auto fill_right_reference = [
+        this,
+        &right_workspace,
+        &operator_workspace
+    ](
+        const RawPersistentOutputReference& reference,
+        const RawOutputFusionGroup& group,
+        std::int64_t reference_k_offset
+    ) {
+        const RawOutputFusionWave& wave =
+            raw_output_fusion_waves_.at(reference.wave);
+        for (
+            std::size_t binding_reference = reference.binding_start;
+            binding_reference < reference.binding_stop;
+            ++binding_reference
+        ) {
+            const RawPersistentOutputBinding& selected =
+                persistent_output_bindings_.at(binding_reference);
+            const RawOutputFusionBatch& batch =
+                wave.batches.at(selected.batch);
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_.at(batch.channel);
+            const RawOutputFusionBinding& binding =
+                wave.bindings.at(selected.binding);
+            const RawExecutionTile& tile =
+                channel.tiles.at(binding.tile);
+            double* target = right_workspace.data()
+                + (
+                    reference_k_offset + binding.group_k_offset
+                ) * group.dq;
+            std::int64_t w_offset = 0;
+            for (
+                std::size_t action_index = tile.action_start;
+                action_index < tile.action_stop;
+                ++action_index
+            ) {
+                const RawExecutionAction& action =
+                    raw_execution_action_arena_.at(action_index);
+                const std::int64_t w =
+                    complementary_local_actions_.at(action.group).dims[2];
+                const std::int32_t right_slot =
+                    action_index < persistent_right_action_slots_.size()
+                    ? persistent_right_action_slots_[action_index]
+                    : -1;
+                if (right_slot >= 0) {
+                    const RawPersistentRightCacheEntry& entry =
+                        persistent_right_cache_.at(
+                            static_cast<std::size_t>(right_slot)
+                        );
+                    const std::size_t elements = static_cast<std::size_t>(
+                        w * channel.cr * group.dq
+                    );
+                    if (
+                        entry.action != action_index
+                        || entry.rows != w * channel.cr
+                        || entry.cols != group.dq
+                        || entry.value_offset + elements
+                            > persistent_right_cache_values_.size()
+                    ) {
+                        throw std::logic_error(
+                            "Persistent right-action cache changed."
+                        );
+                    }
+                    std::copy_n(
+                        persistent_right_cache_values_.data()
+                            + entry.value_offset,
+                        elements,
+                        target + w_offset * channel.cr * group.dq
+                    );
+                } else {
+                    pack_raw_execution_action_into(
+                        action,
+                        tile.total_w,
+                        w_offset,
+                        nullptr,
+                        target,
+                        false,
+                        0,
+                        0,
+                        &operator_workspace
+                    );
+                }
+                w_offset += w;
+            }
+            if (w_offset != tile.total_w) {
+                throw std::logic_error(
+                    "Dynamic persistent-right width changed."
+                );
+            }
+        }
+    };
+    if (combine_references) {
+        left_workspace.resize(static_cast<std::size_t>(
+            scheduled.la * scheduled.total_k
+        ));
+        const bool dynamic_right =
+            scheduled.right_offset
+                == std::numeric_limits<std::size_t>::max();
+        if (dynamic_right) {
+            right_workspace.resize(static_cast<std::size_t>(
+                scheduled.total_k * scheduled.dq
+            ));
+        }
+        for (
+            std::size_t reference_index = reference_start;
+            reference_index < reference_stop;
+            ++reference_index
+        ) {
+            const RawPersistentOutputReference& reference =
+                persistent_output_references_.at(reference_index);
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_.at(reference.wave);
+            const RawOutputFusionGroup& group =
+                wave.groups.at(reference.group);
+            fill_reference(
+                reference,
+                group,
+                scheduled.total_k,
+                reference.group_k_offset
+            );
+            if (dynamic_right) {
+                fill_right_reference(
+                    reference,
+                    group,
+                    reference.group_k_offset
+                );
+            }
+        }
+        const double* right_values = (
+            dynamic_right
+            ? right_workspace.data()
+            : raw_persistent_output_right_.data()
+                + scheduled.right_offset
+        );
+        raw_dgemm(
+            false,
+            false,
+            scheduled.la,
+            scheduled.dq,
+            scheduled.total_k,
+            1.0,
+            left_workspace.data(),
+            scheduled.total_k,
+            right_values,
+            scheduled.dq,
+            1.0,
+            output + scheduled.output_offset,
+            scheduled.dq
+        );
+        return copied_elements;
+    }
+    for (
+        std::size_t reference_index = reference_start;
+        reference_index < reference_stop;
+        ++reference_index
+    ) {
+        const RawPersistentOutputReference& reference =
+            persistent_output_references_.at(reference_index);
+        const RawOutputFusionWave& wave =
+            raw_output_fusion_waves_.at(reference.wave);
+        const RawOutputFusionGroup& group =
+            wave.groups.at(reference.group);
+        left_workspace.resize(static_cast<std::size_t>(
+            group.la * group.total_k
+        ));
+        fill_reference(reference, group, group.total_k, 0);
+        const bool dynamic_right =
+            group.right_offset
+                == std::numeric_limits<std::size_t>::max();
+        if (dynamic_right) {
+            right_workspace.resize(static_cast<std::size_t>(
+                group.total_k * group.dq
+            ));
+            fill_right_reference(reference, group, 0);
+        }
+        const double* right_values = (
+            dynamic_right
+            ? right_workspace.data()
+            : raw_persistent_output_right_.data()
+                + wave.persistent_right_offset
+                + group.right_offset
+        );
+        raw_dgemm(
+            false,
+            false,
+            group.la,
+            group.dq,
+            group.total_k,
+            1.0,
+            left_workspace.data(),
+            group.total_k,
+            right_values,
+            group.dq,
+            1.0,
+            output + group.output_offset,
+            group.dq
+        );
+    }
+    return copied_elements;
+}
+
 void MovingEnvironment::refresh_output_binding_right_offsets() {
     for (RawOutputFusionWave& wave : raw_output_fusion_waves_) {
         for (RawOutputFusionBatch& scheduled : wave.batches) {
@@ -16238,6 +18685,7 @@ void MovingEnvironment::prepare_complementary_execution_slab() {
         select_direct_complementary_tiles();
         compact_selected_direct_right_layout();
         refresh_compact_right_panels();
+        build_persistent_output_group_schedule();
         peak_complementary_left_cached_elements_ = std::max(
             peak_complementary_left_cached_elements_,
             cached_left_elements
@@ -16261,66 +18709,7 @@ void MovingEnvironment::prepare_complementary_execution_slab() {
         } else {
             complementary_execution_slab_.resize(cached_elements);
         }
-        for (RawInputSuperchannel& channel :
-             raw_input_superchannels_) {
-            if (channel.cached_unique_left_offset == no_offset) {
-                continue;
-            }
-            if (
-                channel.unique_left_actions.size()
-                != channel.unique_left_row_offsets.size()
-            ) {
-                throw std::logic_error(
-                    "Channel unique-left schedule is inconsistent."
-                );
-            }
-            for (
-                std::size_t unique_index = 0;
-                unique_index < channel.unique_left_actions.size();
-                ++unique_index
-            ) {
-                const RawExecutionAction& action =
-                    raw_execution_action_arena_.at(
-                        channel.unique_left_actions[unique_index]
-                    );
-                const std::int64_t w =
-                    complementary_local_actions_.at(
-                        action.group
-                    ).dims[2];
-                pack_raw_execution_action_into(
-                    action,
-                    w,
-                    0,
-                    complementary_execution_slab_.data()
-                        + channel.cached_unique_left_offset
-                        + channel.unique_left_row_offsets[unique_index]
-                            * channel.kb,
-                    nullptr
-                );
-            }
-        }
-        for (RawInputSuperchannel& channel : raw_input_superchannels_) {
-            for (RawExecutionBatch& batch : channel.batches) {
-                if (
-                    batch.cached_left_offset == no_offset
-                    && batch.cached_right_offset == no_offset
-                ) {
-                    continue;
-                }
-                pack_raw_execution_batch(
-                    channel,
-                    batch,
-                    batch.cached_left_offset == no_offset
-                        ? nullptr
-                        : complementary_execution_slab_.data()
-                            + batch.cached_left_offset,
-                    batch.cached_right_offset == no_offset
-                        ? nullptr
-                        : complementary_execution_slab_.data()
-                            + batch.cached_right_offset
-                );
-            }
-        }
+        pack_cached_complementary_execution_slab();
         prepare_output_fusion_right_slab();
         raw_execution_pack_seconds_ += wall_seconds() - started;
         return;
@@ -16369,6 +18758,7 @@ void MovingEnvironment::prepare_complementary_execution_slab() {
             }
         }
     }
+    build_persistent_output_group_schedule();
     prepare_output_fusion_right_slab();
     raw_execution_pack_seconds_ += wall_seconds() - started;
 }
@@ -16553,7 +18943,8 @@ void MovingEnvironment::pack_raw_execution_action_into(
     double* right_target,
     bool horizontal_right,
     std::int64_t right_total_w,
-    std::int64_t right_w_offset
+    std::int64_t right_w_offset,
+    std::vector<double>* panel_scratch
 ) {
     if (!complementary_local_actions_.empty()) {
         const ComplementaryLocalAction& local_action =
@@ -16710,7 +19101,9 @@ void MovingEnvironment::pack_raw_execution_action_into(
                         w_offset * cr * dq
                     ),
                     right_elements,
-                    complementary_panel_scratch_
+                    panel_scratch == nullptr
+                        ? complementary_panel_scratch_
+                        : *panel_scratch
                 );
                 return;
             }
@@ -17010,7 +19403,15 @@ void MovingEnvironment::raw_dgemm(
         output,
         &ldc
     );
-    ++raw_factor_gemm_calls_;
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+#pragma omp atomic update
+        ++raw_factor_gemm_calls_;
+    } else
+#endif
+    {
+        ++raw_factor_gemm_calls_;
+    }
 #else
     for (std::int64_t row = 0; row < rows; ++row)
     for (std::int64_t column = 0; column < cols; ++column) {
@@ -17044,7 +19445,15 @@ void MovingEnvironment::accumulate_raw_output_product(
     double* output
 ) {
     const std::size_t work_limit = tiny_output_kernel_work_limit();
-    ++raw_output_product_calls_;
+#ifdef _OPENMP
+    if (omp_in_parallel()) {
+#pragma omp atomic update
+        ++raw_output_product_calls_;
+    } else
+#endif
+    {
+        ++raw_output_product_calls_;
+    }
     if (work_limit == 0) {
         raw_dgemm(
             false,
@@ -17282,7 +19691,7 @@ void MovingEnvironment::accumulate_factorized_output(
     const RawExecutionTile& tile,
     const double* temporary,
     double* output
-) const {
+) {
     const RawExecutionGroup& execution =
         raw_execution_groups_[tile.execution];
     const std::int64_t la =
@@ -17314,28 +19723,17 @@ void MovingEnvironment::accumulate_factorized_output(
                 reduced_contextual_right_matrices_.at(
                     static_cast<std::size_t>(term.right_matrix)
                 );
-            for (std::int64_t row = 0; row < la; ++row) {
-                const double* left_row =
-                    temporary + row * total_k + action_k_offset;
-                double* output_row = output + row * dq;
-                for (
-                    std::int64_t inner = 0;
-                    inner < action_k;
-                    ++inner
-                ) {
-                    const double scale =
-                        (action.right_grouped ? 1.0 : term.scale)
-                        * left_row[inner];
-                    for (
-                        std::int64_t column = 0;
-                        column < dq;
-                        ++column
-                    ) {
-                        output_row[column] +=
-                            scale * right.value(inner, column);
-                    }
-                }
-            }
+            accumulate_reduced_contextual_output_product(
+                la,
+                dq,
+                action_k,
+                action.right_grouped ? 1.0 : term.scale,
+                temporary + action_k_offset,
+                total_k,
+                right,
+                output,
+                dq
+            );
         }
         action_k_offset += action_k;
     }
@@ -17634,6 +20032,14 @@ void MovingEnvironment::apply_raw_factor_groups(
         );
         raw_factor_gemm_calls_ += 2;
 #else
+#ifdef _OPENMP
+        const bool parallel_rows = n_threads_ > 1 && execution.rows > 1;
+        if (parallel_rows) {
+            ++openmp_parallel_regions_;
+            openmp_tasks_ += static_cast<std::uint64_t>(execution.rows);
+        }
+#pragma omp parallel for schedule(static) num_threads(n_threads_) if(parallel_rows)
+#endif
         for (std::int64_t row = 0; row < execution.rows; ++row) {
             double real = 0.0;
             double imag = 0.0;
@@ -18079,14 +20485,19 @@ void MovingEnvironment::apply_raw_factor_groups_real(
     }
     raw_input_pack_seconds_ += wall_seconds() - input_pack_started;
     const double dense_started = wall_seconds();
-    for (const DensePairExecution& execution : dense_pair_executions_) {
-        raw_input_real_.resize(static_cast<std::size_t>(execution.cols));
-        raw_output_real_.resize(static_cast<std::size_t>(execution.rows));
+    const auto apply_dense_pair = [input](
+        const DensePairExecution& execution,
+        double* target_output,
+        std::vector<double>& input_work,
+        std::vector<double>& output_work
+    ) {
+        input_work.resize(static_cast<std::size_t>(execution.cols));
+        output_work.resize(static_cast<std::size_t>(execution.rows));
         if (execution.shared_input) {
             std::copy(
                 input + execution.common_offset,
                 input + execution.common_offset + execution.cols,
-                raw_input_real_.begin()
+                input_work.begin()
             );
         } else {
             std::int64_t target = 0;
@@ -18099,7 +20510,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     input + execution.offsets[segment],
                     input + execution.offsets[segment]
                         + execution.sizes[segment],
-                    raw_input_real_.begin() +
+                    input_work.begin() +
                         static_cast<std::ptrdiff_t>(target)
                 );
                 target += execution.sizes[segment];
@@ -18113,13 +20524,12 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             1.0,
             execution.values.data(),
             static_cast<int>(execution.cols),
-            raw_input_real_.data(),
+            input_work.data(),
             1,
             0.0,
-            raw_output_real_.data(),
+            output_work.data(),
             1
         );
-        ++raw_factor_gemm_calls_;
         if (execution.shared_input) {
             std::int64_t source = 0;
             for (
@@ -18132,8 +20542,8 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 index < execution.sizes[segment];
                 ++index
             ) {
-                output[execution.offsets[segment] + index] +=
-                    raw_output_real_[source++];
+                target_output[execution.offsets[segment] + index] +=
+                    output_work[source++];
             }
         } else {
             for (
@@ -18141,11 +20551,75 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 index < execution.rows;
                 ++index
             ) {
-                output[execution.common_offset + index] +=
-                    raw_output_real_[index];
+                target_output[execution.common_offset + index] +=
+                    output_work[index];
             }
         }
+    };
+#ifdef _OPENMP
+    const int dense_threads = std::min<int>(
+        n_threads_,
+        static_cast<int>(dense_pair_max_wave_width_)
+    );
+    if (dense_threads > 1) {
+        dense_pair_thread_inputs_.resize(
+            static_cast<std::size_t>(dense_threads)
+        );
+        dense_pair_thread_outputs_.resize(
+            static_cast<std::size_t>(dense_threads)
+        );
+#pragma omp parallel num_threads(dense_threads)
+        {
+            const std::size_t thread_id = static_cast<std::size_t>(
+                omp_get_thread_num()
+            );
+            std::vector<double>& input_work =
+                dense_pair_thread_inputs_[thread_id];
+            std::vector<double>& output_work =
+                dense_pair_thread_outputs_[thread_id];
+            for (
+                std::size_t wave = 0;
+                wave + 1 < dense_pair_wave_offsets_.size();
+                ++wave
+            ) {
+                const std::int64_t begin = static_cast<std::int64_t>(
+                    dense_pair_wave_offsets_[wave]
+                );
+                const std::int64_t end = static_cast<std::int64_t>(
+                    dense_pair_wave_offsets_[wave + 1]
+                );
+#pragma omp for schedule(dynamic, 1)
+                for (std::int64_t position = begin; position < end; ++position) {
+                    const std::size_t execution_index =
+                        dense_pair_wave_indices_[
+                            static_cast<std::size_t>(position)
+                        ];
+                    apply_dense_pair(
+                        dense_pair_executions_[execution_index],
+                        output,
+                        input_work,
+                        output_work
+                    );
+                }
+            }
+        }
+        ++openmp_parallel_regions_;
+        openmp_tasks_ += static_cast<std::uint64_t>(
+            dense_pair_executions_.size()
+        );
+    } else
+#endif
+    {
+        for (const DensePairExecution& execution : dense_pair_executions_) {
+            apply_dense_pair(
+                execution,
+                output,
+                raw_input_real_,
+                raw_output_real_
+            );
+        }
     }
+    raw_factor_gemm_calls_ += dense_pair_executions_.size();
     dense_pair_matvec_seconds_ += wall_seconds() - dense_started;
     const double execution_started = wall_seconds();
     const bool pointer_actions =
@@ -18192,6 +20666,116 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             );
         }
     }
+#ifdef _OPENMP
+    const int direct_threads = std::min<int>(
+        n_threads_,
+        static_cast<int>(direct_execution_max_wave_width_)
+    );
+    if (
+        direct_threads > 1
+        && reduced_contextual_routes_
+        && !complementary_local_actions_.empty()
+        && raw_output_fusion_waves_.empty()
+        && direct_execution_wave_offsets_.size() > 1
+        && !compare_shared_left_actions()
+        && !compare_shared_right_panels()
+    ) {
+        direct_action_thread_left_.resize(
+            static_cast<std::size_t>(direct_threads)
+        );
+        direct_action_thread_temporary_.resize(
+            static_cast<std::size_t>(direct_threads)
+        );
+        std::atomic<bool> failed{false};
+        std::exception_ptr parallel_error;
+        std::uint64_t source_factor_loads = 0;
+        std::uint64_t action_calls = 0;
+        std::uint64_t action_count = 0;
+        double action_seconds = 0.0;
+#pragma omp parallel num_threads(direct_threads) \
+    reduction(+:source_factor_loads,action_calls,action_count,action_seconds)
+        {
+            const std::size_t thread_id = static_cast<std::size_t>(
+                omp_get_thread_num()
+            );
+            std::vector<double>& left_workspace =
+                direct_action_thread_left_[thread_id];
+            std::vector<double>& temporary_workspace =
+                direct_action_thread_temporary_[thread_id];
+            for (
+                std::size_t wave = 0;
+                wave + 1 < direct_execution_wave_offsets_.size();
+                ++wave
+            ) {
+                const std::int64_t begin = static_cast<std::int64_t>(
+                    direct_execution_wave_offsets_[wave]
+                );
+                const std::int64_t end = static_cast<std::int64_t>(
+                    direct_execution_wave_offsets_[wave + 1]
+                );
+#pragma omp for schedule(dynamic, 1)
+                for (
+                    std::int64_t position = begin;
+                    position < end;
+                    ++position
+                ) {
+                    if (failed.load(std::memory_order_relaxed)) {
+                        continue;
+                    }
+                    const std::size_t execution_index =
+                        direct_execution_wave_indices_[
+                            static_cast<std::size_t>(position)
+                        ];
+                    const RawExecutionGroup& execution =
+                        raw_execution_groups_[execution_index];
+                    const double action_started = wall_seconds();
+                    try {
+                        source_factor_loads +=
+                            apply_direct_complementary_actions_real_workspace(
+                                execution,
+                                execution.action_start,
+                                execution.action_stop,
+                                raw_packed_input_real_.data(),
+                                output,
+                                left_workspace,
+                                temporary_workspace
+                            );
+                        ++action_calls;
+                        action_count +=
+                            execution.action_stop - execution.action_start;
+                        action_seconds += wall_seconds() - action_started;
+                    } catch (...) {
+#pragma omp critical(pyqed_su2_direct_action_error)
+                        {
+                            if (!parallel_error) {
+                                parallel_error = std::current_exception();
+                            }
+                        }
+                        failed.store(true, std::memory_order_relaxed);
+                    }
+                }
+            }
+        }
+        if (parallel_error) {
+            std::rethrow_exception(parallel_error);
+        }
+        direct_source_factor_loads_ += source_factor_loads;
+        direct_complementary_action_calls_ += action_calls;
+        direct_complementary_actions_ += action_count;
+        direct_complementary_action_seconds_ += action_seconds;
+        ++openmp_parallel_regions_;
+        openmp_tasks_ += static_cast<std::uint64_t>(
+            direct_execution_wave_indices_.size()
+        );
+        raw_execution_matvec_seconds_ +=
+            wall_seconds() - execution_started;
+        peak_factor_route_scratch_bytes_ = std::max(
+            peak_factor_route_scratch_bytes_,
+            factor_route_scratch_bytes()
+        );
+        return;
+    }
+#endif
     if (
         reduced_contextual_routes_
         && raw_output_fusion_waves_.empty()
@@ -18227,9 +20811,186 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 );
             }
         }
-        std::uint32_t prepared_channel =
-            std::numeric_limits<std::uint32_t>::max();
-        for (const RawOutputFusionWave& wave : raw_output_fusion_waves_) {
+        const double channel_first_stage_started = wall_seconds();
+        raw_channel_temporary_offsets_.resize(
+            raw_input_superchannels_.size() + 1
+        );
+        std::size_t channel_temporary_elements = 0;
+        std::size_t eligible_channels = 0;
+        long double channel_first_stage_work = 0.0;
+        for (
+            std::size_t channel_index = 0;
+            channel_index < raw_input_superchannels_.size();
+            ++channel_index
+        ) {
+            raw_channel_temporary_offsets_[channel_index] =
+                channel_temporary_elements;
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_[channel_index];
+            const bool scheduled = std::any_of(
+                channel.batches.begin(),
+                channel.batches.end(),
+                [](const RawExecutionBatch& batch) {
+                    return !batch.right_first;
+                }
+            );
+            if (
+                scheduled
+                && channel.cached_unique_left_offset != no_offset
+                && channel.unique_left_rows > 0
+            ) {
+                channel_temporary_elements += static_cast<std::size_t>(
+                    channel.unique_left_rows * channel.cr
+                );
+                channel_first_stage_work +=
+                    static_cast<long double>(channel.unique_left_rows)
+                    * static_cast<long double>(channel.cr)
+                    * static_cast<long double>(channel.kb);
+                ++eligible_channels;
+            }
+        }
+        raw_channel_temporary_offsets_.back() = channel_temporary_elements;
+        raw_channel_temporary_real_.resize(channel_temporary_elements);
+#ifdef _OPENMP
+        const std::uint64_t integral_channel_work =
+            static_cast<std::uint64_t>(
+                std::min<long double>(
+                    channel_first_stage_work,
+                    static_cast<long double>(
+                        std::numeric_limits<std::uint64_t>::max()
+                    )
+                )
+            );
+        const int channel_threads = adaptive_openmp_thread_count(
+            n_threads_,
+            eligible_channels,
+            integral_channel_work
+        );
+        const bool parallel_channels = channel_threads > 1;
+        if (parallel_channels) {
+            ++openmp_parallel_regions_;
+            openmp_tasks_ += static_cast<std::uint64_t>(
+                eligible_channels
+            );
+        }
+#pragma omp parallel num_threads(channel_threads) if(parallel_channels)
+#endif
+        {
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+        for (
+            std::int64_t channel_index = 0;
+            channel_index < static_cast<std::int64_t>(
+                raw_input_superchannels_.size()
+            );
+            ++channel_index
+        ) {
+            const std::size_t index = static_cast<std::size_t>(channel_index);
+            if (
+                raw_channel_temporary_offsets_[index]
+                == raw_channel_temporary_offsets_[index + 1]
+            ) {
+                continue;
+            }
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_[index];
+            raw_dgemm(
+                false,
+                false,
+                channel.unique_left_rows,
+                channel.cr,
+                channel.kb,
+                1.0,
+                complementary_execution_slab_.data()
+                    + channel.cached_unique_left_offset,
+                channel.kb,
+                raw_packed_input_real_.data() + channel.input_offset,
+                channel.cr,
+                0.0,
+                raw_channel_temporary_real_.data()
+                    + raw_channel_temporary_offsets_[index],
+                channel.cr
+            );
+        }
+#ifdef _OPENMP
+#pragma omp single
+#endif
+        {
+        raw_channel_first_stage_seconds_ +=
+            wall_seconds() - channel_first_stage_started;
+        }
+        }
+        std::uint64_t persistent_output_work = 0;
+        for (const RawPersistentOutputGroup& group :
+             persistent_output_groups_) {
+            persistent_output_work += group.work;
+        }
+        const std::size_t affinity_output_task_count =
+            persistent_output_bundles_.empty()
+            ? persistent_output_groups_.size()
+            : persistent_output_bundles_.size();
+#ifdef _OPENMP
+        const int affinity_output_threads =
+            adaptive_openmp_thread_count(
+                n_threads_,
+                affinity_output_task_count,
+                persistent_output_work
+            );
+        const int private_output_threads =
+            adaptive_openmp_thread_count(
+                n_threads_,
+                persistent_output_tasks_.size(),
+                persistent_output_work
+            );
+        const bool private_output_candidate =
+            private_output_threads > affinity_output_threads;
+        const std::size_t private_output_vectors =
+            private_output_candidate
+            ? static_cast<std::size_t>(private_output_threads - 1)
+            : 0;
+        const bool private_output_size_safe =
+            factor_route_dimension_ == 0
+            || private_output_vectors <= (
+                std::numeric_limits<std::size_t>::max()
+                / sizeof(double)
+                / factor_route_dimension_
+            );
+        const std::size_t private_output_bytes = private_output_size_safe
+            ? private_output_vectors * factor_route_dimension_
+                * sizeof(double)
+            : std::numeric_limits<std::size_t>::max();
+        const bool use_private_output_executor =
+            private_output_candidate
+            && private_output_bytes
+                <= private_output_workspace_budget_bytes();
+        if (private_output_candidate && !use_private_output_executor) {
+            ++private_output_executor_fallbacks_;
+        }
+        const std::size_t persistent_output_task_count =
+            use_private_output_executor
+            ? persistent_output_tasks_.size()
+            : affinity_output_task_count;
+        const int persistent_output_threads =
+            use_private_output_executor
+            ? private_output_threads
+            : affinity_output_threads;
+        const bool use_persistent_output_executor =
+            persistent_output_threads > 1;
+#else
+        constexpr bool use_private_output_executor = false;
+        const std::size_t persistent_output_task_count =
+            affinity_output_task_count;
+        constexpr int persistent_output_threads = 1;
+        constexpr bool use_persistent_output_executor = false;
+#endif
+        for (
+            std::size_t wave_index = 0;
+            wave_index < raw_output_fusion_waves_.size();
+            ++wave_index
+        ) {
+            const RawOutputFusionWave& wave =
+                raw_output_fusion_waves_[wave_index];
             raw_output_fusion_temporary_real_.resize(
                 wave.temporary_elements
             );
@@ -18259,6 +21020,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             const auto consume_batch = [
                 this,
                 &wave,
+                use_persistent_output_executor,
                 output
             ](
                 const RawOutputFusionBatch& scheduled,
@@ -18267,6 +21029,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 const double* channel_temporary_values,
                 const double* right_values
             ) {
+                double phase_started = wall_seconds();
                 apply_shared_left_output_products(
                     wave,
                     scheduled,
@@ -18275,6 +21038,9 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     channel_temporary_values,
                     output
                 );
+                raw_shared_left_output_seconds_ +=
+                    wall_seconds() - phase_started;
+                phase_started = wall_seconds();
                 apply_grouped_output_products(
                     wave,
                     scheduled,
@@ -18283,6 +21049,9 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     right_values,
                     output
                 );
+                raw_grouped_output_seconds_ +=
+                    wall_seconds() - phase_started;
+                phase_started = wall_seconds();
                 for (
                     std::size_t binding_index =
                         scheduled.binding_start;
@@ -18298,6 +21067,12 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                         channel.tiles.at(binding.tile);
                     const RawOutputFusionGroup& group =
                         wave.groups.at(binding.group);
+                    if (
+                        use_persistent_output_executor
+                        && group.persistent_output
+                    ) {
+                        continue;
+                    }
                     const std::int64_t k =
                         tile.total_w * channel.cr;
                     const double* temporary =
@@ -18610,149 +21385,154 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     raw_output_fusion_copied_elements_ +=
                         static_cast<std::uint64_t>(group.la * k);
                 }
+                raw_binding_output_seconds_ +=
+                    wall_seconds() - phase_started;
             };
-            bool all_channel_left = true;
-            for (
-                const RawOutputFusionBatch& scheduled :
-                wave.batches
+            const auto consume_channel_batch = [
+                this,
+                &wave,
+                &consume_batch,
+                use_persistent_output_executor,
+                output
+            ](
+                const RawOutputFusionBatch& scheduled,
+                const RawInputSuperchannel& channel,
+                const RawExecutionBatch& batch
             ) {
-                const RawInputSuperchannel& channel =
-                    raw_input_superchannels_.at(scheduled.channel);
                 if (
                     channel.cached_unique_left_offset == no_offset
                     || channel.unique_left_rows == 0
                 ) {
-                    all_channel_left = false;
-                    break;
+                    return false;
                 }
-            }
+                const double* channel_temporary =
+                    raw_channel_temporary_real_.data()
+                    + raw_channel_temporary_offsets_.at(
+                        scheduled.channel
+                    );
+                const double* temporary_values =
+                    expand_raw_execution_batch_channel_left_real(
+                        channel,
+                        batch,
+                        channel_temporary,
+                        wave,
+                        scheduled,
+                        use_persistent_output_executor
+                    );
+                const double* right_values = nullptr;
+                bool factorized_batch = scheduled.singleton_outputs;
+                if (factorized_batch) {
+                    for (
+                        std::size_t binding_index =
+                            scheduled.binding_start;
+                        binding_index < scheduled.binding_stop;
+                        ++binding_index
+                    ) {
+                        if (
+                            wave.bindings[binding_index]
+                                .shared_right_start
+                            != wave.bindings[binding_index]
+                                .shared_right_stop
+                        ) {
+                            continue;
+                        }
+                        const RawExecutionTile& tile =
+                            channel.tiles.at(
+                                wave.bindings[binding_index].tile
+                            );
+                        if (!can_accumulate_factorized_output(
+                            channel,
+                            tile
+                        )) {
+                            factorized_batch = false;
+                            break;
+                        }
+                    }
+                }
+                if (!factorized_batch && batch.requires_right) {
+                    if (
+                        batch.cached_right_offset == no_offset
+                        && batch.right_values.empty()
+                        && scheduled.shared_left_group_start
+                            == scheduled.shared_left_group_stop
+                        && std::none_of(
+                            grouped_output_executed_.begin()
+                                + scheduled.binding_start,
+                            grouped_output_executed_.begin()
+                                + scheduled.binding_stop,
+                            [](std::uint8_t value) {
+                                return value != 0;
+                            }
+                        )
+                        && !scheduled.shared_right_panels
+                        && !scheduled.deferred_outputs
+                        // Direct channel-to-fusion leaves the ordinary
+                        // batch temporary sparse on purpose.  It cannot
+                        // be consumed by the whole-batch direct fallback.
+                        && !direct_channel_output_fusion()
+                        && apply_direct_complementary_temporary_batch_real(
+                            channel,
+                            batch,
+                            temporary_values,
+                            output
+                        )
+                    ) {
+                        clear_raw_output_fusion_batch(
+                            wave,
+                            scheduled,
+                            channel
+                        );
+                        return true;
+                    }
+                    right_values = prepare_raw_execution_batch_right_real(
+                        channel,
+                        batch
+                    );
+                }
+                consume_batch(
+                    scheduled,
+                    channel,
+                    temporary_values,
+                    channel_temporary,
+                    right_values
+                );
+                return true;
+            };
+            const double wave_batch_started = wall_seconds();
             constexpr std::size_t fused_first_stage_limit =
                 1'048'576;
-            if (all_channel_left) {
+            if (wave.channel_left_ready) {
                 for (
-                    const RawOutputFusionBatch& scheduled :
-                    wave.batches
+                    std::size_t scheduled_index = 0;
+                    scheduled_index < wave.batches.size();
+                    ++scheduled_index
                 ) {
+                    const RawOutputFusionBatch& scheduled =
+                        wave.batches[scheduled_index];
                     const RawInputSuperchannel& channel =
                         raw_input_superchannels_.at(
                             scheduled.channel
                         );
-                    if (prepared_channel != scheduled.channel) {
-                        raw_batch_left_.resize(
-                            static_cast<std::size_t>(
-                                channel.unique_left_rows
-                                * channel.cr
-                            )
-                        );
-                        raw_dgemm(
-                            false,
-                            false,
-                            channel.unique_left_rows,
-                            channel.cr,
-                            channel.kb,
-                            1.0,
-                            complementary_execution_slab_.data()
-                                + channel.cached_unique_left_offset,
-                            channel.kb,
-                            raw_packed_input_real_.data()
-                                + channel.input_offset,
-                            channel.cr,
-                            0.0,
-                            raw_batch_left_.data(),
-                            channel.cr
-                        );
-                        prepared_channel = scheduled.channel;
-                    }
                     const RawExecutionBatch& batch =
                         channel.batches.at(scheduled.batch);
-                    const double* temporary_values =
-                        expand_raw_execution_batch_channel_left_real(
-                            channel,
-                            batch,
-                            raw_batch_left_.data(),
-                            wave,
-                            scheduled
-                        );
-                    const double* right_values =
-                        nullptr;
-                    bool factorized_batch =
-                        scheduled.singleton_outputs;
-                    if (factorized_batch) {
-                        for (
-                            std::size_t binding_index =
-                                scheduled.binding_start;
-                            binding_index < scheduled.binding_stop;
-                            ++binding_index
-                        ) {
-                            if (
-                                wave.bindings[binding_index]
-                                    .shared_right_start
-                                != wave.bindings[binding_index]
-                                    .shared_right_stop
-                            ) {
-                                continue;
-                            }
-                            const RawExecutionTile& tile =
-                                channel.tiles.at(
-                                    wave.bindings[binding_index].tile
-                                );
-                            if (!can_accumulate_factorized_output(
-                                channel,
-                                tile
-                            )) {
-                                factorized_batch = false;
-                                break;
-                            }
-                        }
+                    if (
+                        scheduled.direct_channel_fusion
+                        || (
+                            use_persistent_output_executor
+                            && scheduled.persistent_output_only
+                        )
+                    ) {
+                        continue;
                     }
-                    if (!factorized_batch && batch.requires_right) {
-                        if (
-                            batch.cached_right_offset == no_offset
-                            && batch.right_values.empty()
-                            && scheduled.shared_left_group_start
-                                == scheduled.shared_left_group_stop
-                            && std::none_of(
-                                grouped_output_executed_.begin()
-                                    + scheduled.binding_start,
-                                grouped_output_executed_.begin()
-                                    + scheduled.binding_stop,
-                                [](std::uint8_t value) {
-                                    return value != 0;
-                                }
-                            )
-                            && !scheduled.shared_right_panels
-                            && !scheduled.deferred_outputs
-                            // Direct channel-to-fusion leaves the ordinary
-                            // batch temporary sparse on purpose.  It cannot
-                            // be consumed by the whole-batch direct fallback.
-                            && !direct_channel_output_fusion()
-                            && apply_direct_complementary_temporary_batch_real(
-                                channel,
-                                batch,
-                                temporary_values,
-                                output
-                            )
-                        ) {
-                            clear_raw_output_fusion_batch(
-                                wave,
-                                scheduled,
-                                channel
-                            );
-                            continue;
-                        }
-                        right_values =
-                            prepare_raw_execution_batch_right_real(
-                                channel,
-                                batch
-                            );
-                    }
-                    consume_batch(
+                    if (!consume_channel_batch(
                         scheduled,
                         channel,
-                        temporary_values,
-                        raw_batch_left_.data(),
-                        right_values
-                    );
+                        batch
+                    )) {
+                        throw std::logic_error(
+                            "Channel-left wave lost its cached input."
+                        );
+                    }
                 }
             } else {
               std::size_t scheduled_index = 0;
@@ -18763,6 +21543,17 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     raw_input_superchannels_.at(scheduled.channel);
                 const RawExecutionBatch& batch =
                     channel.batches.at(scheduled.batch);
+                if (
+                    use_persistent_output_executor
+                    && scheduled.persistent_output_only
+                ) {
+                    ++scheduled_index;
+                    continue;
+                }
+                if (consume_channel_batch(scheduled, channel, batch)) {
+                    ++scheduled_index;
+                    continue;
+                }
                 std::size_t fused_stop = scheduled_index;
                 std::int64_t fused_rows = 0;
                 std::size_t expected_left_offset =
@@ -18777,6 +21568,11 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                         if (
                             candidate_schedule.channel
                                 != scheduled.channel
+                            || (
+                                use_persistent_output_executor
+                                && candidate_schedule
+                                    .persistent_output_only
+                            )
                         ) {
                             break;
                         }
@@ -18872,7 +21668,8 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 }
                 const double* temporary_values = nullptr;
                 const double* right_values = nullptr;
-                if (!prepare_raw_execution_batch_real(
+                const double fallback_prepare_started = wall_seconds();
+                const bool prepared = prepare_raw_execution_batch_real(
                     channel,
                     batch,
                     raw_packed_input_real_.data(),
@@ -18882,7 +21679,10 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     batch.requires_right,
                     temporary_values,
                     right_values
-                )) {
+                );
+                raw_batch_fallback_prepare_seconds_ +=
+                    wall_seconds() - fallback_prepare_started;
+                if (!prepared) {
                     clear_raw_output_fusion_batch(
                         wave,
                         scheduled,
@@ -18901,6 +21701,37 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 ++scheduled_index;
               }
             }
+            raw_wave_batch_seconds_ +=
+                wall_seconds() - wave_batch_started;
+            const double direct_fusion_started = wall_seconds();
+            std::uint64_t direct_copied_elements = 0;
+            for (const RawChannelFusionTask& task :
+                 wave.channel_fusion_tasks) {
+                const RawOutputFusionBatch& scheduled =
+                    wave.batches.at(task.batch);
+                const RawOutputFusionBinding& binding =
+                    wave.bindings.at(task.binding);
+                const RawOutputFusionGroup& group =
+                    wave.groups.at(binding.group);
+                if (
+                    !scheduled.direct_channel_fusion
+                    || (
+                        use_persistent_output_executor
+                        && group.persistent_output
+                    )
+                    || group.temporary_offset == no_offset
+                ) {
+                    continue;
+                }
+                direct_copied_elements +=
+                    apply_persistent_channel_fusion_task(wave, task);
+            }
+            raw_output_fusion_copied_elements_ += direct_copied_elements;
+            if (direct_copied_elements != 0) {
+                raw_binding_output_seconds_ +=
+                    wall_seconds() - direct_fusion_started;
+            }
+            const double fusion_finalize_started = wall_seconds();
             for (
                 const RawSharedRightPanel& panel :
                 wave.shared_right_panels
@@ -19035,10 +21866,14 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     }
                 }
             }
-            for (
-                const RawOutputFusionGroup& group : wave.groups
-            ) {
-                if (group.temporary_offset == no_offset) {
+            for (const RawOutputFusionGroup& group : wave.groups) {
+                if (
+                    group.temporary_offset == no_offset
+                    || (
+                        use_persistent_output_executor
+                        && group.persistent_output
+                    )
+                ) {
                     continue;
                 }
                 raw_dgemm(
@@ -19061,6 +21896,327 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 );
                 ++raw_output_fusion_gemm_calls_;
             }
+            raw_fusion_finalize_seconds_ +=
+                wall_seconds() - fusion_finalize_started;
+        }
+        if (use_persistent_output_executor) {
+            const double persistent_output_started = wall_seconds();
+            std::uint64_t persistent_copied_elements = 0;
+#ifdef _OPENMP
+            ++openmp_parallel_regions_;
+            openmp_tasks_ += static_cast<std::uint64_t>(
+                persistent_output_task_count
+            );
+            if (use_private_output_executor) {
+                openmp_tasks_ += static_cast<std::uint64_t>(
+                    persistent_product_cache_.size()
+                );
+            }
+#endif
+            persistent_output_thread_left_.resize(
+                static_cast<std::size_t>(persistent_output_threads)
+            );
+            persistent_output_thread_operator_.resize(
+                static_cast<std::size_t>(persistent_output_threads)
+            );
+            persistent_output_thread_right_.resize(
+                static_cast<std::size_t>(persistent_output_threads)
+            );
+            persistent_output_thread_products_.resize(
+                use_private_output_executor
+                ? 1
+                : static_cast<std::size_t>(persistent_output_threads)
+            );
+            persistent_output_thread_product_valid_.resize(
+                use_private_output_executor
+                ? 1
+                : static_cast<std::size_t>(persistent_output_threads)
+            );
+            for (
+                std::size_t thread_index = 0;
+                thread_index < persistent_output_thread_products_.size();
+                ++thread_index
+            ) {
+                persistent_output_thread_products_[thread_index].resize(
+                    persistent_product_cache_elements_
+                );
+                persistent_output_thread_product_valid_[thread_index]
+                    .assign(persistent_product_cache_.size(), 0);
+            }
+            if (use_private_output_executor) {
+                ++private_output_executor_calls_;
+                const std::size_t thread_count =
+                    static_cast<std::size_t>(persistent_output_threads);
+                persistent_output_thread_outputs_.resize(thread_count - 1);
+                for (std::vector<double>& private_output :
+                     persistent_output_thread_outputs_) {
+                    private_output.resize(factor_route_dimension_);
+                }
+                const std::size_t private_elements =
+                    (thread_count - 1) * factor_route_dimension_;
+                peak_private_output_workspace_bytes_ = std::max(
+                    peak_private_output_workspace_bytes_,
+                    private_elements * sizeof(double)
+                );
+                private_output_reduced_elements_ += private_elements;
+#ifdef _OPENMP
+#pragma omp parallel num_threads(persistent_output_threads)
+#endif
+                {
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                    for (
+                        std::int64_t element = 0;
+                        element < static_cast<std::int64_t>(
+                            private_elements
+                        );
+                        ++element
+                    ) {
+                        const std::size_t private_index =
+                            static_cast<std::size_t>(element)
+                            / factor_route_dimension_;
+                        const std::size_t output_index =
+                            static_cast<std::size_t>(element)
+                            % factor_route_dimension_;
+                        persistent_output_thread_outputs_[private_index]
+                            [output_index] = 0.0;
+                    }
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+                    for (
+                        std::int64_t cache_index = 0;
+                        cache_index < static_cast<std::int64_t>(
+                            persistent_product_cache_.size()
+                        );
+                        ++cache_index
+                    ) {
+#ifdef _OPENMP
+                        const std::size_t thread_index =
+                            static_cast<std::size_t>(omp_get_thread_num());
+#else
+                        constexpr std::size_t thread_index = 0;
+#endif
+                        const RawPersistentProductCacheEntry& entry =
+                            persistent_product_cache_.at(
+                                static_cast<std::size_t>(cache_index)
+                            );
+                        const RawInputSuperchannel& channel =
+                            raw_input_superchannels_.at(entry.channel);
+                        const RawExecutionAction& action =
+                            raw_execution_action_arena_.at(entry.action);
+                        const std::int64_t w =
+                            complementary_local_actions_.at(action.group)
+                                .dims[2];
+                        const std::size_t left_elements =
+                            static_cast<std::size_t>(
+                                entry.rows * channel.kb
+                            );
+                        std::vector<double>& operator_workspace =
+                            persistent_output_thread_operator_[thread_index];
+                        operator_workspace.resize(left_elements);
+                        pack_raw_execution_action_into(
+                            action,
+                            w,
+                            0,
+                            operator_workspace.data(),
+                            nullptr
+                        );
+                        raw_dgemm(
+                            false,
+                            false,
+                            entry.rows,
+                            entry.cols,
+                            channel.kb,
+                            1.0,
+                            operator_workspace.data(),
+                            channel.kb,
+                            raw_packed_input_real_.data()
+                                + channel.input_offset,
+                            channel.cr,
+                            0.0,
+                            persistent_output_thread_products_[0].data()
+                                + entry.value_offset,
+                            entry.cols
+                        );
+                        persistent_output_thread_product_valid_[0][
+                            static_cast<std::size_t>(cache_index)
+                        ] = 1;
+                    }
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 1) \
+    reduction(+:persistent_copied_elements)
+#endif
+                    for (
+                        std::int64_t task_index = 0;
+                        task_index < static_cast<std::int64_t>(
+                            persistent_output_task_count
+                        );
+                        ++task_index
+                    ) {
+#ifdef _OPENMP
+                        const std::size_t thread_index =
+                            static_cast<std::size_t>(omp_get_thread_num());
+#else
+                        constexpr std::size_t thread_index = 0;
+#endif
+                        const RawPersistentOutputTask& task =
+                            persistent_output_tasks_.at(
+                                static_cast<std::size_t>(task_index)
+                            );
+                        double* thread_output = thread_index == 0
+                            ? output
+                            : persistent_output_thread_outputs_.at(
+                                thread_index - 1
+                            ).data();
+                        persistent_copied_elements +=
+                            apply_persistent_output_group(
+                                persistent_output_groups_.at(task.group),
+                                thread_output,
+                                persistent_output_thread_left_[thread_index],
+                                persistent_output_thread_operator_[thread_index],
+                                persistent_output_thread_right_[thread_index],
+                                persistent_output_thread_products_[0],
+                                persistent_output_thread_product_valid_[0],
+                                task.reference_start,
+                                task.reference_stop,
+                                task.combined
+                            );
+                    }
+                    for (
+                        std::size_t stride = 1;
+                        stride < thread_count;
+                        stride *= 2
+                    ) {
+                        const std::size_t pair_count =
+                            (thread_count + 2 * stride - 1)
+                            / (2 * stride);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                        for (
+                            std::int64_t pair = 0;
+                            pair < static_cast<std::int64_t>(pair_count);
+                            ++pair
+                        ) {
+                            const std::size_t target_index =
+                                static_cast<std::size_t>(pair)
+                                * 2 * stride;
+                            const std::size_t source_index =
+                                target_index + stride;
+                            if (source_index >= thread_count) {
+                                continue;
+                            }
+                            double* target = target_index == 0
+                                ? output
+                                : persistent_output_thread_outputs_.at(
+                                    target_index - 1
+                                ).data();
+                            const double* source =
+                                persistent_output_thread_outputs_.at(
+                                    source_index - 1
+                                ).data();
+                            for (
+                                std::size_t index = 0;
+                                index < factor_route_dimension_;
+                                ++index
+                            ) {
+                                target[index] += source[index];
+                            }
+                        }
+                    }
+                }
+            } else {
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic, 1) \
+    num_threads(persistent_output_threads) \
+    reduction(+:persistent_copied_elements)
+#endif
+                for (
+                    std::int64_t task_index = 0;
+                    task_index < static_cast<std::int64_t>(
+                        persistent_output_task_count
+                    );
+                    ++task_index
+                ) {
+#ifdef _OPENMP
+                    const std::size_t thread_index =
+                        static_cast<std::size_t>(omp_get_thread_num());
+#else
+                    constexpr std::size_t thread_index = 0;
+#endif
+                    if (persistent_output_bundles_.empty()) {
+                        const RawPersistentOutputGroup& scheduled =
+                            persistent_output_groups_.at(
+                                static_cast<std::size_t>(task_index)
+                            );
+                        persistent_copied_elements +=
+                            apply_persistent_output_group(
+                                scheduled,
+                                output,
+                                persistent_output_thread_left_[thread_index],
+                                persistent_output_thread_operator_[thread_index],
+                                persistent_output_thread_right_[thread_index],
+                                persistent_output_thread_products_[thread_index],
+                                persistent_output_thread_product_valid_[thread_index],
+                                scheduled.reference_start,
+                                scheduled.reference_stop,
+                                scheduled.combined
+                            );
+                        continue;
+                    }
+                    const RawPersistentOutputBundle& bundle =
+                        persistent_output_bundles_.at(
+                            static_cast<std::size_t>(task_index)
+                        );
+                    for (
+                        std::size_t bundle_group = bundle.group_start;
+                        bundle_group < bundle.group_stop;
+                        ++bundle_group
+                    ) {
+                        const std::uint32_t group_index =
+                            persistent_output_bundle_groups_.at(
+                                bundle_group
+                            );
+                        const RawPersistentOutputGroup& scheduled =
+                            persistent_output_groups_.at(group_index);
+                        persistent_copied_elements +=
+                            apply_persistent_output_group(
+                                scheduled,
+                                output,
+                                persistent_output_thread_left_[thread_index],
+                                persistent_output_thread_operator_[thread_index],
+                                persistent_output_thread_right_[thread_index],
+                                persistent_output_thread_products_[thread_index],
+                                persistent_output_thread_product_valid_[thread_index],
+                                scheduled.reference_start,
+                                scheduled.reference_stop,
+                                scheduled.combined
+                            );
+                    }
+                }
+            }
+            raw_output_fusion_copied_elements_ +=
+                persistent_copied_elements;
+            if (use_private_output_executor) {
+                for (const RawPersistentOutputTask& task :
+                     persistent_output_tasks_) {
+                    raw_output_fusion_gemm_calls_ += task.combined
+                        ? 1
+                        : task.reference_stop - task.reference_start;
+                }
+            } else {
+                for (const RawPersistentOutputGroup& scheduled :
+                     persistent_output_groups_) {
+                    raw_output_fusion_gemm_calls_ += scheduled.combined
+                        ? 1
+                        : scheduled.reference_stop
+                            - scheduled.reference_start;
+                }
+            }
+            raw_binding_output_seconds_ +=
+                wall_seconds() - persistent_output_started;
         }
     } else {
     for (const RawInputSuperchannel& channel : raw_input_superchannels_) {
@@ -19338,6 +22494,32 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
     double* output
 ) {
     const double started = wall_seconds();
+    direct_source_factor_loads_ +=
+        apply_direct_complementary_actions_real_workspace(
+            execution,
+            action_start,
+            action_stop,
+            packed_input,
+            output,
+            raw_batch_left_,
+            raw_temporary_real_
+        );
+    ++direct_complementary_action_calls_;
+    direct_complementary_actions_ += action_stop - action_start;
+    direct_complementary_action_seconds_ += wall_seconds() - started;
+}
+
+std::uint64_t
+MovingEnvironment::apply_direct_complementary_actions_real_workspace(
+    const RawExecutionGroup& execution,
+    std::size_t action_start,
+    std::size_t action_stop,
+    const double* packed_input,
+    double* output,
+    std::vector<double>& left_workspace,
+    std::vector<double>& temporary_workspace
+) {
+    std::uint64_t source_factor_loads = 0;
     const std::int64_t la =
         execution.dims[0] * execution.dims[2];
     const std::int64_t kb =
@@ -19358,17 +22540,17 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
             );
         if (first_action.right_grouped) {
             const std::int64_t w = first_local.dims[2];
-            raw_batch_left_.resize(
+            left_workspace.resize(
                 static_cast<std::size_t>(la * w * kb)
             );
             pack_raw_execution_action_into(
                 first_action,
                 w,
                 0,
-                raw_batch_left_.data(),
+                left_workspace.data(),
                 nullptr
             );
-            raw_temporary_real_.resize(
+            temporary_workspace.resize(
                 static_cast<std::size_t>(la * w * cr)
             );
             raw_dgemm(
@@ -19378,12 +22560,12 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
                 cr,
                 kb,
                 1.0,
-                raw_batch_left_.data(),
+                left_workspace.data(),
                 kb,
                 packed_input + execution.input_offset,
                 cr,
                 0.0,
-                raw_temporary_real_.data(),
+                temporary_workspace.data(),
                 cr
             );
             const ReducedContextualMatrix& right =
@@ -19403,13 +22585,13 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
                 dq,
                 w * cr,
                 1.0,
-                raw_temporary_real_.data(),
+                temporary_workspace.data(),
                 w * cr,
                 right,
                 output + execution.output_offset,
                 dq
             );
-            ++direct_source_factor_loads_;
+            ++source_factor_loads;
             ++action_index;
             continue;
         }
@@ -19445,7 +22627,7 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
                 "Direct complementary left shape changed."
             );
         }
-        raw_temporary_real_.resize(
+        temporary_workspace.resize(
             static_cast<std::size_t>(la * w * cr)
         );
         raw_dgemm(
@@ -19460,7 +22642,7 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
             packed_input + execution.input_offset,
             cr,
             0.0,
-            raw_temporary_real_.data(),
+            temporary_workspace.data(),
             cr
         );
         for (
@@ -19514,20 +22696,18 @@ void MovingEnvironment::apply_direct_complementary_actions_real(
                     dq,
                     w * cr,
                     term.scale,
-                    raw_temporary_real_.data(),
+                    temporary_workspace.data(),
                     w * cr,
                     right,
                     output + execution.output_offset,
                     dq
                 );
-                ++direct_source_factor_loads_;
+                ++source_factor_loads;
             }
         }
         action_index = run_stop;
     }
-    ++direct_complementary_action_calls_;
-    direct_complementary_actions_ += action_stop - action_start;
-    direct_complementary_action_seconds_ += wall_seconds() - started;
+    return source_factor_loads;
 }
 
 void MovingEnvironment::apply_raw_pointer_actions_real(
@@ -20487,6 +23667,20 @@ bool MovingEnvironment::install_factor_routes(
         raw_pointer_action_arena_
     );
     std::vector<std::uint32_t>().swap(raw_combined_left_terms_);
+    std::vector<std::size_t>().swap(direct_execution_wave_offsets_);
+    std::vector<std::size_t>().swap(direct_execution_wave_indices_);
+    std::vector<std::vector<double>>().swap(direct_action_thread_left_);
+    std::vector<std::vector<double>>().swap(
+        direct_action_thread_temporary_
+    );
+    std::vector<double>().swap(complementary_panel_scratch_);
+    std::vector<std::vector<double>>().swap(
+        complementary_panel_thread_scratch_
+    );
+    std::vector<std::array<std::size_t, 3>>().swap(
+        complementary_pack_tasks_
+    );
+    direct_execution_max_wave_width_ = 0;
     raw_execution_actions_ = 0;
     right_grouped_execution_actions_ = 0;
     std::vector<RawInputSuperchannel>().swap(
@@ -20495,6 +23689,54 @@ bool MovingEnvironment::install_factor_routes(
     std::vector<RawOutputFusionWave>().swap(
         raw_output_fusion_waves_
     );
+    std::vector<RawPersistentOutputGroup>().swap(
+        persistent_output_groups_
+    );
+    std::vector<RawPersistentOutputReference>().swap(
+        persistent_output_references_
+    );
+    std::vector<RawPersistentOutputBinding>().swap(
+        persistent_output_bindings_
+    );
+    std::vector<RawPersistentOutputBundle>().swap(
+        persistent_output_bundles_
+    );
+    std::vector<std::uint32_t>().swap(
+        persistent_output_bundle_groups_
+    );
+    std::vector<RawPersistentOutputTask>().swap(
+        persistent_output_tasks_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_outputs_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_left_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_operator_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_right_
+    );
+    std::vector<RawPersistentProductCacheEntry>().swap(
+        persistent_product_cache_
+    );
+    persistent_product_cache_elements_ = 0;
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_products_
+    );
+    std::vector<std::vector<std::uint8_t>>().swap(
+        persistent_output_thread_product_valid_
+    );
+    std::vector<std::int32_t>().swap(
+        persistent_right_action_slots_
+    );
+    std::vector<RawPersistentRightCacheEntry>().swap(
+        persistent_right_cache_
+    );
+    std::vector<double>().swap(persistent_right_cache_values_);
+    dynamic_persistent_output_right_ = false;
     complementary_execution_slab_required_elements_ = 0;
     complementary_execution_slab_.clear();
     raw_input_superchannel_tiles_ = 0;
@@ -20515,8 +23757,15 @@ bool MovingEnvironment::install_factor_routes(
     );
     std::vector<double>().swap(raw_shared_right_tile_output_real_);
     std::vector<double>().swap(raw_shared_left_output_real_);
+    std::vector<std::size_t>().swap(raw_channel_temporary_offsets_);
+    std::vector<double>().swap(raw_channel_temporary_real_);
     std::vector<DensePairKernel>().swap(dense_pair_kernels_);
     std::vector<DensePairExecution>().swap(dense_pair_executions_);
+    std::vector<std::size_t>().swap(dense_pair_wave_offsets_);
+    std::vector<std::size_t>().swap(dense_pair_wave_indices_);
+    std::vector<std::vector<double>>().swap(dense_pair_thread_inputs_);
+    std::vector<std::vector<double>>().swap(dense_pair_thread_outputs_);
+    dense_pair_max_wave_width_ = 0;
     dense_pair_kernels_built_ = 0;
     dense_pair_kernel_elements_ = 0;
     dense_pair_routes_ = 0;
@@ -26881,6 +30130,11 @@ bool MovingEnvironment::install_raw_factor_routes(
     );
     std::vector<DensePairKernel>().swap(dense_pair_kernels_);
     std::vector<DensePairExecution>().swap(dense_pair_executions_);
+    std::vector<std::size_t>().swap(dense_pair_wave_offsets_);
+    std::vector<std::size_t>().swap(dense_pair_wave_indices_);
+    std::vector<std::vector<double>>().swap(dense_pair_thread_inputs_);
+    std::vector<std::vector<double>>().swap(dense_pair_thread_outputs_);
+    dense_pair_max_wave_width_ = 0;
     dense_pair_kernels_built_ = 0;
     dense_pair_kernel_elements_ = 0;
     dense_pair_routes_ = 0;
@@ -27359,6 +30613,20 @@ void MovingEnvironment::clear_factor_routes() {
         raw_pointer_action_arena_
     );
     std::vector<std::uint32_t>().swap(raw_combined_left_terms_);
+    std::vector<std::size_t>().swap(direct_execution_wave_offsets_);
+    std::vector<std::size_t>().swap(direct_execution_wave_indices_);
+    std::vector<std::vector<double>>().swap(direct_action_thread_left_);
+    std::vector<std::vector<double>>().swap(
+        direct_action_thread_temporary_
+    );
+    std::vector<double>().swap(complementary_panel_scratch_);
+    std::vector<std::vector<double>>().swap(
+        complementary_panel_thread_scratch_
+    );
+    std::vector<std::array<std::size_t, 3>>().swap(
+        complementary_pack_tasks_
+    );
+    direct_execution_max_wave_width_ = 0;
     raw_execution_actions_ = 0;
     right_grouped_execution_actions_ = 0;
     std::vector<RawInputSuperchannel>().swap(
@@ -27367,6 +30635,54 @@ void MovingEnvironment::clear_factor_routes() {
     std::vector<RawOutputFusionWave>().swap(
         raw_output_fusion_waves_
     );
+    std::vector<RawPersistentOutputGroup>().swap(
+        persistent_output_groups_
+    );
+    std::vector<RawPersistentOutputReference>().swap(
+        persistent_output_references_
+    );
+    std::vector<RawPersistentOutputBinding>().swap(
+        persistent_output_bindings_
+    );
+    std::vector<RawPersistentOutputBundle>().swap(
+        persistent_output_bundles_
+    );
+    std::vector<std::uint32_t>().swap(
+        persistent_output_bundle_groups_
+    );
+    std::vector<RawPersistentOutputTask>().swap(
+        persistent_output_tasks_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_outputs_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_left_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_operator_
+    );
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_right_
+    );
+    std::vector<RawPersistentProductCacheEntry>().swap(
+        persistent_product_cache_
+    );
+    persistent_product_cache_elements_ = 0;
+    std::vector<std::vector<double>>().swap(
+        persistent_output_thread_products_
+    );
+    std::vector<std::vector<std::uint8_t>>().swap(
+        persistent_output_thread_product_valid_
+    );
+    std::vector<std::int32_t>().swap(
+        persistent_right_action_slots_
+    );
+    std::vector<RawPersistentRightCacheEntry>().swap(
+        persistent_right_cache_
+    );
+    std::vector<double>().swap(persistent_right_cache_values_);
+    dynamic_persistent_output_right_ = false;
     raw_input_superchannel_tiles_ = 0;
     raw_input_superchannel_batches_ = 0;
     std::vector<double>().swap(raw_batch_left_);
@@ -27382,8 +30698,15 @@ void MovingEnvironment::clear_factor_routes() {
         raw_shared_right_deferred_output_real_
     );
     std::vector<double>().swap(raw_shared_right_tile_output_real_);
+    std::vector<std::size_t>().swap(raw_channel_temporary_offsets_);
+    std::vector<double>().swap(raw_channel_temporary_real_);
     std::vector<DensePairKernel>().swap(dense_pair_kernels_);
     std::vector<DensePairExecution>().swap(dense_pair_executions_);
+    std::vector<std::size_t>().swap(dense_pair_wave_offsets_);
+    std::vector<std::size_t>().swap(dense_pair_wave_indices_);
+    std::vector<std::vector<double>>().swap(dense_pair_thread_inputs_);
+    std::vector<std::vector<double>>().swap(dense_pair_thread_outputs_);
+    dense_pair_max_wave_width_ = 0;
     dense_pair_kernels_built_ = 0;
     dense_pair_kernel_elements_ = 0;
     dense_pair_routes_ = 0;
@@ -36604,6 +39927,33 @@ double MovingEnvironment::raw_execution_matvec_seconds() const noexcept {
 double MovingEnvironment::raw_execution_pack_seconds() const noexcept {
     return raw_execution_pack_seconds_;
 }
+double MovingEnvironment::raw_batch_expand_seconds() const noexcept {
+    return raw_batch_expand_seconds_;
+}
+double MovingEnvironment::raw_batch_right_prepare_seconds() const noexcept {
+    return raw_batch_right_prepare_seconds_;
+}
+double MovingEnvironment::raw_batch_fallback_prepare_seconds() const noexcept {
+    return raw_batch_fallback_prepare_seconds_;
+}
+double MovingEnvironment::raw_channel_first_stage_seconds() const noexcept {
+    return raw_channel_first_stage_seconds_;
+}
+double MovingEnvironment::raw_wave_batch_seconds() const noexcept {
+    return raw_wave_batch_seconds_;
+}
+double MovingEnvironment::raw_shared_left_output_seconds() const noexcept {
+    return raw_shared_left_output_seconds_;
+}
+double MovingEnvironment::raw_grouped_output_seconds() const noexcept {
+    return raw_grouped_output_seconds_;
+}
+double MovingEnvironment::raw_binding_output_seconds() const noexcept {
+    return raw_binding_output_seconds_;
+}
+double MovingEnvironment::raw_fusion_finalize_seconds() const noexcept {
+    return raw_fusion_finalize_seconds_;
+}
 double
 MovingEnvironment::raw_pointer_execution_matvec_seconds() const noexcept {
     return raw_pointer_execution_matvec_seconds_;
@@ -36764,6 +40114,25 @@ std::size_t MovingEnvironment::dense_pair_kernel_count() const noexcept {
 std::size_t MovingEnvironment::dense_pair_execution_count() const noexcept {
     return dense_pair_executions_.size();
 }
+std::size_t MovingEnvironment::dense_pair_wave_count() const noexcept {
+    return dense_pair_wave_offsets_.empty()
+        ? 0
+        : dense_pair_wave_offsets_.size() - 1;
+}
+std::size_t MovingEnvironment::dense_pair_max_wave_width() const noexcept {
+    return dense_pair_max_wave_width_;
+}
+std::size_t
+MovingEnvironment::dense_pair_thread_workspace_bytes() const noexcept {
+    std::size_t elements = 0;
+    for (const auto& workspace : dense_pair_thread_inputs_) {
+        elements += workspace.capacity();
+    }
+    for (const auto& workspace : dense_pair_thread_outputs_) {
+        elements += workspace.capacity();
+    }
+    return elements * sizeof(double);
+}
 std::size_t MovingEnvironment::dense_pair_kernel_elements() const noexcept {
     return dense_pair_kernel_elements_;
 }
@@ -36856,6 +40225,38 @@ MovingEnvironment::raw_output_fusion_gemm_calls() const noexcept {
 std::uint64_t
 MovingEnvironment::raw_output_fusion_copied_elements() const noexcept {
     return raw_output_fusion_copied_elements_;
+}
+std::size_t
+MovingEnvironment::peak_persistent_output_batch_count() const noexcept {
+    return peak_persistent_output_batches_;
+}
+std::size_t
+MovingEnvironment::peak_persistent_output_task_count() const noexcept {
+    return peak_persistent_output_tasks_;
+}
+std::size_t
+MovingEnvironment::peak_persistent_output_group_count() const noexcept {
+    return peak_persistent_output_groups_;
+}
+std::uint64_t
+MovingEnvironment::private_output_executor_calls() const noexcept {
+    return private_output_executor_calls_;
+}
+std::uint64_t
+MovingEnvironment::private_output_executor_fallbacks() const noexcept {
+    return private_output_executor_fallbacks_;
+}
+std::size_t
+MovingEnvironment::peak_private_output_task_count() const noexcept {
+    return peak_private_output_tasks_;
+}
+std::size_t
+MovingEnvironment::peak_private_output_workspace_bytes() const noexcept {
+    return peak_private_output_workspace_bytes_;
+}
+std::uint64_t
+MovingEnvironment::private_output_reduced_elements() const noexcept {
+    return private_output_reduced_elements_;
 }
 bool MovingEnvironment::grouped_output_product_backend() const noexcept {
     return !disable_grouped_output_products()
@@ -37453,6 +40854,10 @@ std::size_t MovingEnvironment::factor_route_table_bytes() const noexcept {
     ) * sizeof(RawExecutionAction);
     total += raw_combined_left_terms_.capacity()
         * sizeof(std::uint32_t);
+    total += (
+        direct_execution_wave_offsets_.capacity()
+        + direct_execution_wave_indices_.capacity()
+    ) * sizeof(std::size_t);
     total += raw_input_superchannels_.capacity()
         * sizeof(RawInputSuperchannel);
     for (const RawInputSuperchannel& channel : raw_input_superchannels_) {
@@ -37462,6 +40867,8 @@ std::size_t MovingEnvironment::factor_route_table_bytes() const noexcept {
             * sizeof(std::uint32_t);
         total += channel.unique_left_row_offsets.capacity()
             * sizeof(std::uint32_t);
+        total += channel.persistent_product_slots.capacity()
+            * sizeof(std::int32_t);
         for (const RawExecutionBatch& batch : channel.batches) {
             total += batch.left_values.capacity() * sizeof(double);
             total += batch.right_values.capacity() * sizeof(double);
@@ -37487,8 +40894,30 @@ std::size_t MovingEnvironment::factor_route_table_bytes() const noexcept {
     for (const RawOutputFusionWave& wave : raw_output_fusion_waves_) {
         total += wave.memory_bytes();
     }
+    total += persistent_output_groups_.capacity()
+        * sizeof(RawPersistentOutputGroup);
+    total += persistent_output_references_.capacity()
+        * sizeof(RawPersistentOutputReference);
+    total += persistent_output_bindings_.capacity()
+        * sizeof(RawPersistentOutputBinding);
+    total += persistent_output_bundles_.capacity()
+        * sizeof(RawPersistentOutputBundle);
+    total += persistent_output_bundle_groups_.capacity()
+        * sizeof(std::uint32_t);
+    total += persistent_output_tasks_.capacity()
+        * sizeof(RawPersistentOutputTask);
+    total += persistent_product_cache_.capacity()
+        * sizeof(RawPersistentProductCacheEntry);
+    total += persistent_right_action_slots_.capacity()
+        * sizeof(std::int32_t);
+    total += persistent_right_cache_.capacity()
+        * sizeof(RawPersistentRightCacheEntry);
     total += complementary_execution_slab_.capacity() * sizeof(double);
     total += dense_pair_executions_.capacity() * sizeof(DensePairExecution);
+    total += (
+        dense_pair_wave_offsets_.capacity()
+        + dense_pair_wave_indices_.capacity()
+    ) * sizeof(std::size_t);
     for (const DensePairExecution& execution : dense_pair_executions_) {
         total += execution.offsets.capacity() * sizeof(std::int64_t);
         total += execution.sizes.capacity() * sizeof(std::int64_t);
@@ -37527,12 +40956,48 @@ std::size_t MovingEnvironment::borrowed_factor_pool_bytes() const noexcept {
         + borrowed_raw_factor_source_bytes();
 }
 std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
+    std::size_t thread_workspace_elements = 0;
+    for (const auto& workspace : dense_pair_thread_inputs_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : dense_pair_thread_outputs_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : direct_action_thread_left_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : direct_action_thread_temporary_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : complementary_panel_thread_scratch_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : persistent_output_thread_left_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : persistent_output_thread_operator_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : persistent_output_thread_right_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : persistent_output_thread_products_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    for (const auto& workspace : persistent_output_thread_outputs_) {
+        thread_workspace_elements += workspace.capacity();
+    }
+    std::size_t product_valid_bytes = 0;
+    for (const auto& valid : persistent_output_thread_product_valid_) {
+        product_valid_bytes += valid.capacity() * sizeof(std::uint8_t);
+    }
     return (
             factor_route_scratch_.capacity()
             + active_bond_h_diagonal_.capacity()
             + active_bond_n_diagonal_.capacity()
             + active_bond_solution_.capacity()
         ) * sizeof(Complex)
+        + product_valid_bytes
         + (
             factor_route_real_scratch_.capacity()
             + real_matvec_input_.capacity()
@@ -37563,9 +41028,12 @@ std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
             + raw_shared_right_deferred_output_real_.capacity()
             + raw_shared_right_tile_output_real_.capacity()
             + raw_shared_left_output_real_.capacity()
+            + raw_channel_temporary_real_.capacity()
+            + persistent_right_cache_values_.capacity()
             + dense_factor_pack_arena_.capacity()
             + left_raw_factor_source_.build_scratch.capacity()
             + right_raw_factor_source_.build_scratch.capacity()
+            + thread_workspace_elements
         ) * sizeof(double)
         + (
             raw_basis_offsets_.capacity()
@@ -37576,7 +41044,10 @@ std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
             + active_bond_basis_shapes_.capacity()
             + active_bond_basis_quantum_numbers_.capacity()
         ) * sizeof(std::int64_t)
-        + active_bond_basis_order_.capacity() * sizeof(std::size_t)
+        + (
+            active_bond_basis_order_.capacity()
+            + raw_channel_temporary_offsets_.capacity()
+        ) * sizeof(std::size_t)
         + (
             grouped_output_transpose_left_.capacity()
             + grouped_output_transpose_right_.capacity()
@@ -37599,7 +41070,9 @@ std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
         ) * sizeof(double*)
         + grouped_output_executed_.capacity() * sizeof(std::uint8_t)
         + grouped_output_executed_bindings_.capacity()
-            * sizeof(std::uint32_t);
+            * sizeof(std::uint32_t)
+        + complementary_pack_tasks_.capacity()
+            * sizeof(std::array<std::size_t, 3>);
 }
 std::size_t
 MovingEnvironment::borrowed_raw_factor_source_bytes() const noexcept {

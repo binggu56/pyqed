@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from pyqed.dvr import DVR, SineDVR
-from pyqed.ldr import LDR
+from pyqed.ldr import Coord, LDR
 from pyqed.models.pyrazine_abinitio import pyrazine_sto3g_rhf_modes
 from pyqed.qchem import Molecule
 from pyqed.units import au2fs
@@ -46,8 +46,15 @@ def geometry(q):
     return equilibrium + np.einsum("m,mAx->Ax", q, modes)
 
 
-solver = LDR(mc, grid=grid, geometry=geometry, states=(1, 2))
-solver.build(progress=True)
+solver = LDR(
+    mc,
+    grid=grid,
+    coord=Coord(
+        to_cartesian=geometry,
+        bounds=((-2.5, 2.5), (-2.5, 2.5)),
+    ),
+    states=(1, 2),
+).build(progress=True)
 envelope = np.multiply.outer(*(np.exp(-axis.x**2 / 2) for axis in axes))
 solver.run(solver.wavepacket(envelope, state=1), dt=0.1 / au2fs, nsteps=50)
 

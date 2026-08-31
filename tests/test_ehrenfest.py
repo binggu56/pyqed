@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from pyqed.units import au2k
 from pyqed.namd.mf import Ehrenfest, TDDFTTrajectory
 from pyqed.namd import TDDFTEhrenfest
 from pyqed.namd.ehrenfest import AbInitioEhrenfest
@@ -207,7 +208,7 @@ def test_tddft_ehrenfest_real_h2_thermal_wigner_sampling_matches_mode_variances(
     q = np.array([traj.q[0] for traj in ed.trajs])
     p = np.array([traj.p_mode[0] for traj in ed.trajs])
 
-    temperature_au = 300.0 / 315774.67
+    temperature_au = 300.0 / au2k
     coth = 1.0 / np.tanh(0.5 * omega / temperature_au)
     q_var_expected = 0.5 * coth / omega
     p_var_expected = 0.5 * coth * omega
@@ -360,13 +361,12 @@ def test_native_tddft_driver_supports_builtin_point_charge_embedding():
         mol,
         2,
         xc="lda",
-        build_driver="builtin",
         point_charge_coords=pc_coords,
         point_charges=pc_charges,
     )
 
     ref_mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    ref_mol.build(driver="builtin")
+    ref_mol.build()
     ref_energy = embed_point_charges(
         RKS(ref_mol, xc="lda"),
         pc_coords,

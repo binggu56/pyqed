@@ -9,7 +9,7 @@ Created on Mon Sep 29 13:32:14 2025
 # if __name__ == "__main__":
 import numpy as np
 from pyqed import Molecule
-from pyqed.ldr.ldr import LDRN
+from pyqed.dvr import DVR
 from pyqed.qchem.ci import CASCI
 from pyqed.qchem.ci.casci import overlap
 
@@ -32,10 +32,10 @@ from pyqed.units import amu2au
 # print(mol.atom_coords())
 
 nstates = 3
-ldr = LDRN([[2, 10]], levels=[2], ndim=1, nstates=nstates)
+grid = DVR([(2, 10)], npts=[3])
 
-x = ldr.x[0] # bond length
-nx = ldr.nx[0]
+x = grid.x[0] # bond length
+nx = grid.shape[0]
 
 print(x)
 

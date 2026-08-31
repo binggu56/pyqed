@@ -4,12 +4,9 @@ import pytest
 from pyqed.qchem import CASCI, CD, Molecule, RHF, TDA, TDDFT
 
 
-def _h2_casci(nstates=2, driver='builtin'):
+def _h2_casci(nstates=2):
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    if driver == 'builtin':
-        mol.build(driver=driver, eri='s8')
-    else:
-        mol.build(driver=driver)
+    mol.build(eri='s8')
     mf = RHF(mol).run()
     return CASCI(mf, ncas=2, nelecas=2).run(nstates=nstates)
 
@@ -33,13 +30,13 @@ def _chiral_methyl_lactate_molecule():
         'H 3.890 1.670 -0.370'
     )
     mol = Molecule(atom=atom, unit='angstrom', basis='sto-3g')
-    mol.build(driver='builtin', eri='s8')
+    mol.build(eri='s8')
     return mol
 
 
 def test_builtin_angular_momentum_and_magnetic_dipole_integrals_h2():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='s8')
+    mol.build(eri='s8')
 
     center = mol.nuc_charge_center()
     position = mol.position_integral(center=center)
@@ -118,8 +115,8 @@ def test_cd_from_tda_pcm_backend_h2():
     pytest.importorskip('pyscf.solvent')
 
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    # This TDDFT/PCM test deliberately uses PySCF-built orbitals.
-    mol.build(driver='pyscf')
+    # Exercise TDDFT/PCM from the native molecule representation.
+    mol.build()
     mf = RHF(mol).run()
 
     gas_td = TDA(mf).run(nstates=1)
@@ -181,8 +178,8 @@ def test_tddft_pcm_cd_matches_pyscf_h2o2():
     ptd.kernel()
 
     mol = Molecule(atom=atom, unit='angstrom', basis='sto-3g')
-    # Keep PySCF AO ordering because the reference MO/TD data are injected below.
-    mol.build(driver='pyscf')
+    # Native spherical AO ordering matches the injected PySCF reference data.
+    mol.build()
     mf = RHF(mol)
     mf.mo_energy = np.array(pmf.mo_energy)
     mf.mo_coeff = np.array(pmf.mo_coeff)

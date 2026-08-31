@@ -12,12 +12,27 @@ __all__ = [
     "Cell",
     "Chain",
     "EwaldRHF",
+    "FiniteDisplacementPhonon",
     "KRHF",
+    "KRHFForceCalculator",
+    "KRHFHessian",
+    "Phonon",
     "RHF",
+    "interpolate_q_path",
 ]
 
 
 def __getattr__(name):
+    if name in {
+        "FiniteDisplacementPhonon",
+        "KRHFForceCalculator",
+        "Phonon",
+        "interpolate_q_path",
+    }:
+        module = import_module("pyqed.pbc.phonon")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
     if name in __all__:
         module = import_module("pyqed.qchem.pbc")
         value = getattr(module, name)

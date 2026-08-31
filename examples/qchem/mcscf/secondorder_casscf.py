@@ -13,7 +13,7 @@ mol = Molecule(
     unit='bohr',
     basis='631g',
 )
-mol.build(driver='builtin', aosym='s8', eri='dense')
+mol.build(aosym='s8', eri='dense')
 
 mf = mol.RHF().run()
 

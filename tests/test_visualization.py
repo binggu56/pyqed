@@ -156,7 +156,7 @@ def h2_reference():
     from pyqed.qchem.hf.rhf import RHF
 
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin")
+    mol.build()
     return RHF(mol).run()
 
 

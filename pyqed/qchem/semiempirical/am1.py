@@ -17,7 +17,7 @@ import warnings
 from scipy.linalg import eigh
 from numba import njit
 
-from pyqed import au2angstrom
+from pyqed import au2angstrom, au2ev, au2kcalmol
 from pyqed.qchem.basis import ContractedGaussian, overlap as gaussian_overlap
 from pyqed.qchem.ci.fci import CI_H, SlaterCondon
 from pyqed.qchem.mcscf.direct_ci import build_direct_connectivity, _compute_diag_compact
@@ -26,9 +26,11 @@ from periodictable import elements
 warnings.warn('AM1 model is under testing')
 
 BOHR = au2angstrom
-HARTREE2EV = 27.21138602
-HARTREE2KCAL = 627.52177300722
-EV2KCAL = 23.061
+HARTREE2EV = au2ev
+HARTREE2KCAL = au2kcalmol
+EV2KCAL = au2kcalmol / au2ev
+# Published AM1/MOPAC parameter: 14.399 eV Angstrom in Hartree Angstrom.
+# This is part of the fitted model, not a Bohr-radius conversion.
 E2 = 0.5291534944018261
 
 

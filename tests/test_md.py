@@ -1858,7 +1858,7 @@ def test_pair_displacements_cache_reuses_nonexcluded_mask():
 
 def test_qmmm_electrostatic_embedding_maps_qm_and_mm_forces():
     qm_mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    qm_mol.build(driver="builtin")
+    qm_mol.build()
     atoms = Atoms(
         [
             ["H", (0.0, 0.0, 0.0)],
@@ -1884,7 +1884,7 @@ def test_qmmm_electrostatic_embedding_maps_qm_and_mm_forces():
     forces = atoms.get_forces()
     components = atoms.calc.results
     reference_mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    reference_mol.build(driver="builtin")
+    reference_mol.build()
     reference = embed_point_charges(
         reference_mol.RHF(),
         coords=[[0.0, 0.0, 3.0]],
@@ -2021,7 +2021,7 @@ def test_qmmm_electrostatic_embedding_runs_one_step_with_water_mm():
         exclude_angles=True,
     )
     qm_mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    qm_mol.build(driver="builtin")
+    qm_mol.build()
     system.calc = QMMM(
         qm=qm_mol.RHF(),
         mm=mm,
@@ -2161,7 +2161,7 @@ def test_qmmm_solvate_box_runs_short_embedded_md():
 def _builtin_h2_rhf(positions):
     atom = "; ".join(f"H {x} {y} {z}" for x, y, z in np.asarray(positions, dtype=float))
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     return mol.RHF()
 
 
@@ -2389,7 +2389,7 @@ def test_md_engine_accepts_langevin_friction_per_ps():
     state = engine.run(2)
 
     assert state.step == 2
-    assert friction_ps_to_atomic_units(1.0) == pytest.approx(2.41888432651e-5)
+    assert friction_ps_to_atomic_units(1.0) == pytest.approx(au2fs * 1.0e-3)
     assert np.all(np.isfinite(atoms.get_positions()))
 
     with pytest.raises(ValueError, match="only one"):

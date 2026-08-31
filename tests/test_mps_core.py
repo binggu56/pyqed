@@ -3,10 +3,12 @@ import itertools
 import numpy as np
 import pytest
 
-from pyqed.mps import MPS, MPO
+from pyqed.mps import MPS, MPO, NonabelianMPO, NonabelianMPS
+from pyqed.mps.nonabelian import MPS as ReducedMPS, MPO as ReducedMPO
 from pyqed.mps.abelian_direct import AbelianRenormalizedActionDataTable
 from pyqed.mps.decompose import decompose, tt_to_tensor
-from pyqed.mps.mps import LeftCanonical, PauliSite, RightCanonical, Site, apply_mpo
+from pyqed.lattice.site import Leg, Site
+from pyqed.mps.mps import LeftCanonical, RightCanonical, apply_mpo
 
 
 STANDARD_LABELS = ("lv", "p", "rv")
@@ -41,6 +43,27 @@ def test_mps_uses_left_physical_right_as_its_default_order():
     assert state.lv_idx == 0
     assert state.p_idx == 1
     assert state.rv_idx == 2
+    assert tuple(site.dim for site in state.sites) == tuple(state.dims)
+    assert state.legs == tuple(site.leg for site in state.sites)
+    assert not hasattr(state, "Bs")
+    assert not hasattr(state, "data")
+
+
+def test_root_mps_names_are_dense_and_nonabelian_names_are_explicit():
+    assert NonabelianMPS is ReducedMPS
+    assert NonabelianMPO is ReducedMPO
+    assert MPS is not NonabelianMPS
+    assert MPO is not NonabelianMPO
+
+
+def test_mps_preserves_explicit_sites_through_layout_and_compression():
+    _, factors = _random_state(shape=(2, 2, 2))
+    sites = tuple(Site.spin_half() for _ in factors)
+    state = MPS(factors, sites=sites)
+
+    assert state.copy().sites == sites
+    assert state.to_order(("p", "lv", "rv")).sites == sites
+    assert state.compress(4).sites == sites
 
 
 def test_mps_relabeling_transposes_data_without_changing_the_state():
@@ -71,7 +94,7 @@ def test_mps_gauge_aliases_are_canonicalized(alias, canonical, center):
 
     assert state.gauge == canonical
     assert state.center == center
-    assert state.norm() == pytest.approx(state.norm_squared())
+    assert state.norm() ** 2 == pytest.approx(state.norm_squared())
 
 
 def test_mps_mixed_gauge_requires_a_center():
@@ -83,6 +106,15 @@ def test_mps_mixed_gauge_requires_a_center():
     state = MPS(factors, gauge="mixed", center=1)
     assert state.center == 1
     assert state.gauge == "mixed"
+
+
+def test_mps_expectation_requires_an_owned_operator():
+    state = MPS([np.array([[[1.0], [2.0]]])])
+    number = MPO([np.diag([0.0, 1.0]).reshape(1, 1, 2, 2)])
+
+    assert state.expectation(number) == pytest.approx(4.0)
+    with pytest.raises(TypeError, match="expects an MPO"):
+        state.expectation(number.factors)
 
 
 def test_mps_canonicalization_preserves_state_and_exposes_schmidt_values():
@@ -171,7 +203,7 @@ def test_get_singular_values_requires_canonicalization():
         state.get_singular_values(state.nbonds)
 
 
-def test_legacy_helpers_remain_reexported_from_mps_module():
+def test_canonical_site_and_leg_own_local_basis_metadata():
     tensor, factors = _random_state()
 
     left = LeftCanonical(factors)
@@ -179,10 +211,11 @@ def test_legacy_helpers_remain_reexported_from_mps_module():
     np.testing.assert_allclose(tt_to_tensor(left), tensor / np.linalg.norm(tensor))
     np.testing.assert_allclose(tt_to_tensor(right), tensor / np.linalg.norm(tensor))
 
-    site = Site(2)
-    pauli = PauliSite()
-    assert site.operators["id"].shape == (2, 2)
-    np.testing.assert_allclose(pauli.operators["s_z"], np.diag([-1.0, 1.0]))
+    site = Site.generic(2)
+    spin = Site.spin_half()
+    assert isinstance(site.leg, Leg)
+    assert site.operators["I"].shape == (2, 2)
+    np.testing.assert_allclose(spin.operators["Z"], np.diag([1.0, -1.0]))
 
 
 def test_mpo_validates_its_fixed_tensor_order():
@@ -192,6 +225,27 @@ def test_mpo_validates_its_fixed_tensor_order():
     assert mpo.labels == ("left", "right", "up", "down")
     with pytest.raises(ValueError, match="must use"):
         MPO([identity], labels=("left", "up", "down", "right"))
+
+
+def test_mpo_application_validates_and_propagates_ordered_sites():
+    spin = Site.spin_half()
+    state = MPS([np.array([[[1.0], [0.0]]])], sites=(spin,))
+    operator = MPO(
+        [np.eye(2).reshape(1, 1, 2, 2)],
+        sites=(spin,),
+        input_sites=(spin,),
+    )
+
+    applied = operator @ state
+    assert applied.sites == (spin,)
+
+    incompatible = Site.generic(2, labels=("zero", "one"))
+    with pytest.raises(ValueError, match="incompatible"):
+        MPO(
+            [np.eye(2).reshape(1, 1, 2, 2)],
+            sites=(incompatible,),
+            input_sites=(incompatible,),
+        ) @ state
 
 
 @pytest.mark.parametrize("labels", itertools.permutations(STANDARD_LABELS))
@@ -209,11 +263,10 @@ def test_mpo_application_preserves_scale_and_declared_mps_layout(labels):
         "ai,bj,ck,ijk->abc", *local_ops, tensor, optimize=True
     )
 
-    compressed = MPS(apply_mpo(mpo, state, chi_max=32))
+    compressed = apply_mpo(mpo, state, max_bond=32)
     np.testing.assert_allclose(_dense(compressed), expected, atol=1.0e-12)
-    np.testing.assert_allclose(_dense(mpo.dot(state, D=32)), expected, atol=1.0e-12)
     np.testing.assert_allclose(
-        _dense(mpo.matmul(state, chi_max=32)), expected, atol=1.0e-12
+        _dense(mpo.apply(state, max_bond=32)), expected, atol=1.0e-12
     )
     np.testing.assert_allclose(_dense(mpo @ state), expected, atol=1.0e-12)
 
@@ -223,12 +276,12 @@ def test_apply_mpo_validates_lengths_and_physical_dimensions():
     state = MPS([np.ones((1, 2, 1)), np.ones((1, 2, 1))])
 
     with pytest.raises(ValueError, match="lengths must match"):
-        apply_mpo([identity], state, chi_max=2)
-    with pytest.raises(ValueError, match="Physical input dimension mismatch"):
+        apply_mpo(MPO([identity]), state, max_bond=2)
+    with pytest.raises(ValueError, match="incompatible"):
         apply_mpo(
-            [np.eye(3).reshape(1, 1, 3, 3), identity],
+            MPO([np.eye(3).reshape(1, 1, 3, 3), identity]),
             state,
-            chi_max=2,
+            max_bond=2,
         )
 
 
@@ -237,7 +290,7 @@ def test_apply_mpo_handles_the_zero_operator_without_nan_bonds():
     state = MPS(factors)
     zero = np.zeros((1, 1, 2, 2))
 
-    result = MPS(apply_mpo([zero, zero], state, chi_max=4))
+    result = apply_mpo(MPO([zero, zero]), state, max_bond=4)
 
     assert result.check_sanity()
     assert all(np.all(np.isfinite(factor)) for factor in result.factors)
@@ -260,12 +313,12 @@ def test_apply_mpo_preserves_bonded_mpo_virtual_index_order():
     expected = tensor + np.einsum("ai,bj,ij->ab", x_op, z_op, tensor)
 
     np.testing.assert_allclose(
-        _dense(MPS(apply_mpo(mpo, state, chi_max=4))),
+        _dense(apply_mpo(mpo, state, max_bond=4)),
         expected,
         atol=1.0e-12,
     )
     np.testing.assert_allclose(_dense(mpo @ state), expected, atol=1.0e-12)
-    np.testing.assert_allclose(_dense(mpo.matmul(state)), expected, atol=1.0e-12)
+    np.testing.assert_allclose(_dense(mpo.apply(state)), expected, atol=1.0e-12)
 
 
 def test_compressed_mpo_product_preserves_operator_scale():
@@ -273,10 +326,124 @@ def test_compressed_mpo_product_preserves_operator_scale():
     left = MPO([2.0 * identity, identity])
     right = MPO([3.0 * identity, identity])
 
-    product = left.matmul(right, chi_max=1)
+    product = left.compose(right, max_bond=1)
 
     state = MPS([np.ones((1, 2, 1)), np.ones((1, 2, 1))])
     np.testing.assert_allclose(_dense(product @ state), 6.0 * _dense(state))
+
+
+def _random_mpo(dims=(3, 2, 2), ranks=(1, 4, 3, 1), seed=47):
+    rng = np.random.default_rng(seed)
+    factors = [
+        rng.normal(size=(left, right, dim, dim))
+        + 1j * rng.normal(size=(left, right, dim, dim))
+        for left, right, dim in zip(ranks[:-1], ranks[1:], dims)
+    ]
+    return MPO(factors)
+
+
+def test_mpo_canonical_rounding_is_exact_without_rank_truncation():
+    operator = _random_mpo()
+    rounded = operator.compress(32)
+
+    np.testing.assert_allclose(rounded.to_dense(), operator.to_dense(), atol=2.0e-12)
+    assert max(rounded.bond_orders()) <= 32
+
+
+def test_mpo_canonical_rounding_never_forms_two_site_physical_matrix(monkeypatch):
+    operator = _random_mpo(dims=(11, 7, 5), ranks=(1, 6, 8, 1))
+    original_svd = np.linalg.svd
+    shapes = []
+
+    def recorded_svd(matrix, *args, **kwargs):
+        shapes.append(matrix.shape)
+        return original_svd(matrix, *args, **kwargs)
+
+    monkeypatch.setattr(np.linalg, "svd", recorded_svd)
+    rounded = operator.compress(3)
+
+    assert shapes[0] == (11**2, 6)
+    assert max(columns for _rows, columns in shapes) <= 8
+    assert max(rounded.bond_orders()) <= 3
+
+
+def test_mpo_hermitian_compression_remains_exactly_hermitian():
+    operator = _random_mpo()
+    hermitian = 0.5 * (operator + operator.adjoint())
+    rounded = hermitian.compress_hermitian(4)
+    dense = rounded.to_dense()
+
+    np.testing.assert_allclose(dense, dense.conj().T, atol=2.0e-12)
+    assert max(rounded.bond_orders()) <= 4
+
+
+def test_streamed_hadamard_hermitian_compression_matches_materialized_route():
+    left = _random_mpo(dims=(4, 3, 2), ranks=(1, 3, 4, 1), seed=51)
+    right = _random_mpo(dims=(4, 3, 2), ranks=(1, 2, 3, 1), seed=52)
+
+    reference = (left * right).compress_hermitian(6)
+    streamed = left.hadamard_compress_hermitian(right, 6)
+    dense = streamed.to_dense()
+
+    np.testing.assert_allclose(dense, reference.to_dense(), atol=3.0e-11)
+    np.testing.assert_allclose(dense, dense.conj().T, atol=3.0e-12)
+    assert max(streamed.bond_orders()) <= 6
+
+
+def test_matrix_free_hadamard_rounding_avoids_raw_product_core(monkeypatch):
+    from pyqed.mps.mps import MPO, _round_hadamard_mpo_factors
+
+    left = _random_mpo(dims=(4, 3, 2), ranks=(1, 3, 4, 1), seed=61)
+    right = _random_mpo(dims=(4, 3, 2), ranks=(1, 2, 3, 1), seed=62)
+    expected = (left * right).to_dense()
+
+    original_einsum = np.einsum
+
+    def reject_raw_product(subscripts, *operands, **kwargs):
+        assert subscripts != "abij,mnij->ambnij"
+        return original_einsum(subscripts, *operands, **kwargs)
+
+    monkeypatch.setattr(np, "einsum", reject_raw_product)
+    factors = _round_hadamard_mpo_factors(
+        left.factors,
+        right.factors,
+        max_bond=64,
+        matrix_free=True,
+    )
+    result = MPO(factors).to_dense()
+
+    np.testing.assert_allclose(result, expected, atol=3.0e-11)
+
+
+def test_matrix_free_hadamard_compression_is_rank_capped_and_hermitian():
+    from pyqed.mps.mps import MPO, _round_hadamard_mpo_factors
+
+    left = _random_mpo(dims=(5, 4, 3), ranks=(1, 5, 6, 1), seed=63)
+    right = _random_mpo(dims=(5, 4, 3), ranks=(1, 4, 5, 1), seed=64)
+    factors = _round_hadamard_mpo_factors(
+        left.factors,
+        right.factors,
+        max_bond=3,
+        matrix_free=True,
+    )
+    result = MPO(factors).hermitian_part()
+    dense = result.to_dense()
+    target = (left * right).to_dense()
+    target = 0.5 * (target + target.conj().T)
+    materialized = MPO(
+        _round_hadamard_mpo_factors(
+            left.factors,
+            right.factors,
+            max_bond=3,
+            matrix_free=False,
+        )
+    ).hermitian_part().to_dense()
+    matrix_free_error = np.linalg.norm(dense - target) / np.linalg.norm(target)
+    materialized_error = np.linalg.norm(materialized - target) / np.linalg.norm(target)
+
+    np.testing.assert_allclose(dense, dense.conj().T, atol=3.0e-12)
+    assert matrix_free_error <= 1.001 * materialized_error
+    assert max(result.bond_orders()) <= 6
 
 
 def test_renormalized_table_python_fallback_applies_raw_entries():

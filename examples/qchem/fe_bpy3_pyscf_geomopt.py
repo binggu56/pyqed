@@ -1,8 +1,8 @@
 """Standalone PySCF RI geometry optimization for [Fe(bpy)3]2+.
 
-This optional driver is intentionally outside pyqed's package code and does not
-import pyqed.  It provides a lightweight Cartesian L-BFGS-B optimizer when the
-usual PySCF geometry optimizers (geomeTRIC/pyberny) are unavailable.
+This optional driver is intentionally outside pyqed's package code. It provides
+a lightweight Cartesian L-BFGS-B optimizer when the usual PySCF geometry
+optimizers (geomeTRIC/pyberny) are unavailable.
 
 The generated geometry is only an initial scaffold.  Prefer ``--xyz`` with a
 reasonable experimental or pre-optimized structure for production work.
@@ -20,8 +20,9 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import minimize
 
+from pyqed.units import angstrom2au
 
-BOHR_PER_ANG = 1.8897261254578281
+BOHR_PER_ANG = angstrom2au
 ANG_PER_BOHR = 1.0 / BOHR_PER_ANG
 
 

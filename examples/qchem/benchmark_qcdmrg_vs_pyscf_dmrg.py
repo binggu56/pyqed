@@ -66,7 +66,7 @@ def _to_scalar_energy(value) -> float:
 def run_pyqed_qcdmrg(case, D: int, nsweeps: int, d_schedule: list[int] | None, use_cholesky: bool):
     mol = Molecule(atom=case["atom"], unit=case["unit"], basis=case["basis"])
     t0 = time.perf_counter()
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run(**({"cholesky_jk": True, "cholesky_tol": 1e-8} if use_cholesky else {}))
     t1 = time.perf_counter()
 
@@ -87,7 +87,7 @@ def run_pyqed_qcdmrg(case, D: int, nsweeps: int, d_schedule: list[int] | None, u
         "build_s": t2 - t1,
         "solve_s": t3 - t2,
         "total_s": t3 - t0,
-        "info": dict(dmrg._active_integral_build_info or {}),
+        "info": dict(dmrg.build_info or {}),
     }
 
 

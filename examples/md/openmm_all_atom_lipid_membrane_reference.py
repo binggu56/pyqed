@@ -29,9 +29,9 @@ from pyqed.md.calculators import (
     _add_pme_reciprocal,
 )
 from pyqed.md.neighborlist import minimum_image
-from pyqed.units import au2kcalmol, au2nm, au2fs, fs
+from pyqed.units import au2angstrom, au2fs, au2kjmol, au2nm, fs
 
-HARTREE_TO_KJ_MOL = au2kcalmol * 4.184
+HARTREE_TO_KJ_MOL = au2kjmol
 
 
 def parse_args():
@@ -140,11 +140,11 @@ def apply_preset(args, argv=None):
 
 def write_pdb(atoms, atom_types, path, positions_bohr=None):
     positions = atoms.get_positions() if positions_bohr is None else np.asarray(positions_bohr, dtype=float)
-    positions_angstrom = positions * 0.529177249
+    positions_angstrom = positions * au2angstrom
     regions = atoms.get_array("regions")
     lipid_ids = atoms.get_array("lipid_ids")
     symbols = atoms.atom_symbols()
-    cell_angstrom = np.asarray(atoms.get_cell().lengths(), dtype=float) * 0.529177249
+    cell_angstrom = np.asarray(atoms.get_cell().lengths(), dtype=float) * au2angstrom
     residue_names = {0: "LIP", 1: "LIP", 2: "HOH", 3: "ION"}
     with open(path, "w") as handle:
         handle.write(
@@ -166,7 +166,7 @@ def write_pdb(atoms, atom_types, path, positions_bohr=None):
 
 def write_xyz(atoms, path, positions_bohr=None, comment=""):
     positions = atoms.get_positions() if positions_bohr is None else np.asarray(positions_bohr, dtype=float)
-    positions_angstrom = positions * 0.529177249
+    positions_angstrom = positions * au2angstrom
     with open(path, "w") as handle:
         handle.write(f"{len(atoms)}\n")
         handle.write(f"{comment}\n")
@@ -454,7 +454,7 @@ def _pyqed_energy_at_positions(atoms, positions_bohr, lj_energy_shift=None):
 
 
 def _append_xyz_frame(handle, atoms, positions_bohr, comment):
-    positions_angstrom = np.asarray(positions_bohr, dtype=float) * 0.529177249
+    positions_angstrom = np.asarray(positions_bohr, dtype=float) * au2angstrom
     handle.write(f"{len(atoms)}\n")
     handle.write(f"{comment}\n")
     for symbol, xyz in zip(atoms.atom_symbols(), positions_angstrom):

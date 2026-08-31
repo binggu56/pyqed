@@ -22,9 +22,9 @@ approximation, which is often the cheapest useful first model.
 import numpy as np
 from opt_einsum import contract
 
-from pyqed.qchem._libcint import CBasis1e
+from pyqed.units import fine_structure
 
-LIGHT_SPEED = 137.03599967994
+LIGHT_SPEED = 1.0 / fine_structure
 
 
 def soc_1e_prefactor(light_speed=None):
@@ -102,20 +102,6 @@ def _get_pyscf_mol(mol):
     raise ValueError("A PySCF Mole object or a pyqed Molecule with topyscf() is required.")
 
 
-def _get_cbasis(mol):
-    """
-    Build a libcint-compatible basis wrapper from a pyqed Molecule.
-    """
-    if getattr(mol, '_bas', None) is None:
-        raise ValueError(
-            "mol._bas is not available. Build the molecule with driver='gbasis' "
-            "before requesting SOC integrals without PySCF."
-        )
-
-    coord_type = getattr(mol._bas[0], 'coord_type', 'spherical')
-    return CBasis1e(mol._bas, mol.atom_symbols(), mol.atom_coords(), coord_type=coord_type)
-
-
 def get_pvxp_ao(mol, one_center=True):
     """
     Raw three-component ``p V x p`` operator in the AO basis.
@@ -134,33 +120,22 @@ def get_pvxp_ao(mol, one_center=True):
     ndarray
         Array of shape ``(3, nao, nao)`` with components ``(x, y, z)``.
     """
-    cbasis = _get_cbasis(mol)
-    mat = np.zeros((3, cbasis.nbfn, cbasis.nbfn), dtype=float)
-    atom_coords = np.asarray(mol.atom_coords(), dtype=float)
-    atom_charges = np.asarray(mol.atom_charges(), dtype=float)
-
-    if one_center:
-        for ia, coord in enumerate(atom_coords):
-            p0, p1 = cbasis.ao_slice_by_atom(ia)
-            # ``int1e_prinvxp`` is not shell-Hermitian, so we need the full
-            # shell-pair evaluation instead of mirroring the lower triangle.
-            w = -atom_charges[ia] * cbasis.int1e(
-                'int1e_prinvxp',
-                components=(3,),
-                inv_origin=coord,
-                hermi=False,
-            )
-            mat[:, p0:p1, p0:p1] = np.moveaxis(w[p0:p1, p0:p1], -1, 0)
-    else:
-        for ia, coord in enumerate(atom_coords):
-            w = -atom_charges[ia] * cbasis.int1e(
-                'int1e_prinvxp',
-                components=(3,),
-                inv_origin=coord,
-                hermi=False,
-            )
-            mat += np.moveaxis(w, -1, 0)
-
+    pmol = _get_pyscf_mol(mol)
+    pmol.build()
+    mat = np.zeros((3, pmol.nao_nr(), pmol.nao_nr()), dtype=float)
+    atom_charges = np.asarray(pmol.atom_charges(), dtype=float)
+    ao_slices = pmol.aoslice_by_atom()
+    for ia in range(pmol.natm):
+        with pmol.with_rinv_as_nucleus(ia):
+            block = -atom_charges[ia] * pmol.intor('int1e_prinvxp', comp=3)
+        if one_center:
+            p0, p1 = ao_slices[ia, 2:4]
+            mat[:, p0:p1, p0:p1] = block[:, p0:p1, p0:p1]
+        else:
+            mat += block
+    if hasattr(mol, 'pyscf_ao_permutation'):
+        permutation = mol.pyscf_ao_permutation(pmol)
+        mat = mat[:, permutation][:, :, permutation]
     return mat
 
 
@@ -196,11 +171,20 @@ def get_soc_2e_somf_ao(mf, dm=None, states=None, with_prefactor=True, light_spee
             f"SOMF density has shape {dm_ao.shape}, expected AO shape {(nao, nao)}."
         )
 
+    permutation = None
+    dm_pyscf = dm_ao
+    if hasattr(mf.mol, 'pyscf_ao_permutation'):
+        permutation = mf.mol.pyscf_ao_permutation(pmol)
+        inverse = np.argsort(permutation)
+        dm_pyscf = dm_ao[np.ix_(inverse, inverse)]
+
     g = pmol.intor('int2e_p1vxp1', comp=3)
-    term1 = contract('xpqrs,rs->xpq', g, dm_ao)
-    term2 = contract('xprsq,rs->xpq', g, dm_ao)
-    term3 = contract('xsqpr,rs->xpq', g, dm_ao)
+    term1 = contract('xpqrs,rs->xpq', g, dm_pyscf)
+    term2 = contract('xprsq,rs->xpq', g, dm_pyscf)
+    term3 = contract('xsqpr,rs->xpq', g, dm_pyscf)
     mat = term1 - 1.5 * term2 - 1.5 * term3
+    if permutation is not None:
+        mat = mat[:, permutation][:, :, permutation]
     if with_prefactor:
         mat = soc_1e_prefactor(light_speed=light_speed) * mat
     return mat

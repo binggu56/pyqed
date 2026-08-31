@@ -17,6 +17,7 @@ from .su2_reduced_tensor import (
     reconstruct_component_block,
 )
 from .su2_two_site import RenormalizedSU2Block
+from .su2_three_site import rotate_reduced_tensors_to_truncated
 
 
 def _infer_site_count(operators: dict[tuple, ReducedSU2Tensor]) -> int:
@@ -46,6 +47,22 @@ def final_reduced_operators(
             int(site_count),
             include_spin=include_spin,
         )
+
+    if hasattr(final, "_su2_detached_parent"):
+        operators = grown_coupling_operators(
+            final.source,
+            include_even_composites=True,
+            even_composites={"Density", "SpinDensity"} if include_spin else {"Density"},
+        )
+        if site_count is None:
+            site_count = _infer_site_count(operators)
+        operators = complete_density_composites(
+            operators,
+            int(site_count),
+            source_block=final._su2_source_renormalized_block,
+            include_spin=include_spin,
+        )
+        return rotate_reduced_tensors_to_truncated(final, operators)
 
     source_block = getattr(final, "_su2_source_renormalized_block", None)
     if source_block is None:

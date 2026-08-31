@@ -16,7 +16,7 @@ from pyqed.qchem.mcscf.casscf import CASSCF
 if __name__ == '__main__':
 
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.4', unit='b', basis='sto3g')
-    mol.build(driver = 'pyscf')
+    mol.build()
     mf = mol.RHF()
 
     # RHF with pcm

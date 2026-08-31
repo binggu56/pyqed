@@ -49,7 +49,7 @@ def atom_string():
 
 def run_pyqed(nstates, pcm_cycles):
     mol = Molecule(atom=atom_string(), unit="angstrom", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
 
     gas = CASCI(mf, ncas=4, nelecas=4).run(nstates=nstates)

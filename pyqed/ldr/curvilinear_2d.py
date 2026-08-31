@@ -10,6 +10,10 @@ from pyqed.phys import gwp
 import os
 from tqdm import tqdm 
 
+from ._legacy import warn_legacy_module
+
+warn_legacy_module("pyqed.ldr.curvilinear_2d")
+
 
 class LDR2_Curvilinear:
     """

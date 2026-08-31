@@ -271,11 +271,11 @@ class FermiHubbard(SpinHalfFermionChain):
         self.h_mpo = MPO(mpo)
         return
 
-    def DMRG(self, D=10):
+    def DMRG(self, init_guess, D=10, **kwargs):
+        """Build a dense DMRG solver from an explicit MPS initial state."""
 
         self.build_h_mpo()
-
-        return DMRG(self.h_mpo.cores, D)
+        return DMRG(self.h_mpo, D, init_guess=init_guess, **kwargs)
 
     def number_operator(self, site_id, spin='up'):
         """

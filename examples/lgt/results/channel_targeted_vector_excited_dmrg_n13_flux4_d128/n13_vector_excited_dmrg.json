@@ -1,0 +1,159 @@
+{
+  "description": "N=13 flux-4 D=128 vector excited-DMRG spatial benchmark",
+  "parameters": {
+    "npts": 13,
+    "length": 10.0,
+    "spacing_length_over_n": 0.7692307692307693,
+    "flux_cutoff": 4,
+    "bond_dim": 128,
+    "half_sweeps": 12,
+    "weights": [
+      0.2,
+      0.2,
+      0.6
+    ],
+    "performance": "packed-compiled-fast",
+    "resume_from_active_root": true
+  },
+  "energies": [
+    -23.302297499749923,
+    -23.282685722044636,
+    -22.368616109034033
+  ],
+  "vector_strengths": [
+    2.421220458301887e-06,
+    3.5423676229826114e-07,
+    0.03995697850471642
+  ],
+  "active_root": 2,
+  "vector_excitation": 0.9336813907158898,
+  "vector_mass": 0.6906350435111035,
+  "continuum_vector_mass": 0.5641895835477563,
+  "ground_cutoff1_history": [],
+  "ground_cutoff4_history": [],
+  "excited_history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energies": [
+        -23.268645782692182,
+        -23.245828798579247,
+        -22.35320671792512
+      ]
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energies": [
+        -23.280368998011337,
+        -23.25656156345455,
+        -22.357644281939685
+      ]
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energies": [
+        -23.267339932856228,
+        -23.24835733557067,
+        -22.352731764960087
+      ]
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energies": [
+        -23.28079824291708,
+        -23.257817090893248,
+        -22.35750479662592
+      ]
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energies": [
+        -23.267466051818936,
+        -23.248494286024577,
+        -22.35269094949113
+      ]
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energies": [
+        -23.28088535079027,
+        -23.25804104352814,
+        -22.357557201686546
+      ]
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energies": [
+        -23.267511749283443,
+        -23.248639114022854,
+        -22.352688831933154
+      ]
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energies": [
+        -23.2809453165284,
+        -23.258199831037956,
+        -22.357573606863557
+      ]
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energies": [
+        -23.267548744035075,
+        -23.248738103669506,
+        -22.352679119832217
+      ]
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energies": [
+        -23.281000099112607,
+        -23.258309778870043,
+        -22.357579648791095
+      ]
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energies": [
+        -23.267575992224735,
+        -23.24881095494887,
+        -22.35266761283011
+      ]
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energies": [
+        -23.28104606257518,
+        -23.258386243244008,
+        -22.357579395430072
+      ]
+    },
+    {
+      "sweep": 12,
+      "direction": "recenter-right",
+      "energies": [
+        -23.302297499749976,
+        -23.282685722044768,
+        -22.368616109034043
+      ]
+    }
+  ],
+  "timing_seconds": {
+    "ground_cutoff1": 0.0,
+    "ground_cutoff4": 0.0,
+    "excited": 1471.7544928328134
+  },
+  "converged": false
+}

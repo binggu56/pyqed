@@ -260,6 +260,21 @@ def test_two_site_narg_fusion_preserves_factorized_state():
     np.testing.assert_allclose(two_site, nearest, atol=1e-12)
 
 
+def test_narg_state_accepts_compact_mps_append_factors():
+    dims = (3, 2, 4)
+    rng = np.random.default_rng(25)
+    first = rng.normal(size=(dims[0], 5, dims[1]))
+    append = rng.normal(size=(5, 6, dims[2]))
+    coeff = rng.normal(size=(1, 6, 2))
+
+    state = narg_state_vector([first, append], coeff, dims=dims, root=1)
+    expected = []
+    for s0, s1, s2 in np.ndindex(*dims):
+        expected.append(first[s0, :, s1] @ append[:, :, s2] @ coeff[0, :, 1])
+
+    np.testing.assert_allclose(state, expected, atol=1e-12)
+
+
 def test_sequential_narg_state_accepts_two_site_growth_tensors():
     dims = (2, 2, 3)
     rng = np.random.default_rng(24)

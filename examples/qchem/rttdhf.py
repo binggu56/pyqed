@@ -10,7 +10,7 @@ mol = Molecule(
     unit="angstrom",
     basis="631g",
 )
-mol.build(driver="gbasis")
+mol.build()
 
 mf = RHF(mol).run()
 

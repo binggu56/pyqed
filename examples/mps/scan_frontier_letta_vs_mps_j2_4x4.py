@@ -158,7 +158,7 @@ def _optimize_mps(
         davidson_max_iter=100,
         noise=0.0,
         recenter_final=False,
-        performance="generic",
+        performance="reference",
     ).run()
     seconds = perf_counter() - start
     directional_history = [

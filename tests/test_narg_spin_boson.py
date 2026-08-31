@@ -1235,7 +1235,7 @@ def test_spin_boson_wilson_mpo_matches_dense_hamiltonian():
         epsilon=0.01,
         delta=0.1,
     )
-    mpo = MPO(spin_boson_wilson_mpo(chain, nboson=3, basis="fock"))
+    mpo = spin_boson_wilson_mpo(chain, nboson=3, basis="fock")
     dense = spin_boson_wilson_hamiltonian(chain, nboson=3, basis="fock")
 
     np.testing.assert_allclose(_mpo_to_dense_operator(mpo), dense, atol=1e-12)

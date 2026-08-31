@@ -9,7 +9,7 @@ mol = Molecule(atom=[
     ["H", (0., 0., 0.)],
 ], basis="631g")
 
-mol.build(driver="builtin", aosym='s8')
+mol.build(aosym='s8')
 mf = mol.RHF().run()
 
 pulse = gaussian_pulse(

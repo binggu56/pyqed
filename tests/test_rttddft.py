@@ -6,7 +6,7 @@ from pyqed.qchem.dft import RKS
 
 def test_rttddft_ground_state_is_stationary_without_field():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='lda').run()
     rt = RTTDDFT(mf).run(dt=0.05, nsteps=5, store_dm=True)

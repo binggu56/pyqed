@@ -380,7 +380,7 @@ def test_dense_and_diagonal_mpo_adapters_match_dense_action():
         .reshape(4, 9)
     )
     identity_mpo = _dense_to_mpo(identity, [2, 3], max_rank=16)
-    identity_result = identity_mpo.matmul(state, chi_max=16)
+    identity_result = identity_mpo.apply(state, max_bond=16)
     np.testing.assert_allclose(
         contract(identity_result.factors),
         dense_state,
@@ -389,7 +389,7 @@ def test_dense_and_diagonal_mpo_adapters_match_dense_action():
 
     diagonal = np.arange(1.0, 7.0).reshape(2, 3)
     diagonal_mpo = _diagonal_mpo(diagonal, max_rank=16)
-    diagonal_result = diagonal_mpo.matmul(state, chi_max=16)
+    diagonal_result = diagonal_mpo.apply(state, max_bond=16)
     np.testing.assert_allclose(
         contract(diagonal_result.factors),
         diagonal * dense_state,

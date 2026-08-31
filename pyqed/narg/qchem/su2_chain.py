@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import math
 import os
 import time
 
@@ -30,6 +31,7 @@ from .su2_three_site import (
     profile_function,
     profile_section,
     reduced_product_tensor_irrep,
+    reduced_product_tensors_irrep,
     reset_su2_profile,
     rotate_reduced_tensors_to_truncated,
     su2_profile_snapshot,
@@ -40,6 +42,8 @@ from .su2_two_site import (
     SectorRoot,
     TruncatedSU2NARG,
     build_renormalized_two_site_block,
+    dress_truncation_with_cc,
+    dress_truncation_with_future_couplings,
     retained_multiplets,
     truncate_to_D,
 )
@@ -54,6 +58,7 @@ from .su2_reduced_tensor import (
 from .su2_core import asarray, full_jw_model
 from .su2_core import Multiplet, cg, local_site_multiplets
 from .su2_backend import resolve_su2_narg_backend
+from .su2_detached import detached_frame_truncation
 
 
 @dataclass
@@ -64,6 +69,21 @@ class SU2ChainResult:
     blocks: dict[int, RenormalizedSU2Block]
     timings: dict[str, object] = field(default_factory=dict)
     backend: dict = field(default_factory=dict)
+
+
+_TRANSIENT_GROWTH_CACHES = (
+    "_su2_product_states_cache",
+    "_su2_scalar_product_cache",
+    "_su2_product_tensor_cache",
+    "_su2_composite_cache",
+)
+
+
+def clear_transient_growth_caches(block: RenormalizedSU2Block) -> None:
+    """Release reconstructible angular scratch data after a growth step."""
+    for name in _TRANSIENT_GROWTH_CACHES:
+        if hasattr(block, name):
+            delattr(block, name)
 
 
 @dataclass(frozen=True)
@@ -736,20 +756,24 @@ def grown_coupling_operators(
     nsites = old_site_indices[-1] + 2
     new_site_index = nsites - 1
 
-    grown = {}
+    requests = []
     local_jw = local_reduced_operator("JW")
     for site_index in old_site_indices:
-        grown[("Cdag", site_index)] = reduced_product_tensor_irrep(
-            source_block,
-            source_block.reduced_operators[("Cdag", site_index)],
-            local_jw,
-            total_rank2=1,
+        requests.append(
+            (
+                ("Cdag", site_index),
+                source_block.reduced_operators[("Cdag", site_index)],
+                local_jw,
+                1,
+            )
         )
-        grown[("Ctilde", site_index)] = reduced_product_tensor_irrep(
-            source_block,
-            source_block.reduced_operators[("Ctilde", site_index)],
-            local_jw,
-            total_rank2=1,
+        requests.append(
+            (
+                ("Ctilde", site_index),
+                source_block.reduced_operators[("Ctilde", site_index)],
+                local_jw,
+                1,
+            )
         )
 
     if include_even_composites:
@@ -766,27 +790,33 @@ def grown_coupling_operators(
         for key, tensor in source_block.reduced_operators.items():
             if not isinstance(key, tuple) or key[0] not in even_composites:
                 continue
-            grown[key] = reduced_product_tensor_irrep(
-                source_block,
-                tensor,
-                local_identity,
-                total_rank2=tensor.op.charge[1],
+            requests.append(
+                (
+                    key,
+                    tensor,
+                    local_identity,
+                    tensor.op.charge[1],
+                )
             )
 
     block_identity = block_identity_reduced_tensor(source_block)
-    grown[("Cdag", new_site_index)] = reduced_product_tensor_irrep(
-        source_block,
-        block_identity,
-        local_reduced_operator("Cdag"),
-        total_rank2=1,
+    requests.append(
+        (
+            ("Cdag", new_site_index),
+            block_identity,
+            local_reduced_operator("Cdag"),
+            1,
+        )
     )
-    grown[("Ctilde", new_site_index)] = reduced_product_tensor_irrep(
-        source_block,
-        block_identity,
-        local_reduced_operator("Ctilde"),
-        total_rank2=1,
+    requests.append(
+        (
+            ("Ctilde", new_site_index),
+            block_identity,
+            local_reduced_operator("Ctilde"),
+            1,
+        )
     )
-    return grown
+    return reduced_product_tensors_irrep(source_block, requests)
 
 
 def reduced_density_tensor(operators: dict[tuple[str, int], ReducedSU2Tensor], i: int, j: int):
@@ -988,85 +1018,94 @@ def complete_density_composites(
     local_jw_ctilde = local_reduced_operator("JWCtilde")
     product_requests = []
 
-    def direct_density(i: int, j: int) -> ReducedSU2Tensor | None:
-        if source_block is None:
-            return None
-        i = int(i)
-        j = int(j)
-        if i < new_site and j < new_site:
-            return grow_source_tensor(
-                source_block,
-                block_density_tensor(source_block, i, j),
-                local_name="I",
-            )
-        if i < new_site and j == new_site:
-            return scale_reduced_tensor(
-                reduced_product_tensor_irrep(
-                    source_block,
-                    source_block.reduced_operators[("Cdag", i)],
-                    local_jw_ctilde,
-                    total_rank2=0,
-                ),
-                np.sqrt(2.0),
-            )
-        if i == new_site and j < new_site:
-            forward = direct_density(j, i)
-            return ReducedSU2Tensor(forward.tensor.adjoint()) if forward is not None else None
-        if i == new_site and j == new_site:
-            return reduced_product_tensor_irrep(
-                source_block,
-                block_identity_reduced_tensor(source_block),
-                local_reduced_operator("Ntot"),
-                total_rank2=0,
-            )
-        return None
-
-    def direct_spin_density(i: int, j: int) -> ReducedSU2Tensor | None:
-        if source_block is None:
-            return None
-        i = int(i)
-        j = int(j)
-        if i < new_site and j < new_site:
-            return grow_source_tensor(
-                source_block,
-                block_spin_density_tensor(source_block, i, j),
-                local_name="I",
-            )
-        if i < new_site and j == new_site:
-            return reduced_product_tensor_irrep(
-                source_block,
-                source_block.reduced_operators[("Cdag", i)],
-                local_jw_ctilde,
-                total_rank2=2,
-            )
-        if i == new_site and j < new_site:
-            forward = direct_spin_density(j, i)
-            return ReducedSU2Tensor(forward.tensor.adjoint()) if forward is not None else None
-        return None
+    if source_block is not None:
+        direct_requests = []
+        local_identity = local_reduced_operator("I")
+        for i in range(int(site_count)):
+            for j in range(int(site_count)):
+                if i == new_site and j < new_site:
+                    continue
+                key = ("Density", i, j)
+                if key not in out:
+                    if i < new_site and j < new_site:
+                        direct_requests.append(
+                            (
+                                key,
+                                block_density_tensor(source_block, i, j),
+                                local_identity,
+                                0,
+                            )
+                        )
+                    elif i < new_site and j == new_site:
+                        direct_requests.append(
+                            (
+                                key,
+                                source_block.reduced_operators[("Cdag", i)],
+                                local_jw_ctilde,
+                                0,
+                                np.sqrt(2.0),
+                            )
+                        )
+                    elif i == new_site and j == new_site:
+                        direct_requests.append(
+                            (
+                                key,
+                                block_identity_reduced_tensor(source_block),
+                                local_reduced_operator("Ntot"),
+                                0,
+                            )
+                        )
+                if not include_spin:
+                    continue
+                key = ("SpinDensity", i, j)
+                if key in out:
+                    continue
+                if i < new_site and j < new_site:
+                    direct_requests.append(
+                        (
+                            key,
+                            block_spin_density_tensor(source_block, i, j),
+                            local_identity,
+                            2,
+                        )
+                    )
+                elif i < new_site and j == new_site:
+                    direct_requests.append(
+                        (
+                            key,
+                            source_block.reduced_operators[("Cdag", i)],
+                            local_jw_ctilde,
+                            2,
+                        )
+                    )
+        if direct_requests:
+            out.update(reduced_product_tensors_irrep(source_block, direct_requests))
+        for i in range(new_site):
+            forward_key = ("Density", i, new_site)
+            reverse_key = ("Density", new_site, i)
+            if reverse_key not in out and forward_key in out:
+                out[reverse_key] = ReducedSU2Tensor(out[forward_key].tensor.adjoint())
+            if include_spin:
+                forward_key = ("SpinDensity", i, new_site)
+                reverse_key = ("SpinDensity", new_site, i)
+                if reverse_key not in out and forward_key in out:
+                    out[reverse_key] = ReducedSU2Tensor(out[forward_key].tensor.adjoint())
 
     for i in range(int(site_count)):
         for j in range(int(site_count)):
             key = ("Density", i, j)
             if key not in out:
-                tensor = direct_density(i, j)
-                if tensor is not None:
-                    out[key] = tensor
-                else:
-                    product_requests.append(
-                        (key, out[("Cdag", i)], out[("Ctilde", j)], 0, np.sqrt(2.0))
-                    )
+                product_requests.append(
+                    (key, out[("Cdag", i)], out[("Ctilde", j)], 0, np.sqrt(2.0))
+                )
             if not include_spin:
                 continue
             key = ("SpinDensity", i, j)
             if key in out:
                 continue
-            tensor = direct_spin_density(i, j)
-            if tensor is not None:
-                out[key] = tensor
-            else:
-                product_requests.append(
-                    (key, out[("Cdag", i)], out[("Ctilde", j)], 2)
-                )
+            product_requests.append(
+                (key, out[("Cdag", i)], out[("Ctilde", j)], 2)
+            )
     if product_requests:
         out.update(coupled_reduced_products(product_requests))
     return out
@@ -1584,13 +1623,36 @@ def update_future_weighted_packages(
         "NextPairAnnihilate",
     }
     odd_prefixes = {"NextV1Spinor", "NextV3Cdag"}
+    carried_requests = []
+    local_identity = local_reduced_operator("I")
+    local_jw = local_reduced_operator("JW")
+    for q in future_sites:
+        for prefix in even_prefixes:
+            key = (prefix, q)
+            carried = source_block.reduced_operators.get(key)
+            if carried is not None:
+                carried_requests.append(
+                    (key, carried, local_identity, carried.op.charge[1])
+                )
+        for prefix in odd_prefixes:
+            key = (prefix, q)
+            carried = source_block.reduced_operators.get(key)
+            if carried is not None:
+                carried_requests.append(
+                    (key, carried, local_jw, carried.op.charge[1])
+                )
+    carried_grown = (
+        reduced_product_tensors_irrep(source_block, carried_requests)
+        if carried_requests
+        else {}
+    )
+
     for q in future_sites:
         for prefix in even_prefixes:
             key = (prefix, q)
             terms = []
-            carried = source_block.reduced_operators.get(key)
-            if carried is not None:
-                terms.append(grow_source_tensor(source_block, carried, local_name="I"))
+            if key in carried_grown:
+                terms.append(carried_grown[key])
             if key in new_involving:
                 terms.append(new_involving[key])
             total = add_optional_reduced_terms(terms)
@@ -1599,9 +1661,8 @@ def update_future_weighted_packages(
         for prefix in odd_prefixes:
             key = (prefix, q)
             terms = []
-            carried = source_block.reduced_operators.get(key)
-            if carried is not None:
-                terms.append(grow_source_tensor(source_block, carried, local_name="JW"))
+            if key in carried_grown:
+                terms.append(carried_grown[key])
             if key in new_involving:
                 terms.append(new_involving[key])
             total = add_optional_reduced_terms(terms)
@@ -1622,6 +1683,11 @@ def reduced_coupling_operators_from_growth(
     project_v1_packages: bool = False,
     carry_rdm_operators: bool = False,
     carry_spin_rdm_operators: bool = False,
+    future_cc: bool = False,
+    future_cc_level_shift: float = 0.1,
+    future_cc_response_tol: float = 1.0e-10,
+    future_cc_max_responses: int | None = None,
+    future_cc_strength: float = 0.1,
     rotate: bool = True,
 ) -> dict[tuple, ReducedSU2Tensor]:
     """Grow, optionally compose, and rotate reduced operators after truncation."""
@@ -1676,12 +1742,24 @@ def reduced_coupling_operators_from_growth(
         if h1e is not None
         else {}
     )
+    if future_cc and rotate and weighted:
+        dress_truncation_with_future_couplings(
+            truncated,
+            weighted,
+            level_shift=future_cc_level_shift,
+            response_tol=future_cc_response_tol,
+            max_responses=future_cc_max_responses,
+            strength=future_cc_strength,
+        )
     tensors = {**grown, **weighted}
     if rotate:
+        grown.clear()
+        weighted.clear()
         return rotate_reduced_tensors_to_truncated(
             truncated,
             tensors,
             backend=backend,
+            consume=True,
         )
 
     selected = set(truncated.site.irreps)
@@ -1846,6 +1924,21 @@ def renormalized_block_from_narg(
     project_v1_packages: bool = False,
     carry_rdm_operators: bool = False,
     carry_spin_rdm_operators: bool = False,
+    future_cc: bool = False,
+    future_cc_level_shift: float = 0.1,
+    future_cc_response_tol: float = 1.0e-10,
+    future_cc_max_responses: int | None = None,
+    future_cc_strength: float = 0.1,
+    detached_frames: bool = False,
+    detached_chi: int | None = None,
+    frame_adapt_tol: float | None = None,
+    frame_max_dim: int | None = None,
+    frame_expand_dim: int = 1,
+    frame_protect_dim: int | None = None,
+    detached_cc: bool = False,
+    cc_level_shift: float = 0.0,
+    cc_response_tol: float = 1.0e-10,
+    cc_max_responses: int | None = None,
     retain_all: bool = False,
 ) -> RenormalizedSU2Block:
     """Truncate a grown SU2-NARG object and attach reduced coupling operators."""
@@ -1915,6 +2008,30 @@ def renormalized_block_from_narg(
             transform,
             hamiltonian,
         )
+    elif detached_frames:
+        if isinstance(D, AdaptiveD):
+            raise ValueError("SU2 detached frames currently require a fixed integer D")
+        if detached_chi is None:
+            raise ValueError("SU2 detached frames require chi")
+        with profile_section("detached_frame_truncation"):
+            truncated = detached_frame_truncation(
+                narg,
+                frame_dim=int(D),
+                chi=int(detached_chi),
+                baseline=None,
+                adapt_tol=frame_adapt_tol,
+                max_frame_rank=frame_max_dim,
+                expand_dim=frame_expand_dim,
+                protect_per_branch=frame_protect_dim,
+            )
+        if detached_cc:
+            with profile_section("detached_cc_response"):
+                truncated = dress_truncation_with_cc(
+                    truncated,
+                    level_shift=cc_level_shift,
+                    response_tol=cc_response_tol,
+                    max_responses=cc_max_responses,
+                )
     else:
         scorer = adaptive_root_scorer(
             D,
@@ -1942,6 +2059,11 @@ def renormalized_block_from_narg(
         project_v1_packages=project_v1_packages,
         carry_rdm_operators=carry_rdm_operators,
         carry_spin_rdm_operators=carry_spin_rdm_operators,
+        future_cc=future_cc,
+        future_cc_level_shift=future_cc_level_shift,
+        future_cc_response_tol=future_cc_response_tol,
+        future_cc_max_responses=future_cc_max_responses,
+        future_cc_strength=future_cc_strength,
         rotate=not retain_all,
     )
     block = RenormalizedSU2Block(
@@ -1956,6 +2078,26 @@ def renormalized_block_from_narg(
     block._su2_requested_D = D
     block._su2_chosen_D = len(truncated.kept_roots)
     block._su2_exact_basis = bool(retain_all)
+    block._su2_future_cc_diagnostics = getattr(
+        truncated,
+        "_su2_future_cc_diagnostics",
+        None,
+    )
+    block._su2_detached_diagnostics = getattr(
+        truncated,
+        "_su2_detached_diagnostics",
+        None,
+    )
+    block._su2_target_truncated = getattr(
+        truncated,
+        "_su2_target_truncated",
+        truncated,
+    )
+    block._su2_cc_diagnostics = getattr(
+        truncated,
+        "_su2_cc_diagnostics",
+        None,
+    )
     return block
 
 
@@ -2002,12 +2144,27 @@ def run_su2_narg_chain(
     target_nelec: int | None = None,
     target_j2: int | None = None,
     backend=None,
+    threads: int | None = None,
     low_rank_eri: LowRankERI | str | bool | None = None,
     build_branch_basis: bool = False,
     project_growth_hamiltonian: bool = False,
     project_v1_packages: bool = True,
     carry_rdm_operators: bool = False,
     carry_spin_rdm_operators: bool = False,
+    dressing: str | None = None,
+    future_cc_level_shift: float = 0.1,
+    future_cc_response_tol: float = 1.0e-10,
+    future_cc_max_responses: int | None = None,
+    future_cc_strength: float = 0.1,
+    chi: int | None = None,
+    n0: int | None = None,
+    frame_adapt_tol: float | None = None,
+    frame_max_dim: int | None = None,
+    frame_expand_dim: int = 1,
+    frame_protect_dim: int | None = None,
+    cc_level_shift: float = 0.0,
+    cc_response_tol: float = 1.0e-10,
+    cc_max_responses: int | None = None,
     cluster_boundaries: tuple[int, ...] | None = None,
 ) -> SU2ChainResult:
     """Grow a direct-reduced SU(2)-NARG chain.
@@ -2022,6 +2179,57 @@ def run_su2_narg_chain(
     target_nelec = final_size if target_nelec is None else int(target_nelec)
     if final_size < 2:
         raise ValueError("final_size must be at least 2")
+    dressing_key = "none" if dressing is None else str(dressing).lower().replace("-", "_")
+    if dressing_key in {"none", "off", "false"}:
+        dressing_key = "none"
+    elif dressing_key in {"future_cc", "environment_cc", "lookahead_cc"}:
+        dressing_key = "future_cc"
+    elif dressing_key in {"detached", "detached_frame", "detached_frames"}:
+        dressing_key = "detached_frames"
+    elif dressing_key in {
+        "detached+cc",
+        "detached_cc",
+        "detached_frames_cc",
+        "cc_detached",
+    }:
+        dressing_key = "detached_cc"
+    else:
+        raise ValueError(
+            "SU2-NARG dressing must be None, 'future_cc', 'detached_frames', or 'detached_cc'"
+        )
+    if dressing_key in {"detached_frames", "detached_cc"}:
+        fixed_dimensions = [
+            int(spec)
+            for size, spec in D_by_size.items()
+            if int(size) < final_size and not isinstance(spec, AdaptiveD)
+        ]
+        if any(isinstance(spec, AdaptiveD) for spec in D_by_size.values()):
+            raise ValueError("SU2 detached frames currently require fixed integer D")
+        frame_capacity = max(fixed_dimensions, default=1)
+        if chi is None:
+            chi = 16 * frame_capacity
+        if int(chi) < 1:
+            raise ValueError("SU2 detached frames require a positive chi")
+        if n0 is None:
+            # Four local Fock states: the first n0 - 1 orbitals must be able
+            # to host four mutually orthogonal rank-D conditional frames.
+            required = 2 + int(math.ceil(math.log(max(frame_capacity, 1), 4)))
+            n0 = min(required, max(2, final_size - 2))
+        n0 = int(n0)
+        if n0 < 2 or n0 >= final_size:
+            raise ValueError("SU2 detached-frame n0 must satisfy 2 <= n0 < final_size")
+        if frame_adapt_tol is not None and float(frame_adapt_tol) < 0.0:
+            raise ValueError("frame_adapt_tol must be non-negative")
+        if frame_max_dim is not None and int(frame_max_dim) < 1:
+            raise ValueError("frame_max_dim must be positive")
+        if int(frame_expand_dim) < 1:
+            raise ValueError("frame_expand_dim must be positive")
+        if frame_protect_dim is not None and int(frame_protect_dim) < 0:
+            raise ValueError("frame_protect_dim must be non-negative")
+        if float(cc_level_shift) < 0.0 or float(cc_response_tol) < 0.0:
+            raise ValueError("CC level shift and response tolerance must be non-negative")
+        if cc_max_responses is not None and int(cc_max_responses) < 1:
+            raise ValueError("cc_max_responses must be positive")
     if cluster_boundaries is None:
         cluster_boundaries = tuple(range(2, final_size + 1))
     else:
@@ -2033,7 +2241,7 @@ def run_su2_narg_chain(
         ):
             raise ValueError("cluster_boundaries must lie between 2 and final_size")
     cluster_boundary_set = set(cluster_boundaries)
-    backend = resolve_su2_narg_backend(backend)
+    backend = resolve_su2_narg_backend(backend, threads=threads)
     if project_growth_hamiltonian:
         build_branch_basis = True
     if low_rank_eri is None:
@@ -2058,6 +2266,12 @@ def run_su2_narg_chain(
         "exact_internal_sizes": tuple(
             size for size in range(2, final_size) if size not in cluster_boundary_set
         ),
+        "dressing": dressing_key,
+        "n0": n0 if dressing_key in {"detached_frames", "detached_cc"} else None,
+        "chi": int(chi) if chi is not None else None,
+        "future_cc_by_size": {},
+        "detached_by_size": {},
+        "cc_by_size": {},
     }
     blocks: dict[int, RenormalizedSU2Block] = {}
     reset_su2_profile()
@@ -2065,7 +2279,7 @@ def run_su2_narg_chain(
     start = time.perf_counter()
     # The two-site seed lies inside a larger first supersite when size 2 is
     # not a cluster boundary, so retain its complete ten-multiplet basis.
-    d2 = (
+    d2 = 10 if dressing_key in {"detached_frames", "detached_cc"} else (
         seed_D_from_spec(D_by_size.get(2, 10))
         if 2 in cluster_boundary_set
         else 10
@@ -2126,7 +2340,15 @@ def run_su2_narg_chain(
 
         if nsites < final_size:
             start = time.perf_counter()
-            if nsites in cluster_boundary_set:
+            exact_seed = (
+                dressing_key in {"detached_frames", "detached_cc"}
+                and nsites <= int(n0)
+            )
+            exact_cluster_interior = nsites not in cluster_boundary_set
+            retain_all = exact_seed or exact_cluster_interior
+            if retain_all:
+                retain = sum(int(dim) for dim in final.site.dims.values())
+            elif nsites in cluster_boundary_set:
                 retain = D_by_size[nsites]
             else:
                 # Keeping every feasible multiplet makes the internal growth an
@@ -2148,11 +2370,70 @@ def run_su2_narg_chain(
                 project_v1_packages=project_v1_packages,
                 carry_rdm_operators=carry_rdm_operators,
                 carry_spin_rdm_operators=carry_spin_rdm_operators,
-                retain_all=nsites not in cluster_boundary_set,
+                future_cc=dressing_key == "future_cc",
+                future_cc_level_shift=future_cc_level_shift,
+                future_cc_response_tol=future_cc_response_tol,
+                future_cc_max_responses=future_cc_max_responses,
+                future_cc_strength=future_cc_strength,
+                detached_frames=(
+                    dressing_key in {"detached_frames", "detached_cc"}
+                    and not retain_all
+                ),
+                detached_chi=chi,
+                frame_adapt_tol=frame_adapt_tol,
+                frame_max_dim=frame_max_dim,
+                frame_expand_dim=frame_expand_dim,
+                frame_protect_dim=frame_protect_dim,
+                detached_cc=dressing_key == "detached_cc" and not retain_all,
+                cc_level_shift=cc_level_shift,
+                cc_response_tol=cc_response_tol,
+                cc_max_responses=cc_max_responses,
+                retain_all=retain_all,
             )
             timings[f"renormalize_{nsites}"] = time.perf_counter() - start
             timings["kept_by_size"][nsites] = len(blocks[nsites].truncated.kept_roots)
+            if blocks[nsites]._su2_future_cc_diagnostics is not None:
+                timings["future_cc_by_size"][nsites] = dict(
+                    blocks[nsites]._su2_future_cc_diagnostics
+                )
+            if blocks[nsites]._su2_detached_diagnostics is not None:
+                timings["detached_by_size"][nsites] = dict(
+                    blocks[nsites]._su2_detached_diagnostics
+                )
+            if blocks[nsites]._su2_cc_diagnostics is not None:
+                timings["cc_by_size"][nsites] = dict(
+                    blocks[nsites]._su2_cc_diagnostics
+                )
+            clear_transient_growth_caches(source)
             source = blocks[nsites]
+        else:
+            if dressing_key in {"detached_frames", "detached_cc"}:
+                start = time.perf_counter()
+                final_D = int(D_by_size[max(D_by_size)])
+                final._su2_detached_required_irrep = Irrep(
+                    (int(target_nelec), int(target_j2))
+                )
+                parent = detached_frame_truncation(
+                    final,
+                    frame_dim=final_D,
+                    chi=int(chi),
+                    baseline=None,
+                    adapt_tol=frame_adapt_tol,
+                    max_frame_rank=frame_max_dim,
+                    expand_dim=frame_expand_dim,
+                    protect_per_branch=frame_protect_dim,
+                )
+                target = parent._su2_target_truncated
+                target._su2_detached_parent = parent
+                target._su2_source_renormalized_block = source
+                target._su2_detached_diagnostics = parent._su2_detached_diagnostics
+                final = target
+                timings["detached_by_size"][nsites] = dict(
+                    parent._su2_detached_diagnostics
+                )
+                timings["final_target_dim"] = len(target.kept_roots)
+                timings[f"renormalize_{nsites}"] = time.perf_counter() - start
+            clear_transient_growth_caches(source)
 
     if final is None:
         raise RuntimeError("chain growth did not produce a final NARG object")

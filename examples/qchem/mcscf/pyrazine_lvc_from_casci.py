@@ -44,12 +44,6 @@ def parse_args():
     )
     parser.add_argument("--basis", default="sto-3g", help="AO basis for RHF, Hessian, and CASCI.")
     parser.add_argument(
-        "--driver",
-        default="gbasis",
-        choices=("gbasis", "builtin"),
-        help="Integral backend for the RHF/CASCI derivative calculation.",
-    )
-    parser.add_argument(
         "--reference-geometry",
         default="pyscf-casscf-opt",
         choices=("input", "pyscf-rhf-opt", "pyscf-casscf-opt"),
@@ -138,7 +132,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_pyrazine(basis, driver, eri, coords=None):
+def build_pyrazine(basis, eri, coords=None):
     atom = PYRAZINE_GEOMETRY_BOHR
     if coords is not None:
         coords = np.asarray(coords, dtype=float)
@@ -147,15 +141,12 @@ def build_pyrazine(basis, driver, eri, coords=None):
             for row, (x, y, z) in zip(PYRAZINE_GEOMETRY_BOHR, coords)
         ]
     mol = Molecule(atom=atom, unit="bohr", basis=basis)
-    if driver == "builtin":
-        mol.build(driver="builtin", eri=eri)
-    else:
-        mol.build(driver=driver)
+    mol.build(eri=eri)
     return mol
 
 
 def run_reference(coords, args):
-    mol = build_pyrazine(args.basis, args.driver, args.eri, coords=coords)
+    mol = build_pyrazine(args.basis, args.eri, coords=coords)
     mf = mol.RHF().run()
     if args.mc_method == "casscf":
         from pyqed.qchem.mcscf.casscf import CASSCF
@@ -355,14 +346,14 @@ def main():
     args = parse_args()
 
     print("Building pyrazine molecule...", flush=True)
-    mol = build_pyrazine(args.basis, args.driver, args.eri)
+    mol = build_pyrazine(args.basis, args.eri)
     opt_history = []
     opt_result = None
     if args.reference_geometry != "input":
         method_label = "CASSCF" if args.reference_geometry == "pyscf-casscf-opt" else "RHF"
         print(f"Optimizing S0 reference geometry with PySCF {method_label} gradients...", flush=True)
         coords, opt_result, opt_history = optimize_reference_geometry_pyscf(mol.atom_coords(), args)
-        mol = build_pyrazine(args.basis, args.driver, args.eri, coords=coords)
+        mol = build_pyrazine(args.basis, args.eri, coords=coords)
 
     modes, frequencies_au, frequencies_cm1, mode_indices = get_modes(mol, args)
 
@@ -396,7 +387,7 @@ def main():
     print()
     print("Pyrazine two-mode LVC.from_casci benchmark")
     print(f"  basis: {args.basis}")
-    print(f"  driver: {args.driver}")
+    print("  integral engine: native")
     print(f"  reference geometry: {args.reference_geometry}")
     if opt_result is not None and opt_history:
         last_opt = opt_history[-1]

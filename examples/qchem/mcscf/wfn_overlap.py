@@ -14,7 +14,7 @@ if __name__ == "__main__":
     mol = Molecule(atom = [
     ['Li' , (0. , 0. , 0)],
     ['F' , (0. , 0. , 1)], ], basis = 'sto6g')
-    mol.build(driver='gbasis')
+    mol.build()
     
     # mol.molecular_frame()
     # print(mol.atom_coords())
@@ -41,7 +41,7 @@ if __name__ == "__main__":
     ['F' , (0. , 0. , 1.2)], ], basis = 'sto6g')
 
     # mol.unit = 'b'
-    mol2.build(driver='gbasis')
+    mol2.build()
 
     mf2 = mol2.RHF().run()
     mc2 = CASSCF(mf2, ncas, nelecas)

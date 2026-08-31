@@ -605,6 +605,7 @@ def svd_two_site(
     two_site,
     max_bond=None,
     cutoff=1e-10,
+    max_truncation_error=None,
     absorb="right",
     bond_coupling="left",
     max_bond_mode="reduced",
@@ -615,6 +616,10 @@ def svd_two_site(
 ):
     """
     Reduced SVD/truncation helper for a merged two-site tensor.
+
+    ``max_truncation_error`` selects the smallest retained reduced rank whose
+    relative discarded squared norm meets the requested bound. ``max_bond``
+    remains a hard ceiling when both are provided.
     """
     if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
         raise ValueError("svd_two_site expects a rank-4 NonabelianTensor.")
@@ -708,7 +713,11 @@ def svd_two_site(
         if sweep_engine is None
         else getattr(sweep_engine, "blockwise_svd", None)
     )
-    if cpp_blockwise_svd is not None and metric_factor_maps is None:
+    if (
+        cpp_blockwise_svd is not None
+        and metric_factor_maps is None
+        and max_truncation_error is None
+    ):
         ordered_sectors = list(sector_projections)
         matrices = []
         inverse_right_scales = []
@@ -784,6 +793,7 @@ def svd_two_site(
             sector_svds,
             cutoff=cutoff,
             max_bond=max_bond,
+            max_truncation_error=max_truncation_error,
             mode=max_bond_mode,
             retain_sector_topology=retain_sector_topology,
         )

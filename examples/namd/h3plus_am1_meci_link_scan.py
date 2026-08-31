@@ -20,9 +20,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pyqed.units import au2ev
 from pyqed.namd.triatomic import Triatom
 
-HARTREE_TO_EV = 27.211386245988
+HARTREE_TO_EV = au2ev
 
 
 def h3plus_body_frame(r=1.65, theta=np.pi / 3.0):

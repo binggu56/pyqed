@@ -1,8 +1,19 @@
 import numpy as np
 
 from pyqed.dvr import DVR
-from pyqed.ldr import LDR
+from pyqed.ldr import AbInitioFit, Coord, LDR
+from pyqed.ldr import keo as keo_tools
 from pyqed.ldr import overlap
+
+
+def _coord(grid, to_cartesian=None):
+    return Coord(
+        to_cartesian=to_cartesian,
+        bounds=tuple(
+            (float(np.min(axis)), float(np.max(axis)))
+            for axis in grid.x
+        ),
+    )
 
 
 def _diabatic_model():
@@ -62,12 +73,41 @@ class _ElectronicDriver(_ElectronicResult):
         return _ElectronicScanner()
 
 
+class _Molecule:
+    natom = 3
+
+    def atom_mass_list(self):
+        return np.asarray((1.0, 16.0, 1.0))
+
+    def set_geom(self, geometry):
+        self.geometry = np.asarray(geometry)
+
+    def build(self):
+        return self
+
+
+class _MolecularScanner:
+    def __call__(self, _molecule):
+        return _ElectronicResult((0.0, 0.1), np.eye(2))
+
+
+class _MolecularElectronicDriver(_ElectronicResult):
+    def __init__(self):
+        super().__init__((0.0, 0.1), np.eye(2))
+        self.nstates = 2
+        self.mol = _Molecule()
+
+    def as_scanner(self, nstates=None):
+        assert nstates == 2
+        return _MolecularScanner()
+
+
 def test_electronic_driver_builds_energies_and_links():
     grid = DVR([(-1.0, 1.0)], [3], mass=2.0)
     solver = LDR(
         _ElectronicDriver(),
         grid=grid,
-        geometry=lambda q: q,
+        coord=_coord(grid, lambda q: q),
         states=(1, 2),
     )
 
@@ -91,14 +131,14 @@ def test_parallel_electronic_build_matches_serial_ordering():
     serial = LDR(
         _ElectronicDriver(),
         grid=grid,
-        geometry=lambda q: q,
+        coord=_coord(grid, lambda q: q),
         states=(1, 2),
     ).build()
     completed = []
     parallel = LDR(
         _ElectronicDriver(),
         grid=grid,
-        geometry=lambda q: q,
+        coord=_coord(grid, lambda q: q),
         states=(1, 2),
     ).build(
         n_workers=2,
@@ -113,6 +153,85 @@ def test_parallel_electronic_build_matches_serial_ordering():
         np.testing.assert_allclose(parallel.links[key], serial.links[key])
     assert sorted(count for count, _total, _index in completed) == list(range(1, 6))
     assert all(total == 5 for _count, total, _index in completed)
+
+
+def test_direct_product_infers_shift_from_multidimensional_anchor(tmp_path):
+    grid = DVR([(-1.0, 1.0), (-0.5, 0.5)], [3, 4], mass=2.0)
+    with AbInitioFit(
+        _ElectronicDriver(),
+        coord=_coord(grid, lambda q: q),
+        states=(1, 2),
+        database=tmp_path / "electronic.sqlite",
+    ) as fit:
+        solver = fit.direct_product(
+            grid,
+            keo=keo_tools.cartesian(grid.axes, masses=2.0),
+        )
+
+    assert solver.energies.shape == (*grid.shape, 2)
+    anchor = tuple(size // 2 for size in grid.shape)
+    np.testing.assert_allclose(np.min(solver.energies[anchor]), 0.0)
+
+
+def test_coord_and_zero_argument_podolsky_build_from_molecule():
+    import jax
+    from jax import numpy as jnp
+
+    grid = DVR([(-0.5, 0.5), (-0.5, 0.5)], [2, 2], mass=1.0)
+
+    def geometry(q):
+        first = 2.3 + 0.1 * q[0]
+        second = 2.5 + 0.1 * q[1]
+        angle = 1.9
+        return jnp.stack(
+            (
+                jnp.stack((-first, 0.0 * first, 0.0 * first)),
+                jnp.zeros(3),
+                jnp.stack(
+                    (
+                        second * jnp.cos(angle),
+                        second * jnp.sin(angle),
+                        0.0 * second,
+                    )
+                ),
+            )
+        )
+
+    solver = LDR(
+        _MolecularElectronicDriver(),
+        grid=grid,
+        coord=_coord(grid, geometry),
+        states=(0, 1),
+        keo=keo_tools.podolsky(),
+    )
+    x64_before = bool(jax.config.x64_enabled)
+    assert solver.keo is None
+    solver.build()
+
+    assert bool(jax.config.x64_enabled) is x64_before
+    assert isinstance(solver.keo, keo_tools.MPOComponents)
+    assert solver.keo.shape == (grid.size, grid.size)
+    assert solver.keo.metric.shape == (*grid.shape, grid.ndim, grid.ndim)
+    assert solver.keo.pseudopotential.shape == grid.shape
+    assert np.all(np.isfinite(solver.keo.to_dense()))
+
+
+def test_podolsky_false_or_none_omits_pseudopotential():
+    grid = DVR([(-0.5, 0.5)], [3], mass=1.0)
+    coord = _coord(grid)
+    metric = np.ones((*grid.shape, 1, 1))
+    zero = np.zeros(grid.shape)
+
+    explicit_zero = keo_tools.podolsky(
+        metric=metric,
+        pseudopotential=zero,
+    ).bind(coord, grid=grid)
+    for disabled in (False, None):
+        without = keo_tools.podolsky(
+            metric=metric,
+            pseudopotential=disabled,
+        ).bind(coord, grid=grid)
+        np.testing.assert_allclose(without.to_dense(), explicit_zero.to_dense())
 
 
 def test_diabatic_and_local_ldr_hamiltonians_are_unitarily_equivalent():
@@ -165,6 +284,37 @@ def test_static_interval_propagation_matches_stepwise_exponential():
 
     np.testing.assert_allclose(interval.times, stepwise.times)
     np.testing.assert_allclose(interval.states, stepwise.states, atol=1.0e-12)
+
+
+def test_matrix_free_propagation_accepts_a_nuclear_cap():
+    from scipy.linalg import expm
+
+    dvr, potential = _diabatic_model()
+    solver = LDR(dvr, 2).set_diabatic(potential, representation="links")
+    state = np.arange(1, solver.size + 1, dtype=float).astype(complex)
+    state /= np.linalg.norm(state)
+    absorber = np.linspace(0.0, 0.12, dvr.size)
+    dt = 0.04
+    steps = 3
+
+    hamiltonian = solver.hamiltonian()
+    full_cap = np.repeat(absorber, solver.nstates)
+    expected = expm(-1j * dt * steps * (hamiltonian - 1j * np.diag(full_cap))) @ state
+    solver.run(
+        state,
+        dt=dt,
+        nsteps=steps,
+        nout=steps,
+        matrix_free=True,
+        absorber=absorber,
+    )
+
+    np.testing.assert_allclose(solver.state.reshape(-1), expected, atol=2.0e-12)
+    np.testing.assert_allclose(
+        solver.absorbed_probability,
+        1.0 - solver.norm,
+        atol=2.0e-12,
+    )
 
 
 def test_density_propagation_with_qme_alias_removed():
@@ -247,6 +397,54 @@ def test_wavepacket_uses_overlap_phase_gauge():
     np.testing.assert_allclose(packet[:, 0], phases.conj() / 2.0)
     np.testing.assert_allclose(packet[:, 1], 0.0)
     np.testing.assert_allclose(np.linalg.norm(packet), 1.0)
+
+    full = overlap.from_frames(frames)
+    direct = LDR(dvr, 2, overlaps=full)
+    direct_packet = direct.wavepacket(np.ones(dvr.shape), state=0, anchor=(0,))
+    np.testing.assert_allclose(direct_packet, packet)
+
+
+def test_wavepacket_phase_gauge_can_be_limited_to_packet_support():
+    dvr = DVR([(-1.0, 1.0)], [4], mass=3.0)
+    links = {
+        (0, (0,)): np.diag((-1.0, 1.0)),
+        (0, (1,)): np.diag((1.0j, 1.0)),
+        (0, (2,)): np.asarray(((0.0, 1.0), (1.0, 0.0))),
+    }
+    solver = LDR(dvr, 2, links=links)
+
+    packet = solver.wavepacket(
+        np.asarray((1.0, 1.0, 0.0, 0.0)),
+        state=0,
+        anchor=(0,),
+        support_threshold=1.0e-12,
+    )
+
+    np.testing.assert_allclose(
+        packet[:, 0],
+        np.asarray((1.0, -1.0, 0.0, 0.0)) / np.sqrt(2.0),
+    )
+    np.testing.assert_allclose(packet[:, 1], 0.0)
+
+
+def test_wavepacket_follows_energy_order_when_tracked_roots_exchange():
+    dvr = DVR([(-1.0, 1.0)], [4], mass=3.0)
+    energies = np.asarray(
+        ((0.0, 1.0), (0.2, 0.8), (0.8, 0.2), (1.0, 0.0))
+    )
+    links = {
+        (0, (0,)): np.eye(2),
+        (0, (1,)): np.asarray(((0.0, 1.0), (1.0, 0.0))),
+        (0, (2,)): np.eye(2),
+    }
+    solver = LDR(dvr, 2, energies=energies, links=links)
+
+    packet = solver.wavepacket(np.ones(dvr.shape), state=1)
+
+    expected = np.zeros((4, 2))
+    expected[:2, 1] = 0.5
+    expected[2:, 0] = 0.5
+    np.testing.assert_allclose(packet, expected)
 
 
 def test_thermal_density_is_normalized():

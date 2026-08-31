@@ -6,6 +6,7 @@ from .overlap import (
     overlap,
     unitary_overlap,
     biorthogonal_overlap,
+    su2_biorthogonal_overlap,
     biorthogonal_overlap_diagnostics,
     automatic_overlap,
 )

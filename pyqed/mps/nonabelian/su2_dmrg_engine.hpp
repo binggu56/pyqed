@@ -1218,6 +1218,7 @@ struct RawInputSuperchannel {
     std::vector<RawExecutionBatch> batches;
     std::vector<std::uint32_t> unique_left_actions;
     std::vector<std::uint32_t> unique_left_row_offsets;
+    std::vector<std::int32_t> persistent_product_slots;
     std::int64_t unique_left_rows = 0;
     std::size_t cached_unique_left_offset =
         std::numeric_limits<std::size_t>::max();
@@ -1277,6 +1278,14 @@ struct RawOutputFusionBatch {
     bool singleton_outputs = false;
     bool shared_right_panels = false;
     bool deferred_outputs = false;
+    bool direct_channel_fusion = false;
+    bool persistent_output_only = false;
+};
+
+struct RawChannelFusionTask {
+    std::uint32_t batch = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t channel_action_offset = 0;
 };
 
 struct RawOutputFusionGroup {
@@ -1289,6 +1298,64 @@ struct RawOutputFusionGroup {
     std::size_t right_offset =
         std::numeric_limits<std::size_t>::max();
     std::uint32_t tile_count = 0;
+    bool persistent_output = false;
+};
+
+struct RawPersistentOutputBinding {
+    std::uint32_t wave = 0;
+    std::uint32_t batch = 0;
+    std::uint32_t binding = 0;
+    std::uint32_t channel_action_offset = 0;
+};
+
+struct RawPersistentOutputReference {
+    std::uint32_t wave = 0;
+    std::uint32_t group = 0;
+    std::uint32_t binding_start = 0;
+    std::uint32_t binding_stop = 0;
+    std::int64_t group_k_offset = 0;
+};
+
+struct RawPersistentOutputGroup {
+    std::uint32_t reference_start = 0;
+    std::uint32_t reference_stop = 0;
+    std::uint64_t work = 0;
+    std::int64_t output_offset = 0;
+    std::int64_t la = 0;
+    std::int64_t dq = 0;
+    std::int64_t total_k = 0;
+    std::size_t right_offset =
+        std::numeric_limits<std::size_t>::max();
+    bool combined = false;
+};
+
+struct RawPersistentProductCacheEntry {
+    std::uint32_t channel = 0;
+    std::uint32_t action = 0;
+    std::int64_t rows = 0;
+    std::int64_t cols = 0;
+    std::size_t value_offset = 0;
+};
+
+struct RawPersistentRightCacheEntry {
+    std::uint32_t action = 0;
+    std::int64_t rows = 0;
+    std::int64_t cols = 0;
+    std::size_t value_offset = 0;
+};
+
+struct RawPersistentOutputBundle {
+    std::uint32_t group_start = 0;
+    std::uint32_t group_stop = 0;
+    std::uint64_t work = 0;
+};
+
+struct RawPersistentOutputTask {
+    std::uint32_t group = 0;
+    std::uint32_t reference_start = 0;
+    std::uint32_t reference_stop = 0;
+    std::uint64_t work = 0;
+    bool combined = false;
 };
 
 struct RawSharedRightBinding {
@@ -1323,6 +1390,7 @@ struct RawOutputFusionWave {
     std::vector<std::uint32_t> shared_right_tile_bindings;
     std::vector<RawSharedRightPanel> shared_right_panels;
     std::vector<std::size_t> shared_right_deferred_output_offsets;
+    std::vector<RawChannelFusionTask> channel_fusion_tasks;
     std::size_t temporary_elements = 0;
     std::size_t right_elements = 0;
     std::size_t shared_right_input_elements = 0;
@@ -1333,6 +1401,8 @@ struct RawOutputFusionWave {
     std::size_t shared_left_output_elements = 0;
     std::size_t grouped_product_right_elements = 0;
     std::size_t persistent_right_offset = 0;
+    long double channel_fusion_work = 0.0L;
+    bool channel_left_ready = false;
 
     std::size_t memory_bytes() const noexcept {
         return batches.capacity() * sizeof(RawOutputFusionBatch)
@@ -1353,7 +1423,9 @@ struct RawOutputFusionWave {
             + shared_right_panels.capacity()
                 * sizeof(RawSharedRightPanel)
             + shared_right_deferred_output_offsets.capacity()
-                * sizeof(std::size_t);
+                * sizeof(std::size_t)
+            + channel_fusion_tasks.capacity()
+                * sizeof(RawChannelFusionTask);
     }
 };
 
@@ -1610,6 +1682,13 @@ using HalfSweepBondExecutor = bool (*)(
 class MovingEnvironment {
 public:
     explicit MovingEnvironment(const System* system);
+
+    void set_num_threads(int n_threads);
+    int num_threads() const noexcept;
+    bool openmp_available() const noexcept;
+    int openmp_version() const noexcept;
+    std::uint64_t openmp_parallel_regions() const noexcept;
+    std::uint64_t openmp_tasks() const noexcept;
 
     bool install_boundary(
         const std::string& side,
@@ -2524,6 +2603,15 @@ public:
     double dense_pair_matvec_seconds() const noexcept;
     double raw_execution_matvec_seconds() const noexcept;
     double raw_execution_pack_seconds() const noexcept;
+    double raw_batch_expand_seconds() const noexcept;
+    double raw_batch_right_prepare_seconds() const noexcept;
+    double raw_batch_fallback_prepare_seconds() const noexcept;
+    double raw_channel_first_stage_seconds() const noexcept;
+    double raw_wave_batch_seconds() const noexcept;
+    double raw_shared_left_output_seconds() const noexcept;
+    double raw_grouped_output_seconds() const noexcept;
+    double raw_binding_output_seconds() const noexcept;
+    double raw_fusion_finalize_seconds() const noexcept;
     double raw_pointer_execution_matvec_seconds() const noexcept;
     std::uint64_t raw_pointer_execution_matvec_calls() const noexcept;
     double direct_complementary_action_seconds() const noexcept;
@@ -2563,6 +2651,9 @@ public:
     std::size_t fused_raw_route_count() const noexcept;
     std::size_t dense_pair_kernel_count() const noexcept;
     std::size_t dense_pair_execution_count() const noexcept;
+    std::size_t dense_pair_wave_count() const noexcept;
+    std::size_t dense_pair_max_wave_width() const noexcept;
+    std::size_t dense_pair_thread_workspace_bytes() const noexcept;
     std::size_t dense_pair_kernel_elements() const noexcept;
     std::size_t dense_pair_route_count() const noexcept;
     std::size_t dense_factor_pack_bytes() const noexcept;
@@ -2588,6 +2679,14 @@ public:
     std::size_t peak_raw_output_fusion_workspace_bytes() const noexcept;
     std::uint64_t raw_output_fusion_gemm_calls() const noexcept;
     std::uint64_t raw_output_fusion_copied_elements() const noexcept;
+    std::size_t peak_persistent_output_batch_count() const noexcept;
+    std::size_t peak_persistent_output_task_count() const noexcept;
+    std::size_t peak_persistent_output_group_count() const noexcept;
+    std::uint64_t private_output_executor_calls() const noexcept;
+    std::uint64_t private_output_executor_fallbacks() const noexcept;
+    std::size_t peak_private_output_task_count() const noexcept;
+    std::size_t peak_private_output_workspace_bytes() const noexcept;
+    std::uint64_t private_output_reduced_elements() const noexcept;
     bool grouped_output_product_backend() const noexcept;
     std::size_t grouped_output_product_group_count() const noexcept;
     std::size_t grouped_output_product_binding_count() const noexcept;
@@ -2889,6 +2988,7 @@ private:
     void build_dense_pair_executions();
     void build_fused_factor_aggregates();
     void build_raw_execution_groups();
+    void build_direct_execution_waves();
     void build_raw_input_superchannels();
     void build_compact_right_panel_registry();
     void refresh_compact_right_panels();
@@ -2902,13 +3002,35 @@ private:
         bool restore_local_actions = false
     );
     void refresh_complementary_execution_slab();
+    void pack_cached_complementary_execution_slab();
     void prepare_output_fusion_right_slab();
     void select_direct_complementary_tiles();
+    void build_persistent_output_group_schedule();
+    void build_persistent_right_action_cache();
+    void build_persistent_output_bundles(int thread_count);
+    void build_persistent_output_tasks();
+    std::uint64_t apply_persistent_channel_fusion_task(
+        const RawOutputFusionWave& wave,
+        const RawChannelFusionTask& task
+    );
+    std::uint64_t apply_persistent_output_group(
+        const RawPersistentOutputGroup& scheduled,
+        double* output,
+        std::vector<double>& left_workspace,
+        std::vector<double>& operator_workspace,
+        std::vector<double>& right_workspace,
+        std::vector<double>& product_workspace,
+        std::vector<std::uint8_t>& product_valid,
+        std::size_t reference_start,
+        std::size_t reference_stop,
+        bool combine_references
+    );
     void pack_raw_execution_batch(
         const RawInputSuperchannel& channel,
         const RawExecutionBatch& batch,
         double* left_values,
-        double* right_values
+        double* right_values,
+        std::vector<double>* panel_scratch = nullptr
     );
     bool prepare_raw_execution_batch_real(
         const RawInputSuperchannel& channel,
@@ -2981,7 +3103,8 @@ private:
         const RawExecutionBatch& batch,
         const double* channel_temporary,
         const RawOutputFusionWave& wave,
-        const RawOutputFusionBatch& scheduled
+        const RawOutputFusionBatch& scheduled,
+        bool skip_persistent_output
     );
     const double* prepare_raw_execution_batch_right_real(
         const RawInputSuperchannel& channel,
@@ -3023,7 +3146,8 @@ private:
         double* right_target,
         bool horizontal_right = false,
         std::int64_t right_total_w = 0,
-        std::int64_t right_w_offset = 0
+        std::int64_t right_w_offset = 0,
+        std::vector<double>* panel_scratch = nullptr
     );
     std::int64_t raw_execution_action_left_key(
         const RawExecutionAction& action
@@ -3071,7 +3195,7 @@ private:
         const RawExecutionTile& tile,
         const double* temporary,
         double* output
-    ) const;
+    );
     void apply_raw_factor_groups(
         const Complex* input,
         Complex* output
@@ -3086,6 +3210,15 @@ private:
         std::size_t action_stop,
         const double* packed_input,
         double* output
+    );
+    std::uint64_t apply_direct_complementary_actions_real_workspace(
+        const RawExecutionGroup& execution,
+        std::size_t action_start,
+        std::size_t action_stop,
+        const double* packed_input,
+        double* output,
+        std::vector<double>& left_workspace,
+        std::vector<double>& temporary_workspace
     );
     void apply_raw_pointer_actions_real(
         const double* input,
@@ -3142,6 +3275,9 @@ private:
     bool metric_is_real() const noexcept;
 
     const System* system_ = nullptr;
+    int n_threads_ = 1;
+    std::uint64_t openmp_parallel_regions_ = 0;
+    std::uint64_t openmp_tasks_ = 0;
     std::unordered_map<std::string, PackedArena> boundaries_;
     std::unordered_map<std::string, PackedArena> metric_boundaries_;
     std::unordered_map<std::string, ComplexPackedArena> complex_boundaries_;
@@ -3300,6 +3436,8 @@ private:
     std::vector<ComplementaryLocalAction> complementary_local_actions_;
     std::vector<ComplementaryLocalTerm> complementary_local_terms_;
     std::vector<double> complementary_panel_scratch_;
+    std::vector<std::vector<double>> complementary_panel_thread_scratch_;
+    std::vector<std::array<std::size_t, 3>> complementary_pack_tasks_;
     std::vector<double> reduced_contextual_diagonal_;
     std::uint64_t reduced_contextual_fallbacks_ = 0;
     std::int32_t reduced_contextual_fallback_reason_ = 0;
@@ -3320,6 +3458,11 @@ private:
     std::vector<RawExecutionAction> raw_execution_action_arena_;
     std::vector<RawExecutionAction> raw_pointer_action_arena_;
     std::vector<std::uint32_t> raw_combined_left_terms_;
+    std::vector<std::size_t> direct_execution_wave_offsets_;
+    std::vector<std::size_t> direct_execution_wave_indices_;
+    std::size_t direct_execution_max_wave_width_ = 0;
+    std::vector<std::vector<double>> direct_action_thread_left_;
+    std::vector<std::vector<double>> direct_action_thread_temporary_;
     std::size_t raw_execution_actions_ = 0;
     std::size_t right_grouped_execution_actions_ = 0;
     std::size_t peak_right_grouped_execution_actions_ = 0;
@@ -3327,6 +3470,28 @@ private:
     std::size_t peak_raw_execution_actions_ = 0;
     std::vector<RawInputSuperchannel> raw_input_superchannels_;
     std::vector<RawOutputFusionWave> raw_output_fusion_waves_;
+    std::vector<RawPersistentOutputGroup> persistent_output_groups_;
+    std::vector<RawPersistentOutputReference>
+        persistent_output_references_;
+    std::vector<RawPersistentOutputBinding>
+        persistent_output_bindings_;
+    std::vector<std::vector<double>> persistent_output_thread_left_;
+    std::vector<std::vector<double>> persistent_output_thread_operator_;
+    std::vector<std::vector<double>> persistent_output_thread_right_;
+    std::vector<RawPersistentProductCacheEntry>
+        persistent_product_cache_;
+    std::size_t persistent_product_cache_elements_ = 0;
+    std::vector<std::vector<double>> persistent_output_thread_products_;
+    std::vector<std::vector<std::uint8_t>>
+        persistent_output_thread_product_valid_;
+    std::vector<std::int32_t> persistent_right_action_slots_;
+    std::vector<RawPersistentRightCacheEntry> persistent_right_cache_;
+    std::vector<double> persistent_right_cache_values_;
+    std::vector<RawPersistentOutputBundle> persistent_output_bundles_;
+    std::vector<std::uint32_t> persistent_output_bundle_groups_;
+    std::vector<RawPersistentOutputTask> persistent_output_tasks_;
+    std::vector<std::vector<double>> persistent_output_thread_outputs_;
+    bool dynamic_persistent_output_right_ = false;
     std::vector<RawCompactRightPanel> compact_right_panels_;
     std::vector<double> compact_right_panel_values_;
     std::uint64_t compact_right_panel_registry_builds_ = 0;
@@ -3346,6 +3511,14 @@ private:
     std::size_t peak_raw_output_fusion_workspace_elements_ = 0;
     std::uint64_t raw_output_fusion_gemm_calls_ = 0;
     std::uint64_t raw_output_fusion_copied_elements_ = 0;
+    std::size_t peak_persistent_output_batches_ = 0;
+    std::size_t peak_persistent_output_tasks_ = 0;
+    std::size_t peak_persistent_output_groups_ = 0;
+    std::uint64_t private_output_executor_calls_ = 0;
+    std::uint64_t private_output_executor_fallbacks_ = 0;
+    std::size_t peak_private_output_tasks_ = 0;
+    std::size_t peak_private_output_workspace_bytes_ = 0;
+    std::uint64_t private_output_reduced_elements_ = 0;
     std::size_t grouped_output_product_groups_ = 0;
     std::size_t grouped_output_product_bindings_ = 0;
     std::size_t peak_grouped_output_candidate_bindings_ = 0;
@@ -3370,6 +3543,11 @@ private:
     std::uint64_t complementary_execution_slab_matvec_repacks_ = 0;
     std::vector<DensePairKernel> dense_pair_kernels_;
     std::vector<DensePairExecution> dense_pair_executions_;
+    std::vector<std::size_t> dense_pair_wave_offsets_;
+    std::vector<std::size_t> dense_pair_wave_indices_;
+    std::size_t dense_pair_max_wave_width_ = 0;
+    std::vector<std::vector<double>> dense_pair_thread_inputs_;
+    std::vector<std::vector<double>> dense_pair_thread_outputs_;
     std::size_t dense_pair_kernels_built_ = 0;
     std::size_t dense_pair_kernel_elements_ = 0;
     std::size_t dense_pair_routes_ = 0;
@@ -3392,6 +3570,8 @@ private:
     std::vector<double> raw_shared_right_deferred_output_real_;
     std::vector<double> raw_shared_right_tile_output_real_;
     std::vector<double> raw_shared_left_output_real_;
+    std::vector<std::size_t> raw_channel_temporary_offsets_;
+    std::vector<double> raw_channel_temporary_real_;
     std::vector<std::int32_t> grouped_output_transpose_left_;
     std::vector<std::int32_t> grouped_output_transpose_right_;
     std::vector<std::int32_t> grouped_output_rows_;
@@ -3423,6 +3603,15 @@ private:
     double dense_pair_matvec_seconds_ = 0.0;
     double raw_execution_matvec_seconds_ = 0.0;
     double raw_execution_pack_seconds_ = 0.0;
+    double raw_batch_expand_seconds_ = 0.0;
+    double raw_batch_right_prepare_seconds_ = 0.0;
+    double raw_batch_fallback_prepare_seconds_ = 0.0;
+    double raw_channel_first_stage_seconds_ = 0.0;
+    double raw_wave_batch_seconds_ = 0.0;
+    double raw_shared_left_output_seconds_ = 0.0;
+    double raw_grouped_output_seconds_ = 0.0;
+    double raw_binding_output_seconds_ = 0.0;
+    double raw_fusion_finalize_seconds_ = 0.0;
     double raw_pointer_execution_matvec_seconds_ = 0.0;
     std::uint64_t raw_pointer_execution_matvec_calls_ = 0;
     double direct_complementary_action_seconds_ = 0.0;

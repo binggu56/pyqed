@@ -4561,7 +4561,10 @@ class DMRG(CASCI):
         scale=1,
         identity_tol=1e-10,
         phase_align_tol=1e-14,
-        backend="structured",
+        backend="auto",
+        cutoff=1.0e-10,
+        max_bond="auto",
+        return_info=False,
     ):
         from pyqed.qchem.dmrg.overlap import biorthogonal_overlap
 
@@ -4578,6 +4581,9 @@ class DMRG(CASCI):
             identity_tol=identity_tol,
             phase_align_tol=phase_align_tol,
             backend=backend,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            return_info=return_info,
         )
 
     def overlap_auto(
@@ -4689,6 +4695,7 @@ class DMRG(CASCI):
         compute_s2=False,
         *,
         su2_kernel_backend="auto",
+        n_threads=None,
         require_convergence=True,
         **kwargs,
     ):
@@ -4709,6 +4716,9 @@ class DMRG(CASCI):
         su2_kernel_backend : {"auto", "cpp", "python"}
             SU(2) execution backend. ``"cpp"`` requires the compiled engine;
             ``"python"`` selects the slower reference implementation.
+        n_threads : int or None
+            Native shared-memory threads. For SU(2), this controls OpenMP in
+            reduced-sector contractions; ``None`` selects one thread.
         nsweeps : int
             Maximum number of complete sweeps. One complete sweep is a
             left-to-right pass followed by a right-to-left pass. The default
@@ -4742,6 +4752,17 @@ class DMRG(CASCI):
             raise TypeError("nsweeps must be a positive integer.") from exc
         if nsweeps < 1:
             raise ValueError("nsweeps must be positive.")
+        if n_threads is not None:
+            if isinstance(n_threads, (bool, np.bool_)):
+                raise TypeError("n_threads must be a positive integer or None.")
+            try:
+                n_threads = operator.index(n_threads)
+            except TypeError as exc:
+                raise TypeError(
+                    "n_threads must be a positive integer or None."
+                ) from exc
+            if n_threads < 1:
+                raise ValueError("n_threads must be positive or None.")
         self.max_sweeps = int(nsweeps)
         complete_sweep_limit = (
             f"{nsweeps} complete "
@@ -4932,6 +4953,7 @@ class DMRG(CASCI):
                     weights=self.weights,
                     local_solver_kwargs=local_solver_kwargs,
                     su2_kernel_backend=su2_kernel_backend,
+                    n_threads=n_threads,
                     verbose=self.verbose,
                     **kwargs,
                 )
@@ -5378,6 +5400,7 @@ class DMRG(CASCI):
                     True if final_expectation is None else bool(final_expectation)
                 ),
                 converge_on_full_sweeps=True,
+                n_threads=n_threads,
             )
             if self.build_info is not None:
                 self.build_info[

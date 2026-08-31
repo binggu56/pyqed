@@ -101,9 +101,9 @@ def extract_rdms_for_helper(solver, n_spatial, sym_mgr=None, verbose=False):
     state = solver.ground_state
     
     # Get 1-RDM
-    if sym_mgr is not None and hasattr(state.Bs[0], 'qns'):
+    if sym_mgr is not None and hasattr(state.factors[0], 'qns'):
         P_spin = state.make_rdm1(sym_mgr=sym_mgr)
-    elif hasattr(state.Bs[0], 'qns'):
+    elif hasattr(state.factors[0], 'qns'):
         from pyqed.mps.mps import symmetric_to_dense
         dense_state = symmetric_to_dense(state)
         P_spin = dense_state.make_rdm1()

@@ -16,7 +16,7 @@ from pyqed.md import pme_reciprocal_potential
 
 def test_point_charge_hcore_and_nuclear_energy_are_finite():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     coords = np.array([[0.0, 0.0, 3.0]])
     charges = np.array([-0.2])
 
@@ -34,7 +34,7 @@ def test_point_charge_hcore_and_nuclear_energy_are_finite():
 
 def test_pme_reciprocal_hcore_contracts_smooth_periodic_potential():
     mol = Molecule(atom="H 1 1 1; H 1 1 2.4", unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     mm_coords = np.array([[2.0, 2.0, 2.0], [5.0, 5.0, 5.0]])
     mm_charges = np.array([0.2, -0.2])
     cell = np.diag([8.0, 8.0, 8.0])
@@ -69,7 +69,7 @@ def test_pme_reciprocal_hcore_contracts_smooth_periodic_potential():
 
 def test_embed_point_charges_returns_energy_gradients_and_charge_forces():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     mf = embed_point_charges(
         mol.RHF(),
         coords=[[0.0, 0.0, 3.0]],
@@ -95,7 +95,7 @@ def _fail_if_called(*args, **kwargs):
 
 def test_embedded_qm_gradient_matches_energy_finite_difference():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     mf = embed_point_charges(
         mol.RHF(),
         coords=[[0.0, 0.0, 3.0]],
@@ -107,7 +107,7 @@ def test_embedded_qm_gradient_matches_energy_finite_difference():
 
     step = 1e-4
     plus_mol = Molecule(atom=f"H 0 0 {step}; H 0 0 1.4", unit="b", basis="sto3g")
-    plus_mol.build(driver="builtin")
+    plus_mol.build()
     plus = embed_point_charges(
         plus_mol.RHF(),
         coords=[[0.0, 0.0, 3.0]],
@@ -115,7 +115,7 @@ def test_embedded_qm_gradient_matches_energy_finite_difference():
         run_kwargs={"verbose": 0, "max_cycle": 100},
     ).kernel()
     minus_mol = Molecule(atom=f"H 0 0 {-step}; H 0 0 1.4", unit="b", basis="sto3g")
-    minus_mol.build(driver="builtin")
+    minus_mol.build()
     minus = embed_point_charges(
         minus_mol.RHF(),
         coords=[[0.0, 0.0, 3.0]],
@@ -129,7 +129,7 @@ def test_embedded_qm_gradient_matches_energy_finite_difference():
 
 def test_point_charge_forces_match_energy_finite_difference():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     mf = embed_point_charges(
         mol.RHF(),
         coords=[[0.0, 0.0, 3.0]],

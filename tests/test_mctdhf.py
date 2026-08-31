@@ -16,13 +16,13 @@ from pyqed.qchem.mcscf.direct_ci import CASCI
 
 def _h2_mf(basis="sto-3g"):
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis=basis)
-    mol.build(driver="gbasis")
+    mol.build()
     return RHF(mol).run()
 
 
 def _lih_mf(basis="sto-3g"):
     mol = Molecule(atom="Li 0 0 0; H 0 0 3.0", unit="bohr", basis=basis)
-    mol.build(driver="gbasis")
+    mol.build()
     return RHF(mol).run()
 
 

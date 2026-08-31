@@ -557,7 +557,7 @@ def _h3plus_sacasscf(coords):
         spin=0,
         unit="bohr",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.RHF(verbose=0).run(max_cycle=100)
     return (
         SecondOrderCASSCF(

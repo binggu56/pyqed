@@ -1,0 +1,66 @@
+{
+  "description": "Compact quantum U(1) links, exact Gauss-law basis, electric L_n^2 energy, and shortest-path Wilson strings on the Fourier-DVR hopping.",
+  "parameters": {
+    "npts": 9,
+    "length_times_g": 10.0,
+    "fermion_mass_over_g": 0.0,
+    "nroots": 8
+  },
+  "exact": {
+    "vector_gap_over_g": 0.5641895835477563,
+    "scalar_gap_over_g": 1.1283791670955126
+  },
+  "flux_convergence": [
+    {
+      "flux_cutoff": 1,
+      "dimension": 63552,
+      "hamiltonian_nnz": 1961040,
+      "seconds": 18.643148583127186,
+      "vacuum_dimension": 2,
+      "vector_level": 2,
+      "vector_excitation_energy": 0.815662120924042,
+      "vector_momentum": 0.6283185307179586,
+      "vector_gap": 0.5201158711928835,
+      "scalar_level": 5,
+      "scalar_gap": 0.9530679340817372,
+      "hermiticity_residual": 0.0,
+      "maximum_gauss_residual": 0
+    }
+  ],
+  "converged_spectrum": {
+    "energies": [
+      -10.291546767136431,
+      -10.291546767136426,
+      -9.47588464621239,
+      -9.475884646212384,
+      -9.47588464621231,
+      -9.338478833054694,
+      -9.338478833054646,
+      -8.946432606505269
+    ],
+    "vector_strengths": [
+      1.6430283341785967e-30,
+      1.2885143584440484e-30,
+      0.08163296077583555,
+      0.0237536976786733,
+      0.08744625851090929,
+      1.1474017829060116e-28,
+      7.539046962491465e-28,
+      7.265087883467641e-30
+    ],
+    "scalar_strengths": [
+      1.6183052693124573,
+      1.6210855063070653,
+      3.145930593350099e-27,
+      3.053852400539196e-23,
+      7.207866382866075e-27,
+      1.6288721854350945,
+      1.629854028122229,
+      9.103639688992089e-29
+    ]
+  },
+  "figures": {
+    "gaps": "examples/lgt/results/channel_mv_ms_ed_n9_cutoff1/07_dynamical_schwinger_gaps.png",
+    "channel_strengths": "examples/lgt/results/channel_mv_ms_ed_n9_cutoff1/08_dynamical_channel_strengths.png"
+  }
+}

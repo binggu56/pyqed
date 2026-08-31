@@ -11,7 +11,6 @@
   "method": {
     "name": "RHF",
     "basis": "sto-3g",
-    "pyqed_integral_driver": "builtin",
     "pyqed_eri_representation": "dense",
     "pyqed_eri_backend": "rys",
     "pyqed_ao_symmetry": "s8",

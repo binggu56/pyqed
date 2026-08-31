@@ -1,0 +1,43 @@
+{
+  "description": "Single-thread exact-Gauss open-chain Kogut-Susskind DMRG timing; the 16-sweep values are linear projections, not convergence claims.",
+  "parameters": {
+    "length_times_g": 20.0,
+    "flux_cutoff": 3
+  },
+  "records": [
+    {
+      "nsites": 40,
+      "mps_sites": 79,
+      "bond_dim": 32,
+      "setup_seconds": 0.9726354170124978,
+      "sweep_seconds": 0.6379321250133216,
+      "projected_16_sweeps_seconds": 11.179549417225644,
+      "energy_after_one_sweep": -22.61095015583725,
+      "raw_mpo_bond": 117,
+      "symmetric_mpo_bond": 4
+    },
+    {
+      "nsites": 80,
+      "mps_sites": 159,
+      "bond_dim": 64,
+      "setup_seconds": 10.122147458139807,
+      "sweep_seconds": 2.9006240000016987,
+      "projected_16_sweeps_seconds": 56.53213145816699,
+      "energy_after_one_sweep": -98.17594869689349,
+      "raw_mpo_bond": 237,
+      "symmetric_mpo_bond": 4
+    },
+    {
+      "nsites": 80,
+      "mps_sites": 159,
+      "bond_dim": 128,
+      "setup_seconds": 10.17452224995941,
+      "sweep_seconds": 6.779573416803032,
+      "projected_16_sweeps_seconds": 118.64769691880792,
+      "energy_after_one_sweep": -98.17854151080556,
+      "raw_mpo_bond": 237,
+      "symmetric_mpo_bond": 4
+    }
+  ],
+  "figure": "/Users/gugroup/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/lgt/results/kogut_susskind_timing/31_kogut_susskind_ground_timing.png"
+}

@@ -95,8 +95,12 @@ SU2_COMPILED_ANGULAR_MIN_STATE_PAIRS = int(
 )
 _CPP_ANGULAR_CHECKED = False
 _CPP_PRODUCT_TENSOR_PAIR_ENTRIES = None
+_CPP_PRODUCT_TENSOR_PAIR_ENTRIES_BATCH = None
+_CPP_SCALAR_PRODUCT_PAIR_ENTRIES = None
 _CPP_PRODUCT_TENSOR_GROUP_INDICES = None
 _CPP_ACCUMULATE_BILINEAR = None
+_CPP_ACCUMULATE_BILINEAR_WAVE = None
+_CPP_REDUCED_GROWTH_GRAPH = None
 _SU2_PROFILE: dict[str, dict[str, float | int]] = {}
 
 
@@ -113,8 +117,12 @@ def _cpp_angular_kernels():
     """Return optional native angular-entry kernels, compiling lazily if needed."""
     global _CPP_ANGULAR_CHECKED
     global _CPP_PRODUCT_TENSOR_PAIR_ENTRIES
+    global _CPP_PRODUCT_TENSOR_PAIR_ENTRIES_BATCH
+    global _CPP_SCALAR_PRODUCT_PAIR_ENTRIES
     global _CPP_PRODUCT_TENSOR_GROUP_INDICES
     global _CPP_ACCUMULATE_BILINEAR
+    global _CPP_ACCUMULATE_BILINEAR_WAVE
+    global _CPP_REDUCED_GROWTH_GRAPH
 
     if _CPP_ANGULAR_CHECKED:
         return _CPP_PRODUCT_TENSOR_PAIR_ENTRIES, _CPP_PRODUCT_TENSOR_GROUP_INDICES
@@ -131,12 +139,32 @@ def _cpp_angular_kernels():
             "product_tensor_pair_entries",
             None,
         )
+        _CPP_PRODUCT_TENSOR_PAIR_ENTRIES_BATCH = getattr(
+            su2_native,
+            "product_tensor_pair_entries_batch",
+            None,
+        )
+        _CPP_SCALAR_PRODUCT_PAIR_ENTRIES = getattr(
+            su2_native,
+            "scalar_product_pair_entries",
+            None,
+        )
         _CPP_PRODUCT_TENSOR_GROUP_INDICES = getattr(
             su2_native,
             "product_tensor_group_indices",
             None,
         )
         _CPP_ACCUMULATE_BILINEAR = getattr(su2_native, "accumulate_bilinear", None)
+        _CPP_ACCUMULATE_BILINEAR_WAVE = getattr(
+            su2_native,
+            "accumulate_bilinear_wave",
+            None,
+        )
+        _CPP_REDUCED_GROWTH_GRAPH = getattr(
+            su2_native,
+            "reduced_growth_graph",
+            None,
+        )
     return _CPP_PRODUCT_TENSOR_PAIR_ENTRIES, _CPP_PRODUCT_TENSOR_GROUP_INDICES
 
 
@@ -150,6 +178,28 @@ def _compiled_product_tensor_pair_available() -> bool:
 def _cpp_accumulate_bilinear_kernel():
     _cpp_angular_kernels()
     return _CPP_ACCUMULATE_BILINEAR
+
+
+def _cpp_accumulate_bilinear_wave_kernel():
+    _cpp_angular_kernels()
+    return _CPP_ACCUMULATE_BILINEAR_WAVE
+
+
+def _compiled_scalar_product_pair_kernel():
+    _cpp_angular_kernels()
+    return _CPP_SCALAR_PRODUCT_PAIR_ENTRIES or cython_scalar_product_pair_entries
+
+
+def _cpp_product_tensor_pair_batch_kernel():
+    _cpp_angular_kernels()
+    return _CPP_PRODUCT_TENSOR_PAIR_ENTRIES_BATCH
+
+
+def _cpp_reduced_growth_graph_kernel():
+    if os.environ.get("SU2_NARG_DISABLE_CPP_GROWTH_GRAPH", "0") == "1":
+        return None
+    _cpp_angular_kernels()
+    return _CPP_REDUCED_GROWTH_GRAPH
 
 
 def reset_su2_profile() -> None:
@@ -797,12 +847,13 @@ def scalar_product_angular_terms(
     block_dnelec, block_rank2 = block_op.charge
     local_dnelec, local_rank2 = local_op.charge
     terms_by_irrep = {}
+    scalar_pair_entries = _compiled_scalar_product_pair_kernel()
 
     if block_rank2 == 0 and local_rank2 == 0:
         for irrep, states in grouped.items():
             use_compiled_pair = (
                 SU2_COMPILED_ANGULAR
-                and cython_scalar_product_pair_entries is not None
+                and scalar_pair_entries is not None
                 and len(states) * len(states) >= SU2_COMPILED_ANGULAR_MIN_STATE_PAIRS
             )
             if use_compiled_pair:
@@ -854,7 +905,7 @@ def scalar_product_angular_terms(
         total_j2 = irrep.charge[1]
         use_compiled_pair = (
             SU2_COMPILED_ANGULAR
-            and cython_scalar_product_pair_entries is not None
+            and scalar_pair_entries is not None
             and len(states) * len(states) >= SU2_COMPILED_ANGULAR_MIN_STATE_PAIRS
         )
         if use_compiled_pair:
@@ -1403,7 +1454,10 @@ def compiled_scalar_product_pair_entries(
     local_rank2: int,
     atol: float,
 ):
-    """Build scalar-product angular entries with one optional Cython call."""
+    """Build scalar-product angular entries with one native call."""
+    pair_entries = _compiled_scalar_product_pair_kernel()
+    if pair_entries is None:
+        raise RuntimeError("compiled scalar product pair entries are unavailable")
     (
         rows,
         cols,
@@ -1412,7 +1466,7 @@ def compiled_scalar_product_pair_entries(
         block_cols,
         local_rows,
         local_cols,
-    ) = cython_scalar_product_pair_entries(
+    ) = pair_entries(
         state_table,
         int(total_j2),
         int(block_dnelec),
@@ -1569,6 +1623,57 @@ def compiled_product_tensor_pair_entries(
     )
 
 
+@profile_function("compiled_product_tensor_pair_entries_batch")
+def compiled_product_tensor_pair_entries_batch(jobs):
+    """Build many angular pair tables through one native work wave."""
+    jobs = list(jobs)
+    batch_kernel = _cpp_product_tensor_pair_batch_kernel()
+    if batch_kernel is None or len(jobs) < 2:
+        return [
+            compiled_product_tensor_pair_entries(
+                job[2],
+                job[3],
+                job[4],
+                job[5],
+                bra_total_j2=job[6],
+                ket_total_j2=job[7],
+                total_rank2=job[8],
+                block_dnelec=job[9],
+                block_rank2=job[10],
+                local_dnelec=job[11],
+                local_rank2=job[12],
+                atol=job[13],
+            )
+            for job in jobs
+        ]
+    specs = [
+        (
+            job[4],
+            job[5],
+            job[6],
+            job[7],
+            job[8],
+            job[9],
+            job[10],
+            job[11],
+            job[12],
+            job[13],
+        )
+        for job in jobs
+    ]
+    arrays = batch_kernel(specs)
+    return [
+        pack_compiled_bilinear_arrays(
+            job[2],
+            job[3],
+            job[4],
+            job[5],
+            *values,
+        )
+        for job, values in zip(jobs, arrays)
+    ]
+
+
 @profile_function("product_tensor_angular_terms")
 def product_tensor_angular_terms(
     block: RenormalizedSU2Block,
@@ -1594,10 +1699,11 @@ def product_tensor_angular_terms(
     dnelec = block_dnelec + local_dnelec
     op = OpIrrep((dnelec, int(total_rank2)))
     terms_by_pair = {}
+    compiled_jobs = []
+    state_tables = {}
 
     for bra_irrep, bra_states in grouped.items():
         bra_nelec, bra_j2 = bra_irrep.charge
-        bra_table = None
         for ket_irrep, ket_states in grouped.items():
             ket_nelec, ket_j2 = ket_irrep.charge
             if bra_nelec != ket_nelec + dnelec:
@@ -1612,25 +1718,32 @@ def product_tensor_angular_terms(
                 and _compiled_product_tensor_pair_available()
             )
             if use_compiled_pair:
+                bra_table = state_tables.get(bra_irrep)
                 if bra_table is None:
                     bra_table = product_state_integer_table(bra_states)
-                ket_table = product_state_integer_table(ket_states)
-                merged_entries = compiled_product_tensor_pair_entries(
-                    bra_states,
-                    ket_states,
-                    bra_table,
-                    ket_table,
-                    bra_total_j2=bra_j2,
-                    ket_total_j2=ket_j2,
-                    total_rank2=total_rank2,
-                    block_dnelec=block_dnelec,
-                    block_rank2=block_rank2,
-                    local_dnelec=local_dnelec,
-                    local_rank2=local_rank2,
-                    atol=atol,
+                    state_tables[bra_irrep] = bra_table
+                ket_table = state_tables.get(ket_irrep)
+                if ket_table is None:
+                    ket_table = product_state_integer_table(ket_states)
+                    state_tables[ket_irrep] = ket_table
+                compiled_jobs.append(
+                    (
+                        bra_irrep,
+                        ket_irrep,
+                        bra_states,
+                        ket_states,
+                        bra_table,
+                        ket_table,
+                        bra_j2,
+                        ket_j2,
+                        total_rank2,
+                        block_dnelec,
+                        block_rank2,
+                        local_dnelec,
+                        local_rank2,
+                        atol,
+                    )
                 )
-                if merged_entries.groups:
-                    terms_by_pair[(bra_irrep, ket_irrep)] = merged_entries
                 continue
 
             estimates = []
@@ -1718,6 +1831,13 @@ def product_tensor_angular_terms(
                     merged_entries
                 )
 
+    for job, merged_entries in zip(
+        compiled_jobs,
+        compiled_product_tensor_pair_entries_batch(compiled_jobs),
+    ):
+        if merged_entries.groups:
+            terms_by_pair[(job[0], job[1])] = merged_entries
+
     cached = (site, op, terms_by_pair)
     cache[key] = cached
     return cached
@@ -1760,6 +1880,217 @@ def reduced_product_tensor_irrep(
             blocks[(bra_irrep, ket_irrep)] = reduced_block
 
     return ReducedSU2Tensor(IrrepTensor(site, site, op, blocks))
+
+
+@profile_function("compiled_reduced_growth_graph")
+def compiled_reduced_growth_graph(
+    block: RenormalizedSU2Block,
+    requests,
+    *,
+    atol: float = 1e-12,
+):
+    """Execute a complete block-local reduced-product graph natively."""
+    kernel = _cpp_reduced_growth_graph_kernel()
+    if kernel is None:
+        return None
+
+    grouped = product_states_for_block(block)
+    sectors = list(grouped)
+    site = IrrepSite(
+        su2_product_symmetry(),
+        {irrep: len(grouped[irrep]) for irrep in sectors},
+    )
+    sector_specs = [
+        (
+            irrep.charge[0],
+            irrep.charge[1],
+            product_state_integer_table(grouped[irrep]),
+        )
+        for irrep in sectors
+    ]
+
+    def matrix_specs(tensor):
+        return [
+            (
+                bra.charge[0],
+                bra.charge[1],
+                ket.charge[0],
+                ket.charge[1],
+                value,
+            )
+            for (bra, ket), value in tensor.blocks.items()
+            if value.size
+        ]
+
+    parsed = []
+    native_requests = []
+    for request in requests:
+        if len(request) == 4:
+            key, block_tensor, local_tensor, total_rank2 = request
+            prefactor = 1.0
+        elif len(request) == 5:
+            key, block_tensor, local_tensor, total_rank2, prefactor = request
+        else:
+            raise ValueError(
+                "reduced product requests must be "
+                "(key, block_tensor, local_tensor, total_rank2[, scale])"
+            )
+        block_dnelec, block_rank2 = block_tensor.op.charge
+        local_dnelec, local_rank2 = local_tensor.op.charge
+        op = OpIrrep((block_dnelec + local_dnelec, int(total_rank2)))
+        parsed.append((key, op, complex(prefactor)))
+        native_requests.append(
+            (
+                block_dnelec,
+                block_rank2,
+                local_dnelec,
+                local_rank2,
+                int(total_rank2),
+                matrix_specs(block_tensor),
+                matrix_specs(local_tensor),
+            )
+        )
+
+    try:
+        native_results = kernel(sector_specs, native_requests, float(atol))
+    except Exception:
+        return None
+
+    out = {}
+    for (key, op, prefactor), request_results in zip(parsed, native_results):
+        blocks = {}
+        for bra_index, ket_index, value, max_abs in request_results:
+            if abs(prefactor) * float(max_abs) <= atol:
+                continue
+            value = np.asarray(value, dtype=complex)
+            if prefactor != 1.0:
+                value *= prefactor
+            blocks[(sectors[int(bra_index)], sectors[int(ket_index)])] = value
+        out[key] = ReducedSU2Tensor(IrrepTensor(site, site, op, blocks))
+    return out
+
+
+@profile_function("reduced_product_tensors_irrep")
+def reduced_product_tensors_irrep(
+    block: RenormalizedSU2Block,
+    requests,
+    *,
+    atol: float = 1e-12,
+) -> dict:
+    """Build a wave of independent reduced block-local products.
+
+    Each request is ``(key, block_tensor, local_tensor, total_rank2[, scale])``.
+    The native path owns one complete output block per task, allowing a single
+    coarse OpenMP region without races or determinant-space projection.
+    """
+    requests = list(requests)
+
+    def individual(request):
+        if len(request) == 4:
+            key, block_tensor, local_tensor, total_rank2 = request
+            prefactor = 1.0
+        elif len(request) == 5:
+            key, block_tensor, local_tensor, total_rank2, prefactor = request
+        else:
+            raise ValueError(
+                "reduced product requests must be "
+                "(key, block_tensor, local_tensor, total_rank2[, scale])"
+            )
+        tensor = reduced_product_tensor_irrep(
+            block,
+            block_tensor,
+            local_tensor,
+            total_rank2=int(total_rank2),
+            atol=atol,
+        )
+        if complex(prefactor) != 1.0:
+            tensor = scale_reduced_tensor(tensor, prefactor)
+        return key, tensor
+
+    wave_kernel = _cpp_accumulate_bilinear_wave_kernel()
+    if len(requests) >= 2:
+        graph_result = compiled_reduced_growth_graph(
+            block,
+            requests,
+            atol=atol,
+        )
+        if graph_result is not None:
+            return graph_result
+    if wave_kernel is None or len(requests) < 2:
+        return dict(individual(request) for request in requests)
+
+    prepared = []
+    wave_specs = []
+    wave_targets = []
+    for request in requests:
+        if len(request) == 4:
+            key, block_tensor, local_tensor, total_rank2 = request
+            prefactor = 1.0
+        elif len(request) == 5:
+            key, block_tensor, local_tensor, total_rank2, prefactor = request
+        else:
+            raise ValueError(
+                "reduced product requests must be "
+                "(key, block_tensor, local_tensor, total_rank2[, scale])"
+            )
+        site, op, terms_by_pair = product_tensor_angular_terms(
+            block,
+            block_tensor.op,
+            local_tensor.op,
+            int(total_rank2),
+            atol=atol,
+        )
+        blocks = {}
+        prepared.append((key, site, op, blocks))
+        for block_key, entries in terms_by_pair.items():
+            packed = (
+                entries
+                if isinstance(entries, PackedBilinearEntries)
+                else pack_bilinear_entries(entries)
+            )
+            groups = []
+            for group in packed.groups:
+                block_matrix = block_tensor.block(*group.block_key)
+                local_matrix = local_tensor.block(*group.local_key)
+                if block_matrix.size == 0 or local_matrix.size == 0:
+                    continue
+                groups.append(
+                    (
+                        group.rows,
+                        group.cols,
+                        group.block_rows,
+                        group.block_cols,
+                        group.local_rows,
+                        group.local_cols,
+                        group.coeffs,
+                        block_matrix,
+                        local_matrix,
+                        prefactor,
+                    )
+                )
+            bra_irrep, ket_irrep = block_key
+            wave_specs.append(
+                (
+                    site.sector_dim(bra_irrep),
+                    site.sector_dim(ket_irrep),
+                    groups,
+                )
+            )
+            wave_targets.append((blocks, block_key))
+
+    try:
+        wave_blocks = wave_kernel(wave_specs)
+    except Exception:
+        return dict(individual(request) for request in requests)
+
+    for (blocks, block_key), reduced_block in zip(wave_targets, wave_blocks):
+        reduced_block = np.asarray(reduced_block, dtype=complex)
+        if np.any(np.abs(reduced_block) > atol):
+            blocks[block_key] = reduced_block
+    return {
+        key: ReducedSU2Tensor(IrrepTensor(site, site, op, blocks))
+        for key, site, op, blocks in prepared
+    }
 
 
 @profile_function("rotate_reduced_tensor_to_truncated")
@@ -1807,18 +2138,42 @@ def rotate_reduced_tensors_to_truncated(
     *,
     atol: float = 1e-12,
     backend=None,
+    consume: bool = False,
+    max_batch_bytes: int = 64 * 1024**2,
 ) -> dict:
-    """Rotate many reduced tensors into kept states with one backend batch.
+    """Rotate reduced tensors in bounded backend batches.
 
-    This is the projection boundary for the SU2-NARG growth step.  Keeping all
-    tensor blocks in one request lets the backend group same-shaped rotations
-    across spinors, densities, pairs, and weighted future packages.
+    This is the projection boundary for the SU2-NARG growth step. Coarse
+    requests retain native batching while ``consume=True`` releases each grown
+    tensor once its projected blocks have been produced.
     """
     backend = resolve_su2_narg_backend(backend)
-    block_specs = []
-    ops = {}
-    for tensor_key, tensor in tensors.items():
-        ops[tensor_key] = tensor.op
+    max_batch_bytes = max(1, int(max_batch_bytes))
+    ops = {tensor_key: tensor.op for tensor_key, tensor in tensors.items()}
+    rotated_blocks = {tensor_key: {} for tensor_key in tensors}
+    batch_specs = []
+    batch_keys = []
+    batch_bytes = 0
+
+    def flush():
+        nonlocal batch_specs, batch_keys, batch_bytes
+        if batch_specs:
+            for (tensor_key, bra_irrep, ket_irrep), new_block in (
+                backend.rotate_operator_blocks(batch_specs)
+            ):
+                if np.any(np.abs(new_block) > atol):
+                    rotated_blocks[tensor_key][(bra_irrep, ket_irrep)] = new_block
+        if consume:
+            for tensor_key in batch_keys:
+                tensors.pop(tensor_key, None)
+        batch_specs = []
+        batch_keys = []
+        batch_bytes = 0
+
+    for tensor_key in list(tensors):
+        tensor = tensors[tensor_key]
+        tensor_specs = []
+        tensor_bytes = 0
         for (bra_irrep, ket_irrep), old_block in tensor.blocks.items():
             if bra_irrep not in truncated.site.dims or ket_irrep not in truncated.site.dims:
                 continue
@@ -1837,12 +2192,19 @@ def rotate_reduced_tensors_to_truncated(
                 continue
             u_bra = truncated.transform.block(bra_irrep, bra_irrep)
             u_ket = truncated.transform.block(ket_irrep, ket_irrep)
-            block_specs.append(((tensor_key, bra_irrep, ket_irrep), u_bra, old_block, u_ket))
-
-    rotated_blocks = {tensor_key: {} for tensor_key in tensors}
-    for (tensor_key, bra_irrep, ket_irrep), new_block in backend.rotate_operator_blocks(block_specs):
-        if np.any(np.abs(new_block) > atol):
-            rotated_blocks[tensor_key][(bra_irrep, ket_irrep)] = new_block
+            tensor_specs.append(
+                ((tensor_key, bra_irrep, ket_irrep), u_bra, old_block, u_ket)
+            )
+            tensor_bytes += int(old_block.nbytes)
+            tensor_bytes += int(u_bra.shape[1] * u_ket.shape[1] * old_block.itemsize)
+        if batch_specs and batch_bytes + tensor_bytes > max_batch_bytes:
+            flush()
+        batch_specs.extend(tensor_specs)
+        batch_keys.append(tensor_key)
+        batch_bytes += tensor_bytes
+        if batch_bytes >= max_batch_bytes:
+            flush()
+    flush()
 
     return {
         tensor_key: ReducedSU2Tensor(

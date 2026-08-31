@@ -27,10 +27,9 @@ from vpot import derivs
 #from fit import linear_fit_domain_nor 
 
 from scipy.optimize import curve_fit
+from pyqed.units import au2wavenumber
 
-
-bohr_angstrom = 0.52917721092
-hartree_wavenumber = 219474.63 
+hartree_wavenumber = au2wavenumber
 
 #hartree_wavenumber = scipy.constants.value(u'hartree-inverse meter relationship') / 1e2 
 

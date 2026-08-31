@@ -524,9 +524,17 @@ class PCM:
 
                 grid_coords = self.surface['grid_coords']
                 exponents = self.surface['charge_exp']
-                int3c2e = self.mol._add_suffix('int3c2e')
+                pmol = (
+                    self.mol
+                    if hasattr(self.mol, 'intor')
+                    else self.mol.topyscf().build()
+                )
+                int3c2e = pmol._add_suffix('int3c2e')
                 fakemol = fakemol_for_charges(grid_coords, expnt=exponents**2)
-                v_nj = df.incore.aux_e2(self.mol, fakemol, intor=int3c2e, aosym='s1')
+                v_nj = df.incore.aux_e2(pmol, fakemol, intor=int3c2e, aosym='s1')
+                if hasattr(self.mol, 'pyscf_ao_permutation'):
+                    permutation = self.mol.pyscf_ao_permutation(pmol)
+                    v_nj = v_nj[permutation][:, permutation]
             else:
                 raise ValueError("PCM integral_backend must be 'native' or 'pyscf'.")
             self._intermediates['surface_coulomb_tensor'] = v_nj

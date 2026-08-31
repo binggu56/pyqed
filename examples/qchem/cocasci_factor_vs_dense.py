@@ -32,7 +32,7 @@ def run_case(label, options, repeats=REPEATS):
             t0 = time.perf_counter()
 
             mol = Molecule(atom=ATOM, unit="angstrom", basis=BASIS)
-            mol.build(driver="builtin", options=options)
+            mol.build(options=options)
 
             t1 = time.perf_counter()
 

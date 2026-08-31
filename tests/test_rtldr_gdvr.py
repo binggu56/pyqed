@@ -45,8 +45,9 @@ class _ToyGDVRRHF:
         self.dm = np.diag(self.mo_occ)
 
 
-def test_ldrn_sparse_linked_kinetic_matrix_matches_dense_scalar_lpa():
-    from pyqed.ldr.ldr import LDRN
+def test_sparse_linked_kinetic_matrix_matches_dense_scalar_lpa():
+    from pyqed.ldr import kinetic as kinetic_tools
+    from pyqed.ldr import overlap as overlap_tools
 
     grid_shape = (2, 2)
     kinetic = np.array(
@@ -68,16 +69,21 @@ def test_ldrn_sparse_linked_kinetic_matrix_matches_dense_scalar_lpa():
     def overlap_fn(i, j):
         return pair_links[(i, j)]
 
-    links = LDRN.lpa_links(grid_shape, overlap_fn)
-    dense_overlap = LDRN.lpa_matrix(grid_shape, links)
+    _, flat_index, _ = overlap_tools.layout(grid_shape)
+    links = overlap_tools.nearest(
+        grid_shape,
+        lambda left, right: overlap_fn(flat_index[left], flat_index[right]),
+    )
+    dense_overlap = overlap_tools.dense(grid_shape, links)
     dense_h = 0.5 * (kinetic * dense_overlap + (kinetic * dense_overlap).conj().T)
-    sparse_h = LDRN.lpa_kinetic(kinetic, grid_shape, overlap_fn)
+    sparse_h = kinetic_tools.linked(kinetic, grid_shape, links)
 
     np.testing.assert_allclose(sparse_h.toarray(), dense_h, atol=1.0e-12)
 
 
-def test_ldrn_sparse_linked_kinetic_matrix_supports_state_blocks():
-    from pyqed.ldr.ldr import LDRN
+def test_sparse_linked_kinetic_matrix_supports_state_blocks():
+    from pyqed.ldr import kinetic as kinetic_tools
+    from pyqed.ldr import overlap as overlap_tools
 
     kinetic = np.array([[0.4, -0.2], [-0.2, 0.5]], dtype=complex)
     link = np.array([[0.95, 0.04j], [0.02j, 0.9]], dtype=complex)
@@ -95,14 +101,43 @@ def test_ldrn_sparse_linked_kinetic_matrix_supports_state_blocks():
     dense_h = dense_h.reshape(4, 4)
     dense_h = 0.5 * (dense_h + dense_h.conj().T)
 
-    sparse_h = LDRN.lpa_kinetic(
+    links = overlap_tools.nearest(
+        (2,),
+        lambda left, right: overlap_fn(left[0], right[0]),
+    )
+    sparse_h = kinetic_tools.linked(
         kinetic,
         (2,),
-        overlap_fn,
+        links,
         nstates=2,
     )
 
     np.testing.assert_allclose(sparse_h.toarray(), dense_h, atol=1.0e-12)
+
+
+def test_dress_kinetic_accepts_sparse_matrix_and_exact_frames():
+    import scipy.sparse as sp
+
+    from pyqed.ldr import kinetic as kinetic_tools
+
+    kinetic = sp.csr_matrix(np.array([[0.4, -0.2], [-0.2, 0.5]]))
+    angle = 0.31
+    frames = np.array(
+        [
+            np.eye(2),
+            [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]],
+        ]
+    )
+    overlap = np.einsum("ima,jmb->iajb", frames.conj(), frames, optimize=True)
+
+    actual = kinetic_tools.dress(
+        kinetic,
+        lambda i, j: frames[i].conj().T @ frames[j],
+        nstates=2,
+    )
+    expected = (kinetic.toarray()[:, None, :, None] * overlap).reshape(4, 4)
+
+    np.testing.assert_allclose(actual.toarray(), expected, atol=1.0e-14)
 
 
 def test_gdvr_rtldr_frame_overlap_is_normalized():

@@ -57,12 +57,6 @@ def main():
         help="nearest-neighbor H-H distance in bohr (default: 1.8)",
     )
     parser.add_argument(
-        "--driver",
-        default="gbasis",
-        choices=["builtin", "gbasis", "gbasis-pyscf", "pyscf"],
-        help="integral backend (default: gbasis)",
-    )
-    parser.add_argument(
         "--nstates",
         type=int,
         default=10,
@@ -84,13 +78,13 @@ def main():
     mol = Molecule(atom=atom, unit="bohr", basis="sto-6g", spin=0)
 
     build_options = None
-    if args.driver == "builtin" and args.use_cholesky:
+    if args.use_cholesky:
         build_options = {"eri_representation": "factors"}
 
     if build_options is None:
-        mol.build(driver=args.driver)
+        mol.build()
     else:
-        mol.build(driver=args.driver, options=build_options)
+        mol.build(options=build_options)
 
     capture = io.StringIO()
     with contextlib.redirect_stdout(capture), contextlib.redirect_stderr(capture):
@@ -111,7 +105,7 @@ def main():
             pyscf_error = str(exc)
 
     print("H8 / STO-6G exact CASCI(8e,8o)")
-    print(f"driver    : {args.driver}")
+    print("integrals : native")
     print(f"distance  : {args.distance:.6f} bohr")
     print(f"backend   : {getattr(mc, 'solver_backend', 'unknown')}")
     print(f"E(HF)     : {float(mf.e_tot):.12f} Ha")

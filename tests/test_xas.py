@@ -6,7 +6,7 @@ from pyqed.qchem import CASCI, Molecule, RHF, TDA, XAS
 
 def _h2_tda():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
     return TDA(mf).run(nstates=1)
 
@@ -40,7 +40,7 @@ def test_cvs_tda_xas_targets_water_oxygen_core_roots():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
 
     cvs = XAS(TDA(mf), core_atoms="O").run(cvs=True, nstates=2)
@@ -67,7 +67,7 @@ def test_xas_can_target_core_atom_by_index_and_ranked_orbital():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
 
     oxygen_by_symbol = XAS(TDA(mf), core_atoms="O").run(cvs=True, nstates=1)
@@ -96,7 +96,7 @@ def test_xas_accepts_spectroscopic_core_string():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
 
     from_constructor = XAS(TDA(mf), core="O 1s").run(cvs=True, nstates=1)
@@ -111,7 +111,7 @@ def test_xas_accepts_spectroscopic_core_string():
 
 def test_xas_core_string_rejects_unsupported_shell():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
 
     with pytest.raises(NotImplementedError, match="Core shell"):
@@ -155,7 +155,7 @@ def test_xas_rejects_invalid_core_weight_threshold():
 
 def test_xas_from_full_active_casci_h2():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
 
@@ -173,7 +173,7 @@ def test_xas_from_full_active_casci_h2():
 
 def test_cvs_casci_xas_targets_core_hole_subspace_h2():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2, method="ci")
 
@@ -200,7 +200,7 @@ def test_cvs_casci_xas_finds_water_oxygen_core_roots_without_many_valence_roots(
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=mol.nao, nelecas=mol.nelec).run(nstates=10, method="ci")
 
@@ -217,7 +217,7 @@ def test_cvs_casci_xas_finds_water_oxygen_core_roots_without_many_valence_roots(
 
 def test_casci_xas_rejects_frozen_core_orbital():
     mol = Molecule(atom="Li 0 0 0; H 0 0 3.0", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
 

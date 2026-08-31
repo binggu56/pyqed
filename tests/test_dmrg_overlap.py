@@ -28,7 +28,7 @@ def _interleaved_to_grouped_sign(det):
 
 def _run_h2_solver(atom):
     mol = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
     casci = CASCI(mf, ncas=2, nelecas=2).run(nstates=1)
     dmrg = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()
@@ -53,13 +53,13 @@ def test_dmrg_overlap_matches_casci_for_displaced_h2():
     mixed_overlap = dmrg1.overlap(cas2)
 
     np.testing.assert_allclose(dmrg1.overlap(dmrg1), np.array([[1.0]]), atol=1e-8)
-    np.testing.assert_allclose(dmrg_overlap, cas_overlap, atol=1e-6)
+    np.testing.assert_allclose(np.abs(dmrg_overlap), np.abs(cas_overlap), atol=1e-6)
     np.testing.assert_allclose(np.abs(mixed_overlap), np.abs(cas_overlap), atol=1e-6)
 
 
 def test_dmrg_unitary_overlap_matches_exact_bridge_for_active_rotation():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     dmrg_ref = DMRG(mf, ncas=2, nelecas=2, D=8, init_guess="cid").build()

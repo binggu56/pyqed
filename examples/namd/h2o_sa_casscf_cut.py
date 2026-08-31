@@ -22,9 +22,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pyqed.units import au2ev
 from pyqed.qchem import CASSCF, Molecule
 
-HARTREE_TO_EV = 27.211386245988
+HARTREE_TO_EV = au2ev
 
 
 def h2o_atom(r, theta_deg):
@@ -44,7 +45,7 @@ def run_point(args, theta_deg):
         spin=0,
         unit="bohr",
     )
-    mol.build(driver=args.driver, eri=args.eri)
+    mol.build(eri=args.eri)
     mf = mol.RHF(verbose=0).run(max_cycle=100)
     weights = np.ones(args.nstates) / args.nstates
     mc = (
@@ -67,7 +68,6 @@ def run_point(args, theta_deg):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--basis", default="sto-3g")
-    p.add_argument("--driver", default="builtin")
     p.add_argument("--eri", default="dense")
     p.add_argument("--ncas", type=int, default=4)
     p.add_argument("--nelecas", type=int, default=4)

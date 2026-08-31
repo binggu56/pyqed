@@ -58,7 +58,7 @@ def casci_point(mol0, symbols, coords, ncas, nelecas, nstates=1, method="direct_
         spin=mol0.spin,
         unit="bohr",
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = mol.RHF(verbose=0).run(max_cycle=100)
     mc = CASCI(mf, ncas, nelecas, verbose=0).run(nstates=nstates, method=method)
     return mc, ao_density_matrices(mf, mc, nstates)

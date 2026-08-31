@@ -3,6 +3,7 @@
 import numpy as np
 
 from pyqed.qchem.mol import Molecule
+from pyqed.units import angstrom2au
 
 
 class IR:
@@ -390,11 +391,7 @@ class IR:
             basis=mol0.basis,
             unit="bohr",
         )
-        driver = getattr(mol0, "_build_driver", None) or "builtin"
-        if driver == "builtin":
-            mol.build(driver=driver, options=getattr(mol0, "builtin_options", None))
-        else:
-            mol.build(driver=driver)
+        mol.build(options=getattr(mol0, "builtin_options", None))
 
         name = method.__class__.__name__.lower()
         if name == "rks":
@@ -619,14 +616,13 @@ class IR:
             "Br": 1.20,
             "I": 1.39,
         }
-        bohr_per_angstrom = 1.889726125
         coords = np.asarray(coords, dtype=float)
         bonds = []
         for i in range(len(coords)):
             ri = radii.get(symbols[i], 0.8)
             for j in range(i + 1, len(coords)):
                 rj = radii.get(symbols[j], 0.8)
-                cutoff = 1.25 * (ri + rj) * bohr_per_angstrom
+                cutoff = 1.25 * (ri + rj) * angstrom2au
                 if np.linalg.norm(coords[i] - coords[j]) <= cutoff:
                     bonds.append((i, j))
         return bonds

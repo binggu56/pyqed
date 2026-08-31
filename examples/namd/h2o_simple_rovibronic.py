@@ -30,9 +30,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pyqed.namd.triatomic import Triatom
-from pyqed.units import au2fs
+from pyqed.units import au2ev, au2fs
 
-HARTREE_TO_EV = 27.211386245988
+HARTREE_TO_EV = au2ev
 FS_TO_AU = 1.0 / au2fs
 
 

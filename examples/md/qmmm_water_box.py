@@ -94,7 +94,7 @@ def mm_from_topology(system, cutoff):
 def qm_h2_reference(positions):
     atom = "; ".join(f"H {x:.16g} {y:.16g} {z:.16g}" for x, y, z in positions)
     mol = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin")
+    mol.build()
     return mol.RHF()
 
 

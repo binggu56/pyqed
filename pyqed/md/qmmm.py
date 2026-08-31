@@ -37,7 +37,6 @@ class QMMM:
         charge_array="charges",
         mm_charges=None,
         qm_run_kwargs=None,
-        qm_build_driver=None,
         exclude_qm_coulomb=True,
         exclude_qm_qm_lj=True,
         embedding_pbc=None,
@@ -51,7 +50,6 @@ class QMMM:
         self.charge_array = str(charge_array)
         self.mm_charges = None if mm_charges is None else np.asarray(mm_charges, dtype=float)
         self.qm_run_kwargs = {} if qm_run_kwargs is None else dict(qm_run_kwargs)
-        self.qm_build_driver = qm_build_driver
         self.exclude_qm_coulomb = bool(exclude_qm_coulomb)
         self.exclude_qm_qm_lj = bool(exclude_qm_qm_lj)
         self.embedding_pbc = _normalize_embedding_pbc(embedding_pbc)
@@ -219,12 +217,12 @@ class QMMM:
     def _embed_point_charges(self, coords, charges):
         from pyqed.qchem import embed_point_charges
 
-        kwargs = {
-            "run_kwargs": self.qm_run_kwargs,
-        }
-        if self.qm_build_driver is not None:
-            kwargs["build_driver"] = self.qm_build_driver
-        return embed_point_charges(self.qm, coords, charges, **kwargs)
+        return embed_point_charges(
+            self.qm,
+            coords,
+            charges,
+            run_kwargs=self.qm_run_kwargs,
+        )
 
     def _calculate_mm_for_embedding(self, atoms, qm_indices, natoms):
         extra_coulomb_exclusions = None

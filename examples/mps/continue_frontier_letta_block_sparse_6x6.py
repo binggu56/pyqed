@@ -176,6 +176,15 @@ def continue_run(
                 "maximum_residual_norm": float(
                     max(update.residual_norm for update in row["updates"])
                 ),
+                "maximum_reconstructed_residual_norm": float(
+                    max(
+                        update.reconstructed_residual_norm
+                        for update in row["updates"]
+                    )
+                ),
+                "maximum_full_residual_norm": float(
+                    max(update.full_residual_norm for update in row["updates"])
+                ),
                 "identity_metric_sites": int(
                     sum(update.solver_metric_is_identity for update in row["updates"])
                 ),

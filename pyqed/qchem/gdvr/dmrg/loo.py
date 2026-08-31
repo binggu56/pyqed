@@ -5,6 +5,8 @@ import logging
 import datetime
 import numpy as np
 
+from pyqed.units import angstrom2au
+
 # ============================================================
 # GDVR / HF imports
 # ============================================================
@@ -51,7 +53,7 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-ANG_TO_BOHR = 1.8897259886
+ANG_TO_BOHR = angstrom2au
 
 DEFAULT_S_EXPS = np.array(
     [35.52322122, 6.513143725, 1.822142904, 0.6259552659, 0.2430767471, 0.1001124280],
@@ -799,8 +801,8 @@ def run_dmrg_from_hf_data(
     solver.run()
 
     try:
-        psi_tensors = solver.ground_state.Bs
-        e_elec = mps_lib.expect_mps(psi_tensors, solver.H, psi_tensors)
+        psi_tensors = solver.ground_state.factors
+        e_elec = mps_lib._expect_factors(psi_tensors, solver.H, psi_tensors)
         E_dmrg = np.real(e_elec) + Enuc
     except Exception as e:
         logger.info(f"[DMRG] expect_mps failed, fallback to solver.e_tot. Error: {e}")
@@ -809,7 +811,7 @@ def run_dmrg_from_hf_data(
     with open(os.path.join(outdir, "dmrg_ground_state.pkl"), "wb") as f:
         pickle.dump(
             {
-                "Bs": solver.ground_state.Bs,
+                "Bs": solver.ground_state.factors,
                 "nkeep": nkeep,
                 "charge": nelec,
                 "spin": 0,

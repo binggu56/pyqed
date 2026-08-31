@@ -362,10 +362,15 @@ class NARG:
             raise TypeError("NARG(..., blocks=...) was removed; use symmetry=... instead.")
         workflow = None
         if isinstance(mf, MPOHamiltonian):
-            raise NotImplementedError(
-                "NARG(MPOHamiltonian) is reserved for the generic MPO-NARG backend, "
-                "which is not implemented yet. Use form='integrals' for now."
-            )
+            if args:
+                raise TypeError("NARG(MPOHamiltonian, ...) does not accept positional backend arguments.")
+            if mf.model is None or mf.model.__class__.__name__ != "Hubbard":
+                raise NotImplementedError(
+                    "MPO-NARG currently supports Hubbard Hamiltonians."
+                )
+            from pyqed.narg.hubbard import HubbardMPONARG
+
+            return HubbardMPONARG(mf, **kwargs)
         if isinstance(mf, IntegralHamiltonian):
             if args:
                 raise TypeError("NARG(IntegralHamiltonian, ...) does not accept positional backend arguments.")
@@ -429,6 +434,11 @@ def energy_groups(*args, **kwargs):
 
 
 def __getattr__(name):
+    if name == "SU2LETTA":
+        from pyqed.letta import SU2LETTA
+
+        globals()[name] = SU2LETTA
+        return SU2LETTA
     if name == "BareNARG":
         _load_bare_backend()
         return globals()[name]
@@ -450,6 +460,7 @@ def __getattr__(name):
 __all__ = [
     "NARG",
     "LETTA",
+    "SU2LETTA",
     "NARGOpt",
     "NARGSCF",
     "BareNARG",
