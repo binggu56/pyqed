@@ -38,6 +38,8 @@ def parse_args():
     parser.add_argument("--bond-dimension", type=int, default=64)
     parser.add_argument("--nsweeps", type=int, default=12)
     parser.add_argument("--max-cycles", type=int, default=12)
+    parser.add_argument("--n-threads", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--macro-tol", type=float, default=1.0e-6)
     parser.add_argument("--orb-grad-tol", type=float, default=1.0e-4)
     parser.add_argument("--dmrg-tol", type=float, default=1.0e-7)
@@ -102,6 +104,7 @@ def json_default(value):
 def main():
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    np.random.seed(args.seed)
     t0 = time.perf_counter()
 
     mol = Molecule(atom=PYRAZINE_GEOMETRY_BOHR, unit="bohr", basis=args.basis)
@@ -130,6 +133,7 @@ def main():
         mo_coeff=initial_mo_coeff,
         orb_grad_tol=args.orb_grad_tol,
         nsweeps=args.nsweeps,
+        n_threads=args.n_threads,
         require_conv=False,
         mixer_zero_block_noise_scale=0.0,
         mixer_nsweeps=0,
@@ -160,6 +164,8 @@ def main():
         "bond_dimension": args.bond_dimension,
         "requested_sweeps": args.nsweeps,
         "requested_macro_cycles": args.max_cycles,
+        "n_threads": args.n_threads,
+        "seed": args.seed,
         "macro_tolerance_hartree": args.macro_tol,
         "orbital_gradient_tolerance": args.orb_grad_tol,
         "initial_data": None if args.initial_data is None else str(args.initial_data),
@@ -172,7 +178,10 @@ def main():
         "macro_iterations": int(mc.macro_iterations),
         "macro_diagnostics": mc.macro_diagnostics,
         "dmrgscf_timing": mc.dmrgscf_timing,
-        "orbital_integral_backend": mc.orbital_integral_backend_actual,
+        "threading": dict(getattr(mc.dmrg, "threading_info", {}) or {}),
+        "orbital_integral_backend": getattr(
+            mc, "orbital_integral_backend_actual", None
+        ),
         "wall_time_seconds": time.perf_counter() - t0,
     }
     (args.output_dir / "pyrazine_cas1010_dmrgscf_summary.json").write_text(
