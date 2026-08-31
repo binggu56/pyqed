@@ -90,6 +90,7 @@ docs = [
 ]
 test = [
     "build>=1.2",
+    "matplotlib>=3.8",
     "pytest>=8",
     "twine>=5",
 ]
@@ -119,13 +120,16 @@ include = ["pyqed*"]
 namespaces = false
 
 [tool.setuptools.package-data]
+"pyqed" = ["*.hpp"]
 "pyqed.qchem" = [
+    "*.hpp",
     "H2/*.in",
     "basis_set/*.gbs",
     "basis_set/*.txt",
 ]
 "pyqed.narg.qchem" = ["su2_native.cpp"]
-"pyqed.mps.nonabelian" = ["su2_coupling_core.hpp"]
+"pyqed.mps" = ["*.hpp"]
+"pyqed.mps.nonabelian" = ["*.hpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

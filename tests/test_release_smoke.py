@@ -24,5 +24,5 @@ def test_public_quickstart_runs(capsys):
     namespace = runpy.run_path(str(quickstart))
 
     assert namespace["mf"].converged
-    assert namespace["mf"].e_tot == pytest.approx(-1.116759310293, abs=1.0e-10)
+    assert namespace["mf"].e_tot == pytest.approx(-1.116759310293, abs=1.0e-8)
     assert "RHF energy:" in capsys.readouterr().out

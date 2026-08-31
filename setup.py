@@ -155,12 +155,11 @@ def _optional_extensions():
             ["-framework", "Accelerate"] if sys.platform == "darwin" else []
         )
         mps_openmp_compile_args, mps_openmp_link_args = _mps_openmp_flags()
-        casscf_libraries = ["blas"] if sys.platform.startswith("linux") else []
-        casscf_macros = (
-            [("PYQED_USE_CBLAS", "1")]
-            if sys.platform.startswith("linux")
-            else []
-        )
+        # Accelerate is available on macOS.  Generic Linux wheels must retain
+        # the extension's internal fallback instead of assuming a system BLAS
+        # development library is installed on the target machine.
+        casscf_libraries = []
+        casscf_macros = []
         extensions.append(
             Extension(
                 "pyqed.qchem._integrals_cpp",
