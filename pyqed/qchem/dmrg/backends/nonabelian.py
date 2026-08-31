@@ -202,7 +202,7 @@ def _make_state_average_root_sites(
             initial_guess=initial_guess,
             bond_multiplicity=bond_multiplicity,
             seed=seed,
-        ).sites
+        ).tensors
     )
     for root_idx in range(1, nroots):
         root = _make_initial_mps(
@@ -212,7 +212,7 @@ def _make_state_average_root_sites(
             bond_multiplicity=bond_multiplicity,
             seed=seed + 104729 * root_idx,
         )
-        roots.append(root.sites)
+        roots.append(root.tensors)
     return [[site.copy() for site in root] for root in roots]
 
 
@@ -250,13 +250,13 @@ def _expectation_from_nonabelian_mps(
     moving_environment=None,
 ):
     numerator = contract_chain_expectation(
-        state.sites,
+        state.tensors,
         mpo_factors,
         moving_environment=moving_environment,
     )
     denominator = contract_chain_expectation(
-        state.sites,
-        _identity_mpo_factors_for_sites_and_mpo(state.sites, mpo_factors),
+        state.tensors,
+        _identity_mpo_factors_for_sites_and_mpo(state.tensors, mpo_factors),
     )
     denom = float(np.real(denominator))
     if abs(denom) < 1.0e-15:
@@ -912,7 +912,7 @@ def _run_spatial_qchem_dmrg(
             max_bond_mode="reduced",
         )
         su2_moving_environment.install_state_average_mps(
-            initial_multiroot_mps.roots,
+            [root.tensors for root in initial_multiroot_mps.roots],
             initial_multiroot_mps.weights,
             0,
         )

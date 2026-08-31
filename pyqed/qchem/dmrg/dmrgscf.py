@@ -314,6 +314,8 @@ def _complete_mo_basis(mf, mo_coeff):
 
 
 class DMRGSCF(QCDMRG):
+    """DMRG orbital optimization with fully reduced SU(2) DMRG by default."""
+
     def __init__(
         self,
         mf,
@@ -324,6 +326,7 @@ class DMRGSCF(QCDMRG):
         macro_tol=1e-6,
         dmrg_conv_tol=1e-7,
         integral_backend=None,
+        symmetry="su2",
         **kwargs,
     ):
         super().__init__(
@@ -332,6 +335,7 @@ class DMRGSCF(QCDMRG):
             nelecas,
             D,
             integral_backend=integral_backend,
+            symmetry=symmetry,
             **kwargs,
         )
 

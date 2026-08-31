@@ -627,7 +627,7 @@ def _fully_reduced_spatial_mps_to_component_mps(state):
     )
     from pyqed.mps.su2 import SpatialOrbitalSite
 
-    sites = list(getattr(state, "sites", state))
+    sites = list(getattr(state, "tensors", state))
     if not sites:
         raise ValueError("Cannot expand an empty fully reduced MPS.")
 
@@ -5667,7 +5667,7 @@ class DMRG(CASCI):
         native_npdm = getattr(moving_environment, "spatial_npdm", None)
         if native_npdm is not None:
             payload = native_npdm(
-                state.sites,
+                state.tensors,
                 spin_rotation_reduction=is_singlet,
             )
             diagnostics = {

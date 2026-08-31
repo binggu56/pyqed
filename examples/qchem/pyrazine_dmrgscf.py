@@ -40,6 +40,7 @@ def parse_args():
     parser.add_argument("--max-cycles", type=int, default=12)
     parser.add_argument("--n-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--symmetry", choices=("su2", "sz"), default="su2")
     parser.add_argument("--macro-tol", type=float, default=1.0e-6)
     parser.add_argument("--orb-grad-tol", type=float, default=1.0e-4)
     parser.add_argument("--dmrg-tol", type=float, default=1.0e-7)
@@ -77,10 +78,18 @@ def plot_convergence(energy_history, output, macro_tol, orb_grad_tol, diagnostic
             label=r"$|\Delta E|$",
         )
     if diagnostics:
-        gradients = np.asarray([row["gn"] for row in diagnostics], dtype=float)
-        axes[1].semilogy(
-            np.arange(1, len(gradients) + 1), gradients, "s-", label="orbital gradient"
+        gradients = np.asarray(
+            [row.get("gn", row.get("gradient_norm", np.nan)) for row in diagnostics],
+            dtype=float,
         )
+        finite = np.isfinite(gradients) & (gradients > 0.0)
+        if np.any(finite):
+            axes[1].semilogy(
+                np.arange(1, len(gradients) + 1)[finite],
+                gradients[finite],
+                "s-",
+                label="orbital gradient",
+            )
     axes[1].axhline(macro_tol, color="k", ls="--", lw=1, label="energy tolerance")
     axes[1].axhline(
         orb_grad_tol, color="0.4", ls=":", lw=1, label="gradient tolerance"
@@ -124,7 +133,7 @@ def main():
         macro_tol=args.macro_tol,
         dmrg_conv_tol=args.dmrg_tol,
         site="spatial",
-        symmetry="sz",
+        symmetry=args.symmetry,
         init_guess="cid",
         verbose=args.verbose,
     )
@@ -160,7 +169,9 @@ def main():
         "geometry_unit": "bohr",
         "basis": args.basis,
         "active_space": {"electrons": 10, "orbitals": 10, "ncore": int(mc.ncore)},
-        "symmetry": "charge + Sz",
+        "symmetry": (
+            "charge + SU(2)" if args.symmetry == "su2" else "charge + Sz"
+        ),
         "bond_dimension": args.bond_dimension,
         "requested_sweeps": args.nsweeps,
         "requested_macro_cycles": args.max_cycles,
@@ -178,7 +189,10 @@ def main():
         "macro_iterations": int(mc.macro_iterations),
         "macro_diagnostics": mc.macro_diagnostics,
         "dmrgscf_timing": mc.dmrgscf_timing,
-        "threading": dict(getattr(mc.dmrg, "threading_info", {}) or {}),
+        "threading": dict(
+            getattr(mc.dmrg, "threading_info", {})
+            or (getattr(mc.dmrg, "diagnostics", {}) or {}).get("threading", {})
+        ),
         "orbital_integral_backend": getattr(
             mc, "orbital_integral_backend_actual", None
         ),

@@ -29,6 +29,22 @@ def _h2_factor_rhf():
     return RHF(mol).run()
 
 
+def test_dmrgscf_defaults_to_fully_reduced_su2():
+    mc = DMRGSCF(
+        _h2_rhf(),
+        ncas=2,
+        nelecas=2,
+        D=8,
+        max_cycles=1,
+        init_guess="hf",
+        verbose=0,
+    )
+
+    assert mc.symmetry == ["charge", "su2"]
+    assert mc.site == "spatial"
+    assert mc.spatial_site_basis == "fully_reduced"
+
+
 def test_state_averaged_su2_dmrgscf_preserves_su2_solver():
     mf = _h2_rhf()
     mc = DMRGSCF(
