@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep
+from pyqed.symmetry import Irrep
 
 from .su2_chain import (
     complete_density_composites,
@@ -221,7 +221,7 @@ class SU2RDMBuilder:
         self._ensure_spin_density_operators()
         target = Irrep((self.nelec, self.j2))
         m2 = self.j2
-        site = next(iter(self.operators.values())).site
+        site = next(iter(self.operators.values())).leg
         sectors = [
             irrep
             for irrep in site.irreps
