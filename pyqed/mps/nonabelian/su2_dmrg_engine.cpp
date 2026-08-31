@@ -86,6 +86,20 @@ extern "C" void cblas_dscal(
     double* values,
     const int stride
 );
+#else
+inline double cblas_ddot(
+    const int count,
+    const double* left,
+    const int left_stride,
+    const double* right,
+    const int right_stride
+) {
+    double value = 0.0;
+    for (int index = 0; index < count; ++index) {
+        value += left[index * left_stride] * right[index * right_stride];
+    }
+    return value;
+}
 #endif
 
 namespace pyqed::su2 {
