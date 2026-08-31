@@ -31,7 +31,42 @@ from pyqed.mps.nonabelian.states import (
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
 from pyqed.mps.su2 import SpatialOrbitalSite
 from pyqed.narg.qchem import LETTA
+from pyqed.qchem.letta import LETTA as QChemLETTA
 from pyqed.qchem.dmrg.backends.reduced import build_spatial_reduced_hamiltonian_mpo
+
+
+def test_qchem_letta_constructs_su2_state_from_mean_field():
+    class Molecule:
+        nelec = (1, 1)
+        spin = 0
+
+        @staticmethod
+        def energy_nuc():
+            return 0.7
+
+    class MeanField:
+        mol = Molecule()
+
+        @staticmethod
+        def get_hcore_mo():
+            return np.array([[-1.0, -0.2], [-0.2, 0.5]])
+
+        @staticmethod
+        def get_eri_mo():
+            return np.zeros((2, 2, 2, 2))
+
+    mf = MeanField()
+    state = QChemLETTA(mf, D=1, graph=[(0, 1)], seed=4)
+
+    assert isinstance(state, SU2LETTA)
+    assert state.mf is mf
+    assert state.ncas == 2
+    assert state.nelecas == 2
+    assert state.ncore == 0
+    assert state.is_native_su2
+    state.run(nsweeps=1, algorithm="one_site", tol=0.0)
+    assert np.isfinite(state.energy)
+    state.close()
 
 
 def _dense_vector_from_reduced_spatial_mps(sites):

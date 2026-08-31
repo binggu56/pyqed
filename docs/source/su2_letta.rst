@@ -8,22 +8,23 @@ reachable virtual sector.
 Construction
 ------------
 
-Build directly from active-space spatial-orbital integrals through the qchem
-adapter:
+Build directly from a completed mean-field calculation through the qchem
+driver:
 
 .. code-block:: python
 
-   from pyqed.narg.qchem import LETTA
+   from pyqed.qchem.letta import LETTA
 
-   state = LETTA.from_integrals(
-       h1e,
-       eri,
+   state = LETTA(
+       mf,
        symmetry="su2",
-       nelec=nelec,
-       spin=two_s,
-       graph=graph,
        D=32,
    )
+
+For an active-space calculation, additionally pass ``ncas``, ``nelecas``, and
+optionally ``ncore`` or ``mo_coeff``.  ``LETTA.from_integrals`` remains
+available for model Hamiltonians with precomputed spatial-orbital integrals.
+The generic tensor ansatz remains ``pyqed.letta.LETTA``.
 
 For a pre-existing fully reduced spatial-orbital MPS, use the native class:
 

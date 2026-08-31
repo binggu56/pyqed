@@ -180,6 +180,11 @@ except (ImportError, OSError):
     gaussian_pulse = None
 
 try:
+    from .letta import LETTA
+except (ImportError, OSError):
+    LETTA = None
+
+try:
     from .dmrg.overlap import overlap as dmrg_overlap
     from .dmrg.overlap import unitary_overlap as dmrg_unitary_overlap
     from .dmrg.overlap import biorthogonal_overlap as dmrg_biorthogonal_overlap
