@@ -24,7 +24,6 @@ include pyqed/letta/_physical_blocks_cpp.cpp
 include pyqed/letta/_support_kernels_cpp.cpp
 include pyqed/mps/davidson.cpp
 include pyqed/mps/dmrg_linalg_core.hpp
-include pyqed/mps/nonabelian/_su2_kernel.cpp
 include pyqed/mps/nonabelian/_su2_kernel.pyx
 include pyqed/mps/nonabelian/su2_dmrg_engine.cpp
 include pyqed/mps/nonabelian/su2_dmrg_engine.hpp

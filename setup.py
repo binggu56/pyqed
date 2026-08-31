@@ -220,7 +220,7 @@ def _optional_extensions():
             Extension(
                 "pyqed.mps.nonabelian._su2_kernel",
                 [
-                    "pyqed/mps/nonabelian/_su2_kernel.cpp",
+                    "pyqed/mps/nonabelian/_su2_kernel.pyx",
                     "pyqed/mps/nonabelian/su2_dmrg_engine.cpp",
                 ],
                 depends=[

@@ -2493,7 +2493,7 @@ public:
         bool accept_unconverged
     );
     std::vector<OwnedSplitSiteExport> export_owned_split_sites() const;
-    SpatialNPDMResult spatial_npdm(bool spin_rotation_reduction);
+    SpatialNPDMResult spatial_npdm(bool spin_rotation_reduction) const;
     SpatialNPDMResult spatial_npdm_component_reference(
         bool spin_rotation_reduction
     ) const;

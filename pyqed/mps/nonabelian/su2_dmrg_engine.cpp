@@ -39057,7 +39057,7 @@ double component_string_expectation(
 
 SpatialNPDMResult MovingEnvironment::spatial_npdm(
     bool spin_rotation_reduction
-) {
+) const {
     const double setup_started = wall_seconds();
     if (system_ == nullptr || split_sites_.size() != system_->n_sites()) {
         throw std::logic_error(
@@ -39168,53 +39168,16 @@ SpatialNPDMResult MovingEnvironment::spatial_npdm(
             {1, 0, 1.0},
             {1, 1, 1.0},
         };
-    const std::uint64_t rdm2_pairs = n2 * (n2 + 1) / 2;
-#ifdef _OPENMP
-    const long double bond = static_cast<long double>(
-        std::max<std::size_t>(1, result.max_reduced_bond_dimension)
-    );
-    const std::uint64_t rdm2_work = static_cast<std::uint64_t>(
-        std::min<long double>(
-            static_cast<long double>(std::numeric_limits<std::uint64_t>::max()),
-            static_cast<long double>(rdm2_pairs)
-                * static_cast<long double>(spin_channels.size())
-                * static_cast<long double>(n_sites) * bond * bond
-        )
-    );
-    const int rdm2_threads = adaptive_openmp_thread_count(
-        n_threads_,
-        n2,
-        rdm2_work
-    );
-#else
-    constexpr int rdm2_threads = 1;
-#endif
-    const auto contract_left_pair = [
-        &reduced_sites,
-        &left_identity,
-        &right_identity,
-        &spin_channels,
-        &result,
-        n_sites,
-        n2
-    ](
-        std::size_t left_pair,
-        ReducedNPDMRecouplingCache& thread_recoupling_cache,
-        ReducedNPDMLocalDecompositionCache& thread_decomposition_cache,
-        std::vector<double>& thread_temporary,
-        std::size_t& maximum_operator_channels,
-        std::int32_t& maximum_operator_two_j
-    ) {
-        const std::size_t p = left_pair / n_sites;
-        const std::size_t r = left_pair % n_sites;
-        for (std::size_t right_pair = left_pair;
-             right_pair < n2;
-             ++right_pair) {
-            const std::size_t q = right_pair / n_sites;
-            const std::size_t s = right_pair % n_sites;
-            double value = 0.0;
-            for (const auto& [spin, tau, scale] : spin_channels) {
-                value += scale * reduced_npdm_string_expectation(
+    for (const auto& [spin, tau, scale] : spin_channels) {
+        for (std::size_t left_pair = 0; left_pair < n2; ++left_pair) {
+            const std::size_t p = left_pair / n_sites;
+            const std::size_t r = left_pair % n_sites;
+            for (std::size_t right_pair = left_pair;
+                 right_pair < n2;
+                 ++right_pair) {
+                const std::size_t q = right_pair / n_sites;
+                const std::size_t s = right_pair % n_sites;
+                const double value = scale * reduced_npdm_string_expectation(
                     reduced_sites,
                     left_identity,
                     right_identity,
@@ -39225,88 +39188,24 @@ SpatialNPDMResult MovingEnvironment::spatial_npdm(
                         FermionSpec{false, spin, static_cast<std::int64_t>(q)},
                     },
                     result.norm,
-                    thread_recoupling_cache,
-                    thread_decomposition_cache,
-                    thread_temporary,
-                    maximum_operator_channels,
-                    maximum_operator_two_j
+                    recoupling_cache,
+                    local_decomposition_cache,
+                    product_temporary,
+                    result.max_operator_channels,
+                    result.max_operator_two_j
                 );
-            }
-            const std::size_t index =
-                ((p * n_sites + q) * n_sites + r) * n_sites + s;
-            result.rdm2[index] = value;
-            if (left_pair != right_pair) {
-                const std::size_t reverse =
-                    ((q * n_sites + p) * n_sites + s) * n_sites + r;
-                result.rdm2[reverse] = value;
-            }
-        }
-    };
-    if (rdm2_threads == 1) {
-        for (std::size_t left_pair = 0; left_pair < n2; ++left_pair) {
-            contract_left_pair(
-                left_pair,
-                recoupling_cache,
-                local_decomposition_cache,
-                product_temporary,
-                result.max_operator_channels,
-                result.max_operator_two_j
-            );
-        }
-    }
-#ifdef _OPENMP
-    else {
-        ++openmp_parallel_regions_;
-        openmp_tasks_ += n2;
-        std::atomic<bool> rdm2_failed{false};
-        std::exception_ptr rdm2_error;
-#pragma omp parallel num_threads(rdm2_threads)
-        {
-            ReducedNPDMRecouplingCache thread_recoupling_cache;
-            ReducedNPDMLocalDecompositionCache thread_decomposition_cache;
-            std::vector<double> thread_temporary;
-            std::size_t maximum_operator_channels = 0;
-            std::int32_t maximum_operator_two_j = 0;
-#pragma omp for schedule(dynamic, 1)
-            for (std::int64_t left_pair = 0;
-                 left_pair < static_cast<std::int64_t>(n2);
-                 ++left_pair) {
-                if (rdm2_failed.load(std::memory_order_relaxed)) continue;
-                try {
-                    contract_left_pair(
-                        static_cast<std::size_t>(left_pair),
-                        thread_recoupling_cache,
-                        thread_decomposition_cache,
-                        thread_temporary,
-                        maximum_operator_channels,
-                        maximum_operator_two_j
-                    );
-                } catch (...) {
-                    rdm2_failed.store(true, std::memory_order_relaxed);
-#pragma omp critical(pyqed_su2_npdm_rdm2_error)
-                    {
-                        if (rdm2_error == nullptr) {
-                            rdm2_error = std::current_exception();
-                        }
-                    }
+                ++result.string_contractions;
+                const std::size_t index =
+                    ((p * n_sites + q) * n_sites + r) * n_sites + s;
+                result.rdm2[index] += value;
+                if (left_pair != right_pair) {
+                    const std::size_t reverse =
+                        ((q * n_sites + p) * n_sites + s) * n_sites + r;
+                    result.rdm2[reverse] += value;
                 }
             }
-#pragma omp critical(pyqed_su2_npdm_rdm2_diagnostics)
-            {
-                result.max_operator_channels = std::max(
-                    result.max_operator_channels,
-                    maximum_operator_channels
-                );
-                result.max_operator_two_j = std::max(
-                    result.max_operator_two_j,
-                    maximum_operator_two_j
-                );
-            }
         }
-        if (rdm2_error != nullptr) std::rethrow_exception(rdm2_error);
     }
-#endif
-    result.string_contractions += rdm2_pairs * spin_channels.size();
     result.rdm2_seconds = wall_seconds() - rdm2_started;
     return result;
 }
