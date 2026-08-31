@@ -68,7 +68,7 @@ def pair_distances(coords):
 
 
 def geometry_benchmark():
-    tri = Triatomic(h2o_reference_geometry(), unit="bohr", coordinates="jacobi-h-oh")
+    tri = Triatomic(h2o_reference_geometry(), unit="bohr", coordinates="jacobi")
     qeq = tri.valence_to_jacobi(1.81, 1.81, np.deg2rad(104.5))
     coords = tri.internal_to_xyz(*qeq)
     return {
@@ -89,7 +89,7 @@ def energies_from_driver(driver, xyz):
 
 def pes_equivalence_benchmark(driver):
     val = Triatomic(h2o_reference_geometry(), unit="bohr", coordinates="valence")
-    jac = Triatomic(h2o_reference_geometry(), unit="bohr", coordinates="jacobi-h-oh")
+    jac = Triatomic(h2o_reference_geometry(), unit="bohr", coordinates="jacobi")
     points = [
         (1.81, 1.81, np.deg2rad(104.5)),
         (1.95, 1.81, np.deg2rad(104.5)),

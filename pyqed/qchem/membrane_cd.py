@@ -110,7 +110,6 @@ class MembraneCD:
         min_qm_distance=None,
         cap_charge_distance=None,
         charge_array="charges",
-        build_driver="builtin",
         build_kwargs=None,
         mf_run_kwargs=None,
         method_kwargs=None,
@@ -129,8 +128,7 @@ class MembraneCD:
         self.min_qm_distance = min_qm_distance
         self.cap_charge_distance = cap_charge_distance
         self.charge_array = charge_array
-        self.build_driver = build_driver
-        self.build_kwargs = self._default_build_kwargs(build_driver, build_kwargs)
+        self.build_kwargs = self._default_build_kwargs(build_kwargs)
         self.mf_run_kwargs = {} if mf_run_kwargs is None else dict(mf_run_kwargs)
         self.method_kwargs = {} if method_kwargs is None else dict(method_kwargs)
         self.cd_kwargs = {} if cd_kwargs is None else dict(cd_kwargs)
@@ -172,7 +170,6 @@ class MembraneCD:
             mf,
             snapshot.charge_coords,
             snapshot.charges,
-            build_driver=self.build_driver,
             build_kwargs=self.build_kwargs,
             run_kwargs=self.mf_run_kwargs,
         ).run()
@@ -222,7 +219,7 @@ class MembraneCD:
             charge=self.charge,
             spin=self.spin,
         )
-        mol.build(driver=self.build_driver, **self.build_kwargs)
+        mol.build(**self.build_kwargs)
         return mol
 
     def _run_backend(self, mf):
@@ -244,13 +241,10 @@ class MembraneCD:
         raise ValueError("method must be 'tda', 'tddft', or 'casci'.")
 
     @staticmethod
-    def _default_build_kwargs(build_driver, build_kwargs):
+    def _default_build_kwargs(build_kwargs):
         if build_kwargs is not None:
             return dict(build_kwargs)
-        driver = "builtin" if build_driver is None else str(build_driver).lower()
-        if driver in {"builtin", "native", "own", "pyqed"}:
-            return {"eri": "s8"}
-        return {}
+        return {"eri": "s8"}
 
 
 def _energy_scale(units):

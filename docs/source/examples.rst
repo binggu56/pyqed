@@ -93,6 +93,14 @@ Open Quantum Systems and Spectroscopy
 * ``examples/2DES.py``: two-dimensional electronic spectroscopy example.
 * ``examples/TPA.py``: two-photon absorption example.
 
+Tensor Networks
+---------------
+
+* ``examples/peps/heisenberg_2d.py``: finite square-lattice PEPS construction,
+  exact-environment optimization, boundary-MPS contraction, and CTMRG.
+* ``examples/peps/u1_exchange_dynamics.py``: sector-resolved U(1) PEPS
+  real-time evolution with adaptive bond-charge growth.
+
 Running Examples
 ----------------
 

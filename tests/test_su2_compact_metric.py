@@ -2,11 +2,10 @@ import numpy as np
 
 from pyqed.mps.nonabelian import solver as solver_module
 from pyqed.mps.nonabelian.basis import (
-    BondBasis,
     LocalLayoutEntry,
-    SiteBasis,
     TwoSiteBasis,
 )
+from pyqed.symmetry import Leg
 from pyqed.mps.nonabelian.decompose import (
     _build_side_pipe,
     _factor_metric_weighted_projected_svd,
@@ -156,10 +155,10 @@ def test_factorized_route_metric_owned_cholesky_transform_is_exact():
 def test_identity_metric_scans_cross_sector_routes_after_dense_diagonal_block():
     left0, left1, phys, right = "left0", "left1", "phys", "right"
     basis = TwoSiteBasis(
-        left=BondBasis((left0, left1), {left0: 2, left1: 1}),
-        phys1=SiteBasis((phys,), {phys: 1}),
-        phys2=SiteBasis((phys,), {phys: 1}),
-        right=BondBasis((right,), {right: 1}),
+        left=Leg((left0, left1), {left0: 2, left1: 1}),
+        phys1=Leg((phys,), {phys: 1}),
+        phys2=Leg((phys,), {phys: 1}),
+        right=Leg((right,), {right: 1}),
         entries=(
             LocalLayoutEntry((left0, phys, phys, right), (2, 1, 1, 1), 0, 2),
             LocalLayoutEntry((left1, phys, phys, right), (1, 1, 1, 1), 2, 1),

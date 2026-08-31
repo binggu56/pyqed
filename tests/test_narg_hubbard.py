@@ -61,6 +61,7 @@ def test_hubbard_H_accepts_public_symmetry_name():
 
     assert hub.H(symmetry="number").symmetry == "number"
     assert hub.H(symmetry="spin").symmetry == "spin"
+    assert hub.NARG(symmetry="number", D=8).__class__.__name__ == "HubbardMPONARG"
 
     with pytest.raises(TypeError, match="blocks"):
         hub.H(blocks="spin")
@@ -268,15 +269,65 @@ def test_clustered_su2_narg_supports_variable_supersites(
     assert solver.timings["exact_internal_sizes"] == internal_sizes
 
 
-def test_hubbard_H_can_return_mpo_placeholder():
+def test_hubbard_mpo_narg_matches_integral_backend_and_keeps_chain_frontier():
     hub = Hubbard(nsites=4, nelec=(2, 2), t=1.0, U=4.0)
 
     H = hub.H(symmetry="number", form="mpo")
+    mpo = NARG(H, D=16, n0=2, nstates=1)
+    mpo.run()
+    integral = hub.NARG(
+        form="integrals",
+        symmetry="number",
+        D=16,
+        n0=2,
+        nstates=1,
+    )
 
     assert isinstance(H, MPOHamiltonian)
     assert H.form == "mpo"
-    with pytest.raises(NotImplementedError):
-        NARG(H, D=8)
+    np.testing.assert_allclose(mpo.e_tot, integral.e_tot, atol=1.0e-12)
+    assert max(step["frontier_width"] for step in mpo.history) == 1
+    assert max(step["environment_matrices"] for step in mpo.history) == 3
+
+
+def test_hubbard_detached_mpo_narg_matches_integral_backend():
+    hub = Hubbard(nsites=6, nelec=(3, 3), t=0.7, U=2.0)
+    options = dict(
+        symmetry="number",
+        D=2,
+        n0=2,
+        nstates=1,
+        dressing="detached_frames",
+        chi=12,
+    )
+
+    mpo = hub.NARG(form="mpo", **options)
+    integral = hub.NARG(form="integrals", **options)
+
+    np.testing.assert_allclose(mpo.e_tot, integral.e_tot, atol=1.0e-12)
+    assert len(mpo.detached_history) == 4
+
+
+@pytest.mark.parametrize(
+    "hub",
+    [
+        Hubbard(nsites=4, nelec=(2, 2), t=0.7, U=2.0, periodic=True),
+        Hubbard(lx=2, ly=2, nelec=(2, 2), t=0.7, U=2.0),
+    ],
+)
+def test_hubbard_mpo_frontier_is_exact_for_periodic_and_square_graphs(hub):
+    solver = hub.NARG(
+        form="mpo",
+        symmetry="number",
+        D=16,
+        n0=2,
+        nstates=1,
+    )
+    h1e, eri = hub.integrals()
+    exact = _exact_hubbard_sector_ground(h1e, eri, hub.nelec)
+
+    np.testing.assert_allclose(solver.e_tot[0], exact, atol=1.0e-10)
+    assert max(step["frontier_width"] for step in solver.history) >= 1
 
 
 def test_hubbard_narg_is_instance_api_only():

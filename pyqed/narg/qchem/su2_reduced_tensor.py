@@ -22,7 +22,7 @@ import os
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep
+from pyqed.narg.irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep
 from .su2_core import Multiplet, asarray, cg, su2_product_symmetry
 
 
@@ -102,7 +102,7 @@ class ReducedSU2Tensor:
         return self.tensor.op
 
     @property
-    def site(self) -> IrrepSite:
+    def site(self) -> Leg:
         return self.tensor.bra
 
     @property
@@ -120,9 +120,12 @@ def group_multiplets(multiplets: list[Multiplet]) -> dict[Irrep, list[Multiplet]
     return dict(sorted(groups.items(), key=lambda item: item[0].charge))
 
 
-def site_from_multiplets(multiplets: list[Multiplet]) -> IrrepSite:
+def site_from_multiplets(multiplets: list[Multiplet]) -> Leg:
     groups = group_multiplets(multiplets)
-    return IrrepSite(su2_product_symmetry(), {irrep: len(mps) for irrep, mps in groups.items()})
+    return Leg(
+        {irrep: len(mps) for irrep, mps in groups.items()},
+        symmetry=su2_product_symmetry(),
+    )
 
 
 def component_basis(groups: dict[Irrep, list[Multiplet]], irrep: Irrep, m2: int) -> np.ndarray:
@@ -257,7 +260,7 @@ def add_reduced_tensors(*tensors: ReducedSU2Tensor, atol: float = 1e-14) -> Redu
     return ReducedSU2Tensor(IrrepTensor(site, site, op, blocks))
 
 
-def _site_charge_signature(site: IrrepSite) -> tuple[tuple[tuple[int, int], int], ...]:
+def _site_charge_signature(site: Leg) -> tuple[tuple[tuple[int, int], int], ...]:
     return tuple(
         (tuple(int(x) for x in irrep.charge), int(site.sector_dim(irrep)))
         for irrep in site.irreps

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Small symmetry-aware MPO builders for fixed-layout non-Abelian chains.
+Small symmetry-aware MPOCore builders for fixed-layout non-Abelian chains.
 """
 
 from __future__ import annotations
@@ -16,14 +16,14 @@ from .contraction import normalize_site_tensor_layout
 from .mpo import (
     Leg,
     SiteOperator,
-    MPO,
+    MPOCore,
     IrreducibleChannelTerm,
     IrreducibleMPO,
     RankCoupledChannelTerm,
     RankCoupledMPO,
     SparseVirtualBlock,
 )
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def identity_operator(phys_leg, *, dtype=float):
@@ -81,8 +81,8 @@ def _parity_operator(phys_leg, *, dtype=float):
 
 
 def _site_physical_leg_from_tensor(site):
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
-        raise TypeError("_site_physical_leg_from_tensor expects a rank-3 NonabelianTensor.")
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
+        raise TypeError("_site_physical_leg_from_tensor expects a rank-3 IrrepTensor.")
     site = normalize_site_tensor_layout(site)
     dims = {}
     for key, block in site.data.items():
@@ -415,7 +415,7 @@ class AutoMPO:
         """
         Add a site-ordered fermionic bilinear using reduced endpoint operators.
 
-        The reduced endpoints are carried through the resulting MPO core without
+        The reduced endpoints are carried through the resulting MPOCore core without
         expanding all physical-sector blocks up front. Distinct spherical
         components are routed through separate virtual subchannels so the chain
         still contracts componentwise.
@@ -577,7 +577,7 @@ class AutoMPO:
 
     def add_term(self, *site_operators, coeff=1.0, family=None):
         """
-        Add a product term ``coeff * O_i O_j ...`` to the MPO.
+        Add a product term ``coeff * O_i O_j ...`` to the MPOCore.
 
         Parameters
         ----------
@@ -1428,7 +1428,7 @@ class AutoMPO:
                 )
             else:
                 mpo.append(
-                    MPO(
+                    MPOCore(
                         blocks={
                             key: np.asarray(block)
                             for key, block in sparse_visible_blocks.items()

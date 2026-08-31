@@ -62,7 +62,9 @@ class Gradients:
 
         dm0 = getattr(self.base._scf, 'dm', None)
         if dm0 is not None:
-            mf.kernel(dm0=np.asarray(dm0))
+            permutation = mol.pyscf_ao_permutation(pmol)
+            inverse = np.argsort(permutation)
+            mf.kernel(dm0=np.asarray(dm0)[np.ix_(inverse, inverse)])
         else:
             mf.kernel()
 

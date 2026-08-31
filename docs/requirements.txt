@@ -7,4 +7,3 @@ scipy>=1.13
 matplotlib>=3.8
 opt-einsum>=3.3
 periodictable>=1.7
-qc-gbasis>=0.1

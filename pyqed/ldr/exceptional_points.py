@@ -24,7 +24,6 @@ from pyqed import dag, coth, ket2dm, comm, anticomm, sigmax, sort, Mol, \
     polar2cartesian
 from pyqed.optics import Pulse
 from pyqed.wpd import SPO2, ResultSPO2
-from pyqed.ldr.ldr import WPD2, LDR2
 from pyqed.ldr.nonherm import NHLDR2
 
 # from pyqed.ldr.gwp import WPD2

@@ -4287,7 +4287,7 @@ def _embedded_casci_point(
         for symbol, (x, y, z) in zip(symbols, geometry)
     )
     mol = Molecule(atom=atom, unit="bohr", basis=basis, charge=int(charge), spin=spin)
-    mol.build(driver="builtin")
+    mol.build()
     mf = mol.RHF()
     mc = CASCI(mf, ncas=int(ncas), nelecas=nelecas, spin=spin, verbose=0)
     embedded = embed_point_charges(

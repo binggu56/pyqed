@@ -1391,7 +1391,8 @@ class Molecule:
 
         Returns
         -------
-        None.
+        Molecule
+            This molecule, with its integral data populated.
 
         """
         if eri is not None:
@@ -1453,6 +1454,8 @@ class Molecule:
             self.ao_irrep_ids = info.ao_irrep_ids
             self.symmetry_axis = symmetry_axis
             self.symmetry_tol = float(symmetry_tol)
+
+        return self
 
     def geometry_signature(self, digits=12):
         """
@@ -1803,6 +1806,12 @@ class Molecule:
         if self.nao is None:
             raise ValueError("Build the molecule before aligning PySCF AO order.")
         pmol = self.topyscf() if pyscf_mol is None else pyscf_mol
+        if self._bas is None:
+            if int(self.nao) != int(pmol.nao):
+                raise ValueError("Native and PySCF AO dimensions do not match.")
+            # A PySCF-only density-fitted reference has no independently built
+            # native AO ordering.  Its working AO basis is therefore pmol's.
+            return np.arange(int(self.nao), dtype=int)
         native_labels = [self._canonical_ao_label(label) for label in self.ao_labels()]
         pyscf_labels = [self._canonical_ao_label(label) for label in pmol.ao_labels()]
         positions = {}
@@ -2125,6 +2134,9 @@ class Molecule:
         nstates=None,
         method="direct_ci",
         mf=None,
+        spin=None,
+        ms2=None,
+        multiplicity=None,
         scf_options=None,
         run_options=None,
         verbose=0,
@@ -2148,6 +2160,9 @@ class Molecule:
             mf,
             ncas=int(ncas),
             nelecas=nelecas,
+            spin=spin,
+            ms2=ms2,
+            multiplicity=multiplicity,
             verbose=verbose,
         )
         electronic.nstates = nstates

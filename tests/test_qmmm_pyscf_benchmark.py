@@ -19,7 +19,7 @@ def test_native_point_charge_embedding_matches_pyscf_qmmm():
     pc_charges = np.array([-0.2])
 
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     native_hcore = point_charge_hcore(mol, pc_coords, pc_charges)
     native_mf = embed_point_charges(
         mol.RHF(),
@@ -61,7 +61,7 @@ def test_md_qmmm_electrostatic_embedding_matches_pyscf_qmmm():
     pc_charges = np.array([-0.2])
 
     qm_mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    qm_mol.build(driver="builtin")
+    qm_mol.build()
     atoms = Atoms(
         [
             ["H", (0.0, 0.0, 0.0)],
@@ -138,7 +138,7 @@ def test_solvated_box_snapshot_embedding_matches_pyscf_qmmm():
         unit="b",
         basis="sto3g",
     )
-    qm_mol.build(driver="builtin")
+    qm_mol.build()
     atoms.calc = QMMM(
         qm=qm_mol.RHF(),
         qm_indices=qm_indices,
@@ -247,7 +247,7 @@ def test_rks_point_charge_embedding_matches_pyscf_qmmm():
     pc_charges = np.array([-0.2])
 
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     native_mf = RKS(mol, xc="svwn")
     native_mf.max_cycle = 80
     native_mf.conv_tol = 1e-10
@@ -278,7 +278,7 @@ def test_rks_point_charge_embedding_gradient_matches_pyscf_qmmm():
     pc_charges = np.array([-0.2])
 
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     native_mf = RKS(mol, xc="svwn")
     native_mf.max_cycle = 80
     native_mf.conv_tol = 1e-10
@@ -311,7 +311,7 @@ def test_md_qmmm_rks_embedding_gradient_matches_pyscf_qmmm(monkeypatch):
     pc_charges = np.array([-0.2])
 
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     qm = RKS(mol, xc="svwn")
     qm.max_cycle = 80
     qm.conv_tol = 1e-10
@@ -369,7 +369,7 @@ def test_casci_and_casscf_point_charge_embedding_match_pyscf_qmmm():
     pc_charges = np.array([-0.2])
 
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     native_casci = embed_point_charges(
         CASCI(mol.RHF(), ncas=2, nelecas=2),
         pc_coords,
@@ -379,7 +379,7 @@ def test_casci_and_casscf_point_charge_embedding_match_pyscf_qmmm():
     ).kernel()[0]
 
     mol = Molecule(atom=atom, unit="b", basis="sto3g")
-    mol.build(driver="builtin")
+    mol.build()
     native_casscf = embed_point_charges(
         CASSCF(mol.RHF(), ncas=2, nelecas=2, max_cycle=5),
         pc_coords,
@@ -460,7 +460,7 @@ def _qm_water_in_water_system(with_mm=False):
         unit="b",
         basis="sto3g",
     )
-    qm_mol.build(driver="builtin")
+    qm_mol.build()
     mm = _mm_from_topology(atoms) if with_mm else None
     atoms.calc = QMMM(
         qm=qm_mol.RHF(),

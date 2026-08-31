@@ -1,10 +1,12 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.dmrg.backends.nonabelian import _qchem_sweep_measure
 from pyqed.qchem.dmrg.dmrg import QCDMRG
-from pyqed.qchem.dmrg.dmrgscf import DMRGSCF
+from pyqed.qchem.dmrg.dmrgscf import DMRGSCF, _SecondOrder
 from pyqed.qchem.mcscf.cocas import _fresh_macro_casci
 from pyqed.qchem.hf import RHF
 
@@ -266,6 +268,85 @@ def test_su2_dmrgscf_second_order_orbital_driver_runs():
     assert mc.macro_converged
     assert mc.solver_converged
     assert mc.macro_diagnostics
+    assert mc.micro_history
+    assert mc.micro_history[0]["ci_mode"] == "keyframe"
+    assert mc.dmrg_solve_count >= 1
+    assert mc.rdm_build_count >= 1
+
+
+def test_dmrg_second_order_fixed_trials_contract_cached_rdms():
+    driver = object.__new__(_SecondOrder)
+    driver.mf = SimpleNamespace(energy_nuc=lambda: 0.7)
+    driver.weights = None
+    driver.state_id = 0
+
+    dm1 = np.array([[1.2, 0.1], [0.1, 0.8]])
+    dm2 = np.arange(16, dtype=float).reshape(2, 2, 2, 2) / 50.0
+    template = SimpleNamespace(
+        e_tot=np.array([0.0]),
+        _dmrgscf_root_rdms_occ={0: (dm1, dm2)},
+    )
+    h1 = np.array([[0.5, -0.2], [-0.2, 0.9]])
+    pair = np.array(
+        [
+            [[0.8, 0.1], [0.1, 0.4]],
+            [[0.2, -0.3], [-0.3, 0.7]],
+        ]
+    )
+    eri = np.einsum("Ppq,Prs->pqrs", pair, pair, optimize=True)
+    expected = (
+        0.7
+        + np.einsum("pq,qp->", h1, dm1, optimize=True)
+        + 0.5 * np.einsum("pqrs,pqrs->", eri, dm2, optimize=True)
+    )
+
+    dense = driver._fixed_ci_trial(template, h1, eri, ci0=[object()])
+    factor = driver._fixed_factor_ci_trial(template, h1, pair, ci0=[object()])
+
+    assert dense.e_tot[0] == pytest.approx(expected)
+    assert factor.e_tot[0] == pytest.approx(expected)
+    assert factor.solver_backend == "fixed_dmrg_rdm_keyframe"
+    assert factor._dmrgscf_root_rdms_occ is template._dmrgscf_root_rdms_occ
+    assert driver.fixed_mps_trial_count == 2
+
+
+def test_dmrg_second_order_state_average_fixed_trial_uses_one_averaged_rdm():
+    driver = object.__new__(_SecondOrder)
+    driver.mf = SimpleNamespace(energy_nuc=lambda: 0.4)
+    driver.weights = np.array([0.25, 0.75])
+    driver.state_id = 0
+
+    h1 = np.array([[0.3, 0.1], [0.1, -0.2]])
+    eri = np.arange(16, dtype=float).reshape(2, 2, 2, 2) / 40.0
+    root_rdms = {
+        0: (np.eye(2), np.ones((2, 2, 2, 2)) / 8.0),
+        1: (np.diag([1.5, 0.5]), np.ones((2, 2, 2, 2)) / 12.0),
+    }
+    effective_dm1 = sum(
+        weight * root_rdms[root][0]
+        for root, weight in enumerate(driver.weights)
+    )
+    effective_dm2 = sum(
+        weight * root_rdms[root][1]
+        for root, weight in enumerate(driver.weights)
+    )
+    template = SimpleNamespace(
+        e_tot=np.array([1.0, 2.0]),
+        _dmrgscf_effective_rdms_occ=(effective_dm1, effective_dm2),
+    )
+
+    trial = driver._fixed_ci_trial(template, h1, eri, ci0=[object(), object()])
+    expected_objective = (
+        0.4
+        + np.einsum("pq,qp->", h1, effective_dm1, optimize=True)
+        + 0.5 * np.einsum("pqrs,pqrs->", eri, effective_dm2, optimize=True)
+    )
+
+    assert driver._objective_energy(trial, 0) == pytest.approx(
+        expected_objective
+    )
+    assert trial.e_tot[1] - trial.e_tot[0] == pytest.approx(1.0)
+    assert trial._dmrgscf_effective_rdms_occ is template._dmrgscf_effective_rdms_occ
 
 
 def test_su2_dmrgscf_h6_rebuilds_final_runtime_after_bond_topology_changes():

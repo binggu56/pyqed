@@ -116,8 +116,8 @@ def evaluate_shortlist(
                 "solver": "whitened",
                 "tol": 0.0,
                 "metric_tol": 1.0e-12,
-                "frontier_canonicalization": True,
-                "frontier_gauge_weighting": "uniform",
+                "gauge": "frontier",
+                "gauge_weight": "uniform",
                 "verbose": True,
             },
         )

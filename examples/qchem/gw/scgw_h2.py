@@ -14,7 +14,7 @@ mol = Molecule(
     basis="sto-3g",
     unit="angstrom",
 )
-mol.build(driver="builtin", eri="dense")
+mol.build(eri="dense")
 mf = RHF(mol).run(verbose=0)
 
 common = dict(

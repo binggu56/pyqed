@@ -94,6 +94,53 @@ local block are held fixed, producing an effective eigenvalue problem:
 Sweeping repeatedly through the chain relaxes the MPS toward the ground state
 or targeted low-lying states.
 
+Shared-memory parallelism
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Finite DMRG accepts ``n_threads`` for shared-memory execution.  The sweep and
+the Davidson iteration sequence remain serial, while independent output blocks
+of the native dense effective-Hamiltonian matvec and scalar environment-update
+kernels use OpenMP.  The same setting is forwarded to Numba's parallel Abelian
+contraction kernels.  For example:
+
+.. code-block:: python
+
+   dmrg = DMRG(H, D=256, init_guess=psi0, n_threads=8)
+   dmrg.run()
+
+``dmrg.threading_info`` records which native and Numba runtimes were available
+and the resolved thread counts.  Native OpenMP is optional: if the extension
+was built without it, dense DMRG retains the serial native/BLAS path.  Keep the
+BLAS thread count at one when using outer DMRG threads to avoid nested thread
+oversubscription.
+
+Quantum-chemistry SU(2) DMRG accepts the same spelling, ``n_threads``::
+
+   solver = qcdmrg.run(symmetry="su2", D=256, n_threads=8)
+
+Here OpenMP acts only on reduced-sector local-operator rows and independent
+reduced complementary-operator execution batches.  A dependency-wave
+scheduler groups executions with disjoint outputs and runs them inside one
+persistent OpenMP region.  The default output-affinity executor writes
+disjoint reduced-sector blocks directly.  If output conflicts leave that
+executor with fewer usable threads, a memory-gated executor instead computes
+reusable first-stage products once, schedules whole fused contractions into
+worker-private outputs, and combines those outputs with a tree reduction.
+It retains already-combined GEMMs and is selected only when it exposes more
+parallelism than output affinity.  The private replicas are limited to 128 MiB
+per bond by default; ``PYQED_SU2_PRIVATE_OUTPUT_BYTES`` changes that limit and
+``0`` disables this executor.  The implementation never expands the SU(2)
+state into determinants.
+``solver.diagnostics["threading"]`` and each sweep-history entry report the
+compiled OpenMP availability, selected thread count, and executed parallel
+work.  Set ``PYQED_MPS_OPENMP=0`` while building to request a serial extension,
+or ``PYQED_MPS_OPENMP=1`` to require OpenMP.  On macOS, automatic discovery
+prefers Homebrew ``libomp`` over the active Conda environment; set
+``PYQED_OPENMP_PREFIX`` to select another runtime explicitly.  The selected
+runtime is linked directly by both native DMRG extensions so the runtime-built
+dense Davidson module cannot preload a different ``libomp.dylib`` before the
+SU(2) kernel.
+
 Infinite-system DMRG
 --------------------
 
@@ -142,6 +189,80 @@ For SU(2)-adapted quantum chemistry, tensors store reduced multiplet data
 rather than all spin components. This requires explicit Clebsch-Gordan and
 fusion-tree bookkeeping, but can substantially reduce the number of states
 needed for spin-adapted calculations.
+
+Tensor and owner model
+----------------------
+
+Finite dense, Abelian, and non-Abelian chains use one object model.  Every
+stored MPS/MPO core implements ``pyqed.symmetry.IrrepTensor`` and every axis is
+described by ``pyqed.symmetry.Leg``.  Dense tensors are represented by one
+trivial block; Abelian tensors use charge blocks; SU(2) tensors store reduced
+multiplet blocks plus fusion metadata.  ``tensor.shape`` always reports the
+actual axis dimensions, while sector counts and reduced multiplicities live on
+the corresponding ``Leg``.
+
+``pyqed.mps.MPS`` and ``pyqed.mps.MPO`` are the finite-chain owners for all
+three storage modes.  ``state.tensors``/``state.factors`` are the owned tensor
+sequence, whereas ``state.sites`` contains physical-site descriptors.  The
+``pyqed.mps.nonabelian`` import path re-exports the same owners; its specialized
+MPO classes are site-core and virtual-channel implementations used inside a
+shared ``MPO`` chain.  ``UniformMPS`` follows the same tensor contract for its
+unit-cell tensor.  NARG operator spaces likewise use the shared ``Leg`` and
+``IrrepTensor`` types rather than a parallel tensor hierarchy.
+
+Cross-geometry SU(2) overlaps
+-----------------------------
+
+Two completed fully reduced SU(2) DMRG calculations can be compared across
+different molecular geometries with ``dmrg_bra.overlap(dmrg_ket)`` or
+``dmrg_bra.overlap_biorthogonal(dmrg_ket, backend="su2")``.  PyQED first
+builds the cross-geometry AO overlap, eliminates the inactive-core coupling,
+and biorthogonalizes the active orbital spaces.  It then factors each
+nonunitary active-orbital map into diagonal scalings and adjacent two-orbital
+Gaussian gates.  Every gate is applied directly to the reduced charge x SU(2)
+channel blocks, including the exact intermediate-spin recoupling, before an
+identity-MPO contraction of the transformed MPSs.
+
+The biorthogonalization follows P.-A. Malmqvist, *Int. J. Quantum Chem.* **30**,
+479--494 (1986), `doi:10.1002/qua.560300404
+<https://doi.org/10.1002/qua.560300404>`_.  The use of nonunitary
+transformations for nonorthogonal MPS state interaction follows S. Knecht,
+S. Keller, J. Autschbach, and M. Reiher, *J. Chem. Theory Comput.* **12**,
+5881--5894 (2016), `doi:10.1021/acs.jctc.6b00889
+<https://doi.org/10.1021/acs.jctc.6b00889>`_.  The adjacent reduced-sector
+circuit is a PyQED adaptation; it is not a line-by-line reproduction of either
+reference implementation.
+
+The practical defaults are ``cutoff=1e-10`` and ``max_bond="auto"``.  If the
+input reduced MPS bond dimension is :math:`D`, the adaptive cap is
+
+.. math::
+
+   D_{\mathrm{overlap}} =
+   \max\left[D,\min\left(8192,\max(256,16D)\right)\right].
+
+This never compresses below the input dimension but bounds transformation-
+induced growth in normal use.  The factor and limits were selected from
+reduced-SU(2) truncation tests: a chemically structured H10/CAS(10,10) test
+required approximately :math:`16D` to recover the untruncated overlap, whereas
+:math:`4D` and :math:`8D` produced material errors.  The result remains a
+controlled MPS approximation.  Set ``cutoff=0`` and ``max_bond=None``
+explicitly to discard no singular values and obtain a result exact up to
+floating-point roundoff.
+With ``return_info=True``, each transformed state reports its resolved bond
+cap, peak reduced bond dimension, sum of the per-gate relative discarded
+weights, maximum relative discarded weight at one gate, and number of gates
+that truncated data.  The sum is a convergence diagnostic, not a rigorous
+bound on the final overlap error.
+
+The active path does not recover determinant amplitudes, create a
+spin-component MPS, or allocate a ``4**ncas`` state.  Its practical cost
+instead follows the bond dimensions generated by the orbital circuit.  An
+arbitrary untruncated orbital transformation can produce exponential
+entanglement and therefore exponential bond growth in the worst case; sector
+preservation does not imply a fixed polynomial bound.  The current SU(2) route
+requires matching numbers of active and inactive orbitals and a nonsingular
+effective active overlap.
 
 Time-Dependent MPS
 ------------------
@@ -197,8 +318,8 @@ The MPS-related code is split across several namespaces:
 * ``pyqed.mps`` contains general MPS, MPO, TEBD, DMRG, symmetry, and AutoMPO
   utilities, plus ``UniformMPS`` for one-site uniform/infinite MPS work.
 * ``pyqed.mps.autompo`` contains automatic MPO construction helpers.
-* ``pyqed.mps.nonabelian`` contains prototype SU(2)/non-Abelian tensor and DMRG
-  components.
+* ``pyqed.mps.nonabelian`` contains SU(2)/non-Abelian algorithms, fusion
+  metadata, and specialized MPO cores; it re-exports the common finite owners.
 * ``pyqed.qchem.dmrg`` contains quantum-chemistry DMRG and DMRG-SCF-facing
   code.
 * ``pyqed.dmrg`` contains older/simple DMRG examples and prototypes.

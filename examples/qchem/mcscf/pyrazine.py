@@ -3,6 +3,7 @@
 
 import numpy as np
 import pickle
+from pyqed.units import au2ev
 from pyqed import Molecule
 from pyqed.qchem.mcscf.casscf import CASSCF
 
@@ -25,7 +26,7 @@ n_states = 3
 weights  = np.array([1/3, 1/3, 1/3])
 
 mol = Molecule(atom=atom_list, unit='b', basis='6-31g')
-mol.build(driver='builtin', eri='dense')
+mol.build(eri='dense')
 
 # RHF
 mf = mol.RHF().run()
@@ -44,7 +45,7 @@ print("SA-CASSCF singlet energies (Hartree):")
 for i, e in enumerate(e_tot):
     print(f"  S{i}: {e:.10f}")
 
-HARTREE2EV = 27.211386245988
+HARTREE2EV = au2ev
 e0 = e_tot[0]
 
 # gbasis_shells_cart = mol._get_or_build_gbasis_shells_cart()

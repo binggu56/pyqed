@@ -15,11 +15,12 @@ def _validate_dims(dims):
     return dims
 
 
-def _infer_mixed_narg_dims(tensors):
+def _infer_mixed_narg_layout(tensors):
     tensors = [np.asarray(tensor) for tensor in tensors]
     if not tensors:
         raise ValueError("at least one NARG tensor is required.")
     dims = []
+    modes = []
     left_dim = 1
     position = 0
     for index, tensor in enumerate(tensors):
@@ -27,18 +28,31 @@ def _infer_mixed_narg_dims(tensors):
             raise ValueError("NARG tensors must have at least three dimensions.")
         if tensor.shape[0] % left_dim:
             raise ValueError(f"NARG tensor {index} row dimension is not divisible by the left bond.")
-        current_dim = tensor.shape[0] // left_dim
+        row_factor = tensor.shape[0] // left_dim
         if position == 0:
+            current_dim = row_factor
             dims.append(current_dim)
-        elif dims[position] != current_dim:
+            mode = "conditional"
+        elif row_factor == dims[position]:
+            current_dim = row_factor
+            mode = "conditional"
+        elif row_factor == 1:
+            mode = "append"
+        else:
             raise ValueError(
-                f"NARG tensor {index} current-site dimension {current_dim} "
-                f"does not match dims[{position}]={dims[position]}."
+                f"NARG tensor {index} row factor {row_factor} does not match "
+                f"dims[{position}]={dims[position]} and is not a compact MPS append factor."
             )
         dims.extend(tensor.shape[2:])
+        modes.append(mode)
         position += tensor.ndim - 2
         left_dim = tensor.shape[1]
-    return tuple(dims), left_dim
+    return tuple(dims), left_dim, tuple(modes)
+
+
+def _infer_mixed_narg_dims(tensors):
+    dims, left_dim, _modes = _infer_mixed_narg_layout(tensors)
+    return dims, left_dim
 
 
 def _coeff_matrix(coeff, last_dim, bond_dim, root=0, terminal_local_shape=None):
@@ -51,6 +65,8 @@ def _coeff_matrix(coeff, last_dim, bond_dim, root=0, terminal_local_shape=None):
             raise ValueError("coeff shape must be (terminal_local_dim, final_bond_dim, nroots).")
         if root < 0 or root >= coeff.shape[2]:
             raise IndexError("root is out of range for coeff.")
+        if coeff.shape[0] == 1:
+            return coeff[0, :, root], "bond"
         if coeff.shape[0] == last_dim:
             return coeff[:, :, root], "last"
         if coeff.shape[0] == terminal_local_dim:
@@ -79,7 +95,7 @@ def _coeff_matrix(coeff, last_dim, bond_dim, root=0, terminal_local_shape=None):
 def narg_state_vector(tensors, coeff, *, dims=None, root=0):
     """Return the dense vector represented by mixed one-/two-site NARG factors."""
     tensors = [np.asarray(tensor) for tensor in tensors]
-    inferred_dims, final_bond_dim = _infer_mixed_narg_dims(tensors)
+    inferred_dims, final_bond_dim, factor_modes = _infer_mixed_narg_layout(tensors)
     if dims is None:
         dims = inferred_dims
     dims = _validate_dims(dims)
@@ -100,15 +116,25 @@ def narg_state_vector(tensors, coeff, *, dims=None, root=0):
         vector = np.ones(1, dtype=dtype)
         position = 0
         terminal_local_config = ()
-        for tensor_index, tensor in enumerate(tensors):
-            rows = config[position] * vector.size + np.arange(vector.size)
+        for tensor_index, (tensor, factor_mode) in enumerate(zip(tensors, factor_modes)):
             next_count = tensor.ndim - 2
             if tensor_index == len(tensors) - 1:
                 terminal_local_config = config[position + 1 : position + 1 + next_count]
-            index = (rows, slice(None), *config[position + 1 : position + 1 + next_count])
+            if factor_mode == "conditional":
+                rows = config[position] * vector.size + np.arange(vector.size)
+            else:
+                rows = np.arange(vector.size)
+            index = (
+                rows,
+                slice(None),
+                *config[position + 1 : position + 1 + next_count],
+            )
             block = tensor[index]
             position += next_count
             vector = vector @ block
+        if coeff_selector == "bond":
+            psi[flat] = vector @ coeff_matrix
+            continue
         if coeff_selector == "terminal":
             coeff_local = np.ravel_multi_index(terminal_local_config, terminal_local_shape)
         else:

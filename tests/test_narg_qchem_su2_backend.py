@@ -3,6 +3,7 @@ import pytest
 from types import SimpleNamespace
 
 from pyqed.narg import NARG as PublicNARG
+from pyqed.narg.irrep_tensor import Irrep
 from pyqed.narg.qchem import NARG, SU2NARG
 from pyqed.narg.qchem import su2_three_site as su2_three_site_module
 from pyqed.narg.qchem import su2_backend as su2_backend_module
@@ -10,6 +11,7 @@ from pyqed.narg.qchem.su2_backend import SU2NARGBackend, resolve_su2_narg_backen
 from pyqed.narg.qchem.su2_core import su2_projected_roots
 from pyqed.narg.qchem.su2_chain import (
     LowRankERI,
+    block_identity_reduced_tensor,
     diagonalize_block,
     env_spin_can_couple,
     feasible_target_irreps,
@@ -29,6 +31,7 @@ from pyqed.narg.qchem.su2_three_site import (
     local_reduced_operator,
     product_tensor_angular_terms,
     reduced_product_tensor_irrep,
+    reduced_scalar_product_irrep_tensor,
     rotate_reduced_tensor_to_truncated,
     rotate_reduced_tensors_to_truncated,
 )
@@ -187,6 +190,170 @@ def test_su2_python_backend_sector_matvec_and_diagonalization():
     assert backend.summary()["name"] == "python"
 
 
+def test_su2_native_openmp_operator_rotation_matches_numpy():
+    from pyqed.narg.qchem import su2_native
+
+    if su2_native.rotate_operator_blocks is None:
+        pytest.skip("optional SU(2)-NARG C++ extension is unavailable")
+    rng = np.random.default_rng(71)
+    specs = []
+    expected = []
+    for _ in range(8):
+        u_bra = rng.normal(size=(48, 24)) + 1j * rng.normal(size=(48, 24))
+        block = rng.normal(size=(48, 52)) + 1j * rng.normal(size=(48, 52))
+        u_ket = rng.normal(size=(52, 20)) + 1j * rng.normal(size=(52, 20))
+        specs.append((u_bra, block, u_ket))
+        expected.append(u_bra.conj().T @ block @ u_ket)
+
+    threads = 4 if su2_native.openmp_available() else 1
+    before = su2_native.openmp_info()
+    try:
+        assert su2_native.set_num_threads(threads) == threads
+        actual = su2_native.rotate_operator_blocks(specs)
+    finally:
+        su2_native.set_num_threads(1)
+
+    for block, reference in zip(actual, expected):
+        np.testing.assert_allclose(block, reference, atol=5.0e-13)
+    after = su2_native.openmp_info()
+    if threads > 1:
+        assert after["parallel_regions"] > before["parallel_regions"]
+        assert after["tasks"] >= before["tasks"] + len(specs)
+
+
+def test_su2_native_openmp_bilinear_wave_matches_numpy():
+    from pyqed.narg.qchem import su2_native
+
+    if su2_native.accumulate_bilinear_wave is None:
+        pytest.skip("optional SU(2)-NARG growth-wave kernel is unavailable")
+    rng = np.random.default_rng(83)
+    specs = []
+    expected = []
+    for _ in range(8):
+        size = 512
+        rows = rng.integers(0, 32, size=size, dtype=np.int64)
+        cols = rng.integers(0, 32, size=size, dtype=np.int64)
+        block_rows = rng.integers(0, 16, size=size, dtype=np.int64)
+        block_cols = rng.integers(0, 16, size=size, dtype=np.int64)
+        local_rows = rng.integers(0, 4, size=size, dtype=np.int64)
+        local_cols = rng.integers(0, 4, size=size, dtype=np.int64)
+        coeffs = rng.normal(size=size) + 1j * rng.normal(size=size)
+        block = rng.normal(size=(16, 16)) + 1j * rng.normal(size=(16, 16))
+        local = rng.normal(size=(4, 4)) + 1j * rng.normal(size=(4, 4))
+        prefactor = 0.75 - 0.2j
+        group = (
+            rows,
+            cols,
+            block_rows,
+            block_cols,
+            local_rows,
+            local_cols,
+            coeffs,
+            block,
+            local,
+            prefactor,
+        )
+        specs.append((32, 32, (group,)))
+        reference = np.zeros((32, 32), dtype=complex)
+        np.add.at(
+            reference,
+            (rows, cols),
+            prefactor
+            * coeffs
+            * block[block_rows, block_cols]
+            * local[local_rows, local_cols],
+        )
+        expected.append(reference)
+
+    threads = 4 if su2_native.openmp_available() else 1
+    before = su2_native.openmp_info()
+    try:
+        su2_native.set_num_threads(threads)
+        actual = su2_native.accumulate_bilinear_wave(specs)
+    finally:
+        su2_native.set_num_threads(1)
+
+    for value, reference in zip(actual, expected):
+        np.testing.assert_allclose(value, reference, atol=2.0e-13)
+    after = su2_native.openmp_info()
+    if threads > 1:
+        assert after["parallel_regions"] > before["parallel_regions"]
+        assert after["tasks"] >= before["tasks"] + len(specs)
+
+
+def test_compiled_su2_backend_threads_preserve_chain_energy():
+    compiled = resolve_su2_narg_backend("compiled", threads=1)
+    if not compiled.capabilities.openmp:
+        pytest.skip("compiled SU(2)-NARG backend has no OpenMP support")
+    h1e, eri = _hubbard_integrals(4)
+    try:
+        serial = run_su2_narg_chain(
+            h1e,
+            eri,
+            {2: 8, 3: 12},
+            final_size=4,
+            target_nelec=4,
+            target_j2=0,
+            backend=compiled,
+            threads=1,
+        )
+        parallel = run_su2_narg_chain(
+            h1e,
+            eri,
+            {2: 8, 3: 12},
+            final_size=4,
+            target_nelec=4,
+            target_j2=0,
+            backend=compiled,
+            threads=4,
+        )
+        serial_energy, _ = diagonalize_block(
+            serial.final, nelec=4, j2=0, nroots=2, backend=compiled
+        )
+        parallel_energy, _ = diagonalize_block(
+            parallel.final, nelec=4, j2=0, nroots=2, backend=compiled
+        )
+    finally:
+        compiled.configure_threads(1)
+
+    np.testing.assert_allclose(parallel_energy, serial_energy, atol=1.0e-12)
+    assert parallel.backend["threads"] == 4
+    assert parallel.backend["openmp"] is True
+
+
+def test_public_su2_narg_propagates_threads_to_backend():
+    class DummyMol:
+        nelec = (2, 2)
+        spin = 0
+
+        @staticmethod
+        def energy_nuc():
+            return 0.0
+
+    backend = resolve_su2_narg_backend("compiled", threads=1)
+    if not backend.capabilities.openmp:
+        pytest.skip("compiled SU(2)-NARG backend has no OpenMP support")
+    h1e, eri = _hubbard_integrals(4)
+    try:
+        solver = NARG(
+            SimpleNamespace(mol=DummyMol()),
+            mol=DummyMol(),
+            symmetry="spin",
+            h1e=h1e,
+            eri=eri,
+            D=8,
+            nstates=1,
+            threads=3,
+        ).run()
+    finally:
+        backend.configure_threads(1)
+
+    assert solver.timings["threads"] == 3
+    assert solver.backend["threads"] == 3
+    assert solver.backend["openmp"] is True
+    assert np.isfinite(solver.e_tot[0])
+
+
 def test_public_su2_narg_uses_constructor_integrals():
     class DummyMol:
         nelec = (2, 2)
@@ -234,6 +401,40 @@ def test_public_su2_narg_uses_constructor_integrals():
     assert returned is solver
     assert block.size
     np.testing.assert_allclose(energies, reference, atol=1.0e-12)
+
+
+def test_public_su2_detached_frames_choose_seed_and_parent_capacity():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        @staticmethod
+        def energy_nuc():
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6)
+    mol = DummyMol()
+    solver = NARG(
+        SimpleNamespace(mol=mol),
+        mol=mol,
+        symmetry="su2",
+        h1e=h1e,
+        eri=eri,
+        D=2,
+        nstates=1,
+        target_nelec=6,
+        target_j2=0,
+        su2_backend="python",
+        project_v1_packages=False,
+        dressing="detached_frames",
+    ).run()
+
+    assert solver.n0 == 3
+    assert solver.chi == 32
+    assert set(solver.timings["detached_by_size"]) == {4, 5, 6}
+    assert np.isfinite(solver.e_tot[0])
+    rdm1 = solver.make_rdm1()
+    np.testing.assert_allclose(np.trace(rdm1), 6.0, atol=1.0e-8)
 
 
 def test_top_level_public_narg_dispatches_to_su2_qchem_driver():
@@ -550,6 +751,89 @@ def test_su2_compiled_product_tensor_matches_python_when_available():
         np.testing.assert_allclose(block, python_tensor.blocks[key], atol=1.0e-12)
 
 
+def test_su2_compiled_scalar_product_matches_python_when_available():
+    h1e, eri = _hubbard_integrals(2)
+    python_block = build_renormalized_two_site_block(h1e, eri, D=8, backend="python")
+    compiled_block = build_renormalized_two_site_block(h1e, eri, D=8, backend="python")
+    local_tensor = local_reduced_operator("JWCtilde")
+
+    old_flag = su2_three_site_module.SU2_COMPILED_ANGULAR
+    try:
+        su2_three_site_module.SU2_COMPILED_ANGULAR = False
+        python_tensor = reduced_scalar_product_irrep_tensor(
+            python_block,
+            python_block.reduced_operators[("Cdag", 0)],
+            local_tensor,
+        )
+        su2_three_site_module.SU2_COMPILED_ANGULAR = True
+        compiled_tensor = reduced_scalar_product_irrep_tensor(
+            compiled_block,
+            compiled_block.reduced_operators[("Cdag", 0)],
+            local_tensor,
+        )
+    finally:
+        su2_three_site_module.SU2_COMPILED_ANGULAR = old_flag
+
+    assert set(compiled_tensor.blocks) == set(python_tensor.blocks)
+    for key, value in python_tensor.blocks.items():
+        np.testing.assert_allclose(compiled_tensor.blocks[key], value, atol=1.0e-12)
+
+
+def test_su2_growth_wave_matches_individual_reduced_products():
+    from pyqed.narg.qchem import su2_native
+
+    h1e, eri = _hubbard_integrals(3)
+    source = build_renormalized_two_site_block(
+        h1e[:2, :2],
+        eri[:2, :2, :2, :2],
+        D=8,
+        backend="python",
+    )
+    grown_narg = grow_one_site_direct_reduced(
+        h1e,
+        eri,
+        source,
+        target_nelec=None,
+        build_branch_basis=False,
+    )
+    before = su2_native.openmp_info() if su2_native.openmp_info else None
+    actual = grown_coupling_operators(
+        grown_narg,
+        include_even_composites=False,
+    )
+    after = su2_native.openmp_info() if su2_native.openmp_info else None
+    if su2_native.reduced_growth_graph is not None:
+        assert after["growth_graph_calls"] > before["growth_graph_calls"]
+        assert after["growth_graph_plans"] > before["growth_graph_plans"]
+
+    identity = block_identity_reduced_tensor(source)
+    expected = {}
+    for key in actual:
+        name, site = key
+        if site < 2:
+            block_tensor = source.reduced_operators[key]
+            local_tensor = local_reduced_operator("JW")
+        else:
+            block_tensor = identity
+            local_tensor = local_reduced_operator(name)
+        expected[key] = reduced_product_tensor_irrep(
+            source,
+            block_tensor,
+            local_tensor,
+            total_rank2=1,
+        )
+
+    assert set(actual) == set(expected)
+    for key, expected_tensor in expected.items():
+        assert set(actual[key].blocks) == set(expected_tensor.blocks)
+        for block_key, expected_block in expected_tensor.blocks.items():
+            np.testing.assert_allclose(
+                actual[key].blocks[block_key],
+                expected_block,
+                atol=1.0e-12,
+            )
+
+
 def test_su2_operator_rotation_uses_backend_batch_hook():
     class TrackingBackend(SU2NARGBackend):
         def __init__(self):
@@ -664,6 +948,169 @@ def test_su2_chain_accepts_adaptive_D_and_reports_kept_counts():
     assert block.size
     assert roots.size
     assert np.all(np.isfinite(roots))
+
+
+def test_su2_future_cc_uses_reduced_future_couplings_and_preserves_sectors():
+    h1e, eri = _hubbard_integrals(5)
+    common = dict(
+        D_by_size={2: 3, 3: 3, 4: 3},
+        final_size=5,
+        target_nelec=5,
+        target_j2=1,
+        backend="python",
+        project_v1_packages=False,
+    )
+    plain = run_su2_narg_chain(h1e, eri, **common)
+    dressed = run_su2_narg_chain(
+        h1e,
+        eri,
+        **common,
+        dressing="future_cc",
+        future_cc_strength=0.2,
+    )
+    plain_energy = diagonalize_block(
+        plain.final,
+        nelec=5,
+        j2=1,
+        nroots=1,
+        backend="python",
+    )[0][0]
+    dressed_energy = diagonalize_block(
+        dressed.final,
+        nelec=5,
+        j2=1,
+        nroots=1,
+        backend="python",
+    )[0][0]
+
+    assert dressed_energy < plain_energy - 1.0e-3
+    assert dressed.timings["dressing"] == "future_cc"
+    assert dressed.timings["future_cc_by_size"]
+    assert any(
+        item["discarded_source_norm"] > 1.0e-8
+        for item in dressed.timings["future_cc_by_size"].values()
+    )
+    assert all(
+        item["maximum_response_residual"] < 1.0e-8
+        for item in dressed.timings["future_cc_by_size"].values()
+    )
+    for block in dressed.blocks.values():
+        for (bra, ket), transform in block.transform.blocks.items():
+            assert bra == ket
+            np.testing.assert_allclose(
+                transform.conj().T @ transform,
+                np.eye(transform.shape[1]),
+                atol=1.0e-10,
+            )
+
+
+def test_su2_detached_frames_keep_all_post_seed_rayleigh_solves_at_most_D():
+    h1e, eri = _hubbard_integrals(4)
+    exact = su2_projected_roots(h1e, eri, nelec=4, j2=0, nroots=1)[0][0]
+    chain = run_su2_narg_chain(
+        h1e,
+        eri,
+        {2: 2, 3: 2},
+        final_size=4,
+        target_nelec=4,
+        target_j2=0,
+        backend="python",
+        project_v1_packages=False,
+        dressing="detached_frames",
+    )
+    energy = diagonalize_block(
+        chain.final,
+        nelec=4,
+        j2=0,
+        nroots=1,
+        backend="python",
+    )[0][0]
+
+    assert energy >= exact - 1.0e-10
+    assert np.isfinite(energy)
+    assert chain.timings["dressing"] == "detached_frames"
+    assert set(chain.timings["detached_by_size"]) == {3, 4}
+    for diagnostics in chain.timings["detached_by_size"].values():
+        assert diagnostics["branch_ranks"] == (2, 2, 2)
+        assert diagnostics["baseline_rank"] == 2
+        assert diagnostics["protected_per_branch"] == 0
+        assert diagnostics["cross_product_basis"] is True
+        assert diagnostics["strict_D_rayleigh"] is True
+        assert diagnostics["initial_frame_rank"] == sum(
+            diagnostics["branch_ranks"]
+        )
+        assert diagnostics["detached_dim"] >= diagnostics["frame_union_rank"]
+        assert diagnostics["orthogonality_error"] < 1.0e-10
+        assert diagnostics["target_dim"] == 2
+        assert diagnostics["maximum_eigensolve_order"] <= 2
+        assert diagnostics["retained_dim"] <= diagnostics["chi"]
+    assert any(
+        diagnostics["maximum_ambient_dimension"] > 2
+        for diagnostics in chain.timings["detached_by_size"].values()
+    )
+    assert chain.timings["final_target_dim"] == 2
+    assert chain.final.hamiltonian.block(Irrep((4, 0)), Irrep((4, 0))).shape == (2, 2)
+    for block in chain.blocks.values():
+        for (bra, ket), transform in block.transform.blocks.items():
+            assert bra == ket
+            np.testing.assert_allclose(
+                transform.conj().T @ transform,
+                np.eye(transform.shape[1]),
+                atol=1.0e-10,
+            )
+
+    combined = run_su2_narg_chain(
+        h1e,
+        eri,
+        {2: 2, 3: 2},
+        final_size=4,
+        target_nelec=4,
+        target_j2=0,
+        backend="python",
+        project_v1_packages=False,
+        dressing="detached+cc",
+    )
+    combined_energy = diagonalize_block(
+        combined.final,
+        nelec=4,
+        j2=0,
+        nroots=1,
+        backend="python",
+    )[0][0]
+    assert combined_energy >= exact - 1.0e-10
+    assert set(combined.timings["cc_by_size"]) == {3}
+    cc = combined.timings["cc_by_size"][3]
+    assert cc["response_rank"] > 0
+    assert cc["sector_energy_gain"] >= -1.0e-12
+    assert cc["maximum_response_residual"] < 1.0e-8
+    assert cc["iterative_fallbacks"] == 0
+
+
+def test_su2_detached_frames_use_exact_seed_and_rolling_parent():
+    h1e, eri = _hubbard_integrals(6)
+    chain = run_su2_narg_chain(
+        h1e,
+        eri,
+        {size: 2 for size in range(2, 6)},
+        final_size=6,
+        target_nelec=6,
+        target_j2=0,
+        backend="python",
+        project_v1_packages=False,
+        dressing="detached_frames",
+    )
+
+    assert chain.timings["n0"] == 3
+    assert chain.timings["chi"] == 32
+    assert set(chain.timings["detached_by_size"]) == {4, 5, 6}
+    assert chain.timings["kept_by_size"][3] > 2
+    for size in (4, 5):
+        diagnostics = chain.timings["detached_by_size"][size]
+        assert diagnostics["branch_ranks"] == (2, 2, 2)
+        assert diagnostics["target_dim"] == 2
+        assert diagnostics["parent_dim"] > diagnostics["target_dim"]
+        assert len(chain.blocks[size]._su2_target_truncated.kept_roots) == 2
+        assert len(chain.blocks[size].truncated.kept_roots) == diagnostics["parent_dim"]
 
 
 def test_su2_low_rank_eri_chain_matches_dense_v1_packages():

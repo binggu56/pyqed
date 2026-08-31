@@ -62,11 +62,11 @@ def test_builtin_native_ri_builds_factors_without_dense_eri():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri")
+    mol.build(eri="ri")
 
     assert mol.eri is None
     assert mol.eri_factors is not None
-    assert mol.eri_factors.shape == (50, mol.nao, mol.nao)
+    assert mol.eri_factors.shape == (46, mol.nao, mol.nao)
     assert mol._builtin_build_info["factor_builder"] == "native-ri"
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-jkfit"
     assert mol._builtin_build_info["ri"]["metric_solver"] == "cholesky"
@@ -77,6 +77,9 @@ def test_builtin_native_ri_builds_factors_without_dense_eri():
         "cython-kernel-packed-parallel",
         "python",
         "python-parallel",
+        "cpp-kernel-packed-spherical-pair-blocked",
+        "cython-kernel-packed-spherical-pair-blocked",
+        "cython-kernel-packed-parallel-spherical-pair-blocked",
     }
 
 
@@ -89,7 +92,7 @@ def test_builtin_native_ri_ignores_dense_aosym_keyword():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", aosym="s8")
+    mol.build(eri="ri", aosym="s8")
 
     assert mol.eri is None
     assert mol.eri_s8 is None
@@ -107,10 +110,10 @@ def test_builtin_native_ri_accepts_auxbasis_keyword():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
 
     assert mol.eri is None
-    assert mol.eri_factors.shape == (30, mol.nao, mol.nao)
+    assert mol.eri_factors.shape == (28, mol.nao, mol.nao)
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-rifit"
     assert mol._builtin_build_info["ri"]["storage"] == "full"
 
@@ -124,7 +127,7 @@ def test_builtin_native_ri_defaults_pople_to_cc_pvdz_jkfit():
         basis="6-31g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri")
+    mol.build(eri="ri")
 
     assert mol.eri is None
     assert mol.eri_factors is not None
@@ -153,7 +156,7 @@ def test_builtin_native_ri_purpose_can_prefer_rifit():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", options={"ri_purpose": "ri"})
+    mol.build(eri="ri", options={"ri_purpose": "ri"})
 
     assert mol._builtin_build_info["ri"]["auxbasis"] == "cc-pvdz-rifit"
     assert mol._builtin_build_info["ri"]["purpose"] == "ri"
@@ -169,10 +172,10 @@ def test_builtin_native_ri_packed_storage_option():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", options={"ri_storage": "packed"})
+    mol.build(eri="ri", options={"ri_storage": "packed"})
 
     assert mol._builtin_build_info["ri"]["storage"] == "packed"
-    assert mol.eri_factors.pair_shape == (50, mol.nao * (mol.nao + 1) // 2)
+    assert mol.eri_factors.pair_shape == (46, mol.nao * (mol.nao + 1) // 2)
 
 
 def test_builtin_native_ri_full_storage_option_matches_packed_jk():
@@ -182,12 +185,10 @@ def test_builtin_native_ri_full_storage_option_matches_packed_jk():
 
     atom = "H 0 0 0; H 0 0 0.74"
     packed = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-    packed.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    packed.build(eri="ri", auxbasis="cc-pvdz-rifit")
 
     full = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-    full.build(
-        driver="builtin",
-        eri="ri",
+    full.build(eri="ri",
         auxbasis="cc-pvdz-rifit",
         options={"ri_storage": "full"},
     )
@@ -223,10 +224,10 @@ def test_builtin_native_ri_reconstructs_dense_eri_to_auxbasis_accuracy():
 
     atom = "H 0 0 0; H 0 0 0.74"
     dense = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-    dense.build(driver="builtin", eri="dense", aosym="s1")
+    dense.build(eri="dense", aosym="s1")
 
     ri = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-    ri.build(driver="builtin", eri="ri")
+    ri.build(eri="ri")
 
     eri_ri = np.einsum("Pij,Pkl->ijkl", ri.eri_factors, ri.eri_factors, optimize=True)
     rel_error = np.linalg.norm(eri_ri - dense.eri) / np.linalg.norm(dense.eri)
@@ -243,7 +244,7 @@ def test_builtin_native_ri_rhf_runs_without_pyscf():
     energies = []
     for eri in ("dense", "ri"):
         mol = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-        mol.build(driver="builtin", eri=eri)
+        mol.build(eri=eri)
         mf = RHF(mol).run(verbose=0)
         energies.append(float(mf.e_tot))
 
@@ -260,9 +261,7 @@ def test_builtin_native_ri_h2_matches_pyscf_df_integrals_and_energy():
     auxbasis = "cc-pvdz-rifit"
     mol = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
     symbols = mol.atom_symbols()
-    mol.build(
-        driver="builtin",
-        eri="ri",
+    mol.build(eri="ri",
         auxbasis=auxbasis,
         options={"coord_type": "cartesian"},
     )
@@ -295,9 +294,7 @@ def test_builtin_native_ri_casscf_matches_pyscf_cartesian_df():
     auxbasis = "cc-pvdz-jkfit"
     mol = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
     symbols = mol.atom_symbols()
-    mol.build(
-        driver="builtin",
-        eri="ri",
+    mol.build(eri="ri",
         auxbasis=auxbasis,
         options={"coord_type": "cartesian"},
     )

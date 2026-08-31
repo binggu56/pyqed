@@ -28,6 +28,10 @@
 #include <unordered_set>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
 #ifdef __APPLE__
 #include <malloc/malloc.h>
 #endif
@@ -35,6 +39,48 @@
 namespace py = pybind11;
 
 using cdouble = std::complex<double>;
+
+static int dmrg_openmp_threads = 1;
+
+static bool openmp_available_cpp() {
+#ifdef _OPENMP
+    return true;
+#else
+    return false;
+#endif
+}
+
+static int set_dmrg_openmp_threads(int n_threads) {
+    if (n_threads < 1) {
+        throw std::invalid_argument("DMRG OpenMP thread count must be positive");
+    }
+#ifdef _OPENMP
+    dmrg_openmp_threads = n_threads;
+    omp_set_dynamic(0);
+    omp_set_num_threads(n_threads);
+#else
+    dmrg_openmp_threads = 1;
+#endif
+    return dmrg_openmp_threads;
+}
+
+static int get_dmrg_openmp_threads() {
+    return dmrg_openmp_threads;
+}
+
+static py::dict dmrg_openmp_info() {
+    py::dict out;
+    out["available"] = py::bool_(openmp_available_cpp());
+    out["threads"] = py::int_(dmrg_openmp_threads);
+#ifdef _OPENMP
+    out["max_threads"] = py::int_(omp_get_max_threads());
+    out["version"] = py::int_(_OPENMP);
+#else
+    out["max_threads"] = py::int_(1);
+    out["version"] = py::none();
+#endif
+    return out;
+}
 
 #ifdef __APPLE__
 extern "C" void cblas_zgemv(
@@ -45654,26 +45700,34 @@ static py::array_t<cdouble> dense_two_site_matvec_cpp(
     py::array_t<cdouble> out({bra_l * phys_out * bra_r});
     cdouble* y = static_cast<cdouble*>(out.request().ptr);
 
-    for (ssize_t i = 0; i < bra_l; ++i) {
-        for (ssize_t p = 0; p < phys_out; ++p) {
-            for (ssize_t j = 0; j < bra_r; ++j) {
-                cdouble total = 0.0;
-                for (ssize_t a = 0; a < mpo_l; ++a) {
-                    for (ssize_t b = 0; b < mpo_r; ++b) {
-                        for (ssize_t k = 0; k < ket_l; ++k) {
-                            const cdouble e_val = e(a, i, k);
-                            for (ssize_t s = 0; s < phys_in; ++s) {
-                                const cdouble ew_val = e_val * w(a, b, p, s);
-                                const ssize_t base = (k * phys_in + s) * ket_r;
-                                for (ssize_t l = 0; l < ket_r; ++l) {
-                                    total += ew_val * x[base + l] * f(b, j, l);
-                                }
+    const ssize_t output_size = bra_l * phys_out * bra_r;
+    {
+        py::gil_scoped_release release;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(dmrg_openmp_threads) \
+    if(output_size > 1 && dmrg_openmp_threads > 1)
+#endif
+        for (ssize_t output = 0; output < output_size; ++output) {
+            const ssize_t j = output % bra_r;
+            const ssize_t tmp = output / bra_r;
+            const ssize_t p = tmp % phys_out;
+            const ssize_t i = tmp / phys_out;
+            cdouble total = 0.0;
+            for (ssize_t a = 0; a < mpo_l; ++a) {
+                for (ssize_t b = 0; b < mpo_r; ++b) {
+                    for (ssize_t k = 0; k < ket_l; ++k) {
+                        const cdouble e_val = e(a, i, k);
+                        for (ssize_t s = 0; s < phys_in; ++s) {
+                            const cdouble ew_val = e_val * w(a, b, p, s);
+                            const ssize_t base = (k * phys_in + s) * ket_r;
+                            for (ssize_t l = 0; l < ket_r; ++l) {
+                                total += ew_val * x[base + l] * f(b, j, l);
                             }
                         }
                     }
                 }
-                y[(i * phys_out + p) * bra_r + j] = total;
             }
+            y[output] = total;
         }
     }
     return out;
@@ -45930,6 +45984,8 @@ public:
         out["batched_matvec_vectors"] = py::int_(batched_matvec_vectors);
         out["blas_matvec_calls"] = py::int_(blas_matvec_calls);
         out["loop_matvec_calls"] = py::int_(loop_matvec_calls);
+        out["openmp_matvec_calls"] = py::int_(openmp_matvec_calls);
+        out["openmp"] = dmrg_openmp_info();
         out["diagonal_calls"] = py::int_(diagonal_calls);
         out["evolve_calls"] = py::int_(evolve_calls);
         out["evolve_matvecs"] = py::int_(evolve_matvecs);
@@ -45951,6 +46007,7 @@ public:
         batched_matvec_vectors = 0;
         blas_matvec_calls = 0;
         loop_matvec_calls = 0;
+        openmp_matvec_calls = 0;
         diagonal_calls = 0;
         evolve_calls = 0;
         evolve_matvecs = 0;
@@ -46061,50 +46118,60 @@ private:
                 );
             }
             std::vector<cdouble> diag(static_cast<size_t>(input_dim()), cdouble(0.0, 0.0));
-            for (ssize_t k = 0; k < ket_l; ++k) {
-                for (ssize_t s = 0; s < phys_in; ++s) {
-                    for (ssize_t l = 0; l < ket_r; ++l) {
-                        cdouble total = cdouble(0.0, 0.0);
-                        for (ssize_t a = 0; a < mpo_l; ++a) {
-                            const cdouble e_val = e_data[e_index(a, k, k)];
-                            for (ssize_t b = 0; b < mpo_r; ++b) {
-                                total += e_val * w_data[w_index(a, b, s, s)]
-                                    * f_data[f_index(b, l, l)];
-                            }
+            const ssize_t dimension = input_dim();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(dmrg_openmp_threads) \
+    if(dimension > 1 && dmrg_openmp_threads > 1)
+#endif
+            for (ssize_t index = 0; index < dimension; ++index) {
+                const ssize_t l = index % ket_r;
+                const ssize_t tmp = index / ket_r;
+                const ssize_t s = tmp % phys_in;
+                const ssize_t k = tmp / phys_in;
+                cdouble total = cdouble(0.0, 0.0);
+                for (ssize_t a = 0; a < mpo_l; ++a) {
+                    const cdouble e_val = e_data[e_index(a, k, k)];
+                    for (ssize_t b = 0; b < mpo_r; ++b) {
+                        total += e_val * w_data[w_index(a, b, s, s)]
+                            * f_data[f_index(b, l, l)];
                         }
-                        diag[static_cast<size_t>((k * phys_in + s) * ket_r + l)] = total;
                     }
-                }
+                diag[static_cast<size_t>(index)] = total;
             }
             return diag;
         }
 
         std::vector<cdouble> matvec_loop(const std::vector<cdouble>& x) const {
             std::vector<cdouble> out(static_cast<size_t>(output_dim()), cdouble(0.0, 0.0));
-            for (ssize_t i = 0; i < bra_l; ++i) {
-                for (ssize_t p = 0; p < phys_out; ++p) {
-                    for (ssize_t j = 0; j < bra_r; ++j) {
-                        cdouble total = cdouble(0.0, 0.0);
-                        for (ssize_t a = 0; a < mpo_l; ++a) {
-                            for (ssize_t b = 0; b < mpo_r; ++b) {
-                                for (ssize_t k = 0; k < ket_l; ++k) {
-                                    const cdouble e_val = e_data[e_index(a, i, k)];
-                                    for (ssize_t s = 0; s < phys_in; ++s) {
-                                        const cdouble ew_val =
-                                            e_val * w_data[w_index(a, b, p, s)];
-                                        const ssize_t base = (k * phys_in + s) * ket_r;
-                                        for (ssize_t l = 0; l < ket_r; ++l) {
-                                            total += ew_val
-                                                * x[static_cast<size_t>(base + l)]
-                                                * f_data[f_index(b, j, l)];
-                                        }
+            const ssize_t output_size = output_dim();
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(dmrg_openmp_threads) \
+    if(output_size > 1 && dmrg_openmp_threads > 1)
+#endif
+            for (ssize_t output = 0; output < output_size; ++output) {
+                const ssize_t j = output % bra_r;
+                const ssize_t tmp = output / bra_r;
+                const ssize_t p = tmp % phys_out;
+                const ssize_t i = tmp / phys_out;
+                cdouble total = cdouble(0.0, 0.0);
+                for (ssize_t a = 0; a < mpo_l; ++a) {
+                    for (ssize_t b = 0; b < mpo_r; ++b) {
+                        for (ssize_t k = 0; k < ket_l; ++k) {
+                            const cdouble e_val = e_data[e_index(a, i, k)];
+                            for (ssize_t s = 0; s < phys_in; ++s) {
+                                const cdouble ew_val =
+                                    e_val * w_data[w_index(a, b, p, s)];
+                                const ssize_t base = (k * phys_in + s) * ket_r;
+                                for (ssize_t l = 0; l < ket_r; ++l) {
+                                    total += ew_val
+                                        * x[static_cast<size_t>(base + l)]
+                                        * f_data[f_index(b, j, l)];
                                     }
                                 }
                             }
                         }
-                        out[static_cast<size_t>((i * phys_out + p) * bra_r + j)] = total;
                     }
-                }
+                out[static_cast<size_t>(output)] = total;
             }
             return out;
         }
@@ -46475,6 +46542,7 @@ private:
     long long batched_matvec_vectors = 0;
     long long blas_matvec_calls = 0;
     long long loop_matvec_calls = 0;
+    long long openmp_matvec_calls = 0;
     long long diagonal_calls = 0;
     long long evolve_calls = 0;
     long long evolve_matvecs = 0;
@@ -46514,7 +46582,12 @@ private:
     ) {
         const double start = wall_seconds();
         std::vector<cdouble> y;
-        if (backend == "loop" || backend == "scalar") {
+        if (backend == "openmp") {
+            y = problem.matvec_loop(x);
+            ++openmp_matvec_calls;
+            last_matvec_backend = openmp_available_cpp()
+                && dmrg_openmp_threads > 1 ? "openmp" : "loop";
+        } else if (backend == "loop" || backend == "scalar") {
             y = problem.matvec_loop(x);
             ++loop_matvec_calls;
             last_matvec_backend = "loop";
@@ -46539,7 +46612,15 @@ private:
     ) {
         const double start = wall_seconds();
         std::vector<std::vector<cdouble>> ys;
-        if (backend == "loop" || backend == "scalar") {
+        if (backend == "openmp") {
+            ys.reserve(xs.size());
+            for (const auto& x : xs) {
+                ys.push_back(problem.matvec_loop(x));
+            }
+            openmp_matvec_calls += static_cast<long long>(xs.size());
+            last_matvec_backend = openmp_available_cpp()
+                && dmrg_openmp_threads > 1 ? "openmp" : "loop";
+        } else if (backend == "loop" || backend == "scalar") {
             ys.reserve(xs.size());
             for (const auto& x : xs) {
                 ys.push_back(problem.matvec_loop(x));
@@ -46822,25 +46903,33 @@ static py::array_t<cdouble> dense_environment_update_left_cpp(
     auto e = E.unchecked<3>();
     auto b = B.unchecked<3>();
     auto y = out.mutable_unchecked<3>();
-    for (ssize_t beta = 0; beta < mpo_r; ++beta) {
-        for (ssize_t j = 0; j < bra_r; ++j) {
-            for (ssize_t l = 0; l < ket_r; ++l) {
-                cdouble total = cdouble(0.0, 0.0);
-                for (ssize_t alpha = 0; alpha < mpo_l; ++alpha) {
-                    for (ssize_t i = 0; i < E.shape(1); ++i) {
-                        for (ssize_t k = 0; k < E.shape(2); ++k) {
-                            const cdouble e_val = e(alpha, i, k);
-                            for (ssize_t s = 0; s < d_out; ++s) {
-                                const cdouble ea = e_val * std::conj(a(i, s, j));
-                                for (ssize_t t = 0; t < d_in; ++t) {
-                                    total += ea * w(alpha, beta, s, t) * b(k, t, l);
-                                }
+    const ssize_t output_size = mpo_r * bra_r * ket_r;
+    {
+        py::gil_scoped_release release;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(dmrg_openmp_threads) \
+    if(output_size > 1 && dmrg_openmp_threads > 1)
+#endif
+        for (ssize_t output = 0; output < output_size; ++output) {
+            const ssize_t l = output % ket_r;
+            const ssize_t tmp = output / ket_r;
+            const ssize_t j = tmp % bra_r;
+            const ssize_t beta = tmp / bra_r;
+            cdouble total = cdouble(0.0, 0.0);
+            for (ssize_t alpha = 0; alpha < mpo_l; ++alpha) {
+                for (ssize_t i = 0; i < E.shape(1); ++i) {
+                    for (ssize_t k = 0; k < E.shape(2); ++k) {
+                        const cdouble e_val = e(alpha, i, k);
+                        for (ssize_t s = 0; s < d_out; ++s) {
+                            const cdouble ea = e_val * std::conj(a(i, s, j));
+                            for (ssize_t t = 0; t < d_in; ++t) {
+                                total += ea * w(alpha, beta, s, t) * b(k, t, l);
                             }
                         }
                     }
                 }
-                y(beta, j, l) = total;
             }
+            y(beta, j, l) = total;
         }
     }
     return out;
@@ -47020,25 +47109,33 @@ static py::array_t<cdouble> dense_environment_update_right_cpp(
     auto f = F.unchecked<3>();
     auto b = B.unchecked<3>();
     auto y = out.mutable_unchecked<3>();
-    for (ssize_t alpha = 0; alpha < mpo_l; ++alpha) {
-        for (ssize_t i = 0; i < bra_l; ++i) {
-            for (ssize_t k = 0; k < ket_l; ++k) {
-                cdouble total = cdouble(0.0, 0.0);
-                for (ssize_t beta = 0; beta < mpo_r; ++beta) {
-                    for (ssize_t j = 0; j < F.shape(1); ++j) {
-                        for (ssize_t l = 0; l < F.shape(2); ++l) {
-                            const cdouble f_val = f(beta, j, l);
-                            for (ssize_t s = 0; s < d_out; ++s) {
-                                const cdouble af = std::conj(a(i, s, j)) * f_val;
-                                for (ssize_t t = 0; t < d_in; ++t) {
-                                    total += af * w(alpha, beta, s, t) * b(k, t, l);
-                                }
+    const ssize_t output_size = mpo_l * bra_l * ket_l;
+    {
+        py::gil_scoped_release release;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(dmrg_openmp_threads) \
+    if(output_size > 1 && dmrg_openmp_threads > 1)
+#endif
+        for (ssize_t output = 0; output < output_size; ++output) {
+            const ssize_t k = output % ket_l;
+            const ssize_t tmp = output / ket_l;
+            const ssize_t i = tmp % bra_l;
+            const ssize_t alpha = tmp / bra_l;
+            cdouble total = cdouble(0.0, 0.0);
+            for (ssize_t beta = 0; beta < mpo_r; ++beta) {
+                for (ssize_t j = 0; j < F.shape(1); ++j) {
+                    for (ssize_t l = 0; l < F.shape(2); ++l) {
+                        const cdouble f_val = f(beta, j, l);
+                        for (ssize_t s = 0; s < d_out; ++s) {
+                            const cdouble af = std::conj(a(i, s, j)) * f_val;
+                            for (ssize_t t = 0; t < d_in; ++t) {
+                                total += af * w(alpha, beta, s, t) * b(k, t, l);
                             }
                         }
                     }
                 }
-                y(alpha, i, k) = total;
             }
+            y(alpha, i, k) = total;
         }
     }
     return out;
@@ -51987,6 +52084,10 @@ static py::tuple rank_coupled_reduced_actions_cpp(
 
 PYBIND11_MODULE(_cpp_davidson, m) {
     m.doc() = "Optional C++ packed Davidson kernels for PyQED MPS.";
+    m.def("openmp_available", &openmp_available_cpp);
+    m.def("set_num_threads", &set_dmrg_openmp_threads, py::arg("n_threads"));
+    m.def("get_num_threads", &get_dmrg_openmp_threads);
+    m.def("openmp_info", &dmrg_openmp_info);
     m.def(
         "lapack_svd",
         &lapack_svd,

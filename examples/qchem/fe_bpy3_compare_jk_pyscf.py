@@ -187,9 +187,7 @@ def main(argv=None):
     print("Building PyQED native RI ...", flush=True)
     mol = Molecule(atom=atom, unit="angstrom", basis=args.basis, charge=args.charge, spin=args.spin)
     t0 = time.perf_counter()
-    mol.build(
-        driver="builtin",
-        eri="ri",
+    mol.build(eri="ri",
         auxbasis=args.auxbasis,
         options={
             "ri_tensor_backend": "native",

@@ -343,7 +343,6 @@ class TDDFTDriver:
         mol,
         nstates,
         xc='lda,vwn',
-        build_driver='gbasis',
         nac_method='none',
         point_charge_coords=None,
         point_charges=None,
@@ -361,7 +360,6 @@ class TDDFTDriver:
         """
         self.mol = mol
         self.xc = xc
-        self.build_driver = build_driver
         self.nstates = nstates
         self.nexc = max(0, nstates - 1)
         self.fd_step = 1e-3
@@ -386,7 +384,7 @@ class TDDFTDriver:
         if hasattr(self.mol, 'build'):
             self.backend = 'pyqed'
             if getattr(self.mol, 'nao', None) is None or getattr(self.mol, '_bas', None) is None:
-                self.mol.build(driver=self.build_driver)
+                self.mol.build()
             self.ks, self.td = self._build_pyqed_point(self.mol)
             return
 
@@ -411,7 +409,7 @@ class TDDFTDriver:
             unit='bohr',
         )
         mol.set_geom(coords)
-        mol.build(driver=self.build_driver)
+        mol.build()
         return mol
 
     def _build_pyscf_point(self, mol):
@@ -446,7 +444,6 @@ class TDDFTDriver:
                 ks,
                 self.point_charge_coords,
                 self.point_charges,
-                build_driver=self.build_driver,
                 run_kwargs={'verbose': 0},
             )
             embedded.run()

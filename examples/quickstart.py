@@ -8,7 +8,7 @@ mol = Molecule(
     unit="angstrom",
     basis="sto-3g",
 )
-mol.build(driver="builtin", eri="auto")
+mol.build(eri="auto")
 
 mf = mol.RHF().run()
 if not mf.converged:

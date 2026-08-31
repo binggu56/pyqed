@@ -240,7 +240,7 @@ class UHF:
 
     def get_eri(self, representation='ao'):
         if representation == 'ao':
-            return self.eri
+            return _dense_ao_eri(self.mol)
         if representation == 'mo':
             if self.mo_coeff is None:
                 raise ValueError("Run UHF before requesting MO integrals.")
@@ -254,10 +254,22 @@ class UHF:
             raise ValueError("Run UHF before requesting MO integrals.")
 
         ca, cb = mo_coeff
-        aa = contract('pqrs,pi,qj,rk,sl->ijkl', self.eri, ca.conj(), ca, ca.conj(), ca)
-        bb = contract('pqrs,pi,qj,rk,sl->ijkl', self.eri, cb.conj(), cb, cb.conj(), cb)
-        ab = contract('pqrs,pi,qj,rk,sl->ijkl', self.eri, ca.conj(), ca, cb.conj(), cb)
-        ba = contract('pqrs,pi,qj,rk,sl->ijkl', self.eri, cb.conj(), cb, ca.conj(), ca)
+        factors = getattr(self.mol, 'eri_factors', None)
+        if factors is not None:
+            from pyqed.qchem.basis import mo_pair_factors
+
+            factors_aa = mo_pair_factors(factors, ca, ca)
+            factors_bb = mo_pair_factors(factors, cb, cb)
+            aa = contract('Pij,Pkl->ijkl', factors_aa, factors_aa)
+            bb = contract('Pij,Pkl->ijkl', factors_bb, factors_bb)
+            ab = contract('Pij,Pkl->ijkl', factors_aa, factors_bb)
+            ba = contract('Pij,Pkl->ijkl', factors_bb, factors_aa)
+        else:
+            eri = _dense_ao_eri(self.mol)
+            aa = contract('pqrs,pi,qj,rk,sl->ijkl', eri, ca.conj(), ca, ca.conj(), ca)
+            bb = contract('pqrs,pi,qj,rk,sl->ijkl', eri, cb.conj(), cb, cb.conj(), cb)
+            ab = contract('pqrs,pi,qj,rk,sl->ijkl', eri, ca.conj(), ca, cb.conj(), cb)
+            ba = contract('pqrs,pi,qj,rk,sl->ijkl', eri, cb.conj(), cb, ca.conj(), ca)
 
         if notation == 'phys':
             aa = np.transpose(aa, (0, 2, 1, 3))
@@ -270,12 +282,32 @@ class UHF:
         return np.array(((aa, ab), (ba, bb)), dtype=complex)
 
 
+def _dense_ao_eri(mol):
+    eri = getattr(mol, 'eri', None)
+    if eri is not None:
+        return np.asarray(eri)
+    eri_s4 = getattr(mol, 'eri_s4', None)
+    if eri_s4 is not None:
+        from pyqed.qchem.basis import unpack_eri_s4
+        return unpack_eri_s4(eri_s4, mol.nao)
+    eri_s8 = getattr(mol, 'eri_s8', None)
+    if eri_s8 is not None:
+        from pyqed.qchem.basis import unpack_eri_s8
+        return unpack_eri_s8(eri_s8, mol.nao)
+    factors = getattr(mol, 'eri_factors', None)
+    if factors is not None:
+        return contract('Ppq,Prs->pqrs', factors, factors)
+    raise ValueError("No AO ERI representation is available.")
+
+
 def get_j(mol, dm):
-    return np.einsum('rs,pqrs->pq', dm, mol.eri, optimize=True)
+    from pyqed.qchem.hf.rhf import get_jk
+    return get_jk(mol, dm)[0]
 
 
 def get_k(mol, dm):
-    return np.einsum('rs,psrq->pq', dm, mol.eri, optimize=True)
+    from pyqed.qchem.hf.rhf import get_jk
+    return get_jk(mol, dm)[1]
 
 
 def get_veff(mol, dm, dm_last=None, vhf_last=None):
@@ -437,8 +469,6 @@ def _adjust_spin_occupations(spin_occ, na_target, nb_target):
 
 
 def _builtin_orientation_groups(mol):
-    if getattr(mol, '_build_driver', None) != 'builtin':
-        raise ValueError("init_guess='atom_config' currently requires driver='builtin'.")
     if getattr(mol, '_bas', None) is None:
         raise ValueError("Molecule basis is not built.")
     if getattr(mol, 'natom', 0) != 1:
@@ -581,6 +611,23 @@ def _mom_select_occupations(mo_coeff, prev_occ_coeff, overlap, nocc):
     return occ, mo_coeff[:, occ_idx]
 
 
+def _reorder_fixed_occupations(mo_energy, mo_coeff, mo_occ, prev_occ_coeff, overlap):
+    """Keep explicitly occupied orbitals on their requested column indices."""
+    targets = np.flatnonzero(np.asarray(mo_occ) > 0)
+    if targets.size == 0:
+        return mo_energy, mo_coeff, mo_coeff[:, :0]
+    projection = prev_occ_coeff.conj().T @ overlap @ mo_coeff
+    scores = np.sum(np.abs(projection) ** 2, axis=0)
+    selected = list(np.argsort(scores)[::-1][:targets.size])
+    remaining = [idx for idx in range(mo_coeff.shape[1]) if idx not in selected]
+    order = np.empty(mo_coeff.shape[1], dtype=int)
+    order[targets] = selected
+    order[np.flatnonzero(np.asarray(mo_occ) <= 0)] = remaining
+    aligned_coeff = mo_coeff[:, order]
+    aligned_energy = np.asarray(mo_energy)[order]
+    return aligned_energy, aligned_coeff, aligned_coeff[:, targets]
+
+
 def _make_diis_extrapolator(max_diis=6):
     error_a = np.zeros((max_diis, 1, 1))
     error_b = np.zeros((max_diis, 1, 1))
@@ -680,6 +727,7 @@ def unrestricted_hartree_fock(
         _occupied_subspace_from_density(dm[0], overlap, na),
         _occupied_subspace_from_density(dm[1], overlap, nb),
     )
+    track_fixed_occupations = mo_occ0 is not None and not mom
     diis = _make_diis_extrapolator()
 
     e_last = None
@@ -708,6 +756,14 @@ def unrestricted_hartree_fock(
                 mo_coeff_b, prev_occ_coeff[1], overlap, nb
             )
             mo_occ = (mo_occ_a, mo_occ_b)
+            prev_occ_coeff = (occ_coeff_a, occ_coeff_b)
+        elif track_fixed_occupations:
+            mo_energy_a, mo_coeff_a, occ_coeff_a = _reorder_fixed_occupations(
+                mo_energy_a, mo_coeff_a, mo_occ[0], prev_occ_coeff[0], overlap
+            )
+            mo_energy_b, mo_coeff_b, occ_coeff_b = _reorder_fixed_occupations(
+                mo_energy_b, mo_coeff_b, mo_occ[1], prev_occ_coeff[1], overlap
+            )
             prev_occ_coeff = (occ_coeff_a, occ_coeff_b)
         else:
             prev_occ_coeff = (

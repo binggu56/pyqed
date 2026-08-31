@@ -318,10 +318,10 @@ class MovingEnvironmentContractionCache:
 
 def factorize_left_two_site_dense_term(E, W1):
     """
-    Precontract a left environment block with an adjacent MPO block.
+    Precontract a left environment block with an adjacent MPOCore block.
 
     :param E: Left renormalized operator block.
-    :param W1: Left active-site MPO block.
+    :param W1: Left active-site MPOCore block.
     :returns: Dense left factor tensor.
     """
 
@@ -330,9 +330,9 @@ def factorize_left_two_site_dense_term(E, W1):
 
 def factorize_right_two_site_dense_term(W2, F):
     """
-    Precontract a right environment block with an adjacent MPO block.
+    Precontract a right environment block with an adjacent MPOCore block.
 
-    :param W2: Right active-site MPO block.
+    :param W2: Right active-site MPOCore block.
     :param F: Right renormalized operator block.
     :returns: Dense right factor tensor.
     """
@@ -343,17 +343,17 @@ def factorize_right_two_site_dense_term(W2, F):
 
 def group_mpo_blocks_by_input(W, phys_slices):
     """
-    Group dense or block-sparse MPO blocks by physical input sector.
+    Group dense or block-sparse MPOCore blocks by physical input sector.
 
-    :param W: MPO core.
-    :param phys_slices: Physical-sector slices for dense MPO cores.
+    :param W: MPOCore core.
+    :param phys_slices: Physical-sector slices for dense MPOCore cores.
     :returns: Mapping from physical input sector to output-sector blocks.
     """
 
-    from .mpo import IrreducibleMPO, MPO, RankCoupledMPO
+    from .mpo import IrreducibleMPO, MPOCore, RankCoupledMPO
 
     grouped = {}
-    if isinstance(W, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(W, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         phys_in_sectors = getattr(W, "phys_in_sectors", None)
         phys_out_sectors = getattr(W, "phys_out_sectors", None)
         if phys_in_sectors is None:
@@ -380,9 +380,9 @@ def group_mpo_blocks_by_input(W, phys_slices):
 
 def group_rank_coupled_reduced_blocks_by_input(W):
     """
-    Group rank-coupled reduced MPO blocks by physical input sector.
+    Group rank-coupled reduced MPOCore blocks by physical input sector.
 
-    :param W: Rank-coupled MPO core.
+    :param W: Rank-coupled MPOCore core.
     :returns: Mapping from physical input sector to reduced block entries.
     """
 
@@ -399,11 +399,11 @@ def group_rank_coupled_reduced_blocks_by_input(W):
 
 def build_left_factor_table(left_blocks_by_ket, W, phys_slices):
     """
-    Build a dense-MPO left factor table from grouped boundary blocks.
+    Build a dense-MPOCore left factor table from grouped boundary blocks.
 
     :param left_blocks_by_ket: Left boundary payloads grouped by ket sector.
-    :param W: Adjacent MPO core.
-    :param phys_slices: Physical-sector slices for dense MPO cores.
+    :param W: Adjacent MPOCore core.
+    :param phys_slices: Physical-sector slices for dense MPOCore cores.
     :returns: Factor table grouped by ``(left_ket, physical_ket)``.
     """
 
@@ -428,11 +428,11 @@ def build_left_factor_table(left_blocks_by_ket, W, phys_slices):
 
 def build_right_factor_table(right_blocks_by_ket, W, phys_slices):
     """
-    Build a dense-MPO right factor table from grouped boundary blocks.
+    Build a dense-MPOCore right factor table from grouped boundary blocks.
 
     :param right_blocks_by_ket: Right boundary payloads grouped by ket sector.
-    :param W: Adjacent MPO core.
-    :param phys_slices: Physical-sector slices for dense MPO cores.
+    :param W: Adjacent MPOCore core.
+    :param phys_slices: Physical-sector slices for dense MPOCore cores.
     :returns: Factor table grouped by ``(right_ket, physical_ket)``.
     """
 
@@ -460,7 +460,7 @@ def build_rank_coupled_left_factor_table(left_blocks_by_ket, W):
     Build a rank-coupled left factor table from grouped boundary payloads.
 
     :param left_blocks_by_ket: Left boundary payloads grouped by ket sector.
-    :param W: Rank-coupled MPO core.
+    :param W: Rank-coupled MPOCore core.
     :returns: Factor table grouped by ``(left_ket, physical_ket)``.
     """
 
@@ -501,7 +501,7 @@ def build_rank_coupled_right_factor_table(right_blocks_by_ket, W):
     Build a rank-coupled right factor table from grouped boundary payloads.
 
     :param right_blocks_by_ket: Right boundary payloads grouped by ket sector.
-    :param W: Rank-coupled MPO core.
+    :param W: Rank-coupled MPOCore core.
     :returns: Factor table grouped by ``(right_ket, physical_ket)``.
     """
 
@@ -554,9 +554,9 @@ def _family_names_from_symbolic_label(label):
 
 def _symbolic_transition_families_by_channel(W, *, side):
     """
-    Group symbolic transition family labels by one visible MPO channel.
+    Group symbolic transition family labels by one visible MPOCore channel.
 
-    :param W: MPO core carrying ``symbolic_transitions`` metadata.
+    :param W: MPOCore core carrying ``symbolic_transitions`` metadata.
     :param side: ``"left"`` groups by incoming channel; ``"right"`` groups by
         outgoing channel.
     :returns: Mapping ``channel -> tuple(family labels)``.
@@ -579,11 +579,11 @@ def _symbolic_transition_families_by_channel(W, *, side):
 @dataclass(frozen=True)
 class SymbolicMPOTransition:
     """
-    Symbolic MPO virtual-channel transition used by recursive boundary algebra.
+    Symbolic MPOCore virtual-channel transition used by recursive boundary algebra.
 
     :param kind: Transition kind, for example ``"dense"`` or ``"reduced"``.
-    :param left_channel: Incoming left MPO virtual channel.
-    :param right_channel: Outgoing right MPO virtual channel.
+    :param left_channel: Incoming left MPOCore virtual channel.
+    :param right_channel: Outgoing right MPOCore virtual channel.
     :param label: Stable label describing the local operator carried by the
         transition.
     """
@@ -614,9 +614,9 @@ class SymbolicRenormalizedOperatorTerm:
     """
     One symbolic renormalized boundary operator path.
 
-    :param channel: Current MPO virtual channel represented by this boundary
+    :param channel: Current MPOCore virtual channel represented by this boundary
         operator.
-    :param path: Ordered tuple of local MPO transition keys absorbed into the
+    :param path: Ordered tuple of local MPOCore transition keys absorbed into the
         boundary.
     :param multiplicity: Number of equivalent symbolic paths merged into this
         term.
@@ -661,18 +661,18 @@ class SymbolicRenormalizedOperatorTable:
     Recursive symbolic renormalized-operator table for one boundary.
 
     The table mirrors the block2 view of a boundary: each entry is keyed by a
-    visible MPO virtual channel and stores the symbolic MPO path absorbed into
+    visible MPOCore virtual channel and stores the symbolic MPOCore path absorbed into
     that renormalized operator.  Numeric environment tensors remain owned by
     :class:`RenormalizedBlockEntry`; this table owns the operator algebra and
     lineage.
 
     :param side: Boundary side, ``"left"`` or ``"right"``.
     :param bond: Boundary bond index.
-    :param terms_by_channel: Mapping from MPO virtual channel to symbolic
+    :param terms_by_channel: Mapping from MPOCore virtual channel to symbolic
         terms.
     :param source: How the table was produced.
     :param parent_key: Optional parent boundary-stack key.
-    :param used_mpo_symbolic_metadata: Whether the absorbed MPO core supplied
+    :param used_mpo_symbolic_metadata: Whether the absorbed MPOCore core supplied
         preserved AutoMPO symbolic transition records.
     :param numeric_payloads: Numeric renormalized-operator payloads owned by
         this symbolic table.  Entries are keyed by ``(q_out, q_in, channel)``
@@ -761,9 +761,9 @@ class SymbolicRenormalizedOperatorTable:
 
     def advance_left(self, W, *, bond, block=None, parent_key=None):
         """
-        Advance this symbolic table by absorbing an MPO core on the right.
+        Advance this symbolic table by absorbing an MPOCore core on the right.
 
-        :param W: MPO core for the absorbed site.
+        :param W: MPOCore core for the absorbed site.
         :param bond: New left-boundary bond.
         :param block: Optional numeric child block for active-channel pruning.
         :param parent_key: Optional parent boundary-stack key.
@@ -810,9 +810,9 @@ class SymbolicRenormalizedOperatorTable:
 
     def advance_right(self, W, *, bond, block=None, parent_key=None):
         """
-        Advance this symbolic table by absorbing an MPO core on the left.
+        Advance this symbolic table by absorbing an MPOCore core on the left.
 
-        :param W: MPO core for the absorbed site.
+        :param W: MPOCore core for the absorbed site.
         :param bond: New right-boundary bond.
         :param block: Optional numeric child block for active-channel pruning.
         :param parent_key: Optional parent boundary-stack key.
@@ -900,7 +900,7 @@ class SymbolicRenormalizedOperatorTable:
 
     @property
     def channels(self):
-        """Return the sorted active MPO virtual channels."""
+        """Return the sorted active MPOCore virtual channels."""
 
         return tuple(sorted(int(channel) for channel in self.terms_by_channel))
 
@@ -918,7 +918,7 @@ class SymbolicRenormalizedOperatorTable:
 
     @property
     def max_path_length(self):
-        """Return the longest absorbed symbolic MPO path."""
+        """Return the longest absorbed symbolic MPOCore path."""
 
         if not self.terms_by_channel:
             return 0
@@ -957,7 +957,7 @@ class SymbolicRenormalizedOperatorTable:
         """
         Group numeric boundary blocks using this symbolic boundary table.
 
-        The symbolic table owns the active MPO virtual channels.  The numeric
+        The symbolic table owns the active MPOCore virtual channels.  The numeric
         block map supplies the tensor payloads.  This is the bridge from the
         recursive symbolic operator algebra to the current block-sparse matvec
         kernels.
@@ -1017,8 +1017,8 @@ class SymbolicRenormalizedOperatorTable:
         Build one-site factor tables from symbolic-owned boundary payloads.
 
         :param representation: Factor-table representation.
-        :param W: MPO core adjacent to this boundary.
-        :param phys_slices: Physical sector slices for dense MPO cores.
+        :param W: MPOCore core adjacent to this boundary.
+        :param phys_slices: Physical sector slices for dense MPOCore cores.
         :returns: Factor table grouped by ket-sector pair.
         """
 
@@ -1034,10 +1034,10 @@ class SymbolicRenormalizedOperatorTable:
 
     def left_factor_table(self, W, *, phys_slices=None):
         """
-        Build a left dense-MPO factor table from owned symbolic payloads.
+        Build a left dense-MPOCore factor table from owned symbolic payloads.
 
-        :param W: MPO core adjacent to this boundary.
-        :param phys_slices: Physical sector slices for dense MPO cores.
+        :param W: MPOCore core adjacent to this boundary.
+        :param phys_slices: Physical sector slices for dense MPOCore cores.
         :returns: Factor table grouped by ``(left_ket, physical_ket)``.
         """
 
@@ -1049,10 +1049,10 @@ class SymbolicRenormalizedOperatorTable:
 
     def right_factor_table(self, W, *, phys_slices=None):
         """
-        Build a right dense-MPO factor table from owned symbolic payloads.
+        Build a right dense-MPOCore factor table from owned symbolic payloads.
 
-        :param W: MPO core adjacent to this boundary.
-        :param phys_slices: Physical sector slices for dense MPO cores.
+        :param W: MPOCore core adjacent to this boundary.
+        :param phys_slices: Physical sector slices for dense MPOCore cores.
         :returns: Factor table grouped by ``(right_ket, physical_ket)``.
         """
 
@@ -1066,7 +1066,7 @@ class SymbolicRenormalizedOperatorTable:
         """
         Build a left rank-coupled factor table from owned symbolic payloads.
 
-        :param W: Rank-coupled MPO core adjacent to this boundary.
+        :param W: Rank-coupled MPOCore core adjacent to this boundary.
         :returns: Factor table grouped by ``(left_ket, physical_ket)``.
         """
 
@@ -1079,7 +1079,7 @@ class SymbolicRenormalizedOperatorTable:
         """
         Build a right rank-coupled factor table from owned symbolic payloads.
 
-        :param W: Rank-coupled MPO core adjacent to this boundary.
+        :param W: Rank-coupled MPOCore core adjacent to this boundary.
         :returns: Factor table grouped by ``(right_ket, physical_ket)``.
         """
 
@@ -1095,7 +1095,7 @@ class ComplementaryFamilyRenormalizedOperatorBlock:
     One stored renormalized boundary-operator family block.
 
     :param family_name: Complementary family label.
-    :param channels: MPO virtual channels carrying this family.
+    :param channels: MPOCore virtual channels carrying this family.
     :param symbolic_terms: Multiplicity-counted symbolic path count.
     :param payload_keys: Numeric payload keys owned by these channels.
     :param stored_elements: Number of scalar tensor elements in payloads.
@@ -2591,9 +2591,9 @@ def _stable_operator_label(operator):
 
 def symbolic_mpo_core_transitions(core):
     """
-    Return symbolic virtual-channel transitions for an MPO core.
+    Return symbolic virtual-channel transitions for an MPOCore core.
 
-    :param core: Dense, block-sparse, irreducible, or rank-coupled MPO core.
+    :param core: Dense, block-sparse, irreducible, or rank-coupled MPOCore core.
     :returns: ``(transitions, used_metadata)``.
     """
 
@@ -2724,12 +2724,12 @@ def _compact_advance_symbolic_terms(terms_by_channel, transitions, *, active=Non
 
     The numeric renormalized block already owns the exact contracted operator
     payload.  For local table construction the symbolic boundary only needs
-    active MPO virtual channels and lineage counts, not every full absorbed
-    MPO path.  This mirrors symbolic MPO compression by merging all paths that
+    active MPOCore virtual channels and lineage counts, not every full absorbed
+    MPOCore path.  This mirrors symbolic MPOCore compression by merging all paths that
     end in the same visible channel while preserving multiplicity diagnostics.
 
     :param terms_by_channel: Parent channel-to-terms mapping.
-    :param transitions: MPO virtual-channel transitions for the absorbed site.
+    :param transitions: MPOCore virtual-channel transitions for the absorbed site.
     :param active: Optional active child channels discovered from the numeric
         child block.
     :param direction: ``"left"`` for left-boundary growth or ``"right"`` for
@@ -3555,7 +3555,7 @@ class RenormalizedBlockEntry:
 
     @property
     def rank_coupled(self):
-        """Return whether the stored block uses rank-coupled MPO channels."""
+        """Return whether the stored block uses rank-coupled MPOCore channels."""
 
         return bool(getattr(self.block, "rank_coupled", False))
 
@@ -4529,7 +4529,7 @@ class RenormalizedBlockStack:
 
         :param entry: Previous left boundary entry.
         :param bond: New boundary bond index.
-        :param W: MPO core for the absorbed site.
+        :param W: MPOCore core for the absorbed site.
         :param site: Mixed-canonical MPS site tensor to absorb.
         :param phys_slices: Optional physical-sector slices.
         :param signature: Optional signature for the advanced block.
@@ -4619,7 +4619,7 @@ class RenormalizedBlockStack:
 
         :param entry: Previous right boundary entry.
         :param bond: New boundary bond index.
-        :param W: MPO core for the absorbed site.
+        :param W: MPOCore core for the absorbed site.
         :param site: Mixed-canonical MPS site tensor to absorb.
         :param phys_slices: Optional physical-sector slices.
         :param signature: Optional signature for the advanced block.

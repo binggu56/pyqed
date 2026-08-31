@@ -13,13 +13,13 @@ from pyqed.qchem.symmetry import (
 )
 
 
-def test_c2v_ao_irreps_for_linear_hf_gbasis():
+def test_c2v_ao_irreps_for_linear_hf_builtin():
     mol = Molecule(
         atom="H 0 0 0; F 0 0 0.9",
         unit="angstrom",
         basis="cc-pvdz",
     )
-    mol.build(driver="gbasis", symmetry="c2v")
+    mol.build(symmetry="c2v")
 
     assert mol.groupname == "C2v"
     assert mol.irrep_names == ("A1", "A2", "B1", "B2")
@@ -35,13 +35,13 @@ def test_c2v_ao_irreps_for_linear_hf_gbasis():
     assert labels["1 F 3dx2-y2"] == "A1"
 
 
-def test_coov_ao_irreps_for_linear_hf_gbasis():
+def test_coov_ao_irreps_for_linear_hf_builtin():
     mol = Molecule(
         atom="H 0 0 0; F 0 0 0.9",
         unit="angstrom",
         basis="cc-pvdz",
     )
-    mol.build(driver="gbasis", symmetry="coov")
+    mol.build(symmetry="coov")
 
     assert mol.groupname == "Coov"
     assert set(mol.irrep_names) >= {"A1", "A2", "E1x", "E1y", "E2x", "E2y"}
@@ -63,7 +63,7 @@ def test_c2v_ao_irreps_for_builtin_cartesian_basis():
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", symmetry="c2v")
+    mol.build(eri="dense", symmetry="c2v")
 
     labels = dict(zip(mol.ao_labels(), mol.ao_irrep_labels))
     assert labels["1 F 2px"] == "B1"
@@ -79,7 +79,7 @@ def test_c2v_symmetry_rejects_off_axis_geometry():
     )
 
     with pytest.raises(ValueError, match="not invariant"):
-        mol.build(driver="gbasis", symmetry="c2v")
+        mol.build(symmetry="c2v")
 
 
 def test_rhf_assigns_native_mo_irreps():
@@ -88,7 +88,7 @@ def test_rhf_assigns_native_mo_irreps():
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis", symmetry="c2v")
+    mol.build(symmetry="c2v")
 
     mf = RHF(mol).run(verbose=0, max_cycle=50)
 
@@ -161,7 +161,7 @@ def test_casci_attaches_active_symmetry_metadata():
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis", symmetry="c2v")
+    mol.build(symmetry="c2v")
     mf = RHF(mol).run(verbose=0, max_cycle=50)
 
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -181,7 +181,7 @@ def test_casci_can_filter_determinants_by_wfnsym():
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis", symmetry="c2v")
+    mol.build(symmetry="c2v")
     mf = RHF(mol).run(verbose=0, max_cycle=50)
 
     full = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -203,7 +203,7 @@ def test_casci_can_filter_coov_wfnsym():
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis", symmetry="coov")
+    mol.build(symmetry="coov")
     mf = RHF(mol).run(verbose=0, max_cycle=50)
 
     full = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method="direct_ci")
@@ -252,7 +252,7 @@ def test_native_mo_irreps_match_pyscf_c2v():
         )
 
         mol = Molecule(atom=atom, unit="angstrom", basis=basis)
-        mol.build(driver="gbasis", symmetry="c2v")
+        mol.build(symmetry="c2v")
         mf = RHF(mol).run(verbose=0, max_cycle=80)
 
         assert mf.orb_irrep_labels == pyscf_labels
@@ -274,7 +274,7 @@ def test_native_mo_irreps_match_pyscf_coov():
     )
 
     mol = Molecule(atom=atom, unit="angstrom", basis=basis)
-    mol.build(driver="gbasis", symmetry="coov")
+    mol.build(symmetry="coov")
     mf = RHF(mol).run(verbose=0, max_cycle=80)
 
     assert mf.orb_irrep_labels == pyscf_labels
@@ -287,7 +287,7 @@ def test_dooh_labels_for_homonuclear_h2_sigma_orbitals():
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis", symmetry="dooh")
+    mol.build(symmetry="dooh")
     mf = RHF(mol).run(verbose=0, max_cycle=50)
 
     assert mol.groupname == "Dooh"
@@ -310,7 +310,7 @@ def test_native_casci_wfnsym_singlets_match_pyscf_spin0_symm():
     pmf = pyscf_scf.RHF(pmol).run(verbose=0)
 
     mol = Molecule(atom=atom, unit="angstrom", basis=basis)
-    mol.build(driver="gbasis", symmetry="c2v")
+    mol.build(symmetry="c2v")
     mf = RHF(mol).run(verbose=0, max_cycle=80)
 
     pyscf_refs = {}

@@ -11,7 +11,8 @@ from scipy.linalg import det, eigh, expm
 from scipy.sparse import diags
 from scipy.sparse.linalg import expm_multiply
 
-from pyqed.ldr.ldr import LDRN
+from pyqed.ldr import kinetic as kinetic_tools
+from pyqed.ldr import overlap as overlap_tools
 from pyqed.qchem.gdvr import RTTDHF
 
 
@@ -44,7 +45,37 @@ def gdvr_det_overlap(left, right, *, phase="full"):
     if not np.allclose(left.z, right.z, rtol=0.0, atol=1.0e-12):
         raise ValueError("GDVR determinant overlaps require a shared z grid.")
 
-    orbital_overlap = left.overlap_orbitals.conj().T @ right.overlap_orbitals
+    c_left = getattr(left.mol, "c_list", None)
+    c_right = getattr(right.mol, "c_list", None)
+    if c_left is None and c_right is None:
+        orbital_overlap = left.overlap_orbitals.conj().T @ right.overlap_orbitals
+    elif c_left is None or c_right is None:
+        raise ValueError("Both GDVR frames must provide c_list for determinant overlaps.")
+    else:
+        context_left = left.mol._gdvr_build_context
+        context_right = right.mol._gdvr_build_context
+        if not (
+            np.array_equal(context_left["alphas"], context_right["alphas"])
+            and np.array_equal(context_left["centers"], context_right["centers"])
+            and tuple(context_left["labels"]) == tuple(context_right["labels"])
+        ):
+            raise ValueError("GDVR determinant overlaps require a shared primitive transverse basis.")
+        basis_overlap = np.einsum(
+            "kpa,pq,kqb->kab",
+            np.stack(c_left).conj(),
+            context_left["S_prim"],
+            np.stack(c_right),
+            optimize=True,
+        )
+        orbitals_left = left.overlap_orbitals.reshape(len(left.z), left.M, -1)
+        orbitals_right = right.overlap_orbitals.reshape(len(right.z), right.M, -1)
+        orbital_overlap = np.einsum(
+            "kai,kab,kbj->ij",
+            orbitals_left.conj(),
+            basis_overlap,
+            orbitals_right,
+            optimize=True,
+        )
     spatial_det = det(orbital_overlap)
     if phase == "full":
         left_phase = getattr(left, "det_phase", 1.0 + 0.0j)
@@ -367,7 +398,7 @@ class Solver:
         if self.grid_shape is None:
             raise ValueError("LPA overlap construction requires grid_shape or an inferable product grid.")
 
-        return LDRN.lpa_layout(self.grid_shape)[2]
+        return overlap_tools.layout(self.grid_shape)[2]
 
     def _map_frames(self, func, frames=None):
         frames = self.frames if frames is None else list(frames)
@@ -398,17 +429,22 @@ class Solver:
 
     def _lpa_overlap_links(self, phase=None):
         phase = self._overlap_phase(phase)
-        return LDRN.lpa_links(
+        _, flat_index, _ = overlap_tools.layout(self.grid_shape)
+        return overlap_tools.nearest(
             self.grid_shape,
-            lambda i, j: gdvr_det_overlap(self.frames[i], self.frames[j], phase=phase),
+            lambda left, right: gdvr_det_overlap(
+                self.frames[flat_index[left]],
+                self.frames[flat_index[right]],
+                phase=phase,
+            ),
             unitarize=self.lpa_unitarize_links,
         )
 
     def _lpa_overlap_between(self, bra_idx, ket_idx, links):
-        return LDRN.lpa_overlap(bra_idx, ket_idx, links, self.grid_shape)
+        return overlap_tools.between(bra_idx, ket_idx, links)
 
     def _lpa_overlap_matrix(self, phase=None):
-        return LDRN.lpa_matrix(
+        return overlap_tools.dense(
             self.grid_shape,
             self._lpa_overlap_links(phase=phase),
         )
@@ -426,12 +462,11 @@ class Solver:
             raise ValueError("hamiltonian_method='lpa-sparse' requires overlap_method='lpa'.")
         phase = self._overlap_phase(phase)
 
-        return LDRN.lpa_kinetic(
+        return kinetic_tools.linked(
             self.kinetic,
             self.grid_shape,
-            lambda i, j: gdvr_det_overlap(self.frames[i], self.frames[j], phase=phase),
-            kinetic_sparse_tol=self.kinetic_sparse_tol,
-            unitarize_links=self.lpa_unitarize_links,
+            self._lpa_overlap_links(phase=phase),
+            threshold=self.kinetic_sparse_tol,
         )
 
     def electronic_energy_vector(self, time=0.0):

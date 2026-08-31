@@ -10,12 +10,12 @@ import numpy as np
 
 from .contraction import merge_mps_sites
 from .decompose import svd_two_site
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def _site_dense_matrix(site, *, mode):
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
-        raise ValueError("_site_dense_matrix expects a rank-3 NonabelianTensor site tensor.")
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
+        raise ValueError("_site_dense_matrix expects a rank-3 IrrepTensor site tensor.")
     if mode not in {"left", "right"}:
         raise ValueError("mode must be 'left' or 'right'.")
 
@@ -46,8 +46,8 @@ def _irrep_dim(sector):
 
 
 def _site_full_dense_matrix(site, *, mode):
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
-        raise ValueError("_site_full_dense_matrix expects a rank-3 NonabelianTensor site tensor.")
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
+        raise ValueError("_site_full_dense_matrix expects a rank-3 IrrepTensor site tensor.")
     if mode not in {"left", "right"}:
         raise ValueError("mode must be 'left' or 'right'.")
 
@@ -148,8 +148,8 @@ def right_canonical_error(site):
     """
     Return the maximum isometry error for a right-canonical site tensor.
     """
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
-        raise ValueError("right_canonical_error expects a rank-3 NonabelianTensor site tensor.")
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
+        raise ValueError("right_canonical_error expects a rank-3 IrrepTensor site tensor.")
     grouped = {}
     for (q_left, _q_phys, q_right), block in site.data.items():
         arr = np.asarray(block)

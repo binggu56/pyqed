@@ -73,7 +73,6 @@ class SU2ReadinessResult:
 
     system: str
     basis: str
-    driver: str
     ncas: int
     nelecas: int
     spin: int
@@ -223,7 +222,6 @@ def run_case(
     system,
     *,
     basis="sto-3g",
-    driver="builtin",
     bond_dim=16,
     nsweeps=4,
     energy_tol=1.0e-7,
@@ -241,12 +239,8 @@ def run_case(
     if system not in PRESETS:
         raise ValueError(f"Unknown readiness preset {system!r}; choose one of {sorted(PRESETS)}.")
     case = PRESETS[system]
-    if str(driver).lower() not in {"builtin", "native"}:
-        raise ValueError("SU(2) readiness benchmarks require the compiled builtin C++ integral backend.")
     mol = Molecule(atom=case["atom"], unit=case["unit"], basis=basis, spin=case["spin"])
-    mol.build(
-        driver="builtin",
-        eri="dense",
+    mol.build(eri="dense",
         aosym="s1",
         options={"eri_backend": "cpp"},
     )
@@ -307,7 +301,6 @@ def run_case(
     result = SU2ReadinessResult(
         system=system,
         basis=basis,
-        driver=driver,
         ncas=int(case["ncas"]),
         nelecas=int(case["nelecas"]),
         spin=int(case["spin"]),
@@ -395,7 +388,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--system", choices=sorted(PRESETS), action="append")
     parser.add_argument("--basis", default="sto-3g")
-    parser.add_argument("--driver", choices=["builtin", "native"], default="builtin")
     parser.add_argument("--D", type=int, default=16)
     parser.add_argument("--nsweeps", type=int, default=4)
     parser.add_argument("--energy-tol", type=float, default=1.0e-7)
@@ -414,7 +406,6 @@ def main():
         run_case(
             system,
             basis=args.basis,
-            driver=args.driver,
             bond_dim=args.D,
             nsweeps=args.nsweeps,
             energy_tol=args.energy_tol,

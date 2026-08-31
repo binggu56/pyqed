@@ -43,8 +43,45 @@ from pyqed.lattice.site import (
     sites_compatible,
 )
 from pyqed.mps.umps import UniformMPS
+from pyqed.symmetry import IrrepTensor
 
 logger = logging.getLogger(__name__)
+
+
+def _as_shared_tensor(tensor, *, dirs, names):
+    """Return a finite-TN core using the canonical tensor data model."""
+    if isinstance(tensor, IrrepTensor):
+        return tensor
+    return IrrepTensor.from_dense_data(tensor, dirs=dirs, names=names)
+
+
+def _is_symmetry_reduced_tensor(tensor):
+    return isinstance(tensor, IrrepTensor) and not tensor.is_dense
+
+
+class _TensorCoreList(list):
+    """List that preserves the shared tensor invariant on replacement."""
+
+    def __init__(self, values, *, dirs, names):
+        self._dirs = tuple(dirs)
+        self._names = tuple(names)
+        super().__init__(self._coerce(value) for value in values)
+
+    def _coerce(self, value):
+        return _as_shared_tensor(value, dirs=self._dirs, names=self._names)
+
+    def __setitem__(self, key, value):
+        if isinstance(key, slice):
+            value = [self._coerce(item) for item in value]
+        else:
+            value = self._coerce(value)
+        super().__setitem__(key, value)
+
+    def append(self, value):
+        super().append(self._coerce(value))
+
+    def extend(self, values):
+        super().extend(self._coerce(value) for value in values)
 
 _NUMERIC_ALLOCATOR_RELIEF = None
 _NUMERIC_ALLOCATOR_RELIEF_INITIALIZED = False
@@ -27658,6 +27695,7 @@ class MPS:
         center=-1,
         gauge=None,
         sites=None,
+        target_sector=None,
     ):
         """Create a finite MPS.
 
@@ -27699,14 +27737,26 @@ class MPS:
         self.lv_idx = self.labels.index("lv")
         self.p_idx = self.labels.index("p")
         self.rv_idx = self.labels.index("rv")
-        self.center, self.gauge = self._resolved_gauge(center, gauge)
+        self.center, self.gauge = self._resolved_gauge(
+            -1 if center is None else center,
+            gauge,
+        )
+        self.target_sector = target_sector
 
-        self.factors = tensors
+        factor_dirs = tuple(
+            -1 if label == "lv" else 1
+            for label in self.labels
+        )
+        self.factors = _TensorCoreList(
+            tensors,
+            dirs=factor_dirs,
+            names=self.labels,
+        )
         self.homogeneous = bool(homogeneous)
-        stored_dims = [int(tensor.shape[self.p_idx]) for tensor in tensors]
+        stored_dims = [int(tensor.shape[self.p_idx]) for tensor in self.factors]
         block_sparse = all(
-            hasattr(tensor, "qns") and isinstance(getattr(tensor, "data", None), dict)
-            for tensor in tensors
+            _is_symmetry_reduced_tensor(tensor)
+            for tensor in self.factors
         )
         if sites is not None and block_sparse:
             supplied_sites = tuple(sites)
@@ -27790,7 +27840,7 @@ class MPS:
             rank = getattr(tensor, "rank", getattr(tensor, "ndim", None))
             if rank != 3:
                 raise ValueError(f"MPS site {i} must have rank 3; got rank {rank}.")
-            if not hasattr(tensor, "qns"):
+            if not _is_symmetry_reduced_tensor(tensor):
                 dense_shapes.append(tuple(int(n) for n in self._get_std_B(i).shape))
 
         if dense_shapes:
@@ -27859,6 +27909,7 @@ class MPS:
             homogeneous=self.homogeneous,
             center=self.center,
             sites=self.sites,
+            target_sector=self.target_sector,
         )
         copied.gauge = self.gauge
         return copied
@@ -27869,7 +27920,7 @@ class MPS:
 
     def norm_squared(self):
         """Return the squared Hilbert-space norm ``<psi|psi>``."""
-        if self.factors and hasattr(self.factors[0], "qns"):
+        if self.factors and _is_symmetry_reduced_tensor(self.factors[0]):
             identity = [make_identity_mpo_site_from_mps_site(site) for site in self.factors]
             env = initial_E(identity[0])
             for W, site in zip(identity, self.factors):
@@ -27902,7 +27953,7 @@ class MPS:
             raise ValueError("MPS sites are incompatible with the MPO output sites.")
         factors = (
             self.factors
-            if self.factors and hasattr(self.factors[0], "qns")
+            if self.factors and _is_symmetry_reduced_tensor(self.factors[0])
             else [self._get_std_B(site) for site in range(self.L)]
         )
         return _expect_factors(factors, operator.factors)
@@ -27960,7 +28011,7 @@ class MPS:
         B = self.factors[i]
         # Symmetry tensors retain their native (left, right, physical) layout;
         # their contraction kernels consume that representation directly.
-        if hasattr(B, "qns") and isinstance(B.data, dict):
+        if _is_symmetry_reduced_tensor(B):
             return B
         return B.transpose(self.lv_idx, self.p_idx, self.rv_idx)
 
@@ -28026,6 +28077,9 @@ class MPS:
         """Return site tensor ``i``."""
         return self.factors[i]
 
+    def __iter__(self):
+        return iter(self.factors)
+
     def __setitem__(self, i, value):
         """Replace site tensor ``i`` and invalidate canonical metadata."""
         new_dim = int(value.shape[self.p_idx])
@@ -28042,6 +28096,139 @@ class MPS:
     def __len__(self):
         """Return the number of sites."""
         return self.L
+
+    @property
+    def tensors(self):
+        """Canonical name for the owned rank-three tensor sequence."""
+        return self.factors
+
+    @tensors.setter
+    def tensors(self, tensors):
+        tensors = list(tensors)
+        if len(tensors) != self.L:
+            raise ValueError("replacement tensor sequence must preserve MPS length.")
+        self.factors[:] = tensors
+
+    @property
+    def has_nonabelian_symmetry(self):
+        return bool(self.factors) and any(
+            tensor.has_nonabelian_symmetry for tensor in self.factors
+        )
+
+    @classmethod
+    def from_tensors(cls, tensors, *, center=-1, target_sector=None, sites=None):
+        return cls(
+            tensors,
+            center=center,
+            target_sector=target_sector,
+            sites=sites,
+        )
+
+    def with_tensors(self, tensors, *, center=None):
+        return type(self)(
+            tensors,
+            center=self.center if center is None else center,
+            target_sector=self.target_sector,
+            sites=self.sites,
+        )
+
+    def canonicalize(
+        self,
+        center,
+        *,
+        cutoff=0.0,
+        max_bond=None,
+        max_bond_mode="states",
+        bond_coupling="left",
+    ):
+        """Put a dense or symmetry-reduced finite MPS in mixed gauge."""
+        center = int(center)
+        if not 0 <= center < self.L:
+            raise IndexError(f"Center {center} out of range for chain length {self.L}.")
+        if self.has_nonabelian_symmetry:
+            from .nonabelian.canonical import mixed_canonicalize_sites
+
+            self.factors[:] = mixed_canonicalize_sites(
+                self.factors,
+                center,
+                cutoff=cutoff,
+                max_bond=max_bond,
+                max_bond_mode=max_bond_mode,
+                bond_coupling=bond_coupling,
+            )
+            self.center = center
+            self.gauge = "mixed"
+            return self
+        if center == 0:
+            return self.right_canonicalize()
+        if center == self.L - 1:
+            return self.left_canonicalize()
+        raise NotImplementedError(
+            "interior mixed canonicalization is currently available for reduced tensors."
+        )
+
+    def canonical_errors(self, center=None):
+        center = self.center if center is None else int(center)
+        if self.has_nonabelian_symmetry:
+            from .nonabelian.canonical import mixed_canonical_errors
+
+            return mixed_canonical_errors(self.factors, center)
+        if center is None or center < 0:
+            raise ValueError("canonical_errors requires a canonical center.")
+        errors = []
+        for site, tensor in enumerate(self.factors):
+            dense = np.asarray(self._get_std_B(site))
+            if site < center:
+                matrix = dense.reshape(dense.shape[0] * dense.shape[1], dense.shape[2])
+                errors.append(float(np.linalg.norm(matrix.conj().T @ matrix - np.eye(matrix.shape[1]))))
+            elif site > center:
+                matrix = dense.reshape(dense.shape[0], dense.shape[1] * dense.shape[2])
+                errors.append(float(np.linalg.norm(matrix @ matrix.conj().T - np.eye(matrix.shape[0]))))
+        return tuple(errors)
+
+    def assert_canonical(self, center=None, *, tol=1e-10):
+        errors = self.canonical_errors(center=center)
+        if errors and max(errors) > float(tol):
+            raise ValueError(f"MPS canonical error {max(errors):.3e} exceeds {tol:.3e}.")
+        return self
+
+    def site_bases(self, site):
+        return tuple(self.factors[int(site)].legs)
+
+    def bond_basis(self, bond):
+        bond = int(bond)
+        if bond < 0 or bond + 1 >= self.L:
+            raise IndexError(f"Bond {bond} out of range for chain length {self.L}.")
+        right = self.site_bases(bond)[self.rv_idx]
+        left = self.site_bases(bond + 1)[self.lv_idx]
+        if not right.dual_compatible_with(left):
+            raise ValueError(f"MPS bond {bond} has incompatible shared Legs.")
+        return right
+
+    def merge_bond(self, bond):
+        if not self.has_nonabelian_symmetry:
+            bond = int(bond)
+            left = np.asarray(self._get_std_B(bond))
+            right = np.asarray(self._get_std_B(bond + 1))
+            merged = np.tensordot(left, right, axes=([2], [0]))
+            return IrrepTensor.from_dense_data(
+                merged,
+                dirs=(-1, 1, 1, 1),
+                names=("left", "physical-1", "physical-2", "right"),
+            )
+        from .nonabelian.contraction import merge_mps_sites
+
+        return merge_mps_sites(self.factors[int(bond)], self.factors[int(bond) + 1])
+
+    def local_two_site_basis(self, bond):
+        if not self.has_nonabelian_symmetry:
+            return self.merge_bond(bond).legs
+        from .nonabelian.basis import TwoSiteBasis
+        from .nonabelian.solver import pack_two_site_state
+
+        merged = self.merge_bond(bond)
+        _vector, layout = pack_two_site_state(merged)
+        return TwoSiteBasis.from_tensor_and_layout(merged, layout)
 
     def entanglement_entropy(self):
         """Return the (von-Neumann) entanglement entropy for a bipartition
@@ -28215,7 +28402,14 @@ class MPS:
             )
         return type(self)(factors, sites=richer_sites(self.sites, other.sites))
 
-    def left_canonicalize(self):
+    def left_canonicalize(
+        self,
+        *,
+        cutoff=0.0,
+        max_bond=None,
+        max_bond_mode="states",
+        bond_coupling="left",
+    ):
         """
         Sweeps from Left (0) to Right (L-1) to transform the MPS into Left-Canonical Form.
         Effect:
@@ -28223,6 +28417,19 @@ class MPS:
         - Populates self.singular_values with bond weights.
         - Moves orthogonality center to the last site (L-1).
         """
+        if self.has_nonabelian_symmetry:
+            from .nonabelian.canonical import left_canonicalize_sites
+
+            self.factors[:] = left_canonicalize_sites(
+                self.factors,
+                cutoff=cutoff,
+                max_bond=max_bond,
+                max_bond_mode=max_bond_mode,
+                bond_coupling=bond_coupling,
+            )
+            self.center = self.L - 1
+            self.gauge = "left_canonical"
+            return self
         if isinstance(self.factors[0], AbelianSiteTensorData):
             self.center = self.L - 1
             self.gauge = 'left_canonical'
@@ -28257,7 +28464,14 @@ class MPS:
         self.gauge = "left_canonical"
         return self
 
-    def right_canonicalize(self):
+    def right_canonicalize(
+        self,
+        *,
+        cutoff=0.0,
+        max_bond=None,
+        max_bond_mode="states",
+        bond_coupling="left",
+    ):
         """
         Sweeps from Right (L-1) to Left (0) to transform the MPS into Right-Canonical Form.
         Effect:
@@ -28265,6 +28479,19 @@ class MPS:
         - Populates self.singular_values with bond weights.
         - Moves orthogonality center to the first site (0).
         """
+        if self.has_nonabelian_symmetry:
+            from .nonabelian.canonical import right_canonicalize_sites
+
+            self.factors[:] = right_canonicalize_sites(
+                self.factors,
+                cutoff=cutoff,
+                max_bond=max_bond,
+                max_bond_mode=max_bond_mode,
+                bond_coupling=bond_coupling,
+            )
+            self.center = 0
+            self.gauge = "right_canonical"
+            return self
         if isinstance(self.factors[0], AbelianSiteTensorData):
             self.center = 0
             self.gauge = 'right_canonical'
@@ -28306,7 +28533,7 @@ class MPS:
         reconstruct the state as ``Gamma[0] Lambda[0] Gamma[1] ...``.  They are
         copies and do not replace the canonical tensors stored by this object.
         """
-        if self.factors and hasattr(self.factors[0], 'qns'):
+        if self.factors and _is_symmetry_reduced_tensor(self.factors[0]):
             raise NotImplementedError(
                 "Vidal conversion is currently defined only for dense MPS tensors."
             )
@@ -28375,7 +28602,7 @@ class MPS:
         if self.L == 0:
             return {}
 
-        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
+        if SYMMETRY_AVAILABLE and _is_symmetry_reduced_tensor(self.factors[0]):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
             return dense_self._calc_local_site_rdms(idx=idx)
@@ -28451,7 +28678,7 @@ class MPS:
         is d=2 (Empty, Occupied). The returned scalar corresponds to the bottom-right
         diagonal element of the theoretical 4x4 two-site reduced density matrix.
         """
-        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
+        if SYMMETRY_AVAILABLE and _is_symmetry_reduced_tensor(self.factors[0]):
             from pyqed.mps.mps import symmetric_to_dense
             dense_self = symmetric_to_dense(self)
             return dense_self.make_diagonal_rdm2(idx_pairs=idx_pairs)
@@ -28568,7 +28795,7 @@ class MPS:
         L = self.L
 
         # 1. Symmetric Branch
-        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
+        if SYMMETRY_AVAILABLE and _is_symmetry_reduced_tensor(self.factors[0]):
             if sym_mgr is None:
                 raise ValueError("[Error] Symmetric RDM requires sym_mgr.")
 
@@ -28694,7 +28921,7 @@ class MPS:
         L = self.L
         G = np.zeros((L, L, L, L), dtype=complex)
 
-        if SYMMETRY_AVAILABLE and hasattr(self.factors[0], 'qns'):
+        if SYMMETRY_AVAILABLE and _is_symmetry_reduced_tensor(self.factors[0]):
             if not sym_mgr:
                 warnings.warn("Symmetric 2-RDM requires sym_mgr.", stacklevel=2)
                 return G
@@ -29299,14 +29526,18 @@ class MPO:
                 "MPO tensors must use ('left', 'right', 'up', 'down') ordering."
             )
 
-        self.factors = factors
+        self.factors = _TensorCoreList(
+            factors,
+            dirs=(-1, 1, 1, -1),
+            names=self.STANDARD_LABELS,
+        )
         self.target_qn = target_qn
         self.labels = labels
         self.homogeneous = bool(homogeneous)
         self.nsites = self.L = len(factors)
         self.nbonds = self.L - 1
-        self.dims = [int(tensor.shape[2]) for tensor in factors]
-        self.input_dims = [int(tensor.shape[3]) for tensor in factors]
+        self.dims = [int(tensor.shape[2]) for tensor in self.factors]
+        self.input_dims = [int(tensor.shape[3]) for tensor in self.factors]
         self.sites = normalize_sites(sites, self.dims)
         if input_sites is None and sites is not None and self.input_dims == self.dims:
             input_sites = sites
@@ -30499,14 +30730,18 @@ def contract_from_right(W, A, F, B):
 
     #  Dense Branch ---
     if isinstance(A, MPS):
-        A_std = A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx)
+        A_std = np.asarray(A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx))
+    elif isinstance(A, IrrepTensor) and A.is_dense and A.ndim == 3:
+        A_std = np.asarray(A)
     elif isinstance(A, np.ndarray) and A.ndim == 3:
         A_std = A
     else:
         raise ValueError(f"Unknown type/shape for A: {type(A)}")
 
     if isinstance(B, MPS):
-        B_std = B.factors[0].transpose(B.lv_idx, B.p_idx, B.rv_idx)
+        B_std = np.asarray(B.factors[0].transpose(B.lv_idx, B.p_idx, B.rv_idx))
+    elif isinstance(B, IrrepTensor) and B.is_dense and B.ndim == 3:
+        B_std = np.asarray(B)
     else:
         B_std = B
 
@@ -30590,14 +30825,18 @@ def contract_from_left(W, A, E, B):
     #  Dense Branch ---
     # 1. Standardize Inputs to [Left, Phys, Right]
     if isinstance(A, MPS):
-        A_std = A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx)
+        A_std = np.asarray(A.factors[0].transpose(A.lv_idx, A.p_idx, A.rv_idx))
+    elif isinstance(A, IrrepTensor) and A.is_dense and A.ndim == 3:
+        A_std = np.asarray(A)
     elif isinstance(A, np.ndarray) and A.ndim == 3:
         A_std = A
     else:
         raise ValueError(f"Unknown type/shape for A: {type(A)}")
 
     if isinstance(B, MPS):
-        B_std = B.factors[0].transpose(B.lv_idx, B.p_idx, B.rv_idx)
+        B_std = np.asarray(B.factors[0].transpose(B.lv_idx, B.p_idx, B.rv_idx))
+    elif isinstance(B, IrrepTensor) and B.is_dense and B.ndim == 3:
+        B_std = np.asarray(B)
     elif isinstance(B, np.ndarray) and B.ndim == 3:
         B_std = B
     else:

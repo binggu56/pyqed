@@ -64,6 +64,136 @@ def _cpp_array_revision(*values):
     return int.from_bytes(digest.digest(), "little") or 1
 
 
+def mix_orbital_channel_blocks(object coefficients, object blocks):
+    """Apply one reduced orbital-channel matrix to a batch of dense blocks."""
+
+    cdef object source_array = np.ascontiguousarray(blocks, dtype=np.complex128)
+    if source_array.ndim < 2:
+        raise ValueError("Orbital channel source blocks must have at least two axes.")
+    cdef tuple output_shape = (np.shape(coefficients)[0],) + source_array.shape[1:]
+    cdef cnp.ndarray[cnp.complex128_t, ndim=2, mode="c"] coeff = (
+        np.ascontiguousarray(coefficients, dtype=np.complex128)
+    )
+    cdef cnp.ndarray[cnp.complex128_t, ndim=2, mode="c"] source = (
+        source_array.reshape((source_array.shape[0], -1))
+    )
+    if coeff.shape[1] != source.shape[0]:
+        raise ValueError(
+            "Orbital channel coefficients and source blocks have incompatible shapes."
+        )
+
+    cdef cnp.ndarray[cnp.complex128_t, ndim=2, mode="c"] result = np.zeros(
+        (coeff.shape[0], source.shape[1]),
+        dtype=np.complex128,
+    )
+    cdef Py_ssize_t output, source_index, element
+    cdef Py_ssize_t noutput = coeff.shape[0]
+    cdef Py_ssize_t nsource = coeff.shape[1]
+    cdef Py_ssize_t nelement = source.shape[1]
+    cdef cnp.complex128_t value
+
+    with nogil:
+        for output in range(noutput):
+            for element in range(nelement):
+                value = 0.0
+                for source_index in range(nsource):
+                    value += (
+                        coeff[output, source_index]
+                        * source[source_index, element]
+                    )
+                result[output, element] = value
+    return result.reshape(output_shape)
+
+
+def apply_orbital_channel_gate(
+    object fock_gate,
+    object channel_projection,
+    object blocks,
+    double tolerance,
+):
+    """Project and apply one two-orbital gate to reduced channel blocks."""
+
+    cdef cnp.ndarray[cnp.complex128_t, ndim=4, mode="c"] gate = (
+        np.ascontiguousarray(fock_gate, dtype=np.complex128)
+    )
+    cdef cnp.ndarray[cnp.float64_t, ndim=6, mode="c"] projection = (
+        np.ascontiguousarray(channel_projection, dtype=np.float64)
+    )
+    cdef object source_array = np.ascontiguousarray(blocks, dtype=np.complex128)
+    if source_array.ndim < 2:
+        raise ValueError("Orbital channel source blocks must have at least two axes.")
+    if (
+        gate.shape[0] != 4
+        or gate.shape[1] != 4
+        or gate.shape[2] != 4
+        or gate.shape[3] != 4
+        or projection.shape[2] != 4
+        or projection.shape[3] != 4
+        or projection.shape[4] != 4
+        or projection.shape[5] != 4
+        or source_array.shape[0] != projection.shape[1]
+    ):
+        raise ValueError("Orbital gate channel arrays have incompatible shapes.")
+
+    cdef tuple output_shape = (projection.shape[0],) + source_array.shape[1:]
+    cdef cnp.ndarray[cnp.complex128_t, ndim=2, mode="c"] source = (
+        source_array.reshape((source_array.shape[0], -1))
+    )
+    cdef cnp.ndarray[cnp.complex128_t, ndim=2, mode="c"] coefficients = np.zeros(
+        (projection.shape[0], projection.shape[1]),
+        dtype=np.complex128,
+    )
+    cdef cnp.ndarray[cnp.complex128_t, ndim=2, mode="c"] result = np.zeros(
+        (projection.shape[0], source.shape[1]),
+        dtype=np.complex128,
+    )
+    cdef Py_ssize_t output, source_index
+    cdef Py_ssize_t out_left, out_right, in_left, in_right, element
+    cdef Py_ssize_t noutput = projection.shape[0]
+    cdef Py_ssize_t nsource = projection.shape[1]
+    cdef Py_ssize_t nelement = source.shape[1]
+    cdef cnp.complex128_t value
+
+    with nogil:
+        for output in range(noutput):
+            for source_index in range(nsource):
+                value = 0.0
+                for out_left in range(4):
+                    for out_right in range(4):
+                        for in_left in range(4):
+                            for in_right in range(4):
+                                value += (
+                                    projection[
+                                        output,
+                                        source_index,
+                                        out_left,
+                                        out_right,
+                                        in_left,
+                                        in_right,
+                                    ]
+                                    * gate[
+                                        out_left,
+                                        out_right,
+                                        in_left,
+                                        in_right,
+                                    ]
+                                )
+                if abs(value) <= tolerance:
+                    value = 0.0
+                coefficients[output, source_index] = value
+
+        for output in range(noutput):
+            for element in range(nelement):
+                value = 0.0
+                for source_index in range(nsource):
+                    value += (
+                        coefficients[output, source_index]
+                        * source[source_index, element]
+                    )
+                result[output, element] = value
+    return result.reshape(output_shape), coefficients
+
+
 def pack_normal_complementary_boundary_routes(
     object parent_ket_sector_ids,
     object parent_entry_offsets,
@@ -612,6 +742,12 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
 
     cdef cppclass CppMovingEnvironment "pyqed::su2::MovingEnvironment":
         CppMovingEnvironment(const CppSystem* system) except +
+        void set_num_threads(int n_threads) except +
+        int num_threads() noexcept
+        cpp_bool openmp_available() noexcept
+        int openmp_version() noexcept
+        uint64_t openmp_parallel_regions() noexcept
+        uint64_t openmp_tasks() noexcept
         cpp_bool install_boundary(
             const string& side,
             int64_t bond,
@@ -1549,6 +1685,15 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         double dense_pair_matvec_seconds() noexcept
         double raw_execution_matvec_seconds() noexcept
         double raw_execution_pack_seconds() noexcept
+        double raw_batch_expand_seconds() noexcept
+        double raw_batch_right_prepare_seconds() noexcept
+        double raw_batch_fallback_prepare_seconds() noexcept
+        double raw_channel_first_stage_seconds() noexcept
+        double raw_wave_batch_seconds() noexcept
+        double raw_shared_left_output_seconds() noexcept
+        double raw_grouped_output_seconds() noexcept
+        double raw_binding_output_seconds() noexcept
+        double raw_fusion_finalize_seconds() noexcept
         double raw_pointer_execution_matvec_seconds() noexcept
         uint64_t raw_pointer_execution_matvec_calls() noexcept
         double direct_complementary_action_seconds() noexcept
@@ -1586,6 +1731,9 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         size_t fused_raw_route_count() noexcept
         size_t dense_pair_kernel_count() noexcept
         size_t dense_pair_execution_count() noexcept
+        size_t dense_pair_wave_count() noexcept
+        size_t dense_pair_max_wave_width() noexcept
+        size_t dense_pair_thread_workspace_bytes() noexcept
         size_t dense_pair_kernel_elements() noexcept
         size_t dense_pair_route_count() noexcept
         size_t dense_factor_pack_bytes() noexcept
@@ -1611,6 +1759,14 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         size_t peak_raw_output_fusion_workspace_bytes() noexcept
         uint64_t raw_output_fusion_gemm_calls() noexcept
         uint64_t raw_output_fusion_copied_elements() noexcept
+        size_t peak_persistent_output_batch_count() noexcept
+        size_t peak_persistent_output_task_count() noexcept
+        size_t peak_persistent_output_group_count() noexcept
+        uint64_t private_output_executor_calls() noexcept
+        uint64_t private_output_executor_fallbacks() noexcept
+        size_t peak_private_output_task_count() noexcept
+        size_t peak_private_output_workspace_bytes() noexcept
+        uint64_t private_output_reduced_elements() noexcept
         cpp_bool grouped_output_product_backend() noexcept
         size_t grouped_output_product_group_count() noexcept
         size_t grouped_output_product_binding_count() noexcept
@@ -1901,6 +2057,31 @@ cdef class SU2MovingEnvironment:
                 self._system.normal_complementary_primitive_bytes()
             ),
             "memory_bytes": int(self._system.memory_bytes()),
+        }
+
+    def set_num_threads(self, n_threads):
+        """Set native threads for reduced-space SU(2) contractions."""
+        if isinstance(n_threads, (bool, np.bool_)):
+            raise TypeError("n_threads must be a positive integer")
+        try:
+            n_threads = int(n_threads.__index__())
+        except AttributeError:
+            raise TypeError("n_threads must be a positive integer") from None
+        if n_threads < 1:
+            raise ValueError("n_threads must be a positive integer")
+        self._engine.set_num_threads(<int>n_threads)
+        return self
+
+    @property
+    def threading_info(self):
+        """Describe native OpenMP support and work executed so far."""
+        return {
+            "backend": "openmp" if self._engine.openmp_available() else "serial",
+            "available": bool(self._engine.openmp_available()),
+            "n_threads": int(self._engine.num_threads()),
+            "openmp_version": int(self._engine.openmp_version()),
+            "parallel_regions": int(self._engine.openmp_parallel_regions()),
+            "tasks": int(self._engine.openmp_tasks()),
         }
 
     def update_h1(self, object h1):
@@ -6541,6 +6722,7 @@ cdef class SU2MovingEnvironment:
         return {
             "kind": "su2_moving_environment",
             "backend": "cpp",
+            "threading": self.threading_info,
             "system_revision": int(self._engine.system_revision()),
             "boundary_count": int(self._engine.boundary_count()),
             "borrowed_boundary_bytes": int(
@@ -6684,6 +6866,33 @@ cdef class SU2MovingEnvironment:
             ),
             "raw_execution_pack_seconds": float(
                 self._engine.raw_execution_pack_seconds()
+            ),
+            "raw_batch_expand_seconds": float(
+                self._engine.raw_batch_expand_seconds()
+            ),
+            "raw_batch_right_prepare_seconds": float(
+                self._engine.raw_batch_right_prepare_seconds()
+            ),
+            "raw_batch_fallback_prepare_seconds": float(
+                self._engine.raw_batch_fallback_prepare_seconds()
+            ),
+            "raw_channel_first_stage_seconds": float(
+                self._engine.raw_channel_first_stage_seconds()
+            ),
+            "raw_wave_batch_seconds": float(
+                self._engine.raw_wave_batch_seconds()
+            ),
+            "raw_shared_left_output_seconds": float(
+                self._engine.raw_shared_left_output_seconds()
+            ),
+            "raw_grouped_output_seconds": float(
+                self._engine.raw_grouped_output_seconds()
+            ),
+            "raw_binding_output_seconds": float(
+                self._engine.raw_binding_output_seconds()
+            ),
+            "raw_fusion_finalize_seconds": float(
+                self._engine.raw_fusion_finalize_seconds()
             ),
             "raw_pointer_execution_matvec_seconds": float(
                 self._engine.raw_pointer_execution_matvec_seconds()
@@ -6890,6 +7099,16 @@ cdef class SU2MovingEnvironment:
             "dense_pair_execution_count": int(
                 self._engine.dense_pair_execution_count()
             ),
+            "dense_pair_scheduler": "dependency_waves",
+            "dense_pair_wave_count": int(
+                self._engine.dense_pair_wave_count()
+            ),
+            "dense_pair_max_wave_width": int(
+                self._engine.dense_pair_max_wave_width()
+            ),
+            "dense_pair_thread_workspace_bytes": int(
+                self._engine.dense_pair_thread_workspace_bytes()
+            ),
             "dense_pair_kernel_elements": int(
                 self._engine.dense_pair_kernel_elements()
             ),
@@ -6975,6 +7194,30 @@ cdef class SU2MovingEnvironment:
             ),
             "raw_output_fusion_copied_elements": int(
                 self._engine.raw_output_fusion_copied_elements()
+            ),
+            "peak_persistent_output_batch_count": int(
+                self._engine.peak_persistent_output_batch_count()
+            ),
+            "peak_persistent_output_task_count": int(
+                self._engine.peak_persistent_output_task_count()
+            ),
+            "peak_persistent_output_group_count": int(
+                self._engine.peak_persistent_output_group_count()
+            ),
+            "private_output_executor_calls": int(
+                self._engine.private_output_executor_calls()
+            ),
+            "private_output_executor_fallbacks": int(
+                self._engine.private_output_executor_fallbacks()
+            ),
+            "peak_private_output_task_count": int(
+                self._engine.peak_private_output_task_count()
+            ),
+            "peak_private_output_workspace_bytes": int(
+                self._engine.peak_private_output_workspace_bytes()
+            ),
+            "private_output_reduced_elements": int(
+                self._engine.private_output_reduced_elements()
             ),
             "grouped_output_product_backend": bool(
                 self._engine.grouped_output_product_backend()

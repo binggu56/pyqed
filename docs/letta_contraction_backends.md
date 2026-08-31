@@ -20,7 +20,143 @@ obtained changes.
 `frontier_backend="compressed"` contracts a finite-state Hamiltonian MPO with
 dense frontier messages.  `frontier_backend="identity_block"` keeps inactive
 MPO channels in separate blocks and can reduce memory for sparse local-term
-Hamiltonians.
+Hamiltonians. `frontier_backend="termwise"` is also exact, but partitions the
+Hamiltonian into bounded chunks of product strings. Each chunk is compiled as
+a shared-prefix identity-block MPO and scalar contractions stream chunks one at
+a time. This reuses common identity/prefix contractions without constructing
+the full Hamiltonian frontier. Long analytical Jordan--Wigner strings remain
+products and are never materialized as exponentially large dense support
+operators. Diagonal string factors share their bra/ket frontier value.
+
+```python
+state = FrontierLETTA(
+    H,
+    graph=edges,
+    target_charge={"N": 32, "Sz": 0},
+    D=16,
+    frontier_backend="termwise",
+    chunk_size=8,
+    chunk_memory=64,  # MiB; oversized chunks split automatically
+    chunk_span=12,    # optional maximum active site interval
+    workers=4,        # independent chunks; memory grows with this value
+)
+energy = state.expectation()  # exact, term-streamed
+state.run(
+    nsweeps=2,
+    solver="matrix_free",
+    environment_cache="recompute",  # minimum memory; checkpointed is faster
+)
+```
+
+Product components are ordered by their active site interval. Scalar
+contractions precompute the identity left/right frontiers once and splice each
+Hamiltonian chunk into only its active interval. For an off-diagonal operator
+on a tied physical variable, the interval is expanded automatically to that
+variable's earliest tensor reference, which is required for exactness.
+
+`chunk_size`, `chunk_memory`, and `chunk_span` are the exact speed/memory
+controls. Larger
+chunks reuse more work but can have larger streamed messages. The defaults use
+at most eight components and a conservative 64 MiB complex128 message budget;
+oversized chunks are bisected recursively. `chunk_size=1` has the lowest scalar
+memory. `chunk_span` can prevent unrelated spatial terms from forming a long
+active window. Independent chunks can be evaluated concurrently with
+`workers`; a conservative temporary-memory budget is approximately
+`workers * chunk_memory`. During a
+sweep, environments retain one identity-aware block per chunk; shared prefixes
+can make this smaller than storing every term independently.
+`hamiltonian_chunks` reports the realized component counts after memory-budget
+splitting, `hamiltonian_windows` reports their half-open active site intervals,
+and `stream_peak_frontier_elements` reports the scalar-contraction message peak.
+`environment_cache="recompute"` keeps no all-cut or checkpoint cache and
+rebuilds the fixed side for every local update; it is the lowest-memory and
+slowest exact sweep. `"checkpointed"` trades additional storage for fewer
+repeated contractions.
+
+Adaptive bonds combine conservative Gram-qualified pre-sweep growth with
+AMEn/DMRG3S-style residual enrichment:
+
+```python
+state = FrontierLETTA(
+    H,
+    graph=edges,
+    target_charge={"Sz": 0},
+    D=64,                  # expansion cap
+    adaptive_bond=True,    # starts narrow
+    frontier_backend="identity_block",
+)
+state.run(
+    nsweeps=8,
+    solver="matrix_free",
+    enrich="amen",
+    enrich_rank=8,
+    enrich_tol=1.0e-7,
+    enrich_every=8,
+)
+```
+
+After optimizing site $i$, the right-going pass forms the open partial action
+$L_i W_i A_i$; the reverse pass forms $A_i W_i R_i$. The outgoing MPO,
+virtual, and unresolved tied-frontier indices remain open. Their range is
+split by every physical-label assignment shared across the active cut. Each
+block is projected off its own occupied virtual space and compressed by an
+independent running SVD, so Hamiltonian components are consumed one at a time
+without averaging incompatible tie conditions. The $k$-th direction from each
+condition is packed into one temporary virtual channel; the same nominal
+channel can therefore represent a different vector in every tied-label block.
+With no shared labels this reduces to ordinary MPS AMEn. Before each sweep,
+full-support bonds below their cap are enlarged conservatively so every local
+solve in that pass sees the larger space; this removes the one-pass lag of a
+purely in-sweep growth schedule. Any remaining below-cap residual expansion is
+QR-factorized and its center is absorbed into the neighboring tensor while
+preserving the represented state to roundoff. At a saturated bond, the local
+basis is temporarily augmented by up
+to `enrich_rank` residual directions. The temporary $D+r$ bond is retained
+through the neighboring one-site solve and is conditionally SVD-truncated from
+that optimized side only afterward, independently for every shared-label
+assignment. This ordering is essential: immediately truncating an
+orthogonal residual range would simply discard it whenever its mixing scale is
+below the occupied singular values. U(1) states perform the retraction
+independently in each compatible charge sector and restore the original sector
+multiplicities. Each refresh records `subspace_change`, the Frobenius distance
+between the occupied bond projectors before expansion and after retraction;
+roundoff-level no-op refreshes are marked unaccepted. A local Rayleigh-quotient
+guard rejects a harmful truncation, restores the capped pair, and repeats the
+neighboring one-site solve in the original space, so a failed enrichment does
+not roll back the rest of the sweep.
+
+The component residuals retain their physical norms: the running SVD therefore
+approximates $\sum_c R_c R_c^\dagger$, rather than giving every Hamiltonian
+component equal weight. This makes enrichment insensitive to an exact backend's
+choice of component partition, up to the requested low-rank approximation.
+
+For a permanently enlarged below-cap bond, the QR transfer is immediately
+reconditioned with the moving frontier norm.
+For the following Davidson solve, ``solver="matrix_free"`` stores only the
+small norm blocks at fixed tied-physical configurations and whitens them to an
+exact conditional $S=I$ frame; the Hamiltonian remains an action and is never
+materialized. The existing ``block_sparse_max_elements`` cap also limits this
+norm-block storage, falling back to a fully action-only generalized solve when
+the conditional frame would be too large. U(1) masks are applied before the
+blocks are whitened.
+
+Exactly null virtual directions are still removed, but their cut is suppressed
+from enrichment for only the current directional pass. The reverse pass sees a
+new residual and can reopen that cut, avoiding permanent loss of a useful
+channel.
+
+`enrich_rank` caps the directions added at one cut and `enrich_tol` removes
+small singular directions relative to the leading one. `enrich_scale` controls
+the relative weight of the open residual range during the QR and its optimized
+new-channel contribution before the capped retraction (default $10^{-3}$).
+`enrich_every` controls how often saturated bonds are considered for refresh
+(default every eight directional sweeps). By default, refresh is applied only
+when the preceding relative sweep gain is at most `enrich_trigger=1e-4`, so
+ordinary descent is not perturbed while it is still productive. Set
+`enrich_trigger=None` for unconditional periodic refreshes. Bonds below their
+cap can still grow on every sweep. Enrichment currently requires an exact `compressed`,
+`identity_block`, or `termwise` frontier; it is intentionally disabled for
+rank-truncated boundary-TT contractions.
 
 At cut $k$, a message retains only virtual, MPO, and tied physical variables
 that are needed by tensors on both sides.  If $w_k$ tied variables cross the
@@ -59,6 +195,17 @@ noncommuting virtual matrix product generally defines a different variational
 parameterization.  The Hamiltonian and tie graph must be remapped consistently,
 and an MPS warm start must be prepared in that same order.
 
+Edges between consecutive ordered sites can optionally be omitted from the tie
+graph because the virtual backbone already crosses those cuts:
+
+```python
+state = FrontierLETTA(H, graph=edges, D=16, tie_backbone=False)
+```
+
+This often reduces frontier width substantially on a snake-ordered lattice, but
+it changes the variational ansatz and is therefore not an exact contraction
+optimization. Compare converged energies before adopting it.
+
 ## 2. Boundary-MPS / tensor-train frontiers
 
 A dense frontier $F(x_1,\ldots,x_m)$ can instead be stored as
@@ -83,18 +230,18 @@ variables incident on that tensor; this is acceptable for bounded-degree tie
 graphs but not for a tensor tied to an extensive number of sites.
 
 ```python
-state = FrontierTiedLETTA(
-    hamiltonian,
-    dims,
-    parent_sets,
-    bond_dim=4,
-    tensors=initial_tensors,
-    frontier_backend="tensor_train",   # aliases: "tt", "boundary_mps"
-    tt_max_rank=32,
-    tt_transfer_max_rank=16,
-    tt_rtol=1.0e-9,
+state = FrontierLETTA(
+    H,
+    graph=edges,
+    target_charge={"N": 32, "Sz": 0},
+    D=16,
+    frontier_backend="protected",      # aliases: "tensor_train", "tt"
+    max_rank=32,
+    rtol=1.0e-9,
     tt_norm_backend="exact",           # stable default
     tt_hermitize=True,
+    tt_gauge=True,                     # condition tensors before TT rounding
+    tt_channels="component",          # protected shared component traversal
 )
 
 energy = state.expectation()
@@ -111,7 +258,9 @@ When that norm is truncated, it is restricted to scalar diagnostics: its local
 metric need not be Hermitian or positive, so deterministic variational sweeps
 reject the configuration instead of passing it to a generalized eigensolver.
 
-With `tt_max_rank=None`, `tt_transfer_max_rank=None`, and all TT tolerances
+`frontier_backend="protected"` is an alias for this configuration: Hamiltonian
+product channels are kept separate, while only their boundary TT messages may
+be rounded. With `max_rank=None`, `transfer_max_rank=None`, and all tolerances
 zero, this backend performs no truncation and `contraction_is_exact` is true.
 Finite rank caps or nonzero tolerances make the Hamiltonian contraction
 approximate.  `norm_contraction_is_exact` and
@@ -119,6 +268,15 @@ approximate.  `norm_contraction_is_exact` and
 convergence must therefore be checked.  `peak_frontier_elements` remains the
 dense-equivalent reference size, while `peak_compressed_frontier_elements`
 reports the larger of exact-norm storage and observed Hamiltonian-TT storage.
+
+Truncated boundary messages are gauge sensitive. `tt_gauge=True` applies the
+exact conditional frontier gauge before the first TT contraction and should be
+used for optimized tied states. In scalar contractions, protected operator
+components reuse their common identity prefix and merge after the local term
+closes, avoiding a full lattice traversal for every component while retaining
+separate ranks across the operator support. `tt_channels="term"` instead fuses each term into one
+small MPO channel block; it can reduce low-rank storage but may require a
+larger boundary rank because the channel is compressed jointly.
 
 The TT backend supports scalar contractions and matrix-free local hole actions.
 With the default exact norm, frontier-Gram canonicalization and dense local
@@ -180,7 +338,7 @@ included when estimating peak working memory.
 ## 3. Variational Monte Carlo and stochastic reconfiguration
 
 For a fixed configuration, every tied tensor selects one virtual matrix, so
-$\psi(\mathbf{s})$ is just a matrix product.  `LETTAVMC` uses that fact to avoid
+$\psi(\mathbf{s})$ is just a matrix product.  `VMC` uses that fact to avoid
 frontier contraction altogether.  Metropolis samples are drawn from
 $|\psi(\mathbf{s})|^2$, and the energy is estimated from
 
@@ -200,32 +358,37 @@ $$
 by conjugate gradients without forming the parameter-by-parameter matrix $S$.
 
 ```python
-from pyqed.letta import LETTAVMC
+from pyqed.letta import VMC
 
-vmc = LETTAVMC(
+vmc = VMC(
     state,
-    hamiltonian,
     seed=7,
-    proposal="mixed",
-    exchange_probability=0.9,
+    proposal="heat_bath",
 )
 samples = vmc.sample(
     4096,
     burn_in=100,
-    sweeps_between=2,
-    include_log_derivatives=True,
+    sweeps_between=1,
 )
 estimate = vmc.estimate_from_samples(samples)
 proposal = vmc.propose_sr(
     samples,
     step_size=0.04,
     diagonal_shift=1.0e-2,
+    derivative_backend="sparse",
 )
 vmc.apply_sr(proposal, sync_to_state=True)
 ```
 
+Bare tensors use the same undirected tie graph as `FrontierLETTA`; VMC derives
+the oriented tensor dependencies internally:
+
+```python
+vmc = VMC.from_tensors(tensors, hamiltonian, graph=graph)
+```
+
 By default VMC owns a private tensor copy.  `sync_to_state=True` explicitly
-copies an accepted update back to the source `FrontierTiedLETTA`; alternatively,
+copies an accepted update back to the source `FrontierLETTA`; alternatively,
 call `vmc.sync_to_state(target_state)`.  Synchronization invalidates the target's
 stored energy, convergence flag, and deterministic-sweep history.
 
@@ -234,12 +397,13 @@ introduces sampling error and autocorrelation.  Energy estimates report both a
 naive real-energy error and an autocorrelation-corrected error using Geyer's
 initial positive sequence.  `variance` retains the usual complex local-energy
 variance, while `real_variance` is used for both reported standard errors.  The
-current SR implementation stores the rectangular
-sample-by-parameter log-derivative array.  `proposal="exchange"` preserves a
-fixed physical-label histogram, while `proposal="mixed"` combines exchange and
-single-site moves so sector mixing remains possible.  The proposal-specific
-acceptance rates must be checked; cluster moves may still be needed for sharply
-peaked states.
+default SR backend stores only the active derivative entries in a sparse
+sample-by-parameter operator.  `proposal="heat_bath"` samples conditional
+exchanges on Hamiltonian-supported site pairs, while `proposal="exchange"`
+preserves a fixed physical-label histogram using unrestricted pairs.
+`proposal="mixed"` combines exchange and single-site moves so sector mixing
+remains possible.  Proposal-specific acceptance rates must be checked; cluster
+moves may still be needed for sharply peaked states.
 
 With 256 samples, 50 burn-in sweeps, and two sweeps between samples, the checked
 single-chain estimates are:
@@ -266,7 +430,7 @@ cannot diagnose a sector that the chain rarely enters.
 | Small or narrow frontier | Exact `compressed` | Compare `identity_block` timing and memory |
 | Sparse MPO channels | Exact `identity_block` | Confirm the block backend is faster, not only smaller |
 | Moderate frontier with demonstrably compressible messages | Experimental `tensor_train` | Converge boundary and transfer ranks independently |
-| Frontier too wide for deterministic contraction | `LETTAVMC` | Sample convergence, autocorrelation, and move ergodicity |
+| Frontier too wide for deterministic contraction | `VMC` | Sample convergence, autocorrelation, and move ergodicity |
 | New graph or ordering | Exact structural ordering score first | Permute every object consistently |
 
 A practical optimization sequence is: warm-start tensors from an MPS, choose a

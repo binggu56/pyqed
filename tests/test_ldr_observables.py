@@ -55,6 +55,135 @@ def test_separable_hamiltonian_polynomial_reconstructs_quartic_field():
     )
 
 
+def test_quintic_hermite_reconstructs_matrix_polynomial():
+    from pyqed.ldr import SeparableHamiltonian
+
+    coordinates = np.linspace(-1.0, 1.0, 17)
+    anchors = np.array([-1.0, 0.0, 1.0])
+    identity = np.eye(2)
+    sigma_x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    sigma_z = np.diag([1.0, -1.0])
+
+    def hamiltonian(q):
+        return (
+            (0.2 + 0.1 * q**2 - 0.03 * q**5) * identity
+            + (0.4 * q - 0.07 * q**3) * sigma_x
+            + 0.05 * q**4 * sigma_z
+        )
+
+    def gradient(q):
+        return (
+            (0.2 * q - 0.15 * q**4) * identity
+            + (0.4 - 0.21 * q**2) * sigma_x
+            + 0.2 * q**3 * sigma_z
+        )
+
+    def hessian(q):
+        return (
+            (0.2 - 0.6 * q**3) * identity
+            - 0.42 * q * sigma_x
+            + 0.6 * q**2 * sigma_z
+        )
+
+    separable = SeparableHamiltonian.quintic_hermite(
+        coordinates,
+        anchors,
+        np.asarray([hamiltonian(q) for q in anchors]),
+        np.asarray([gradient(q) for q in anchors]),
+        np.asarray([hessian(q) for q in anchors]),
+    )
+
+    expected = np.asarray([hamiltonian(q) for q in coordinates])
+    np.testing.assert_allclose(separable.evaluate(), expected, atol=1.0e-13)
+    assert separable.operators.shape == (9, 2, 2)
+
+    extended = np.array([-1.2, -1.0, 0.3, 1.0, 1.2])
+    continued = SeparableHamiltonian.quintic_hermite(
+        extended,
+        anchors,
+        np.asarray([hamiltonian(q) for q in anchors]),
+        np.asarray([gradient(q) for q in anchors]),
+        np.asarray([hessian(q) for q in anchors]),
+        extrapolation="quadratic",
+    ).evaluate()
+    for index, anchor in ((0, anchors[0]), (-1, anchors[-1])):
+        delta = extended[index] - anchor
+        expected_edge = (
+            hamiltonian(anchor)
+            + delta * gradient(anchor)
+            + 0.5 * delta**2 * hessian(anchor)
+        )
+        np.testing.assert_allclose(
+            continued[index],
+            expected_edge,
+            atol=1.0e-13,
+        )
+
+
+def test_axial_quintic_hermite_reconstructs_two_mode_field():
+    from pyqed.ldr import SeparableHamiltonian
+
+    q1 = np.linspace(-0.8, 0.8, 9)
+    q2 = np.linspace(-0.6, 0.6, 7)
+    anchors1 = np.array([-0.8, 0.0, 0.8])
+    anchors2 = np.array([-0.6, 0.0, 0.6])
+    identity = np.eye(2)
+    sigma_x = np.array([[0.0, 1.0], [1.0, 0.0]])
+    sigma_z = np.diag([1.0, -1.0])
+    center = 0.2 * identity
+
+    def mode1(q):
+        return (0.3 * q - 0.07 * q**3 + 0.02 * q**5) * sigma_x
+
+    def mode1_gradient(q):
+        return (0.3 - 0.21 * q**2 + 0.1 * q**4) * sigma_x
+
+    def mode1_hessian(q):
+        return (-0.42 * q + 0.4 * q**3) * sigma_x
+
+    def mode2(q):
+        return (0.1 * q**2 + 0.03 * q**4) * sigma_z
+
+    def mode2_gradient(q):
+        return (0.2 * q + 0.12 * q**3) * sigma_z
+
+    def mode2_hessian(q):
+        return (0.2 + 0.36 * q**2) * sigma_z
+
+    mixed = np.zeros((2, 2, 2, 2))
+    mixed[0, 1] = mixed[1, 0] = 0.04 * identity
+    separable = SeparableHamiltonian.axial_quintic_hermite(
+        (q1, q2),
+        (anchors1, anchors2),
+        (
+            np.asarray([center + mode1(q) for q in anchors1]),
+            np.asarray([center + mode2(q) for q in anchors2]),
+        ),
+        (
+            np.asarray([mode1_gradient(q) for q in anchors1]),
+            np.asarray([mode2_gradient(q) for q in anchors2]),
+        ),
+        (
+            np.asarray([mode1_hessian(q) for q in anchors1]),
+            np.asarray([mode2_hessian(q) for q in anchors2]),
+        ),
+        center_hamiltonian=center,
+        mixed_hessians=mixed,
+    )
+
+    expected = np.empty((q1.size, q2.size, 2, 2))
+    for i, first in enumerate(q1):
+        for j, second in enumerate(q2):
+            expected[i, j] = (
+                center
+                + mode1(first)
+                + mode2(second)
+                + 0.04 * first * second * identity
+            )
+    np.testing.assert_allclose(separable.evaluate(), expected, atol=1.0e-13)
+    assert separable.operators.shape == (20, 2, 2)
+
+
 def test_cgldr_coordinate_expectations_from_recorded_mps_states():
     from pyqed.ldr import CGLDR
     from pyqed.mps.mps import MPS

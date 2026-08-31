@@ -35,7 +35,7 @@ def _atom_with_coords(coords):
 
 def build_pyqed_rks(*, basis, xc, n_radial, n_angular, conv_tol):
     mol = Molecule(atom=list(ATOM), unit="bohr", basis=basis)
-    mol.build(driver="gbasis")
+    mol.build()
     grid = AOGrid.atom_centered(
         mol,
         n_radial=n_radial,

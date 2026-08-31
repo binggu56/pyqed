@@ -7,7 +7,7 @@ from pyqed.qchem.mcscf.direct_ci import CASCI
 
 def _h2_casci(nstates=4):
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
     return CASCI(mf, ncas=2, nelecas=2, verbose=0).run(
         nstates=nstates,

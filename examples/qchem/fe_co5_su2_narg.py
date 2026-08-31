@@ -7,6 +7,7 @@ import argparse
 
 import numpy as np
 
+from pyqed.units import au2ev
 from pyqed.narg.qchem import NARG
 from pyqed.qchem import Molecule
 
@@ -34,7 +35,7 @@ def main():
     args = parser.parse_args()
 
     mol = Molecule(atom=ATOM, unit="angstrom", basis=args.basis)
-    mol.build(driver="pyscf")
+    mol.build()
     mf = mol.RHF().run()
 
     solver = NARG(
@@ -47,7 +48,7 @@ def main():
         target_j2=0,
     ).run()
     energies = np.asarray(solver.e_tot, dtype=float)
-    excitations = (energies - energies[0]) * 27.211386245988
+    excitations = (energies - energies[0]) * au2ev
 
     print(f"HF = {float(mf.e_tot):.12f} Eh")
     print("state  total energy (Eh)  excitation (eV)")

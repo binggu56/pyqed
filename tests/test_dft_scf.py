@@ -56,7 +56,7 @@ def test_topyscf_preserves_geometry_for_angstrom_input():
 
 def test_rks_builds_default_atom_centered_grid():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin')
+    mol.build()
 
     mf = RKS(mol, xc='lda')
     mf.max_cycle = 80
@@ -68,8 +68,8 @@ def test_rks_builds_default_atom_centered_grid():
     assert mf.converged
 
 
-def test_native_aogrid_matches_gbasis_for_values_gradients_and_hessians():
-    pytest.importorskip('gbasis')
+def test_native_aogrid_matches_pyscf_for_values_gradients_and_hessians():
+    pyscf_numint = pytest.importorskip('pyscf.dft.numint')
 
     atom = 'O 0 0 0; H 0 1.4 0; H 0 -1.4 0'
     coords = np.array(
@@ -84,7 +84,7 @@ def test_native_aogrid_matches_gbasis_for_values_gradients_and_hessians():
     weights = np.ones(coords.shape[0])
 
     native_mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    native_mol.build(driver='builtin')
+    native_mol.build()
     native_grid = AOGrid.from_molecule(
         native_mol,
         coords,
@@ -93,25 +93,24 @@ def test_native_aogrid_matches_gbasis_for_values_gradients_and_hessians():
         with_hess=True,
     )
 
-    gbasis_mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    gbasis_mol.build(driver='gbasis')
-    gbasis_grid = AOGrid.from_molecule(
-        gbasis_mol,
-        coords,
-        weights,
-        with_grad=True,
-        with_hess=True,
-    )
+    pyscf_mol = native_mol.topyscf().build()
+    values = pyscf_numint.eval_ao(pyscf_mol, coords, deriv=2)
+    pyscf_hess = np.empty_like(native_grid.ao_hess)
+    for component, (i, j) in enumerate(
+        ((0, 0), (0, 1), (0, 2), (1, 1), (1, 2), (2, 2)), start=4
+    ):
+        pyscf_hess[i, j] = values[component]
+        pyscf_hess[j, i] = values[component]
 
-    np.testing.assert_allclose(native_grid.ao, gbasis_grid.ao, atol=1e-12)
-    np.testing.assert_allclose(native_grid.ao_grad, gbasis_grid.ao_grad, atol=1e-12)
-    np.testing.assert_allclose(native_grid.ao_hess, gbasis_grid.ao_hess, atol=1e-11)
+    np.testing.assert_allclose(native_grid.ao, values[0], rtol=2e-6, atol=1e-10)
+    np.testing.assert_allclose(native_grid.ao_grad, values[1:4], rtol=2e-6, atol=1e-10)
+    np.testing.assert_allclose(native_grid.ao_hess, pyscf_hess, rtol=2e-6, atol=1e-10)
 
 
 @pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')
 def test_rks_pbe_smoke():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='pbe')
     mf.max_cycle = 80
@@ -127,7 +126,7 @@ def test_rks_pbe_smoke():
 @pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')
 def test_rks_b3lyp_smoke():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='b3lyp')
     mf.max_cycle = 80
@@ -144,7 +143,7 @@ def test_rks_b3lyp_smoke():
 @pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')
 def test_rks_b3lyp_rebuilds_default_grid_when_custom_grid_lacks_coords():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     bare_grid = AOGrid(ao=np.eye(mol.nao), weights=np.ones(mol.nao))
     mf = RKS(mol, grid=bare_grid, xc='b3lyp')
@@ -157,7 +156,7 @@ def test_rks_b3lyp_rebuilds_default_grid_when_custom_grid_lacks_coords():
 @pytest.mark.skipif(not has_libxc_backend(), reason='libxc backend is unavailable')
 def test_run_rks_b3lyp_rebuilds_default_grid_when_custom_grid_lacks_coords():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     bare_grid = AOGrid(ao=np.eye(mol.nao), weights=np.ones(mol.nao))
     out = run_rks(mol, bare_grid, xc='b3lyp', max_cycle=40, conv_tol=1e-8)
@@ -170,7 +169,7 @@ def test_run_rks_b3lyp_rebuilds_default_grid_when_custom_grid_lacks_coords():
 
 def test_rks_geometry_optimization_lowers_h2_energy():
     mol = Molecule(atom='H 0 0 -1.1; H 0 0 1.1', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     grid = AOGrid.atom_centered(mol, n_radial=8, n_angular=14, with_grad=False)
     mf = RKS(mol, grid=grid, xc='svwn')
@@ -197,7 +196,7 @@ def test_rks_geometry_optimization_lowers_h2_energy():
 
 def test_rks_hessian_runs_and_exposes_frequencies():
     mol = Molecule(atom='H 0 0 -0.8; H 0 0 0.8', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     grid = AOGrid.atom_centered(mol, n_radial=8, n_angular=14, with_grad=False)
     mf = RKS(mol, grid=grid, xc='svwn')
@@ -218,7 +217,7 @@ def test_rks_hessian_runs_and_exposes_frequencies():
 
 def test_rks_geometry_optimization_rejects_unknown_backend():
     mol = Molecule(atom='H 0 0 -1.1; H 0 0 1.1', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='svwn')
     with pytest.raises(ValueError, match='backend must be either'):
@@ -229,7 +228,7 @@ def test_rks_geometry_optimization_geometric_requires_dependency():
     pytest.importorskip('pyscf')
 
     mol = Molecule(atom='H 0 0 -1.1; H 0 0 1.1', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='svwn')
 

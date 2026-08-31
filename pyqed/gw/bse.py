@@ -20,7 +20,7 @@ from scipy.optimize import newton
 
 from functools import reduce
 
-from pyqed import is_positive_def
+from pyqed import au2ev, is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 
 
@@ -134,13 +134,8 @@ def _copy_mf_scan_options(mf):
     return opts
 
 
-def _rebuild_scan_mol(mol, build_driver=None):
-    driver = build_driver or getattr(mol, "_build_driver", None) or "builtin"
-    if driver == "builtin":
-        options = getattr(mol, "builtin_options", None)
-        mol.build(driver=driver, options=options)
-    else:
-        mol.build(driver=driver)
+def _rebuild_scan_mol(mol):
+    mol.build(options=getattr(mol, "builtin_options", None))
     return mol
 
 
@@ -634,7 +629,6 @@ class BSE(object):
         self,
         nroots=None,
         energy="pes",
-        build_driver=None,
         gw_method=None,
         gw_kwargs=None,
         mf_kwargs=None,
@@ -652,7 +646,6 @@ class BSE(object):
             self,
             nroots=nroots,
             energy=energy,
-            build_driver=build_driver,
             gw_method=gw_method,
             gw_kwargs=gw_kwargs,
             mf_kwargs=mf_kwargs,
@@ -714,7 +707,6 @@ class GWBSEScanner:
         base,
         nroots=None,
         energy="pes",
-        build_driver=None,
         gw_method=None,
         gw_kwargs=None,
         mf_kwargs=None,
@@ -730,7 +722,6 @@ class GWBSEScanner:
         self.solver_cls = solver_cls
         self.nroots = nroots
         self.energy = str(energy).lower()
-        self.build_driver = build_driver
         self.gw_method = gw_method or getattr(base.gw, "method", None) or "g0w0"
         self.gw_kwargs = {} if gw_kwargs is None else dict(gw_kwargs)
         self.mf_kwargs = {} if mf_kwargs is None else dict(mf_kwargs)
@@ -744,13 +735,13 @@ class GWBSEScanner:
         if isinstance(mol_or_geom, np.ndarray):
             mol = self.mol
             mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
-            return _rebuild_scan_mol(mol, self.build_driver)
+            return _rebuild_scan_mol(mol)
 
         mol = mol_or_geom
         if getattr(mol, "hcore", None) is None or (
             getattr(mol, "eri", None) is None and getattr(mol, "eri_factors", None) is None
         ):
-            return _rebuild_scan_mol(mol, self.build_driver)
+            return _rebuild_scan_mol(mol)
         return mol
 
     def _run_mf(self, mol):
@@ -1558,10 +1549,10 @@ def pes():
 
         nocc = mol.nelectron//2
         ehomo = egw[nocc-1]
-        print("GW -IP = GW HOMO =", ehomo, "au =", ehomo*27.211, "eV")
+        print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")
 
 
-        #print('GW  spacial orbital energies (eV) = ', gw.e_qp*27.211)
+        #print('GW  spacial orbital energies (eV) = ', gw.e_qp * au2ev)
 
         ex = bse(gw, using_tda=True, using_casida=False)[0]
         ex_energy[i] = ex[0]
@@ -1650,12 +1641,12 @@ if __name__ == '__main__':
     nocc = mol.nelectron//2
     ehomo = egw[nocc-1]
     elumo = egw[nocc]
-    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo*27.211, "eV")
-    print("GW EA = GW LUMO =", elumo, "au =", elumo*27.211, "eV")
+    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")
+    print("GW EA = GW LUMO =", elumo, "au =", elumo * au2ev, "eV")
 
 #
 #
-    # print('GW  spacial orbital energies (eV) = ', gw.e_qp*27.211)
+    # print('GW  spacial orbital energies (eV) = ', gw.e_qp * au2ev)
 
     #excite = bse(gw, using_tda=True, using_casida=False)
     #print("BSE Excitation energy =", excite[0] ) #* au2ev)
@@ -1667,6 +1658,6 @@ if __name__ == '__main__':
     R,E, e_rpa = np.genfromtxt('excite_energy.dat', dtype=float, unpack=True)
     #print(R,E)
     #print(R, e_rpa)
-    # R /= 0.529177
+    # R /= au2angstrom
     plt.plot(R, E)
     # plt.plot(R, e_rpa)

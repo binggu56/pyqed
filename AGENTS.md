@@ -21,6 +21,11 @@
 - Avoid running expensive qchem, NAMD, or large benchmark examples unless they are directly relevant or the user requests them.
 - If a full-suite or long-running validation is needed, say what will be run before starting it.
 
+## Calculation Figures
+- After completing a numerical calculation, always generate the relevant diagnostic or result figures from its outputs and display them to the user before reporting completion.
+- Save the figures with clear, calculation-specific filenames and state where they were written.
+- Include plotting code in the calculation script or provide a companion plotting script so the figures are reproducible.
+
 ## SU2 / Non-Abelian NARG Guardrail
 - Do not fix SU2 or non-Abelian NARG energy/recoupling discrepancies by adding final dense variational projection, projected-growth Hamiltonians, primitive branch-basis growth, or `4^n` determinant-space operator projection to the active solver path.
 - Such projections are allowed only as explicit reference/validation helpers in tests or benchmarks.
@@ -34,6 +39,12 @@
 - When optimizing code, prioritize architecture and data flow first; leave micro-optimization until the very end.
 - Use structured numerical APIs and existing helper functions instead of ad hoc parsing or manual array manipulation.
 - Add comments only where the intent would otherwise be hard to recover.
+
+## Method References and Implementation Fidelity
+- When implementing a method from the literature, add the primary references to the relevant user documentation and to the main public class or function docstring. Include enough bibliographic information to identify the work unambiguously, preferably with a DOI or stable URL.
+- In the same documentation, state whether the implementation is an exact reproduction, an adaptation, or a simplified/inspired variant. Describe material approximations, omitted couplings or response terms, restricted cases, unsupported features, and any reference convergence or accuracy guarantees that therefore do not carry over.
+- For hybrid methods, identify the reference or established formulation used for each major algorithmic component. Do not describe a method solely by a literature name when the implemented algorithm differs materially from that reference.
+- Treat reference and fidelity documentation as part of the implementation: add or update it in the same change as the code, and keep it synchronized when the algorithm changes.
 
 ## Math Formatting
 - When showing equations or derivations to the user, always use Markdown math format with inline `$...$` or display `$$...$$` blocks instead of plain-text equations.

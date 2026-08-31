@@ -1,0 +1,108 @@
+{
+  "description": "Compact quantum U(1) links, exact Gauss-law basis, electric L_n^2 energy, and shortest-path Wilson strings on the Fourier-DVR hopping.",
+  "parameters": {
+    "npts": 7,
+    "length_times_g": 10.0,
+    "fermion_mass_over_g": 0.0,
+    "nroots": 12
+  },
+  "exact": {
+    "vector_gap_over_g": 0.5641895835477563,
+    "scalar_gap_over_g": 1.1283791670955126
+  },
+  "flux_convergence": [
+    {
+      "flux_cutoff": 1,
+      "dimension": 5536,
+      "hamiltonian_nnz": 107456,
+      "seconds": 1.0639301668852568,
+      "vacuum_dimension": 2,
+      "vector_level": 2,
+      "vector_excitation_energy": 0.8652355395457745,
+      "vector_momentum": 0.6283185307179586,
+      "vector_gap": 0.5948515469001431,
+      "scalar_level": 6,
+      "scalar_gap": 1.070856350945613,
+      "hermiticity_residual": 0.0,
+      "maximum_gauss_residual": 0
+    },
+    {
+      "flux_cutoff": 2,
+      "dimension": 12400,
+      "hamiltonian_nnz": 269552,
+      "seconds": 2.3279832911211997,
+      "vacuum_dimension": 2,
+      "vector_level": 2,
+      "vector_excitation_energy": 0.8544106442453439,
+      "vector_momentum": 0.6283185307179586,
+      "vector_gap": 0.5789934135689018,
+      "scalar_level": 5,
+      "scalar_gap": 1.0978669847269025,
+      "hermiticity_residual": 0.0,
+      "maximum_gauss_residual": 0
+    },
+    {
+      "flux_cutoff": 3,
+      "dimension": 19264,
+      "hamiltonian_nnz": 431648,
+      "seconds": 4.0269711669534445,
+      "vacuum_dimension": 2,
+      "vector_level": 2,
+      "vector_excitation_energy": 0.8544117017890631,
+      "vector_momentum": 0.6283185307179586,
+      "vector_gap": 0.5789949741668822,
+      "scalar_level": 5,
+      "scalar_gap": 1.0978685801572592,
+      "hermiticity_residual": 0.0,
+      "maximum_gauss_residual": 0
+    }
+  ],
+  "converged_spectrum": {
+    "energies": [
+      -5.7180641847106255,
+      -5.718064184710579,
+      -4.863652482921562,
+      -4.863652482921528,
+      -4.863652482921477,
+      -4.620195604553366,
+      -4.620195604553296,
+      -4.5584525561029725,
+      -4.558452556102958,
+      -4.507351490692196,
+      -4.5073514906921455,
+      -4.205416189508588
+    ],
+    "vector_strengths": [
+      1.3201557243350795e-31,
+      9.473226386382673e-32,
+      0.04828017607867425,
+      0.06412950855812734,
+      0.05076493478993579,
+      2.3991522207523926e-30,
+      7.936784728615801e-32,
+      3.6901310964542204e-32,
+      1.283611190361751e-31,
+      6.380982927040127e-30,
+      1.8995916342917196e-31,
+      1.9688677995932174e-31
+    ],
+    "scalar_strengths": [
+      1.6031068054224955,
+      1.6031879240386397,
+      1.980434175947861e-29,
+      2.865191488326557e-24,
+      5.824268370322174e-29,
+      1.6132911268296017,
+      1.6132907762735664,
+      1.5758784278717325e-26,
+      1.192078655942368e-28,
+      5.174322548930634e-29,
+      1.0721522517577762e-27,
+      9.056964126803292e-25
+    ]
+  },
+  "figures": {
+    "gaps": "examples/lgt/results/mv_ms_n7/07_dynamical_schwinger_gaps.png",
+    "channel_strengths": "examples/lgt/results/mv_ms_n7/08_dynamical_channel_strengths.png"
+  }
+}

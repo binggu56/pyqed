@@ -87,7 +87,6 @@ Example:
        mol,
        nstates=3,
        xc="lda,vwn",
-       build_driver="builtin",
        nac_method="none",
    )
 

@@ -81,6 +81,14 @@ Current development-branch matrix
      - Experimental
      - :doc:`periodic_phonons`
      - ``tests/test_pbc_phonon.py`` and ``examples/pbc_phonon.py``
+   * - Static periodic q-resolved CPHF response
+     - Experimental
+     - :doc:`periodic_cphf`
+     - ``tests/test_pbc_cphf.py`` and ``examples/pbc_cphf.py``
+   * - CPHF-relaxed Gamma-point KRHF Hessian
+     - Experimental
+     - :doc:`periodic_phonons`
+     - ``tests/test_pbc_rhf.py`` and ``examples/pbc_gamma_hessian.py``
    * - Real-time TDHF/TDDFT and coupled dynamics
      - Experimental
      - :doc:`tddft_ehrenfest`

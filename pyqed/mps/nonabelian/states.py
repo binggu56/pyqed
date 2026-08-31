@@ -16,7 +16,7 @@ from pyqed.mps.su2 import (
 )
 
 from .coupling import clebsch_gordan, ordered_two_m_values
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 class FullyReducedSpatialOrbitalSite(SpatialOrbitalSite):
@@ -90,7 +90,7 @@ def build_reduced_product_spatial_mps(labels):
     for q_phys, q_left, q_right in parsed:
         block = np.ones((1, 1, 1), dtype=float)
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data={(q_left, q_phys, q_right): block},
                 qns=[[q_left], list(site.qn), [q_right]],
                 dirs=[-1, 1, 1],
@@ -237,7 +237,7 @@ def build_product_spatial_mps(
         block = data[(q_left_path, q_phys, q_right_path)]
         block[0, state_index_by_label[label], 0] = 1.0
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data=data,
                 qns=[left_qns, list(site.qn), right_qns],
                 dirs=[-1, 1, 1],
@@ -410,7 +410,7 @@ def build_product_state(labels):
             ] = coeff
 
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data=data,
                 qns=[left_qns, list(site.qn), right_qns],
                 dirs=[-1, 1, 1],
@@ -549,7 +549,7 @@ def build_random_spatial_mps(
                     data[(q_left, q_phys, q_right)] = block
 
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data=data,
                 qns=[left_qns, list(phys_sectors), right_qns],
                 dirs=[-1, 1, 1],
@@ -649,7 +649,7 @@ def build_random_reduced_spatial_mps(
                     ).astype(dtype)
 
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data=data,
                 qns=[left_qns, list(phys_sectors), right_qns],
                 dirs=[-1, 1, 1],

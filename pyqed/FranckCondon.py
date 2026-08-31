@@ -14,6 +14,7 @@ import math
 from math import factorial
 from math import sqrt, exp
 from scipy.special import hermite, binom
+from pyqed.units import wavenumber2hartree
 # import numba
 
 def dfactortial(n):
@@ -53,8 +54,8 @@ def FranckCondon(Ln, Lm, d):
     wn_wavenumbers = Ln[1]
     wm_wavenumbers = Lm[1]
 
-    wn = wn_wavenumbers/8065.5/27.2116
-    wm = wm_wavenumbers/8065.5/27.2116
+    wn = wn_wavenumbers * wavenumber2hartree
+    wm = wm_wavenumbers * wavenumber2hartree
     # f = float(wn)/wm
     # w = wm
 
@@ -102,15 +103,15 @@ def FranckCondon(Ln, Lm, d):
 
 # def genIntensities( deltaE, deltaQ, w_wavenumbers, wprime_wavenumbers):
 #     """ wprime must be greater than w"""
-#     wprime = wprime_wavenumbers/8065.5/27.2116
-#     w = w_wavenumbers/8065.5/27.2116
+#     wprime = wprime_wavenumbers * wavenumber2hartree
+#     w = w_wavenumbers * wavenumber2hartree
 #     intensityFunction = lambda n: (diffFreqOverlap([n, wprime_wavenumbers], [0, w_wavenumbers], deltaQ))**2
 #     intensities = map(intensityFunction, range(0,11))
 #     return intensities
 
 # def genEnergies(deltaE, w_wavenumbers, wprime_wavenumbers):
-#     wprime = wprime_wavenumbers/8065.5/27.2116
-#     w = w_wavenumbers/8065.5/27.2116
+#     wprime = wprime_wavenumbers * wavenumber2hartree
+#     w = w_wavenumbers * wavenumber2hartree
 #     energyFunction = lambda n: (deltaE + (n+0.5)*(wprime) - 0.5*w)
 #     energies = map(energyFunction, range(0, 11))
 #     return energies

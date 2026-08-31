@@ -85,7 +85,8 @@ def _u1_bond_charges(n_sites: int, n_down: int, max_bond_dim: int):
                 break
             charge = max(
                 candidates,
-                key=lambda value: capacities[value] - multiplicities[value],
+                key=lambda value: capacities[value]
+                / (multiplicities[value] + 1),
             )
             multiplicities[charge] += 1
         charges.append(
@@ -547,6 +548,7 @@ def initialize_parameters(key: jax.Array) -> dict:
             rows = LOCAL_DIM * BOND_DIMS[site]
             columns = BOND_DIMS[site + 1]
             parameters["heads"][label] = {
+                "context_gate": jnp.asarray(1.0),
                 "adapter_weight": 0.3
                 * jax.random.normal(adapter_key, (HEAD_RANK, CONTEXT_DIM))
                 / np.sqrt(CONTEXT_DIM),
@@ -588,6 +590,7 @@ def initialize_parameters(key: jax.Array) -> dict:
             real_bias_key = next(keys)
             imag_bias_key = next(keys)
             parameters["heads"][label] = {
+                "context_gate": jnp.asarray(1.0),
                 "real_weight": 0.4
                 * jax.random.normal(real_weight_key, (output_size, CONTEXT_DIM))
                 / np.sqrt(CONTEXT_DIM),
@@ -619,8 +622,15 @@ def initialize_from_mps(
     sweeps: int,
     seed: int,
     context_scale: float = 1.0e-4,
+    target_n_down: int | None = None,
 ):
-    """Embed a converged dense MPS as a context-independent LETTA state."""
+    """Embed a converged MPS as a context-independent LETTA state.
+
+    The U(1) route runs the native Abelian two-site solver and adopts its
+    optimized virtual-sector multiplicities exactly.  This avoids projecting a
+    dense MPS into a separately guessed charge layout.
+    """
+    global BOND_CHARGES, BOND_DIMS
 
     if SHARE_BULK_HEADS:
         raise ValueError("MPS warm starts require site-specific matrix heads.")
@@ -628,7 +638,14 @@ def initialize_from_mps(
     from examples.mps.frontier_tied_letta_j1j2_all_nn import (
         heisenberg_local_hamiltonian,
     )
-    from pyqed.mps import DMRG, MPS, MPO
+    from pyqed.mps import (
+        DMRG,
+        MPS,
+        dense_to_symmetric,
+        dense_to_symmetric_mpo,
+        symmetric_to_dense,
+    )
+    from pyqed.mps.symmetry import AbelianSector, SymmetryManager
 
     physical_to_ordered = np.empty(N_SITES, dtype=np.int32)
     physical_to_ordered[ORDERED_SITES] = np.arange(N_SITES)
@@ -644,36 +661,129 @@ def initialize_from_mps(
     hamiltonian = heisenberg_local_hamiltonian(
         N_SITES, ordered_edges
     )
-    mpo = MPO(list(hamiltonian.to_mpo().compress().tensors))
+    mpo = hamiltonian.to_mpo().compress()
     rng = np.random.default_rng(seed)
-    factors = [
-        rng.normal(
-            size=(BOND_DIMS[site], LOCAL_DIM, BOND_DIMS[site + 1])
-        )
-        / np.sqrt(
-            LOCAL_DIM * BOND_DIMS[site] * BOND_DIMS[site + 1]
-        )
-        for site in range(N_SITES)
-    ]
-    initial_state = MPS(factors, labels=["lv", "p", "rv"]).right_canonicalize()
-    solver = DMRG(
-        mpo,
-        D=int(bond_dim),
-        init_guess=initial_state,
-        nsweeps=int(sweeps),
-        opt="2site",
-        not_conv_err=False,
-        verbose=0,
-        sweep_tol=1.0e-10,
-        davidson_tol=1.0e-11,
-        davidson_max_iter=120,
-        noise=0.0,
-        recenter_final=False,
-        performance="auto",
-    ).run()
-
-    ordered_factors = solver.ground_state.to_order(["lv", "p", "rv"]).factors
+    native_u1 = False
+    initial_charges = None
     if U1_SECTORS:
+        native_u1 = True
+        target_down = int(BOND_CHARGES[0][0])
+        q0 = AbelianSector(("charge",), (0,))
+        q1 = AbelianSector(("charge",), (1,))
+        site_qn_maps = [{0: q0, 1: q1} for _ in range(N_SITES)]
+        symmetric_mpo = dense_to_symmetric_mpo(
+            list(mpo.factors),
+            site_qn_maps,
+        )
+        product_factors = []
+        remaining_down = target_down
+        for site in range(N_SITES):
+            spin = int(site % 2)
+            if spin > remaining_down or N_SITES - site - 1 < remaining_down - spin:
+                spin = int(remaining_down > 0)
+            factor = np.zeros((1, LOCAL_DIM, 1))
+            factor[0, spin, 0] = 1.0
+            product_factors.append(factor)
+            remaining_down -= spin
+        if remaining_down:
+            raise ValueError("could not construct a fixed-charge product state.")
+        initial_state = dense_to_symmetric(
+            product_factors,
+            phys_qns=[q0, q1],
+        )
+        manager = SymmetryManager(["charge"])
+        target = manager.get_target_qn(target_down)
+        solver = DMRG(
+            symmetric_mpo,
+            D=int(bond_dim),
+            init_guess=initial_state,
+            nsweeps=int(sweeps),
+            opt="2site",
+            symmetry=True,
+            target_qn=target,
+            sym_mgr=manager,
+            site_qn_maps=site_qn_maps,
+            not_conv_err=False,
+            verbose=0,
+            sweep_tol=1.0e-10,
+            davidson_tol=1.0e-11,
+            davidson_max_iter=120,
+            noise=0.0,
+            recenter_final=False,
+            performance="generic",
+        ).run()
+        symmetric_factors = solver.state.factors
+        labels = solver.state.labels
+        left_axis = labels.index("lv")
+        right_axis = labels.index("rv")
+        accumulated_qns = [
+            tuple(int(charge[0]) for charge in symmetric_factors[0].qns[left_axis])
+        ]
+        accumulated_qns.extend(
+            tuple(int(charge[0]) for charge in factor.qns[right_axis])
+            for factor in symmetric_factors
+        )
+        BOND_CHARGES = tuple(
+            np.asarray([target_down - charge for charge in charges], dtype=np.int32)
+            for charges in accumulated_qns
+        )
+        BOND_DIMS = tuple(len(charges) for charges in BOND_CHARGES)
+        parameters = initialize_parameters(jax.random.PRNGKey(seed))
+        ordered_factors = symmetric_to_dense(
+            solver.state,
+            site_qn_maps=site_qn_maps,
+        ).to_order(["lv", "p", "rv"]).factors
+    elif target_n_down is not None:
+        target_n_down = int(target_n_down)
+        if target_n_down < 0 or target_n_down > N_SITES:
+            raise ValueError("target_n_down must lie between zero and n_sites.")
+        initial_charges = _u1_bond_charges(
+            N_SITES,
+            target_n_down,
+            int(bond_dim),
+        )
+        if tuple(len(charges) for charges in initial_charges) != BOND_DIMS:
+            raise ValueError(
+                "fixed-charge initialization is incompatible with the dense "
+                "MPS bond dimensions."
+            )
+    if not native_u1:
+        factors = []
+        for site in range(N_SITES):
+            shape = (BOND_DIMS[site], LOCAL_DIM, BOND_DIMS[site + 1])
+            factor = rng.normal(size=shape)
+            if initial_charges is not None:
+                left_charges = initial_charges[site]
+                right_charges = initial_charges[site + 1]
+                for spin in range(LOCAL_DIM):
+                    allowed = (
+                        left_charges[:, None] == right_charges[None, :] + spin
+                    )
+                    factor[:, spin, :] = np.where(
+                        allowed,
+                        factor[:, spin, :],
+                        0.0,
+                    )
+            factors.append(factor)
+        initial_state = MPS(factors, labels=["lv", "p", "rv"]).right_canonicalize()
+        solver = DMRG(
+            mpo,
+            D=int(bond_dim),
+            init_guess=initial_state,
+            nsweeps=int(sweeps),
+            opt="2site",
+            not_conv_err=False,
+            verbose=0,
+            sweep_tol=1.0e-10,
+            davidson_tol=1.0e-11,
+            davidson_max_iter=120,
+            noise=0.0,
+            recenter_final=False,
+            performance="auto",
+        ).run()
+        ordered_factors = solver.state.to_order(["lv", "p", "rv"]).factors
+
+    if U1_SECTORS and not native_u1:
         # Charge-resolved TT-SVD directly on the MPS virtual bonds.  ``carry``
         # maps the new suffix-charge basis into the original DMRG bond basis,
         # so this remains polynomial in N and D and never forms the state
@@ -730,21 +840,34 @@ def initialize_from_mps(
             LOCAL_DIM * BOND_DIMS[site], BOND_DIMS[site + 1]
         )
         if U1_SECTORS:
-            # Each charge block is already an isometry from the blockwise SVD.
-            # Store only the entries consumed by conditioned_blocks.
+            # Canonicalize every allowed charge block independently.  The
+            # resulting block-diagonal R is absorbed into the next core, so
+            # this is an exact gauge transformation of the native U(1) MPS.
+            block_isometry = jnp.zeros_like(stack)
+            next_carry = jnp.zeros(
+                (BOND_DIMS[site + 1], BOND_DIMS[site + 1]),
+                dtype=stack.dtype,
+            )
+            for charge in np.unique(BOND_CHARGES[site + 1]):
+                columns = np.flatnonzero(BOND_CHARGES[site + 1] == charge)
+                rows = []
+                for spin in range(LOCAL_DIM):
+                    left = np.flatnonzero(BOND_CHARGES[site] == charge + spin)
+                    rows.extend((spin * BOND_DIMS[site] + left).tolist())
+                rows = np.asarray(rows, dtype=np.int32)
+                block_q, block_r = _phase_fixed_qr(stack[np.ix_(rows, columns)])
+                block_isometry = block_isometry.at[np.ix_(rows, columns)].set(
+                    block_q
+                )
+                next_carry = next_carry.at[np.ix_(columns, columns)].set(block_r)
             packed_rows, packed_columns = _packed_matrix_indices(site)
-            packed = stack[packed_rows, packed_columns]
+            packed = block_isometry[packed_rows, packed_columns]
             isometry = packed
-            carry = None
+            carry = next_carry
         else:
             isometry, carry = _phase_fixed_qr(stack)
         head = parameters["heads"][str(site)]
-        if HEAD_RANK:
-            head["left_real"] = context_scale * head["left_real"]
-            head["left_imag"] = context_scale * head["left_imag"]
-        else:
-            head["real_weight"] = context_scale * head["real_weight"]
-            head["imag_weight"] = context_scale * head["imag_weight"]
+        head["context_gate"] = jnp.asarray(context_scale)
         head["real_bias"] = jnp.real(isometry).reshape(-1)
         head["imag_bias"] = jnp.imag(isometry).reshape(-1)
 
@@ -756,7 +879,7 @@ def initialize_from_mps(
             parameters["probability_bias"]
         )
         parameters["pair_coupling"] = jnp.zeros_like(parameters["pair_coupling"])
-    return parameters, float(solver.e_tot), solver.ground_state.copy()
+    return parameters, float(solver.energy), solver.state.copy()
 
 
 def advance_context(parameters: dict, context: jax.Array, spin: jax.Array) -> jax.Array:
@@ -1016,16 +1139,18 @@ def conditioned_blocks(parameters: dict, site: int, context: jax.Array) -> jax.A
         )
         packed_rows = jnp.asarray(packed_rows)
         packed_columns = jnp.asarray(packed_columns)
-        real = head["real_bias"] + correction_real[
+        gate = head["context_gate"]
+        real = head["real_bias"] + gate * correction_real[
             packed_rows, packed_columns
         ]
-        imag = head["imag_bias"] + correction_imag[
+        imag = head["imag_bias"] + gate * correction_imag[
             packed_rows, packed_columns
         ]
         raw_values = real + 1j * imag
     else:
-        real = head["real_weight"] @ site_context + head["real_bias"]
-        imag = head["imag_weight"] @ site_context + head["imag_bias"]
+        gate = head["context_gate"]
+        real = gate * (head["real_weight"] @ site_context) + head["real_bias"]
+        imag = gate * (head["imag_weight"] @ site_context) + head["imag_bias"]
         raw_values = real + 1j * imag
     if U1_SECTORS:
         isometry = jnp.zeros(
@@ -1233,18 +1358,29 @@ def vmc_surrogate(
 
 
 def adam_update(parameters, gradients, first, second, step, rate):
-    """Apply one Adam update to a real-parameter pytree."""
+    """Apply one Adam update with a scalar or parameter-shaped rate pytree."""
 
     first = jax.tree.map(lambda m, g: 0.9 * m + 0.1 * g, first, gradients)
     second = jax.tree.map(lambda m, g: 0.999 * m + 0.001 * g**2, second, gradients)
     first_hat = jax.tree.map(lambda m: m / (1.0 - 0.9**step), first)
     second_hat = jax.tree.map(lambda m: m / (1.0 - 0.999**step), second)
-    parameters = jax.tree.map(
-        lambda x, m, v: x - rate * m / (jnp.sqrt(v) + 1.0e-8),
-        parameters,
-        first_hat,
-        second_hat,
-    )
+    if np.isscalar(rate):
+        parameters = jax.tree.map(
+            lambda x, m, v: x - rate * m / (jnp.sqrt(v) + 1.0e-8),
+            parameters,
+            first_hat,
+            second_hat,
+        )
+    else:
+        parameters = jax.tree.map(
+            lambda x, m, v, local_rate: (
+                x - local_rate * m / (jnp.sqrt(v) + 1.0e-8)
+            ),
+            parameters,
+            first_hat,
+            second_hat,
+            rate,
+        )
     return parameters, first, second
 
 
@@ -1254,6 +1390,15 @@ def clip_gradient_norm(gradients, max_norm: float = 1.0):
     squared_norm = sum(jnp.sum(gradient**2) for gradient in jax.tree.leaves(gradients))
     scale = jnp.minimum(1.0, max_norm / (jnp.sqrt(squared_norm) + 1.0e-12))
     return jax.tree.map(lambda gradient: scale * gradient, gradients)
+
+
+def freeze_mps_bias_gradients(gradients):
+    """Freeze the context-independent MPS matrices, not their residual adapters."""
+
+    for head in gradients["heads"].values():
+        head["real_bias"] = jnp.zeros_like(head["real_bias"])
+        head["imag_bias"] = jnp.zeros_like(head["imag_bias"])
+    return gradients
 
 
 def sr_update(
@@ -1460,7 +1605,7 @@ def main(
             context_scale=mps_context_noise,
         )
         print(f"MPS warm-start energy: {warm_start_energy:.12f}")
-        print(f"LETTA context-noise scale: {mps_context_noise:.3e}")
+        print(f"LETTA context-gate initialization: {mps_context_noise:.3e}")
     first = jax.tree.map(jnp.zeros_like, parameters)
     second = jax.tree.map(jnp.zeros_like, parameters)
     flat_parameters, unravel = ravel_pytree(parameters)
@@ -1555,16 +1700,14 @@ def main(
                 gradients = jax.tree.map(
                     lambda *values: sum(values) / len(values), *accumulated
                 )
-            if mps_warm_start and freeze_mps_backbone:
-                gradients["heads"] = jax.tree.map(
-                    jnp.zeros_like, gradients["heads"]
-                )
-            elif mps_warm_start:
+            if mps_warm_start:
+                if freeze_mps_backbone or freeze_mps_biases:
+                    gradients = freeze_mps_bias_gradients(gradients)
                 for head in gradients["heads"].values():
-                    if freeze_mps_biases:
-                        head["real_bias"] = jnp.zeros_like(head["real_bias"])
-                        head["imag_bias"] = jnp.zeros_like(head["imag_bias"])
-                    elif POSITIVE_MARSHALL_GAUGE:
+                    if (
+                        not (freeze_mps_backbone or freeze_mps_biases)
+                        and POSITIVE_MARSHALL_GAUGE
+                    ):
                         head["imag_bias"] = jnp.zeros_like(head["imag_bias"])
                     if POSITIVE_MARSHALL_GAUGE:
                         for name in tuple(head):
@@ -1686,6 +1829,18 @@ def main(
     parameters = best_parameters
     if n_steps:
         print(f"selected checkpoint: step {best_step}")
+    if mps_warm_start:
+        gates = np.asarray(
+            [
+                float(head["context_gate"])
+                for head in parameters["heads"].values()
+            ]
+        )
+        print(
+            "context gate mean/range: "
+            f"{float(gates.mean()):.3e} / "
+            f"{float(gates.min()):.3e}..{float(gates.max()):.3e}"
+        )
     if exact_validation:
         psi = state_vector(parameters)
         probabilities = np.asarray(jnp.abs(psi) ** 2)
@@ -1805,8 +1960,19 @@ if __name__ == "__main__":
     parser.add_argument("--positive-marshall-gauge", action="store_true")
     parser.add_argument("--mps-warm-start", action="store_true")
     parser.add_argument("--mps-warm-start-sweeps", type=int, default=12)
-    parser.add_argument("--mps-context-noise", type=float, default=1.0e-3)
-    parser.add_argument("--freeze-mps-backbone", action="store_true")
+    parser.add_argument(
+        "--mps-context-gate",
+        "--mps-context-noise",
+        dest="mps_context_noise",
+        type=float,
+        default=1.0e-3,
+        help="initial trainable residual gate after an exact MPS warm start",
+    )
+    parser.add_argument(
+        "--freeze-mps-backbone",
+        action="store_true",
+        help="freeze MPS matrix biases while training gates and context adapters",
+    )
     parser.add_argument("--freeze-mps-biases", action="store_true")
     parser.add_argument("--reweight-warmup-steps", type=int, default=0)
     parser.add_argument(

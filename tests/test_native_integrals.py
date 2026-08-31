@@ -1,15 +1,20 @@
+import inspect
+
 import numpy as np
 import pytest
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.basis import (
+    ContractedGaussian,
     PackedRIFactors,
+    S,
     _basis_cy,
     _integrals_cpp,
     _rys_cy,
     _basis_signature,
     _builtin_worker_count,
     _cart_shell_blocks,
+    _cart2sph_unit_block,
     _compute_cartesian_shell_quartet_block_cython,
     _compute_dense_eri_serial,
     _compute_dense_eri_serial_cpp_cartesian,
@@ -41,16 +46,18 @@ from pyqed.qchem.basis import (
 
 try:
     from pyscf import gto, scf
+    from pyscf.gto.basis import parse_gaussian
 except ImportError:  # pragma: no cover - optional dependency in some envs
     gto = None
     scf = None
+    parse_gaussian = None
 
 
 def test_native_build_is_default_and_produces_ao_tensors():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build()
 
-    assert mol._build_driver in {'native', 'builtin'}
+    assert not hasattr(mol, '_build_driver')
     assert mol.nao == 2
     assert mol.overlap.shape == (2, 2)
     assert mol.hcore.shape == (2, 2)
@@ -66,9 +73,91 @@ def test_native_build_is_default_and_produces_ao_tensors():
     np.testing.assert_allclose(np.diag(mol.overlap), np.ones(2), atol=1e-12)
 
 
+def test_build_has_no_driver_keyword():
+    assert 'driver' not in inspect.signature(Molecule.build).parameters
+
+
+def test_pyscf_interop_reports_native_ao_permutation_for_segmented_basis():
+    pytest.importorskip('pyscf')
+    mol = Molecule(
+        atom='O 0 0 0; H 0 1 0; H 0 0 1',
+        unit='bohr',
+        basis='6-31g',
+    )
+    mol.build()
+    pmol = mol.topyscf()
+    permutation = mol.pyscf_ao_permutation(pmol)
+
+    assert not np.array_equal(permutation, np.arange(mol.nao))
+    np.testing.assert_allclose(
+        mol.overlap,
+        pmol.intor('int1e_ovlp')[np.ix_(permutation, permutation)],
+        atol=1e-7,
+    )
+
+
+def test_pyscf_only_reference_uses_pyscf_ao_order_without_native_integrals():
+    pytest.importorskip('pyscf')
+    mol = Molecule(
+        atom='O 0 0 0; H 0 1 0; H 0 0 1',
+        unit='bohr',
+        basis='6-31g',
+    )
+    pmol = mol.topyscf()
+    mol.nao = pmol.nao
+
+    np.testing.assert_array_equal(
+        mol.pyscf_ao_permutation(pmol), np.arange(pmol.nao)
+    )
+
+
+@pytest.mark.parametrize("angular_momentum", [4, 5, 6])
+def test_high_angular_cartesian_to_spherical_transform_is_orthonormal(angular_momentum):
+    cart_basis = [
+        ContractedGaussian(shell=shell, exps=[1.0], coefs=[1.0])
+        for shell in _shell(angular_momentum)
+    ]
+    cart_overlap = np.array(
+        [[S(left, right) for right in cart_basis] for left in cart_basis]
+    )
+    transform = _cart2sph_unit_block(angular_momentum)
+
+    np.testing.assert_allclose(
+        transform.T @ cart_overlap @ transform,
+        np.eye(2 * angular_momentum + 1),
+        atol=1.0e-14,
+        rtol=1.0e-14,
+    )
+
+
+@pytest.mark.skipif(gto is None, reason="PySCF is not installed")
+@pytest.mark.parametrize("angular_momentum", [2, 3, 4, 5, 6])
+def test_cartesian_to_spherical_transform_matches_libcint(angular_momentum):
+    mol = gto.Mole()
+    mol.atom = "C 0 0 0"
+    mol.unit = "B"
+    mol.cart = True
+    mol.basis = {"C": [[angular_momentum, [1.0, 1.0]]]}
+    mol.verbose = 0
+    mol.build()
+
+    cart_overlap = mol.intor("int1e_ovlp_cart")
+    libcint_transform = (
+        np.sqrt(np.diag(cart_overlap))[:, None]
+        * gto.cart2sph(angular_momentum)
+    )
+
+    np.testing.assert_allclose(
+        _cart2sph_unit_block(angular_momentum),
+        libcint_transform,
+        atol=5.0e-15,
+        rtol=5.0e-15,
+    )
+
+
 def test_native_build_runs_rhf_without_external_integral_backends():
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='native')
+    mol.build()
 
     mf = mol.RHF().run(max_cycle=60)
     assert np.isfinite(mf.e_tot)
@@ -77,7 +166,7 @@ def test_native_build_runs_rhf_without_external_integral_backends():
 def test_builtin_build_accepts_short_eri_keyword_for_factors():
     for eri in ('factors', 'cd'):
         mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-        mol.build(driver='builtin', eri=eri)
+        mol.build(eri=eri)
 
         assert mol.builtin_eri_representation == 'factors'
         assert mol.builtin_aosym == 's8'
@@ -112,7 +201,7 @@ def test_native_build_supports_d_shells_in_cartesian_basis():
     basis = '6-31g(d,p)'
 
     mol = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol.build(driver='builtin')
+    mol.build(options={'coord_type': 'cartesian'})
     mf = mol.RHF().run(max_cycle=80)
 
     ref = scf.RHF(gto.M(atom=atom, basis=basis, unit='angstrom', cart=True)).run(conv_tol=1e-12)
@@ -127,10 +216,15 @@ def test_builtin_rys_backend_matches_default_dense_builder_for_sp_basis():
     basis = 'sto-3g'
 
     mol_default = Molecule(atom=atom, unit='bohr', basis=basis)
-    mol_default.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
+    mol_default.build(options={
+        'coord_type': 'cartesian', 'eri_representation': 'dense', 'aosym': 's1'
+    })
 
     mol_rys = Molecule(atom=atom, unit='bohr', basis=basis)
-    mol_rys.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1', 'eri_backend': 'rys'})
+    mol_rys.build(options={
+        'coord_type': 'cartesian', 'eri_representation': 'dense',
+        'aosym': 's1', 'eri_backend': 'rys'
+    })
 
     np.testing.assert_allclose(mol_rys.overlap, mol_default.overlap, atol=1e-12, rtol=1e-12)
     np.testing.assert_allclose(mol_rys.hcore, mol_default.hcore, atol=1e-12, rtol=1e-12)
@@ -152,12 +246,13 @@ def test_builtin_parallel_option_keeps_selected_dense_backend():
     basis = 'sto-3g'
 
     mol_serial = Molecule(atom=atom, unit='bohr', basis=basis)
-    mol_serial.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
+    mol_serial.build(options={
+        'coord_type': 'cartesian', 'eri_representation': 'dense', 'aosym': 's1'
+    })
 
     mol_parallel = Molecule(atom=atom, unit='bohr', basis=basis)
-    mol_parallel.build(
-        driver='builtin',
-        options={
+    mol_parallel.build(options={
+            'coord_type': 'cartesian',
             'eri_representation': 'dense',
             'aosym': 's1',
             'parallel': True,
@@ -179,24 +274,22 @@ def test_builtin_rys_backend_rejects_d_basis_before_building_eris():
         basis='6-31g(d,p)',
     )
     with pytest.raises(RuntimeError, match='only Cartesian s/p bases'):
-        mol.build(
-            driver='builtin',
-            options={'eri_representation': 'dense', 'aosym': 's1', 'eri_backend': 'rys'},
+        mol.build(options={'eri_representation': 'dense', 'aosym': 's1', 'eri_backend': 'rys'},
         )
 
 
 def test_builtin_python_backend_is_an_explicit_reference_path():
     atom = 'H 0 0 0; H 0 0 1.4'
     mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol.build(
-        driver='builtin',
-        eri='dense',
+    mol.build(eri='dense',
         aosym='s1',
-        options={'eri_backend': 'python'},
+        options={'coord_type': 'cartesian', 'eri_backend': 'python'},
     )
 
     ref = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    ref.build(driver='builtin', eri='dense', aosym='s1')
+    ref.build(eri='dense', aosym='s1',
+        options={'coord_type': 'cartesian'},
+    )
 
     info = mol._builtin_build_info
     assert info['eri_backend_requested'] == 'python'
@@ -207,9 +300,7 @@ def test_builtin_python_backend_is_an_explicit_reference_path():
 
 def test_builtin_rys_factor_only_honors_s8_pair_storage():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(
-        driver='builtin',
-        eri='factors',
+    mol.build(eri='factors',
         aosym='s8',
         options={'eri_backend': 'rys', 'low_rank_tol': 1e-12},
     )
@@ -217,7 +308,7 @@ def test_builtin_rys_factor_only_honors_s8_pair_storage():
     info = mol._builtin_build_info
     assert isinstance(mol.eri_factors, PackedRIFactors)
     assert info['factor_storage'] == 'packed-pair'
-    assert info['factor_builder'] == 'rys-s8-pair-pivoted-cholesky'
+    assert info['factor_builder'] == 'cpp-rys-matrix-free-spherical-pair'
 
 
 def test_cpp_ssss_dense_helper_matches_existing_dense_builder():
@@ -362,15 +453,15 @@ def test_builtin_cpp_backend_builds_s_shell_dense_eri():
         return
 
     mol_cpp = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol_cpp.build(
-        driver='builtin',
-        eri='dense',
+    mol_cpp.build(eri='dense',
         aosym='s1',
-        options={'eri_backend': 'cpp'},
+        options={'coord_type': 'cartesian', 'eri_backend': 'cpp'},
     )
 
     mol_ref = Molecule(atom=mol_cpp.atom, unit='bohr', basis='sto-3g')
-    mol_ref.build(driver='builtin', eri='dense', aosym='s1')
+    mol_ref.build(eri='dense', aosym='s1',
+        options={'coord_type': 'cartesian'},
+    )
 
     assert mol_cpp._builtin_build_info['eri_backend'] == 'cpp'
     assert mol_cpp._builtin_build_info['dense_builder'] == 'cpp-cartesian-lmax6'
@@ -384,10 +475,10 @@ def test_builtin_cpp_backend_builds_factor_only_cholesky():
         return
 
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(
-        driver='builtin',
-        eri='factors',
-        options={'eri_backend': 'cpp', 'low_rank_tol': 1e-12},
+    mol.build(eri='factors',
+        options={
+            'coord_type': 'cartesian', 'eri_backend': 'cpp', 'low_rank_tol': 1e-12
+        },
     )
 
     assert mol.eri is None
@@ -400,9 +491,7 @@ def test_builtin_cpp_backend_builds_factor_only_cholesky():
     assert mol._builtin_build_info['factor_pair_shape'] == (3, 3)
 
     mol_full = Molecule(atom=mol.atom, unit='bohr', basis='sto-3g')
-    mol_full.build(
-        driver='builtin',
-        eri='factors',
+    mol_full.build(eri='factors',
         aosym='s1',
         options={'eri_backend': 'cpp', 'low_rank_tol': 1e-12},
     )
@@ -457,11 +546,10 @@ def test_builtin_ri_accepts_cpp_tensor_backend_request():
         return
 
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(
-        driver='builtin',
-        eri='ri',
+    mol.build(eri='ri',
         options={
             'eri_backend': 'cpp',
+            'coord_type': 'cartesian',
             'ri_tensor_backend': 'cpp',
             'ri_cache': False,
         },
@@ -482,15 +570,30 @@ def test_builtin_basis_aliases_resolve_existing_gbs_files():
     assert _basis_path("aug-cc-pvdz").endswith("aug-cc-pvdz.0.gbs")
 
 
+def test_builtin_pople_diffuse_polarization_aliases():
+    expected = {
+        "6-31+G*": "6-31+g_st_.0.gbs",
+        "6-31+G(d)": "6-31+g_st_.0.gbs",
+        "6-31+G**": "6-31+g_st__st_.0.gbs",
+        "6-31+G(d,p)": "6-31+g_st__st_.0.gbs",
+        "6-31++G*": "6-31++g_st_.0.gbs",
+        "6-31++G(d)": "6-31++g_st_.0.gbs",
+        "6-31++G**": "6-31++g_st__st_.0.gbs",
+        "6-31++G(d,p)": "6-31++g_st__st_.0.gbs",
+    }
+    for alias, filename in expected.items():
+        assert _basis_path(alias).endswith(filename)
+
+
 def test_builtin_s4_storage_matches_dense_rhf_energy():
     atom = 'H 0 0 0; H 0 0 1.4'
 
     mol_dense = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_dense.build(driver='builtin', eri='dense', aosym='s1')
+    mol_dense.build(eri='dense', aosym='s1')
     e_dense = mol_dense.RHF().run(max_cycle=80).e_tot
 
     mol_s4 = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_s4.build(driver='builtin', eri='s4')
+    mol_s4.build(eri='s4')
     e_s4 = mol_s4.RHF().run(max_cycle=80).e_tot
 
     assert mol_s4.eri is None
@@ -503,11 +606,11 @@ def test_builtin_s8_storage_matches_dense_rhf_energy():
     atom = 'H 0 0 0; H 0 0 1.4'
 
     mol_dense = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_dense.build(driver='builtin', eri='dense', aosym='s1')
+    mol_dense.build(eri='dense', aosym='s1')
     e_dense = mol_dense.RHF().run(max_cycle=80).e_tot
 
     mol_s8 = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_s8.build(driver='builtin', eri='s8')
+    mol_s8.build(eri='s8')
     e_s8 = mol_s8.RHF().run(max_cycle=80).e_tot
 
     npair = mol_s8.nao * (mol_s8.nao + 1) // 2
@@ -523,10 +626,14 @@ def test_builtin_cpp_backend_builds_direct_s8_storage():
         return
 
     mol = Molecule(atom='O 0 0 0; H 0 0 1.8; H 0 1.7 0', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense', aosym='s8', options={'eri_backend': 'cpp'})
+    mol.build(eri='dense', aosym='s8',
+        options={'coord_type': 'cartesian', 'eri_backend': 'cpp'},
+    )
 
     mol_ref = Molecule(atom=mol.atom, unit='bohr', basis='sto-3g')
-    mol_ref.build(driver='builtin', eri='dense', aosym='s1')
+    mol_ref.build(eri='dense', aosym='s1',
+        options={'coord_type': 'cartesian'},
+    )
 
     assert mol.eri is None
     assert mol.eri_s8 is not None
@@ -536,10 +643,10 @@ def test_builtin_cpp_backend_builds_direct_s8_storage():
 
 def test_builtin_dense_defaults_to_cpp_s8_storage():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
 
     info = mol._builtin_build_info
-    assert info['driver'] == 'builtin'
+    assert info['integral_engine'] == 'native'
     assert info['basis'] == 'sto-3g'
     assert info['input_unit'] == 'bohr'
     assert info['coordinate_unit'] == 'bohr'
@@ -549,10 +656,11 @@ def test_builtin_dense_defaults_to_cpp_s8_storage():
     assert info['aosym'] == 's8'
     assert mol.eri is None
     assert mol.eri_s8 is not None
-    if _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_eri_s8_cartesian"):
+    if _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_dense_eri_spherical"):
         assert info['eri_backend_requested'] == 'auto'
         assert info['eri_backend_selected'] == 'cpp'
-        assert info['dense_builder'] == 'cpp-cartesian-s8-lmax6'
+        assert info['dense_builder'].startswith('cpp-rys-spherical-shellblocked')
+        assert info['coord_type'] == 'spherical'
 
 
 def test_builtin_dense_pyrazine_631g_matches_pyscf_rhf():
@@ -573,10 +681,20 @@ H  -2.147000   1.240000   0.000000
 '''
 
     mol = Molecule(atom=atom, unit='angstrom', basis='6-31g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
     mf = mol.RHF().run(tol=1e-9, max_cycle=100)
 
-    ref_mol = gto.M(atom=atom, basis='6-31g', unit='angstrom', cart=mol.cart, verbose=0)
+    ref_basis = {
+        element: parse_gaussian.load(_basis_path('6-31g'), element)
+        for element in ('H', 'C', 'N')
+    }
+    ref_mol = gto.M(
+        atom=mol.atom,
+        basis=ref_basis,
+        unit='bohr',
+        cart=mol.cart,
+        verbose=0,
+    )
     ref = scf.RHF(ref_mol)
     ref.conv_tol = 1e-9
     ref.max_cycle = 100
@@ -596,13 +714,13 @@ def test_builtin_cpp_s8_parallel_matches_serial_storage():
 
     atom = 'O 0 0 0; H 0 0 1.8; H 0 1.7 0'
     serial = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    serial.build(driver='builtin', eri='dense')
+    serial.build(eri='dense', options={'coord_type': 'cartesian'}
+    )
 
     parallel = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    parallel.build(
-        driver='builtin',
-        eri='dense',
+    parallel.build(eri='dense',
         options={
+            'coord_type': 'cartesian',
             'parallel': True,
             'eri_workers': 2,
             'parallel_min_nao': 0,
@@ -636,32 +754,30 @@ def test_builtin_aosym_s8_matches_legacy_eri_alias():
     atom = 'H 0 0 0; H 0 0 1.4'
 
     mol_aosym = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_aosym.build(driver='builtin', eri='dense', aosym='s8')
+    mol_aosym.build(eri='dense', aosym='s8')
 
     mol_legacy = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_legacy.build(driver='builtin', eri='s8')
+    mol_legacy.build(eri='s8')
 
     assert mol_aosym.builtin_eri_representation == 'dense'
     assert mol_aosym.builtin_aosym == 's8'
     assert mol_aosym._builtin_build_info['representation'] == 'dense'
     assert mol_aosym._builtin_build_info['aosym'] == 's8'
-    expected_builder = (
-        'cpp-cartesian-s8-lmax6'
-        if _integrals_cpp is not None and hasattr(_integrals_cpp, "compute_eri_s8_cartesian")
-        else ('cpp-cartesian-lmax6' if _integrals_cpp is not None else 'python-shellblocked')
+    assert (
+        mol_aosym._builtin_build_info['dense_builder'] ==
+        mol_legacy._builtin_build_info['dense_builder']
     )
-    assert mol_aosym._builtin_build_info['dense_builder'] == expected_builder
     np.testing.assert_allclose(mol_aosym.eri_s8, mol_legacy.eri_s8, atol=1e-12)
 
 
 def test_builtin_packed_jk_contractions_match_dense_tensor():
     mol_dense = Molecule(atom='O 0 0 0; H 0 0 1.8; H 0 1.7 0', unit='bohr', basis='sto-3g')
-    mol_dense.build(driver='builtin', eri='dense', aosym='s1')
+    mol_dense.build(eri='dense', aosym='s1')
 
     mol_s4 = Molecule(atom=mol_dense.atom, unit='bohr', basis='sto-3g')
-    mol_s4.build(driver='builtin', eri='s4')
+    mol_s4.build(eri='s4')
     mol_s8 = Molecule(atom=mol_dense.atom, unit='bohr', basis='sto-3g')
-    mol_s8.build(driver='builtin', eri='s8')
+    mol_s8.build(eri='s8')
 
     rng = np.random.default_rng(123)
     dm = rng.normal(size=(mol_dense.nao, mol_dense.nao))
@@ -747,12 +863,31 @@ def test_cpp_packed_ri_jk_and_ao2mo_match_numpy_references():
     np.testing.assert_allclose(transformed, ref, atol=1e-11, rtol=1e-11)
 
 
+def test_large_packed_ri_mo_transform_matches_dense_reference():
+    from pyqed.qchem.basis import mo_pair_factors
+
+    nao, naux, nleft, nright = 20, 12, 18, 17
+    rng = np.random.default_rng(90210)
+    packed = rng.normal(size=(naux, nao * (nao + 1) // 2))
+    left = rng.normal(size=(nao, nleft))
+    right = rng.normal(size=(nao, nright))
+    rows, cols = np.tril_indices(nao)
+    dense = np.zeros((naux, nao, nao))
+    dense[:, rows, cols] = packed
+    dense[:, cols, rows] = packed
+
+    transformed = mo_pair_factors(packed, left, right)
+    reference = np.einsum("Pij,ip,jq->Ppq", dense, left, right, optimize=True)
+
+    np.testing.assert_allclose(transformed, reference, atol=1.0e-11, rtol=1.0e-11)
+
+
 def test_cpp_s8_ao2mo_matches_dense_einsum_reference():
     if _integrals_cpp is None or not hasattr(_integrals_cpp, "ao2mo_s8"):
         return
 
     mol = Molecule(atom='O 0 0 0; H 0 0 1.8; H 0 1.7 0', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='s8')
+    mol.build(eri='s8')
 
     rng = np.random.default_rng(789)
     coeff = rng.normal(size=(mol.nao, mol.nao))
@@ -775,7 +910,7 @@ def test_cpp_s8_mo_veff_matches_density_jk_reference():
         return
 
     mol = Molecule(atom='O 0 0 0; H 0 0 1.8; H 0 1.7 0', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='s8')
+    mol.build(eri='s8')
 
     rng = np.random.default_rng(2468)
     coeff = rng.normal(size=(mol.nao, mol.nao))
@@ -797,10 +932,10 @@ def test_cpp_s8_mo_veff_matches_density_jk_reference():
 def test_builtin_direct_jk_matches_dense_tensor_and_rhf_energy():
     atom = 'O 0 0 0; H 0 0 1.8; H 0 1.7 0'
     mol_dense = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_dense.build(driver='builtin', eri='dense', aosym='s1')
+    mol_dense.build(eri='dense', aosym='s1')
 
     mol_direct = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol_direct.build(driver='builtin', eri='direct')
+    mol_direct.build(eri='direct')
 
     rng = np.random.default_rng(321)
     dm = rng.normal(size=(mol_dense.nao, mol_dense.nao))
@@ -823,13 +958,12 @@ def test_builtin_direct_jk_matches_dense_tensor_and_rhf_energy():
     assert mol_direct._builtin_direct_jk_data is not None
     assert mol_direct.eri_s8 is None
     assert mol_direct._builtin_build_info['dense_builder'] in {
-        'cpp-cartesian-direct-jk',
+        'cpp-spherical-direct-jk',
         'cython-direct-jk',
     }
     if _integrals_cpp is not None and hasattr(_integrals_cpp, "direct_jk_cartesian"):
-        assert mol_direct._builtin_build_info['dense_builder'] == 'cpp-cartesian-direct-jk'
+        assert mol_direct._builtin_build_info['dense_builder'] == 'cpp-spherical-direct-jk'
         assert mol_direct._builtin_build_info['direct_jk']['screening'] == 'schwarz+density'
-        assert mol_direct._builtin_build_info['direct_jk']['task_cache'] == 'cpp-shell-pair-geometry+quartet-tasks'
         data = mol_direct._builtin_direct_jk_data
         direct_cpp = direct_jk_cartesian_cpp(
             data["shells"],
@@ -870,8 +1004,13 @@ def test_builtin_direct_jk_matches_dense_tensor_and_rhf_energy():
     assert mol_direct._builtin_direct_jk_data["last_mode"].startswith("veff-")
     assert mol_direct._builtin_direct_jk_data["last_skipped"] is not None
     e_dense = mol_dense.RHF().run(max_cycle=80).e_tot
-    e_direct = mol_direct.RHF().run(max_cycle=80).e_tot
+    direct_mf = mol_direct.RHF().run(max_cycle=80)
+    e_direct = direct_mf.e_tot
     np.testing.assert_allclose(e_direct, e_dense, atol=1e-10, rtol=1e-10)
+    assert direct_mf.scf_info["direct_scf_tol"] == pytest.approx(1.0e-13)
+    assert direct_mf.scf_info["direct_scf_calls"] > 1
+    assert direct_mf.scf_info["direct_scf_computed"] > 0
+    assert direct_mf.scf_info["direct_scf_skipped"] >= 0
 
 
 def test_builtin_auto_prefers_ri_for_larger_native_builds():
@@ -880,7 +1019,7 @@ def test_builtin_auto_prefers_ri_for_larger_native_builds():
         unit='bohr',
         basis='def2-svp',
     )
-    mol.build(driver='builtin', eri='auto')
+    mol.build(eri='auto')
 
     assert mol._builtin_build_info['representation'] == 'ri'
     assert mol.eri is None
@@ -889,7 +1028,7 @@ def test_builtin_auto_prefers_ri_for_larger_native_builds():
 
 def test_rhf_exposes_factorized_ao2mo_for_ri_builds():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='ri')
+    mol.build(eri='ri')
 
     mf = mol.RHF().run(max_cycle=60)
     pair_factors = mf.mo_factors(mf.mo_coeff)
@@ -904,7 +1043,7 @@ def test_rhf_exposes_factorized_ao2mo_for_ri_builds():
 
 def test_builtin_auto_uses_packed_s8_for_small_exact_builds():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='auto')
+    mol.build(eri='auto')
 
     assert mol._builtin_build_info['representation'] == 'dense'
     assert mol._builtin_build_info['aosym'] == 's8'
@@ -936,7 +1075,7 @@ def test_cython_dense_eri_matches_legacy_aopair_builder_for_d_shell_case():
 
     atom = 'H 0 0 0; F 0 0 0.9'
     mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
-    mol.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
+    mol.build(options={'eri_representation': 'dense', 'aosym': 's1'})
     signatures = tuple(_basis_signature(fn) for fn in mol._bas)
     pair_bounds = _compute_pair_bounds(signatures)
 
@@ -954,7 +1093,7 @@ def test_cython_blocked_dense_eri_matches_legacy_aopair_builder_for_d_shell_case
 
     atom = 'H 0 0 0; F 0 0 0.9'
     mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
-    mol.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
+    mol.build(options={'eri_representation': 'dense', 'aosym': 's1'})
     signatures = tuple(_basis_signature(fn) for fn in mol._bas)
     pair_bounds = _compute_pair_bounds(signatures)
 
@@ -974,7 +1113,7 @@ def test_cython_cartesian_shell_quartet_block_matches_dense_slice():
 
     atom = 'H 0 0 0; F 0 0 0.9'
     mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
-    mol.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
+    mol.build(options={'eri_representation': 'dense', 'aosym': 's1'})
     signatures = tuple(_basis_signature(fn) for fn in mol._bas)
     shell_blocks = _cart_shell_blocks(mol._bas)
 
@@ -1001,7 +1140,7 @@ def test_cython_iterative_os_shell_quartet_matches_default_block():
 
     atom = 'H 0 0 0; F 0 0 0.9'
     mol = Molecule(atom=atom, unit='angstrom', basis='6-31g(d,p)')
-    mol.build(driver='builtin', options={'eri_representation': 'dense', 'aosym': 's1'})
+    mol.build(options={'eri_representation': 'dense', 'aosym': 's1'})
     signatures = tuple(_basis_signature(fn) for fn in mol._bas)
     shell_blocks = _cart_shell_blocks(mol._bas)
 
@@ -1059,16 +1198,12 @@ def test_factor_only_builtin_d_shell_matches_dense_plus_factors():
     basis = '6-31g(d,p)'
 
     mol_dense = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol_dense.build(
-        driver='builtin',
-        options={'eri_representation': 'dense+factors', 'low_rank_tol': 1e-10},
+    mol_dense.build(options={'eri_representation': 'dense+factors', 'low_rank_tol': 1e-10},
     )
     mf_dense = mol_dense.RHF().run(cholesky_jk=True, cholesky_tol=1e-10, max_cycle=80)
 
     mol_fact = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol_fact.build(
-        driver='builtin',
-        options={'eri_representation': 'factors', 'low_rank_tol': 1e-10},
+    mol_fact.build(options={'eri_representation': 'factors', 'low_rank_tol': 1e-10},
     )
     mf_fact = mol_fact.RHF().run(cholesky_jk=True, cholesky_tol=1e-10, max_cycle=80)
 
@@ -1081,6 +1216,8 @@ def test_factor_only_builtin_d_shell_matches_dense_plus_factors():
         'cython-kernel-blocked',
         'cython-kernel-packed',
         'cython-kernel-blocked-packed',
+        'cpp-rys-matrix-free-spherical-pair',
+        'cython-matrix-free-blocked-cartesian-to-spherical-pair',
         'python-oracle-packed',
     }
     np.testing.assert_allclose(mf_fact.e_tot, mf_dense.e_tot, atol=1e-8, rtol=1e-8)

@@ -1,13 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-First-class symmetry basis descriptors for non-Abelian MPS work.
-
-These classes are intentionally lightweight.  They make the current implicit
-``qns``/packed-layout conventions explicit without changing contraction
-semantics yet, giving the DMRG code a stable target for the later
-renormalized-basis refactor.
-"""
+"""Packed two-site basis layouts built from shared symmetry legs."""
 
 from __future__ import annotations
 
@@ -16,8 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from pyqed.mps.symmetry import Sector
-
-from .mpo import Leg
+from pyqed.symmetry import IrrepTensor, Leg
 
 
 def _ordered_unique(items):
@@ -26,141 +18,6 @@ def _ordered_unique(items):
         if item not in ordered:
             ordered.append(item)
     return tuple(ordered)
-
-
-@dataclass(frozen=True)
-class BasisBlock:
-    """One contiguous sector block in a symmetry-adapted basis."""
-
-    sector: Sector
-    dim: int
-    offset: int
-
-    def __post_init__(self):
-        if int(self.dim) <= 0:
-            raise ValueError(f"BasisBlock dimension must be positive, got {self.dim}.")
-        if int(self.offset) < 0:
-            raise ValueError(f"BasisBlock offset must be non-negative, got {self.offset}.")
-        object.__setattr__(self, "dim", int(self.dim))
-        object.__setattr__(self, "offset", int(self.offset))
-
-    @property
-    def slice(self):
-        return slice(self.offset, self.offset + self.dim)
-
-
-@dataclass(frozen=True)
-class SymmetryBasis:
-    """
-    Ordered orthonormal sector basis descriptor.
-
-    ``dims`` stores multiplicity dimensions, not SU(2) magnetic degeneracy.
-    """
-
-    sectors: tuple[Sector, ...]
-    dims: dict[Sector, int]
-    direction: int = 1
-    name: str | None = None
-
-    def __post_init__(self):
-        sectors = _ordered_unique(self.sectors)
-        dims = {sector: int(dim) for sector, dim in dict(self.dims).items()}
-        if self.direction not in (-1, 1):
-            raise ValueError(f"SymmetryBasis direction must be +/-1, got {self.direction!r}.")
-        if not sectors:
-            raise ValueError("SymmetryBasis requires at least one sector.")
-        for sector in sectors:
-            if sector not in dims:
-                raise ValueError(f"Missing dimension for basis sector {sector!r}.")
-            if dims[sector] <= 0:
-                raise ValueError(f"Basis dimension for sector {sector!r} must be positive.")
-        object.__setattr__(self, "sectors", sectors)
-        object.__setattr__(self, "dims", dims)
-
-    @property
-    def total_dim(self):
-        return sum(self.dims[sector] for sector in self.sectors)
-
-    @property
-    def blocks(self):
-        offset = 0
-        out = []
-        for sector in self.sectors:
-            dim = self.dims[sector]
-            out.append(BasisBlock(sector, dim, offset))
-            offset += dim
-        return tuple(out)
-
-    def dim(self, sector):
-        return self.dims[sector]
-
-    def slices(self):
-        return {block.sector: block.slice for block in self.blocks}
-
-    def compatible_with(self, other):
-        return (
-            isinstance(other, SymmetryBasis)
-            and self.sectors == other.sectors
-            and self.dims == other.dims
-            and self.direction == other.direction
-        )
-
-    def same_blocks(self, other):
-        return (
-            isinstance(other, SymmetryBasis)
-            and self.sectors == other.sectors
-            and self.dims == other.dims
-        )
-
-    def dual_compatible_with(self, other):
-        return self.same_blocks(other) and self.direction == -other.direction
-
-    @classmethod
-    def from_qns(cls, qns, *, dims=None, direction=1, name=None):
-        sectors = _ordered_unique(qns)
-        if dims is None:
-            dims = {sector: sum(1 for item in qns if item == sector) for sector in sectors}
-        return cls(sectors=sectors, dims=dims, direction=direction, name=name)
-
-    @classmethod
-    def from_tensor_axis(cls, tensor, axis, *, name=None):
-        axis = int(axis)
-        if axis < 0:
-            axis += tensor.rank
-        if axis < 0 or axis >= tensor.rank:
-            raise ValueError(f"Tensor axis {axis} out of range for rank-{tensor.rank} tensor.")
-        dims = {}
-        for key, block in tensor.data.items():
-            sector = key[axis]
-            dim = int(np.asarray(block).shape[axis])
-            known = dims.get(sector)
-            if known is None:
-                dims[sector] = dim
-            elif known != dim:
-                raise ValueError(
-                    f"Inconsistent dimension for sector {sector!r} on axis {axis}: {known} vs {dim}."
-                )
-        for sector in _ordered_unique(tensor.qns[axis]):
-            dims.setdefault(sector, sum(1 for item in tensor.qns[axis] if item == sector))
-        return cls.from_qns(
-            tensor.qns[axis],
-            dims=dims,
-            direction=tensor.dirs[axis],
-            name=name,
-        )
-
-
-@dataclass(frozen=True)
-class SiteBasis(SymmetryBasis):
-    """Physical local basis descriptor."""
-
-    def as_physical_leg(self):
-        return Leg.from_dims(self.dims, sectors=self.sectors)
-
-
-@dataclass(frozen=True)
-class BondBasis(SymmetryBasis):
-    """Virtual renormalized-basis descriptor."""
 
 
 @dataclass(frozen=True)
@@ -197,12 +54,12 @@ class TwoSiteBasis:
     renormalized-basis solver.
     """
 
-    left: BondBasis
-    phys1: SiteBasis
-    phys2: SiteBasis
-    right: BondBasis
+    left: Leg
+    phys1: Leg
+    phys2: Leg
+    right: Leg
     entries: tuple[LocalLayoutEntry, ...]
-    intermediate: BondBasis | None = None
+    intermediate: Leg | None = None
 
     @property
     def channel_resolved(self):
@@ -493,8 +350,6 @@ class TwoSiteBasis:
     def tensor_from_blocks(self, blocks, template):
         """Rebuild a two-site tensor while preserving fusion-path amplitudes."""
 
-        from .tensor import NonabelianTensor
-
         if not self.channel_resolved:
             data = self.tensor_data_from_blocks(
                 blocks,
@@ -502,7 +357,7 @@ class TwoSiteBasis:
             )
             metadata = template.metadata.copy()
             metadata["contracted_channel_blocks_current"] = False
-            return NonabelianTensor(
+            return IrrepTensor(
                 data,
                 [leg[:] for leg in template.qns],
                 template.dirs[:],
@@ -533,7 +388,7 @@ class TwoSiteBasis:
         metadata = template.metadata.copy()
         metadata["contracted_channel_blocks"] = channel_blocks
         metadata["contracted_channel_blocks_current"] = True
-        return NonabelianTensor(
+        return IrrepTensor(
             data,
             [leg[:] for leg in template.qns],
             template.dirs[:],
@@ -587,10 +442,10 @@ class TwoSiteBasis:
             for entry in layout
         )
         return cls(
-            left=BondBasis.from_tensor_axis(two_site, 0, name="left"),
-            phys1=SiteBasis.from_tensor_axis(two_site, 1, name="phys1"),
-            phys2=SiteBasis.from_tensor_axis(two_site, 2, name="phys2"),
-            right=BondBasis.from_tensor_axis(two_site, 3, name="right"),
+            left=Leg.from_tensor_axis(two_site, 0, name="left"),
+            phys1=Leg.from_tensor_axis(two_site, 1, name="phys1"),
+            phys2=Leg.from_tensor_axis(two_site, 2, name="phys2"),
+            right=Leg.from_tensor_axis(two_site, 3, name="right"),
             entries=entries,
         )
 
@@ -627,14 +482,14 @@ class TwoSiteBasis:
             offset += size
         middle_sectors = _ordered_unique(entry.key[2] for entry in entries)
         return cls(
-            left=BondBasis.from_tensor_axis(two_site, 0, name="left"),
-            phys1=SiteBasis.from_tensor_axis(two_site, 1, name="phys1"),
-            phys2=SiteBasis.from_tensor_axis(two_site, 2, name="phys2"),
-            right=BondBasis.from_tensor_axis(two_site, 3, name="right"),
+            left=Leg.from_tensor_axis(two_site, 0, name="left"),
+            phys1=Leg.from_tensor_axis(two_site, 1, name="phys1"),
+            phys2=Leg.from_tensor_axis(two_site, 2, name="phys2"),
+            right=Leg.from_tensor_axis(two_site, 3, name="right"),
             entries=tuple(entries),
-            intermediate=BondBasis.from_qns(
-                middle_sectors,
-                dims={sector: 1 for sector in middle_sectors},
+            intermediate=Leg.from_dims(
+                {sector: 1 for sector in middle_sectors},
+                sectors=middle_sectors,
                 direction=1,
                 name="intermediate",
             ),

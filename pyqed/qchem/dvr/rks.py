@@ -20,7 +20,7 @@ import warnings
 
 from pyqed import discretize, sort, dag
 from pyqed.davidson import davidson
-from pyqed.ldr.ldr import kinetic
+from pyqed.dvr import kinetic
 from pyqed import au2ev, au2angstrom
 from pyqed.dvr import SineDVR
 from pyqed import scf

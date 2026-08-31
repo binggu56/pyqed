@@ -23,9 +23,10 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from pyqed.units import au2ev
 from pyqed.qchem import CASCI, CD, Molecule, RHF
 
-EV = 27.211386245988
+EV = au2ev
 
 METHYL_LACTATE_ATOMS = (
     ("C", 0.000, 0.000, 0.000),
@@ -52,7 +53,7 @@ def atom_string():
 
 def build_molecule(basis):
     mol = Molecule(atom=atom_string(), unit="angstrom", basis=basis)
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     return mol
 
 

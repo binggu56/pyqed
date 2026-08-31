@@ -15,12 +15,13 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from pyqed.units import au2ev, au2fs, au2watt_per_centimeter_squared
 from pyqed.qchem.gdvr import AtomicChain, RTTDHF
 
 
-AU_TIME_FS = 0.02418884326505
-AU_ENERGY_EV = 27.211386245988
-FIELD_TO_INTENSITY_W_CM2 = 3.50944506e16
+AU_TIME_FS = au2fs
+AU_ENERGY_EV = au2ev
+FIELD_TO_INTENSITY_W_CM2 = au2watt_per_centimeter_squared
 
 
 def _clean_float(value):

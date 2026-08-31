@@ -1,0 +1,44 @@
+{
+  "description": "Penalty-free Gauss-symmetric ground state followed by separate vector/scalar block-sparse TDVP correlations and matrix-pencil poles.",
+  "parameters": {
+    "npts": 5,
+    "length": 10.0,
+    "coupling": 1.0,
+    "mass": 0.0,
+    "flux_cutoff": 1
+  },
+  "bond_dim": 48,
+  "ground_sweeps": 8,
+  "hamiltonian_mpo_bonds": [
+    5,
+    12,
+    18,
+    18,
+    18,
+    18,
+    12,
+    12,
+    4,
+    1
+  ],
+  "dt": 0.1,
+  "vector_steps": 80,
+  "scalar_steps": 160,
+  "ground_energy": -2.3010050153778496,
+  "ground_energy_error": 3.1086244689504383e-15,
+  "vector_excitation_mps": 0.6505213225120526,
+  "vector_excitation_ed": 0.6505210598217768,
+  "vector_mass_mps": 0.1685046438507132,
+  "vector_mass_ed": 0.16850362971779984,
+  "scalar_mass_mps": 0.6357669029925159,
+  "scalar_mass_ed": 0.6357669640911738,
+  "scalar_elastic_mean": [
+    0.5313923467700196,
+    -6.971419969081794e-17
+  ],
+  "timing_seconds": {
+    "ground": 0.16914054099470377,
+    "vector_correlation": 4.525279666064307,
+    "scalar_correlation": 8.931894917041063
+  }
+}

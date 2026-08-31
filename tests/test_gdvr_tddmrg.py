@@ -200,7 +200,7 @@ def test_to_gto_feeds_generic_active_space_tddmrg():
     expected_eri = active_eri_from_gdvr_collocation(mf.mol.eri_j, np.eye(2), nz=2, m=1)
     np.testing.assert_allclose(td.h1e[0], mf.mol.hcore, atol=1.0e-12)
     np.testing.assert_allclose(td.h2e[0, 0], expected_eri, atol=1.0e-12)
-    assert td._active_integral_build_info["mode"] == "gdvr_collocated_dense_active"
+    assert td.build_info["mode"] == "gdvr_collocated_dense_active"
 
 
 def test_gdvr_tddmrg_root_api_has_no_active_space_aliases():
@@ -623,7 +623,7 @@ def test_gdvr_tddmrg_runs_against_direct_mpo():
     np.testing.assert_allclose(td.times, [0.01, 0.02])
     assert td.observables.shape == (2, 1)
     assert td.site == "spatial"
-    assert td._active_integral_build_info["representation"] == "gdvr_direct_spatial_mpo"
+    assert td.build_info["representation"] == "gdvr_direct_spatial_mpo"
     np.testing.assert_allclose(td.pre_normalization_norms, np.ones(2), atol=1.0e-12)
     assert td.static_energies.shape == (3,)
 
@@ -784,7 +784,7 @@ def test_direct_gdvr_tddmrg_build_reuses_native_mpo_for_dmrg():
     td = TDDMRG(_ToyGDVRRHF()).build()
 
     assert td._symmetric_mpo_cache[(("charge", "sz"), "native")] is td.H
-    assert td._active_integral_build_info["native_abelian_mpo"] is True
+    assert td.build_info["native_abelian_mpo"] is True
 
 
 def test_direct_gdvr_tddmrg_optimize_ground_state_tiny_native_setup():

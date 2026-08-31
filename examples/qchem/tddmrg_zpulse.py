@@ -20,7 +20,7 @@ def main():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
     omega = 0.8
 

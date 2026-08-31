@@ -24,7 +24,7 @@ def main():
     atom = "H 0 0 0; H 0 0 1.4"
 
     mol = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     pyscf_mol = gto.M(atom=atom, unit="Bohr", basis="sto-3g")

@@ -1,0 +1,139 @@
+{
+  "description": "Alternating matter/link MPS with every local Gauss law represented as one component of an additive vector quantum number.",
+  "cases": [
+    {
+      "npts": 3,
+      "physical_dimension": 48,
+      "full_product_dimension": 1728,
+      "ed_energy": -1.4638711934956108,
+      "mps_energy": -1.463871193495617,
+      "energy_error": 6.217248937900877e-15,
+      "ed_seconds": 0.0031209171283990145,
+      "mps_setup_seconds": 0.005587416933849454,
+      "mps_sweep_seconds": 0.03828162490390241,
+      "mps_total_seconds": 0.043869041837751865,
+      "converged": true,
+      "requested_bond": 16,
+      "seed_bonds": [
+        1,
+        4,
+        10,
+        10,
+        10,
+        3,
+        1
+      ],
+      "realized_bonds": [
+        4,
+        10,
+        10,
+        10,
+        3,
+        1
+      ],
+      "raw_mpo_bonds": [
+        15,
+        15,
+        15,
+        15,
+        15,
+        1
+      ],
+      "gauss_penalty": 0.0
+    },
+    {
+      "npts": 5,
+      "physical_dimension": 496,
+      "full_product_dimension": 248832,
+      "ed_energy": -2.301005015377848,
+      "mps_energy": -2.301005015377849,
+      "energy_error": 1.3322676295501878e-15,
+      "ed_seconds": 0.040444834157824516,
+      "mps_setup_seconds": 0.05779491690918803,
+      "mps_sweep_seconds": 0.9381891661323607,
+      "mps_total_seconds": 0.9959840830415487,
+      "converged": true,
+      "requested_bond": 48,
+      "seed_bonds": [
+        1,
+        4,
+        10,
+        34,
+        34,
+        34,
+        34,
+        10,
+        10,
+        3,
+        1
+      ],
+      "realized_bonds": [
+        4,
+        10,
+        34,
+        34,
+        34,
+        34,
+        10,
+        10,
+        3,
+        1
+      ],
+      "raw_mpo_bonds": [
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        45,
+        1
+      ],
+      "gauss_penalty": 0.0
+    }
+  ],
+  "scaling": [
+    {
+      "npts": 3,
+      "physical_dimension": 48,
+      "full_product_dimension": 1728,
+      "raw_long_range_channels": 15,
+      "combined_two_site_physical_factor": 144,
+      "alternating_two_site_physical_factor": 12
+    },
+    {
+      "npts": 5,
+      "physical_dimension": 496,
+      "full_product_dimension": 248832,
+      "raw_long_range_channels": 45,
+      "combined_two_site_physical_factor": 144,
+      "alternating_two_site_physical_factor": 12
+    },
+    {
+      "npts": 7,
+      "physical_dimension": 5536,
+      "full_product_dimension": 35831808,
+      "raw_long_range_channels": 91,
+      "combined_two_site_physical_factor": 144,
+      "alternating_two_site_physical_factor": 12
+    },
+    {
+      "npts": 9,
+      "physical_dimension": 63552,
+      "full_product_dimension": 5159780352,
+      "raw_long_range_channels": 153,
+      "combined_two_site_physical_factor": 144,
+      "alternating_two_site_physical_factor": 12
+    }
+  ],
+  "n7_crossover_observation": {
+    "physical_dimension": 5536,
+    "exact_ed_seconds": 0.9145767921581864,
+    "mps_setup_seconds": 2.5143079159315675,
+    "raw_mpo_bond": 91,
+    "exact_sector_bond": 116,
+    "dmrg_status": "stopped after exceeding 90 seconds"
+  }
+}

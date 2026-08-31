@@ -84,6 +84,36 @@ extern "C" void cblas_dgemv(
     double* output,
     const int output_stride
 );
+#else
+inline void cblas_dgemv(
+    const int,
+    const int transpose,
+    const int rows,
+    const int cols,
+    const double alpha,
+    const double* matrix,
+    const int leading_dimension,
+    const double* vector,
+    const int vector_stride,
+    const double beta,
+    double* output,
+    const int output_stride
+) {
+    const bool transposed = transpose == 112;
+    const int output_size = transposed ? cols : rows;
+    const int inner_size = transposed ? rows : cols;
+    for (int outer = 0; outer < output_size; ++outer) {
+        double value = 0.0;
+        for (int inner = 0; inner < inner_size; ++inner) {
+            const int row = transposed ? inner : outer;
+            const int column = transposed ? outer : inner;
+            value += matrix[row * leading_dimension + column]
+                * vector[inner * vector_stride];
+        }
+        output[outer * output_stride] =
+            alpha * value + beta * output[outer * output_stride];
+    }
+}
 #endif
 
 struct ComplexThinSVDWorkspace {

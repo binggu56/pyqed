@@ -29,7 +29,7 @@ def _build_case(name, atom, basis, *, eri="auto", unit="bohr", options=None, max
     mol = Molecule(atom=atom, basis=basis, unit=unit)
 
     t0 = time.perf_counter()
-    mol.build(driver="builtin", eri=eri, options=options)
+    mol.build(eri=eri, options=options)
     build_time = time.perf_counter() - t0
 
     mf = mol.RHF()
@@ -71,7 +71,6 @@ def _build_case(name, atom, basis, *, eri="auto", unit="bohr", options=None, max
         "direct_jk_last": None if direct_data is None else {
             "kernel": direct_data.get("kernel"),
             "screening": direct_data.get("screening"),
-            "task_cache": direct_data.get("task_cache"),
             "last_mode": direct_data.get("last_mode"),
             "last_computed": direct_data.get("last_computed"),
             "last_skipped": direct_data.get("last_skipped"),

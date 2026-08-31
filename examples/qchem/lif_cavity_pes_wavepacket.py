@@ -27,11 +27,12 @@ os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib-pyqed")
 import numpy as np
 from scipy.interpolate import PchipInterpolator
 
+from pyqed.units import amu2au, angstrom2au, au2ev, au2fs
 
-ANGSTROM_TO_BOHR = 1.8897261254578281
-AU_TIME_FS = 0.024188843265857
-EV_TO_HARTREE = 1.0 / 27.211386245988
-AMU_TO_ELECTRON_MASS = 1822.888486209
+ANGSTROM_TO_BOHR = angstrom2au
+AU_TIME_FS = au2fs
+EV_TO_HARTREE = 1.0 / au2ev
+AMU_TO_ELECTRON_MASS = amu2au
 LI7_MASS_AMU = 7.0160034366
 F19_MASS_AMU = 18.9984031627
 DEFAULT_REDUCED_MASS_AMU = LI7_MASS_AMU * F19_MASS_AMU / (

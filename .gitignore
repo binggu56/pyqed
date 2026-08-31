@@ -24,6 +24,7 @@ pyqed/qchem/.DS_Store
 .DS_Store
 pyqed/polariton/negf_leak.npz
 *.npz
+!tests/data/so2_am1_meci_3x3x3.npz
 *.dat
 *.dat
 *.pyc
@@ -64,6 +65,13 @@ Scan_Results_Nz_32
 *.fdb_latexmk
 *.fls
 *.tex
+
+# Versioned CGLDR manuscript sources and publication figures.
+!manuscripts/
+!manuscripts/CGLDR/
+!manuscripts/CGLDR/main.tex
+!manuscripts/CGLDR/figures/
+!manuscripts/CGLDR/figures/*.pdf
 
 # Local LETTA cluster-controller registries and source manifests.
 /hpc_runs/

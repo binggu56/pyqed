@@ -16,7 +16,7 @@ from pyqed.mps.nonabelian import (
     combine_legs,
     recouple_fused_leg,
     split_legs,
-    NonabelianTensor,
+    IrrepTensor,
 )
 from pyqed.mps.symmetry import Sector
 from pyqed.mps.su2 import SU2Irrep
@@ -174,7 +174,7 @@ def test_combine_legs_with_cg_projects_two_doublets_into_singlet():
 
     # |S=0, M=0> = (|up down> - |down up>) / sqrt(2)
     singlet_block = np.array([[[[0.0], [1.0 / np.sqrt(2.0)]], [[-1.0 / np.sqrt(2.0)], [0.0]]]])
-    tensor = NonabelianTensor(
+    tensor = IrrepTensor(
         data={(left_boundary, half, half, singlet): singlet_block},
         qns=[[left_boundary], [half], [half], [singlet]],
         dirs=[-1, 1, 1, 1],
@@ -212,7 +212,7 @@ def test_combine_legs_with_cg_builds_singlet_and_triplet_blocks():
     singlet = _charge_spin_sector(2, 0)
     triplet = _charge_spin_sector(2, 2)
 
-    tensor = NonabelianTensor(
+    tensor = IrrepTensor(
         data={(left_boundary, half, half, right_boundary): np.arange(4.0).reshape(1, 2, 2, 1)},
         qns=[[left_boundary], [half], [half], [right_boundary]],
         dirs=[-1, 1, 1, 1],
@@ -241,7 +241,7 @@ def test_combine_three_doublets_builds_reduced_multiplet_axis_and_recouples():
     final_doublet = _charge_spin_sector(3, 1)
     final_quartet = _charge_spin_sector(3, 3)
 
-    tensor = NonabelianTensor(
+    tensor = IrrepTensor(
         data={
             (left_boundary, half, half, half, right_boundary): np.arange(8.0).reshape(1, 2, 2, 2, 1)
         },
@@ -291,7 +291,7 @@ def test_recouple_fused_leg_handles_multiple_child_sector_tuples_per_fused_secto
     doublet = _charge_spin_sector(1, 1)
     final_doublet = _charge_spin_sector(3, 1)
 
-    tensor = NonabelianTensor(
+    tensor = IrrepTensor(
         data={
             (left_boundary, vacuum, doublet, singlet_pair, right_boundary): np.arange(2.0).reshape(1, 1, 2, 1, 1),
             (left_boundary, singlet_pair, doublet, vacuum, right_boundary): (10.0 + np.arange(2.0)).reshape(1, 1, 2, 1, 1),

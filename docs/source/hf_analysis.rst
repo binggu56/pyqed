@@ -72,7 +72,7 @@ Basic Usage
        unit="angstrom",
        basis="sto-3g",
    )
-   mol.build(driver="builtin", eri="factors")
+   mol.build(eri="factors")
 
    mf = mol.RHF().run()
    analysis = mf.analyze()

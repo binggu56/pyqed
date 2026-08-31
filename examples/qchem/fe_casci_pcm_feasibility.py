@@ -248,7 +248,6 @@ def build_parser():
     parser.add_argument("--basis", default="def2-svp")
     parser.add_argument("--charge", type=int, default=2)
     parser.add_argument("--reference-spin", type=int, default=0)
-    parser.add_argument("--driver", default="builtin")
     parser.add_argument(
         "--eri",
         choices=("auto", "dense", "s4", "s8", "direct", "factors", "ri"),
@@ -366,9 +365,7 @@ def main(argv=None):
 
     _, build_seconds = timed(
         "Integral build",
-        lambda: mol.build(
-            driver=args.driver,
-            eri=args.eri,
+        lambda: mol.build(eri=args.eri,
             auxbasis=args.auxbasis,
             options=build_options,
         ),

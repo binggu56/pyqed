@@ -49,7 +49,6 @@ class PointChargeEmbeddedSCF:
         fd_step=1e-4,
         analytic_qm_gradients=True,
         analytic_point_charge_forces=True,
-        build_driver=None,
         build_kwargs=None,
         run_kwargs=None,
         reference_run_kwargs=None,
@@ -62,7 +61,6 @@ class PointChargeEmbeddedSCF:
         self.fd_step = float(fd_step)
         self.analytic_qm_gradients = bool(analytic_qm_gradients)
         self.analytic_point_charge_forces = bool(analytic_point_charge_forces)
-        self.build_driver = build_driver or getattr(self.mol, "_build_driver", None) or "builtin"
         self.build_kwargs = {} if build_kwargs is None else dict(build_kwargs)
         self.run_kwargs = {} if run_kwargs is None else dict(run_kwargs)
         self.reference_run_kwargs = (
@@ -175,7 +173,7 @@ class PointChargeEmbeddedSCF:
             )
 
         self.mol.set_geom(qm_coords)
-        self.mol.build(driver=self.build_driver, **self.build_kwargs)
+        self.mol.build(**self.build_kwargs)
         hcore0 = np.asarray(self.mol.hcore, dtype=float)
         self.mol.hcore = hcore0 + point_charge_hcore(self.mol, pc_coords, self.charges)
 
@@ -203,7 +201,6 @@ class PointChargeEmbeddedPostSCF:
         fd_step=1e-4,
         analytic_qm_gradients=False,
         analytic_point_charge_forces=False,
-        build_driver=None,
         build_kwargs=None,
         run_kwargs=None,
         reference_run_kwargs=None,
@@ -218,7 +215,6 @@ class PointChargeEmbeddedPostSCF:
         self.fd_step = float(fd_step)
         self.analytic_qm_gradients = bool(analytic_qm_gradients)
         self.analytic_point_charge_forces = bool(analytic_point_charge_forces)
-        self.build_driver = build_driver or getattr(self.mol, "_build_driver", None) or "builtin"
         self.build_kwargs = {} if build_kwargs is None else dict(build_kwargs)
         self.run_kwargs = {} if run_kwargs is None else dict(run_kwargs)
         self.reference_run_kwargs = (
@@ -259,7 +255,7 @@ class PointChargeEmbeddedPostSCF:
             )
 
         self.mol.set_geom(qm_coords)
-        self.mol.build(driver=self.build_driver, **self.build_kwargs)
+        self.mol.build(**self.build_kwargs)
         hcore0 = np.asarray(self.mol.hcore, dtype=float)
         self.mol.hcore = hcore0 + point_charge_hcore(self.mol, pc_coords, self.charges)
 
@@ -281,11 +277,6 @@ def point_charge_hcore(mol, coords, charges):
     """One-electron potential matrix from external point charges."""
     coords = _as_coords(coords)
     charges = _as_charges(charges, len(coords))
-
-    if _has_gbasis_basis(mol):
-        from gbasis.integrals.point_charge import point_charge_integral
-
-        return np.sum(point_charge_integral(mol._bas, coords, charges), axis=-1)
 
     basis, transform = _basis_and_transform(mol)
     nao = len(basis)
@@ -509,15 +500,8 @@ def _basis_and_transform(mol):
         basis = getattr(mol, "_bas", None)
         transform = None
     if basis is None or not all(isinstance(fn, ContractedGaussian) for fn in basis):
-        raise ValueError("Build the molecule with driver='builtin' before point-charge embedding.")
+        raise ValueError("Build the molecule before point-charge embedding.")
     return tuple(basis), transform
-
-
-def _has_gbasis_basis(mol):
-    basis = getattr(mol, "_bas", None)
-    if not basis:
-        return False
-    return basis[0].__class__.__name__ == "GeneralizedContractionShell"
 
 
 def _is_post_scf_method(method):

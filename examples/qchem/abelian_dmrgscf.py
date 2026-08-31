@@ -28,7 +28,6 @@ def parse_args():
     parser.add_argument("--atom", default="Li 0 0 0; F 0 0 1.4")
     parser.add_argument("--unit", default="bohr")
     parser.add_argument("--basis", default="sto-3g")
-    parser.add_argument("--driver", default="builtin")
     parser.add_argument("--eri", default="dense")
     parser.add_argument("--ncas", type=int, default=4)
     parser.add_argument("--nelecas", type=int, default=4)
@@ -40,7 +39,7 @@ def parse_args():
     parser.add_argument("--symmetry", choices=("sz", "pg"), default="sz")
     parser.add_argument(
         "--spatial-abelian-mpo",
-        choices=("spatial", "grouped", "direct"),
+        choices=("spatial", "direct", "reference_grouped"),
         default="spatial",
     )
     parser.add_argument("--orb-sym", default=None, help="Comma-separated AbelianPG orbital irreps, e.g. 0,1,0,1")
@@ -84,10 +83,7 @@ def main():
     print(f"      unit   : {args.unit}")
     print(f"      basis  : {args.basis}")
     mol = Molecule(atom=args.atom, unit=args.unit, basis=args.basis)
-    if args.driver.lower() in {"builtin", "native"}:
-        mol.build(driver=args.driver, eri=args.eri)
-    else:
-        mol.build(driver=args.driver)
+    mol.build(eri=args.eri)
 
     print("[2/4] RHF")
     t0 = time.perf_counter()

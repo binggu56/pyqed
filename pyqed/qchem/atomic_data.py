@@ -7,27 +7,46 @@ atomic data from https://github.com/humeniuka/becke_multicenter_integration/blob
 
 """
 
+from pyqed.units import (
+    AVOGADRO_CONSTANT,
+    BOHR_RADIUS_METER,
+    HARTREE_ENERGY_J,
+    au2amu,
+    au2angstrom,
+    au2debye,
+    au2ev,
+    au2fs,
+    au2kcalmol,
+    au2wavenumber,
+    atomic_mass,
+    fine_structure,
+    hartree2nm,
+    kelvin,
+)
+
 atom_names = ["h", "he", "li", "be", "b", "c", "n", "o", "f", "ne", "na", "mg", "al", "si", "p", "s", "cl", "ar", "k", "ca", "sc", "ti", "v", "cr", "mn", "fe", "co", "ni", "cu", "zn", "ga", "ge", "as", "se", "br", "kr", "rb", "sr", "y", "zr", "nb", "mo", "tc", "ru", "rh", "pd", "ag", "cd", "in", "sn", "sb", "te", "i", "xe","cs", "ba", "la", "ce", "pr", "nd", "pm", "sm", "eu", "gd", "tb", "dy", "ho", "er", "tm", "yb", "lu", "hf", "ta", "w", "re", "os", "ir", "pt", "au", "hg", "tl", "pb", "bi", "po", "at", "rn",
 "fr", "ra", "ac", "th", "pa", "u", "np", "pu", "am", "cm", "bk", "cf", "es", "fm", "md", "no", "lr",
-"rf", "db", "sg", "bh", "hs", "mt", "ds", "rg", "uub", "uut", "uuq", "uup", "uuh"]
-bohr_to_angs = 0.529177249
-hartree_to_eV = 27.211396132
-hartree_to_nm = 45.563352527    # lambda (in nm) = hartree_to_nm / (energy in Hartree)
-hartree_to_wavenumbers = 219474.63 # E(in cm^-1) = E(in Hartree) * hartree_to_wavenumbers
-hartree_to_kcalmol = 627.509469
-autime2fs = 0.02418884326505
-kBoltzmann = 3.1668114 * 1.0e-6 # in hartree/Kelvin
-aumass2amu = 1.0/1822.888486192  # convert masses from atomic units to amu
-ebohr_to_debye = 1.0/0.393430307 # 1 Debye = 0.393430307 e*a0
-speed_of_light = 137.035999139   # speed of light in atomic units, inverse of fine structure constant
-                                 # c = 1/alpha
+"rf", "db", "sg", "bh", "hs", "mt", "ds", "rg", "cn", "nh", "fl", "mc", "lv", "ts", "og"]
+bohr_to_angs = au2angstrom
+hartree_to_eV = au2ev
+hartree_to_nm = hartree2nm
+hartree_to_wavenumbers = au2wavenumber
+hartree_to_kcalmol = au2kcalmol
+autime2fs = au2fs
+kBoltzmann = kelvin
+aumass2amu = au2amu
+ebohr_to_debye = au2debye
+speed_of_light = 1.0 / fine_structure
 
 # standard ambient temperature and pressure in a.u.
 satp_temperature = 298.15  # Kelvin
-satp_pressure = 3.3989296754502665e-09 # 100 kPa in Hartree/(bohr)^3
+satp_pressure = 1.0e5 * BOHR_RADIUS_METER**3 / HARTREE_ENERGY_J
 atm_pressure = 1.01325 * satp_pressure # 1 atmosphere in Hartree/(bohr)^3
 
-avogadro_constant = 6.022140857e23
+avogadro_constant = AVOGADRO_CONSTANT
+atom_masses = {
+    symbol.lower(): mass / au2amu for symbol, mass in atomic_mass.items()
+}
 
 # conversion factor for going from  bohr^2 to megabarn (Mb)
 # 1 Mb = 10^(-18) cm^2 = 10^(-18) * (10^-2)^2 m^2 = 10^(-22) m^2

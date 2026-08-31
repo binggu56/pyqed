@@ -22,7 +22,6 @@ class Chain(Cell):
         spin=0,
         vacuum=20.0,
         low_dim_ft_type="inf_vacuum",
-        integral_driver="builtin",
         integral_options=None,
     ):
         super().__init__(
@@ -35,7 +34,6 @@ class Chain(Cell):
             dimension=1,
             vacuum=vacuum,
             low_dim_ft_type=low_dim_ft_type,
-            integral_driver=integral_driver,
             integral_options=integral_options,
         )
 

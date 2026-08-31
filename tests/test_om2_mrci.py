@@ -175,6 +175,7 @@ def test_om2_parameter_set_builds_zero_order_hamiltonian_data():
 
 def test_default_om2_kernel_uses_xh_and_ecp_rows():
     from pyqed.qchem.semiempirical import OM2
+    from pyqed.units import electronvolt
 
     ch = OM2(atom="C 0 0 0; H 0 0 1.1", unit="angstrom")
     data = ch.build_hamiltonian_data()
@@ -184,7 +185,7 @@ def test_default_om2_kernel_uses_xh_and_ecp_rows():
     assert data.hcore[idx["C1:2px"], idx["H2:1s"]] == pytest.approx(0.0, abs=1e-12)
     assert data.hcore[idx["C1:2py"], idx["H2:1s"]] == pytest.approx(0.0, abs=1e-12)
     assert abs(data.hcore[idx["C1:2pz"], idx["H2:1s"]]) > 1e-6
-    assert data.hcore[idx["H2:1s"], idx["H2:1s"]] < -12.64890000 / 27.211386245988
+    assert data.hcore[idx["H2:1s"], idx["H2:1s"]] < -12.64890000 * electronvolt
 
 
 def test_om2_can_enable_three_center_orthogonalization_correction():
@@ -316,3 +317,41 @@ def test_om2_mrci_scanner_returns_result_object():
 
     assert result.e.shape == (1,)
     assert result.ci.shape[1] == 1
+
+
+def test_om2_multistart_diis_converges_pyrazine_reference():
+    from pyqed.qchem.semiempirical import OM2
+
+    atom = (
+        "N 0.000000 0.000002 1.377759; C 0.000000 1.142103 0.692871; "
+        "C 0.000000 1.142100 -0.692877; N 0.000000 -0.000004 -1.377759; "
+        "C 0.000000 -1.142105 -0.692871; C 0.000000 -1.142102 0.692876; "
+        "H 0.000000 2.051465 1.254941; H 0.000000 2.051459 -1.254951; "
+        "H 0.000000 -2.051467 -1.254942; H 0.000000 -2.051461 1.254950"
+    )
+    om2 = OM2(atom=atom, unit="angstrom").run()
+
+    assert om2.reference.converged
+    assert om2.reference.niter < 100
+    assert om2.reference.residual_norm < 1.0e-5
+    assert len(om2.reference.scf_solutions) >= 2
+
+
+def test_om2_cross_geometry_overlap_is_normalized_and_reciprocal():
+    from pyqed.qchem.semiempirical import OM2
+
+    left = OM2(atom="H 0 0 0; H 0 0 0.74", unit="angstrom").run()
+    right = OM2(atom="H 0 0 0; H 0 0 0.76", unit="angstrom").run()
+
+    np.testing.assert_allclose(
+        left.reference.get_ao_cross_overlap(left.reference), np.eye(2), atol=1.0e-10
+    )
+    overlap_lr = left.reference.get_ao_cross_overlap(right.reference)
+    overlap_rl = right.reference.get_ao_cross_overlap(left.reference)
+    np.testing.assert_allclose(overlap_lr, overlap_rl.T, atol=1.0e-12)
+
+    ci_left = left.MECI(nstates=2, ncas=2).run()
+    ci_right = right.MECI(nstates=2, ncas=2).run()
+    state_overlap = ci_left.wavefunction_overlap(ci_right)
+    assert state_overlap.shape == (2, 2)
+    assert np.all(np.isfinite(state_overlap))

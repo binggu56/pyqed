@@ -1,3 +1,4 @@
+from pyqed.units import au2ev
 import numpy as np
 from pyscf import gto, scf, ci
 from tqdm import tqdm
@@ -97,11 +98,11 @@ class ShinMetiu2CISD:
 
         # Convert energies to eV and set the minimum energy to zero for each surface
         E_s0_min = np.nanmin(E_s0)
-        E_s0 = (E_s0 - E_s0_min) * 27.2114
+        E_s0 = (E_s0 - E_s0_min) * au2ev
         E_s1_min = np.nanmin(E_s1)
-        E_s1 = (E_s1 - E_s1_min) * 27.2114
+        E_s1 = (E_s1 - E_s1_min) * au2ev
         E_s2_min = np.nanmin(E_s2)
-        E_s2 = (E_s2 - E_s2_min) * 27.2114
+        E_s2 = (E_s2 - E_s2_min) * au2ev
 
         # Save the PES data in a separate file with individual state energies in eV
         pes_data_eV = {

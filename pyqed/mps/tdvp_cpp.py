@@ -8,6 +8,7 @@ import shlex
 import subprocess
 import sys
 import sysconfig
+import tempfile
 from pathlib import Path
 
 CPP_TDVP_AVAILABLE = False
@@ -66,6 +67,56 @@ def _darwin_compile_setup():
     return cxx, flags
 
 
+def _linux_cblas_setup(cxx):
+    """Find CBLAS flags by compiling a tiny linked probe."""
+    if not sys.platform.startswith("linux"):
+        return []
+    candidates = []
+    explicit = os.environ.get("PYQED_TDVP_BLAS_FLAGS")
+    if explicit:
+        candidates.append(shlex.split(explicit))
+    for package in ("openblas", "blas"):
+        flags = _command_output(["pkg-config", "--cflags", "--libs", package])
+        if flags:
+            candidates.append(shlex.split(flags))
+    prefix = Path(sys.prefix)
+    for library in ("openblas", "blas"):
+        candidates.append(
+            [f"-I{prefix / 'include'}", f"-L{prefix / 'lib'}", f"-l{library}"]
+        )
+        candidates.append([f"-l{library}"])
+    unique = []
+    seen = set()
+    for flags in candidates:
+        key = tuple(flags)
+        if key not in seen:
+            seen.add(key)
+            unique.append(flags)
+    source = r"""
+#include <cblas.h>
+#include <complex>
+int main() {
+    std::complex<double> alpha(1.0, 0.0), beta(0.0, 0.0), value(0.0, 0.0);
+    cblas_zgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                1, 1, 1, &alpha, &value, 1, &value, 1, &beta, &value, 1);
+    return 0;
+}
+"""
+    with tempfile.TemporaryDirectory(prefix="pyqed-cblas-") as directory:
+        directory = Path(directory)
+        probe = directory / "probe.cpp"
+        executable = directory / "probe"
+        probe.write_text(source)
+        for flags in unique:
+            cmd = [*shlex.split(cxx), "-std=c++17", str(probe), "-o", str(executable), *flags]
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+                return ["-DPYQED_TDVP_USE_CBLAS=1", *flags]
+            except Exception:
+                continue
+    return []
+
+
 def _compile_extension():
     global CPP_TDVP_BUILD_ERROR
 
@@ -81,6 +132,9 @@ def _compile_extension():
         CPP_TDVP_BUILD_ERROR = f"source file not found: {source}"
         return None
 
+    darwin_cxx, darwin_flags = _darwin_compile_setup()
+    cxx = os.environ.get("CXX") or darwin_cxx or sysconfig.get_config_var("CXX") or "c++"
+    linux_blas_flags = _linux_cblas_setup(cxx)
     build_dir = Path(os.environ.get("PYQED_MPS_CPP_BUILD", "/private/tmp/pyqed-mps-cpp"))
     build_dir.mkdir(parents=True, exist_ok=True)
     suffix = sysconfig.get_config_var("EXT_SUFFIX") or ".so"
@@ -95,6 +149,7 @@ def _compile_extension():
             sys.version.split()[0],
             sysconfig.get_config_var("CXX") or "",
             os.environ.get("CXX", ""),
+            " ".join(linux_blas_flags),
         ]
     )
     force_rebuild = _enabled(os.environ.get("PYQED_MPS_FORCE_CPP_TDVP_REBUILD", "0"))
@@ -113,8 +168,6 @@ def _compile_extension():
         except Exception:
             pass
 
-    darwin_cxx, darwin_flags = _darwin_compile_setup()
-    cxx = os.environ.get("CXX") or darwin_cxx or sysconfig.get_config_var("CXX") or "c++"
     cmd = shlex.split(cxx)
     cmd.extend(
         [
@@ -129,6 +182,7 @@ def _compile_extension():
             str(source),
             "-o",
             str(ext_path),
+            *linux_blas_flags,
         ]
     )
     if sys.platform == "darwin":

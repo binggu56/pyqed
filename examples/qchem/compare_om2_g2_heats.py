@@ -23,9 +23,10 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pyqed.qchem.semiempirical import OM2, published_om2_molecule_benchmarks
+from pyqed.units import au2kcalmol
 
 
-KCAL_PER_HARTREE = 627.5094740631
+KCAL_PER_HARTREE = au2kcalmol
 ELEMENTS = ("H", "C", "N", "O", "F")
 
 

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .mps import MPS
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 _ROOT_AXIS_SECTOR = ("state_average_root", 0)
@@ -106,7 +106,7 @@ def _align_shared_root_chains(root_sites):
                     target[tuple(slice(0, size) for size in source.shape)] = source
                 data[key] = target
             aligned_roots[root].append(
-                NonabelianTensor(
+                IrrepTensor(
                     data,
                     [leg[:] for leg in common_legs[site]],
                     tensor.dirs[:],
@@ -128,14 +128,14 @@ def fuse_root_center_tensors(center_tensors, *, root_sector=_ROOT_AXIS_SECTOR):
     if not tensors:
         return None
     first = tensors[0]
-    if not isinstance(first, NonabelianTensor) or first.rank != 4:
-        raise ValueError("Root center tensors must be rank-4 NonabelianTensor objects.")
+    if not isinstance(first, IrrepTensor) or first.rank != 4:
+        raise ValueError("Root center tensors must be rank-4 IrrepTensor objects.")
     qns = [leg[:] for leg in first.qns]
     dirs = first.dirs[:]
     fusion_legs = first.fusion_legs[:]
     for tensor in tensors[1:]:
-        if not isinstance(tensor, NonabelianTensor) or tensor.rank != 4:
-            raise ValueError("Root center tensors must be rank-4 NonabelianTensor objects.")
+        if not isinstance(tensor, IrrepTensor) or tensor.rank != 4:
+            raise ValueError("Root center tensors must be rank-4 IrrepTensor objects.")
         if tensor.qns != qns or tensor.dirs != dirs or tensor.fusion_legs != fusion_legs:
             raise ValueError("Root center tensors must share the same block layout.")
 
@@ -171,7 +171,7 @@ def fuse_root_center_tensors(center_tensors, *, root_sector=_ROOT_AXIS_SECTOR):
             "state_average_center_rank": 4,
         }
     )
-    return NonabelianTensor(
+    return IrrepTensor(
         data=data,
         qns=[[root_sector], *qns],
         dirs=[1, *dirs],
@@ -185,8 +185,8 @@ def unfuse_root_center_tensor(center_tensor):
 
     if center_tensor is None:
         return None
-    if not isinstance(center_tensor, NonabelianTensor) or center_tensor.rank != 5:
-        raise ValueError("Fused root center tensor must be a rank-5 NonabelianTensor.")
+    if not isinstance(center_tensor, IrrepTensor) or center_tensor.rank != 5:
+        raise ValueError("Fused root center tensor must be a rank-5 IrrepTensor.")
     nroots = int(center_tensor.metadata.get("state_average_nroots", 0))
     if nroots <= 0:
         for block in center_tensor.data.values():
@@ -205,7 +205,7 @@ def unfuse_root_center_tensor(center_tensor):
     metadata.pop("state_average_nroots", None)
     metadata.pop("state_average_center_rank", None)
     return [
-        NonabelianTensor(
+        IrrepTensor(
             data=data,
             qns=[leg[:] for leg in center_tensor.qns[1:]],
             dirs=center_tensor.dirs[1:],
@@ -230,12 +230,12 @@ class MultiRootMPS:
     weights: np.ndarray | None = None
     center: int | None = None
     center_bond: int | None = None
-    center_tensor: NonabelianTensor | None = None
-    center_tensors: list[NonabelianTensor] | None = None
+    center_tensor: IrrepTensor | None = None
+    center_tensors: list[IrrepTensor] | None = None
     target_sector: object | None = None
 
     def __post_init__(self):
-        self.roots = [MPS.from_sites(root) for root in self.roots]
+        self.roots = [MPS.from_tensors(root) for root in self.roots]
         if not self.roots:
             raise ValueError("MultiRootMPS requires at least one root.")
         nsites = len(self.roots[0])
@@ -273,8 +273,8 @@ class MultiRootMPS:
             self.center_tensors = None
         if self.center_tensor is not None:
             self.center_tensor = self.center_tensor.copy()
-            if not isinstance(self.center_tensor, NonabelianTensor) or self.center_tensor.rank != 5:
-                raise ValueError("MultiRootMPS center_tensor must be a fused rank-5 NonabelianTensor.")
+            if not isinstance(self.center_tensor, IrrepTensor) or self.center_tensor.rank != 5:
+                raise ValueError("MultiRootMPS center_tensor must be a fused rank-5 IrrepTensor.")
             nroots = int(self.center_tensor.metadata.get("state_average_nroots", len(self.roots)))
             if nroots != len(self.roots):
                 raise ValueError("MultiRootMPS center_tensor root axis must match the number of roots.")
@@ -292,7 +292,7 @@ class MultiRootMPS:
         target_sector=None,
     ):
         roots = [
-            MPS.from_sites(root, center=center, target_sector=target_sector)
+            MPS.from_tensors(root, center=center, target_sector=target_sector)
             for root in root_sites
         ]
         return cls(
@@ -311,10 +311,10 @@ class MultiRootMPS:
 
     @property
     def sites(self):
-        return self.roots[0].sites
+        return self.roots[0].tensors
 
     def root_site_lists(self):
-        return [[site.copy() for site in root.sites] for root in self.roots]
+        return [[site.copy() for site in root.tensors] for root in self.roots]
 
     def copy(self):
         return MultiRootMPS(
@@ -415,7 +415,7 @@ class MultiRootMPS:
         initial_center = 0 if center == nsites - 1 else nsites - 1
         root_sites = [
             mixed_canonicalize_sites(
-                root.sites,
+                root.tensors,
                 initial_center,
                 max_bond=None,
                 cutoff=0.0,
@@ -453,7 +453,7 @@ class MultiRootMPS:
                 root_sites[root][bond] = left
                 root_sites[root][bond + 1] = right
         self.roots = [
-            MPS.from_sites(
+            MPS.from_tensors(
                 sites,
                 center=center,
                 target_sector=self.target_sector,

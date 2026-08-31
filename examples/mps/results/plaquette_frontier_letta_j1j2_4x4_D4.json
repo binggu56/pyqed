@@ -1,0 +1,215 @@
+{
+  "model": {
+    "shape": [
+      4,
+      4
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "target_two_sz": 0
+  },
+  "ansatz": {
+    "kind": "microscopic plaquette-ordered frontier LETTA",
+    "block_shape": [
+      2,
+      2
+    ],
+    "microscopic_sites": 16,
+    "microscopic_tensors": 16,
+    "site_order": [
+      0,
+      1,
+      7,
+      6,
+      2,
+      3,
+      5,
+      4,
+      10,
+      11,
+      13,
+      12,
+      8,
+      9,
+      15,
+      14
+    ],
+    "blocks": [
+      [
+        0,
+        1,
+        2,
+        3
+      ],
+      [
+        4,
+        5,
+        6,
+        7
+      ],
+      [
+        8,
+        9,
+        10,
+        11
+      ],
+      [
+        12,
+        13,
+        14,
+        15
+      ]
+    ],
+    "original_blocks": [
+      [
+        0,
+        1,
+        7,
+        6
+      ],
+      [
+        2,
+        3,
+        5,
+        4
+      ],
+      [
+        10,
+        11,
+        13,
+        12
+      ],
+      [
+        8,
+        9,
+        15,
+        14
+      ]
+    ],
+    "tie_graph": "nearest",
+    "tie_edges": [
+      [
+        1,
+        4
+      ],
+      [
+        2,
+        12
+      ],
+      [
+        3,
+        6
+      ],
+      [
+        3,
+        13
+      ],
+      [
+        6,
+        8
+      ],
+      [
+        7,
+        9
+      ],
+      [
+        8,
+        13
+      ],
+      [
+        10,
+        15
+      ]
+    ],
+    "tie_count": 8,
+    "parent_sets": [
+      [],
+      [
+        4
+      ],
+      [
+        12
+      ],
+      [
+        6,
+        13
+      ],
+      [],
+      [],
+      [
+        8
+      ],
+      [
+        9
+      ],
+      [
+        13
+      ],
+      [],
+      [
+        15
+      ],
+      [],
+      [],
+      [],
+      [],
+      []
+    ],
+    "intra_plaquette_ties": false,
+    "boundary_tie_dimension": 2
+  },
+  "solver": {
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ],
+    "optimizer": "two_site",
+    "solver": "matrix_free",
+    "pair_backend": "block",
+    "frontier_backend": "identity_block",
+    "sweeps": 4,
+    "initialization": "exact U(1) MPS lift",
+    "warm_sweeps": 12,
+    "tie_noise": 0.0,
+    "symmetry_parameters": 187,
+    "dense_parameters": 752,
+    "setup_seconds": 1.51983074999589,
+    "sweep_seconds": 10.291983083006926,
+    "random_mps_energy": 0.31007617810278965,
+    "warm_mps_energy": -6.784892173114835,
+    "initial_energy": -6.784892173114833,
+    "lift_energy_error": 1.7763568394002505e-15,
+    "energy": -6.960240882289801,
+    "energy_per_site": -0.43501505514311256,
+    "history": [
+      -6.946855493524326,
+      -6.956410902738305,
+      -6.959563470394222,
+      -6.960240882289801
+    ],
+    "peak_frontier_elements": 4976,
+    "cached_environment_elements": 27804
+  },
+  "exact": {
+    "energy": -7.505556950081068,
+    "seconds": 0.1581101669871714,
+    "energy_error": 0.5453160677912674,
+    "energy_error_per_site": 0.03408225423695421
+  }
+}

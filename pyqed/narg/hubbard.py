@@ -252,6 +252,237 @@ class HubbardMF:
         return self.mol.energy_nuc()
 
 
+class HubbardMPONARG:
+    """Number-symmetric Hubbard NARG with a graph-frontier MPO environment."""
+
+    def __init__(
+        self,
+        hamiltonian: MPOHamiltonian,
+        *,
+        D=20,
+        n0=4,
+        nstates=1,
+        dressing=None,
+        chi=None,
+        frame_adapt_tol=None,
+        frame_max_dim=None,
+        frame_expand_dim=1,
+        **options,
+    ):
+        if options:
+            unknown = ", ".join(sorted(options))
+            raise TypeError(f"unsupported Hubbard MPO-NARG options: {unknown}")
+        if hamiltonian.symmetry != "number":
+            raise NotImplementedError("Hubbard MPO-NARG currently requires symmetry='number'.")
+        if hamiltonian.basis != "site":
+            raise NotImplementedError("Hubbard MPO-NARG currently requires basis='site'.")
+        if hamiltonian.model is None:
+            raise ValueError("Hubbard MPO-NARG requires its originating Hubbard model.")
+        self.hamiltonian = hamiltonian
+        self.model = hamiltonian.model
+        self.D = int(D)
+        self.n0 = int(n0)
+        self.nstates = int(nstates)
+        self.dressing = dressing
+        self.chi = chi
+        self.frame_adapt_tol = frame_adapt_tol
+        self.frame_max_dim = frame_max_dim
+        self.frame_expand_dim = int(frame_expand_dim)
+        self.energy = None
+        self.e_tot = None
+        self.vectors = None
+        self.history = []
+        self.detached_history = []
+        self.success = False
+        self.message = "not run"
+
+    def run(self, **options):
+        if options:
+            unknown = ", ".join(sorted(options))
+            raise TypeError(f"unsupported Hubbard MPO-NARG run options: {unknown}")
+        from pyqed.mps.fermion import SpinHalfFermionChain
+        from pyqed.narg.qchem.abelian import (
+            JW,
+            LOCAL_QN,
+            add_local_kron_blocks_hc_lloo,
+            add_local_kron_blocks_lloo,
+            cdd,
+            cdu,
+            cd,
+            charge_diagonalize,
+            cu,
+            detached_frame_transition_projector,
+            diagonalize_by_qn,
+            feasible_branch_qns,
+            feasible_qns,
+            primitive_charge_labels,
+            project_two_site_operator,
+        )
+
+        model = self.model
+        nsites = int(model.nsites)
+        n0 = min(max(1, self.n0), nsites)
+
+        def dense(operator):
+            return operator.toarray() if hasattr(operator, "toarray") else np.asarray(operator)
+
+        h1e, eri = model.integrals(basis="site")
+        initial = SpinHalfFermionChain(
+            h1e[:n0, :n0],
+            eri[:n0, :n0, :n0, :n0],
+            nelec=model.nelec,
+        )
+        initial.jordan_wigner(forward=False)
+        block_h = np.asarray(dense(initial.H), dtype=complex)
+        block_qn = primitive_charge_labels(n0)
+        bonds = {tuple(sorted((int(i), int(j)))) for i, j in model.bonds}
+
+        def has_future(site, prefix):
+            return any(site in bond and max(bond) >= prefix for bond in bonds)
+
+        frontier = {
+            site: (dense(initial.Cdu[site]), dense(initial.Cdd[site]))
+            for site in range(n0)
+            if has_future(site, n0)
+        }
+        target_qn = (sum(model.nelec), model.spin)
+        dressing = (
+            "none"
+            if self.dressing is None
+            else str(self.dressing).lower().replace("-", "_")
+        )
+        if dressing in {"detached", "detached_frame"}:
+            dressing = "detached_frames"
+        if dressing not in {"none", "detached_frames"}:
+            raise ValueError("Hubbard MPO-NARG dressing must be None or 'detached_frames'.")
+        chi = self.chi
+        if dressing == "detached_frames":
+            frame_space = len(LOCAL_QN) * self.D
+            chi = 2 * frame_space if chi is None else int(chi)
+            if not frame_space < chi <= len(LOCAL_QN) * frame_space:
+                raise ValueError(
+                    f"detached_frames requires {frame_space} < chi <= "
+                    f"{len(LOCAL_QN) * frame_space} for D={self.D}."
+                )
+
+        for site in range(n0, nsites):
+            old_dim = block_h.shape[0]
+            h_lloo = np.zeros(
+                (4, 4, old_dim, old_dim),
+                dtype=np.result_type(block_h, complex),
+            )
+            add_local_kron_blocks_lloo(h_lloo, block_h, np.eye(4))
+            onsite = h1e[site, site] * (cdu @ cu + cdd @ cd)
+            onsite += eri[site, site, site, site] * (cdu @ cu) @ (cdd @ cd)
+            add_local_kron_blocks_lloo(h_lloo, np.eye(old_dim), onsite)
+            for previous, (create_up, create_down) in frontier.items():
+                coefficient = h1e[previous, site]
+                if abs(coefficient) == 0:
+                    continue
+                add_local_kron_blocks_hc_lloo(
+                    h_lloo, create_up, JW @ cu, coefficient
+                )
+                add_local_kron_blocks_hc_lloo(
+                    h_lloo, create_down, JW @ cd, coefficient
+                )
+            primitive_qn = (
+                block_qn[:, None, :] + LOCAL_QN[None, :, :]
+            ).reshape((-1, LOCAL_QN.shape[1]))
+            output_allowed = feasible_qns(target_qn, site + 1, nsites)
+
+            diagnostics = None
+            if dressing == "detached_frames":
+                frame_allowed = {
+                    tuple(np.asarray(output) - local)
+                    for output in output_allowed
+                    for local in LOCAL_QN
+                }
+                block_h, projector, output_qn, diagnostics = (
+                    detached_frame_transition_projector(
+                        h_lloo,
+                        block_qn,
+                        frame_dim=min(self.D, old_dim),
+                        bond_dim=chi,
+                        allowed_frame_qn=frame_allowed,
+                        allowed_output_qn=output_allowed,
+                        adapt_tol=self.frame_adapt_tol,
+                        max_frame_rank=self.frame_max_dim,
+                        expand_dim=self.frame_expand_dim,
+                    )
+                )
+                self.detached_history.append(dict(diagnostics))
+            else:
+                branches = []
+                labels = []
+                for local_state, local_qn in enumerate(LOCAL_QN):
+                    allowed = feasible_branch_qns(
+                        target_qn, site, nsites, local_qn
+                    )
+                    _energies, vectors, qn = diagonalize_by_qn(
+                        h_lloo[local_state, local_state],
+                        block_qn,
+                        min(self.D, old_dim),
+                        allowed_qn=allowed,
+                        allow_empty=True,
+                    )
+                    branches.append(vectors)
+                    labels.append(qn + local_qn)
+                output_dim = sum(branch.shape[1] for branch in branches)
+                projector = np.zeros((old_dim, 4, output_dim), dtype=complex)
+                output_qn = np.empty((output_dim, LOCAL_QN.shape[1]), dtype=int)
+                offset = 0
+                for local_state, (branch, qn) in enumerate(zip(branches, labels)):
+                    width = branch.shape[1]
+                    projector[:, local_state, offset : offset + width] = branch
+                    output_qn[offset : offset + width] = qn
+                    offset += width
+                full_h = np.ascontiguousarray(
+                    h_lloo.transpose(2, 0, 3, 1)
+                ).reshape(old_dim * 4, old_dim * 4)
+                matrix = projector.reshape(old_dim * 4, output_dim)
+                block_h = matrix.conj().T @ (full_h @ matrix)
+                block_h = 0.5 * (block_h + block_h.T.conj())
+
+            next_frontier = {}
+            for previous, (create_up, create_down) in frontier.items():
+                if has_future(previous, site + 1):
+                    next_frontier[previous] = (
+                        project_two_site_operator(create_up, JW, projector),
+                        project_two_site_operator(create_down, JW, projector),
+                    )
+            if has_future(site, site + 1):
+                identity = np.eye(old_dim)
+                next_frontier[site] = (
+                    project_two_site_operator(identity, cdu, projector),
+                    project_two_site_operator(identity, cdd, projector),
+                )
+            frontier = next_frontier
+            block_qn = output_qn
+            self.history.append(
+                {
+                    "site": site,
+                    "retained_dim": int(block_h.shape[0]),
+                    "frontier_width": len(frontier),
+                    "environment_matrices": 1 + 2 * len(frontier),
+                    "detached": diagnostics is not None,
+                }
+            )
+
+        energies, vectors, final_qn = charge_diagonalize(
+            block_h,
+            block_qn,
+            self.nstates,
+            allowed_qn={target_qn},
+        )
+        self.energy = energies
+        self.e_tot = energies
+        self.vectors = vectors
+        self.final_qn = final_qn
+        self.success = True
+        self.message = "converged"
+        return self.e_tot, self.vectors
+
+
 @dataclass
 class Hubbard:
     """Spinful Hubbard model with a direct qchem-NARG launcher."""
@@ -356,7 +587,11 @@ class Hubbard:
         symmetry = _resolve_symmetry(symmetry, default="number")
         form = normalize_form(form)
         if form == "auto":
-            form = "integrals"
+            form = (
+                "mpo"
+                if basis == "site" and symmetry == "number" and orbital_blocks is None
+                else "integrals"
+            )
         if symmetry == "momentum":
             raise NotImplementedError(
                 "symmetry='momentum' is reserved for total-K sectors and is not implemented yet."
@@ -367,6 +602,7 @@ class Hubbard:
             "mu": float(self.mu),
             "bonds": tuple(self.bonds),
             "order": str(order),
+            "representation": "graph_frontier" if form == "mpo" else "integrals",
         }
         if form == "integrals":
             h1e, eri = self.integrals(basis=basis, order=order)
@@ -409,7 +645,7 @@ class Hubbard:
         *,
         basis: str = "site",
         symmetry=None,
-        form: str = "integrals",
+        form: str = "auto",
         order: str = "energy",
         orbital_blocks=None,
         run: bool = True,
@@ -420,7 +656,11 @@ class Hubbard:
 
         if "blocks" in options:
             raise TypeError("Hubbard.NARG(..., blocks=...) was removed; use symmetry=... instead.")
-        symmetry = _resolve_symmetry(symmetry, default="spin")
+        form = normalize_form(form)
+        symmetry = _resolve_symmetry(
+            symmetry,
+            default="number" if form == "mpo" else "spin",
+        )
         if symmetry == "spin":
             options.setdefault("target_j2", abs(self.spin))
         hamiltonian = self.H(
@@ -444,6 +684,7 @@ class Hubbard:
 
 __all__ = [
     "Hubbard",
+    "HubbardMPONARG",
     "HubbardMF",
     "HubbardMol",
     "chain_bonds",

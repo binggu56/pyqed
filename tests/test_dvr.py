@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from pyqed.dvr import DVR, HermiteDVR, LegendreDVR, SineDVR
+from pyqed.dvr import DVR, ExponentialDVR, HermiteDVR, LegendreDVR, SineDVR
 
 
 def test_dvr_builds_named_product_grid():
@@ -59,6 +59,36 @@ def test_dvr_combines_existing_one_dimensional_axes():
     assert dvr.shape == (3, 4)
     assert dvr.mass == (2.0, 5.0)
     assert dvr.kinetic().shape == (12, 12)
+
+
+def test_exponential_dvr_has_consistent_periodic_momentum_and_kinetic():
+    dvr = ExponentialDVR(3, L=2.0 * np.pi, x0=np.pi, mass=2.5)
+    momentum = dvr.momentum()
+
+    assert np.all(np.isfinite(momentum))
+    np.testing.assert_allclose(momentum, momentum.conj().T, atol=1.0e-14)
+    np.testing.assert_allclose(
+        dvr.t(), momentum @ momentum / (2.0 * dvr.mass), atol=1.0e-13
+    )
+
+
+def test_exponential_dvr_supports_even_permutation_grids():
+    dvr = ExponentialDVR(npts=12, L=2.0 * np.pi, x0=np.pi, mass=2.0)
+
+    assert dvr.npts == 12
+    np.testing.assert_allclose(dvr.momentum(), dvr.momentum().conj().T)
+    np.testing.assert_allclose(dvr.t(), dvr.t().conj().T)
+    assert np.all(np.isfinite(dvr.momentum()))
+
+
+@pytest.mark.parametrize("npts", (11, 12))
+def test_exponential_dvr_toeplitz_descriptor_matches_dense_kinetic(npts):
+    dvr = ExponentialDVR(npts=npts, L=7.0, mass=2.3)
+    column, row = dvr.kinetic_toeplitz()
+
+    assert column.shape == row.shape == (npts,)
+    np.testing.assert_allclose(column, dvr.t()[:, 0])
+    np.testing.assert_allclose(row, dvr.t()[0])
 
 
 def test_hermite_dvr_uses_harmonic_oscillator_scaling():

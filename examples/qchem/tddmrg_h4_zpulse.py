@@ -10,7 +10,6 @@ import ultraplot as uplt
 from pyqed.qchem import Molecule, RTTDHF, gaussian_pulse
 from pyqed.qchem.hf import RHF
 from pyqed.qchem.dmrg import TDDMRG
-from pyqed.mps.mps import expect_mps
 
 
 def main():
@@ -21,7 +20,7 @@ def main():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
     omega = 0.6
 
@@ -45,7 +44,7 @@ def main():
     mu_z_mpo = td.get_interaction_mpo(axis=2)
     center = mol.center_of_mass()
     nuclear_mu_z = np.sum(mol.atom_charges() * (mol.atom_coords()[:, 2] - center[2]))
-    mu0_electronic = float(np.real(expect_mps(psi0.factors, mu_z_mpo.factors)))
+    mu0_electronic = float(np.real(psi0.expectation(mu_z_mpo)))
     td.run(
         dt=0.05,
         steps=10,

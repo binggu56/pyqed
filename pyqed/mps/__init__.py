@@ -51,7 +51,7 @@ from .cmps import (  # noqa: F401
 
 # Non-Abelian prototype exports (kept available even without SciPy).
 from .nonabelian import (  # noqa: F401
-    NonabelianTensor,
+    IrrepTensor,
     SiteOperator,
     MPS as NonabelianMPS,
     MPO as NonabelianMPO,
@@ -148,6 +148,7 @@ try:  # pragma: no cover
         two_site_dmrg,
     )
     from .mpo import nearest_neighbor_mpo, sop_to_mpo  # noqa: F401
+    from .functional import FunctionalTT  # noqa: F401
     from .dmrg import (  # noqa: F401
         DMRG,
         dmrg_matvec_options,
@@ -156,10 +157,12 @@ try:  # pragma: no cover
     from .tdmps import TDMPS  # noqa: F401
     from .tdvp import (  # noqa: F401
         SymmetricTDVP,
+        TDVPEngine,
         block_sparse_one_site_tdvp_step,
         block_sparse_two_site_tdvp_step,
         one_site_tdvp_step,
         spatial_fermion_number_sz_sectors,
+        two_site_tdvp_sum_step,
         two_site_tdvp_step,
     )
     from .first_quantization import Chain, FiniteDimLocalBasis  # noqa: F401

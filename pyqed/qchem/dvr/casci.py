@@ -460,14 +460,6 @@ def overlap(cibra, ciket, h1e=None, h2e=None, return_tdm1=False):
     '''
     # nstates = len(cibra) + 1
 
-    # overlap matrix between MOs at different geometries
-    # if s is None:
-
-    #     from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
-    #     s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
-    #     s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
-
     try:
         assert(isinstance(cibra.mf, RHF1D))
     except:

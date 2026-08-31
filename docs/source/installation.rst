@@ -48,6 +48,28 @@ C/C++ toolchain and opt in explicitly:
 
    PYQED_BUILD_EXTENSIONS=1 python -m pip install .
 
+Native integral extensions use link-time optimization by default. Set
+``PYQED_LTO=0`` only when diagnosing a toolchain that cannot link LTO objects.
+For a machine-local build, ``PYQED_NATIVE_CPU=1`` also enables the compiler's
+host-specific SIMD instruction set; do not use that option for redistributable
+wheels.
+
+The native DMRG Davidson backend detects OpenMP automatically.  Linux builds
+normally use ``-fopenmp``.  On macOS, install Homebrew ``libomp`` or provide a
+runtime with ``PYQED_OPENMP_PREFIX``.  Automatic discovery prefers Homebrew
+over the active Conda environment because an older Conda runtime can be placed
+first on the Python extension search path.  Both the install-time SU(2) kernel
+and runtime-built dense Davidson kernel link the selected runtime by its full
+path so they cannot silently select different ``libomp.dylib`` files.
+``PYQED_MPS_OPENMP=0`` disables OpenMP, while ``PYQED_MPS_OPENMP=1`` makes a
+missing runtime a build error.  Runtime thread selection is explicit through
+``DMRG(..., n_threads=N)`` rather than solely through ``OMP_NUM_THREADS``.
+
+For a redistributable macOS wheel, build against a ``libomp`` whose deployment
+target covers the supported macOS versions and bundle or repair that runtime
+as part of the wheel.  A machine-local Homebrew path is intentionally local to
+that build host.
+
 Record the commit for any research result:
 
 .. code-block:: bash
@@ -64,7 +86,7 @@ Run this small calculation after installation:
 
 .. code-block:: bash
 
-   python -c "from pyqed.qchem import Molecule; m=Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g'); m.build(driver='builtin', eri='auto'); x=m.RHF().run(); print(x.converged, x.e_tot)"
+   python -c "from pyqed.qchem import Molecule; m=Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g'); m.build(eri='auto'); x=m.RHF().run(); print(x.converged, x.e_tot)"
 
 The command should finish with a converged flag and a finite total energy.  If
 it fails, include the command and full output in a support request.

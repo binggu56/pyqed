@@ -3,6 +3,7 @@ import pytest
 
 from pyqed.qchem import Molecule
 from pyqed.qchem.basis_derivatives import (
+    _directional_eri_derivative_scalar_cpp,
     _directional_eri_derivatives_cpp,
     _directional_one_electron_derivatives_cpp,
     compact_eri_veff,
@@ -24,7 +25,7 @@ def _h2(z):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     return mol
 
 
@@ -138,7 +139,7 @@ def test_pyscf_directional_derivatives_match_native_with_p_shells():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     directions = np.random.default_rng(12).normal(size=(2, mol.natom, 3))
 
     for order in (1, 2):
@@ -185,7 +186,7 @@ def test_cpp_directional_one_electron_derivatives_match_python_reference():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     mol.builtin_parallel = True
     mol.builtin_parallel_min_nao = 0
     mol.builtin_eri_workers = 2
@@ -215,7 +216,7 @@ def test_cpp_directional_eri_derivatives_match_python_reference():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     mol.builtin_parallel = True
     mol.builtin_parallel_min_nao = 0
     mol.builtin_eri_workers = 2
@@ -225,6 +226,43 @@ def test_cpp_directional_eri_derivatives_match_python_reference():
         actual = _directional_eri_derivatives_cpp(mol, directions, order)
         reference = directional_eri_derivatives(
             mol, directions, order=order, backend="python"
+        )
+        np.testing.assert_allclose(actual, reference, atol=2.0e-10, rtol=1.0e-10)
+
+
+def test_cpp_directional_eri_scalar_contraction_matches_dense_p_shells():
+    from pyqed.qchem.basis import _integrals_cpp
+
+    if _integrals_cpp is None or not hasattr(
+        _integrals_cpp, "compute_directional_eri_derivative_scalar"
+    ):
+        pytest.skip("C++ derivative-contraction extension is unavailable")
+
+    mol = Molecule(
+        atom="O 0 0 0; H 0 -1.43233673 1.10715266; H 0 1.43233673 1.10715266",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    mol.build(eri="dense", aosym="s1")
+    rng = np.random.default_rng(41)
+    directions = rng.normal(size=(2, mol.natom, 3))
+    dm_left = rng.normal(size=(mol.nao, mol.nao))
+    dm_right = rng.normal(size=(mol.nao, mol.nao))
+
+    for order in (1, 2):
+        derivative = _directional_eri_derivatives_cpp(mol, directions, order)
+        veff = np.einsum("...pqrs,rs->...pq", derivative, dm_right, optimize=True)
+        veff -= 0.5 * np.einsum(
+            "...prqs,rs->...pq", derivative, dm_right, optimize=True
+        )
+        reference = np.einsum("pq,...pq->...", dm_left, veff, optimize=True)
+        actual = _directional_eri_derivative_scalar_cpp(
+            mol,
+            directions,
+            dm_left,
+            dm_right,
+            order=order,
+            workers=2,
         )
         np.testing.assert_allclose(actual, reference, atol=2.0e-10, rtol=1.0e-10)
 
@@ -296,7 +334,7 @@ def test_native_directional_eri_keeps_cross_shell_pair_components():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     directions = np.zeros((1, mol.natom, 3))
     directions[0, 0, 2] = 1.0
 
@@ -414,7 +452,7 @@ def test_cpp_one_index_derivatives_match_python_with_p_shells():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
 
     for kernel in ("overlap", "kinetic"):
         for index in ("bra", "ket"):
@@ -498,7 +536,7 @@ def test_builtin_derivatives_follow_spherical_ao_transform_h2o():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
 
     ds = one_electron_derivatives(mol, "overlap", order=1)
     dh = one_electron_derivatives(mol, "hcore", order=1)

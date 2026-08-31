@@ -13,7 +13,7 @@ def _build_h2_frozen_grid(bond_length, xc='svwn', ngrid=9):
         unit='bohr',
         basis='sto-3g',
     )
-    mol.build(driver='gbasis')
+    mol.build()
 
     coords, weights = cartesian_box_grid((-4, 4), (-4, 4), (-4, 4), ngrid)
     grid = AOGrid.from_molecule(mol, coords, weights, with_grad=True)
@@ -32,7 +32,7 @@ def _build_h2_atom_centered_grid(bond_length, xc='svwn', n_radial=8, n_angular=1
         unit='bohr',
         basis='sto-3g',
     )
-    mol.build(driver='gbasis')
+    mol.build()
 
     grid = AOGrid.atom_centered(
         mol,

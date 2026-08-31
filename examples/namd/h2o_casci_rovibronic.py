@@ -98,7 +98,6 @@ class SACASSCFScanner:
         self.max_cycle = args.casscf_max_cycle
         self.verbose = args.verbose
         self.optimizer = args.casscf_optimizer
-        self.driver = args.qchem_driver
         self.eri = args.eri
         self.mol = Molecule(atom=h2o_frame(), basis=args.basis, charge=0, spin=0, unit="bohr")
 
@@ -110,7 +109,7 @@ class SACASSCFScanner:
     def __call__(self, xyz):
         atom = [[symbol, tuple(coord)] for symbol, coord in zip(self.symbols, xyz)]
         mol = Molecule(atom=atom, basis=self.basis, charge=0, spin=0, unit="bohr")
-        mol.build(driver=self.driver, eri=self.eri)
+        mol.build(eri=self.eri)
         mf = mol.RHF(verbose=0).run(max_cycle=100)
         weights = np.ones(self.nstates) / self.nstates
         return (
@@ -255,7 +254,6 @@ def main():
     p.add_argument("--worker-threads", type=int, default=1)
     p.add_argument("--casscf-max-cycle", type=int, default=20)
     p.add_argument("--casscf-optimizer", default="AH")
-    p.add_argument("--qchem-driver", default="builtin")
     p.add_argument("--eri", default="dense")
     p.add_argument("--verbose", type=int, default=0)
     p.add_argument("--reuse-cache", action="store_true")

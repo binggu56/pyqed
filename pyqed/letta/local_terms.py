@@ -618,11 +618,8 @@ class LocalHamiltonian:
         if local_charges is not None and len(local_charges) != len(self.dims):
             raise ValueError("local charge metadata must cover every site.")
         self.local_charges = local_charges
-        self.physical_legs = (
-            tuple(
-                site.physical_leg if hasattr(site, "physical_leg") else None
-                for site in self.sites
-            )
+        self.legs = (
+            tuple(site.leg for site in self.sites)
             if self.sites is not None
             else None
         )

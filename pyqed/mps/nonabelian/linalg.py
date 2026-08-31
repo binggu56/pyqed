@@ -350,6 +350,7 @@ def truncate_reduced_svds(
     *,
     cutoff=1.0e-10,
     max_bond=None,
+    max_truncation_error=None,
     mode="reduced",
     retain_sector_topology=False,
 ):
@@ -360,6 +361,7 @@ def truncate_reduced_svds(
         normalized = {svd.sector: svd for svd in sector_svds}
 
     sv_list = []
+    full_sq_norm = 0.0
     for sector, svd in normalized.items():
         if sector != svd.sector:
             raise ValueError(
@@ -367,12 +369,13 @@ def truncate_reduced_svds(
                 f"SVD sector {svd.sector!r}."
             )
         sv_list.extend(svd.singular_items(cutoff=cutoff))
+        values = np.asarray(svd.singular_values, dtype=float).reshape(-1)
+        full_sq_norm += svd.state_weight * float(np.dot(values, values))
 
     if not sv_list and not retain_sector_topology:
         raise ValueError("All non-Abelian singular values were truncated.")
 
     sv_list.sort(reverse=True, key=lambda item: item[3] * item[0] ** 2)
-    full_sq_norm = sum(weight * sval**2 for sval, _, _, weight in sv_list)
     if retain_sector_topology:
         topology_items = []
         for sector in sorted(normalized):
@@ -451,10 +454,35 @@ def truncate_reduced_svds(
                 )
     else:
         kept_items = select_kept_singular_values(sv_list, max_bond, mode=mode)
+    if max_truncation_error is not None:
+        max_truncation_error = float(max_truncation_error)
+        if not 0.0 <= max_truncation_error < 1.0:
+            raise ValueError("max_truncation_error must lie in [0, 1).")
+        if retain_sector_topology:
+            raise ValueError(
+                "max_truncation_error does not support retain_sector_topology."
+            )
+        target_sq_norm = (1.0 - max_truncation_error) * full_sq_norm
+        adaptive_items = []
+        adaptive_sq_norm = 0.0
+        for item in sorted(
+            kept_items,
+            reverse=True,
+            key=lambda value: value[3] * value[0] ** 2,
+        ):
+            adaptive_items.append(item)
+            adaptive_sq_norm += item[3] * item[0] ** 2
+            if adaptive_sq_norm >= target_sq_norm:
+                break
+        kept_items = adaptive_items
     if not kept_items:
         raise ValueError("All non-Abelian singular values were truncated.")
     kept_sq_norm = sum(weight * sval**2 for sval, _, _, weight in kept_items)
-    trunc_err = 0.0 if full_sq_norm <= 1.0e-15 else 1.0 - kept_sq_norm / full_sq_norm
+    trunc_err = (
+        0.0
+        if full_sq_norm <= 1.0e-15
+        else float(np.clip(1.0 - kept_sq_norm / full_sq_norm, 0.0, 1.0))
+    )
 
     kept_indices_by_sector = {}
     for _sval, sector, idx, _weight in kept_items:

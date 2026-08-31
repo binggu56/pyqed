@@ -7,12 +7,11 @@ from pyqed.qchem.dmrg import TDDMRG, gaussian_pulse
 from pyqed.qchem.dmrg.tddmrg import _DenseStateTransformOperator, _mpo_to_dense_matrix
 from pyqed.mps import MPS
 from pyqed.mps.decompose import tt_to_tensor
-from pyqed.mps.mps import expect_mps
 
 
 def test_tddmrg_runs_from_converged_ground_state():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
@@ -36,9 +35,204 @@ def test_tddmrg_runs_from_converged_ground_state():
     assert reversal["state_error"] < 1.0e-10
 
 
+def test_qchem_tddmrg_defaults_to_block_sparse_tdvp(monkeypatch):
+    import pyqed.qchem.dmrg.tddmrg as qchem_tddmrg_module
+
+    def _fail_dense_mps_conversion(*args, **kwargs):
+        raise AssertionError("qchem TDVP should keep the native QN MPS initial state")
+
+    monkeypatch.setattr(qchem_tddmrg_module, "symmetric_to_dense", _fail_dense_mps_conversion)
+
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    mol.build()
+    mf = RHF(mol).run()
+
+    td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
+    td.optimize_ground_state(
+        D=8,
+        nstates=1,
+        nsweeps=4,
+        symmetry_list=["charge", "sz"],
+        compute_s2=False,
+    )
+    td._use_exact_dense_td = lambda: False
+
+    td.run(
+        dt=0.01,
+        steps=1,
+        e_ops=[],
+        integrator="tdvp",
+        progress=False,
+        measure_observables=False,
+        track_energy=False,
+        D=4,
+    )
+
+    assert td.tdmps.projection == "block-sparse"
+    assert hasattr(td.final_state.factors[0], "qns")
+
+
+def test_tddmrg_su2_uses_native_reduced_tdvp2():
+    from pyqed.mps.nonabelian import MPS as NonabelianMPS
+
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
+    mol.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mf = RHF(mol).run()
+
+    td = TDDMRG(
+        mf,
+        ncas=2,
+        nelecas=2,
+        init_guess="hf",
+        symmetry="su2",
+    )
+    td.optimize_ground_state(
+        D=8,
+        nsweeps=1,
+        symmetry="su2",
+        compute_s2=False,
+        require_convergence=False,
+        conv_tol=-1.0,
+    )
+
+    assert td._resolve_projection("tdvp2", None) == "su2"
+    assert isinstance(td.ground_state, NonabelianMPS)
+
+    td.run(
+        dt=0.001,
+        steps=1,
+        e_ops=["H"],
+        integrator="tdvp2",
+        progress=False,
+        D=8,
+    )
+
+    assert isinstance(td.final_state, NonabelianMPS)
+    assert td.projection == "su2"
+    assert td.tdmps is None
+    assert td.tdvp_moving_environment_stats["persistent"] is True
+    assert td.tdvp_moving_environment_stats["boundary_side_reuses"] > 0
+    np.testing.assert_allclose(td.pre_normalization_norm2[0], 1.0, atol=1.0e-10)
+    assert abs(td.energy_drift[-1]) < 1.0e-10
+
+    reversal = td.time_reversal_error(dt=0.001, steps=1, integrator="tdvp2", D=8)
+    assert reversal["native_reduced"] is True
+    assert reversal["state_error"] < 1.0e-10
+
+    field = lambda time: np.array([0.0, 0.0, 1.0e-3 * (1.0 + time)])
+    td.run(
+        dt=0.001,
+        steps=1,
+        e_ops=["mu_z"],
+        field=field,
+        integrator="tdvp2",
+        progress=False,
+        D=8,
+    )
+    assert td._native_interaction_mpo_cache is not None
+    assert td.tdvp_moving_environment_stats["persistent"] is True
+    assert td.tdvp_moving_environment_stats["hamiltonian_numeric_refreshes"] > 0
+    assert td.tdvp_moving_environment_stats["norm_boundary_side_reuses"] > 0
+    static = td._native_su2_affine_static_hamiltonian()
+    interactions = td._native_su2_interactions()
+    dynamic_a = td._native_su2_dynamic_hamiltonian(
+        static,
+        interactions,
+        np.array([0.0, 0.0, 1.0e-3]),
+    )
+    dynamic_b = td._native_su2_dynamic_hamiltonian(
+        static,
+        interactions,
+        np.array([0.0, 0.0, 2.0e-3]),
+    )
+    assert dynamic_a[0] is not dynamic_b[0]
+    assert all(left is right for left, right in zip(dynamic_a[1:], dynamic_b[1:]))
+    np.testing.assert_allclose(td.fields[0], field(0.001))
+    assert td.observables.shape == (1, 1)
+
+    driven_reversal = td.time_reversal_error(
+        dt=0.001,
+        steps=1,
+        field=field,
+        integrator="tdvp2",
+        D=8,
+    )
+    assert driven_reversal["state_error"] < 1.0e-10
+
+
+def test_tddmrg_su2_driven_four_orbital_uses_normal_complementary_engine():
+    from pyqed.mps.nonabelian import MPS as NonabelianMPS
+
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 1.6; H 0 0 3.2; H 0 0 4.8",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    mol.build(eri="dense",
+        aosym="s1",
+        options={"eri_backend": "cpp"},
+    )
+    mf = RHF(mol).run()
+    td = TDDMRG(
+        mf,
+        ncas=4,
+        nelecas=4,
+        init_guess="hf",
+        symmetry="su2",
+    )
+    td.optimize_ground_state(
+        D=12,
+        nsweeps=1,
+        symmetry="su2",
+        compute_s2=False,
+        require_convergence=False,
+        conv_tol=-1.0,
+    )
+
+    def reject_conventional_growth():
+        raise AssertionError("driven SU(2) propagation must retain the NC Hamiltonian")
+
+    td._native_su2_affine_static_hamiltonian = reject_conventional_growth
+    owner = td._native_su2_boundary_environment()
+    coefficients_before = tuple(
+        owner.normal_complementary_plan(site)["coefficient"].copy()
+        for site in range(4)
+    )
+    field = lambda time: np.array([0.0, 0.0, 1.0e-4 * (1.0 + time)])
+    td.run(
+        dt=0.001,
+        steps=1,
+        e_ops=["H", "mu_z"],
+        field=field,
+        integrator="tdvp2",
+        progress=False,
+        D=12,
+    )
+
+    assert isinstance(td.final_state, NonabelianMPS)
+    np.testing.assert_allclose(td.pre_normalization_norm2, [1.0], atol=1.0e-10)
+    assert td.observables.shape == (1, 2)
+    assert td.tdvp_moving_environment_stats["persistent"] is True
+    assert td.tdvp_moving_environment_stats["hamiltonian_numeric_refreshes"] > 0
+    assert {
+        backend
+        for step_backends in td.tdvp_propagation_backends
+        for backend in step_backends
+    } == {"cpp"}
+    for site, expected in enumerate(coefficients_before):
+        np.testing.assert_allclose(
+            owner.normal_complementary_plan(site)["coefficient"],
+            expected,
+            atol=0.0,
+        )
+
+
 def test_tddmrg_supports_gaussian_pulse_and_dipole_observable():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     pulse = gaussian_pulse(
@@ -66,7 +260,7 @@ def test_tddmrg_supports_gaussian_pulse_and_dipole_observable():
 
 def test_tddmrg_builds_exact_one_body_field_propagator():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     pulse = gaussian_pulse(
@@ -86,7 +280,7 @@ def test_tddmrg_builds_exact_one_body_field_propagator():
 
 def test_dense_state_transform_operator_respects_td_bond_cap():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     pulse = gaussian_pulse(
@@ -109,7 +303,7 @@ def test_dense_state_transform_operator_respects_td_bond_cap():
 
 def test_rhf_dipole_operator_defaults_to_center_of_mass():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     ao_op = mf.dipole()
@@ -127,7 +321,7 @@ def test_rhf_dipole_operator_defaults_to_center_of_mass():
 
 def test_tddmrg_uses_center_of_mass_dipole_origin():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
@@ -136,7 +330,7 @@ def test_tddmrg_uses_center_of_mass_dipole_origin():
 
 def test_tddmrg_run_with_mo_coeff_rebuilds_interaction_caches():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     td = TDDMRG(mf, ncas=2, nelecas=2, init_guess="cid").build()
@@ -180,7 +374,7 @@ def test_tddmrg_h4_uses_exact_dense_td_path_and_matches_dense_oracle():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     td = TDDMRG(mf, ncas=4, nelecas=4, init_guess="hf").build()
@@ -218,7 +412,7 @@ def test_tddmrg_h4_uses_exact_dense_td_path_and_matches_dense_oracle():
     assert isinstance(builder, _DenseStateTransformOperator)
 
     td.run(psi0=psi0, dt=dt, steps=steps, interval=1, field=pulse, e_ops=["mu_z"], D=8)
-    mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
+    mu0 = float(np.real(psi0.expectation(mu_mpo)))
     mu_td = np.concatenate(([mu0], np.real(td.observables[:, 0])))
 
     np.testing.assert_allclose(mu_td, mu_exact, atol=1e-9, rtol=1e-7)

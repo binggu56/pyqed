@@ -14,7 +14,7 @@ from pyqed.qchem.mcscf.rasscf import (
 
 def _lih_reference():
     mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     return RHF(mol).run()
 
 

@@ -1,0 +1,117 @@
+{
+  "description": "Single-state repair of metastable high-flux vacuum",
+  "flux_cutoff": 3,
+  "bond_dim": 128,
+  "half_sweeps": 20,
+  "initial_energy": -16.225047340556863,
+  "final_energy": -16.36040580934748,
+  "wall_seconds": 59.18938516592607,
+  "converged": false,
+  "history": [
+    {
+      "sweep": 0,
+      "direction": "lr",
+      "energy": -16.335084557975403
+    },
+    {
+      "sweep": 1,
+      "direction": "rl",
+      "energy": -16.350499357935032
+    },
+    {
+      "sweep": 2,
+      "direction": "lr",
+      "energy": -16.35560116835078
+    },
+    {
+      "sweep": 3,
+      "direction": "rl",
+      "energy": -16.35049935793503
+    },
+    {
+      "sweep": 4,
+      "direction": "lr",
+      "energy": -16.3556011683508
+    },
+    {
+      "sweep": 5,
+      "direction": "rl",
+      "energy": -16.359092446685654
+    },
+    {
+      "sweep": 6,
+      "direction": "lr",
+      "energy": -16.359631555867026
+    },
+    {
+      "sweep": 7,
+      "direction": "rl",
+      "energy": -16.359092446685644
+    },
+    {
+      "sweep": 8,
+      "direction": "lr",
+      "energy": -16.359991559274217
+    },
+    {
+      "sweep": 9,
+      "direction": "rl",
+      "energy": -16.36009240007768
+    },
+    {
+      "sweep": 10,
+      "direction": "lr",
+      "energy": -16.360165262502417
+    },
+    {
+      "sweep": 11,
+      "direction": "rl",
+      "energy": -16.36021761001757
+    },
+    {
+      "sweep": 12,
+      "direction": "lr",
+      "energy": -16.36025720359949
+    },
+    {
+      "sweep": 13,
+      "direction": "rl",
+      "energy": -16.360289059451496
+    },
+    {
+      "sweep": 14,
+      "direction": "lr",
+      "energy": -16.360315308037883
+    },
+    {
+      "sweep": 15,
+      "direction": "rl",
+      "energy": -16.360338098837474
+    },
+    {
+      "sweep": 16,
+      "direction": "lr",
+      "energy": -16.36035728684311
+    },
+    {
+      "sweep": 17,
+      "direction": "rl",
+      "energy": -16.360374058193358
+    },
+    {
+      "sweep": 18,
+      "direction": "lr",
+      "energy": -16.360389161313424
+    },
+    {
+      "sweep": 19,
+      "direction": "rl",
+      "energy": -16.360403087582267
+    },
+    {
+      "sweep": 20,
+      "direction": "recenter-right",
+      "energy": -16.36040580934753
+    }
+  ]
+}

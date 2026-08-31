@@ -5,6 +5,7 @@ import numpy as np
 
 from pyqed import au2angstrom
 from pyqed.qchem.mol import Molecule, build_atom_from_coords
+from .pseudo import load_gth_pseudos
 
 
 def _normalize_unit(unit):
@@ -67,6 +68,15 @@ def _dense_integral_options(options):
     return dense_options
 
 
+def _cell_integral_options(options):
+    cell_options = {} if options is None else dict(options)
+    cell_options.setdefault("coord_type", "cartesian")
+    cell_options.setdefault("eri_representation", "dense")
+    if str(cell_options["eri_representation"]).lower() != "direct":
+        cell_options.setdefault("aosym", "s1")
+    return cell_options
+
+
 def materialize_dense_eri(mol):
     """Return a dense AO ERI tensor from any builtin dense-like storage."""
     eri = getattr(mol, "eri", None)
@@ -94,7 +104,7 @@ def materialize_dense_eri(mol):
 
 class Cell:
     """
-    Native periodic Gaussian cell for small all-electron PBC calculations.
+    Native periodic Gaussian cell for small all-electron or GTH PBC calculations.
 
     This implementation is intentionally reference-level and correctness-first:
     it supports 1D chains and 3D cells with dense integrals for small systems.
@@ -111,9 +121,12 @@ class Cell:
         dimension=3,
         vacuum=20.0,
         low_dim_ft_type="inf_vacuum",
-        integral_driver="builtin",
         integral_options=None,
+        pseudo=None,
+        ecp=None,
     ):
+        if pseudo is not None and ecp is not None:
+            raise ValueError("Specify either pseudo or ecp, not both.")
         self.atom = atom
         self.a = a
         self.basis = basis
@@ -123,13 +136,16 @@ class Cell:
         self.dimension = int(dimension)
         self.vacuum = float(vacuum)
         self.low_dim_ft_type = low_dim_ft_type
-        self.integral_driver = integral_driver
         self.integral_options = {} if integral_options is None else dict(integral_options)
+        self.pseudo = pseudo if pseudo is not None else ecp
 
         self._built = False
         self._unit_mol = None
         self._atom_symbols = None
         self._atom_coords = None
+        self._pseudos = {}
+        self._pseudos_by_atom = None
+        self._ionic_charges = None
 
         self.nao = None
         self.nelectron = None
@@ -145,6 +161,16 @@ class Cell:
             raise RuntimeError("Cell has not been built yet.")
         return self._unit_mol
 
+    @property
+    def has_pseudo(self):
+        return bool(self._pseudos)
+
+    @property
+    def ionic_charges(self):
+        if self._ionic_charges is None:
+            raise RuntimeError("Cell has not been built yet.")
+        return np.asarray(self._ionic_charges, dtype=float).copy()
+
     def build(self):
         lattice = _normalize_lattice(self.a, self.dimension, self.vacuum)
         if self.unit == "angstrom":
@@ -158,19 +184,49 @@ class Cell:
             charge=self.charge,
             spin=self.spin,
         )
-        build_kwargs = {"options": _dense_integral_options(self.integral_options)}
-        mol.build(driver=self.integral_driver, **build_kwargs)
-        materialize_dense_eri(mol)
+        build_kwargs = {"options": _cell_integral_options(self.integral_options)}
+        mol.build(**build_kwargs)
+        if any(
+            getattr(mol, name, None) is not None
+            for name in ("eri", "eri_s4", "eri_s8")
+        ):
+            materialize_dense_eri(mol)
+        elif str(
+            getattr(mol, "builtin_resolved_eri_representation", "")
+        ).lower() != "direct":
+            raise ValueError(
+                "Periodic Cell requires a dense-like molecular ERI build or "
+                "eri_representation='direct'."
+            )
 
         self._unit_mol = mol
         self._atom_symbols = list(mol.atom_symbols())
         self._atom_coords = np.asarray(mol.atom_coords(), dtype=float)
+        self._pseudos = load_gth_pseudos(self.pseudo, self._atom_symbols)
+        self._pseudos_by_atom = tuple(
+            self._pseudos.get(symbol)
+            for symbol in self._atom_symbols
+        )
+        nuclear_charges = np.asarray(mol.atom_charges(), dtype=float)
+        self._ionic_charges = np.asarray([
+            nuclear_charge if pseudo is None else pseudo.ionic_charge
+            for nuclear_charge, pseudo in zip(nuclear_charges, self._pseudos_by_atom)
+        ], dtype=float)
         self.nao = int(mol.nao)
-        self.nelectron = int(mol.nelec)
+        electron_count = float(np.sum(self._ionic_charges)) - self.charge
+        if abs(electron_count - round(electron_count)) > 1.0e-10:
+            raise ValueError("The pseudopotential valence electron count must be integral.")
+        self.nelectron = int(round(electron_count))
         self._built = True
         return self
 
-    def make_kpts(self, nk):
+    def make_kpts(self, nk, *, gamma_centered=False):
+        """Return a uniform reciprocal-space mesh in Cartesian coordinates.
+
+        ``gamma_centered=False`` gives the half-shifted Monkhorst-Pack mesh.
+        A Gamma-centered mesh always contains the origin, including for even
+        mesh dimensions, and is closed under reciprocal-lattice wrapping.
+        """
         if not self._built:
             self.build()
         mesh = _normalize_kmesh(nk, self.dimension)
@@ -180,7 +236,12 @@ class Cell:
             n = int(n)
             if n <= 0:
                 raise ValueError("k-point mesh entries must be positive.")
-            axes.append((np.arange(n, dtype=float) + 0.5) / n - 0.5)
+            if gamma_centered:
+                axis = np.arange(n, dtype=float) / n
+                axis[axis >= 0.5] -= 1.0
+            else:
+                axis = (np.arange(n, dtype=float) + 0.5) / n - 0.5
+            axes.append(axis)
 
         out = []
         for i in range(mesh[0]):
@@ -233,7 +294,7 @@ class Cell:
             spin=0,
         )
         build_kwargs = {"options": _dense_integral_options(self.integral_options)}
-        mol.build(driver=self.integral_driver, **build_kwargs)
+        mol.build(**build_kwargs)
         materialize_dense_eri(mol)
         return mol
 
@@ -241,7 +302,7 @@ class Cell:
         if not self._built:
             self.build()
 
-        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        charges = self.ionic_charges
         coords = np.asarray(self._atom_coords, dtype=float)
         e = 0.0
         for ia, (za, ra) in enumerate(zip(charges, coords)):
@@ -268,7 +329,7 @@ class Cell:
 
         from .ewald import ewald_nuclear_repulsion
 
-        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        charges = self.ionic_charges
         coords = np.asarray(self._atom_coords, dtype=float)
         return ewald_nuclear_repulsion(
             charges,
@@ -286,7 +347,11 @@ class Cell:
 
         from .ewald import reciprocal_nuclear_attraction_matrix_s
 
-        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        if self.has_pseudo:
+            raise NotImplementedError(
+                "Use EwaldRHF/KRHF to build k-dependent pseudopotential matrices."
+            )
+        charges = self.ionic_charges
         coords = np.asarray(self._atom_coords, dtype=float)
         return reciprocal_nuclear_attraction_matrix_s(
             charges,
@@ -303,7 +368,11 @@ class Cell:
 
         from .ewald import short_range_nuclear_attraction_matrix_s
 
-        charges = np.asarray(self._unit_mol.atom_charges(), dtype=float)
+        if self.has_pseudo:
+            raise NotImplementedError(
+                "Use EwaldRHF/KRHF to build k-dependent pseudopotential matrices."
+            )
+        charges = self.ionic_charges
         coords = np.asarray(self._atom_coords, dtype=float)
         return short_range_nuclear_attraction_matrix_s(
             charges,
@@ -349,9 +418,15 @@ class Cell:
             eta=eta,
         )
 
-    def RHF(self, kpts=None, nk=None, method="finite_image", **kwargs):
+    def RHF(self, kpts=None, nk=None, method=None, **kwargs):
+        if method is None:
+            method = "ewald" if self.pseudo is not None else "finite_image"
         method = str(method).lower()
         if method in ("finite_image", "finite-image", "image", "native"):
+            if self.pseudo is not None:
+                raise NotImplementedError(
+                    "Pseudopotentials require method='ewald' with GDF/reciprocal J/K."
+                )
             from .hf import RHF
 
             return RHF(self, kpts=kpts, nk=nk, **kwargs)

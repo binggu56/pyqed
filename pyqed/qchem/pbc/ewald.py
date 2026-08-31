@@ -58,18 +58,22 @@ def reciprocal_lattice(lattice_vectors):
 def reciprocal_vectors(lattice_vectors, recip_cut, include_zero=False):
     """Enumerate reciprocal vectors up to integer index cutoff."""
     recip = reciprocal_lattice(lattice_vectors)
-    recip_cut = int(recip_cut)
-    if recip_cut < 0:
+    bounds = np.asarray(recip_cut, dtype=int)
+    if bounds.ndim == 0:
+        bounds = np.repeat(bounds, 3)
+    if bounds.shape != (3,):
+        raise ValueError("recip_cut must be an integer or three integer bounds.")
+    if np.any(bounds < 0):
         raise ValueError("recip_cut must be non-negative.")
 
     out = []
-    for h in range(-recip_cut, recip_cut + 1):
-        for k in range(-recip_cut, recip_cut + 1):
-            for l in range(-recip_cut, recip_cut + 1):
-                if not include_zero and h == 0 and k == 0 and l == 0:
+    for h in range(-bounds[0], bounds[0] + 1):
+        for k in range(-bounds[1], bounds[1] + 1):
+            for n3 in range(-bounds[2], bounds[2] + 1):
+                if not include_zero and h == 0 and k == 0 and n3 == 0:
                     continue
-                gvec = h * recip[0] + k * recip[1] + l * recip[2]
-                out.append((h, k, l, gvec))
+                gvec = h * recip[0] + k * recip[1] + n3 * recip[2]
+                out.append((h, k, n3, gvec))
     return out
 
 
@@ -843,6 +847,198 @@ def ewald_nuclear_repulsion(
         e_background = -math.pi * total_charge * total_charge / (2.0 * eta * eta * volume)
 
     return float(e_real + e_recip + e_self + e_background)
+
+
+def ewald_nuclear_gradient(
+    charges,
+    coords,
+    lattice_vectors,
+    eta=None,
+    real_cut=4,
+    recip_cut=8,
+):
+    """Fixed-lattice nuclear gradient of the three-dimensional Ewald energy."""
+    charges = np.asarray(charges, dtype=float)
+    coords = np.asarray(coords, dtype=float)
+    lattice = np.asarray(lattice_vectors, dtype=float)
+    if coords.shape != (len(charges), 3):
+        raise ValueError("coords must have shape (ncharge, 3).")
+    if lattice.shape != (3, 3):
+        raise ValueError("lattice_vectors must have shape (3, 3).")
+
+    volume = abs(float(np.linalg.det(lattice)))
+    if volume <= 0.0:
+        raise ValueError("lattice volume must be positive.")
+    lengths = np.linalg.norm(lattice, axis=1)
+    if eta is None:
+        eta = math.sqrt(math.pi) / float(np.min(lengths))
+    eta = float(eta)
+    real_cut = int(real_cut)
+    recip_cut = int(recip_cut)
+    if eta <= 0.0:
+        raise ValueError("eta must be positive.")
+    if real_cut < 0 or recip_cut < 0:
+        raise ValueError("real_cut and recip_cut must be non-negative.")
+
+    gradient = np.zeros_like(coords)
+    image_range = range(-real_cut, real_cut + 1)
+    two_eta_over_sqrt_pi = 2.0 * eta / math.sqrt(math.pi)
+    for ia, (za, ra) in enumerate(zip(charges, coords)):
+        for ib, (zb, rb) in enumerate(zip(charges, coords)):
+            zz = za * zb
+            for nx in image_range:
+                for ny in image_range:
+                    for nz in image_range:
+                        if ia == ib and nx == 0 and ny == 0 and nz == 0:
+                            continue
+                        shift = nx * lattice[0] + ny * lattice[1] + nz * lattice[2]
+                        diff = ra - rb + shift
+                        distance = float(np.linalg.norm(diff))
+                        if distance <= 1.0e-14:
+                            continue
+                        radial = -(
+                            two_eta_over_sqrt_pi
+                            * math.exp(-(eta * distance) ** 2)
+                            / distance**2
+                            + math.erfc(eta * distance) / distance**3
+                        )
+                        contribution = 0.5 * zz * radial * diff
+                        gradient[ia] += contribution
+                        gradient[ib] -= contribution
+
+    for _h, _k, _l, gvec in reciprocal_vectors(
+        lattice,
+        recip_cut,
+        include_zero=False,
+    ):
+        g2 = float(np.dot(gvec, gvec))
+        if g2 <= 0.0:
+            continue
+        phases = np.exp(1.0j * (coords @ gvec))
+        rho = np.dot(charges, phases)
+        prefactor = (
+            4.0
+            * math.pi
+            / volume
+            * math.exp(-g2 / (4.0 * eta * eta))
+            / g2
+        )
+        drho = 1.0j * charges[:, None] * phases[:, None] * gvec[None, :]
+        gradient += prefactor * np.real(rho.conjugate() * drho)
+
+    return np.asarray(gradient, dtype=float)
+
+
+def ewald_nuclear_hessian(
+    charges,
+    coords,
+    lattice_vectors,
+    eta=None,
+    real_cut=4,
+    recip_cut=8,
+):
+    """Fixed-lattice analytic Hessian of the three-dimensional Ewald energy."""
+
+    charges = np.asarray(charges, dtype=float)
+    coords = np.asarray(coords, dtype=float)
+    lattice = np.asarray(lattice_vectors, dtype=float)
+    if coords.shape != (len(charges), 3):
+        raise ValueError("coords must have shape (ncharge, 3).")
+    if lattice.shape != (3, 3):
+        raise ValueError("lattice_vectors must have shape (3, 3).")
+    volume = abs(float(np.linalg.det(lattice)))
+    if volume <= 0.0:
+        raise ValueError("lattice volume must be positive.")
+    lengths = np.linalg.norm(lattice, axis=1)
+    if eta is None:
+        eta = math.sqrt(math.pi) / float(np.min(lengths))
+    eta = float(eta)
+    real_cut = int(real_cut)
+    recip_cut = int(recip_cut)
+    if eta <= 0.0:
+        raise ValueError("eta must be positive.")
+    if real_cut < 0 or recip_cut < 0:
+        raise ValueError("real_cut and recip_cut must be non-negative.")
+
+    natom = len(charges)
+    hessian = np.zeros((natom, 3, natom, 3), dtype=float)
+    eye = np.eye(3)
+    image_range = range(-real_cut, real_cut + 1)
+    coefficient = 2.0 * eta / math.sqrt(math.pi)
+    for ia, (za, ra) in enumerate(zip(charges, coords)):
+        for ib, (zb, rb) in enumerate(zip(charges, coords)):
+            zz = float(za * zb)
+            for nx in image_range:
+                for ny in image_range:
+                    for nz in image_range:
+                        if ia == ib and nx == 0 and ny == 0 and nz == 0:
+                            continue
+                        shift = nx * lattice[0] + ny * lattice[1] + nz * lattice[2]
+                        diff = ra - rb + shift
+                        distance = float(np.linalg.norm(diff))
+                        if distance <= 1.0e-14:
+                            continue
+                        gaussian = math.exp(-(eta * distance) ** 2)
+                        erfc = math.erfc(eta * distance)
+                        radial = -(
+                            coefficient * gaussian / distance**2
+                            + erfc / distance**3
+                        )
+                        radial_over_r = (
+                            2.0
+                            * coefficient
+                            * eta
+                            * eta
+                            * gaussian
+                            / distance**2
+                            + 3.0 * coefficient * gaussian / distance**4
+                            + 3.0 * erfc / distance**5
+                        )
+                        block = 0.5 * zz * (
+                            radial * eye + radial_over_r * np.outer(diff, diff)
+                        )
+                        hessian[ia, :, ia, :] += block
+                        hessian[ia, :, ib, :] -= block
+                        hessian[ib, :, ia, :] -= block
+                        hessian[ib, :, ib, :] += block
+
+    for _h, _k, _l, gvec in reciprocal_vectors(
+        lattice,
+        recip_cut,
+        include_zero=False,
+    ):
+        g2 = float(np.dot(gvec, gvec))
+        if g2 <= 0.0:
+            continue
+        phases = np.exp(1.0j * (coords @ gvec))
+        rho = np.dot(charges, phases)
+        prefactor = (
+            4.0
+            * math.pi
+            / volume
+            * math.exp(-g2 / (4.0 * eta * eta))
+            / g2
+        )
+        drho = 1.0j * charges[:, None] * phases[:, None] * gvec[None, :]
+        hessian += prefactor * np.real(
+            np.einsum(
+                "By,Ax->AxBy",
+                drho.conj(),
+                drho,
+                optimize=True,
+            )
+        )
+        outer_g = np.outer(gvec, gvec)
+        for atom in range(natom):
+            d2rho = -charges[atom] * phases[atom] * outer_g
+            hessian[atom, :, atom, :] += prefactor * np.real(
+                rho.conjugate() * d2rho
+            )
+
+    return np.asarray(
+        0.5 * (hessian + hessian.transpose(2, 3, 0, 1)),
+        dtype=float,
+    )
 
 
 def ewald_nuclear_repulsion_1d_inf_vacuum(

@@ -472,76 +472,6 @@ ALIAS = {
     'ccpv5zdkh'  : 'cc-pv5z-dk.dat' ,
 }
 
-# def build(mol):
-#     """
-#     build electronic integrals in AO using GBasis package
-
-#     Parameters
-#     ----------
-#     mol : TYPE
-#         DESCRIPTION.
-
-#     Returns
-#     -------
-#     None.
-
-#     """
-#     from gbasis.parsers import parse_gbs, make_contractions
-
-#     atoms = mol.atom_symbols()
-#     atcoords = mol.atom_coords()
-#     atnums = mol.atom_charges()
-
-#     basis_dir = os.path.abspath(f'{pyqed.__file__}/../qchem/basis_set/')
-
-#     if isinstance(mol.basis, str):
-
-#         basis_dict = parse_gbs(basis_dir + '/' + ALIAS[mol.basis.replace('-','').lower()])
-#         basis = make_contractions(basis_dict, atoms, atcoords, coord_types="p")
-#     else:
-
-#         raise NotImplementedError('Customized basis not supported yet.')
-
-#     # To obtain the total number of AOs we check for each shell its angular momentum and coordinate type
-#     total_ao = 0
-#     for shell in basis:
-#         if shell.coord_type == "cartesian":
-#             total_ao += shell.angmom_components_cart.shape[0]
-#         elif shell.coord_type == "spherical":
-#             total_ao += len(shell.angmom_components_sph)
-
-#     mol.nao = total_ao
-
-#     print("Number of AOs = ", mol.nao)
-
-#     # compute overlap integrals in AO basis
-#     mol.overlap = overlap_integral(basis)
-
-
-#     # olp_mo = overlap_integral(basis, transform=mo_coeffs.T)
-
-#     # compute kinetic energy integrals in AO basis
-#     k_int1e = kinetic_energy_integral(basis)
-#     # print("Shape kinetic energy integral: ", k_int1e.shape, "(#AO, #AO)")
-
-
-#     # compute nuclear-electron attraction integrals in AO basis
-#     # atnums = np.array([1,1])
-#     nuc_int1e = nuclear_electron_attraction_integral(
-#             basis, atcoords, atnums)
-#     # print("Shape Nuclear-electron integral: ", nuc_int1e.shape, "(#AO, #AO)")
-
-#     mol.hcore = k_int1e + nuc_int1e
-
-#     #Compute e-e repulsion integral in MO basis, shape=(#MO, #MO, #MO, #MO)
-#     int2e_mo = electron_repulsion_integral(basis, notation='chemist')
-#     mol.eri = int2e_mo
-
-#     mol._bas = basis
-
-#     return
-
-
 def parse_gbs(gbs_basis_file):
     """Parse Gaussian94 basis set file.
 
@@ -643,7 +573,7 @@ def make_contractions(basis_dict, atoms, coords, coord_types):
     Parameters
     ----------
     basis_dict : dict of str to list of 3-tuple of (int, np.ndarray, np.ndarray)
-        Output of the parsers from gbasis.parsers.
+        Parsed basis dictionary consumed by :func:`make_contractions`.
     atoms : N-list/tuple of str
         Atoms at which the contractions are centered.
     coords : np.ndarray(N, 3)

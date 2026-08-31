@@ -10,7 +10,7 @@ from pyqed.qchem import Molecule
 from pyqed.qchem.dft import RKS
 
 mol = Molecule(atom='H 0 0 -0.8; H 0 0 0.8', unit='bohr', basis='sto-3g')
-mol.build(driver='gbasis')
+mol.build()
 
 mf = RKS(mol, xc='svwn').run()
 

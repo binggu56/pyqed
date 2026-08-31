@@ -23,7 +23,7 @@ from .linalg import sector_state_weight
 from .renormalized import FactorizedRouteMetricBlock, KroneckerMetricBlock
 from .solver import LocalOperator, TwoSiteEffectiveH, solve_local_two_site
 from .tensor import FusionPipe, FusionPipeEntry, FusionLeg
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def _sector_dim_from_data(tensor, axis):
@@ -75,8 +75,12 @@ def _expand_two_site_support(A, B, merged):
     """
     A = normalize_site_tensor_layout(A)
     B = normalize_site_tensor_layout(B)
-    left_dims = {sector: _sector_multiplicity(A.qns[0], sector) for sector in set(A.qns[0])}
-    right_dims = {sector: _sector_multiplicity(B.qns[2], sector) for sector in set(B.qns[2])}
+    # A sector has one global reduced dimension on a Leg.  Counting repeated
+    # labels was a legacy proxy that breaks as soon as a canonical Leg carries
+    # multiplicity greater than one.  Read the declared/data-backed dimensions
+    # instead so every newly seeded block agrees with the merged tensor's Leg.
+    left_dims = _sector_dim_from_data(A, 0)
+    right_dims = _sector_dim_from_data(B, 2)
     phys1_dims = _sector_dim_from_data(A, 1)
     phys2_dims = _sector_dim_from_data(B, 1)
 
@@ -229,7 +233,7 @@ def _expand_two_site_support(A, B, merged):
             ),
         )
 
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [leg[:] for leg in merged.qns],
         merged.dirs[:],
@@ -242,7 +246,7 @@ def _normalize_solver_output(result):
     """
     Normalize a solver callback result into ``(optimized_tensor, objective_dict)``.
     """
-    if isinstance(result, NonabelianTensor):
+    if isinstance(result, IrrepTensor):
         return result, {}
 
     if isinstance(result, tuple):
@@ -286,8 +290,35 @@ def _normalize_solver_output(result):
         return optimized, objective
 
     raise TypeError(
-        "Solver must return a NonabelianTensor, (tensor, objective), or a dict payload."
+        "Solver must return an IrrepTensor, (tensor, objective), or a dict payload."
     )
+
+
+def _restore_split_scale(left, right, optimized, *, absorb):
+    """Restore a global amplitude absorbed by reduced-basis normalization."""
+    rebuilt = merge_mps_sites(left, right)
+    numerator = 0.0j
+    denominator = 0.0
+    for key, block in rebuilt.data.items():
+        target = optimized.data.get(key)
+        if target is None or np.asarray(target).shape != np.asarray(block).shape:
+            continue
+        numerator += np.vdot(block, target)
+        denominator += float(np.vdot(block, block).real)
+    if denominator <= 1.0e-30:
+        return left, right
+    scale = numerator / denominator
+    if np.allclose(scale, 1.0, rtol=1.0e-13, atol=1.0e-15):
+        return left, right
+    tensor = right if absorb == "right" else left
+    scaled = IrrepTensor(
+        {key: scale * block for key, block in tensor.data.items()},
+        tensor.legs,
+        tensor.dirs,
+        fusion_legs=tensor.fusion_legs,
+        metadata=tensor.metadata.copy(),
+    )
+    return (left, scaled) if absorb == "right" else (scaled, right)
 
 
 def _normalize_local_operator_spec(spec):
@@ -638,7 +669,7 @@ def _project_guess_to_merged_layout(guess, merged):
     current merged tensor and zeros everything else, so the result is always
     packable against the current local layout.
     """
-    if not isinstance(guess, NonabelianTensor) or guess.rank != 4:
+    if not isinstance(guess, IrrepTensor) or guess.rank != 4:
         return guess
 
     data = {}
@@ -653,7 +684,7 @@ def _project_guess_to_merged_layout(guess, merged):
 
     if not has_overlap:
         return None
-    projected = NonabelianTensor(
+    projected = IrrepTensor(
         data,
         [leg[:] for leg in merged.qns],
         merged.dirs[:],
@@ -687,7 +718,7 @@ def _seed_zero_block_guess(merged, *, scale, rng):
 
     if not seeded:
         return merged.copy()
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [leg[:] for leg in merged.qns],
         merged.dirs[:],
@@ -762,8 +793,8 @@ def two_site_update(
         Dictionary with keys ``merged``, ``optimized``, ``left``, ``right``,
         ``singular_values``, ``trunc_err``, ``kept``, and ``local_objective``.
     """
-    if not isinstance(A, NonabelianTensor) or not isinstance(B, NonabelianTensor):
-        raise TypeError("two_site_update expects NonabelianTensor site tensors.")
+    if not isinstance(A, IrrepTensor) or not isinstance(B, IrrepTensor):
+        raise TypeError("two_site_update expects IrrepTensor site tensors.")
     if A.rank != 3 or B.rank != 3:
         raise ValueError("two_site_update expects rank-3 site tensors.")
     n_modes = sum(x is not None for x in (solver, optimized_two_site, local_operator))
@@ -787,11 +818,11 @@ def two_site_update(
     t0 = time.perf_counter() if profile else None
     if merged_two_site is not None:
         if (
-            not isinstance(merged_two_site, NonabelianTensor)
+            not isinstance(merged_two_site, IrrepTensor)
             or merged_two_site.rank != 4
         ):
             raise ValueError(
-                "merged_two_site must be a rank-4 NonabelianTensor."
+                "merged_two_site must be a rank-4 IrrepTensor."
             )
         current_merged = merged_two_site
     else:
@@ -809,7 +840,7 @@ def two_site_update(
             timing["local_solve"] += time.perf_counter() - t0
     elif local_operator is not None:
         solver_kwargs = dict(local_solver_kwargs or {})
-        if isinstance(solver_kwargs.get("guess"), NonabelianTensor):
+        if isinstance(solver_kwargs.get("guess"), IrrepTensor):
             projected_guess = _project_guess_to_merged_layout(solver_kwargs["guess"], merged)
             if projected_guess is None:
                 solver_kwargs.pop("guess", None)
@@ -871,8 +902,8 @@ def two_site_update(
     else:
         optimized = merged
 
-    if not isinstance(optimized, NonabelianTensor) or optimized.rank != 4:
-        raise ValueError("two_site_update requires a rank-4 NonabelianTensor as the optimized two-site tensor.")
+    if not isinstance(optimized, IrrepTensor) or optimized.rank != 4:
+        raise ValueError("two_site_update requires a rank-4 IrrepTensor as the optimized two-site tensor.")
     split_owner = (
         None
         if lifecycle_owner is None
@@ -1007,6 +1038,14 @@ def two_site_update(
         )
         if profile:
             timing["svd"] += time.perf_counter() - t0
+
+    if (
+        solver is not None
+        and lifecycle_owner is None
+        and cpp_split_result is None
+        and optimized_roots is None
+    ):
+        left, right = _restore_split_scale(left, right, optimized, absorb=absorb)
 
     if post_split is not None:
         left, right, post_objective = post_split(

@@ -6,8 +6,10 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import os
 import resource
 import statistics
+import subprocess
 import sys
 import tempfile
 import time
@@ -15,7 +17,6 @@ import traceback
 from pathlib import Path
 
 import numpy as np
-from pyblock2.driver.core import DMRGDriver, SymmetryTypes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -246,9 +247,7 @@ def build_cpp_reference(case, basis):
 
     started = time.perf_counter()
     molecule = Molecule(atom=case["atom"], unit="bohr", basis=basis)
-    molecule.build(
-        driver="builtin",
-        eri="dense",
+    molecule.build(eri="dense",
         aosym="s1",
         options={"eri_backend": "cpp"},
     )
@@ -393,7 +392,7 @@ def run_pyqed(
         )
     )
     includes_core_energy = bool(
-        (dmrg._active_integral_build_info or {}).get(
+        (dmrg.build_info or {}).get(
             "includes_core_energy",
             False,
         )
@@ -705,114 +704,62 @@ def run_block2(
     davidson_tol=1.0e-3,
     nstates=1,
 ):
-    """Run one fresh block2 solver on the same active tensors."""
+    """Run block2 in a process that never loads PyQED's OpenMP runtime."""
 
-    half_sweeps = 2 * int(nsweeps)
-    rss_before = _rss_bytes()
-    total_started = time.perf_counter()
-    with tempfile.TemporaryDirectory(prefix="pyqed-block2-large-cas-") as scratch:
-        driver = DMRGDriver(
-            scratch=scratch,
-            symm_type=SymmetryTypes.SU2,
-            n_threads=1,
+    worker = Path(__file__).with_name("_block2_su2_worker.py")
+    with tempfile.TemporaryDirectory(
+        prefix="pyqed-block2-large-cas-input-"
+    ) as temporary:
+        temporary = Path(temporary)
+        input_path = temporary / "active.npz"
+        output_path = temporary / "result.json"
+        np.savez(
+            input_path,
+            ncas=np.asarray(active["ncas"], dtype=np.int64),
+            n_elec=np.asarray(active["n_elec"], dtype=np.int64),
+            spin=np.asarray(active["spin"], dtype=np.int64),
+            ecore=np.asarray(active["ecore"], dtype=float),
+            h1e=np.ascontiguousarray(active["h1e"]),
+            g2e=np.ascontiguousarray(active["g2e"]),
+            orb_sym=np.asarray(active["orb_sym"], dtype=np.int32),
         )
-        driver.bw.b.Random.rand_seed(int(seed))
-        setup_started = time.perf_counter()
-        driver.initialize_system(
-            n_sites=active["ncas"],
-            n_elec=active["n_elec"],
-            spin=active["spin"],
-            orb_sym=active["orb_sym"],
+        environment = os.environ.copy()
+        environment.update(
+            OPENBLAS_NUM_THREADS="1",
+            OMP_NUM_THREADS="1",
+            VECLIB_MAXIMUM_THREADS="1",
+            NUMEXPR_NUM_THREADS="1",
         )
-        mpo = driver.get_qc_mpo(
-            active["h1e"],
-            active["g2e"],
-            ecore=active["ecore"],
-            iprint=0,
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(worker),
+                "--input",
+                str(input_path),
+                "--output",
+                str(output_path),
+                "--bond-dim",
+                str(int(bond_dim)),
+                "--half-sweeps",
+                str(2 * int(nsweeps)),
+                "--seed",
+                str(int(seed)),
+                "--davidson-tol",
+                str(float(davidson_tol)),
+                "--nstates",
+                str(int(nstates)),
+            ],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
         )
-        system_seconds = time.perf_counter() - setup_started
-        state_started = time.perf_counter()
-        ket = driver.get_random_mps(
-            tag="KET",
-            bond_dim=bond_dim,
-            nroots=int(nstates),
-        )
-        state_initialization_seconds = time.perf_counter() - state_started
-        sweep_started = time.perf_counter()
-        energy = driver.dmrg(
-            mpo,
-            ket,
-            n_sweeps=half_sweeps,
-            bond_dims=[bond_dim] * half_sweeps,
-            noises=[0.0] * half_sweeps,
-            # block2 specifies the squared residual, while PyQED specifies
-            # the residual norm itself.
-            thrds=[float(davidson_tol) ** 2] * half_sweeps,
-            tol=1.0e-9,
-            iprint=0,
-            dav_max_iter=100,
-            dav_def_max_size=50,
-        )
-        sweep_seconds = time.perf_counter() - sweep_started
-        expectation_started = time.perf_counter()
-        if int(nstates) == 1:
-            exported_energies = [
-                float(
-                    driver.expectation(ket, mpo, ket, iprint=0)
-                    / driver.expectation(
-                        ket,
-                        driver.get_identity_mpo(),
-                        ket,
-                        iprint=0,
-                    )
-                )
-            ]
-        else:
-            roots = [
-                driver.split_mps(ket, root, f"ROOT{root}")
-                for root in range(int(nstates))
-            ]
-            identity = driver.get_identity_mpo()
-            exported_energies = [
-                float(
-                    driver.expectation(root, mpo, root, iprint=0)
-                    / driver.expectation(root, identity, root, iprint=0)
-                )
-                for root in roots
-            ]
-        expectation_seconds = time.perf_counter() - expectation_started
-        exported_energy = exported_energies[0]
-        solver_energies = [
-            float(value) for value in np.asarray(energy).reshape(-1)
-        ]
-    return {
-        "backend": "block2-su2",
-        # block2's DMRG return is the optimized two-site energy before the
-        # final SVD truncation.  Compare solvers using the expectation of the
-        # actual exported MPS, which is also what PyQED reports.
-        "energy": exported_energy,
-        "state_energies": exported_energies,
-        "solver_energy": solver_energies[0],
-        "solver_state_energies": solver_energies,
-        "returned_mps_total_energy": exported_energy,
-        "reported_expectation_error": abs(
-            solver_energies[0] - exported_energy
-        ),
-        "expectation_seconds": float(expectation_seconds),
-        "system_seconds": float(system_seconds),
-        "state_initialization_seconds": float(state_initialization_seconds),
-        "run_seconds": float(sweep_seconds),
-        "sweep_seconds": float(sweep_seconds),
-        "total_seconds": float(time.perf_counter() - total_started),
-        "bond_updates": int(max(0, active["ncas"] - 1) * half_sweeps),
-        "bond_updates_per_second": float(
-            max(0, active["ncas"] - 1) * half_sweeps
-            / max(sweep_seconds, 1.0e-15)
-        ),
-        "davidson_tol": float(davidson_tol),
-        "peak_rss_bytes": int(_rss_bytes()),
-        "peak_rss_delta_bytes": max(0, int(_rss_bytes() - rss_before)),
-    }
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "isolated block2 worker failed:\n"
+                + (completed.stderr or completed.stdout)
+            )
+        return json.loads(output_path.read_text())
 
 
 def _median(rows, key):
@@ -847,7 +794,7 @@ def run_case(
     """Run one CAS size and summarize fresh-solver medians."""
 
     case = PRESETS[name]
-    mean_field, integral_rhf_seconds, integral_info = build_cpp_reference(case, basis)
+    mean_field, integral_rhf_seconds, build_info = build_cpp_reference(case, basis)
     active = build_active_tensors(mean_field, case)
 
     # Warm extension imports and one-time C++ route setup outside the sample.
@@ -977,7 +924,7 @@ def run_case(
         "repeats": int(repeats),
         "energy_validation": energy_validation,
         "integral_backend": "cpp",
-        "integral_builder": integral_info.get("dense_builder"),
+        "integral_builder": build_info.get("dense_builder"),
         "integral_rhf_seconds": float(integral_rhf_seconds),
         "pyqed": pyqed_rows,
         "block2": block2_rows,
@@ -1037,6 +984,11 @@ def main():
         ),
     )
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        help="write the complete benchmark records as JSON",
+    )
     parser.add_argument("--enforce-first-gate", action="store_true")
     args = parser.parse_args()
 
@@ -1062,6 +1014,12 @@ def main():
         )
         for name in systems
     ]
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(results, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     if args.json:
         print(json.dumps(results, indent=2, sort_keys=True))
     else:

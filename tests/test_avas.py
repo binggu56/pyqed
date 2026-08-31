@@ -11,7 +11,7 @@ from pyqed.qchem.mcscf.avas import (
 
 def _native_reference(atom, basis="sto-3g", unit="angstrom", spin=0):
     mol = Molecule(atom=atom, unit=unit, basis=basis, spin=spin)
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     return mol.RHF().run()
 
 
@@ -74,7 +74,7 @@ def test_native_avas_reports_unmatched_labels():
 
 def test_native_avas_open_shell_option_three_keeps_singly_occupied_orbitals():
     mol = Molecule(atom="O 0 0 0", unit="bohr", basis="sto-3g", spin=2)
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.ROHF().run()
     selector = AVAS(mf, ["O 2p"], openshell_option=3)
 
@@ -84,14 +84,14 @@ def test_native_avas_open_shell_option_three_keeps_singly_occupied_orbitals():
     assert np.count_nonzero(np.isclose(selector.occ_weights, 1.0)) == 2
 
 
-def test_avas_supports_gbasis_reference_natively():
-    pytest.importorskip("gbasis")
+def test_avas_supports_builtin_reference_natively():
+    pytest.importorskip("builtin")
     mol = Molecule(
         atom="H 0 0 0; H 0 0 0.74",
         unit="angstrom",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = mol.RHF().run()
 
     ncas, nelecas, mo = avas.run(mf, ["H 1s"])
@@ -106,7 +106,7 @@ def test_avas_supports_gbasis_reference_natively():
 
 def test_native_avas_rejects_unconverged_reference_data():
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="angstrom", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = mol.RHF()
 
     with pytest.raises(ValueError, match="Run the mean-field calculation"):

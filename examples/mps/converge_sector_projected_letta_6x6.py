@@ -451,56 +451,6 @@ def converge(
     if output.resolve() in protected or snapshot.resolve() in protected:
         raise ValueError("output checkpoints must not overwrite source artifacts.")
 
-    source = json.loads(source_result.read_text(encoding="utf-8"))
-    model = source["model"]
-    if (
-        int(model["nrows"]) != 6
-        or int(model["ncols"]) != 6
-        or int(model["nsites"]) != NSITES
-    ):
-        raise ValueError("the source checkpoint must be the 6x6 model.")
-    source_projection = _source_projection_metadata(source_snapshot)
-    source_is_projected = source_projection is not None
-    source_recorded_energy = float(source["result"]["energy"])
-    protocol = {
-        "ansatz": "P_Q |Psi(A)> with every unrestricted A coordinate retained",
-        "symmetry": "exact variation-after-projection U(1)",
-        "source_state": "projected" if source_is_projected else "unrestricted",
-        "target_two_sz": 0,
-        "local_two_sz": [1, -1],
-        "local_tensor_masks": False,
-        "expected_parameters": EXPECTED_PARAMETERS,
-        "source_result": str(source_result.resolve()),
-        "source_snapshot": str(source_snapshot.resolve()),
-        "frontier_backend": "identity_block",
-        "objective_mpo": "sparse factorized H times P_Q",
-        "materialize_objective_mpo": False,
-        "balance_initial_gauges": False,
-        "optimization": "directional one-site variational sweeps",
-        "sweep_offset": sweep_offset,
-        "solver": str(solver),
-        "metric_tol": float(metric_tol),
-        "eig_tol": float(eig_tol),
-        "maxiter": int(maxiter),
-        "max_subspace": int(max_subspace),
-        "environment_cache": "checkpointed",
-        "frontier_canonicalization": False,
-        "maximum_directional_passes": maximum_passes,
-        "gain_tolerance": gain_tolerance,
-        "gain_tolerance_units": "energy_per_site",
-        "convergence_rule": (
-            "both directional one-site gains per site in one complete "
-            "alternating cycle are below gain_tolerance, with no solver failures"
-        ),
-        "checkpoint_pair_energy_tolerance": CHECKPOINT_PAIR_ENERGY_TOL,
-        "reconstruction_energy_tolerance_per_site": (
-            RECONSTRUCTION_ENERGY_TOL_PER_SITE
-        ),
-        "safe_resume": True,
-    }
-    protocol_fingerprint = _fingerprint(protocol)
-    invocation_start = perf_counter()
-
     output_exists = output.is_file()
     snapshot_exists = snapshot.is_file()
     if resume and output_exists != snapshot_exists:
@@ -509,8 +459,83 @@ def converge(
             "or both be absent."
         )
     resumed = bool(resume and output_exists and snapshot_exists)
+
     if resumed:
         payload = json.loads(output.read_text(encoding="utf-8"))
+        model = payload["model"]
+        protocol = dict(payload["protocol"])
+        requested = {
+            "sweep_offset": sweep_offset,
+            "solver": str(solver),
+            "metric_tol": float(metric_tol),
+            "eig_tol": float(eig_tol),
+            "maxiter": int(maxiter),
+            "max_subspace": int(max_subspace),
+            "gain_tolerance": gain_tolerance,
+        }
+        for key, value in requested.items():
+            if protocol.get(key) != value:
+                raise RuntimeError(
+                    f"unsafe resume: requested {key}={value!r} differs from "
+                    f"checkpoint value {protocol.get(key)!r}."
+                )
+        protocol["maximum_directional_passes"] = maximum_passes
+        source = None
+        source_projection = None
+        source_is_projected = protocol.get("source_state") == "projected"
+        source_recorded_energy = float(payload["source"]["energy_recorded"])
+    else:
+        source = json.loads(source_result.read_text(encoding="utf-8"))
+        model = source["model"]
+        source_projection = _source_projection_metadata(source_snapshot)
+        source_is_projected = source_projection is not None
+        source_recorded_energy = float(source["result"]["energy"])
+        protocol = {
+            "ansatz": "P_Q |Psi(A)> with every unrestricted A coordinate retained",
+            "symmetry": "exact variation-after-projection U(1)",
+            "source_state": "projected" if source_is_projected else "unrestricted",
+            "target_two_sz": 0,
+            "local_two_sz": [1, -1],
+            "local_tensor_masks": False,
+            "expected_parameters": EXPECTED_PARAMETERS,
+            "source_result": str(source_result.resolve()),
+            "source_snapshot": str(source_snapshot.resolve()),
+            "frontier_backend": "identity_block",
+            "objective_mpo": "sparse factorized H times P_Q",
+            "materialize_objective_mpo": False,
+            "balance_initial_gauges": False,
+            "optimization": "directional one-site variational sweeps",
+            "sweep_offset": sweep_offset,
+            "solver": str(solver),
+            "metric_tol": float(metric_tol),
+            "eig_tol": float(eig_tol),
+            "maxiter": int(maxiter),
+            "max_subspace": int(max_subspace),
+            "environment_cache": "checkpointed",
+            "frontier_canonicalization": False,
+            "maximum_directional_passes": maximum_passes,
+            "gain_tolerance": gain_tolerance,
+            "gain_tolerance_units": "energy_per_site",
+            "convergence_rule": (
+                "both directional one-site gains per site in one complete "
+                "alternating cycle are below gain_tolerance, with no solver failures"
+            ),
+            "checkpoint_pair_energy_tolerance": CHECKPOINT_PAIR_ENERGY_TOL,
+            "reconstruction_energy_tolerance_per_site": (
+                RECONSTRUCTION_ENERGY_TOL_PER_SITE
+            ),
+            "safe_resume": True,
+        }
+    if (
+        int(model["nrows"]) != 6
+        or int(model["ncols"]) != 6
+        or int(model["nsites"]) != NSITES
+    ):
+        raise ValueError("the source checkpoint must be the 6x6 model.")
+    protocol_fingerprint = _fingerprint(protocol)
+    invocation_start = perf_counter()
+
+    if resumed:
         metadata = _read_snapshot_metadata(snapshot)
         _validate_resume(
             payload,

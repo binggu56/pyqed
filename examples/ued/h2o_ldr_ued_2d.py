@@ -25,7 +25,7 @@ from pyqed.dvr.dvr_1d import kinetic
 from pyqed.qchem.fourier import AOPairFTPlan, has_compiled_ao_ft
 from pyqed.qchem.mol import Molecule
 from pyqed.ued.ued import UED, electron_density_ft
-from pyqed.units import amu2au
+from pyqed.units import amu2au, au2ev
 
 
 MASS_O = 15.999
@@ -58,7 +58,7 @@ def atom_string(coords: np.ndarray) -> str:
 
 def build_h2o(coords: np.ndarray, basis: str) -> Molecule:
     mol = Molecule(atom=atom_string(coords), unit="bohr", basis=basis, spin=0)
-    mol.build(driver="builtin", eri="dense", aosym="s1")
+    mol.build(eri="dense", aosym="s1")
     return mol
 
 
@@ -183,7 +183,7 @@ def plot_results(path, r_grid, theta_grid, sx, sy, pes, chi, intensity):
 
     theta_deg = np.rad2deg(theta_grid)
     extent_rt = [r_grid[0], r_grid[-1], theta_deg[0], theta_deg[-1]]
-    pes_rel = (pes - pes.min()) * 27.211386245988
+    pes_rel = (pes - pes.min()) * au2ev
     im0 = axes[0].imshow(
         pes_rel.T,
         origin="lower",

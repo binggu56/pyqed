@@ -4,7 +4,7 @@ from itertools import permutations
 
 from pyqed.mps.nonabelian import (
     AutoMPO,
-    NonabelianTensor,
+    IrrepTensor,
     RankCoupledChannelTerm,
     RankCoupledMPO,
     SiteOperator,
@@ -50,7 +50,7 @@ def _spatial_chain():
     site = SpatialOrbitalSite()
     q_empty, q_single, q_double = site.qn
 
-    A = NonabelianTensor(
+    A = IrrepTensor(
         data={
             (q_empty, q_empty, q_empty): np.array([[[1.0]]]),
             (q_single, q_single, q_single): np.array([[[1.0], [0.5]]]),
@@ -59,7 +59,7 @@ def _spatial_chain():
         qns=[list(site.qn), list(site.qn), list(site.qn)],
         dirs=[-1, 1, 1],
     )
-    B = NonabelianTensor(
+    B = IrrepTensor(
         data={
             (q_empty, q_empty, q_empty): np.array([[[0.5]]]),
             (q_single, q_single, q_single): np.array([[[0.75], [1.25]]]),
@@ -68,7 +68,7 @@ def _spatial_chain():
         qns=[list(site.qn), list(site.qn), list(site.qn)],
         dirs=[-1, 1, 1],
     )
-    C = NonabelianTensor(
+    C = IrrepTensor(
         data={
             (q_empty, q_empty, q_empty): np.array([[[1.5]]]),
             (q_single, q_single, q_single): np.array([[[0.2], [1.8]]]),
@@ -314,7 +314,7 @@ def _reduced_spatial_path_mps(labels, bonds):
         q_phys = site.qn[label]
         q_right = bonds[site_index + 1]
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data={(q_left, q_phys, q_right): np.ones((1, 1, 1))},
                 qns=[[q_left], list(site.qn), [q_right]],
                 dirs=[-1, 1, 1],
@@ -417,6 +417,7 @@ def test_fully_reduced_normal_complementary_matrix_matches_dense_reference():
         pytest.skip("optional SU(2) C++ kernel is unavailable")
     from pyqed.qchem.dmrg.backends.reduced import (
         build_su2_normal_complementary_mpo,
+        refresh_su2_normal_complementary_mpo,
     )
     from pyqed.mps.nonabelian.environment import (
         LeftBlock,
@@ -437,12 +438,36 @@ def test_fully_reduced_normal_complementary_matrix_matches_dense_reference():
     eri = np.einsum("pqL,rsL->pqrs", cholesky, cholesky)
 
     owner = SU2MovingEnvironment(
-        one_body,
+        np.zeros_like(one_body),
         eri,
         4,
         two_s=0,
         cutoff=1.0e-12,
         include_half=True,
+    )
+    revision_before = owner.system_stats["revision"]
+    plans_before = tuple(
+        owner.normal_complementary_plan(site) for site in range(nsites)
+    )
+    owner.update_h1(one_body)
+    plans_after = tuple(
+        owner.normal_complementary_plan(site) for site in range(nsites)
+    )
+    assert owner.system_stats["revision"] != revision_before
+    topology_keys = (
+        "source",
+        "target",
+        "operator",
+        "first_index",
+        "second_index",
+        "family_mask",
+    )
+    for before, after in zip(plans_before, plans_after):
+        for key in topology_keys:
+            np.testing.assert_array_equal(after[key], before[key])
+    assert any(
+        not np.array_equal(after["coefficient"], before["coefficient"])
+        for before, after in zip(plans_before, plans_after)
     )
     mpo = build_su2_normal_complementary_mpo(
         owner,
@@ -650,6 +675,85 @@ def test_fully_reduced_normal_complementary_matrix_matches_dense_reference():
         rtol=1.0e-10,
         atol=1.0e-12,
     )
+
+    factor_ids = tuple(id(factor) for factor in mpo)
+    route_ids = tuple(
+        id(term.visible_virtual_block.values)
+        for factor in mpo
+        for term in factor.reduced_terms
+    )
+    one_body_update = one_body + np.diag(np.linspace(-0.01, 0.01, nsites))
+    assert owner.update_h1(one_body_update) is True
+    refresh_su2_normal_complementary_mpo(owner, mpo)
+    assert tuple(id(factor) for factor in mpo) == factor_ids
+    assert tuple(
+        id(term.visible_virtual_block.values)
+        for factor in mpo
+        for term in factor.reduced_terms
+    ) == route_ids
+    refreshed = np.asarray(
+        [
+            [
+                _contract_chain_transition(bra, mpo, ket)
+                for ket in basis_states
+            ]
+            for bra in basis_states
+        ]
+    )
+    refreshed_dense_hamiltonian = (
+        _dense_spatial_one_body_hamiltonian(one_body_update)
+        + _dense_spatial_spinfree_eri_hamiltonian(eri)
+    )
+    refreshed_expected = np.asarray(
+        [
+            [
+                np.vdot(bra, refreshed_dense_hamiltonian @ ket)
+                for ket in dense_vectors
+            ]
+            for bra in dense_vectors
+        ]
+    )
+    np.testing.assert_allclose(
+        refreshed,
+        refreshed_expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+    assert owner.update_h1(one_body_update) is False
+
+    eri_update = 1.1 * eri
+    assert owner.update_integrals(one_body_update, eri_update, 0.17) is True
+    refresh_su2_normal_complementary_mpo(owner, mpo)
+    refreshed_all = np.asarray(
+        [
+            [
+                _contract_chain_transition(bra, mpo, ket)
+                for ket in basis_states
+            ]
+            for bra in basis_states
+        ]
+    )
+    refreshed_all_dense = (
+        _dense_spatial_one_body_hamiltonian(one_body_update)
+        + _dense_spatial_spinfree_eri_hamiltonian(eri_update)
+        + 0.17 * np.eye(4 ** nsites)
+    )
+    refreshed_all_expected = np.asarray(
+        [
+            [
+                np.vdot(bra, refreshed_all_dense @ ket)
+                for ket in dense_vectors
+            ]
+            for bra in dense_vectors
+        ]
+    )
+    np.testing.assert_allclose(
+        refreshed_all,
+        refreshed_all_expected,
+        rtol=1.0e-10,
+        atol=1.0e-12,
+    )
+    assert owner.update_integrals(one_body_update, eri_update, 0.17) is False
 
 
 def test_normal_complementary_pair_adjoint_survives_rank_one_transport():
@@ -962,9 +1066,11 @@ def test_fully_reduced_adjacent_one_body_matrix_matches_exact_reduced_cg_referen
     for create_site, annihilate_site in ((0, 1), (1, 0)):
         h1e = np.zeros((nsites, nsites))
         h1e[create_site, annihilate_site] = 1.0
-        autompo = AutoMPO([phys_leg] * nsites)
-        add_spatial_one_body_terms(autompo, h1e, cutoff=1.0e-12)
-        mpo = autompo.build()
+        mpo = build_spatial_one_body_reduced_mpo(
+            [phys_leg] * nsites,
+            h1e,
+            cutoff=1.0e-12,
+        )
         expected_operator = _dense_spatial_one_body_hamiltonian(h1e)
 
         for bra_index, bra_state in enumerate(basis_states):
@@ -986,12 +1092,21 @@ def test_fully_reduced_one_body_embedded_matrix_matches_exact_reduced_cg_referen
     basis_states, dense_vectors = _reduced_spatial_path_basis(path_specs)
     phys_leg = physical_leg_from_spatial_orbital(FullyReducedSpatialOrbitalSite())
 
-    for create_site, annihilate_site in ((0, 1), (0, 2), (1, 3), (3, 0)):
+    for create_site, annihilate_site in (
+        (0, 0),
+        (2, 2),
+        (0, 1),
+        (0, 2),
+        (1, 3),
+        (3, 0),
+    ):
         h1e = np.zeros((nsites, nsites))
         h1e[create_site, annihilate_site] = 1.0
-        autompo = AutoMPO([phys_leg] * nsites)
-        add_spatial_one_body_terms(autompo, h1e, cutoff=1.0e-12)
-        mpo = autompo.build()
+        mpo = build_spatial_one_body_reduced_mpo(
+            [phys_leg] * nsites,
+            h1e,
+            cutoff=1.0e-12,
+        )
         expected_operator = _dense_spatial_one_body_hamiltonian(h1e)
 
         for bra_index, bra_state in enumerate(basis_states):
@@ -1009,7 +1124,6 @@ def test_fully_reduced_four_distinct_eri_refuses_inexact_recursive_growth():
     eri = np.zeros((4, 4, 4, 4))
     eri[0, 2, 1, 3] = 0.07
     autompo = AutoMPO([phys_leg] * 4)
-
     with pytest.raises(NotImplementedError, match="four-site recoupling data"):
         add_spatial_spinfree_eri_terms(autompo, eri)
 

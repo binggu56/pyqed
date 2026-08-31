@@ -7,7 +7,7 @@ from pyqed.qchem.tdcis import TDCIS as DirectTDCIS
 
 def _h2_rhf():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="gbasis")
+    mol.build()
     return RHF(mol).run()
 
 

@@ -86,7 +86,7 @@ def test_shg_from_ab_initio_casci_heh_plus_smoke():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2, verbose=0).run(nstates=3, method="direct_ci")
 

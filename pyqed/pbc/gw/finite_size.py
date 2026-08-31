@@ -11,6 +11,7 @@ from .coulomb import (
     normalize_coulomb_component,
 )
 from .integrals import (
+    _pyscf_cell_from_reference,
     gdf_transition_factors,
     pyscf_gdf_transition_factors,
     reciprocal_orbital_pair_factors,
@@ -223,28 +224,12 @@ def _pyscf_gradient_head_transitions(space, qvec, energy_table):
     """Return q_ia from the PySCF k.p AO-gradient expression."""
 
     try:
-        from pyscf.pbc import dft, gto
+        from pyscf.pbc import dft
     except Exception as exc:  # pragma: no cover - optional dependency path
         raise ImportError("PySCF is required for finite_size_head_method='pyscf'.") from exc
 
     ref = space.reference
-    src_cell = ref.cell
-    if not all(hasattr(src_cell, name) for name in ("_atom_symbols", "_atom_coords")):
-        raise TypeError("Cannot mirror the native cell into a PySCF PBC Cell.")
-
-    cell = gto.Cell()
-    cell.atom = [
-        (symbol, tuple(coord))
-        for symbol, coord in zip(src_cell._atom_symbols, src_cell._atom_coords)
-    ]
-    cell.a = np.asarray(src_cell.lattice_vectors, dtype=float)
-    cell.basis = src_cell.basis
-    cell.unit = "B"
-    cell.charge = int(getattr(src_cell, "charge", 0))
-    cell.spin = int(getattr(src_cell, "spin", 0))
-    cell.dimension = int(getattr(src_cell, "dimension", 3))
-    cell.verbose = 0
-    cell.build()
+    cell = _pyscf_cell_from_reference(ref)
 
     coords, weights = dft.gen_grid.get_becke_grids(cell, level=5)
     qvec = np.asarray(qvec, dtype=float)

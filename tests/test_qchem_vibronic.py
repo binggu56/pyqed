@@ -207,7 +207,7 @@ def test_sharc_lvc_template_maps_to_pyqed_coupling_tensor():
 
 def test_lvc_from_casci_uses_vibronic_couplings():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
@@ -237,7 +237,7 @@ def test_lvc_from_casci_uses_vibronic_couplings():
 
 def test_qvc_from_casci_uses_first_and_second_derivatives():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
 
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)

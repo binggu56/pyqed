@@ -40,7 +40,7 @@ DEFAULTS = {
     "nstates": 3,
     "initial_state": 2,
     "fc_surface": 0,
-    "coordinates": "jacobi-h-oh",
+    "coordinates": "jacobi",
     "n_r": 11,
     "n_R": 11,
     "n_theta": 15,
@@ -105,7 +105,7 @@ def make_ldr(cfg, driver) -> Triatomic:
         driver=driver,
         coordinates=cfg.coordinates,
     )
-    if ldr.coordinates == "jacobi-h-oh":
+    if ldr.coordinates == "jacobi":
         domains = [
             [cfg.r_min, cfg.r_max],
             [cfg.R_min, cfg.R_max],
@@ -372,7 +372,7 @@ def parse_args():
         elif name == "kinetic_propagator":
             kwargs["choices"] = ("dense", "expm_multiply", "chebyshev")
         elif name == "coordinates":
-            kwargs["choices"] = ("valence", "jacobi-h-oh", "jacobi")
+            kwargs["choices"] = ("valence", "jacobi")
         elif isinstance(default, Path):
             kwargs["type"] = Path
         else:

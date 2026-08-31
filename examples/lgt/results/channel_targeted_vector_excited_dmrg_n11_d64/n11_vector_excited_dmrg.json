@@ -1,0 +1,35 @@
+{
+  "description": "Three-root vector-weighted Gauss-symmetric excited-state DMRG",
+  "parameters": {
+    "npts": 11,
+    "length": 10.0,
+    "coupling": 1.0,
+    "mass": 0.0,
+    "flux_cutoff": 1,
+    "bond_dim": 64,
+    "half_sweeps": 12,
+    "nstates": 3,
+    "weights": [
+      0.2,
+      0.2,
+      0.6
+    ]
+  },
+  "energies": [
+    -16.090492500069555,
+    -16.04913582933505,
+    -15.129538787469906
+  ],
+  "vector_strengths": [
+    5.222083875269375e-07,
+    0.00010582031115096488,
+    0.2993693437803339
+  ],
+  "active_root": 2,
+  "vector_excitation": 0.9609537125996486,
+  "vector_mass": 0.7270817434893231,
+  "continuum_vector_mass": 0.5641895835477563,
+  "tdvp_same_bond_vector_mass": 1.0147456345516521,
+  "wall_seconds": 276.60151762515306,
+  "converged": false
+}

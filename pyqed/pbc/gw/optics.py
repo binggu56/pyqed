@@ -4,11 +4,13 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from pyqed.units import au2ev
+
 from .finite_size import bloch_ao_gradient_matrices, cell_volume
 from .response import KPointTransitionSpace
 
 
-_HARTREE_TO_EV = 27.211386245988
+_HARTREE_TO_EV = au2ev
 
 
 @dataclass

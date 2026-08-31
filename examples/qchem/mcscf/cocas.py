@@ -11,7 +11,7 @@ from pyqed.qchem import COCAS
 import numpy as np
 
 mol = Molecule(atom="Li 0 0 0; F 0 0 1.4", unit="b", basis="631g")
-mol.build(driver="builtin", eri="dense")
+mol.build(eri="dense")
 
 mf = mol.RHF().run()
 print("E(HF) =", mf.e_tot)

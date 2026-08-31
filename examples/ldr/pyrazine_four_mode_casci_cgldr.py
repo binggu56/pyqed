@@ -1243,11 +1243,6 @@ def load_full_data(filename, dvr, *, root_window):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--basis", default="sto-3g")
-    parser.add_argument(
-        "--driver",
-        default="builtin",
-        choices=("gbasis", "builtin"),
-    )
     parser.add_argument("--eri", default="dense")
     parser.add_argument(
         "--derivative-backend",
@@ -1357,7 +1352,6 @@ def main():
     reference = run_casci_point(
         geometry,
         basis=args.basis,
-        driver=args.driver,
         eri=args.eri,
         nstates=args.root_window,
     )
@@ -1380,7 +1374,7 @@ def main():
     base_metadata = {
         "solver": f"CASCI(4e,4o)/{args.basis}",
         "ao_basis": args.basis,
-        "integral_driver": args.driver,
+        "integral_engine": "native",
         "eri_representation": args.eri,
         "state_ids": list(STATE_IDS),
         "root_window": int(args.root_window),
@@ -1425,7 +1419,6 @@ def main():
                 selected.displacements,
                 indices,
                 basis=args.basis,
-                driver=args.driver,
                 eri=args.eri,
                 orbital_reference=reference,
                 root_window=args.root_window,
@@ -1529,7 +1522,6 @@ def main():
             geometry,
             selected.displacements,
             basis=args.basis,
-            driver=args.driver,
             eri=args.eri,
             unitarize_overlaps=False,
             orbital_reference=reference,

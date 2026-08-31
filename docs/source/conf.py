@@ -74,7 +74,6 @@ exclude_patterns = [
 
 autodoc_mock_imports = [
     'cv2',
-    'gbasis',
     'lime',
     'mayavi',
     'numba',

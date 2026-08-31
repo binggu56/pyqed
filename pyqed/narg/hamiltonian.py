@@ -118,7 +118,7 @@ class IntegralHamiltonian(HamiltonianSpec):
 
 @dataclass(frozen=True)
 class MPOHamiltonian(HamiltonianSpec):
-    """MPO Hamiltonian placeholder for lattice-NARG engines."""
+    """MPO or model-native complementary-environment Hamiltonian."""
 
     tensors: tuple[Any, ...] = ()
     sites: tuple[Any, ...] = ()

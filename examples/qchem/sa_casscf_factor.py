@@ -9,7 +9,7 @@ mol = Molecule(
     unit="angstrom",
     basis="sto-3g",
 )
-mol.build(driver="builtin", eri="factors")
+mol.build(eri="factors")
 
 # A Cholesky RHF reference makes CASSCF use factorized integrals automatically.
 mf = mol.RHF().run()

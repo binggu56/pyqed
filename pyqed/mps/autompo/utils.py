@@ -17,20 +17,27 @@ import logging
 import numpy as np
 from typing import List, Union
 import scipy
-from scipy.constants import physical_constants as c
+
+from pyqed.units import (
+    ATOMIC_TIME_SECOND,
+    BOHR_RADIUS_METER,
+    amu2au,
+    au2amu,
+    au2angstrom,
+    au2debye,
+    au2ev,
+    au2fs,
+    au2k,
+    wavenumber2hartree,
+)
 
 # Constants table from scipy 
 ##################### energy ##################
 # 1 a.u. = au2ev eV
-au2ev = c["Hartree energy in eV"][0]
 ev2au = 1./au2ev
 
 # 1 cm^-1 = cm2au a.u.
-cm2au = (
-    1.0e2
-    * c["inverse meter-hertz relationship"][0]
-    / c["hartree-hertz relationship"][0]
-)
+cm2au = wavenumber2hartree
 au2cm = 1./ cm2au
 
 # 1 cm^-1 = cm2ev eV
@@ -39,22 +46,18 @@ ev2cm = 1./cm2ev
 
 ##################### time ##################
 # 1 fs = fs2au a.u
-fs2au = 1.0e-15 / c["atomic unit of time"][0]
-au2fs = 1. / fs2au
+fs2au = 1.0 / au2fs
 
 ps2au = fs2au * 1000
 au2ps = 1. / ps2au
 
 ################ temperature energy ###############
-K2au = c["kelvin-hartree relationship"][0]
-au2K = c["hartree-kelvin relationship"][0]
+K2au = 1.0 / au2k
+au2K = au2k
 
 ###################  mass #################
 # atomic mass unit
-amu2au = c["atomic mass constant"][0] / c["atomic unit of mass"][0]
-angstrom2au = 1e-10 / c["atomic unit of length"][0] 
-au2amu = 1 / amu2au
-au2angstrom = 1 / angstrom2au
+angstrom2au = 1.0 / au2angstrom
 
 ################# wavelength energy #############
 # nm to au
@@ -67,14 +70,13 @@ def au2nm(e):
 ################### mobility ########################
 # 1 cm^2/V s = mobility2au a.u.
 # mobility2au = 23.505175500558234
-mobility2au = au2ev * c["atomic unit of time"][0] / (c["atomic unit of length"][0] * 100) ** 2
+mobility2au = au2ev * ATOMIC_TIME_SECOND / (BOHR_RADIUS_METER * 100) ** 2
 
 ################# dipole moment #################
-debye2au = 0.393456
-au2debye = 1 / debye2au
+debye2au = 1.0 / au2debye
 
 ################ length ####################
-au2m = c["atomic unit of length"][0]
+au2m = BOHR_RADIUS_METER
 m2au = 1/au2m
 
 

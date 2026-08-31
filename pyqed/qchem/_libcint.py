@@ -188,10 +188,8 @@ def _resolve_shell_icenter(shell, atom_coords, tol=1e-10):
     """
     Resolve the atom-center index for a shell.
 
-    ``gbasis`` shells created through ``from_pyscf`` may carry ``icenter=None``
-    even though the shell coordinate matches one of the molecular centers.
-    Recovering the center index here lets the libcint wrapper operate on both
-    native gbasis shells and the PySCF-backed wrapper path.
+    Native contracted Gaussians store their origin directly rather than an
+    atom index, so recover the matching molecular center when needed.
     """
     icenter = getattr(shell, "icenter", None)
     if icenter is not None:
@@ -235,7 +233,7 @@ class CBasis1e:
             suffix = '_cart'
         self._suffix = suffix
 
-        # gbasis shells carry icenter; atom symbols are element labels.
+        # Atom symbols are element labels in the molecule's native basis.
         from periodictable import elements
         atnums = [elements.isotope(symbol).number for symbol in self.atom_symbols]
 

@@ -1,6 +1,5 @@
 import string
 import functools
-import itertools
 import os
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -20,12 +19,22 @@ except Exception:  # pragma: no cover - optional acceleration dependency
     njit = None
 
 from pyqed.units import amu2au, au2fs, au2wavenumber
-from pyqed.dvr.dvr_1d import FEDVR, LegendreDVR, PODVR, SineDVR
+from pyqed.dvr.dvr_1d import (
+    FEDVR,
+    JacobiDVR,
+    LegendreDVR,
+    PODVR,
+    PTDVR,
+    SineDVR,
+)
 from pyqed import interval, au2angstrom
 from pyqed.phys import gwp
 from pyqed.qchem.mol import Molecule
 from pyqed.qchem.hf import RHF, ROHF
 from pyqed.qchem.mcscf.casci import CASCI, overlap
+from pyqed.ldr import kinetic as kinetic_tools
+from pyqed.ldr import keo as keo_tools
+from pyqed.ldr import overlap as overlap_tools
 from pyqed.namd.keo import (
     EPS,
     calculate_exact_keo as calculate_rovibrational_keo,
@@ -43,6 +52,7 @@ warnings.filterwarnings("ignore", message="AM1 model is under testing")
 
 
 SQRT2 = np.sqrt(2.0)
+_JACOBI_COORDINATE = "jacobi"
 
 
 if njit is not None:
@@ -474,6 +484,7 @@ class Triatom(Molecule):
     Inherits from Molecule for electronic structure capabilities, and
     integrates LDR-based split-operator propagation directly.
     """
+    _COORDINATE_JACOBI = _JACOBI_COORDINATE
 
     def __init__(self,
                  atom: str | list[str],
@@ -486,7 +497,8 @@ class Triatom(Molecule):
                  driver=None,
                  coordinates: str = "valence",
                  J: int = 0,
-                 Jz: int | None = None):  # 新增 dvr_type 参数
+                 Jz: int | None = None,
+                 jacobi_atoms: tuple[int, int, int] | tuple[int, tuple[int, int]] | None = None):  # 新增 dvr_type 参数
 
         # 调用父类初始化
         if driver is not None and basis == 'sto-3g':
@@ -516,6 +528,7 @@ class Triatom(Molecule):
         self.nrot = self._rotational_dimension()
         # 用于存储动力学结果
         self.psi_t = None
+        self._jacobi_atoms = self._normalize_jacobi_fragment(jacobi_atoms, self.natom)
 
     @staticmethod
     def _normalize_coordinates(coordinates):
@@ -526,24 +539,101 @@ class Triatom(Molecule):
             "eckart": "valence",
             "internal": "valence",
             "oh-oh": "valence",
-            "jacobi": "jacobi-h-oh",
-            "h-oh": "jacobi-h-oh",
-            "jacobi-hoh": "jacobi-h-oh",
+            "jacobi": _JACOBI_COORDINATE,
             "qsqa": "qs-qa-theta",
             "qs-qa": "qs-qa-theta",
             "symmetric-antisymmetric": "qs-qa-theta",
         }
         coordinates = aliases.get(coordinates, coordinates)
-        if coordinates not in ("valence", "jacobi-h-oh", "qs-qa-theta"):
+        if coordinates not in ("valence", _JACOBI_COORDINATE, "qs-qa-theta"):
             raise ValueError(
-                "coordinates must be 'valence', 'jacobi-h-oh', or "
-                "'qs-qa-theta'."
+                "coordinates must be 'valence', 'jacobi', or 'qs-qa-theta'."
             )
         return coordinates
 
+    @staticmethod
+    def _normalize_jacobi_fragment(
+        jacobi_atoms: tuple[int, int, int] | tuple[int, tuple[int, int]] | None,
+        natom: int,
+    ) -> tuple[int, int, int]:
+        if jacobi_atoms is None:
+            return (0, 1, 2)
+        if not isinstance(jacobi_atoms, (tuple, list)):
+            raise TypeError(
+                "jacobi_atoms must be a tuple/list of indices "
+                "(A, B, C) or (A, (B, C))."
+            )
+        if len(jacobi_atoms) == 2:
+            a, bc = jacobi_atoms
+            if not isinstance(bc, (tuple, list)) or len(bc) != 2:
+                raise ValueError(
+                    "jacobi_atoms = (A, (B, C)) requires B and C indices."
+                )
+            b, c = bc
+        elif len(jacobi_atoms) == 3:
+            a, b, c = jacobi_atoms
+        else:
+            raise ValueError(
+                "jacobi_atoms must have length 2 -> (A, (B, C)) "
+                "or length 3 -> (A, B, C)."
+            )
+        atoms = (int(a), int(b), int(c))
+        if len(set(atoms)) != 3:
+            raise ValueError("jacobi_atoms must contain three distinct indices.")
+        if any(i < 0 or i >= natom for i in atoms):
+            raise ValueError(
+                f"jacobi_atoms indices must be in [0, {natom - 1}] for natom={natom}."
+            )
+        return atoms
+
+    @staticmethod
+    def _jacobi_to_xyz(q, mass, jacobi_atoms, *, module=np):
+        q = module.asarray(q, dtype=float)
+        if q.shape != (3,):
+            raise ValueError("Jacobi coordinates must have shape (r, R, gamma).")
+        mass = module.asarray(mass, dtype=q.dtype)
+        atom_a, atom_b, atom_c = jacobi_atoms
+        r, R, gamma = q
+        m_b = mass[atom_b]
+        m_c = mass[atom_c]
+        m_bc = m_b + m_c
+        zero = module.asarray(0.0, dtype=q.dtype)
+
+        b = module.array([-m_c / m_bc * r, zero, zero], dtype=q.dtype)
+        c = module.array([m_b / m_bc * r, zero, zero], dtype=q.dtype)
+        a = module.array([R * module.cos(gamma), R * module.sin(gamma), zero], dtype=q.dtype)
+
+        xyz = [
+            module.zeros(3, dtype=q.dtype),
+            module.zeros(3, dtype=q.dtype),
+            module.zeros(3, dtype=q.dtype),
+        ]
+        xyz[atom_a] = a
+        xyz[atom_b] = b
+        xyz[atom_c] = c
+        return module.stack(xyz, axis=0)
+
+    @staticmethod
+    def _valence_to_jacobi_geometry(r1, r2, theta, mass, jacobi_atoms):
+        mass = np.asarray(mass, dtype=float)
+        r1 = float(r1)
+        r2 = float(r2)
+        theta = float(theta)
+        _, atom_b, atom_c = jacobi_atoms
+        m_b = mass[atom_b]
+        m_c = mass[atom_c]
+        m_bc = m_b + m_c
+
+        bc_axis = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=float)
+        bc_com = m_c / m_bc * r2 * bc_axis
+        R_vec = np.array([r1, 0.0, 0.0], dtype=float) - bc_com
+        R = float(np.linalg.norm(R_vec))
+        gamma = float(np.arccos(np.clip(np.dot(bc_axis, R_vec) / R, -1.0, 1.0)))
+        return np.array([r2, R, gamma], dtype=float)
+
     @property
     def coordinate_labels(self):
-        if self.coordinates == "jacobi-h-oh":
+        if self.coordinates == _JACOBI_COORDINATE:
             return ("r", "R", "gamma")
         if self.coordinates == "qs-qa-theta":
             return ("qs", "qa", "theta")
@@ -705,41 +795,17 @@ class Triatom(Molecule):
         C = jnp.array([r2 * jnp.cos(theta), r2 * jnp.sin(theta), zero], dtype=q.dtype)
         return jnp.stack([A, B, C], axis=0)
 
-    def _jacobi_h_oh_to_xyz_jax(self, q):
-        r, R, gamma = q
-        zero = jnp.asarray(0.0, dtype=q.dtype)
-        masses = jnp.asarray(self.mass, dtype=q.dtype)
-        m_b = masses[1]
-        m_c = masses[2]
-        m_bc = m_b + m_c
-        x_b = -m_c / m_bc * r
-        x_c = m_b / m_bc * r
-        A = jnp.array([R * jnp.cos(gamma), R * jnp.sin(gamma), zero], dtype=q.dtype)
-        B = jnp.array([x_b, zero, zero], dtype=q.dtype)
-        C = jnp.array([x_c, zero, zero], dtype=q.dtype)
-        return jnp.stack([A, B, C], axis=0)
+    def _jacobi_a_bc_to_xyz_jax(self, q):
+        return self._jacobi_to_xyz(q, self.mass, self._jacobi_atoms, module=jnp)
 
     def _internal_to_xyz_jax(self, q):
-        if self.coordinates == "jacobi-h-oh":
-            return self._jacobi_h_oh_to_xyz_jax(q)
+        if self.coordinates == _JACOBI_COORDINATE:
+            return self._jacobi_a_bc_to_xyz_jax(q)
         return self._valence_to_xyz_jax(q)
 
     def valence_to_jacobi(self, r1, r2, theta):
-        """Convert H-O-H valence coordinates to H + OH Jacobi coordinates.
-
-        Atom order is ``[H_dissociating, O, H_bound]``.  The Jacobi
-        coordinates are ``(r, R, gamma)`` where ``r`` is the bound OH length,
-        ``R`` points from the OH center of mass to the dissociating H, and
-        ``gamma`` is the angle from the OH vector to ``R``.
-        """
-        m_b = float(self.mass[1])
-        m_c = float(self.mass[2])
-        oh_axis = np.array([np.cos(theta), np.sin(theta), 0.0], dtype=float)
-        oh_com = m_c / (m_b + m_c) * r2 * oh_axis
-        R_vec = np.array([r1, 0.0, 0.0], dtype=float) - oh_com
-        R = float(np.linalg.norm(R_vec))
-        gamma = float(np.arccos(np.clip(np.dot(oh_axis, R_vec) / R, -1.0, 1.0)))
-        return np.array([r2, R, gamma], dtype=float)
+        """Convert valence coordinates to Jacobi coordinates for this A+BC split."""
+        return self._valence_to_jacobi_geometry(r1, r2, theta, self.mass, self._jacobi_atoms)
 
     def build_rovibrational_keo(self, J=None, verbose=True):
         """Build the full vibrational + rotational + Coriolis KEO."""
@@ -1370,17 +1436,19 @@ class Triatom(Molecule):
         )
 
     def _buildK_jacobi_h_oh(self, J=None, sparse=False):
-        """Build the J=0 H + OH Jacobi kinetic-energy operator.
+        """Build the J=0 A+BC Jacobi kinetic-energy operator.
 
         Coordinates are ``(r, R, gamma)``:
 
-        * ``r``: OH bond length for atoms [O, H_bound]
-        * ``R``: distance from the OH center of mass to H_dissociating
-        * ``gamma``: angle between the OH vector and ``R``
+        * ``r``: BC bond length
+        * ``R``: distance from the BC center of mass to atom A
+        * ``gamma``: angle between the BC vector and ``R``
 
-        The operator uses the radial-scaled J=0 Jacobi form,
+        The operator uses the radial- and angular-scaled J=0 Jacobi form,
         ``p_r^2/(2 mu_r) + p_R^2/(2 mu_R)
-        + 0.5 * (1/(mu_r r^2) + 1/(mu_R R^2)) p_gamma^2``.
+        + 0.5 * p_gamma (1/(mu_r r^2) + 1/(mu_R R^2)) p_gamma``.
+        The flat-DVR representation also contains the Podolsky geometric
+        potential ``-G_gamma_gamma * (1 + csc(gamma)^2) / 8``.
         """
         J = self.J if J is None else int(J)
         if J > 0:
@@ -1389,54 +1457,16 @@ class Triatom(Molecule):
             )
 
         dvrs = self.dvrs
-        m_a, m_b, m_c = [float(m) for m in self.mass]
+        a_idx, b_idx, c_idx = getattr(self, "_jacobi_atoms", (0, 1, 2))
+        m_a, m_b, m_c = (
+            float(self.mass[a_idx]),
+            float(self.mass[b_idx]),
+            float(self.mass[c_idx]),
+        )
         mu_r = m_b * m_c / (m_b + m_c)
         mu_R = m_a * (m_b + m_c) / (m_a + m_b + m_c)
-
-        def momentum_matrix(dvr):
-            if sparse:
-                try:
-                    return dvr.momentum(sparse=True)
-                except TypeError:
-                    return sp.csr_matrix(dvr.momentum())
-            return dvr.momentum()
-
-        p_r = momentum_matrix(dvrs[0])
-        p_R = momentum_matrix(dvrs[1])
-        p_g = momentum_matrix(dvrs[2])
-
-        r_grid, R_grid, g_grid = self.x
-        n_r, n_R, n_g = self.nx
-
-        if sparse:
-            I_r = sp.eye(n_r, format="csr", dtype=complex)
-            I_R = sp.eye(n_R, format="csr", dtype=complex)
-            I_g = sp.eye(n_g, format="csr", dtype=complex)
-            P_r = sp.kron(p_r, sp.kron(I_R, I_g, format="csr"), format="csr")
-            P_R = sp.kron(I_r, sp.kron(p_R, I_g, format="csr"), format="csr")
-            P_g = sp.kron(I_r, sp.kron(I_R, p_g, format="csr"), format="csr")
-        else:
-            I_r, I_R, I_g = np.eye(n_r), np.eye(n_R), np.eye(n_g)
-            P_r = np.kron(p_r, np.kron(I_R, I_g))
-            P_R = np.kron(I_r, np.kron(p_R, I_g))
-            P_g = np.kron(I_r, np.kron(I_R, p_g))
-
-        Rr, RR, _ = np.meshgrid(r_grid, R_grid, g_grid, indexing="ij")
-        rv = Rr.ravel()
-        Rv = RR.ravel()
-        angular_coeff = 1.0 / mu_r / rv**2 + 1.0 / mu_R / Rv**2
-
-        def sandwich(Pl, g, Pr):
-            if sparse:
-                return Pl.conj().T @ sp.diags(g, format="csr") @ Pr
-            return Pl.conj().T @ np.diag(g) @ Pr
-
-        T = (
-            0.5 / mu_r * (P_r.conj().T @ P_r)
-            + 0.5 / mu_R * (P_R.conj().T @ P_R)
-            + 0.5 * sandwich(P_g, angular_coeff, P_g)
-        )
-        return T.tocsr() if sparse else T
+        kinetic = keo_tools.jacobi(self.dvrs, (mu_r, mu_R), inertia=None)
+        return kinetic.to_sparse() if sparse else kinetic.to_dense()
 
     def buildK(self, J=None, sparse=False):
         """Build the analytical kinetic energy operator in bond-distance /
@@ -1454,7 +1484,7 @@ class Triatom(Molecule):
         1.J. Chem. Phys. 97, 3029–3037 (1992)[An error in Eq.2]
         2.J. Chem. Phys. 88, 4171–4185 (1988)
         """
-        if self.coordinates == "jacobi-h-oh":
+        if self.coordinates == _JACOBI_COORDINATE:
             return self._buildK_jacobi_h_oh(J=J, sparse=sparse)
         if self.coordinates == "qs-qa-theta":
             return self.buildK_qs_qa_theta_from_product_terms(
@@ -2511,84 +2541,93 @@ class Triatom(Molecule):
         self.exp_V = exp_V
         self.exp_V_half = exp_V_half
 
-    def build_ttldr_bundle(self, *, max_rank=None, atol=0.0, prefer_links=True):
-        """Return structured TT-LDR operator pieces for this model.
-
-        This is a lightweight adapter for experiments with tensor-train/MPO
-        representations of APES, electronic overlaps, and future rotational
-        kinetic terms.  It does not alter the current propagation path.
-        """
-        from pyqed.namd.ttldr import build_bundle
-
-        return build_bundle(
-            self,
-            max_rank=max_rank,
-            atol=atol,
-            prefer_links=prefer_links,
-        )
-
-    def build_ttldr_action(
+    def ldr(
         self,
-        T_total=None,
         *,
-        sparse=False,
-        threshold=0.0,
-        max_rank=None,
-        atol=0.0,
-        prefer_links=True,
+        coordinates,
+        jacobi_atoms=None,
+        dvrs,
+        electronic=None,
+        overlap="links",
+        sparse_kinetic=True,
     ):
-        """Return a matrix-free TT-LDR action for dense wavepacket tensors."""
-        from pyqed.namd.ttldr import build_action
+        """Configure a nuclear representation and return its unified LDR solver."""
 
-        return build_action(
-            self,
-            T=T_total,
-            sparse=sparse,
-            threshold=threshold,
-            max_rank=max_rank,
-            atol=atol,
-            prefer_links=prefer_links,
+        coordinates = self._normalize_coordinates(coordinates)
+        if coordinates == _JACOBI_COORDINATE:
+            if jacobi_atoms is None:
+                raise ValueError(
+                    "jacobi_atoms must specify the A + BC partition for Jacobi coordinates"
+                )
+            jacobi_atoms = self._normalize_jacobi_fragment(jacobi_atoms, self.natom)
+        elif jacobi_atoms is not None:
+            raise ValueError("jacobi_atoms is only valid for coordinates='jacobi'")
+
+        if self._rotation_enabled():
+            raise NotImplementedError("The unified LDR adapter currently supports J=0.")
+
+        electronic = self.driver if electronic is None else electronic
+        if electronic is None:
+            raise ValueError("electronic must be configured, for example with mol.casci(...)")
+        electronic_nstates = getattr(electronic, "nstates", None)
+        if electronic_nstates is not None and int(electronic_nstates) != self.nstates:
+            raise ValueError(
+                f"electronic driver has {electronic_nstates} states; molecule has {self.nstates}"
+            )
+
+        overlap = str(overlap).lower().replace("_", "-")
+        if overlap not in {"auto", "links", "full", "none"}:
+            raise ValueError("overlap must be 'auto', 'links', 'full', or 'none'")
+
+        from pyqed.dvr import DVR
+        from pyqed.ldr import LDR
+
+        self.coordinates = coordinates
+        if jacobi_atoms is not None:
+            self._jacobi_atoms = jacobi_atoms
+        if isinstance(dvrs, DVR):
+            dvr = dvrs
+            axes = dvr.axes
+            if dvr.names != tuple(self.coordinate_labels):
+                dvr = DVR.from_axes(axes, names=self.coordinate_labels)
+        else:
+            axes = tuple(dvrs)
+            dvr = DVR.from_axes(axes, names=self.coordinate_labels)
+
+        self._configure_dvr(axes)
+
+        return LDR(
+            dvr,
+            self.nstates,
+            kinetic=self.buildK(sparse=bool(sparse_kinetic)),
+            average_paths=self.overlap_path_average,
+            electronic=electronic,
+            scan_provider=self,
+            overlap_mode=overlap,
         )
+
+    def _scan_ldr(self, electronic, **kwargs):
+        """Sample an electronic driver on the configured nuclear grid."""
+
+        return self.scan_pes(driver=electronic, **kwargs)
+
+    def ttldr(self, **kwargs):
+        """Build a tensor-train LDR driver for this electronic frame field."""
+        from pyqed.namd.ttldr import TTLDR
+
+        return TTLDR(self, **kwargs)
 
     def _build_flat_kinetic_matrix(self, T_total):
         """Build the flat LDR kinetic matrix in the propagation basis."""
-        has_rotation = self._rotation_enabled()
-        state_eye = np.eye(self.nstates, dtype=complex)
-        overlap_links = getattr(self, "overlap_links", None)
-
-        if has_rotation:
-            ng = int(np.prod(self.nx))
-            if self.overlap_matrix is None:
-                if overlap_links is not None:
-                    return self._build_linked_flat_kinetic_matrix(T_total, overlap_links)
-                return np.kron(T_total, state_eye)
-
-            expected = (*self.nx, self.nstates, *self.nx, self.nstates)
-            if self.overlap_matrix.shape != expected:
-                raise ValueError(
-                    f"overlap_matrix shape {self.overlap_matrix.shape} != expected {expected}"
-                )
-            T_rs = T_total.reshape(ng, self.nrot, ng, self.nrot)
-            A = self.overlap_matrix.reshape(ng, self.nstates, ng, self.nstates)
-            K = np.einsum('irms,iamb->iramsb', T_rs, A, optimize=True)
-            K = K.reshape(ng * self.nrot * self.nstates, ng * self.nrot * self.nstates)
-            return 0.5 * (K + K.conj().T)
-
-        if self.overlap_matrix is None:
-            if overlap_links is not None:
-                return self._build_linked_flat_kinetic_matrix(T_total, overlap_links)
-            return np.kron(T_total, state_eye)
-
-        expected = (*self.nx, self.nstates, *self.nx, self.nstates)
-        if self.overlap_matrix.shape != expected:
-            raise ValueError(
-                f"overlap_matrix shape {self.overlap_matrix.shape} != expected {expected}"
-            )
-        ng = int(np.prod(self.nx))
-        A = self.overlap_matrix.reshape(ng, self.nstates, ng, self.nstates)
-        K = np.einsum('im,iamb->iamb', T_total, A, optimize=True)
-        K = K.reshape(ng * self.nstates, ng * self.nstates)
-        return 0.5 * (K + K.conj().T)
+        return kinetic_tools.matrix(
+            T_total,
+            self.nx,
+            self.nstates,
+            overlaps=self.overlap_matrix,
+            links=getattr(self, "overlap_links", None),
+            nrot=self.nrot if self._rotation_enabled() else 1,
+            average_paths=getattr(self, "overlap_path_average", False),
+        )
 
     def _build_linked_flat_kinetic_matrix(self, T_total, links, threshold=0.0):
         """Build the flat LDR kinetic matrix directly from nearest-neighbor links.
@@ -2597,52 +2636,27 @@ class Triatom(Molecule):
         DVR kinetic operators the final flat kinetic matrix is still dense, but
         the electronic overlap blocks are generated on demand from link products.
         """
-        indices = self._grid_indices()
-        ng = len(indices)
-        nstates = self.nstates
-        state_eye = np.eye(nstates, dtype=complex)
-        has_rotation = self._rotation_enabled()
-
-        def linked_block(i, j, bra_idx, ket_idx):
-            if i == j:
-                return state_eye
-            if i < j:
-                return self._linked_overlap_between(bra_idx, ket_idx, links, nstates)
-            return self._linked_overlap_between(ket_idx, bra_idx, links, nstates).conj().T
-
-        if has_rotation:
-            T_rs = T_total.reshape(ng, self.nrot, ng, self.nrot)
-            K = np.zeros((ng, self.nrot, nstates, ng, self.nrot, nstates), dtype=complex)
-            for i, bra_idx in enumerate(indices):
-                for j, ket_idx in enumerate(indices):
-                    block = T_rs[i, :, j, :]
-                    if threshold > 0.0 and np.max(np.abs(block)) <= threshold:
-                        continue
-                    Aij = linked_block(i, j, bra_idx, ket_idx)
-                    K[i, :, :, j, :, :] = (
-                        block[:, None, :, None] * Aij[None, :, None, :]
-                    )
-            K = K.reshape(ng * self.nrot * nstates, ng * self.nrot * nstates)
-            return 0.5 * (K + K.conj().T)
-
-        K = np.zeros((ng, nstates, ng, nstates), dtype=complex)
-        for i, bra_idx in enumerate(indices):
-            for j, ket_idx in enumerate(indices):
-                Tij = T_total[i, j]
-                if threshold > 0.0 and abs(Tij) <= threshold:
-                    continue
-                Aij = linked_block(i, j, bra_idx, ket_idx)
-                K[i, :, j, :] = Tij * Aij
-        K = K.reshape(ng * nstates, ng * nstates)
-        return 0.5 * (K + K.conj().T)
+        return kinetic_tools.matrix(
+            T_total,
+            self.nx,
+            self.nstates,
+            links=links,
+            nrot=self.nrot if self._rotation_enabled() else 1,
+            threshold=threshold,
+            average_paths=getattr(self, "overlap_path_average", False),
+        )
 
     def _linked_overlap_block(self, i, j, bra_idx, ket_idx, links, nstates):
         """Return the linked-product overlap block using dense-A convention."""
-        if i == j:
-            return np.eye(nstates, dtype=complex)
-        if i < j:
-            return self._linked_overlap_between(bra_idx, ket_idx, links, nstates)
-        return self._linked_overlap_between(ket_idx, bra_idx, links, nstates).conj().T
+        return kinetic_tools.block(
+            i,
+            j,
+            bra_idx,
+            ket_idx,
+            links,
+            nstates=nstates,
+            average_paths=getattr(self, "overlap_path_average", False),
+        )
 
     def _build_kinetic_linear_operator(self, T_total, threshold=0.0):
         """Build a matrix-free LDR kinetic operator.
@@ -2651,204 +2665,15 @@ class Triatom(Molecule):
         constructing that matrix explicitly.  With ``overlap_links`` this also
         avoids materializing the full pairwise electronic overlap tensor.
         """
-        from scipy.sparse.linalg import LinearOperator
-
-        has_rotation = self._rotation_enabled()
-        indices = self._grid_indices()
-        ng = len(indices)
-        nstates = self.nstates
-        links = getattr(self, "overlap_links", None)
-        nflat = ng * (self.nrot if has_rotation else 1) * nstates
-        dtype = np.result_type(T_total.dtype, complex)
-
-        if sp.issparse(T_total):
-            T_csr = T_total.tocsr()
-            linked_cache = {}
-
-            def linked_cached(i, j):
-                key = (i, j)
-                block = linked_cache.get(key)
-                if block is None:
-                    block = self._linked_overlap_block(
-                        i, j, indices[i], indices[j], links, nstates
-                    )
-                    linked_cache[key] = block
-                return block
-
-            if has_rotation:
-                A = None
-                if self.overlap_matrix is not None:
-                    A = self.overlap_matrix.reshape(ng, nstates, ng, nstates)
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, self.nrot, nstates)
-                    out = np.zeros_like(psi, dtype=dtype)
-                    for row in range(T_csr.shape[0]):
-                        i, r = divmod(row, self.nrot)
-                        start, stop = T_csr.indptr[row], T_csr.indptr[row + 1]
-                        for ptr in range(start, stop):
-                            Tij = T_csr.data[ptr]
-                            if threshold > 0.0 and abs(Tij) <= threshold:
-                                continue
-                            col = T_csr.indices[ptr]
-                            j, s = divmod(col, self.nrot)
-                            if A is not None:
-                                Aij = A[i, :, j, :]
-                                out[i, r] += Tij * (Aij @ psi[j, s])
-                            elif links is not None:
-                                out[i, r] += Tij * (linked_cached(i, j) @ psi[j, s])
-                            else:
-                                out[i, r] += Tij * psi[j, s]
-                    return out.reshape(-1)
-
-            else:
-                A = None
-                if self.overlap_matrix is not None:
-                    A = self.overlap_matrix.reshape(ng, nstates, ng, nstates)
-
-                rows = np.repeat(np.arange(ng), np.diff(T_csr.indptr))
-                cols = T_csr.indices.copy()
-                data = T_csr.data.copy()
-                if threshold > 0.0:
-                    keep = np.abs(data) > threshold
-                    rows = rows[keep]
-                    cols = cols[keep]
-                    data = data[keep]
-
-                if A is not None:
-                    edge_blocks = A[rows, :, cols, :]
-                elif links is not None:
-                    edge_blocks = np.asarray(
-                        [linked_cached(int(i), int(j)) for i, j in zip(rows, cols)],
-                        dtype=complex,
-                    )
-                else:
-                    edge_blocks = None
-                    T_action = sp.csr_matrix((data, (rows, cols)), shape=T_csr.shape)
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, nstates)
-                    if edge_blocks is None:
-                        return (T_action @ psi).reshape(-1)
-                    transported = np.einsum(
-                        "eab,eb->ea",
-                        edge_blocks,
-                        psi[cols],
-                        optimize=True,
-                    )
-                    out = np.zeros_like(psi, dtype=dtype)
-                    np.add.at(out, rows, data[:, None] * transported)
-                    return out.reshape(-1)
-
-            def matmat(mat):
-                mat = np.asarray(mat)
-                return np.column_stack([matvec(mat[:, col]) for col in range(mat.shape[1])])
-
-            return LinearOperator(
-                shape=(nflat, nflat),
-                matvec=matvec,
-                rmatvec=matvec,
-                matmat=matmat,
-                dtype=dtype,
-            )
-
-        if has_rotation:
-            T_rs = np.asarray(T_total).reshape(ng, self.nrot, ng, self.nrot)
-            linked_cache = {}
-
-            def linked_cached(i, j, bra_idx, ket_idx):
-                key = (i, j)
-                block = linked_cache.get(key)
-                if block is None:
-                    block = self._linked_overlap_block(
-                        i, j, bra_idx, ket_idx, links, nstates
-                    )
-                    linked_cache[key] = block
-                return block
-
-            if self.overlap_matrix is not None:
-                A = self.overlap_matrix.reshape(ng, nstates, ng, nstates)
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, self.nrot, nstates)
-                    out = np.einsum("irjs,iajb,jsb->ira", T_rs, A, psi, optimize=True)
-                    return out.reshape(-1)
-
-            elif links is not None:
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, self.nrot, nstates)
-                    out = np.zeros_like(psi, dtype=dtype)
-                    for i, bra_idx in enumerate(indices):
-                        for j, ket_idx in enumerate(indices):
-                            block = T_rs[i, :, j, :]
-                            if threshold > 0.0 and np.max(np.abs(block)) <= threshold:
-                                continue
-                            Aij = linked_cached(i, j, bra_idx, ket_idx)
-                            transported = psi[j] @ Aij.T
-                            out[i] += np.einsum("rs,sa->ra", block, transported)
-                    return out.reshape(-1)
-
-            else:
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, self.nrot, nstates)
-                    out = np.einsum("irjs,jsa->ira", T_rs, psi, optimize=True)
-                    return out.reshape(-1)
-
-        else:
-            T = np.asarray(T_total)
-            linked_cache = {}
-
-            def linked_cached(i, j, bra_idx, ket_idx):
-                key = (i, j)
-                block = linked_cache.get(key)
-                if block is None:
-                    block = self._linked_overlap_block(
-                        i, j, bra_idx, ket_idx, links, nstates
-                    )
-                    linked_cache[key] = block
-                return block
-
-            if self.overlap_matrix is not None:
-                A = self.overlap_matrix.reshape(ng, nstates, ng, nstates)
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, nstates)
-                    out = np.einsum("ij,iajb,jb->ia", T, A, psi, optimize=True)
-                    return out.reshape(-1)
-
-            elif links is not None:
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, nstates)
-                    out = np.zeros_like(psi, dtype=dtype)
-                    for i, bra_idx in enumerate(indices):
-                        for j, ket_idx in enumerate(indices):
-                            Tij = T[i, j]
-                            if threshold > 0.0 and abs(Tij) <= threshold:
-                                continue
-                            Aij = linked_cached(i, j, bra_idx, ket_idx)
-                            out[i] += Tij * (Aij @ psi[j])
-                    return out.reshape(-1)
-
-            else:
-
-                def matvec(vec):
-                    psi = np.asarray(vec).reshape(ng, nstates)
-                    out = T @ psi
-                    return out.reshape(-1)
-
-        def matmat(mat):
-            mat = np.asarray(mat)
-            return np.column_stack([matvec(mat[:, col]) for col in range(mat.shape[1])])
-
-        return LinearOperator(
-            shape=(nflat, nflat),
-            matvec=matvec,
-            rmatvec=matvec,
-            matmat=matmat,
-            dtype=dtype,
+        return kinetic_tools.operator(
+            T_total,
+            self.nx,
+            self.nstates,
+            overlaps=self.overlap_matrix,
+            links=getattr(self, "overlap_links", None),
+            nrot=self.nrot if self._rotation_enabled() else 1,
+            threshold=threshold,
+            average_paths=getattr(self, "overlap_path_average", False),
         )
 
     def _kinetic_trace_from_nuclear_operator(self, T_total):
@@ -3247,21 +3072,14 @@ class Triatom(Molecule):
         """Convert the active internal coordinates to Cartesian XYZ.
 
         For ``coordinates='valence'``, ``(q0, q1, q2) = (r1, r2, theta)``.
-        For ``coordinates='jacobi-h-oh'``, ``(q0, q1, q2) = (r, R, gamma)``
-        in the H + OH arrangement.  The atom order is always the molecule atom
-        order, typically ``[H, O, H]`` for the H2O examples.
+        For ``coordinates='jacobi'``, ``(q0, q1, q2) = (r, R, gamma)``
+        in the generic A+BC arrangement defined by ``jacobi_atoms``.
+        The atom order is always the molecule atom order.
         For ``coordinates='qs-qa-theta'``, the coordinates are the symmetric
         stretch, antisymmetric stretch, and valence angle.
         """
-        if self.coordinates == "jacobi-h-oh":
-            r, R, gamma = q0, q1, q2
-            m_b = float(self.mass[1])
-            m_c = float(self.mass[2])
-            m_bc = m_b + m_c
-            B = np.array([-m_c / m_bc * r, 0.0, 0.0])
-            C = np.array([m_b / m_bc * r, 0.0, 0.0])
-            A = np.array([R * np.cos(gamma), R * np.sin(gamma), 0.0])
-            return np.array([A, B, C])
+        if self.coordinates == _JACOBI_COORDINATE:
+            return self._jacobi_to_xyz((q0, q1, q2), self.mass, self._jacobi_atoms)
 
         if self.coordinates == "qs-qa-theta":
             qs, qa, theta = q0, q1, q2
@@ -3285,10 +3103,11 @@ class Triatom(Molecule):
         -------
         coords : ndarray, shape (*nx, natom, 3)
             Body-fixed Cartesian coordinates for each DVR grid point.  The
-            array is cached after the first call and invalidated by set_dvr().
+            array is cached after the first call and invalidated when a new
+            LDR nuclear representation is configured.
         """
         if self.x is None or self.nx is None:
-            raise RuntimeError("DVR grids not set. Call set_dvr() first.")
+            raise RuntimeError("No nuclear grid is configured. Call mol.ldr(...) first.")
         cached = getattr(self, "_cartesian_grid_cache", None)
         if cached is None:
             axes = [np.asarray(axis, dtype=float) for axis in self.x]
@@ -3299,6 +3118,38 @@ class Triatom(Molecule):
             self._cartesian_grid_cache = coords
             cached = coords
         return cached.copy() if copy else cached
+
+    def _configure_dvr(self, dvrs):
+        """Install a solver-owned DVR view for electronic scans and KEO assembly."""
+
+        self.dvrs = tuple(dvrs)
+        if not self.dvrs:
+            raise ValueError("dvrs must contain at least one DVR axis")
+        if len(self.dvrs) != self.ndim:
+            raise ValueError(f"dvrs has {len(self.dvrs)} axes; expected {self.ndim}")
+        self.dvr_type = tuple(
+            getattr(dvr, "type", dvr.__class__.__name__.lower())
+            for dvr in self.dvrs
+        )
+        self.x = [np.asarray(dvr.x) for dvr in self.dvrs]
+        self.nx = [len(axis) for axis in self.x]
+        self.dx = [float(dvr.dx) for dvr in self.dvrs]
+        self.dv = np.prod(self.dx)
+        self.w = [
+            np.asarray(getattr(dvr, "w", np.ones(len(dvr.x)) * dvr.dx))
+            for dvr in self.dvrs
+        ]
+        self.grid_weights = self._build_grid_weights()
+        self.sqrt_grid_weights = np.sqrt(self.grid_weights)
+        self._cartesian_grid_cache = None
+
+        self.apes = None
+        self.overlap_matrix = None
+        self.overlap_links = None
+        self.adiabatic_states = None
+        self.grid_mc_objects = None
+        self.electronic_data = None
+        return self
 
     def set_dvr(self, dvrs=None, domains=None, npts=None, dvr_type=None, dvr_params=None):
         """
@@ -3363,6 +3214,10 @@ class Triatom(Molecule):
                     )
                 elif kind in ('legendre', 'legendre_dvr'):
                     self.dvrs.append(LegendreDVR(dom[0], dom[1], n, **params))
+                elif kind in ('jacobi', 'jacobi_dvr'):
+                    self.dvrs.append(JacobiDVR(dom[0], dom[1], n, **params))
+                elif kind in ('pt', 'ptdvr', 'poschl-teller', 'poschl_teller'):
+                    self.dvrs.append(PTDVR(dom[0], dom[1], n, **params))
                 else:
                     raise ValueError(f"Unsupported DVR type: {kind!r}.")
 
@@ -3533,54 +3388,28 @@ class Triatom(Molecule):
         return psi / norm
 
     def _as_state_overlap_matrix(self, ov, nstates):
-        ov = np.asarray(ov, dtype=complex)
-        if ov.ndim == 0:
-            ov = ov.reshape(1, 1)
-        if ov.shape != (nstates, nstates):
-            raise ValueError(f"State overlap shape {ov.shape} != {(nstates, nstates)}.")
-        return ov
+        return overlap_tools.as_block(ov, nstates)
 
     def _grid_indices(self):
-        return list(np.ndindex(*self.nx))
+        indices, _, _ = overlap_tools.layout(self.nx)
+        return list(map(tuple, indices))
 
     def _snake_grid_indices(self):
         """Return a nearest-neighbor-friendly serpentine traversal of the grid."""
-        shape = tuple(int(n) for n in self.nx)
-
-        def build(axis, reverse=False):
-            values = range(shape[axis] - 1, -1, -1) if reverse else range(shape[axis])
-            out = []
-            for count, value in enumerate(values):
-                if axis == len(shape) - 1:
-                    out.append((value,))
-                else:
-                    child_reverse = bool(count % 2)
-                    out.extend((value,) + tail for tail in build(axis + 1, child_reverse))
-            return out
-
-        return build(0, False)
+        return list(overlap_tools.snake(self.nx))
 
     def _build_full_overlap_matrix(self, grid_mc_objects, nstates, overlap_fn=overlap):
-        nx = self.nx
-        flat_mc = grid_mc_objects.flatten()
-        ngrid = len(flat_mc)
-        S = np.zeros((ngrid, nstates, ngrid, nstates), dtype=complex)
-        state_eye = np.eye(nstates, dtype=complex)
-
-        for a in range(ngrid):
-            S[a, :, a, :] = state_eye
-            for b in range(a + 1, ngrid):
-                ov_ab = self._as_state_overlap_matrix(overlap_fn(flat_mc[a], flat_mc[b]), nstates)
-                S[a, :, b, :] = ov_ab
-                S[b, :, a, :] = ov_ab.conj().T
-
-        return S.reshape((*nx, nstates, *nx, nstates))
+        result = overlap_tools.full(
+            grid_mc_objects,
+            overlap_fn,
+            nstates=nstates,
+        )
+        return result.reshape((*self.nx, nstates, *self.nx, nstates))
 
     @staticmethod
     def _polar_unitary(mat):
         """Return the unitary polar factor of a square overlap matrix."""
-        u, _, vh = np.linalg.svd(np.asarray(mat, dtype=complex), full_matrices=False)
-        return u @ vh
+        return overlap_tools.unitary(mat)
 
     def _compute_overlap_links(
         self,
@@ -3589,105 +3418,53 @@ class Triatom(Molecule):
         overlap_fn=overlap,
         unitarize=False,
     ):
-        indices = self._grid_indices()
-        links = {}
-
-        for idx in indices:
-            for axis in range(self.ndim):
-                if idx[axis] + 1 >= self.nx[axis]:
-                    continue
-                nxt = list(idx)
-                nxt[axis] += 1
-                nxt = tuple(nxt)
-                link = self._as_state_overlap_matrix(
-                    overlap_fn(grid_mc_objects[idx], grid_mc_objects[nxt]),
-                    nstates,
-                )
-                if unitarize:
-                    link = self._polar_unitary(link)
-                links[(axis, idx)] = link
-
-        return links
+        return overlap_tools.nearest(
+            self.nx,
+            lambda left, right: self._as_state_overlap_matrix(
+                overlap_fn(grid_mc_objects[left], grid_mc_objects[right]),
+                nstates,
+            ),
+            unitarize=unitarize,
+        )
 
     def _pack_overlap_links(self, links):
         """Convert an overlap-link dictionary to arrays suitable for np.savez."""
-        items = sorted(links.items(), key=lambda item: (item[0][0], item[0][1]))
-        if not items:
-            return (
-                np.empty(0, dtype=int),
-                np.empty((0, self.ndim), dtype=int),
-                np.empty((0, self.nstates, self.nstates), dtype=complex),
-            )
-        axes = np.asarray([axis for (axis, _), _ in items], dtype=int)
-        indices = np.asarray([idx for (_, idx), _ in items], dtype=int)
-        data = np.asarray([mat for _, mat in items], dtype=complex)
-        return axes, indices, data
+        return overlap_tools.pack(
+            links,
+            ndim=self.ndim,
+            nstates=self.nstates,
+        )
 
     def _unpack_overlap_links(self, axes, indices, data):
         """Rebuild an overlap-link dictionary from packed arrays."""
-        return {
-            (int(axis), tuple(int(i) for i in idx)): np.asarray(mat, dtype=complex)
-            for axis, idx, mat in zip(axes, indices, data)
-        }
+        return overlap_tools.unpack(axes, indices, data)
 
     def _linked_overlap_between_path(self, bra_idx, ket_idx, links, nstates, axes):
-        current = list(bra_idx)
-        mat = np.eye(nstates, dtype=complex)
-
-        for axis in axes:
-            while current[axis] < ket_idx[axis]:
-                src = tuple(current)
-                mat = mat @ links[(axis, src)]
-                current[axis] += 1
-            while current[axis] > ket_idx[axis]:
-                current[axis] -= 1
-                src = tuple(current)
-                mat = mat @ links[(axis, src)].conj().T
-
-        return mat
+        return overlap_tools.follow(
+            bra_idx,
+            ket_idx,
+            links,
+            nstates=nstates,
+            axes=axes,
+        )
 
     def _linked_overlap_between(self, bra_idx, ket_idx, links, nstates):
-        active_axes = [
-            axis for axis in range(self.ndim)
-            if int(bra_idx[axis]) != int(ket_idx[axis])
-        ]
-        if not getattr(self, "overlap_path_average", False) or len(active_axes) <= 1:
-            return self._linked_overlap_between_path(
-                bra_idx,
-                ket_idx,
-                links,
-                nstates,
-                range(self.ndim),
-            )
-
-        paths = list(itertools.permutations(active_axes))
-        out = np.zeros((nstates, nstates), dtype=complex)
-        for axes in paths:
-            out += self._linked_overlap_between_path(
-                bra_idx,
-                ket_idx,
-                links,
-                nstates,
-                axes,
-            )
-        return out / len(paths)
+        return overlap_tools.between(
+            bra_idx,
+            ket_idx,
+            links,
+            nstates=nstates,
+            average_paths=getattr(self, "overlap_path_average", False),
+        )
 
     def _build_linked_overlap_from_links(self, links, nstates):
-        indices = self._grid_indices()
-        ngrid = len(indices)
-        flat_index = {idx: i for i, idx in enumerate(indices)}
-        S = np.zeros((ngrid, nstates, ngrid, nstates), dtype=complex)
-        state_eye = np.eye(nstates, dtype=complex)
-
-        for i, bra_idx in enumerate(indices):
-            S[i, :, i, :] = state_eye
-            for ket_idx in indices[i + 1:]:
-                j = flat_index[ket_idx]
-                ov_ij = self._linked_overlap_between(bra_idx, ket_idx, links, nstates)
-                S[i, :, j, :] = ov_ij
-                S[j, :, i, :] = ov_ij.conj().T
-
-        return S.reshape((*self.nx, nstates, *self.nx, nstates))
+        result = overlap_tools.dense(
+            self.nx,
+            links,
+            nstates=nstates,
+            average_paths=getattr(self, "overlap_path_average", False),
+        )
+        return result.reshape((*self.nx, nstates, *self.nx, nstates))
 
     def _build_linked_overlap_matrix(self, grid_mc_objects, nstates, overlap_fn=overlap):
         links = self._compute_overlap_links(grid_mc_objects, nstates, overlap_fn=overlap_fn)
@@ -3885,7 +3662,7 @@ class Triatom(Molecule):
                 raise ValueError("Scanner scan received mixed electronic methods.")
             if electronic_method_task not in ("casci", "rohf-casci"):
                 raise NotImplementedError(
-                    "scan_pes(use_scanner=True) currently supports 'casci' and "
+                    "scan(use_scanner=True) currently supports 'casci' and "
                     "'rohf/casci'."
                 )
 
@@ -4041,7 +3818,7 @@ class Triatom(Molecule):
 
     def scan_pes(
         self,
-        basis="631g*",
+        basis=None,
         nstates=None,
         verbose=0,
         ncas=6,
@@ -4094,8 +3871,8 @@ class Triatom(Molecule):
 
         Parameters
         ----------
-        basis : str
-            Gaussian basis set string (default: '631g*').
+        basis : str, optional
+            Gaussian basis set. Defaults to the basis stored on this molecule.
         nstates : int, optional
             Number of electronic states. Defaults to self.nstates.
         verbose : int
@@ -4179,12 +3956,18 @@ class Triatom(Molecule):
             Cartesian geometries when the backend provides them.
         """
         if self.x is None:
-            raise RuntimeError("DVR grids not set. Call set_dvr() first.")
+            raise RuntimeError(
+                "No nuclear grid is configured. Scan through mol.ldr(...).scan()."
+            )
         if not hasattr(self, "internal_to_xyz"):
             raise NotImplementedError("Method 'internal_to_xyz' must be implemented.")
 
         driver = self.driver if driver is None else driver
         using_driver = driver is not None
+        if basis is None:
+            basis = self.basis
+        if basis is None:
+            raise ValueError("No Gaussian basis is set on the molecule or scan.")
         if using_driver:
             driver_ref = getattr(driver, "template", driver)
             driver_mol = getattr(driver_ref, "mol", None)
@@ -4346,7 +4129,7 @@ class Triatom(Molecule):
                 return
             arrays["meta"] = np.array(meta)
             np.savez("electronic_data.npz", **arrays)
-            print("[scan_pes] Saved electronic_data.npz")
+            print("[scan] Saved electronic_data.npz")
 
         def scan_return(apes, overlap_data, grid_mc_objects, save_electronic=False):
             electronic_data = make_electronic_data(grid_mc_objects)
@@ -4361,7 +4144,7 @@ class Triatom(Molecule):
         if self.apes is not None and (
             self.overlap_matrix is not None or self.overlap_links is not None
         ):
-            print("[scan_pes] External PES and LDR overlaps already set. Skipping.")
+            print("[scan] External PES and LDR overlaps already set. Skipping.")
             grid_mc_objects = getattr(self, "grid_mc_objects", None)
             overlap_data = (
                 self.overlap_matrix
@@ -4372,7 +4155,7 @@ class Triatom(Molecule):
 
         # --- 1. Scan: compute electronic states at every grid point ------------
         print(
-            f"[scan_pes] Scanning PES "
+            f"[scan] Scanning PES "
             f"(method={electronic_method}, basis={basis}, ncas={ncas}, "
             f"nelecas={nelecas}, n_workers={n_workers}, use_scanner={use_scanner or using_driver}) ..."
         )
@@ -4437,7 +4220,7 @@ class Triatom(Molecule):
         if (not using_driver) and use_scanner:
             if n_workers is not None and int(n_workers) != 1:
                 warnings.warn(
-                    "scan_pes(use_scanner=True) is serial; ignoring n_workers > 1.",
+                    "scan(use_scanner=True) is serial; ignoring n_workers > 1.",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -4461,7 +4244,7 @@ class Triatom(Molecule):
         )
 
         np.savez("apes.npz", data=self.apes, meta=np.array(meta))
-        print("[scan_pes] Saved apes.npz")
+        print("[scan] Saved apes.npz")
 
         # --- 2. Compute LDR overlap matrix -------------------------------------
         if overlap_method == "none":
@@ -4475,7 +4258,7 @@ class Triatom(Molecule):
             )
 
         if overlap_method == "linked":
-            print("[scan_pes] Computing overlap matrix with linked-product approximation ...")
+            print("[scan] Computing overlap matrix with linked-product approximation ...")
             self.overlap_links = self._compute_overlap_links(
                 grid_mc_objects,
                 nstates,
@@ -4490,13 +4273,13 @@ class Triatom(Molecule):
                 data=link_data,
                 meta=np.array(meta),
             )
-            print("[scan_pes] Saved overlap_links.npz")
+            print("[scan] Saved overlap_links.npz")
             self.overlap_matrix = self._build_linked_overlap_from_links(
                 self.overlap_links,
                 nstates,
             )
         elif overlap_method == "link-only":
-            print("[scan_pes] Computing nearest-neighbor overlap links only ...")
+            print("[scan] Computing nearest-neighbor overlap links only ...")
             self.overlap_links = self._compute_overlap_links(
                 grid_mc_objects,
                 nstates,
@@ -4512,7 +4295,7 @@ class Triatom(Molecule):
                 data=link_data,
                 meta=np.array(meta),
             )
-            print("[scan_pes] Saved overlap_links.npz")
+            print("[scan] Saved overlap_links.npz")
             return scan_return(
                 self.apes,
                 self.overlap_links,
@@ -4520,7 +4303,7 @@ class Triatom(Molecule):
                 save_electronic=True,
             )
         else:
-            print("[scan_pes] Computing full pairwise overlap matrix ...")
+            print("[scan] Computing full pairwise overlap matrix ...")
             self.overlap_matrix = self._build_full_overlap_matrix(
                 grid_mc_objects,
                 nstates,
@@ -4528,7 +4311,7 @@ class Triatom(Molecule):
             )
 
         np.savez("overlap_matrix.npz", data=self.overlap_matrix, meta=np.array(meta))
-        print("[scan_pes] Saved overlap_matrix.npz")
+        print("[scan] Saved overlap_matrix.npz")
 
         return scan_return(
             self.apes,

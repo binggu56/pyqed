@@ -171,7 +171,7 @@ def _make_initial_mps(
             )
     else:
         raise ValueError(f"Unsupported non-Abelian initial guess {guess!r}.")
-    return MPS.from_sites(sites, target_sector=target_sector)
+    return MPS.from_tensors(sites, target_sector=target_sector)
 
 
 def _make_state_average_root_sites(
@@ -413,6 +413,7 @@ def _run_spatial_qchem_dmrg(
     nstates=1,
     weights=None,
     local_solver_kwargs=None,
+    n_threads=None,
     verbose=0,
     **sweep_kwargs,
 ):
@@ -427,6 +428,14 @@ def _run_spatial_qchem_dmrg(
     nsweeps = int(nsweeps)
     if nsweeps < 1:
         raise ValueError("nsweeps must be positive.")
+    if n_threads is not None:
+        if isinstance(n_threads, (bool, np.bool_)) or not isinstance(
+            n_threads, (int, np.integer)
+        ):
+            raise TypeError("n_threads must be a positive integer or None.")
+        if int(n_threads) < 1:
+            raise ValueError("n_threads must be positive or None.")
+        n_threads = int(n_threads)
     if qcdmrg.site != "spatial":
         raise NotImplementedError("The non-Abelian qchem DMRG backend currently requires site='spatial'.")
     if qcdmrg.H is None:
@@ -878,6 +887,10 @@ def _run_spatial_qchem_dmrg(
         and su2_kernel_active.get("actual") == "cpp"
         else None
     )
+    if su2_moving_environment is not None:
+        su2_moving_environment.set_num_threads(
+            1 if n_threads is None else n_threads
+        )
     if (
         su2_kernel_active.get("actual") == "cpp"
         and su2_moving_environment is None
@@ -1033,6 +1046,18 @@ def _run_spatial_qchem_dmrg(
             direct_policy_active
         )
         entry["su2_kernel_policy"] = dict(su2_kernel_active)
+        entry["threading"] = (
+            dict(su2_moving_environment.threading_info)
+            if su2_moving_environment is not None
+            else {
+                "backend": "serial",
+                "available": False,
+                "n_threads": 1,
+                "openmp_version": 0,
+                "parallel_regions": 0,
+                "tasks": 0,
+            }
+        )
         local_backend_actuals = []
         for objective in entry.get("bond_objectives", []) or []:
             objective.setdefault(
@@ -1243,5 +1268,14 @@ def _run_spatial_qchem_dmrg(
         "python_bond_callbacks": engine_stats.get(
             "half_sweep_python_bond_callbacks"
         ),
+        "threading": final_history.get("threading"),
+        "operator_schedule": {
+            "kind": engine_stats.get("dense_pair_scheduler"),
+            "executions": engine_stats.get("dense_pair_execution_count"),
+            "waves": engine_stats.get("dense_pair_wave_count"),
+            "max_wave_width": engine_stats.get(
+                "dense_pair_max_wave_width"
+            ),
+        },
     }
     return solver

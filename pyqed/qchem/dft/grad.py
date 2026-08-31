@@ -119,7 +119,7 @@ class Gradients:
 
         if getattr(self.mol, '_bas', None) is None:
             raise ValueError(
-                "mol._bas is not available. Build the molecule with driver='gbasis' first."
+                "mol._bas is not available. Build the molecule first."
             )
 
         coord_type = getattr(self.mol._bas[0], 'coord_type', 'spherical')

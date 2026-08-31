@@ -52,3 +52,17 @@ def test_legendre_dvr_builds_angular_grid_and_operators():
     np.testing.assert_allclose(np.sum(dvr.w), np.pi)
     assert dvr.t().shape == (6, 6)
     assert dvr.momentum().shape == (6, 6)
+
+
+def test_legendre_dvr_kinetic_is_positive_and_recovers_free_rotor_levels():
+    dvr = LegendreDVR(0.0, np.pi, 17, mass=2.0)
+    kinetic = dvr.t()
+    energies = np.linalg.eigvalsh(kinetic)
+
+    np.testing.assert_allclose(kinetic, kinetic.conj().T, atol=1.0e-12)
+    assert energies[0] >= -1.0e-12
+    np.testing.assert_allclose(
+        energies[:6],
+        np.arange(6, dtype=float) ** 2 / 4.0,
+        atol=1.0e-7,
+    )

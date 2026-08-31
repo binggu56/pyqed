@@ -26,7 +26,7 @@ from examples.mps.frontier_tied_letta_j1j2_all_nn import (
 )
 from pyqed.letta import (
     FrontierTiedLETTA,
-    LETTAVMC,
+    VMC,
     adaptive_tie_graph_step,
     graph_signals_from_samples,
     tie_edges,
@@ -107,9 +107,8 @@ def run_adaptive_diagonal(
         initial_configuration = np.repeat((0, 1), nsites // 2)
         chain_rng = np.random.default_rng(int(seed) + 10_000 + chain)
         chain_rng.shuffle(initial_configuration)
-        vmc = LETTAVMC(
+        vmc = VMC(
             state,
-            state.hamiltonian,
             seed=int(seed) + chain,
             initial_configuration=initial_configuration,
             proposal=str(sampler_proposal),
@@ -151,8 +150,8 @@ def run_adaptive_diagonal(
             "solver": "whitened",
             "tol": 0.0,
             "metric_tol": 1.0e-12,
-            "frontier_canonicalization": True,
-            "frontier_gauge_weighting": "uniform",
+            "gauge": "frontier",
+            "gauge_weight": "uniform",
             "verbose": True,
         },
     )
@@ -252,7 +251,7 @@ def run_adaptive_diagonal(
         "relaxation": {
             "directional_passes": 1,
             "solver": "whitened",
-            "frontier_canonicalization": "uniform",
+            "gauge": "frontier",
             "migrated_energy": float(evaluation.migrated_energy),
             "fresh_energy": float(evaluation.energy_after),
             "fresh_energy_per_site": float(evaluation.energy_after / nsites),

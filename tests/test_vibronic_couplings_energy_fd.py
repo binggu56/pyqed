@@ -14,7 +14,7 @@ def _h2_casci(r_bohr, nstates=2):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=nstates)
     return mol, mc
@@ -32,7 +32,7 @@ def _displaced_energy(coords, symbols, mode, q):
     displaced = coords + q * mode[0]
     atom = [[symbol, *xyz] for symbol, xyz in zip(symbols, displaced)]
     mol = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)
     return np.asarray(mc.e_tot, dtype=float)
@@ -44,7 +44,7 @@ def _lih_casci(r_bohr, nstates=2):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(tol=1.0e-11)
     return CASCI(mf, ncas=2, nelecas=2).run(nstates=nstates)
 
@@ -56,7 +56,7 @@ def _tracked_lih_casci(r_bohr, reference, parallel):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(tol=1.0e-11)
     cross = gto.intor_cross("int1e_ovlp", reference.mol.topyscf(), mol.topyscf())
     mo_overlap = reference.mo_coeff.T @ cross @ mf.mo_coeff

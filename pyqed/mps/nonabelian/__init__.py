@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Non-Abelian tensor foundations for future symmetry-adapted MPS/DMRG.
+Non-Abelian tensor foundations for symmetry-adapted MPS/DMRG.
 
 This package intentionally keeps a small, explicit surface:
 
-- :mod:`tensor` stores reduced block tensors and fusion-edge metadata
+- :mod:`pyqed.symmetry` stores the shared ``IrrepTensor``/``Leg`` data model
+- :mod:`tensor` stores fusion and recoupling metadata
 - :mod:`contraction` implements fixed-layout reduced contractions
 - :mod:`linalg` stores reusable reduced projection/SVD/truncation helpers
 - :mod:`decompose` provides the first reduced two-site SVD/truncation helper
@@ -13,17 +14,16 @@ This package intentionally keeps a small, explicit surface:
 Short names are preferred inside this package.
 """
 
-from .tensor import FusionLeg, FusionEdge, FusionPipe, FusionPipeEntry, NonabelianTensor
+from pyqed.symmetry import IrrepTensor, Leg
+
+from .tensor import FusionLeg, FusionEdge, FusionPipe, FusionPipeEntry
 from .basis import (
-    BasisBlock,
-    SymmetryBasis,
-    SiteBasis,
-    BondBasis,
     LocalLayoutEntry,
     MetricOrthonormalization,
     TwoSiteBasis,
 )
-from .mps import MPS
+from pyqed.mps.mps import MPS, MPO
+from .tdvp import two_site_tdvp_step
 from .multiroot import MultiRootMPS, fuse_root_center_tensors, unfuse_root_center_tensor
 from .coupling import (
     CouplingChannel,
@@ -39,14 +39,14 @@ from .coupling import (
     recoupling_matrix,
 )
 from .mpo import (
-    Leg,
     SiteOperator,
-    MPO,
+    MPOCore,
     IrreducibleChannelTerm,
     IrreducibleMPO,
     RankCoupledChannelTerm,
     RankCoupledMPO,
     as_rank_coupled_mpo,
+    expand_rank_coupled_mpo,
     compress_rank_coupled_mpo_chain,
     direct_sum_rank_coupled_mpo,
     scale_mpo_chain,
@@ -123,6 +123,10 @@ from .decompose import (
     svd_two_site,
     state_averaged_svd_two_site,
 )
+from .orbital_transform import (
+    apply_spatial_orbital_transform,
+    is_fully_reduced_su2_mps,
+)
 from .canonical import (
     left_canonical_error,
     right_canonical_error,
@@ -177,15 +181,18 @@ from .renormalized import (
 )
 from .su2_qchem_plan import SU2OperatorEngine
 from .environment import (
+    AdjacentPairTransitionPlan,
     DenseEnvironmentChain,
     DenseEnvironmentSweep,
     LeftBlock,
     RightBlock,
     BlockSparseEnvironmentChain,
     BlockSparseEnvironmentSweep,
+    LocalTransitionPlan,
     build_dense_bond_operator,
     build_block_sparse_bond_operator,
     contract_chain_expectation,
+    contract_chain_transition,
 )
 from .update import (
     two_site_update,

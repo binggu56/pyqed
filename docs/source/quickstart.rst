@@ -31,7 +31,7 @@ Save the following as ``quickstart.py``:
    )
 
    # Build one- and two-electron data before constructing a solver.
-   mol.build(driver="builtin", eri="auto")
+   mol.build(eri="auto")
 
    mf = mol.RHF().run()
    print("converged:", mf.converged)
@@ -52,10 +52,9 @@ What each step means
 --------------------
 
 ``Molecule`` records the geometry, units, charge/spin defaults, and basis.
-``mol.build(...)`` constructs the data required by the selected backend.
-``driver="builtin"`` requests the native path, while ``eri="auto"`` lets the
-builder select an appropriate supported electron-repulsion representation for
-the problem.  ``mol.RHF().run()`` constructs and executes the closed-shell
+``mol.build(...)`` constructs native AO integrals. ``eri="auto"`` lets the
+builder select an appropriate electron-repulsion representation for the
+problem. ``mol.RHF().run()`` constructs and executes the closed-shell
 mean-field solver.
 
 Continue to correlated and active-space methods

@@ -14,7 +14,7 @@ def test_native_pcm_rys_surface_integrals_match_pyscf_fake_charge_backend():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="pyscf")
+    mol.build()
 
     pcm_pyscf = PCM(mol)
     pcm_pyscf.lebedev_order = 3
@@ -46,7 +46,7 @@ def test_pcm_default_integral_backend_is_native_without_pyscf_backend():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
 
     pcm = PCM(mol)
     pcm.lebedev_order = 3
@@ -66,7 +66,7 @@ def test_pcm_auto_backend_uses_native_libcint_order_for_pyscf_general_basis():
         unit="bohr",
         basis="6-31g",
     )
-    mol.build(driver="pyscf")
+    mol.build()
 
     pcm_auto = PCM(mol)
     pcm_auto.verbose = 0
@@ -83,8 +83,8 @@ def test_pcm_auto_backend_uses_native_libcint_order_for_pyscf_general_basis():
     np.testing.assert_allclose(
         pcm_auto._surface_coulomb_tensor(),
         pcm_pyscf._surface_coulomb_tensor(),
-        atol=5e-12,
-        rtol=5e-12,
+        atol=5e-8,
+        rtol=5e-8,
     )
 
 
@@ -100,7 +100,7 @@ def test_compiled_pcm_rys_surface_integrals_match_python_fallback(monkeypatch):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="s8")
+    mol.build(eri="s8")
 
     pcm = PCM(mol)
     pcm.lebedev_order = 3

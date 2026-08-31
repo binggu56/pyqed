@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Symmetry-aware MPO core containers for the fixed-layout non-Abelian prototype.
+Symmetry-aware MPOCore core containers for the fixed-layout non-Abelian prototype.
 """
 
 from __future__ import annotations
@@ -10,16 +10,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from pyqed.lattice.site import Leg
 from pyqed.mps.su2 import SU2Irrep
 from pyqed.mps.symmetry import Sector
+from pyqed.symmetry import Leg
 
 from .coupling import clebsch_gordan, left_or_right_fusion, ordered_two_m_values
 
 
 class SparseVirtualBlock:
     """
-    Sparse storage for the two virtual axes of an MPO block.
+    Sparse storage for the two virtual axes of an MPOCore block.
 
     Physical payloads remain small dense arrays.  This avoids padding every
     local operator across the full visible ``(D_left, D_right)`` carrier.
@@ -295,9 +295,9 @@ class SiteOperator:
 
 
 @dataclass(frozen=True)
-class MPO:
+class MPOCore:
     """
-    MPO core with sector-keyed physical blocks.
+    MPOCore core with sector-keyed physical blocks.
 
     Parameters
     ----------
@@ -317,49 +317,49 @@ class MPO:
         phys_out_leg = self.phys_out_leg
         phys_in_leg = self.phys_in_leg
         if not isinstance(phys_out_leg, Leg):
-            raise TypeError("MPO phys_out_leg must be a Leg.")
+            raise TypeError("MPOCore phys_out_leg must be a Leg.")
         if not isinstance(phys_in_leg, Leg):
-            raise TypeError("MPO phys_in_leg must be a Leg.")
+            raise TypeError("MPOCore phys_in_leg must be a Leg.")
         blocks = {
             (q_out, q_in): np.asarray(block)
             for (q_out, q_in), block in self.blocks.items()
         }
         if not blocks:
-            raise ValueError("MPO requires at least one stored block.")
+            raise ValueError("MPOCore requires at least one stored block.")
 
         left_dim = None
         right_dim = None
         for key, block in blocks.items():
             if len(key) != 2:
-                raise ValueError(f"Invalid MPO block key {key!r}; expected (phys_out, phys_in).")
+                raise ValueError(f"Invalid MPOCore block key {key!r}; expected (phys_out, phys_in).")
             if block.ndim != 4:
                 raise ValueError(
-                    f"MPO block {key!r} must be rank-4, got shape {block.shape!r}."
+                    f"MPOCore block {key!r} must be rank-4, got shape {block.shape!r}."
                 )
             q_out, q_in = key
             if q_out not in phys_out_leg.sectors:
                 raise ValueError(
-                    f"MPO block uses undeclared output sector {q_out!r}."
+                    f"MPOCore block uses undeclared output sector {q_out!r}."
                 )
             if q_in not in phys_in_leg.sectors:
                 raise ValueError(
-                    f"MPO block uses undeclared input sector {q_in!r}."
+                    f"MPOCore block uses undeclared input sector {q_in!r}."
                 )
             if int(block.shape[2]) != phys_out_leg.sector_dim(q_out):
                 raise ValueError(
-                    f"MPO block {key!r} output dimension {block.shape[2]} does not match "
+                    f"MPOCore block {key!r} output dimension {block.shape[2]} does not match "
                     f"declared sector dimension {phys_out_leg.sector_dim(q_out)}."
                 )
             if int(block.shape[3]) != phys_in_leg.sector_dim(q_in):
                 raise ValueError(
-                    f"MPO block {key!r} input dimension {block.shape[3]} does not match "
+                    f"MPOCore block {key!r} input dimension {block.shape[3]} does not match "
                     f"declared sector dimension {phys_in_leg.sector_dim(q_in)}."
                 )
             if left_dim is None:
                 left_dim = int(block.shape[0])
                 right_dim = int(block.shape[1])
             elif int(block.shape[0]) != left_dim or int(block.shape[1]) != right_dim:
-                raise ValueError("All MPO blocks must share the same virtual dimensions.")
+                raise ValueError("All MPOCore blocks must share the same virtual dimensions.")
 
         object.__setattr__(self, "blocks", blocks)
         object.__setattr__(self, "phys_out_leg", phys_out_leg)
@@ -418,12 +418,12 @@ class MPO:
         tol=0.0,
     ):
         """
-        Build a block-sparse MPO core from a dense physical-tensor core.
+        Build a block-sparse MPOCore core from a dense physical-tensor core.
         """
         dense = np.asarray(core)
         if dense.ndim != 4:
             raise ValueError(
-                f"MPO.from_dense expects a rank-4 core, got {dense.shape!r}."
+                f"MPOCore.from_dense expects a rank-4 core, got {dense.shape!r}."
             )
         if phys_out_leg is None:
             if phys_out_dims is not None:
@@ -483,7 +483,7 @@ class MPO:
         virtual_blocks=None,
     ):
         """
-        Build an MPO core directly from a symmetry-aware local site operator.
+        Build an MPOCore core directly from a symmetry-aware local site operator.
 
         Parameters
         ----------
@@ -530,11 +530,11 @@ class MPO:
 @dataclass(frozen=True)
 class IrreducibleChannelTerm:
     """
-    One irreducible tensor-operator contribution carried by an MPO core.
+    One irreducible tensor-operator contribution carried by an MPOCore core.
 
     The virtual coefficient matrices are keyed by spherical-component labels in
     doubled-``m`` notation. Distinct components may connect different virtual
-    subchannels, which lets the MPO contract componentwise without storing the
+    subchannels, which lets the MPOCore contract componentwise without storing the
     fully expanded physical blocks.
     """
 
@@ -628,7 +628,7 @@ class IrreducibleChannelTerm:
 @dataclass(frozen=True)
 class IrreducibleMPO:
     """
-    MPO core that mixes ordinary scalar physical blocks with irreducible channels.
+    MPOCore core that mixes ordinary scalar physical blocks with irreducible channels.
 
     Physical blocks are expanded lazily per sector pair through the attached
     reduced tensor operators, so the core can carry reduced operator metadata
@@ -757,7 +757,7 @@ class RankCoupledChannelTerm:
     """
     One reduced operator carried on a visible virtual channel pair.
 
-    The visible MPO channel indices carry SU(2) irreps. The associated hidden
+    The visible MPOCore channel indices carry SU(2) irreps. The associated hidden
     component spaces are only expanded when the core is queried for a concrete
     sector block or dense tensor.
     """
@@ -826,7 +826,7 @@ class RankCoupledChannelTerm:
 @dataclass(frozen=True)
 class RankCoupledMPO:
     """
-    MPO core with visible reduced virtual channels carrying SU(2) irreps.
+    MPOCore core with visible reduced virtual channels carrying SU(2) irreps.
 
     The stored ``dense_blocks`` are indexed by visible virtual channels rather
     than fully expanded component-resolved channels. Reduced endpoint operators
@@ -868,6 +868,12 @@ class RankCoupledMPO:
         repr=False,
     )
     _reduced_block_cache: dict[tuple[Sector, Sector], dict[tuple[int, int], np.ndarray]] = field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+    _environment_reduced_block_cache: dict[tuple, dict] = field(
         default_factory=dict,
         init=False,
         repr=False,
@@ -997,8 +1003,8 @@ class RankCoupledMPO:
             "_dtype_cache",
             np.dtype(np.result_type(*dtypes) if dtypes else np.float64),
         )
-        # The reduced action list is static MPO metadata.  Build it once with
-        # the MPO core so qchem sweeps do not repeatedly pay this bookkeeping
+        # The reduced action list is static MPOCore metadata.  Build it once with
+        # the MPOCore core so qchem sweeps do not repeatedly pay this bookkeeping
         # cost while advancing rank-coupled environments.
         self._reduced_actions()
 
@@ -1438,7 +1444,7 @@ def _transform_sparse_virtual_axis(
     new_shape,
     cutoff,
 ):
-    """Apply block-diagonal virtual gauges to one sparse MPO payload."""
+    """Apply block-diagonal virtual gauges to one sparse MPOCore payload."""
 
     block = as_sparse_virtual_block(block)
     payload_shape = tuple(block.shape[2:])
@@ -1611,7 +1617,7 @@ def compress_rank_coupled_mpo_chain(
     return_info=False,
 ):
     """
-    Exactly compress a rank-coupled MPO from right to left.
+    Exactly compress a rank-coupled MPOCore from right to left.
 
     Virtual channels are reduced only inside equal ``(SU(2) irrep, charge)``
     sectors.  The default skeleton gauge keeps selected symbolic suffix rows
@@ -1622,9 +1628,9 @@ def compress_rank_coupled_mpo_chain(
 
     factors = list(factors)
     if not factors:
-        raise ValueError("Rank-coupled MPO compression requires a nonempty chain.")
+        raise ValueError("Rank-coupled MPOCore compression requires a nonempty chain.")
     if any(not isinstance(core, RankCoupledMPO) for core in factors):
-        raise TypeError("Rank-coupled MPO compression requires RankCoupledMPO cores.")
+        raise TypeError("Rank-coupled MPOCore compression requires RankCoupledMPO cores.")
     gauge = str(gauge).strip().lower()
     if gauge not in {"skeleton", "orthonormal"}:
         raise ValueError("gauge must be 'skeleton' or 'orthonormal'.")
@@ -1702,17 +1708,41 @@ def compress_rank_coupled_mpo_chain(
     return (factors, info) if return_info else factors
 
 
+def expand_rank_coupled_mpo(core):
+    """Expand visible SU(2) virtual components into an ordinary block MPOCore.
+
+    Physical state tensors remain fully reduced.  This compatibility view is
+    used only by the projected local LETTA fallback; native Wigner--Eckart
+    contractions continue to consume the rank-coupled core directly.
+    """
+    if isinstance(core, MPOCore):
+        return core
+    if not isinstance(core, RankCoupledMPO):
+        raise TypeError("expand_rank_coupled_mpo expects an MPOCore or RankCoupledMPO core.")
+    blocks = {}
+    for q_out in core.phys_out_leg.sectors:
+        for q_in in core.phys_in_leg.sectors:
+            block = core.block(q_out, q_in)
+            if block is not None:
+                blocks[(q_out, q_in)] = block
+    return MPOCore(
+        blocks=blocks,
+        phys_out_leg=core.phys_out_leg,
+        phys_in_leg=core.phys_in_leg,
+    )
+
+
 def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):
     """
     Return ``core`` as a :class:`RankCoupledMPO`.
 
-    Ordinary scalar MPO cores are embedded with spin-scalar visible virtual
+    Ordinary scalar MPOCore cores are embedded with spin-scalar visible virtual
     channels. Dense rank-4 arrays require ``phys_leg`` so the physical block
     structure is explicit.
     """
     if isinstance(core, RankCoupledMPO):
         return core
-    if isinstance(core, MPO):
+    if isinstance(core, MPOCore):
         scalar_irreps_left = tuple(SU2Irrep(0) for _ in range(core.left_dim))
         scalar_irreps_right = tuple(SU2Irrep(0) for _ in range(core.right_dim))
         return RankCoupledMPO(
@@ -1727,11 +1757,11 @@ def as_rank_coupled_mpo(core, *, phys_leg=None, cutoff=0.0):
     dense = np.asarray(core)
     if dense.ndim != 4:
         raise TypeError(
-            "as_rank_coupled_mpo expects a RankCoupledMPO, MPO, or rank-4 dense core."
+            "as_rank_coupled_mpo expects a RankCoupledMPO, MPOCore, or rank-4 dense core."
         )
     if phys_leg is None:
-        raise ValueError("phys_leg is required when embedding a dense MPO core.")
-    scalar_mpo = MPO.from_dense(
+        raise ValueError("phys_leg is required when embedding a dense MPOCore core.")
+    scalar_mpo = MPOCore.from_dense(
         dense,
         phys_out_leg=phys_leg,
         phys_in_leg=phys_leg,
@@ -1751,16 +1781,16 @@ def _pad_visible_virtual_block(block, shape, *, row_offset=0, col_offset=0, dtyp
 
 def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg=None, cutoff=0.0):
     """
-    Direct-sum two MPO cores while preserving reduced virtual-channel metadata.
+    Direct-sum two MPOCore cores while preserving reduced virtual-channel metadata.
 
-    This is the reduced-MPO analogue of summing two finite-state MPOs: boundary
+    This is the reduced-MPOCore analogue of summing two finite-state MPOs: boundary
     channels are shared at the chain ends and virtual channels are direct-summed
     in the bulk.
     """
     left_core = as_rank_coupled_mpo(left_core, phys_leg=phys_leg, cutoff=cutoff)
     right_core = as_rank_coupled_mpo(right_core, phys_leg=phys_leg, cutoff=cutoff)
     if left_core.phys_out_leg != right_core.phys_out_leg or left_core.phys_in_leg != right_core.phys_in_leg:
-        raise ValueError("Cannot sum MPO cores with different physical legs.")
+        raise ValueError("Cannot sum MPOCore cores with different physical legs.")
 
     dtype = np.result_type(left_core.dtype, right_core.dtype)
     if nsites == 1:
@@ -1769,18 +1799,18 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
         left_charges = left_core.left_channel_charges
         right_charges = left_core.right_channel_charges
         if left_irreps != right_core.left_channel_irreps or right_irreps != right_core.right_channel_irreps:
-            raise ValueError("Single-site MPO sum requires matching virtual channels.")
+            raise ValueError("Single-site MPOCore sum requires matching virtual channels.")
         if left_charges != right_core.left_channel_charges or right_charges != right_core.right_channel_charges:
-            raise ValueError("Single-site MPO sum requires matching virtual channel charges.")
+            raise ValueError("Single-site MPOCore sum requires matching virtual channel charges.")
         left_row_offset = right_row_offset = 0
         left_col_offset = right_col_offset = 0
     elif site == 0:
         left_irreps = left_core.left_channel_irreps
         left_charges = left_core.left_channel_charges
         if left_irreps != right_core.left_channel_irreps:
-            raise ValueError("Left-edge MPO sum requires matching left boundary channels.")
+            raise ValueError("Left-edge MPOCore sum requires matching left boundary channels.")
         if left_charges != right_core.left_channel_charges:
-            raise ValueError("Left-edge MPO sum requires matching left boundary channel charges.")
+            raise ValueError("Left-edge MPOCore sum requires matching left boundary channel charges.")
         right_irreps = left_core.right_channel_irreps + right_core.right_channel_irreps
         right_charges = left_core.right_channel_charges + right_core.right_channel_charges
         left_row_offset = right_row_offset = 0
@@ -1790,9 +1820,9 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
         right_irreps = left_core.right_channel_irreps
         right_charges = left_core.right_channel_charges
         if right_irreps != right_core.right_channel_irreps:
-            raise ValueError("Right-edge MPO sum requires matching right boundary channels.")
+            raise ValueError("Right-edge MPOCore sum requires matching right boundary channels.")
         if right_charges != right_core.right_channel_charges:
-            raise ValueError("Right-edge MPO sum requires matching right boundary channel charges.")
+            raise ValueError("Right-edge MPOCore sum requires matching right boundary channel charges.")
         left_irreps = left_core.left_channel_irreps + right_core.left_channel_irreps
         left_charges = left_core.left_channel_charges + right_core.left_channel_charges
         left_row_offset = 0
@@ -1909,7 +1939,7 @@ def direct_sum_rank_coupled_mpo(left_core, right_core, *, site, nsites, phys_leg
 
 def sum_mpo_chains(*chains, phys_leg=None, cutoff=0.0):
     """
-    Sum finite MPO chains while keeping rank-coupled cores rank-coupled.
+    Sum finite MPOCore chains while keeping rank-coupled cores rank-coupled.
     """
     nonempty = [list(chain) for chain in chains if chain]
     if not nonempty:
@@ -1934,7 +1964,7 @@ def sum_mpo_chains(*chains, phys_leg=None, cutoff=0.0):
 
 
 def scale_mpo_chain(chain, coefficient, *, site=0):
-    """Return an MPO chain multiplied by one scalar coefficient."""
+    """Return an MPOCore chain multiplied by one scalar coefficient."""
     chain = list(chain)
     if not chain:
         return []
@@ -1942,7 +1972,7 @@ def scale_mpo_chain(chain, coefficient, *, site=0):
     if site < 0:
         site += len(chain)
     if site < 0 or site >= len(chain):
-        raise IndexError("MPO scaling site is out of range.")
+        raise IndexError("MPOCore scaling site is out of range.")
 
     core = as_rank_coupled_mpo(chain[site])
     coefficient = np.asarray(coefficient).reshape(()).item()

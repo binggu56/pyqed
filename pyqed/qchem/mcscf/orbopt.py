@@ -602,6 +602,7 @@ def davidson_augmented_hessian_direction(
             "residual_norm": 0.0,
             "eigenvalue": 0.0,
             "model": 0.0,
+            "hessian_step": step.copy(),
             "subspace_dim": 0,
             "used_fallback": False,
         }
@@ -656,6 +657,7 @@ def davidson_augmented_hessian_direction(
         "residual_norm": np.inf,
         "eigenvalue": np.nan,
         "model": np.nan,
+        "hessian_step": None,
         "subspace_dim": int(V.shape[1]),
         "used_fallback": False,
     }
@@ -705,6 +707,7 @@ def davidson_augmented_hessian_direction(
                 "residual_norm": residual_norm,
                 "eigenvalue": float(eigvals[root]),
                 "step": step,
+                "hessian_step": hv,
                 "orbital_residual": orbital_residual,
                 "subspace_dim": int(V.shape[1]),
             }
@@ -730,6 +733,9 @@ def davidson_augmented_hessian_direction(
                 "residual_norm": float(candidate["residual_norm"]),
                 "eigenvalue": float(candidate["eigenvalue"]),
                 "model": float(candidate["model"]),
+                "hessian_step": np.asarray(
+                    candidate["hessian_step"], dtype=float
+                ).copy(),
                 "subspace_dim": int(candidate["subspace_dim"]),
             }
         )
@@ -774,6 +780,9 @@ def davidson_augmented_hessian_direction(
                 "residual_norm": float(best["residual_norm"]),
                 "eigenvalue": float(best["eigenvalue"]),
                 "model": float(best["model"]),
+                "hessian_step": np.asarray(
+                    best["hessian_step"], dtype=float
+                ).copy(),
                 "subspace_dim": int(best["subspace_dim"]),
             }
         )

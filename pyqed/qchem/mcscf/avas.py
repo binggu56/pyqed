@@ -54,26 +54,6 @@ def _reference_molecule(mol, minao):
         charge=getattr(mol, "charge", 0),
         spin=getattr(mol, "spin", 0),
     )
-    if getattr(mol, "_build_driver", None) == "gbasis":
-        from gbasis.integrals.overlap import overlap_integral
-        from gbasis.parsers import make_contractions, parse_gbs
-
-        from pyqed.qchem.basis import _basis_path
-
-        basis_dict = parse_gbs(_basis_path(basis))
-        shells = make_contractions(
-            basis_dict,
-            reference.atom_symbols(),
-            reference.atom_coords(),
-            coord_types="p",
-        )
-        reference.overlap = np.asarray(overlap_integral(shells))
-        reference.nao = reference.overlap.shape[0]
-        reference.nbas = reference.nao
-        reference._bas = shells
-        reference._build_driver = "gbasis"
-        return reference
-
     from pyqed.qchem.basis import S, _basis_path, make_contractions, parse_gbs
 
     basis_dict = parse_gbs(_basis_path(basis))
@@ -94,7 +74,6 @@ def _reference_molecule(mol, minao):
     reference.nbas = reference.nao
     reference._bas = functions
     reference.cart = True
-    reference._build_driver = "builtin"
     return reference
 
 

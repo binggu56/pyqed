@@ -10,7 +10,6 @@ from pyqed.models.ShinMetiu import ShinMetiu
 
 if __name__=='__main__':
     import time
-    from pyqed.ldr.ldr import LDRN
     
     import proplot as plt
     

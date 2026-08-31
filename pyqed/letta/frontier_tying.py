@@ -66,6 +66,8 @@ class FrontierSiteUpdate:
     hamiltonian_batch_calls: int = 0
     recycled_vectors: int = 0
     preconditioner_blocks: int = 0
+    reconstructed_residual_norm: float = float("nan")
+    full_residual_norm: float = float("nan")
 
 
 @dataclass(frozen=True)
@@ -336,17 +338,10 @@ class FrontierTiedLETTA:
         self._objective_is_hermitian = bool(_objective_is_hermitian)
         if hamiltonian.sites is not None:
             self.sites = tuple(hamiltonian.sites)
-            self.physical_legs = (
-                hamiltonian.physical_legs
-                if hasattr(hamiltonian, "physical_legs")
-                else tuple(
-                    site.physical_leg if hasattr(site, "physical_leg") else None
-                    for site in self.sites
-                )
-            )
+            self.legs = tuple(site.leg for site in self.sites)
         else:
             self.sites = None
-            self.physical_legs = None
+            self.legs = None
         self.norm_mpo = _norm_mpo
         self.objective_mpo = _objective_mpo
         if not isinstance(_balance_initial_gauges, (bool, np.bool_)):
@@ -6902,6 +6897,8 @@ class FrontierTiedLETTA:
         metric_matvecs = 0
         iterations = 0
         residual_norm = float("inf")
+        reconstructed_residual_norm = float("inf")
+        full_residual_norm = float("inf")
         solver_record = selected_solver
         solver_converged = False
         message = "local solve not attempted"
@@ -6942,6 +6939,8 @@ class FrontierTiedLETTA:
                 residual_norm = float(
                     np.linalg.norm(hamiltonian_vector - energy_after * metric_vector)
                 )
+                full_residual_norm = residual_norm
+                reconstructed_residual_norm = residual_norm
                 solver_converged = True
                 message = "converged"
             elif selected_solver == "whitened":
@@ -6974,6 +6973,8 @@ class FrontierTiedLETTA:
                 residual_norm = float(
                     np.linalg.norm(hamiltonian_vector - energy_after * metric_vector)
                 )
+                full_residual_norm = residual_norm
+                reconstructed_residual_norm = residual_norm
                 metric_rank = int(frame["metric_rank"])
                 solver_metric_is_identity = True
                 solver_metric_identity_error = float(frame["identity_metric_error"])
@@ -6997,6 +6998,8 @@ class FrontierTiedLETTA:
                 metric_matvecs = diagnostics.metric_matvecs
                 iterations = diagnostics.iterations
                 residual_norm = diagnostics.residual_norm
+                reconstructed_residual_norm = diagnostics.reconstructed_residual_norm
+                full_residual_norm = diagnostics.full_residual_norm
                 solver_converged = diagnostics.converged
                 message = diagnostics.message
                 physical_blocks = diagnostics.metric_blocks
@@ -7029,6 +7032,8 @@ class FrontierTiedLETTA:
                 metric_matvecs = diagnostics.metric_matvecs
                 iterations = diagnostics.iterations
                 residual_norm = diagnostics.residual_norm
+                reconstructed_residual_norm = residual_norm
+                full_residual_norm = residual_norm
                 solver_converged = diagnostics.converged
                 message = diagnostics.message
                 if not diagnostics.converged:
@@ -7139,6 +7144,8 @@ class FrontierTiedLETTA:
             solver_metric_is_identity=solver_metric_is_identity,
             solver_metric_identity_error=solver_metric_identity_error,
             solver_coordinate_residual_norm=solver_coordinate_residual_norm,
+            reconstructed_residual_norm=reconstructed_residual_norm,
+            full_residual_norm=full_residual_norm,
         )
 
     def natural_gradient_step(

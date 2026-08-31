@@ -184,8 +184,13 @@ def benchmark_ground_state(H_mpo, n_sites, d, chi=32, nsweeps=8):
         a[0, 1, 0] = 1.0
         a += 1e-8 * rng.standard_normal(a.shape)
         psi0.append(a)
-    dmrg = DMRG(H_mpo.factors, D=chi, nsweeps=nsweeps, opt="2site")
-    dmrg.init_guess = psi0
+    dmrg = DMRG(
+        H_mpo,
+        D=chi,
+        init_guess=MPS(psi0, sites=H_mpo.input_sites),
+        nsweeps=nsweeps,
+        opt="2site",
+    )
     dmrg.run()
 
     e_dmrg = float(np.real(dmrg.e_tot))

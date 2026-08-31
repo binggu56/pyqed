@@ -22,6 +22,10 @@ from scipy.linalg import inv
 from scipy.sparse import kron, eye
 from scipy.linalg import eigh
 
+from ._legacy import warn_legacy_module
+
+warn_legacy_module("pyqed.ldr.gwp")
+
 # import proplot as plt
 
 # class ResultLDR(Result):
@@ -1825,4 +1829,3 @@ if __name__ == '__main__':
     # c = [result.psilist[k][112, :] for k in range(nt//nout)]
     # fig, ax = plt.subplots()
     # ax.plot(result.times, [np.prod(_c).real for _c in c])
-

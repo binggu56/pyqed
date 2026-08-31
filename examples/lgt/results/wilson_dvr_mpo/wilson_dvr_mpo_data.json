@@ -1,0 +1,119 @@
+{
+  "description": "Exact cell MPO with two fermion orbitals, a compact outgoing link, Jordan-Wigner parity, shortest Wilson strings, electric energy, and an optional Gauss-law penalty.",
+  "validation": {
+    "npts": 3,
+    "flux_cutoff": 1,
+    "full_product_dimension": 1728,
+    "physical_dimension": 48,
+    "raw_mpo_bond": 33,
+    "compressed_mpo_bond": 12,
+    "projected_matrix_relative_error": 9.667076025448262e-16,
+    "full_mpo_hermiticity_residual": 0.0,
+    "ed_ground_energy": -0.5155562457214466,
+    "dmrg_ground_energy": -0.5155562457213864,
+    "dmrg_energy_error": 6.0285110237146e-14,
+    "gauss_squared_expectation": 8.4565938936993505e-16,
+    "dmrg_seconds": 0.03820883412845433,
+    "dmrg_converged": true,
+    "dmrg_bonds": [
+      12,
+      12,
+      1
+    ]
+  },
+  "rank_scaling": [
+    {
+      "npts": 3,
+      "term_channels": 15,
+      "exact_numerical_bond": 10,
+      "bond_profile": [
+        10,
+        10,
+        1
+      ]
+    },
+    {
+      "npts": 5,
+      "term_channels": 45,
+      "exact_numerical_bond": 18,
+      "bond_profile": [
+        12,
+        18,
+        18,
+        12,
+        1
+      ]
+    },
+    {
+      "npts": 7,
+      "term_channels": 91,
+      "exact_numerical_bond": 26,
+      "bond_profile": [
+        12,
+        20,
+        26,
+        26,
+        20,
+        12,
+        1
+      ]
+    },
+    {
+      "npts": 9,
+      "term_channels": 153,
+      "exact_numerical_bond": 34,
+      "bond_profile": [
+        12,
+        20,
+        28,
+        34,
+        34,
+        28,
+        20,
+        12,
+        1
+      ]
+    }
+  ],
+  "compression_scan_n7": [
+    {
+      "bond_cap": 4,
+      "realized_bond": 4,
+      "relative_hilbert_schmidt_error": 0.3053572487334111
+    },
+    {
+      "bond_cap": 8,
+      "realized_bond": 8,
+      "relative_hilbert_schmidt_error": 0.26462954634319286
+    },
+    {
+      "bond_cap": 12,
+      "realized_bond": 12,
+      "relative_hilbert_schmidt_error": 0.04820191431318168
+    },
+    {
+      "bond_cap": 16,
+      "realized_bond": 16,
+      "relative_hilbert_schmidt_error": 0.04174515389859447
+    },
+    {
+      "bond_cap": 20,
+      "realized_bond": 20,
+      "relative_hilbert_schmidt_error": 0.031300139996309685
+    },
+    {
+      "bond_cap": 24,
+      "realized_bond": 24,
+      "relative_hilbert_schmidt_error": 0.017461721703405375
+    },
+    {
+      "bond_cap": 26,
+      "realized_bond": 26,
+      "relative_hilbert_schmidt_error": 5.1471699661669216e-08
+    }
+  ],
+  "figures": {
+    "rank": "/Users/gugroup/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/lgt/results/wilson_dvr_mpo/10_wilson_dvr_mpo_rank.png",
+    "validation": "/Users/gugroup/Library/CloudStorage/OneDrive-\u897f\u6e56\u5927\u5b66/pyqed/examples/lgt/results/wilson_dvr_mpo/11_wilson_dvr_mpo_validation.png"
+  }
+}

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from pyqed.mps.nonabelian import (
-    PhysicalLeg,
+    Leg,
     ReducedTensorOperator,
     build_random_spatial_mps,
     compose_site_operators,
@@ -31,9 +31,9 @@ def test_physical_leg_from_spatial_orbital_matches_site_structure():
     site = SpatialOrbitalSite()
     leg = physical_leg_from_spatial_orbital(site)
 
-    assert isinstance(leg, PhysicalLeg)
+    assert isinstance(leg, Leg)
     assert leg.sectors == site.qn
-    assert leg.dims == {
+    assert leg.sector_dims == {
         site.qn[0]: 1,
         site.qn[1]: 2,
         site.qn[2]: 1,
@@ -45,7 +45,7 @@ def test_physical_leg_from_spatial_orbital_accepts_canonical_site_tensor():
     tensor_site = build_random_spatial_mps(2, seed=3)[0]
     leg = physical_leg_from_spatial_orbital(tensor_site)
 
-    assert isinstance(leg, PhysicalLeg)
+    assert isinstance(leg, Leg)
     assert leg == physical_leg_from_spatial_orbital()
 
 

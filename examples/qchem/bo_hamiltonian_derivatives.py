@@ -21,7 +21,7 @@ from pyqed.qchem import CASCI, Molecule, bo_hamiltonian_derivatives
 
 def main():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", options={"eri_representation": "factors"})
+    mol.build(options={"eri_representation": "factors"})
 
     mf = mol.RHF().run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=2)

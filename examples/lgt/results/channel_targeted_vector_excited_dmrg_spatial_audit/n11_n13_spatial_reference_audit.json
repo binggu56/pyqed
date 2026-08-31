@@ -1,0 +1,28 @@
+{
+  "description": "N=11/13 vector-mass audit for state-averaged versus independently optimized ground references",
+  "records": [
+    {
+      "npts": 11,
+      "spacing_length_over_n": 0.9090909090909091,
+      "ground_energy_single_state": -16.401803674546017,
+      "ground_energy_state_average": -16.372864621515006,
+      "ground_reference_mismatch": 0.028939053031010076,
+      "vector_energy": -15.504421491107708,
+      "vector_strength": 0.3220677270575376,
+      "mass_state_average_reference": 0.5995075434955373,
+      "mass_single_state_ground_reference": 0.6407110168468555
+    },
+    {
+      "npts": 13,
+      "spacing_length_over_n": 0.7692307692307693,
+      "ground_energy_single_state": -23.334011263253956,
+      "ground_energy_state_average": -23.302297499749923,
+      "ground_reference_mismatch": 0.03171376350403321,
+      "vector_energy": -22.368616109034033,
+      "vector_strength": 0.03995697850471642,
+      "mass_state_average_reference": 0.6906350435111035,
+      "mass_single_state_ground_reference": 0.7329417628623265
+    }
+  ],
+  "continuum_vector_mass": 0.5641895835477563
+}

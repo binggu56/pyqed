@@ -35,10 +35,18 @@ except (ImportError, OSError, TimeoutError):
     NEVPT2Component = None
 
 try:
-    from .caspt2 import CASPT2, DiagonalCASPT2, CASPT2Component
+    from .caspt2 import (
+        CASPT2,
+        DiagonalCASPT2,
+        MSCASPT2,
+        XMSCASPT2,
+        CASPT2Component,
+    )
 except (ImportError, OSError, TimeoutError):
     CASPT2 = None
     DiagonalCASPT2 = None
+    MSCASPT2 = None
+    XMSCASPT2 = None
     CASPT2Component = None
 
 try:

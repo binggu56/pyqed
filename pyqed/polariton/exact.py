@@ -31,7 +31,7 @@ from timeit import default_timer as timer
 # sys.path.append(r'C:\Users\Bing\Google Drive\lime')
 # sys.path.append(r'/Users/bing/Google Drive/lime')
 
-from pyqed.units import au2fs, au2ev, au2k
+from pyqed.units import au2fs, au2ev, au2k, wavenumber2hartree
 from pyqed import dag, dagger, commutator, comm, anticomm, \
     rk4, ket2dm, Mol, multi_spin, Cavity, Polariton, tensor_power, pauli, \
         driven_dynamics
@@ -57,8 +57,6 @@ class Env:
 
 # hbar = 0.65821220 # in units of eV*fs
 # hbarinv = 1.0/hbar
-
-wavenumber2hartree = 4.55633525277e-06 #
 
 def spec_den(x):
     return  2. * reorg * x * cutfreq/(x**2 + cutfreq**2)

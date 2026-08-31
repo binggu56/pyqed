@@ -22,7 +22,7 @@ from .local_operator import (
     identity_mpo_transitions,
     transitions_are_identity_operator,
 )
-from .mpo import MPO, IrreducibleMPO, RankCoupledMPO
+from .mpo import MPOCore, IrreducibleMPO, RankCoupledMPO
 from .solver import pack_two_site_state, unpack_two_site_state
 
 
@@ -230,14 +230,14 @@ class EffectiveBlockOperator:
     Two-site effective operator assembled from explicit renormalized blocks.
 
     :param left_block: Left renormalized environment block.
-    :param mpo_left: MPO core on the left active site.
-    :param mpo_right: MPO core on the right active site.
+    :param mpo_left: MPOCore core on the left active site.
+    :param mpo_right: MPOCore core on the right active site.
     :param right_block: Right renormalized environment block.
     :param two_site_template: Rank-4 two-site tensor defining local sectors.
     :param basis: Explicit local two-site basis.
     :param phys1_slices: Physical sector slices for the left active site.
     :param phys2_slices: Physical sector slices for the right active site.
-    :param rank_coupled: Whether the MPO/environment path is rank-coupled.
+    :param rank_coupled: Whether the MPOCore/environment path is rank-coupled.
     :param left_entry: Optional persisted left boundary-stack entry.
     :param right_entry: Optional persisted right boundary-stack entry.
     :param su2_operator_engine: Persistent owner for packed SU(2) factors,
@@ -915,7 +915,7 @@ class EffectiveBlockOperator:
 
         :param symbolic_table: Symbolic boundary table owning numeric payloads.
         :param representation: Factor-table representation.
-        :param W: Adjacent MPO core.
+        :param W: Adjacent MPOCore core.
         :param phys_slices: Optional physical-sector slices.
         :returns: Factor table grouped by ket-sector pair.
         """
@@ -1055,7 +1055,7 @@ class EffectiveBlockOperator:
         """
         Infer the scalar dtype for this local effective operator.
 
-        :returns: NumPy result dtype from MPO cores and the two-site template.
+        :returns: NumPy result dtype from MPOCore cores and the two-site template.
         """
 
         from .environment import _mpo_dtype
@@ -1067,7 +1067,7 @@ class EffectiveBlockOperator:
         )
 
     def _physical_diagonal_slice(self, mpo_core, sector, phys_slices):
-        if isinstance(mpo_core, (MPO, IrreducibleMPO, RankCoupledMPO)):
+        if isinstance(mpo_core, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
             return mpo_core.block(sector, sector)
         if phys_slices is None:
             return None
@@ -1143,7 +1143,7 @@ class EffectiveBlockOperator:
         if arr.ndim == 3 and arr.shape[0] == 1:
             return arr[0]
         raise ValueError(
-            "Identity-MPO local diagonal expects rank-2 environment blocks or "
+            "Identity-MPOCore local diagonal expects rank-2 environment blocks or "
             f"rank-3 blocks with leading dimension 1, got {arr.shape!r}."
         )
 
@@ -1410,7 +1410,7 @@ class EffectiveBlockOperator:
 
     def _identity_local_actions(self, *, out_dtype):
         """
-        Build local actions for an identity-MPO effective block operator.
+        Build local actions for an identity-MPOCore effective block operator.
 
         :param out_dtype: Scalar dtype for the local operator.
         :returns: ``(tensor_matvec, reduced_matvec, packed_matvec,

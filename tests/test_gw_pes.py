@@ -14,7 +14,7 @@ from pyqed.units import au2ev
 
 def test_plane_wave_dipole_centered_s_gaussian_has_zero_k_zero_dipole():
     mol = Molecule(atom="H 0 0 0", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
 
     dipoles = ao_plane_wave_dipoles(mol, kvec=[0.0, 0.0, 0.0], origin=[0.0, 0.0, 0.0])
 
@@ -24,7 +24,7 @@ def test_plane_wave_dipole_centered_s_gaussian_has_zero_k_zero_dipole():
 
 def test_default_pes_origin_is_nuclear_center_of_mass():
     mol = Molecule(atom="O 0 0 0; H 0 0 1.8", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
 
     center_of_mass = mol.center_of_mass()
     assert not np.allclose(center_of_mass, mol.nuc_charge_center())
@@ -37,7 +37,7 @@ def test_default_pes_origin_is_nuclear_center_of_mass():
 
 def test_gw_photoelectron_spectrum_h2_smoke():
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", unit="angstrom")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     gw = GW(mf, screening="TDH", eta=1e-3).run()
 
@@ -199,7 +199,7 @@ def test_gw_photoelectron_spectrum_h2_smoke():
 
 def test_gw_arpes_fixed_and_transverse_polarization_h2():
     mol = Molecule(atom="H 0 0 0; H 0 0 0.74", basis="sto-3g", unit="angstrom")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     gw = GW(mf, screening="TDH", eta=1e-3).run()
 
@@ -266,7 +266,7 @@ def test_matrix_dyson_orbital_and_arpes_h2o_smoke():
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     gw = GW(mf, screening="TDH", eta=1e-3).run()
 
@@ -384,7 +384,7 @@ def test_gw_h2_spectral_function_matches_molgw_selfenergy_reference():
         basis="cc-pvdz",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+    mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
     mf = RHF(mol).run(verbose=0, cholesky_jk=True, cholesky_tol=1e-12)
     gw = GW(mf, screening="TDH", eta=1e-3).run()
 

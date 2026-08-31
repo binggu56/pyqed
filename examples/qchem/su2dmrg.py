@@ -15,9 +15,7 @@ mol = Molecule(
     unit="bohr",
     basis="631g",
 )
-mol.build(
-    driver="builtin",
-    eri="dense",
+mol.build(eri="dense",
     aosym="s1",
     options={"eri_backend": "cpp"},
 )

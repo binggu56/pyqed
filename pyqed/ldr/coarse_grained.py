@@ -389,6 +389,74 @@ def _cubic_hermite_factors(coordinates, anchors, *, extrapolation="linear"):
     return factors
 
 
+def _quintic_hermite_factors(coordinates, anchors, *, extrapolation="error"):
+    """Return nodal value/slope/curvature factors for a 1D spline."""
+    coordinates = np.asarray(coordinates, dtype=float)
+    anchors = np.asarray(anchors, dtype=float)
+    if coordinates.ndim != 1:
+        raise ValueError("coordinates must be one-dimensional")
+    if (
+        anchors.ndim != 1
+        or anchors.size < 2
+        or np.any(np.diff(anchors) <= 0.0)
+    ):
+        raise ValueError("anchors must contain at least two ordered values")
+    if extrapolation not in ("error", "quadratic"):
+        raise ValueError("quintic extrapolation must be 'error' or 'quadratic'")
+    outside = (coordinates < anchors[0]) | (coordinates > anchors[-1])
+    if extrapolation == "error" and np.any(outside):
+        raise ValueError("coordinates lie outside the anchor interval")
+
+    factors = np.zeros((3 * anchors.size, coordinates.size), dtype=float)
+    for coordinate_index, coordinate in enumerate(coordinates):
+        if coordinate < anchors[0]:
+            delta = coordinate - anchors[0]
+            factors[:3, coordinate_index] = (1.0, delta, 0.5 * delta**2)
+            continue
+        if coordinate > anchors[-1]:
+            delta = coordinate - anchors[-1]
+            factors[-3:, coordinate_index] = (1.0, delta, 0.5 * delta**2)
+            continue
+        interval_index = np.searchsorted(
+            anchors,
+            coordinate,
+            side="right",
+        ) - 1
+        interval_index = int(np.clip(
+            interval_index,
+            0,
+            anchors.size - 2,
+        ))
+        left = anchors[interval_index]
+        width = anchors[interval_index + 1] - left
+        reduced = (coordinate - left) / width
+        reduced2 = reduced**2
+        reduced3 = reduced2 * reduced
+        reduced4 = reduced3 * reduced
+        reduced5 = reduced4 * reduced
+        left_offset = 3 * interval_index
+        right_offset = left_offset + 3
+        factors[left_offset, coordinate_index] = (
+            1.0 - 10.0 * reduced3 + 15.0 * reduced4 - 6.0 * reduced5
+        )
+        factors[left_offset + 1, coordinate_index] = width * (
+            reduced - 6.0 * reduced3 + 8.0 * reduced4 - 3.0 * reduced5
+        )
+        factors[left_offset + 2, coordinate_index] = 0.5 * width**2 * (
+            reduced2 - 3.0 * reduced3 + 3.0 * reduced4 - reduced5
+        )
+        factors[right_offset, coordinate_index] = (
+            10.0 * reduced3 - 15.0 * reduced4 + 6.0 * reduced5
+        )
+        factors[right_offset + 1, coordinate_index] = width * (
+            -4.0 * reduced3 + 7.0 * reduced4 - 3.0 * reduced5
+        )
+        factors[right_offset + 2, coordinate_index] = 0.5 * width**2 * (
+            reduced3 - 2.0 * reduced4 + reduced5
+        )
+    return factors
+
+
 @dataclass(frozen=True)
 class SeparableHamiltonian:
     """Low-rank coordinate expansion of an electronic Hamiltonian.
@@ -482,6 +550,48 @@ class SeparableHamiltonian:
             *hamiltonians.shape[-2:],
         )
         factors = _cubic_hermite_factors(
+            coordinates,
+            anchors,
+            extrapolation=extrapolation,
+        )
+        return cls(operators=operators, factors=(factors,))
+
+    @classmethod
+    def quintic_hermite(
+        cls,
+        coordinates,
+        anchors,
+        hamiltonians,
+        gradients,
+        hessians,
+        *,
+        extrapolation="error",
+    ):
+        """Build a one-coordinate C2 piecewise-quintic interpolant."""
+        hamiltonians = np.asarray(hamiltonians)
+        gradients = np.asarray(gradients)
+        hessians = np.asarray(hessians)
+        anchors = np.asarray(anchors, dtype=float)
+        if (
+            hamiltonians.shape != gradients.shape
+            or hamiltonians.shape != hessians.shape
+            or hamiltonians.ndim < 3
+            or hamiltonians.shape[-3] != anchors.size
+            or hamiltonians.shape[-1] != hamiltonians.shape[-2]
+        ):
+            raise ValueError(
+                "anchor values, gradients, and hessians must have matching "
+                "shape (*sampled, nanchors, nstates, nstates)"
+            )
+        operators = np.stack(
+            (hamiltonians, gradients, hessians),
+            axis=-3,
+        ).reshape(
+            *hamiltonians.shape[:-3],
+            3 * anchors.size,
+            *hamiltonians.shape[-2:],
+        )
+        factors = _quintic_hermite_factors(
             coordinates,
             anchors,
             extrapolation=extrapolation,
@@ -645,6 +755,172 @@ class SeparableHamiltonian:
                 [term[axis] for term in factor_terms],
                 axis=0,
             )
+            for axis in range(ndim)
+        )
+        return cls(operators=operators, factors=factors)
+
+    @classmethod
+    def axial_quintic_hermite(
+        cls,
+        coordinates,
+        anchors,
+        hamiltonians,
+        gradients,
+        hessians,
+        *,
+        center_hamiltonian,
+        centers=None,
+        mixed_hessians=None,
+        extrapolation="quadratic",
+    ):
+        """Build a sparse axial C2 mode-combination expansion.
+
+        Each expanded coordinate is represented by a piecewise-quintic
+        ``H/F/G`` interpolant along its axial anchor line. Optional mixed
+        Hessians add pair terms about ``centers`` without a Cartesian anchor
+        grid.
+        """
+        coordinates = tuple(np.asarray(values, dtype=float) for values in coordinates)
+        anchors = tuple(np.asarray(values, dtype=float) for values in anchors)
+        hamiltonians = tuple(np.asarray(values) for values in hamiltonians)
+        gradients = tuple(np.asarray(values) for values in gradients)
+        hessians = tuple(np.asarray(values) for values in hessians)
+        ndim = len(coordinates)
+        if (
+            ndim == 0
+            or len(anchors) != ndim
+            or len(hamiltonians) != ndim
+            or len(gradients) != ndim
+            or len(hessians) != ndim
+        ):
+            raise ValueError(
+                "coordinates, anchors, hamiltonians, gradients, and hessians "
+                "must contain one entry per expanded coordinate"
+            )
+        if isinstance(extrapolation, str):
+            extrapolation = (extrapolation,) * ndim
+        else:
+            extrapolation = tuple(extrapolation)
+        if len(extrapolation) != ndim:
+            raise ValueError(
+                "extrapolation must contain one policy per expanded coordinate"
+            )
+
+        center_hamiltonian = np.asarray(center_hamiltonian)
+        if (
+            center_hamiltonian.ndim < 2
+            or center_hamiltonian.shape[-1] != center_hamiltonian.shape[-2]
+        ):
+            raise ValueError(
+                "center_hamiltonian must have shape "
+                "(*sampled, nstates, nstates)"
+            )
+        sampled_shape = center_hamiltonian.shape[:-2]
+        matrix_shape = center_hamiltonian.shape[-2:]
+        centers = (
+            np.zeros(ndim, dtype=float)
+            if centers is None
+            else np.asarray(centers, dtype=float)
+        )
+        if centers.shape != (ndim,) or not np.all(np.isfinite(centers)):
+            raise ValueError("centers must contain one finite value per coordinate")
+
+        operator_terms = [center_hamiltonian]
+        factor_terms = [[np.ones(values.size) for values in coordinates]]
+        for axis in range(ndim):
+            values = hamiltonians[axis]
+            slopes = gradients[axis]
+            curvatures = hessians[axis]
+            expected = (*sampled_shape, anchors[axis].size, *matrix_shape)
+            if (
+                values.shape != expected
+                or slopes.shape != expected
+                or curvatures.shape != expected
+            ):
+                raise ValueError(
+                    f"axis {axis} anchor H/F/G arrays must have shape {expected}"
+                )
+            center_matches = np.flatnonzero(
+                np.isclose(anchors[axis], centers[axis], rtol=0.0, atol=1.0e-12)
+            )
+            if center_matches.size != 1:
+                raise ValueError(
+                    f"axis {axis} anchors must contain center {centers[axis]}"
+                )
+            center_value = values[..., int(center_matches[0]), :, :]
+            if not np.allclose(
+                center_value,
+                center_hamiltonian,
+                rtol=1.0e-8,
+                atol=1.0e-10,
+            ):
+                raise ValueError(
+                    f"axis {axis} Hamiltonian at the center does not match "
+                    "center_hamiltonian"
+                )
+
+            axis_operators = np.stack(
+                (
+                    values - center_hamiltonian[..., None, :, :],
+                    slopes,
+                    curvatures,
+                ),
+                axis=-3,
+            ).reshape(
+                *sampled_shape,
+                3 * anchors[axis].size,
+                *matrix_shape,
+            )
+            axis_factors = _quintic_hermite_factors(
+                coordinates[axis],
+                anchors[axis],
+                extrapolation=extrapolation[axis],
+            )
+            for term in range(axis_operators.shape[-3]):
+                operator_terms.append(axis_operators[..., term, :, :])
+                factor_terms.append([
+                    axis_factors[term]
+                    if current == axis
+                    else np.ones(coordinates[current].size)
+                    for current in range(ndim)
+                ])
+
+        if mixed_hessians is not None:
+            mixed_hessians = np.asarray(mixed_hessians)
+            expected = (*sampled_shape, ndim, ndim, *matrix_shape)
+            if mixed_hessians.shape != expected:
+                raise ValueError(
+                    f"mixed_hessians shape {mixed_hessians.shape} != {expected}"
+                )
+            if not np.allclose(
+                mixed_hessians,
+                mixed_hessians.swapaxes(
+                    len(sampled_shape),
+                    len(sampled_shape) + 1,
+                ),
+                rtol=1.0e-8,
+                atol=1.0e-10,
+            ):
+                raise ValueError(
+                    "mixed_hessians must be symmetric in coordinate indices"
+                )
+            for first in range(ndim - 1):
+                for second in range(first + 1, ndim):
+                    operator_terms.append(
+                        mixed_hessians[..., first, second, :, :]
+                    )
+                    factor_terms.append([
+                        (
+                            coordinates[current] - centers[current]
+                            if current in (first, second)
+                            else np.ones(coordinates[current].size)
+                        )
+                        for current in range(ndim)
+                    ])
+
+        operators = np.stack(operator_terms, axis=len(sampled_shape))
+        factors = tuple(
+            np.stack([term[axis] for term in factor_terms], axis=0)
             for axis in range(ndim)
         )
         return cls(operators=operators, factors=factors)
@@ -1388,7 +1664,7 @@ def _mpo_norm(mpo):
 
 
 def _matmul(left, right, max_rank):
-    return left.matmul(right, chi_max=max_rank)
+    return left.compose(right, max_bond=max_rank)
 
 
 def _mpo_exponential(mpo, constant, scale, order, max_rank):
@@ -3891,8 +4167,6 @@ def H_val(full_coords):
         v18b,   v14,  v19b,   v20b,
         v16b, v11
     """
-    au2ev = 27.2116
-
     freq = torch.tensor([
         0.1139, 0.0739, 0.1258, 0.1525, 0.1961, 0.3788,
         0.0937, 0.1219,
@@ -4129,7 +4403,7 @@ if __name__ == "__main__":
     nstates = 2
     dt = 0.5/au2fs
 
-    nt = 300  # 1au=2.41888432651e-2fs
+    nt = 300  # one atomic unit of time is au2fs femtoseconds
     nout = 1
 
     dims = [2, 2]

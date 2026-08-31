@@ -41,7 +41,15 @@ class RHF:
     cutoff-sensitive.
     """
 
-    def __init__(self, cell, kpts=None, nimages=1, damping=0.5, nk=None):
+    def __init__(
+        self,
+        cell,
+        kpts=None,
+        nimages=1,
+        damping=0.5,
+        nk=None,
+        gamma_centered=False,
+    ):
         self.cell = cell
         self.nimages = int(nimages)
         if kpts is not None and nk is not None:
@@ -49,7 +57,7 @@ class RHF:
         if nk is not None:
             if not self.cell.built:
                 self.cell.build()
-            kpts = self.cell.make_kpts(nk)
+            kpts = self.cell.make_kpts(nk, gamma_centered=gamma_centered)
         self.kpts = _normalize_kpts(kpts)
         self.damping = float(damping)
 

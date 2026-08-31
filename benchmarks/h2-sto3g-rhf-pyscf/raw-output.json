@@ -27,7 +27,6 @@
     "method": {
       "name": "RHF",
       "basis": "sto-3g",
-      "pyqed_integral_driver": "builtin",
       "pyqed_eri_representation": "dense",
       "pyqed_eri_backend": "rys",
       "pyqed_ao_symmetry": "s8",
@@ -54,7 +53,7 @@
   "implementations": {
     "pyqed": {
       "version": "0.2.0",
-      "integral_driver": "builtin",
+      "integral_engine": "native",
       "eri_representation": "dense",
       "eri_backend": "rys",
       "dense_builder": "rys-cython-blocked",

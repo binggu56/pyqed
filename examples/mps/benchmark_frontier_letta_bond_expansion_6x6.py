@@ -329,8 +329,8 @@ def run_benchmark(
         eig_tol=1.0e-10,
         maxiter=1600,
         max_subspace=96,
-        frontier_canonicalization=True,
-        frontier_gauge_weighting="uniform",
+        gauge="frontier",
+        gauge_weight="uniform",
         verbose=True,
     )
     relaxation_seconds = perf_counter() - relaxation_start
@@ -359,8 +359,8 @@ def run_benchmark(
             "candidate_solver": solver,
             "relaxation_solver": solver,
             "relaxation_passes": int(relaxation_passes),
-            "frontier_canonicalization": True,
-            "frontier_gauge_weighting": "uniform",
+            "gauge": "frontier",
+            "gauge_weight": "uniform",
             "seed": int(seed),
             "exact_state_used_for_selection": False,
         },

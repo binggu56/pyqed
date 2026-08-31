@@ -23,7 +23,7 @@ A typical native calculation follows this structure:
        unit="angstrom",
        basis="sto-3g",
    )
-   mol.build(driver="builtin", eri="auto")
+   mol.build(eri="auto")
 
    mf = mol.RHF().run()
    print(mf.e_tot)
@@ -57,7 +57,6 @@ Integral Backends
 The molecular build step can use different integral representations depending
 on the calculation:
 
-* ``driver="builtin"`` uses the native integral path.
 * ``eri="auto"`` uses compact eight-fold exact storage for small systems and
   prefers native RI factors for larger systems when an auxiliary basis is
   available.
@@ -81,9 +80,7 @@ Auxiliary bases can be selected explicitly:
 
 .. code-block:: python
 
-   mol.build(
-       driver="builtin",
-       eri="ri",
+   mol.build(eri="ri",
        auxbasis="cc-pvdz-rifit",
    )
 
@@ -110,6 +107,125 @@ dedicated guide for examples:
 
    guide/guide_qchem_mcscf
    guide/guide_qchem_om2_mrci
+
+SU(2)-NARG State Overlaps
+-------------------------
+
+Two completed direct-reduced SU(2)-NARG calculations can be connected without
+recovering determinant amplitudes:
+
+.. code-block:: python
+
+   overlap = narg_bra.overlap(narg_ket)
+
+   overlap_exact, info = narg_bra.overlap(
+       narg_ket,
+       cutoff=0.0,
+       max_bond=None,
+       return_info=True,
+   )
+
+When the calculations carry molecular orbitals, the method builds the
+cross-geometry AO overlap automatically. ``ao_overlap`` or a full core plus
+active ``mo_overlap`` can instead be supplied explicitly. Frozen cores are
+eliminated with their exact Schur complement and determinant prefactor. The
+conditional NARG tensors are converted to a fully reduced SU(2) MPS, including
+the NARG local-state phase convention, and the nonorthogonal orbital map is
+applied as a sector-preserving Gaussian circuit.
+
+Here ``circuit`` means a tensor-network factorization, not quantum hardware or
+physical time evolution. A one-particle map :math:`G` induces the Fock-space
+operator
+
+.. math::
+
+   \widehat G\,a_p^\dagger\widehat G^{-1}
+   = \sum_q G_{qp}a_q^\dagger.
+
+Constructing :math:`\widehat G` as a dense operator would require the full
+Fock space. Instead, an SVD and adjacent Givens factorizations express
+:math:`G` as diagonal scalings and two-orbital maps. Their second-quantized
+actions are applied directly to neighboring reduced-MPS tensors, followed by
+an SU(2)-resolved SVD. This is why the implementation has a circuit even though
+the overlap itself is a static scalar.
+
+When :math:`G^\dagger G=I` within numerical tolerance, the implementation
+recognizes a true orbital rotation and factors :math:`G` directly with one
+adjacent-Givens sweep. A generic unitary map therefore needs at most
+:math:`L(L-1)/2` two-orbital gates. Only a genuinely nonunitary map uses the
+two-sweep :math:`U\Sigma V^\dagger` construction. The selected route and the
+unitarity residual are available as ``orbital_factorization`` and
+``unitarity_residual`` in the overlap diagnostics.
+
+Selected roots are carried together as an open terminal boundary. Consequently
+the orbital circuit is applied at most once to each root bundle, and a single
+reduced environment contraction produces the full root-overlap matrix. The
+expensive orbital transformation therefore does not repeat for every root or
+root pair. ``return_info=True`` reports
+``batched_roots``, the two root-batch sizes, the orbital-transform call count,
+and the overlap-contraction count.
+
+The default ``orbital_split="auto"`` estimates the circuit cost on each side
+and chooses among balanced, bra-only, and ket-only factorizations of the exact
+active-space relation
+
+.. math::
+
+   G_L^\dagger G_R = S_{\mathrm{eff}}.
+
+For a geometry sequence, aligning the next orbital gauge before solving keeps
+this map local:
+
+.. code-block:: python
+
+   next_narg = NARG.from_parallel_transport(
+       previous_narg,
+       next_mf,
+       transport_method="polar",
+       ncas=ncas,
+       nelecas=nelecas,
+       D=128,
+   ).run()
+
+``transport_method="match"`` restricts the gauge to permutation and phase
+changes when preserving localized orbitals matters more than the optimal polar
+alignment. Core and active spaces are aligned separately and never mixed.
+``overlap_orbital_order`` can also suggest a common chain order by minimizing
+the cumulative overlap-graph boundary cost.
+
+An exact block-diagonal map is automatically factored into independent
+contiguous Gaussian circuits. For a nearly local map,
+``orbital_map_threshold=tau`` additionally drops off-diagonal edges with
+magnitude at most :math:`\tau`. This is an explicit approximation: diagnostics
+report the block count and
+
+.. math::
+
+   \epsilon_{\mathrm{map}}
+   = \left\|G_L^\dagger G_R-S_{\mathrm{eff}}\right\|_2,
+
+and ``exact`` is false whenever this residual is nonzero. The threshold is zero
+by default. If the resulting contiguous block sizes are :math:`b_\alpha`, the
+number of generic adjacent gates is reduced from
+:math:`L(L-1)` to
+
+.. math::
+
+   N_{\mathrm{gate}}
+   = \sum_\alpha b_\alpha(b_\alpha-1).
+
+Thus the circuit frontier is controlled by the largest connected orbital block
+rather than by the full active-orbital count :math:`L`.
+
+The defaults ``cutoff=1e-10`` and ``max_bond="auto"`` compress intermediate
+bonds and are approximate. Setting ``cutoff=0`` and ``max_bond=None`` removes
+that compression, although an exact general orbital map can still produce
+exponential intermediate bond growth. This implementation is an adaptation of
+the biorthogonal transformations of P.-A. Malmqvist, *Int. J. Quantum Chem.*
+**30**, 479 (1986), DOI ``10.1002/qua.560300404``, and the nonorthogonal MPS
+state-interaction construction of S. Knecht et al., *J. Chem. Theory Comput.*
+**12**, 5881 (2016), DOI ``10.1021/acs.jctc.6b00889``. It is not a direct
+reproduction of either reference implementation.
 
 Related Topics
 --------------

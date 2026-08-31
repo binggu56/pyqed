@@ -40,7 +40,7 @@ def _h2_rhf(r):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="gbasis")
+    mol.build()
     return RHF(mol).run()
 
 

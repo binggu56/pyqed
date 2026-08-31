@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from pyqed.namd.triatomic import Triatom
-from pyqed.units import au2fs
+from pyqed.units import au2ev, au2fs
 
 from h3plus_3d_sine_legendre_linked_ldr import (
     arrangement_populations,
@@ -36,7 +36,7 @@ from h3plus_3d_sine_legendre_linked_ldr import (
     working_directory,
 )
 
-HARTREE_TO_EV = 27.211386245988
+HARTREE_TO_EV = au2ev
 
 
 def so2_body_frame(r: float = 2.70, theta: float = np.deg2rad(119.5)):

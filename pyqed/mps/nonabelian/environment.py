@@ -37,7 +37,7 @@ from .local_operator import (
     materialize_packed_matrix,
     transitions_are_identity_operator,
 )
-from .mpo import MPO, IrreducibleMPO, RankCoupledMPO, iter_virtual_routes
+from .mpo import MPOCore, IrreducibleMPO, RankCoupledMPO, iter_virtual_routes
 from .solver import (
     LocalOperator,
     ReducedStateVector,
@@ -46,7 +46,7 @@ from .solver import (
     two_site_state_basis,
 )
 from .renormalized import RenormalizedBlockStack, RenormalizedOperatorStack
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 from pyqed.mps.su2 import SU2Irrep
 
 
@@ -398,7 +398,7 @@ def _contract_rank_coupled_left_step(E_block, A_conj, W_block, B_block):
 
     :param E_block: Left environment component with indices ``xij``.
     :param A_conj: Conjugated bra MPS block with indices ``ipr``.
-    :param W_block: Reduced MPO block with indices ``xypq``.
+    :param W_block: Reduced MPOCore block with indices ``xypq``.
     :param B_block: Ket MPS block with indices ``jqs``.
     :returns: Contribution with indices ``yrs``.
     """
@@ -441,7 +441,7 @@ def _contract_rank_coupled_right_step(A_conj, W_block, F_block, B_block):
     Contract one right environment update term without dynamic path planning.
 
     :param A_conj: Conjugated bra MPS block with indices ``ipr``.
-    :param W_block: Reduced MPO block with indices ``xypq``.
+    :param W_block: Reduced MPOCore block with indices ``xypq``.
     :param F_block: Right environment component with indices ``yrs``.
     :param B_block: Ket MPS block with indices ``jqs``.
     :returns: Contribution with indices ``xij``.
@@ -481,8 +481,8 @@ def _contract_rank_coupled_right_step(A_conj, W_block, F_block, B_block):
 
 
 def _tensor_dense_layout(tensor, axis_overrides=None):
-    if not isinstance(tensor, NonabelianTensor):
-        raise TypeError("_tensor_dense_layout expects a NonabelianTensor.")
+    if not isinstance(tensor, IrrepTensor):
+        raise TypeError("_tensor_dense_layout expects an IrrepTensor.")
     axis_overrides = axis_overrides or {}
 
     sector_dims = [dict() for _ in range(tensor.rank)]
@@ -518,7 +518,7 @@ def _tensor_dense_layout(tensor, axis_overrides=None):
                 if tensor.rank == 3 and axis == 1 and hasattr(sector, "dim"):
                     # Physical legs must keep their full local Hilbert-space
                     # sectors even when the current MPS has zero amplitude in
-                    # one sector; otherwise dense MPO -> sparse MPO conversion
+                    # one sector; otherwise dense MPOCore -> sparse MPOCore conversion
                     # silently drops operator channels.
                     dim = int(sector.dim)
                 else:
@@ -560,19 +560,19 @@ def _site_physical_dims(site_layout):
 
 
 def _mpo_left_dim(mpo_core):
-    if isinstance(mpo_core, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(mpo_core, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         return mpo_core.left_dim
     return int(np.asarray(mpo_core).shape[0])
 
 
 def _mpo_right_dim(mpo_core):
-    if isinstance(mpo_core, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(mpo_core, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         return mpo_core.right_dim
     return int(np.asarray(mpo_core).shape[1])
 
 
 def _mpo_dtype(mpo_core):
-    if isinstance(mpo_core, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(mpo_core, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         return mpo_core.dtype
     return np.asarray(mpo_core).dtype
 
@@ -584,7 +584,7 @@ def _is_identity_mpo_core(mpo_core, *, tol=1e-12):
         return bool(cached[1])
     if cached is not None:
         _IDENTITY_MPO_CORE_CACHE.pop(cache_key, None)
-    if not isinstance(mpo_core, MPO):
+    if not isinstance(mpo_core, MPOCore):
         return False
     if mpo_core.left_dim != 1 or mpo_core.right_dim != 1:
         _IDENTITY_MPO_CORE_CACHE[cache_key] = (weakref.ref(mpo_core), False)
@@ -610,7 +610,7 @@ def _is_identity_mpo_core(mpo_core, *, tol=1e-12):
 
 
 def _normalize_dense_mpo_core(mpo_core, *, phys_out_slices, phys_in_slices=None):
-    if isinstance(mpo_core, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(mpo_core, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         return mpo_core.as_dense(phys_out_slices, phys_in_slices)
     return np.asarray(mpo_core)
 
@@ -623,9 +623,9 @@ def _normalize_block_sparse_mpo_core(
     phys_out_dims=None,
     phys_in_dims=None,
 ):
-    if isinstance(mpo_core, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(mpo_core, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         return mpo_core
-    return MPO.from_dense(
+    return MPOCore.from_dense(
         mpo_core,
         phys_out_slices=phys_out_slices,
         phys_in_slices=phys_in_slices,
@@ -710,8 +710,8 @@ def _dense_to_packed_vector(dense, *, pack_layout, dense_layout):
 
 
 def _site_to_dense(site, dense_layout=None):
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
-        raise ValueError("_site_to_dense expects a rank-3 NonabelianTensor.")
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
+        raise ValueError("_site_to_dense expects a rank-3 IrrepTensor.")
     return _tensor_to_dense(site, dense_layout=dense_layout)
 
 
@@ -752,7 +752,7 @@ def _apply_two_site_dense(E, W1, W2, F, theta):
     E, F
         Dense left/right environments with shape ``(w, bra, ket)``.
     W1, W2
-        Dense MPO tensors with shape ``(wL, wR, pOut, pIn)``.
+        Dense MPOCore tensors with shape ``(wL, wR, pOut, pIn)``.
     theta
         Dense two-site tensor with layout ``(left, phys1, phys2, right)``.
     """
@@ -814,7 +814,7 @@ def _two_site_diagonal_block(E, W1, W2, F):
     E, F
         Environment blocks with shape ``(w, bra, ket)``.
     W1, W2
-        MPO blocks with shape ``(wL, wR, pOut, pIn)``.
+        MPOCore blocks with shape ``(wL, wR, pOut, pIn)``.
 
     Returns
     -------
@@ -846,8 +846,8 @@ def _shape_from_slices(slices):
 
 
 def _apply_two_site_block_sparse(E, W1, W2, F, theta, dense_layout):
-    if not isinstance(theta, NonabelianTensor) or theta.rank != 4:
-        raise ValueError("_apply_two_site_block_sparse expects a rank-4 NonabelianTensor.")
+    if not isinstance(theta, IrrepTensor) or theta.rank != 4:
+        raise ValueError("_apply_two_site_block_sparse expects a rank-4 IrrepTensor.")
 
     out_data = {}
     dtype = np.result_type(
@@ -877,7 +877,7 @@ def _apply_two_site_block_sparse(E, W1, W2, F, theta, dense_layout):
             tmp = _apply_two_site_dense(E_slice, W1_slice, W2_slice, F_slice, block_in)
             out_data[out_key] += tmp
 
-    return NonabelianTensor(
+    return IrrepTensor(
         out_data,
         [leg[:] for leg in theta.qns],
         theta.dirs[:],
@@ -1452,6 +1452,20 @@ def _right_reduced_recoupling_coeff(
 
 
 def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    cache_key = (
+        "left",
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+        bool(getattr(W, "normal_complementary_right_dual", False)),
+        id(getattr(W, "normal_complementary_plan", None)),
+    )
+    cache = W._environment_reduced_block_cache
+    if cache_key in cache:
+        return cache[cache_key]
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -1533,6 +1547,7 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     if relaxed_scalar_transfer:
         for key, block in _rank_coupled_reduced_terms_block(W, q_pb, q_pk).items():
             reduced[key] = reduced.get(key, 0) + block
+        cache[cache_key] = reduced
         return reduced
 
     for term in W.reduced_terms:
@@ -1721,10 +1736,25 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             )
                 if np.any(block):
                     reduced[(left_idx, right_idx)] = block
+    cache[cache_key] = reduced
     return reduced
 
 
 def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    cache_key = (
+        "right",
+        q_lb,
+        q_lk,
+        q_pb,
+        q_pk,
+        q_rb,
+        q_rk,
+        bool(getattr(W, "normal_complementary_right_dual", False)),
+        id(getattr(W, "normal_complementary_plan", None)),
+    )
+    cache = W._environment_reduced_block_cache
+    if cache_key in cache:
+        return cache[cache_key]
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -1805,6 +1835,7 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     if relaxed_scalar_transfer:
         for key, block in _rank_coupled_reduced_terms_block(W, q_pb, q_pk).items():
             reduced[key] = reduced.get(key, 0) + block
+        cache[cache_key] = reduced
         return reduced
 
     for term in W.reduced_terms:
@@ -2000,6 +2031,7 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             )
                 if np.any(block):
                     reduced[(left_idx, right_idx)] = block
+    cache[cache_key] = reduced
     return reduced
 
 
@@ -2028,7 +2060,7 @@ def _rank_coupled_channel_expectation(env_map, channel):
 
 
 def _rank_coupled_cut_expectation(left, right, channel_irreps):
-    """Contract independently reduced SU(2) boundaries across one MPO cut."""
+    """Contract independently reduced SU(2) boundaries across one MPOCore cut."""
 
     channel_irreps = tuple(channel_irreps)
     value = 0.0 + 0.0j
@@ -2186,7 +2218,7 @@ class LeftBlock(_BlockEnvironment):
     Left renormalized block environment for a sweep boundary.
 
     This mirrors block-DMRG terminology: the object owns the left block basis
-    sector-pair map and advances by absorbing one MPS/MPO site.
+    sector-pair map and advances by absorbing one MPS/MPOCore site.
     """
 
     def advance(
@@ -2204,10 +2236,10 @@ class LeftBlock(_BlockEnvironment):
         """
         Absorb one site into this left block.
 
-        :param W: MPO core for the absorbed site.
+        :param W: MPOCore core for the absorbed site.
         :param bra_site: Bra-side site tensor.
         :param ket_site: Ket-side site tensor.
-        :param phys_slices: Physical sector slices for dense MPO cores.
+        :param phys_slices: Physical sector slices for dense MPOCore cores.
         :returns: Advanced ``LeftBlock``.
         """
 
@@ -2255,7 +2287,7 @@ class RightBlock(_BlockEnvironment):
     Right renormalized block environment for a sweep boundary.
 
     The object owns the right block sector-pair map and advances by absorbing
-    one MPS/MPO site from the right.
+    one MPS/MPOCore site from the right.
     """
 
     def advance(
@@ -2273,10 +2305,10 @@ class RightBlock(_BlockEnvironment):
         """
         Absorb one site into this right block.
 
-        :param W: MPO core for the absorbed site.
+        :param W: MPOCore core for the absorbed site.
         :param bra_site: Bra-side site tensor.
         :param ket_site: Ket-side site tensor.
-        :param phys_slices: Physical sector slices for dense MPO cores.
+        :param phys_slices: Physical sector slices for dense MPOCore cores.
         :returns: Advanced ``RightBlock``.
         """
 
@@ -2327,7 +2359,7 @@ def _contract_from_left_blocks(W, A, E_map, B, phys_slices):
             E_block = E_map.get((q_lb, q_lk))
             if E_block is None:
                 continue
-            if isinstance(W, (MPO, IrreducibleMPO, RankCoupledMPO)):
+            if isinstance(W, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
                 W_slice = W.block(q_pb, q_pk)
             else:
                 p_slice_b = phys_slices[q_pb]
@@ -2557,11 +2589,21 @@ def _contract_rank_coupled_boundary_cpp(
     packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
     if packed_parent is None:
         return None
+    # LETTA commonly carries numerically real tensors in complex arrays.  Keep
+    # those on the real boundary store installed by the local contextual
+    # action; only select the complex route when the parent or site tensors
+    # contain a material imaginary component.  A genuinely complex MPOCore block
+    # is caught by ``register`` below and falls back to the Python contraction.
     complex_update = bool(
-        np.iscomplexobj(packed_parent.block_pool.data)
-        or np.dtype(_mpo_dtype(W)).kind == "c"
-        or any(np.iscomplexobj(block) for block in A.data.values())
-        or any(np.iscomplexobj(block) for block in B.data.values())
+        _real64_contiguous_or_none(packed_parent.block_pool.data) is None
+        or any(
+            _real64_contiguous_or_none(block) is None
+            for block in A.data.values()
+        )
+        or any(
+            _real64_contiguous_or_none(block) is None
+            for block in B.data.values()
+        )
     )
     if complex_update and not hasattr(moving_environment, "advance_boundary_complex"):
         return None
@@ -2704,12 +2746,12 @@ def _contract_rank_coupled_boundary_cpp(
                         raw_reduced = (
                             _right_reduced_rank_coupled_block(
                                 W,
-                                q_boundary_bra,
-                                q_boundary_ket,
-                                q_phys_bra,
-                                q_phys_ket,
                                 q_next_bra,
                                 q_next_ket,
+                                q_phys_bra,
+                                q_phys_ket,
+                                q_boundary_bra,
+                                q_boundary_ket,
                             )
                             if reduced_physical
                             else W.reduced_block(q_phys_bra, q_phys_ket)
@@ -3160,7 +3202,7 @@ def _contract_normal_complementary_boundary_cpp(
     child_bond,
     numeric_revision,
 ):
-    """Advance one NC boundary without constructing Python MPO component cores."""
+    """Advance one NC boundary without constructing Python MPOCore component cores."""
 
     if (
         parent_bond is None
@@ -3796,7 +3838,7 @@ def _contract_from_right_blocks(W, A, F_map, B, phys_slices):
             F_block = F_map.get((q_rb, q_rk))
             if F_block is None:
                 continue
-            if isinstance(W, (MPO, IrreducibleMPO, RankCoupledMPO)):
+            if isinstance(W, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
                 W_slice = W.block(q_pb, q_pk)
             else:
                 p_slice_b = phys_slices[q_pb]
@@ -4106,7 +4148,7 @@ def _precompute_two_site_block_env_transitions(
 
 def _group_mpo_blocks_by_input(W, phys_slices):
     grouped = {}
-    if isinstance(W, (MPO, IrreducibleMPO, RankCoupledMPO)):
+    if isinstance(W, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
         phys_in_sectors = getattr(W, "phys_in_sectors", None)
         phys_out_sectors = getattr(W, "phys_out_sectors", None)
         if phys_in_sectors is None:
@@ -4502,8 +4544,8 @@ def _effective_block_operator_from_parts(
     Assemble an explicit two-site effective block operator from block pieces.
 
     :param E_map: Left renormalized environment block mapping.
-    :param W1: MPO core on the left active site.
-    :param W2: MPO core on the right active site.
+    :param W1: MPOCore core on the left active site.
+    :param W2: MPOCore core on the right active site.
     :param F_map: Right renormalized environment block mapping.
     :param two_site_template: Rank-4 two-site tensor defining local sectors.
     :param basis: Explicit packed two-site basis.
@@ -4608,7 +4650,7 @@ def _build_rank_coupled_block_sparse_local_actions(
 @dataclass
 class DenseEnvironmentChain:
     """
-    Dense left/right environments for a fixed chain of site tensors and MPO cores.
+    Dense left/right environments for a fixed chain of site tensors and MPOCore cores.
     """
 
     sites: list
@@ -4620,7 +4662,7 @@ class DenseEnvironmentChain:
     @classmethod
     def build(cls, sites, mpo_factors):
         if len(sites) != len(mpo_factors):
-            raise ValueError("DenseEnvironmentChain requires one MPO core per site tensor.")
+            raise ValueError("DenseEnvironmentChain requires one MPOCore core per site tensor.")
         if len(sites) < 2:
             raise ValueError("DenseEnvironmentChain requires at least two sites.")
         sites = [normalize_site_tensor_layout(site) for site in sites]
@@ -4930,7 +4972,7 @@ class BlockSparseEnvironmentChain:
         Build block-sparse renormalized environments for a chain.
 
         :param sites: MPS site tensors.
-        :param mpo_factors: One MPO core per site.
+        :param mpo_factors: One MPOCore core per site.
         :param renormalized_blocks: Optional persistent boundary-stack owner.
         :param require_symbolic_payloads: If True, local operators must use
             symbolic boundary payloads.
@@ -4947,7 +4989,7 @@ class BlockSparseEnvironmentChain:
         """
 
         if len(sites) != len(mpo_factors):
-            raise ValueError("BlockSparseEnvironmentChain requires one MPO core per site tensor.")
+            raise ValueError("BlockSparseEnvironmentChain requires one MPOCore core per site tensor.")
         if len(sites) < 2:
             raise ValueError("BlockSparseEnvironmentChain requires at least two sites.")
         if sweep_direction is not None:
@@ -5206,7 +5248,7 @@ class BlockSparseEnvironmentChain:
         """
         Persist adjacent one-site factor tables on a boundary entry.
 
-        Factor tables depend on the boundary side and adjacent MPO core.  They
+        Factor tables depend on the boundary side and adjacent MPOCore core.  They
         are stored on the same boundary entry as the grouped side tables so the
         local effective-H builder can reuse them without rebuilding raw
         environment-map contractions.
@@ -5894,7 +5936,7 @@ def contract_chain_expectation(
     site_layouts=None,
 ):
     """
-    Contract ``<bra|MPO|sites>`` for one non-Abelian MPS chain.
+    Contract ``<bra|MPOCore|sites>`` for one non-Abelian MPS chain.
 
     Parameters
     ----------
@@ -5903,7 +5945,7 @@ def contract_chain_expectation(
     bra_sites
         Optional bra sequence. Omitting it computes an expectation value.
     mpo_factors
-        Sequence of MPO cores (dense or block-sparse ``MPO`` objects), one per
+        Sequence of MPOCore cores (dense or block-sparse ``MPOCore`` objects), one per
         site.
     moving_environment
         Optional persistent C++ owner for direct normal/complementary
@@ -5916,10 +5958,10 @@ def contract_chain_expectation(
     Returns
     -------
     complex
-        Scalar expectation value of the MPO on the provided MPS.
+        Scalar expectation value of the MPOCore on the provided MPS.
     """
     if len(sites) != len(mpo_factors):
-        raise ValueError("contract_chain_expectation requires one MPO core per site tensor.")
+        raise ValueError("contract_chain_expectation requires one MPOCore core per site tensor.")
     if not sites:
         raise ValueError("contract_chain_expectation requires at least one site tensor.")
     bra_sites = sites if bra_sites is None else list(bra_sites)
@@ -6000,3 +6042,359 @@ def contract_chain_expectation(
     ) is not None:
         return _rank_coupled_channel_expectation(env, 0)
     return _environment_map_expectation(env, rank_coupled=rank_coupled)
+
+def contract_chain_transition(bra_sites, mpo_factors, ket_sites):
+    """Contract ``<bra|MPOCore|ket>`` in the native reduced representation."""
+    if len(bra_sites) != len(ket_sites) or len(ket_sites) != len(mpo_factors):
+        raise ValueError(
+            "contract_chain_transition requires equally sized bra, MPOCore, and ket chains."
+        )
+    if not ket_sites:
+        raise ValueError("contract_chain_transition requires at least one site tensor.")
+
+    bra_sites = [normalize_site_tensor_layout(site) for site in bra_sites]
+    ket_sites = [normalize_site_tensor_layout(site) for site in ket_sites]
+    site_layouts = [_tensor_dense_layout(site) for site in ket_sites]
+    sparse_mpo_factors = _normalize_block_sparse_mpo_factors(
+        mpo_factors,
+        site_layouts=site_layouts,
+    )
+    rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
+    if rank_coupled:
+        env = _initial_left_env_blocks_rank_coupled(
+            site_layouts[0], sparse_mpo_factors[0]
+        )
+        for core, bra, ket in zip(sparse_mpo_factors, bra_sites, ket_sites):
+            env = _contract_from_left_blocks_rank_coupled(core, bra, env, ket)
+    else:
+        phys_slice_maps = [layout["sector_slices"][1] for layout in site_layouts]
+        env = _initial_left_env_blocks(site_layouts[0], sparse_mpo_factors[0])
+        for core, bra, ket, phys_slices in zip(
+            sparse_mpo_factors, bra_sites, ket_sites, phys_slice_maps
+        ):
+            env = _contract_from_left_blocks(
+                core, bra, env, ket, phys_slices
+            )
+    if rank_coupled and getattr(
+        sparse_mpo_factors[0], "normal_complementary_plan", None
+    ) is not None:
+        return _rank_coupled_channel_expectation(env, 0)
+    return _environment_map_expectation(env, rank_coupled=rank_coupled)
+
+
+@dataclass(frozen=True)
+class LocalTransitionPlan:
+    """Cached exact contraction plan for a single varying MPS site.
+
+    The fixed half of the chain is contracted once.  Each subsequent
+    ``contract`` call only absorbs the varying bra/ket tensor and the shorter
+    unfixed half.  Rank-coupled MPOCore cores remain in their reduced
+    Wigner--Eckart representation throughout.
+    """
+
+    site: int
+    sites: tuple
+    mpo_factors: tuple
+    phys_slices: tuple
+    rank_coupled: bool
+    direction: str
+    anchor: object
+
+    @classmethod
+    def build(cls, sites, mpo_factors, site, *, direction=None):
+        if len(sites) != len(mpo_factors):
+            raise ValueError(
+                "LocalTransitionPlan requires one MPOCore core per site tensor."
+            )
+        if not sites:
+            raise ValueError("LocalTransitionPlan requires a nonempty chain.")
+        site = int(site)
+        if site < 0 or site >= len(sites):
+            raise IndexError(f"Site {site} is outside a chain of length {len(sites)}.")
+
+        sites = tuple(normalize_site_tensor_layout(tensor) for tensor in sites)
+        layouts = tuple(_tensor_dense_layout(tensor) for tensor in sites)
+        factors = tuple(
+            _normalize_block_sparse_mpo_factors(
+                mpo_factors,
+                site_layouts=layouts,
+            )
+        )
+        rank_coupled = _is_rank_coupled_chain(factors)
+        phys_slices = tuple(layout["sector_slices"][1] for layout in layouts)
+
+        # Cache the longer side so a repeated local transition traverses only
+        # the shorter side of the chain.
+        if direction is None:
+            direction = "lr" if site >= len(sites) - site - 1 else "rl"
+        else:
+            direction = str(direction).lower()
+            if direction not in {"lr", "rl"}:
+                raise ValueError("LocalTransitionPlan direction must be 'lr' or 'rl'.")
+        if direction == "lr":
+            if rank_coupled:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks_rank_coupled(layouts[0], factors[0]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks(layouts[0], factors[0]),
+                    rank_coupled=False,
+                )
+            for index in range(site):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+        else:
+            direction = "rl"
+            if rank_coupled:
+                anchor = RightBlock(
+                    _initial_right_env_blocks_rank_coupled(layouts[-1], factors[-1]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = RightBlock(
+                    _initial_right_env_blocks(layouts[-1], factors[-1]),
+                    rank_coupled=False,
+                )
+            for index in range(len(sites) - 1, site, -1):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+
+        return cls(
+            site=site,
+            sites=sites,
+            mpo_factors=factors,
+            phys_slices=phys_slices,
+            rank_coupled=rank_coupled,
+            direction=direction,
+            anchor=anchor,
+        )
+
+    @property
+    def cached_sites(self):
+        if self.direction == "lr":
+            return int(self.site)
+        return int(len(self.sites) - self.site - 1)
+
+    @property
+    def traversed_sites(self):
+        return int(len(self.sites) - self.cached_sites)
+
+    def contract(self, bra_site, ket_site):
+        bra_site = normalize_site_tensor_layout(bra_site)
+        ket_site = normalize_site_tensor_layout(ket_site)
+        physical = None if self.rank_coupled else self.phys_slices[self.site]
+        env = self.anchor.advance(
+            self.mpo_factors[self.site],
+            bra_site,
+            ket_site,
+            phys_slices=physical,
+        )
+        if self.direction == "lr":
+            for index in range(self.site + 1, len(self.sites)):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=(
+                        None if self.rank_coupled else self.phys_slices[index]
+                    ),
+                )
+        else:
+            for index in range(self.site - 1, -1, -1):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=(
+                        None if self.rank_coupled else self.phys_slices[index]
+                    ),
+                )
+        if self.rank_coupled and getattr(
+            self.mpo_factors[0], "normal_complementary_plan", None
+        ) is not None:
+            return _rank_coupled_channel_expectation(
+                env.data,
+                0 if self.direction == "lr" else 1,
+            )
+        return env.expectation()
+
+
+@dataclass(frozen=True)
+class AdjacentPairTransitionPlan:
+    """Cached exact contraction plan for two adjacent varying MPS sites.
+
+    Unlike the generic merged-pair effective operator, this plan keeps the
+    intermediate reduced bond explicit.  That distinction matters whenever
+    several SU(2) fusion channels have the same four external sector labels.
+    The longer fixed side of the chain is contracted once; each call absorbs
+    the two varying tensors and only traverses the shorter fixed side.
+    """
+
+    bond: int
+    sites: tuple
+    mpo_factors: tuple
+    phys_slices: tuple
+    rank_coupled: bool
+    direction: str
+    anchor: object
+
+    @classmethod
+    def build(cls, sites, mpo_factors, bond, *, direction=None):
+        if len(sites) != len(mpo_factors):
+            raise ValueError(
+                "AdjacentPairTransitionPlan requires one MPOCore core per site tensor."
+            )
+        if len(sites) < 2:
+            raise ValueError("AdjacentPairTransitionPlan requires at least two sites.")
+        bond = int(bond)
+        if bond < 0 or bond >= len(sites) - 1:
+            raise IndexError(
+                f"Bond {bond} is outside a chain of length {len(sites)}."
+            )
+
+        sites = tuple(normalize_site_tensor_layout(tensor) for tensor in sites)
+        layouts = tuple(_tensor_dense_layout(tensor) for tensor in sites)
+        factors = tuple(
+            _normalize_block_sparse_mpo_factors(
+                mpo_factors,
+                site_layouts=layouts,
+            )
+        )
+        rank_coupled = _is_rank_coupled_chain(factors)
+        phys_slices = tuple(layout["sector_slices"][1] for layout in layouts)
+
+        left_fixed = bond
+        right_fixed = len(sites) - bond - 2
+        if direction is None:
+            direction = "lr" if left_fixed >= right_fixed else "rl"
+        else:
+            direction = str(direction).lower()
+            if direction not in {"lr", "rl"}:
+                raise ValueError(
+                    "AdjacentPairTransitionPlan direction must be 'lr' or 'rl'."
+                )
+
+        if direction == "lr":
+            if rank_coupled:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks_rank_coupled(layouts[0], factors[0]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = LeftBlock(
+                    _initial_left_env_blocks(layouts[0], factors[0]),
+                    rank_coupled=False,
+                )
+            for index in range(bond):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+        else:
+            if rank_coupled:
+                anchor = RightBlock(
+                    _initial_right_env_blocks_rank_coupled(layouts[-1], factors[-1]),
+                    rank_coupled=True,
+                )
+            else:
+                anchor = RightBlock(
+                    _initial_right_env_blocks(layouts[-1], factors[-1]),
+                    rank_coupled=False,
+                )
+            for index in range(len(sites) - 1, bond + 1, -1):
+                anchor = anchor.advance(
+                    factors[index],
+                    sites[index],
+                    sites[index],
+                    phys_slices=None if rank_coupled else phys_slices[index],
+                )
+
+        return cls(
+            bond=bond,
+            sites=sites,
+            mpo_factors=factors,
+            phys_slices=phys_slices,
+            rank_coupled=rank_coupled,
+            direction=direction,
+            anchor=anchor,
+        )
+
+    @property
+    def cached_sites(self):
+        if self.direction == "lr":
+            return int(self.bond)
+        return int(len(self.sites) - self.bond - 2)
+
+    @property
+    def traversed_sites(self):
+        return int(len(self.sites) - self.cached_sites)
+
+    def contract(self, bra_left, bra_right, ket_left, ket_right):
+        bra_left = normalize_site_tensor_layout(bra_left)
+        bra_right = normalize_site_tensor_layout(bra_right)
+        ket_left = normalize_site_tensor_layout(ket_left)
+        ket_right = normalize_site_tensor_layout(ket_right)
+        physical = lambda index: (
+            None if self.rank_coupled else self.phys_slices[index]
+        )
+
+        if self.direction == "lr":
+            env = self.anchor.advance(
+                self.mpo_factors[self.bond],
+                bra_left,
+                ket_left,
+                phys_slices=physical(self.bond),
+            )
+            env = env.advance(
+                self.mpo_factors[self.bond + 1],
+                bra_right,
+                ket_right,
+                phys_slices=physical(self.bond + 1),
+            )
+            for index in range(self.bond + 2, len(self.sites)):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=physical(index),
+                )
+        else:
+            env = self.anchor.advance(
+                self.mpo_factors[self.bond + 1],
+                bra_right,
+                ket_right,
+                phys_slices=physical(self.bond + 1),
+            )
+            env = env.advance(
+                self.mpo_factors[self.bond],
+                bra_left,
+                ket_left,
+                phys_slices=physical(self.bond),
+            )
+            for index in range(self.bond - 1, -1, -1):
+                env = env.advance(
+                    self.mpo_factors[index],
+                    self.sites[index],
+                    self.sites[index],
+                    phys_slices=physical(index),
+                )
+        if self.rank_coupled and getattr(
+            self.mpo_factors[0], "normal_complementary_plan", None
+        ) is not None:
+            return _rank_coupled_channel_expectation(
+                env.data,
+                0 if self.direction == "lr" else 1,
+            )
+        return env.expectation()

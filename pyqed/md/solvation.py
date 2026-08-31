@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from pyqed.units import au2angstrom
+from pyqed.units import AVOGADRO_CONSTANT, au2angstrom
 
 from .atoms import Atoms
 from .calculators import MM
@@ -11,7 +11,7 @@ from .topology import Topology, combine_topologies
 from .water import TIP3P_COULOMB_CONSTANT, TIP3P_HOH_ANGLE, TIP3P_OH_DISTANCE, tip3p_waters
 
 WATER_MOLAR_MASS = 18.01528
-AVOGADRO = 6.02214076e23
+AVOGADRO = AVOGADRO_CONSTANT
 ANGSTROM3_PER_CM3 = 1.0e24
 
 

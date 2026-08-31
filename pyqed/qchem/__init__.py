@@ -180,15 +180,22 @@ except (ImportError, OSError):
     gaussian_pulse = None
 
 try:
+    from .letta import LETTA
+except (ImportError, OSError):
+    LETTA = None
+
+try:
     from .dmrg.overlap import overlap as dmrg_overlap
     from .dmrg.overlap import unitary_overlap as dmrg_unitary_overlap
     from .dmrg.overlap import biorthogonal_overlap as dmrg_biorthogonal_overlap
+    from .dmrg.overlap import su2_biorthogonal_overlap as dmrg_su2_biorthogonal_overlap
     from .dmrg.overlap import biorthogonal_overlap_diagnostics as dmrg_biorthogonal_overlap_diagnostics
     from .dmrg.overlap import automatic_overlap as dmrg_automatic_overlap
 except (ImportError, OSError):
     dmrg_overlap = None
     dmrg_unitary_overlap = None
     dmrg_biorthogonal_overlap = None
+    dmrg_su2_biorthogonal_overlap = None
     dmrg_biorthogonal_overlap_diagnostics = None
     dmrg_automatic_overlap = None
 
@@ -219,10 +226,18 @@ except (ImportError, OSError):
     NEVPT2Component = None
 
 try:
-    from .mcscf.caspt2 import CASPT2, DiagonalCASPT2, CASPT2Component
+    from .mcscf.caspt2 import (
+        CASPT2,
+        DiagonalCASPT2,
+        MSCASPT2,
+        XMSCASPT2,
+        CASPT2Component,
+    )
 except (ImportError, OSError):
     CASPT2 = None
     DiagonalCASPT2 = None
+    MSCASPT2 = None
+    XMSCASPT2 = None
     CASPT2Component = None
 
 try:
@@ -275,8 +290,16 @@ except (ImportError, OSError):
 try:
     from pyqed.narg.qchem import NARGOpt, NARGSCF
 except (ImportError, OSError):
-    NARGOpt = None
-    NARGSCF = None
+    pass
+
+
+def __getattr__(name):
+    if name in {"NARGOpt", "NARGSCF"}:
+        from pyqed.narg.qchem import NARGOpt, NARGSCF
+
+        globals().update(NARGOpt=NARGOpt, NARGSCF=NARGSCF)
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 try:
     from .mcscf.soc_si import (

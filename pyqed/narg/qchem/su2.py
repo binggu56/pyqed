@@ -12,6 +12,7 @@ from .su2_chain import (
     diagonalize_block,
     run_su2_narg_chain,
 )
+from .su2_backend import resolve_su2_narg_backend
 from .su2_rdm import build_su2_rdms
 from .su2_two_site import AdaptiveD
 
@@ -35,7 +36,39 @@ def _normalize_su2_orbital_blocks(orbital_blocks, nsites, active_space=None):
 
 
 class NARG:
-    """Object API for the direct-reduced SU(2) quantum-chemistry NARG driver."""
+    """Object API for the direct-reduced SU(2) quantum-chemistry NARG driver.
+
+    ``threads`` controls compiled OpenMP work inside each sequential orbital
+    growth step.  Independent reduced-operator blocks are projected in
+    parallel when the compiled backend is available.
+
+    ``dressing="future_cc"`` is an experimental, linearized
+    Feshbach/Löwdin-inspired adaptation rather than a reproduction of a
+    standard coupled-cluster method.  It builds a scalar importance metric
+    from reduced couplings to future orbitals and solves a matrix-free
+    discarded-multiplet response at each truncation.  It preserves U(1) x
+    SU(2), but it is not size-extensive and does not include nonlinear CC
+    amplitudes or a self-consistent environment resolvent.
+
+    ``dressing="detached_frames"`` forms a separate auxiliary frame for every
+    conditional label and old-block ``(Ne, 2S)`` multiplicity sector, with
+    different frames mutually orthogonal.  Every physical local branch is
+    combined with every symmetry-compatible conditional frame.  The regular
+    ``D``-multiplet space is retained as a protected core, while
+    ``frame_protect_dim`` can additionally protect low conditional roots per
+    branch.  The chain is initialized by exact reduced-sector diagonalization
+    through ``n0`` orbitals.  It then carries a rolling boundary parent space,
+    combines the exposed old and new local labels, and selects the next
+    ``D``-multiplet target space.  ``chi`` bounds that parent space and defaults
+    to the determinant-space count ``16 * D``.  After the exact seed, the
+    parent is used only through Hamiltonian applications to tall tensors.
+    Conditional and terminal subspaces are optimized by projected block
+    iteration whose Rayleigh eigendecompositions have order at most ``D``;
+    no enlarged ``chi`` or ``16 * D`` Ritz matrix is diagonalized.  This is a
+    reduced-sector adaptation of detached conditional NARG, not a determinant
+    projection.
+
+    """
 
     DEFAULT_OPTIONS = {
         "D": 80,
@@ -52,12 +85,27 @@ class NARG:
         "return_spin": False,
         "variational": False,
         "project_growth_hamiltonian": None,
-        "project_v1_packages": False,
+        "project_v1_packages": True,
         "carry_rdm_operators": True,
         "carry_spin_rdm_operators": False,
         "su2_backend": "auto",
+        "threads": 1,
         "low_rank_eri": None,
         "recursive_response_workers": 1,
+        "dressing": None,
+        "future_cc_level_shift": 0.1,
+        "future_cc_response_tol": 1.0e-10,
+        "future_cc_max_responses": None,
+        "future_cc_strength": 0.1,
+        "chi": None,
+        "n0": None,
+        "frame_adapt_tol": None,
+        "frame_max_dim": None,
+        "frame_expand_dim": 1,
+        "frame_protect_dim": None,
+        "cc_level_shift": 0.0,
+        "cc_response_tol": 1.0e-10,
+        "cc_max_responses": None,
         "orbital_blocks": None,
         **CAS_OPTION_DEFAULTS,
     }
@@ -88,6 +136,9 @@ class NARG:
         self.orbital_order = None
         self.local_dims = None
         self.cluster_order_trials = None
+        self.backend = None
+        self.n0 = None
+        self.chi = None
         self._rdm_builders = {}
 
     def integrals(self):
@@ -270,6 +321,8 @@ class NARG:
             "su2_backend",
             opts.pop("backend", self.DEFAULT_OPTIONS["su2_backend"]),
         )
+        threads = int(opts.pop("threads", self.DEFAULT_OPTIONS["threads"]))
+        backend = resolve_su2_narg_backend(su2_backend, threads=threads)
         low_rank_eri = opts.pop("low_rank_eri", self.DEFAULT_OPTIONS["low_rank_eri"])
         recursive_response_workers = int(
             opts.pop(
@@ -299,6 +352,69 @@ class NARG:
             )
         )
         carry_rdm = carry_rdm or carry_spin_rdm
+        dressing = opts.pop("dressing", self.DEFAULT_OPTIONS["dressing"])
+        future_cc_level_shift = float(
+            opts.pop(
+                "future_cc_level_shift",
+                self.DEFAULT_OPTIONS["future_cc_level_shift"],
+            )
+        )
+        future_cc_response_tol = float(
+            opts.pop(
+                "future_cc_response_tol",
+                self.DEFAULT_OPTIONS["future_cc_response_tol"],
+            )
+        )
+        future_cc_max_responses = opts.pop(
+            "future_cc_max_responses",
+            self.DEFAULT_OPTIONS["future_cc_max_responses"],
+        )
+        future_cc_strength = float(
+            opts.pop(
+                "future_cc_strength",
+                self.DEFAULT_OPTIONS["future_cc_strength"],
+            )
+        )
+        chi = opts.pop("chi", self.DEFAULT_OPTIONS["chi"])
+        if chi is not None:
+            chi = int(chi)
+        n0 = opts.pop("n0", self.DEFAULT_OPTIONS["n0"])
+        if n0 is not None:
+            n0 = int(n0)
+        frame_adapt_tol = opts.pop(
+            "frame_adapt_tol",
+            self.DEFAULT_OPTIONS["frame_adapt_tol"],
+        )
+        if frame_adapt_tol is not None:
+            frame_adapt_tol = float(frame_adapt_tol)
+        frame_max_dim = opts.pop(
+            "frame_max_dim",
+            self.DEFAULT_OPTIONS["frame_max_dim"],
+        )
+        if frame_max_dim is not None:
+            frame_max_dim = int(frame_max_dim)
+        frame_expand_dim = int(
+            opts.pop(
+                "frame_expand_dim",
+                self.DEFAULT_OPTIONS["frame_expand_dim"],
+            )
+        )
+        frame_protect_dim = opts.pop(
+            "frame_protect_dim",
+            self.DEFAULT_OPTIONS["frame_protect_dim"],
+        )
+        if frame_protect_dim is not None:
+            frame_protect_dim = int(frame_protect_dim)
+        cc_level_shift = float(
+            opts.pop("cc_level_shift", self.DEFAULT_OPTIONS["cc_level_shift"])
+        )
+        cc_response_tol = float(
+            opts.pop("cc_response_tol", self.DEFAULT_OPTIONS["cc_response_tol"])
+        )
+        cc_max_responses = opts.pop(
+            "cc_max_responses",
+            self.DEFAULT_OPTIONS["cc_max_responses"],
+        )
         if opts:
             unknown = ", ".join(sorted(opts))
             raise TypeError(f"Unknown SU2-NARG options: {unknown}")
@@ -310,13 +426,27 @@ class NARG:
             final_size=final_size,
             target_nelec=target_nelec,
             target_j2=target_j2,
-            backend=su2_backend,
+            backend=backend,
             low_rank_eri=low_rank_eri,
             build_branch_basis=variational,
             project_growth_hamiltonian=project_growth,
             project_v1_packages=effective_project_v1,
             carry_rdm_operators=carry_rdm,
             carry_spin_rdm_operators=carry_spin_rdm,
+            dressing=dressing,
+            future_cc_level_shift=future_cc_level_shift,
+            future_cc_response_tol=future_cc_response_tol,
+            future_cc_max_responses=future_cc_max_responses,
+            future_cc_strength=future_cc_strength,
+            chi=chi,
+            n0=n0,
+            frame_adapt_tol=frame_adapt_tol,
+            frame_max_dim=frame_max_dim,
+            frame_expand_dim=frame_expand_dim,
+            frame_protect_dim=frame_protect_dim,
+            cc_level_shift=cc_level_shift,
+            cc_response_tol=cc_response_tol,
+            cc_max_responses=cc_max_responses,
             cluster_boundaries=cluster_boundaries,
         )
         roots, vectors, block = diagonalize_block(
@@ -324,7 +454,7 @@ class NARG:
             nelec=target_nelec,
             j2=target_j2,
             nroots=nstates,
-            backend=su2_backend,
+            backend=backend,
             return_vectors=True,
         )
         enuc = self.mol.energy_nuc() if self.mol is not None else 0.0
@@ -340,6 +470,11 @@ class NARG:
         self.timings["project_v1_packages_requested"] = project_v1
         self.timings["carry_rdm_operators"] = carry_rdm
         self.timings["carry_spin_rdm_operators"] = carry_spin_rdm
+        self.n0 = self.chain.timings.get("n0")
+        self.chi = self.chain.timings.get("chi")
+        self.backend = backend.summary()
+        self.timings["backend"] = self.backend
+        self.timings["threads"] = int(backend.threads)
         self.recursive_response_workers = max(1, int(recursive_response_workers))
         self.timings["recursive_response_workers"] = self.recursive_response_workers
         self.timings["orbital_blocks"] = self.orbital_blocks
@@ -363,6 +498,143 @@ class NARG:
             raise IndexError(f"state_id={state_id} is outside the available roots")
         nelec, j2 = self.target_irrep
         return self.root_vectors[:, state_id], int(nelec), int(j2)
+
+    def overlap(
+        self,
+        other,
+        *,
+        ao_overlap=None,
+        mo_overlap=None,
+        bra_state_ids=None,
+        ket_state_ids=None,
+        backend="recursive",
+        orbital_split="auto",
+        split_condition_limit=1.0e8,
+        orbital_map_threshold=0.0,
+        cutoff=1.0e-10,
+        max_bond="auto",
+        discarded_weight_budget=1.0e-6,
+        adaptive_max_bond=8192,
+        return_info=False,
+    ):
+        """Return cross-calculation overlaps between SU(2)-NARG roots.
+
+        The selected roots share one fully reduced SU(2) MPS and remain as an
+        open terminal boundary. Nonorthogonal orbital sets are connected by at
+        most one Malmqvist/Knecht biorthogonal circuit per calculation, after
+        which one reduced environment contraction returns the complete
+        root-overlap matrix. ``orbital_split='auto'`` may put the full map on
+        the cheaper side. A positive ``orbital_map_threshold`` exposes
+        independent contiguous graph blocks and reports the resulting map
+        residual. This is an adaptation to NARG conditional tensors; no
+        determinant amplitudes are reconstructed. ``max_bond='adaptive'``
+        distributes ``discarded_weight_budget`` across the orbital circuit and
+        chooses the smallest reduced rank satisfying each gate's allocation,
+        subject to ``adaptive_max_bond``.
+
+        References: P.-A. Malmqvist, Int. J. Quantum Chem. 30, 479 (1986),
+        https://doi.org/10.1002/qua.560300404; S. Knecht et al., J. Chem.
+        Theory Comput. 12, 5881 (2016), https://doi.org/10.1021/acs.jctc.6b00889.
+        """
+        if str(backend).lower().replace("-", "_") not in {
+            "recursive",
+            "recursive_su2",
+            "su2",
+        }:
+            raise ValueError("SU2-NARG overlap backend must be 'recursive'.")
+        from .su2_overlap import su2_narg_overlap
+
+        return su2_narg_overlap(
+            self,
+            other,
+            ao_overlap=ao_overlap,
+            mo_overlap=mo_overlap,
+            bra_state_ids=bra_state_ids,
+            ket_state_ids=ket_state_ids,
+            orbital_split=orbital_split,
+            split_condition_limit=split_condition_limit,
+            orbital_map_threshold=orbital_map_threshold,
+            cutoff=cutoff,
+            max_bond=max_bond,
+            discarded_weight_budget=discarded_weight_budget,
+            adaptive_max_bond=adaptive_max_bond,
+            return_info=return_info,
+        )
+
+    def parallel_transport_orbitals(
+        self,
+        target_mf,
+        *,
+        mo_coeff=None,
+        ao_overlap=None,
+        method="polar",
+        transport_core=True,
+        return_info=False,
+    ):
+        """Align target core/active MOs to this completed NARG reference.
+
+        The polar option uses unitary Procrustes transport; ``method='match'``
+        preserves localization by restricting the gauge to permutations and
+        phases. The returned coefficients are intended for the next NARG run.
+        """
+        from .su2_overlap import parallel_transport_narg_orbitals
+
+        return parallel_transport_narg_orbitals(
+            self,
+            target_mf,
+            mo_coeff=mo_coeff,
+            ao_overlap=ao_overlap,
+            method=method,
+            transport_core=transport_core,
+            return_info=return_info,
+        )
+
+    @classmethod
+    def from_parallel_transport(
+        cls,
+        reference,
+        target_mf,
+        *,
+        transport_method="polar",
+        ao_overlap=None,
+        mo_coeff=None,
+        transport_core=True,
+        return_info=False,
+        **options,
+    ):
+        """Construct the next SU(2)-NARG driver in a transported orbital gauge."""
+        aligned, info = reference.parallel_transport_orbitals(
+            target_mf,
+            mo_coeff=mo_coeff,
+            ao_overlap=ao_overlap,
+            method=transport_method,
+            transport_core=transport_core,
+            return_info=True,
+        )
+        solver = cls(target_mf, mo_coeff=aligned, **options)
+        solver.parallel_transport_info = info
+        return (solver, info) if return_info else solver
+
+    def overlap_orbital_order(
+        self,
+        other,
+        *,
+        ao_overlap=None,
+        mo_overlap=None,
+        exact_limit=18,
+        return_info=False,
+    ):
+        """Suggest a common chain order minimizing overlap-graph cut cost."""
+        from .su2_overlap import narg_overlap_orbital_order
+
+        return narg_overlap_orbital_order(
+            self,
+            other,
+            ao_overlap=ao_overlap,
+            mo_overlap=mo_overlap,
+            exact_limit=exact_limit,
+            return_info=return_info,
+        )
 
     def _rdm_builder(self, state_id=0):
         vector, nelec, j2 = self._require_rdm_state(state_id)
@@ -623,6 +895,7 @@ class NARG:
                 target_j2=target_j2,
                 orbital_blocks=blocks,
                 su2_backend=self.options.get("su2_backend", "auto"),
+                threads=self.options.get("threads", 1),
                 low_rank_eri=self.options.get("low_rank_eri"),
                 carry_rdm_operators=True,
                 carry_spin_rdm_operators=False,

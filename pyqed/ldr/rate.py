@@ -6,7 +6,7 @@ from surfreact import utils as ut
 import csv
 
 
-from pyqed.ldr.ldr import 
+from pyqed.dvr import kinetic
 
 class Rate:
     """
@@ -174,4 +174,3 @@ if __name__ == '__main__':
         writer = csv.writer(file)
         for value in Cff_t:
             writer.writerow([value])
-

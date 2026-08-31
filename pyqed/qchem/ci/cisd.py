@@ -1305,10 +1305,9 @@ def overlap(cibra, ciket, s=None):
 
     # overlap matrix between MOs at different geometries
     if s is None:
+        from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 
-        from gbasis.integrals.overlap_asymm import overlap_integral_asymmetric
-
-        s = overlap_integral_asymmetric(cibra.mol._bas, ciket.mol._bas)
+        s = _cross_ao_overlap_matrix(cibra.mol, ciket.mol)
         s = reduce(np.dot, (cibra.mf.mo_coeff.T, s, ciket.mf.mo_coeff))
 
 

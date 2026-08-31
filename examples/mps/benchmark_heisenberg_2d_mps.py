@@ -13,7 +13,7 @@ import numpy as np
 from examples.mps.frontier_tied_letta_j1j2_all_nn import (
     heisenberg_local_hamiltonian,
 )
-from pyqed.mps import DMRG, MPS, MPO
+from pyqed.mps import DMRG, MPS
 
 
 def lattice_order(rows: int, cols: int, ordering: str) -> tuple[int, ...]:
@@ -97,7 +97,7 @@ def run_benchmark(
     hamiltonian = heisenberg_local_hamiltonian(
         nsites, tuple((left, right, 1.0) for left, right in bonds)
     )
-    mpo = MPO(list(hamiltonian.to_mpo().compress().tensors))
+    mpo = hamiltonian.to_mpo().compress()
     state = None
     records = []
     for bond_dim in bond_dims:
@@ -132,12 +132,12 @@ def run_benchmark(
             else None
         )
         stored_parameters = int(
-            sum(np.asarray(factor).size for factor in solver.ground_state.factors)
+            sum(np.asarray(factor).size for factor in solver.state.factors)
         )
         record = {
             "bond_dim": bond_dim,
-            "energy": float(solver.e_tot),
-            "energy_per_site": float(solver.e_tot) / nsites,
+            "energy": float(solver.energy),
+            "energy_per_site": float(solver.energy) / nsites,
             "final_delta_energy": delta,
             "directional_passes": len(history),
             "stored_parameters": stored_parameters,
@@ -151,7 +151,7 @@ def run_benchmark(
             f"parameters={stored_parameters} time={elapsed:.3f}s",
             flush=True,
         )
-        state = solver.ground_state.copy()
+        state = solver.state.copy()
     return {
         "model": "open spin-1/2 nearest-neighbor Heisenberg",
         "rows": rows,

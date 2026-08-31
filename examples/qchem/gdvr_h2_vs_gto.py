@@ -181,7 +181,7 @@ def gto_tdhf_roots(mf, nstates):
 
 def build_pyqed_gto_reference(bond, basis):
     mol = PyQEDMolecule(atom=h2_atom_string(bond), unit="bohr", basis=basis)
-    mol.build(driver="gbasis")
+    mol.build()
     return PyQEDRHF(mol).run()
 
 

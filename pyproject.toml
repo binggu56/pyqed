@@ -3,6 +3,8 @@ requires = [
     "setuptools>=77",
     "wheel",
     "numpy>=2.0",
+    "scipy>=1.13",
+    "Cython>=3.1,<3.3",
 ]
 build-backend = "setuptools.build_meta"
 
@@ -48,7 +50,6 @@ dependencies = [
 [project.optional-dependencies]
 analysis = [
     "matplotlib>=3.8",
-    "qc-gbasis>=0.1",
 ]
 accelerators = [
     "numba>=0.59",
@@ -59,10 +60,18 @@ md = [
     "h5py>=3.10",
     "openmm>=8.1",
 ]
+mace = [
+    "ase>=3.23",
+    "mace-torch>=0.3.13",
+]
 ml = [
     "jax>=0.4.26",
     "scikit-learn>=1.4",
     "tensorly>=0.8",
+    "tntorch>=1.1.2",
+    "torch>=2.2",
+]
+torch = [
     "torch>=2.2",
 ]
 plot = [
@@ -81,6 +90,9 @@ docs = [
 ]
 test = [
     "build>=1.2",
+    "matplotlib>=3.8",
+    "numba>=0.59",
+    "pyscf>=2.5",
     "pytest>=8",
     "twine>=5",
 ]
@@ -110,16 +122,22 @@ include = ["pyqed*"]
 namespaces = false
 
 [tool.setuptools.package-data]
+"pyqed" = ["*.hpp"]
 "pyqed.qchem" = [
+    "*.hpp",
     "H2/*.in",
     "basis_set/*.gbs",
     "basis_set/*.txt",
 ]
 "pyqed.narg.qchem" = ["su2_native.cpp"]
-"pyqed.mps.nonabelian" = ["su2_coupling_core.hpp"]
+"pyqed.mps" = ["*.hpp"]
+"pyqed.mps.nonabelian" = ["*.hpp"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "qchem: opt-in tests that run live electronic-structure calculations",
+]
 addopts = [
     "--strict-config",
     "--strict-markers",

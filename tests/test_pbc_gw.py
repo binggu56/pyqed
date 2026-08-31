@@ -1,18 +1,31 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
+from pyqed.units import au2ev
 from pyqed.pbc.gw import (
     FULL_EWALD,
+    ExcitonPhononChannel,
+    ExcitonPhononContinuum,
+    ExcitonPhononCoupling,
+    PeriodicTDAElectronPhononDerivative,
     PeriodicBSEHaydockResult,
     PeriodicBSEOpticalResult,
     PeriodicTDAOperator,
+    ProjectedTDAContinuum,
+    TotalMomentumSector,
     DiagonalSelfEnergyCache,
     GammaPBCSCFAdapter,
     GDF,
     attach_pyscf_gdf_context,
+    analytic_tda_electron_phonon_coupling,
+    commensurate_tda_electron_phonon_coupling,
+    gdf_mo_jk,
     gdf_orbital_pair_coupling,
     gdf_transition_factors,
     gdf_transition_metric,
+    gamma_tda_electron_phonon_coupling,
     KBSE,
     KGW,
     KPointSCFAdapter,
@@ -62,6 +75,7 @@ from pyqed.pbc.gw.self_energy import (
 from pyqed.pbc.gw.integrals import (
     _gdf_gaussian_ft_batch,
     _gdf_image_keys,
+    _gdf_metric_invsqrt,
     _pyscf_cell_from_reference,
 )
 from pyqed.qchem.basis import (
@@ -88,6 +102,124 @@ from pyqed.qchem.pbc.ewald import (
     short_range_two_center_coulomb,
 )
 from pyqed.qchem.pbc.hf.ewald_rhf import _shifted_gaussian
+
+
+def test_documented_pbc_h2_gw_bse_workflow_runs(tmp_path):
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "pbc_h2_gw_bse.json"
+    figure = tmp_path / "pbc_h2_gw_bse.pdf"
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=str(root),
+        MPLCONFIGDIR=str(tmp_path / "matplotlib"),
+        OPENBLAS_NUM_THREADS="1",
+        OMP_NUM_THREADS="1",
+        VECLIB_MAXIMUM_THREADS="1",
+        NUMEXPR_NUM_THREADS="1",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "examples" / "pbc_h2_gw_bse.py"),
+            "--nroots",
+            "1",
+            "--output",
+            str(output),
+            "--figure",
+            str(figure),
+        ],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    payload = json.loads(output.read_text())
+
+    assert payload["krhf_converged"]
+    assert payload["gw_converged"]
+    assert payload["resolved_bse_roots"] == 1
+    assert len(payload["tda_energy_Ha"]) == 1
+    assert len(payload["bse_energy_Ha"]) == 1
+    assert payload["gdf_factor_memory_bytes"] > 0
+    assert payload["gw_cache_sizes"]["screened_interactions"] > 0
+    assert figure.exists()
+    assert figure.with_suffix(".png").exists()
+    assert "Fundamental gap" in completed.stdout
+
+
+def test_documented_pbc_lih_gw_pes_workflow_runs(tmp_path):
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    output = tmp_path / "pbc_lih_gw_pes.json"
+    figure = tmp_path / "pbc_lih_gw_pes.pdf"
+    env = dict(os.environ)
+    env.update(
+        PYTHONPATH=str(root),
+        MPLCONFIGDIR=str(tmp_path / "matplotlib"),
+        OPENBLAS_NUM_THREADS="1",
+        OMP_NUM_THREADS="1",
+        VECLIB_MAXIMUM_THREADS="1",
+        NUMEXPR_NUM_THREADS="1",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(root / "examples" / "pbc_lih_gw_pes.py"),
+            "--precision",
+            "1e-6",
+            "--npoints",
+            "81",
+            "--output",
+            str(output),
+            "--figure",
+            str(figure),
+        ],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    payload = json.loads(output.read_text())
+    data = np.load(output.with_suffix(".npz"))
+
+    assert payload["system"] == "rocksalt LiH"
+    assert payload["kmesh"] == [1, 1, 1]
+    assert payload["krhf_converged"]
+    assert payload["gw_converged"]
+    assert payload["gdf_factor_memory_bytes"] > 0
+    assert payload["gdf_stream_pair_batch_mb"] == 128.0
+    assert payload["gdf_stream_pair_batch_size"] is None
+    assert payload["gdf_build_timings"]["0"][
+        "stream_pair_batch_pair_counts"
+    ] == [1]
+    assert payload["gw_cache_sizes"]["screened_interactions"] == 1
+    assert len(payload["spectral_targets"]) > 0
+    np.testing.assert_allclose(payload["binding_range_eV"], [0.0, 10.0])
+    assert output.with_suffix(".csv").exists()
+    assert figure.exists()
+    assert figure.with_suffix(".png").exists()
+    assert data["binding_energy_eV"].shape == (81,)
+    assert data["detector_photoemission_signal"].shape == (81,)
+    assert np.all(np.isfinite(data["detector_photoemission_signal"]))
+    assert float(np.max(data["detector_photoemission_signal"])) > 0.0
+    assert "PES peaks in 0-10 eV" in completed.stdout
 
 
 def _assert_primitive_term_image_groups(primitive_terms, npair):
@@ -394,6 +526,36 @@ def test_gamma_pbc_adapter_rejects_true_kpoint_reference():
 
     with pytest.raises(NotImplementedError, match="Gamma-only"):
         GammaPBCSCFAdapter(mf)
+
+
+def test_gamma_centered_mesh_contains_gamma_and_is_closed():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 6.0, 7.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    kpts = cell.make_kpts((2, 3, 2), gamma_centered=True)
+    gamma = np.flatnonzero(np.linalg.norm(kpts, axis=1) < 1.0e-12)
+    np.testing.assert_array_equal(gamma, [0])
+    shifted = cell.make_kpts((2, 3, 2))
+    assert np.min(np.linalg.norm(shifted, axis=1)) > 1.0e-12
+
+    mf = SimpleNamespace(
+        cell=cell,
+        kpts=kpts,
+        mo_energy=[np.asarray([-0.5, 0.5]) for _ in kpts],
+        mo_coeff=[np.eye(cell.nao) for _ in kpts],
+        mo_occ=[np.asarray([2.0, 0.0]) for _ in kpts],
+    )
+    ref = KPointSCFAdapter(mf)
+    qpts = ref.qpoint_mesh()
+    assert len(qpts) == len(kpts)
+    for kpt in kpts:
+        for qpt in qpts:
+            ref.find_kpoint_index(kpt - qpt)
 
 
 def test_kpoint_scf_adapter_normalizes_multi_k_reference(two_k_h2_reference):
@@ -996,7 +1158,7 @@ def test_gdf_direct_tdh_uses_auxiliary_basis_factors(two_k_h2_reference):
     )
 
     assert factors.coulomb_component == GDF
-    assert factors.factor_method == "periodic_auxiliary_gdf"
+    assert factors.factor_method == "periodic_auxiliary_gdf:range_separated"
     assert factors.auxbasis
     assert factors.aux_coord_type == "spherical"
     assert factors.naux_cart >= len(factors.metric_eigenvalues)
@@ -1050,6 +1212,27 @@ def test_gdf_mo_pair_block_applies_complex_metric_invsqrt_hermitianly():
     )
     np.testing.assert_allclose(batch[0], block, atol=1.0e-12)
     np.testing.assert_allclose(batch[1], 2.0 * block, atol=1.0e-12)
+
+
+def test_gdf_metric_invsqrt_keeps_numerically_real_auxiliary_gauge():
+    metric = np.asarray(
+        [
+            [2.0, 0.4 + 1.0e-15j],
+            [0.4 - 1.0e-15j, 1.5],
+        ],
+        dtype=np.complex128,
+    )
+
+    metric_invsqrt, _evals = _gdf_metric_invsqrt(
+        metric, 1.0e-14, "test-aux"
+    )
+
+    assert np.count_nonzero(metric_invsqrt.imag) == 0
+    np.testing.assert_allclose(
+        metric_invsqrt @ metric_invsqrt.T,
+        np.linalg.inv(metric.real),
+        atol=1.0e-12,
+    )
 
 
 def test_gdf_q_ao_store_reuses_blocks_when_mo_cache_is_cleared(two_k_h2_reference):
@@ -1163,6 +1346,7 @@ def test_prebuild_gdf_q_ao_stores_auto_weighted_aux_screen_streams(two_k_h2_refe
     mf.gdf_recip_cut = 2
     mf.gdf_mesh = (5, 5, 5)
     mf.gdf_precision = 1.0e-4
+    mf.gdf_reciprocal_kernel = "full"
     mf.gdf_pair_ft_screen_tol = 0.0
     if hasattr(mf, "gdf_g_block_size"):
         del mf.gdf_g_block_size
@@ -1211,6 +1395,67 @@ def test_prebuild_gdf_q_ao_stores_can_use_workers(two_k_h2_reference):
         )
 
 
+def test_prebuild_gdf_q_ao_stores_shares_short_range_across_q(
+    two_k_h2_reference,
+):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache, _pair_keys_for_q
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_pair_cut = 0
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_pair_ft_screen_tol = 0.0
+    mf.gdf_short_range_workers = 2
+    mf.gdf_pair_ft_workers = 2
+    mf._periodic_setup()
+    space = KPointTransitionSpace(mf, qpts="mesh")
+
+    summaries = prebuild_gdf_q_ao_stores(
+        space,
+        g2_tol=1.0e-14,
+        workers=2,
+    )
+    timings = [row["timings"] for row in summaries]
+
+    assert len(summaries) == 2
+    assert all(row["multi_q_short_range_prebuild"] for row in timings)
+    assert all(row["multi_q_short_range_qpoints"] == 2 for row in timings)
+    assert all(row["multi_q_short_range_inner_workers"] == 2 for row in timings)
+    assert all(row["multi_q_short_range_outer_workers"] == 1 for row in timings)
+    assert all(row["prebuild_requested_workers"] == 2 for row in timings)
+    assert all(row["prebuild_workers"] == 1 for row in timings)
+    assert all(row["prebuild_parallel"] is False for row in timings)
+    shared = [row["multi_q_short_range_shared_seconds"] for row in timings]
+    assert sum(value > 0.0 for value in shared) == 1
+    owner = timings[int(np.argmax(shared))]
+    assert owner["multi_q_short_range_shared_timings"][
+        "three_center_sr_bloch_batch_qpoints"
+    ] == 2
+    assert owner["multi_q_short_range_shared_timings"][
+        "aux_metric_short_range_qpoints"
+    ] == 2
+    assert owner["multi_q_short_range_shared_timings"][
+        "unconsumed_pair_blocks"
+    ] == 0
+    assert owner["multi_q_short_range_shared_timings"][
+        "unconsumed_metric_blocks"
+    ] == 0
+    assert owner["multi_q_short_range_shared_timings"][
+        "stream_pair_workspace_within_budget"
+    ] is True
+    assert all(row["aux_metric_sr_cache_consumes"] == 1 for row in timings)
+    assert not _gdf_mf_cache(mf, "three_center_ao_short_range")
+    assert not _gdf_mf_cache(mf, "aux_metric_short_range")
+    for summary in summaries:
+        assert summary["pair_blocks"] == len(
+            list(_pair_keys_for_q(space, summary["q_index"]))
+        )
+
+
 def test_gdf_default_prebuild_workers_scales_on_many_core_hosts(monkeypatch):
     from pyqed.pbc.gw import integrals
 
@@ -1219,7 +1464,9 @@ def test_gdf_default_prebuild_workers_scales_on_many_core_hosts(monkeypatch):
     assert integrals._gdf_default_prebuild_workers() == 6
 
 
-def test_prebuild_gdf_q_ao_store_does_not_reuse_self_opposite_q(two_k_h2_reference):
+def test_prebuild_gdf_q_ao_store_reuses_self_opposite_pair_blocks(
+    two_k_h2_reference,
+):
     from pyqed.pbc.gw.integrals import _gdf_opposite_q_index, _pair_keys_for_q
 
     mf = two_k_h2_reference
@@ -1240,7 +1487,47 @@ def test_prebuild_gdf_q_ao_store_does_not_reuse_self_opposite_q(two_k_h2_referen
     assert timings["q_ao_store_cache_misses"] == 1
     assert timings["q_ao_store_requested_pair_blocks"] == pair_count
     assert timings["q_ao_store_existing_pair_blocks"] == pair_count
+    assert timings["q_ao_store_self_opposite_pair_reuses"] == 1
     assert timings["q_ao_store_pair_blocks"] == pair_count
+
+
+def test_gdf_self_opposite_pair_reuse_matches_ordered_pair_build(
+    two_k_h2_reference,
+):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache, _pair_keys_for_q
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_pair_cut = 0
+    mf.gdf_recip_cut = 2
+    mf.gdf_g_block_size = 2
+    mf.gdf_pair_ft_screen_tol = 0.0
+    space = KPointTransitionSpace(mf, qpts="mesh")
+    q_index = 1
+    pair_count = len(list(_pair_keys_for_q(space, q_index)))
+
+    mf.gdf_self_opposite_pair_reuse = False
+    ordered = gdf_transition_factors(space, q_index=q_index, g2_tol=1.0e-14)
+    mf.gdf_self_opposite_pair_reuse = True
+    reused = gdf_transition_factors(space, q_index=q_index, g2_tol=1.0e-14)
+
+    assert ordered.build_timings["q_ao_store_source_pair_blocks"] == pair_count
+    assert ordered.build_timings["q_ao_store_self_opposite_pair_reuses"] == 0
+    assert reused.build_timings["q_ao_store_source_pair_blocks"] == pair_count // 2
+    assert reused.build_timings["q_ao_store_self_opposite_pair_reuses"] == pair_count // 2
+    assert len(_gdf_mf_cache(mf, "q_ao_store")) == 2
+    assert ordered.pair_blocks.keys() == reused.pair_blocks.keys()
+    for key in ordered.pair_blocks:
+        np.testing.assert_allclose(
+            reused.pair_blocks[key],
+            ordered.pair_blocks[key],
+            atol=1.0e-12,
+        )
+    np.testing.assert_allclose(
+        reused.coulomb_metric(),
+        ordered.coulomb_metric(),
+        atol=1.0e-12,
+    )
 
 
 def test_prebuild_gdf_q_ao_stores_reuses_opposite_q_blocks():
@@ -1404,6 +1691,8 @@ def test_gdf_cutoffs_can_be_decoupled_from_reference_cutoffs(two_k_h2_reference)
 
     del mf.gdf_pair_cut
     del mf.gdf_recip_cut
+    mf.gdf_default_pair_cut = 2
+    mf.gdf_default_recip_cut = 5
     mf.pair_cut = 2
     mf.recip_cut = 5
     mf._periodic_setup()
@@ -1414,6 +1703,185 @@ def test_gdf_cutoffs_can_be_decoupled_from_reference_cutoffs(two_k_h2_reference)
     )
 
     np.testing.assert_allclose(decoupled, direct, atol=1.0e-12)
+    del mf.gdf_default_pair_cut
+    del mf.gdf_default_recip_cut
+
+
+def test_gdf_defaults_use_accuracy_controlled_range_separation(
+    two_k_h2_reference,
+):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.pair_cut = 0
+    mf.recip_cut = 2
+    for name in ("gdf_pair_cut", "gdf_recip_cut", "gdf_mesh", "gdf_precision"):
+        if hasattr(mf, name):
+            delattr(mf, name)
+
+    ref = KGW(mf).transition_space(qpts="mesh").reference
+    settings = integrals._gdf_backend_settings(ref)
+    _recip_cut, pair_cut, mesh, _recip_key, kernel, omega, *_rest = settings
+    assert pair_cut == "auto"
+    assert mesh != "auto"
+    assert all(int(value) > 1 for value in mesh)
+    assert kernel == "range_separated"
+    assert float(omega) > 0.0
+
+    mf.gdf_reciprocal_kernel = "full"
+    recip_cut, pair_cut = integrals._gdf_backend_cutoffs(ref)
+    assert recip_cut == 15
+    assert pair_cut == 3
+    del mf.gdf_reciprocal_kernel
+
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 5
+    recip_cut, pair_cut = integrals._gdf_backend_cutoffs(ref)
+    assert recip_cut == 5
+    assert pair_cut == 2
+
+
+def test_gdf_default_cutoffs_match_pyscf_lih_pair_metric():
+    pytest.importorskip("pyscf")
+    from pyscf.pbc import gto, scf
+
+    atom = "Li 0 0 0; H 1.6 0 0"
+    lattice = np.diag([7.0, 7.0, 7.0])
+    auxbasis = "def2-svp-jkfit"
+    pcell = gto.Cell()
+    pcell.atom = atom
+    pcell.a = lattice
+    pcell.basis = "sto-3g"
+    pcell.unit = "B"
+    pcell.verbose = 0
+    pcell.build()
+    kpts = pcell.make_kpts((1, 1, 1))
+    pmf = scf.KRHF(pcell, kpts=kpts, exxdiv="ewald").density_fit(
+        auxbasis=auxbasis
+    )
+    pmf.conv_tol = 1.0e-10
+    pmf.verbose = 0
+    pmf.kernel()
+
+    qcell = Cell(
+        atom=atom,
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+    ).build()
+    qmf = qcell.KRHF(
+        kpts=kpts,
+        eta=0.5,
+        real_cut=0,
+        pair_cut=3,
+        recip_cut=7,
+        jk_builder="ewald",
+    )
+    qmf.gdf_auxbasis = auxbasis
+    qmf.gdf_pair_ft_screen_tol = 0.0
+    qmf.gdf_g_block_size = 96
+    qmf.mo_energy = [np.asarray(block).copy() for block in pmf.mo_energy]
+    qmf.mo_coeff = [np.asarray(block).copy() for block in pmf.mo_coeff]
+    qmf.mo_occ = [np.asarray(block).copy() for block in pmf.mo_occ]
+    qmf._periodic_setup()
+    space = KPointTransitionSpace(qmf)
+
+    native = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    pyscf = pyscf_gdf_transition_factors(space, q_index=0)
+    native_pairs = native.pair_blocks[(0, 0)].reshape(native.naux, -1).T
+    pyscf_pairs = pyscf.pair_blocks[(0, 0)].reshape(pyscf.naux, -1).T
+    native_metric = native_pairs @ native_pairs.conj().T
+    pyscf_metric = pyscf_pairs @ pyscf_pairs.conj().T
+
+    relative_error = np.linalg.norm(native_metric - pyscf_metric) / np.linalg.norm(
+        pyscf_metric
+    )
+    assert relative_error < 1.0e-5
+    assert native.factor_method == "periodic_auxiliary_gdf:range_separated"
+    assert native.build_timings["short_range_screen_tol"] == 0.0
+    assert native.build_timings["q_ao_store_shared_range_separated_passes"] == 1
+    native_j, native_k = gdf_mo_jk(space, coulomb_component=GDF)
+    pyscf_j, pyscf_k = gdf_mo_jk(space, coulomb_component=PYSCF_GDF)
+    np.testing.assert_allclose(native_j, pyscf_j, rtol=1.0e-5, atol=1.0e-7)
+    np.testing.assert_allclose(native_k, pyscf_k, rtol=1.0e-5, atol=1.0e-7)
+
+    gw_options = {
+        "direct_scale": 1.0,
+        "linearized": True,
+        "frequency_integration": "ac",
+        "ac_nw": 16,
+        "finite_size_correction": False,
+        "qp_bands": [0, 1],
+    }
+    native_gw = diagonal_g0w0(space, coulomb_component=GDF, **gw_options)
+    pyscf_gw = diagonal_g0w0(space, coulomb_component=PYSCF_GDF, **gw_options)
+    np.testing.assert_allclose(native_gw.e_qp, pyscf_gw.e_qp, atol=1.0e-7)
+
+    native_bse = periodic_bse_matrices(space, coulomb_component=GDF)
+    pyscf_bse = periodic_bse_matrices(space, coulomb_component=PYSCF_GDF)
+    np.testing.assert_allclose(native_bse.A, pyscf_bse.A, atol=2.0e-6)
+    np.testing.assert_allclose(native_bse.B, pyscf_bse.B, atol=2.0e-6)
+
+
+def test_gdf_automatic_policy_matches_pyscf_neon_pair_metric():
+    pytest.importorskip("pyscf")
+    from pyscf.pbc import gto, scf
+
+    lattice = np.diag([8.0, 8.0, 8.0])
+    auxbasis = "def2-svp-jkfit"
+    pcell = gto.Cell()
+    pcell.atom = "Ne 0 0 0"
+    pcell.a = lattice
+    pcell.basis = "sto-3g"
+    pcell.unit = "B"
+    pcell.verbose = 0
+    pcell.build()
+    kpts = pcell.make_kpts((1, 1, 1))
+    pmf = scf.KRHF(pcell, kpts=kpts, exxdiv="ewald").density_fit(
+        auxbasis=auxbasis
+    )
+    pmf.conv_tol = 1.0e-10
+    pmf.verbose = 0
+    pmf.kernel()
+
+    qcell = Cell(
+        atom="Ne 0 0 0",
+        a=lattice,
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+    ).build()
+    qmf = qcell.KRHF(
+        kpts=kpts,
+        eta=0.5,
+        real_cut=0,
+        pair_cut=3,
+        recip_cut=7,
+        jk_builder="ewald",
+    )
+    qmf.gdf_auxbasis = auxbasis
+    qmf.gdf_pair_ft_screen_tol = 0.0
+    qmf.gdf_g_block_size = 96
+    qmf.mo_energy = [np.asarray(block).copy() for block in pmf.mo_energy]
+    qmf.mo_coeff = [np.asarray(block).copy() for block in pmf.mo_coeff]
+    qmf.mo_occ = [np.asarray(block).copy() for block in pmf.mo_occ]
+    qmf._periodic_setup()
+    space = KPointTransitionSpace(qmf)
+
+    native = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    pyscf = pyscf_gdf_transition_factors(space, q_index=0)
+    native_pairs = native.pair_blocks[(0, 0)].reshape(native.naux, -1).T
+    pyscf_pairs = pyscf.pair_blocks[(0, 0)].reshape(pyscf.naux, -1).T
+    native_metric = native_pairs @ native_pairs.conj().T
+    pyscf_metric = pyscf_pairs @ pyscf_pairs.conj().T
+    relative_error = np.linalg.norm(native_metric - pyscf_metric) / np.linalg.norm(
+        pyscf_metric
+    )
+
+    assert relative_error < 1.0e-6
+    assert native.metric_rank == pyscf.naux
+    assert native.build_timings["q_ao_store_shared_range_separated_passes"] == 1
 
 
 def test_gdf_mesh_can_replace_reciprocal_cutoff(two_k_h2_reference):
@@ -1591,12 +2059,57 @@ def test_gdf_auto_pair_cut_builds_shell_pair_image_plan(two_k_h2_reference):
     timings = factors.build_timings
     assert timings["pair_cut"] == "auto"
     assert timings["pair_image_plan_auto"] is True
-    assert timings["pair_image_plan_tol"] == pytest.approx(1.0e-8)
+    assert timings["pair_image_plan_tol"] == pytest.approx(1.0e-6)
     assert timings["pair_image_plan_screen"] == "overlap"
     assert timings["pair_image_plan_max_cut"] <= 2
     assert timings["pair_image_plan_images"] > 0
     assert timings["pair_image_plan_kept_image_pairs"] > 0
     assert np.all(np.isfinite(factors.transition_vectors))
+
+
+def test_gdf_shell_pair_image_mask_matches_cartesian_component_scan():
+    import pyqed.pbc.gw.integrals as integrals
+
+    cell = Cell(
+        atom="Li 0 0 0; H 3.0 0 0",
+        a=np.diag([8.0, 8.0, 8.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(nk=(1, 1, 1), eta=0.5, real_cut=1, pair_cut=1)
+    mf._validate()
+    mf._periodic_setup()
+    basis = tuple(mf._basis)
+    shell_blocks = tuple(integrals._cart_shell_blocks(basis))
+    volume = abs(float(np.linalg.det(cell.lattice_vectors)))
+    tolerance = 1.0e-8
+
+    for shift in (np.zeros(3), np.asarray(cell.lattice_vectors[0]) * 2.0):
+        expected = np.zeros((len(basis), len(basis)), dtype=np.bool_)
+        for p0, p1, _lp in shell_blocks:
+            for q0, q1, _lq in shell_blocks:
+                keep = any(
+                    integrals._gdf_pair_image_bound(
+                        basis[p], basis[q], shift, volume, "overlap"
+                    )
+                    > tolerance
+                    for p in range(p0, p1)
+                    for q in range(q0, q1)
+                )
+                if keep:
+                    expected[p0:p1, q0:q1] = True
+
+        actual = integrals._gdf_shell_pair_keep_mask(
+            basis,
+            shell_blocks,
+            shift,
+            tolerance,
+            volume,
+            "overlap",
+        )
+        np.testing.assert_array_equal(actual, expected)
 
 
 def test_gdf_auto_pair_cut_can_use_legacy_decay_screen(two_k_h2_reference):
@@ -1644,6 +2157,15 @@ def test_gdf_auto_pair_cut_tolerance_factor_override(two_k_h2_reference):
     assert plan.tolerance == pytest.approx(2.5e-5)
 
 
+def test_gdf_auto_pair_cut_default_tolerance_tracks_precision(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_precision = 1.0e-4
+
+    assert integrals._gdf_pair_image_tolerance(mf, 0.0) == pytest.approx(1.0e-6)
+
+
 def test_gdf_weighted_aux_screen_tolerance_tracks_precision(two_k_h2_reference):
     import pyqed.pbc.gw.integrals as integrals
 
@@ -1667,7 +2189,7 @@ def test_gdf_pair_ft_coeff_tol_defaults_to_pair_screen(two_k_h2_reference):
     assert integrals._gdf_pair_ft_coeff_tol(mf, 1.0e-13) == pytest.approx(1.0e-13)
 
     mf.gdf_precision = 1.0e-4
-    assert integrals._gdf_pair_ft_coeff_tol(mf, 1.0e-13) == pytest.approx(1.0e-8)
+    assert integrals._gdf_pair_ft_coeff_tol(mf, 1.0e-13) == pytest.approx(1.0e-7)
 
     mf.gdf_pair_ft_coeff_tol_factor = 1.0e-5
     assert integrals._gdf_pair_ft_coeff_tol(mf, 1.0e-13) == pytest.approx(1.0e-9)
@@ -1677,6 +2199,68 @@ def test_gdf_pair_ft_coeff_tol_defaults_to_pair_screen(two_k_h2_reference):
 
     mf.gdf_pair_ft_coeff_tol = 0.0
     assert integrals._gdf_pair_ft_coeff_tol(mf, 1.0e-13) == 0.0
+
+
+def test_gdf_pair_ft_factor_screen_tol_defaults_to_coeff_tol(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+
+    assert integrals._gdf_pair_ft_factor_screen_tol(mf, 1.0e-7) == pytest.approx(
+        1.0e-7
+    )
+
+    mf.gdf_pair_ft_factor_screen_tol_factor = 0.25
+    assert integrals._gdf_pair_ft_factor_screen_tol(mf, 1.0e-7) == pytest.approx(
+        2.5e-8
+    )
+
+    mf.gdf_pair_ft_factor_screen_tol = 0.0
+    assert integrals._gdf_pair_ft_factor_screen_tol(mf, 1.0e-7) == 0.0
+
+
+def test_gdf_pair_plan_tolerance_change_invalidates_factor_and_ao_store_cache(
+    two_k_h2_reference,
+):
+    from pyqed.pbc.gw.integrals import _gdf_mf_cache
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_precision = 1.0e-4
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_pair_cut = "auto"
+    mf.gdf_pair_image_cut_max = 1
+    mf._periodic_setup()
+    space = KPointTransitionSpace(mf, qpts="mesh")
+
+    screened = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    mf.gdf_pair_ft_factor_screen_tol = 0.0
+    factor_unscreened = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    mf.gdf_pair_image_tol = 0.0
+    mf.gdf_pair_ft_coeff_tol = 0.0
+    unscreened = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert screened is not factor_unscreened
+    assert factor_unscreened is not unscreened
+    assert screened is not unscreened
+    assert len(space._gdf_factor_cache) == 3
+    assert len(_gdf_mf_cache(mf, "q_ao_store")) == 3
+    assert screened.build_timings["pair_image_plan_tol"] == pytest.approx(1.0e-6)
+    assert screened.build_timings["pair_ft_coeff_tol"] == pytest.approx(1.0e-7)
+    assert screened.build_timings["pair_ft_factor_screen_tol"] == pytest.approx(
+        1.0e-7
+    )
+    assert factor_unscreened.build_timings["pair_image_plan_tol"] == pytest.approx(
+        1.0e-6
+    )
+    assert factor_unscreened.build_timings["pair_ft_coeff_tol"] == pytest.approx(
+        1.0e-7
+    )
+    assert factor_unscreened.build_timings["pair_ft_factor_screen_tol"] == 0.0
+    assert unscreened.build_timings["pair_image_plan_tol"] == 0.0
+    assert unscreened.build_timings["pair_ft_coeff_tol"] == 0.0
+    assert unscreened.build_timings["pair_ft_factor_screen_tol"] == 0.0
 
 
 def test_gdf_aux_transform_plan_matches_dense():
@@ -1747,6 +2331,37 @@ def test_gdf_aux_transform_plan_matches_dense():
 
     np.testing.assert_allclose(sparse_out, cart_ft @ sparse_transform)
     assert sparse_timings["aux_ft_transform_backend"] == "sparse_pattern"
+
+
+def test_gdf_auxiliary_shells_use_charge_normalization():
+    import math
+
+    import pyqed.pbc.gw.integrals as integrals
+
+    basis = tuple(
+        make_contractions(
+            parse_gbs(_basis_path("def2-sv(p)-jkfit")),
+            ["C"],
+            np.zeros((1, 3)),
+            coord_types="c",
+        )
+    )
+    normalized = integrals._gdf_charge_normalized_auxiliary_basis(basis)
+    target = math.sqrt(0.25 / math.pi)
+
+    for start, _stop, angular_momentum in _cart_shell_blocks(normalized):
+        fn = normalized[start]
+        order = float(angular_momentum) + 1.5
+        radial_moment = (
+            math.gamma(order)
+            / (2.0 * np.asarray(fn.exps, dtype=float) ** order)
+        )
+        radial_norm = 1.0 / np.sqrt(
+            math.gamma(order)
+            / (2.0 * (2.0 * np.asarray(fn.exps, dtype=float)) ** order)
+        )
+        multipole = np.dot(fn.coefs * radial_norm, radial_moment)
+        assert multipole == pytest.approx(target, abs=2.0e-15)
 
 
 def test_gdf_weighted_aux_metric_matches_einsum():
@@ -1956,6 +2571,12 @@ def test_range_separated_g_vector_streaming_matches_full_grid(two_k_h2_reference
 
     assert streamed.build_timings["g_block_size"] == 7
     assert streamed.build_timings["g_blocks"] > 1
+    assert streamed.build_timings["q_ao_store_shared_range_separated_passes"] == 1
+    assert streamed.build_timings["q_ao_store_shared_reciprocal_blocks_reused"] > 0
+    assert (
+        streamed.build_timings["pair_ft_stream_g_blocks"]
+        == streamed.build_timings["g_blocks"]
+    )
     np.testing.assert_allclose(
         streamed.coulomb_metric(),
         full.coulomb_metric(),
@@ -2235,11 +2856,58 @@ def test_gdf_precision_can_derive_mesh(two_k_h2_reference):
     )
 
     assert factors.build_timings["reciprocal_mode"] == "mesh"
+    assert factors.build_timings["reciprocal_kernel"] == "range_separated"
+    assert factors.build_timings["pair_cut"] == 2
     assert factors.build_timings["gdf_mesh_auto"] is True
     assert factors.build_timings["gdf_precision"] == 1.0e-8
     assert factors.build_timings["gdf_ke_cutoff"] > 0.0
     assert all(n > 0 for n in factors.build_timings["mesh"])
     assert np.all(np.isfinite(factors.coulomb_metric()))
+
+
+def test_gdf_precision_defaults_to_fully_automatic_range_separation(
+    two_k_h2_reference,
+):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_precision = 1.0e-8
+    for name in (
+        "gdf_pair_cut",
+        "gdf_mesh",
+        "gdf_omega",
+        "gdf_reciprocal_kernel",
+    ):
+        if hasattr(mf, name):
+            delattr(mf, name)
+    mf._periodic_setup()
+    ref = KGW(mf).transition_space(qpts="mesh").reference
+
+    settings = integrals._gdf_backend_settings(ref)
+
+    assert settings[1] == "auto"
+    assert settings[4] == "range_separated"
+    assert settings[5] > 0.0
+    assert all(value > 1 for value in settings[2])
+
+
+def test_gdf_auto_mesh_adds_one_native_reciprocal_safety_shell(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_precision = 1.0e-8
+    mf.gdf_mesh = "auto"
+    mf._periodic_setup()
+    ref = KGW(mf).transition_space(qpts="mesh").reference
+
+    mf.gdf_mesh_safety_pad = 0
+    unpadded = integrals._gdf_backend_settings(ref)
+    mf.gdf_mesh_safety_pad = 2
+    padded = integrals._gdf_backend_settings(ref)
+
+    np.testing.assert_array_equal(np.asarray(padded[2]), np.asarray(unpadded[2]) + 2)
+    assert unpadded[-1]["mesh_safety_pad"] == 0
+    assert padded[-1]["mesh_safety_pad"] == 2
 
 
 def test_gdf_auto_omega_resolves_from_precision_and_cutoff(two_k_h2_reference):
@@ -2309,7 +2977,14 @@ def test_gdf_precision_derives_bounded_range_separated_work(two_k_h2_reference):
     assert np.prod(mesh) < 1_000_000
     assert isinstance(short_range_cut, int)
     assert 0 <= short_range_cut <= 64
-    assert integrals._gdf_short_range_screen_tol(ref) == pytest.approx(1.0e-8)
+    assert integrals._gdf_short_range_screen_tol(ref) == 0.0
+    expected_exp_cutoff = -np.log(1.0e-4) + 4.0 * np.log(10.0)
+    assert integrals._gdf_short_range_primitive_exp_cutoff(ref) == pytest.approx(
+        expected_exp_cutoff
+    )
+
+    mf.gdf_short_range_primitive_exp_cutoff = 0.0
+    assert integrals._gdf_short_range_primitive_exp_cutoff(ref) == 0.0
 
 
 def test_range_separated_factor_build_streams_image_tensors(two_k_h2_reference):
@@ -2321,6 +2996,7 @@ def test_range_separated_factor_build_streams_image_tensors(two_k_h2_reference):
     mf.gdf_short_range_cut = 1
     mf.gdf_auxbasis = "sto-3g"
     mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_pair_ft_screen_tol = 0.0
     mf.gdf_short_range_workers = 2
     mf._periodic_setup()
 
@@ -2332,10 +3008,57 @@ def test_range_separated_factor_build_streams_image_tensors(two_k_h2_reference):
     timings = factors.build_timings
 
     assert timings["three_center_sr_component_streamed"] is True
+    assert timings["three_center_sr_grouped_bloch"] is True
+    assert (
+        timings["three_center_short_range_compiled_calls"]
+        < timings["three_center_sr_component_terms"]
+    )
     assert timings["three_center_sr_max_inflight_tasks"] <= 4
     assert timings["three_center_sr_retained_image_tensor_bytes"] == 0
     assert timings["three_center_sr_result_cache_enabled"] is False
-    assert timings["three_center_sr_peak_image_tensor_bytes"] > 0
+    assert timings["three_center_sr_peak_image_tensor_bytes"] == 0
+    assert timings["three_center_sr_group_output_bytes"] > 0
+    assert timings["three_center_sr_group_workspace_bytes_upper_bound"] > 0
+    assert timings["three_center_sr_primitive_exp_cutoff"] > 0.0
+    assert timings["three_center_sr_primitive_candidates"] > 0
+    assert (
+        0
+        < timings["three_center_sr_primitive_skips"]
+        < timings["three_center_sr_primitive_candidates"]
+    )
+
+
+def test_range_separated_primitive_screening_matches_unscreened_and_separates_cache(
+    two_k_h2_reference,
+):
+    mf = two_k_h2_reference
+    mf.gdf_precision = 1.0e-8
+    mf.gdf_pair_cut = 2
+    mf.gdf_mesh = (5, 5, 5)
+    mf.gdf_reciprocal_kernel = "range_separated"
+    mf.gdf_omega = 0.4
+    mf.gdf_short_range_cut = 1
+    mf.gdf_auxbasis = "sto-3g"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf.gdf_pair_ft_screen_tol = 0.0
+    mf.gdf_short_range_primitive_exp_cutoff = 0.0
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    unscreened = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    mf.gdf_short_range_primitive_exp_cutoff = "auto"
+    screened = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+
+    assert screened is not unscreened
+    assert screened.build_timings["q_ao_store_cache_misses"] == 1
+    assert screened.build_timings["three_center_sr_primitive_skips"] > 0
+    assert screened.build_timings["three_center_ao_cache_misses"] > 0
+    np.testing.assert_allclose(
+        screened.coulomb_metric(),
+        unscreened.coulomb_metric(),
+        rtol=2.0e-10,
+        atol=2.0e-11,
+    )
 
 
 def test_gdf_metric_accepts_only_precision_sized_negative_modes():
@@ -2357,6 +3080,101 @@ def test_gdf_metric_accepts_only_precision_sized_negative_modes():
             "test-aux",
             precision=1.0e-4,
         )
+
+
+def test_gdf_metric_relative_tol_drops_ill_conditioned_modes():
+    import pyqed.pbc.gw.integrals as integrals
+
+    invsqrt, evals = integrals._gdf_metric_invsqrt(
+        np.diag([1.0e-12, 1.0, 2.0]),
+        1.0e-14,
+        "test-aux",
+        relative_threshold=1.0e-10,
+    )
+
+    assert invsqrt.shape == (3, 2)
+    np.testing.assert_allclose(evals, [1.0e-12, 1.0, 2.0])
+
+
+def test_periodic_gdf_exposes_relative_metric_regularization(gamma_h2_mf):
+    from pyqed.qchem.pbc.gdf import PeriodicGDF
+
+    backend = PeriodicGDF(
+        gamma_h2_mf,
+        auxbasis="sto-3g",
+        metric_relative_tol=1.0e-10,
+    )
+
+    assert backend.metric_relative_tol == 1.0e-10
+    assert gamma_h2_mf.gdf_metric_relative_tol == 1.0e-10
+    with pytest.raises(ValueError, match="metric_relative_tol"):
+        PeriodicGDF(
+            gamma_h2_mf,
+            auxbasis="sto-3g",
+            metric_relative_tol=1.0,
+        )
+
+
+def test_gdf_aux_min_exponent_prunes_diffuse_primitives(two_k_h2_reference):
+    import pyqed.pbc.gw.integrals as integrals
+
+    mf = two_k_h2_reference
+    mf.gdf_auxbasis = "def2-svp-jkfit"
+    mf.gdf_aux_coord_type = "cartesian"
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    full = integrals._gdf_auxiliary_basis(
+        space,
+        integrals._gdf_auxbasis_name(space.reference),
+        "cartesian",
+    )
+    mf.gdf_aux_min_exponent = 0.3
+    pruned = integrals._gdf_auxiliary_basis(
+        space,
+        integrals._gdf_auxbasis_name(space.reference),
+        "cartesian",
+    )
+
+    assert pruned.ncart < full.ncart
+    assert min(float(np.min(fn.exps)) for fn in pruned.cart_basis) >= 0.3
+
+
+def test_periodic_gdf_exposes_aux_min_exponent(gamma_h2_mf):
+    from pyqed.qchem.pbc.gdf import PeriodicGDF
+
+    backend = PeriodicGDF(
+        gamma_h2_mf,
+        auxbasis="sto-3g",
+        aux_min_exponent=0.1,
+    )
+
+    assert backend.aux_min_exponent == 0.1
+    assert gamma_h2_mf.gdf_aux_min_exponent == 0.1
+    with pytest.raises(ValueError, match="aux_min_exponent"):
+        PeriodicGDF(
+            gamma_h2_mf,
+            auxbasis="sto-3g",
+            aux_min_exponent=-0.1,
+        )
+
+
+def test_gdf_metric_tolerance_defaults_to_precision_aware_floor(
+    two_k_h2_reference,
+):
+    from pyqed.pbc.gw.integrals import _gdf_metric_tol
+
+    mf = two_k_h2_reference
+    space = KPointTransitionSpace(mf)
+    mf.gdf_precision = 1.0e-10
+    if hasattr(mf, "gdf_metric_tol"):
+        del mf.gdf_metric_tol
+
+    assert _gdf_metric_tol(space.reference) == pytest.approx(1.0e-11)
+    assert _gdf_metric_tol(space.reference, 3.0e-12) == pytest.approx(3.0e-12)
+
+    mf.gdf_precision = 1.0e-15
+    assert _gdf_metric_tol(space.reference) == pytest.approx(1.0e-14)
 
 
 def test_short_range_auxiliary_integrals_recover_full_coulomb(gamma_h2_mf):
@@ -2561,6 +3379,124 @@ def test_compiled_short_range_gdf_kernels_match_python(gamma_h2_mf):
     )
 
 
+def test_compiled_periodic_pair_ft_plan_matches_python_reference():
+    import pyqed.qchem.fourier as fourier
+
+    if not hasattr(_basis_cy, "compute_periodic_pair_ft_primitive_terms"):
+        pytest.skip("compiled AO-pair Fourier plan builder is not available")
+
+    cell = Cell(
+        atom="Li 0 0 0; H 3.0 0 0",
+        a=np.diag([8.0, 8.0, 8.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(nk=(1, 1, 1), eta=0.5, real_cut=1, pair_cut=1)
+    mf._validate()
+    mf._periodic_setup()
+    basis = tuple(mf._basis)
+    plan = fourier.AOBlockPairFTPlan(basis, basis)
+    origins = np.ascontiguousarray([fn.origin for fn in basis], dtype=float)
+    shifts = np.ascontiguousarray(
+        [
+            np.zeros(3),
+            cell.lattice_vectors[0],
+            -cell.lattice_vectors[1],
+        ],
+        dtype=float,
+    )
+    right_origins = np.ascontiguousarray(
+        origins[None, :, :] + shifts[:, None, :]
+    )
+    image_pair_mask = np.ones((len(shifts), len(plan.pair_p)), dtype=np.bool_)
+    image_pair_mask[2, ::3] = False
+    reference = plan.periodic_primitive_terms(
+        origins,
+        right_origins,
+        image_pair_mask=image_pair_mask,
+        coeff_tol=1.0e-12,
+        compiled=False,
+    )
+    compiled = plan.periodic_primitive_terms(
+        origins,
+        right_origins,
+        image_pair_mask=image_pair_mask,
+        coeff_tol=1.0e-12,
+        compiled=True,
+    )
+
+    floating_keys = {"term_center"}
+    identity_keys = {"product_group_factor_id"}
+    metadata_keys = {"builder_backend"}
+    for key in reference.keys() - floating_keys - identity_keys - metadata_keys:
+        np.testing.assert_array_equal(compiled[key], reference[key])
+    assert compiled["builder_backend"] == "compiled"
+    assert reference["builder_backend"] == "python"
+    np.testing.assert_allclose(
+        compiled["term_center"],
+        reference["term_center"],
+        atol=2.0e-15,
+        rtol=0.0,
+    )
+    compiled_factor_id = np.asarray(compiled["product_group_factor_id"])
+    reference_factor_id = np.asarray(reference["product_group_factor_id"])
+    np.testing.assert_array_equal(
+        compiled_factor_id[:, None] == compiled_factor_id[None, :],
+        reference_factor_id[:, None] == reference_factor_id[None, :],
+    )
+
+    gvecs = np.ascontiguousarray(
+        [
+            [0.0, 0.0, 0.0],
+            [0.2, -0.3, 0.1],
+            [1.1, 0.4, -0.2],
+            [4.0, 0.0, 0.0],
+            [6.0, 0.0, 0.0],
+        ],
+        dtype=float,
+    )
+    phases = np.ascontiguousarray(
+        np.exp(1.0j * (np.asarray([[0.0, 0.0, 0.0], [0.1, 0.2, -0.3]]) @ shifts.T))
+    )
+    reference_ft = plan.periodic_sum_many(
+        gvecs,
+        origins,
+        right_origins,
+        phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=reference,
+        threads=2,
+    )
+    compiled_ft = plan.periodic_sum_many(
+        gvecs,
+        origins,
+        right_origins,
+        phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=compiled,
+        threads=2,
+    )
+    np.testing.assert_allclose(compiled_ft, reference_ft, atol=1.0e-14, rtol=0.0)
+
+    factor_screen_tol = 1.0e-10
+    screened_terms = dict(compiled)
+    screened_terms["factor_screen_tol"] = factor_screen_tol
+    screened_ft = plan.periodic_sum_many(
+        gvecs,
+        origins,
+        right_origins,
+        phases,
+        image_pair_mask=image_pair_mask,
+        primitive_terms=screened_terms,
+        threads=2,
+    )
+    screening_error = float(np.max(np.abs(screened_ft - compiled_ft)))
+    assert screening_error > 0.0
+    assert screening_error <= factor_screen_tol
+
+
 def test_cpp_periodic_pair_ft_primitive_sum_matches_numba(monkeypatch, gamma_h2_mf):
     import pyqed.qchem.fourier as fourier
 
@@ -2589,11 +3525,6 @@ def test_cpp_periodic_pair_ft_primitive_sum_matches_numba(monkeypatch, gamma_h2_
     image_pair_mask = np.ones((len(shifts), len(plan.pair_p)), dtype=np.bool_)
     image_pair_mask[1, 1::2] = False
     primitive_terms = plan.periodic_primitive_terms(
-        origins,
-        right_origins_batch,
-        image_pair_mask=image_pair_mask,
-    )
-    product_terms = plan.periodic_product_terms(
         origins,
         right_origins_batch,
         image_pair_mask=image_pair_mask,
@@ -3382,6 +4313,9 @@ def test_gdf_range_separated_exact_short_range_uses_compiled_kernel(two_k_h2_ref
         > 0
     )
     assert factors.build_timings["three_center_short_range_workers"] == 2
+    assert factors.build_timings["three_center_sr_bloch_contiguous"] is True
+    assert factors.build_timings["three_center_sr_shell_task_skips"] >= 0
+    assert len(factors.build_timings["three_center_sr_worker_seconds"]) == 2
     assert factors.build_timings["pair_ft_workers"] == 2
     assert (
         factors.build_timings["three_center_short_range_compiled_calls"]
@@ -3424,6 +4358,98 @@ def test_gdf_matches_pyscf_gdf_transition_metrics(two_k_h2_reference):
         native = gdf_transition_metric(space, q_index=q_index, g2_tol=1.0e-14)
         pyscf = pyscf_gdf_transition_metric(space, q_index=q_index)
         np.testing.assert_allclose(native, pyscf, rtol=1.0e-4, atol=1.0e-6)
+
+
+def test_two_k_gdf_jk_matches_pyscf_gdf(two_k_h2_reference):
+    pytest.importorskip("pyscf")
+    mf = two_k_h2_reference
+    mf.gdf_pair_cut = 2
+    mf.gdf_recip_cut = 5
+    mf.gdf_pair_ft_screen_tol = 0.0
+    mf._periodic_setup()
+    space = KGW(mf).transition_space(qpts="mesh")
+
+    native_j, native_k = gdf_mo_jk(space, coulomb_component=GDF)
+    pyscf_j, pyscf_k = gdf_mo_jk(space, coulomb_component=PYSCF_GDF)
+    density_j, density_k = gdf_mo_jk(
+        space,
+        coulomb_component=GDF,
+        dm=mf.dm,
+    )
+
+    np.testing.assert_allclose(native_j, pyscf_j, rtol=2.0e-4, atol=2.0e-6)
+    np.testing.assert_allclose(native_k, pyscf_k, rtol=2.0e-4, atol=2.0e-6)
+    np.testing.assert_allclose(density_j, native_j, atol=1.0e-12)
+    np.testing.assert_allclose(density_k, native_k, atol=1.0e-12)
+
+
+def test_three_k_gdf_matches_pyscf_at_nonzero_q():
+    pytest.importorskip("pyscf")
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+    ).build()
+    mf = cell.KRHF(kpts=cell.make_kpts((3, 1, 1)))
+    mf.gdf_auxbasis = "def2-svp-jkfit"
+    mf.gdf_pair_ft_screen_tol = 0.0
+    mf.mo_energy = [np.asarray([-1.0, 0.5]) for _ in range(3)]
+    mf.mo_coeff = [np.eye(cell.nao) for _ in range(3)]
+    mf.mo_occ = [np.asarray([2.0, 0.0]) for _ in range(3)]
+    space = KPointTransitionSpace(mf, qpts="mesh")
+
+    for q_index in range(space.nqpts):
+        native = gdf_transition_factors(space, q_index=q_index, g2_tol=1.0e-14)
+        pyscf = pyscf_gdf_transition_factors(space, q_index=q_index)
+        if q_index == 0:
+            assert native.build_timings["three_center_sr_grouped_bloch"] is True
+            assert native.build_timings["short_range_image_domain"] == "radial"
+        assert np.linalg.norm(space.qpts[q_index]) > 0.0 or q_index == 0
+        for pair_key, native_block in native.pair_blocks.items():
+            pyscf_block = pyscf.pair_blocks[pair_key]
+            native_pairs = native_block.reshape(native.naux, -1).T
+            pyscf_pairs = pyscf_block.reshape(pyscf.naux, -1).T
+            np.testing.assert_allclose(
+                native_pairs @ native_pairs.conj().T,
+                pyscf_pairs @ pyscf_pairs.conj().T,
+                rtol=2.0e-7,
+                atol=2.0e-8,
+            )
+
+
+def test_polarized_ccpvdz_gdf_matches_representation_matched_pyscf():
+    pytest.importorskip("pyscf")
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([7.0, 7.0, 7.0]),
+        basis="cc-pvdz",
+        unit="bohr",
+        dimension=3,
+    ).build()
+    mf = cell.KRHF(kpts=cell.make_kpts((1, 1, 1)))
+    mf.gdf_auxbasis = "cc-pvdz-jkfit"
+    mf.mo_energy = [np.arange(cell.nao, dtype=float)]
+    mf.mo_coeff = [np.eye(cell.nao)]
+    mf.mo_occ = [np.r_[2.0, np.zeros(cell.nao - 1)]]
+    space = KPointTransitionSpace(mf)
+
+    native = gdf_transition_factors(space, q_index=0, g2_tol=1.0e-14)
+    pyscf = pyscf_gdf_transition_factors(space, q_index=0)
+    native_pairs = native.pair_blocks[(0, 0)].reshape(native.naux, -1).T
+    pyscf_pairs = pyscf.pair_blocks[(0, 0)].reshape(pyscf.naux, -1).T
+    native_metric = native_pairs @ native_pairs.conj().T
+    pyscf_metric = pyscf_pairs @ pyscf_pairs.conj().T
+    relative_error = np.linalg.norm(native_metric - pyscf_metric) / np.linalg.norm(
+        pyscf_metric
+    )
+    assert relative_error < 5.0e-6
+
+    native_j, native_k = gdf_mo_jk(space, coulomb_component=GDF)
+    pyscf_j, pyscf_k = gdf_mo_jk(space, coulomb_component=PYSCF_GDF)
+    np.testing.assert_allclose(native_j, pyscf_j, rtol=1.0e-5, atol=1.0e-6)
+    np.testing.assert_allclose(native_k, pyscf_k, rtol=1.0e-5, atol=1.0e-6)
 
 
 def test_pyscf_gdf_mirror_preserves_cartesian_orbital_basis():
@@ -3560,7 +4586,6 @@ def test_periodic_gw_ac_pyscf_gdf_matches_pyscf_kernel_same_reference():
     pytest.importorskip("pyscf")
     from pyscf.pbc import gto, gw, scf
 
-    hartree_to_ev = 27.211386245988
     auxbasis = "def2-svp-jkfit"
     qcell = Cell(
         atom="H 0 0 0; H 1.4 0 0",
@@ -3622,8 +4647,8 @@ def test_periodic_gw_ac_pyscf_gdf_matches_pyscf_kernel_same_reference():
     pyscf_qp = kgw.kernel(orbs=[0, 1], kptlist=[0, 1], nw=24)
 
     np.testing.assert_allclose(
-        np.asarray(result.e_qp) * hartree_to_ev,
-        np.asarray(pyscf_qp) * hartree_to_ev,
+        np.asarray(result.e_qp) * au2ev,
+        np.asarray(pyscf_qp) * au2ev,
         atol=1.0e-8,
     )
 
@@ -4806,6 +5831,43 @@ def test_diagonal_g0w0_gdf_can_prebuild_q_ao_store(two_k_h2_reference):
     assert len(_gdf_mf_cache(mf, "q_ao_store")) == 1
 
 
+def test_diagonal_g0w0_prebuild_reuses_persistent_scf_gdf(two_k_h2_reference):
+    mf = two_k_h2_reference.density_fit(
+        auxbasis="def2-svp-jkfit",
+        precision=1.0e-6,
+        mesh="auto",
+        omega="auto",
+        pair_cut="auto",
+        image_cut="auto",
+        storage="memory",
+    )
+    try:
+        mf.with_df.build(q_indices=[0], workers=1)
+        space = KGW(mf).transition_space(qpts="mesh")
+        q_index = space.find_qpoint_index(np.zeros(3))
+
+        result = diagonal_g0w0(
+            space,
+            coulomb_component="gdf",
+            prebuild_gdf=True,
+            q_indices=[q_index],
+            qp_bands=[1],
+            intermediate_bands=[0],
+            direct_scale=1.0,
+            eta=1.0e-3,
+        )
+
+        assert result.info["gdf_prebuild_backend"] == "persistent_ao"
+        assert len(result.info["gdf_prebuild"]) == 1
+        timing = result.info["gdf_prebuild"][0]["timings"]
+        assert timing["persistent_backend_reuse"] is True
+        assert "q_ao_store_cache_misses" not in timing
+        assert result.info["gdf_prebuild_seconds"] >= 0.0
+        assert result.info["cache_sizes"]["transition_factors"] == 1
+    finally:
+        mf.with_df.close()
+
+
 def test_diagonal_g0w0_gdf_prebuild_can_use_workers(two_k_h2_reference):
     mf = two_k_h2_reference
     mf.gdf_auxbasis = "sto-3g"
@@ -5246,6 +6308,29 @@ def test_periodic_bse_screening_energy_matches_explicit_screening_space(two_k_h2
     )
 
 
+def test_periodic_bse_inherits_pyscf_gdf_context_in_internal_screening_space(
+    two_k_h2_reference,
+):
+    import pyqed.pbc.gw.bse as bse_module
+
+    space = KGW(two_k_h2_reference).transition_space(qpts="mesh")
+    context = object()
+    context_key = ("pyscf_gdf", "test-aux")
+    space._pyscf_gdf_context = context
+    space._pyscf_gdf_context_key = context_key
+
+    inherited = bse_module._screening_space(space)
+    shifted = bse_module._screening_space(
+        space,
+        screening_energy=np.asarray(two_k_h2_reference.mo_energy) + 0.1,
+    )
+
+    assert inherited._pyscf_gdf_context is context
+    assert inherited._pyscf_gdf_context_key == context_key
+    assert shifted._pyscf_gdf_context is context
+    assert shifted._pyscf_gdf_context_key == context_key
+
+
 def test_two_k_periodic_tda_and_bse_wrappers(two_k_h2_reference):
     gw = KGW(two_k_h2_reference).run(direct_scale=1.0)
 
@@ -5355,6 +6440,30 @@ def test_periodic_transition_velocity_matches_pyscf_grid(two_k_h2_reference):
         np.testing.assert_allclose(expected, pyscf_values[key], rtol=5.0e-4, atol=1.0e-8)
 
 
+def test_pyscf_gradient_head_accepts_native_basis_dictionary(two_k_h2_reference):
+    pytest.importorskip("pyscf")
+    from pyqed.pbc.gw.finite_size import _pyscf_gradient_head_transitions
+
+    two_k_h2_reference.cell.basis = {
+        "H": [
+            (
+                0,
+                np.asarray([3.42525091, 0.62391373, 0.16885540]),
+                np.asarray([[0.15432897], [0.53532814], [0.44463454]]),
+            )
+        ]
+    }
+    space = KPointTransitionSpace(two_k_h2_reference, qpts="optical")
+    values = _pyscf_gradient_head_transitions(
+        space,
+        qvec=np.asarray([1.0e-3, 0.0, 0.0]),
+        energy_table=np.asarray(space.reference.mo_energy),
+    )
+
+    assert len(values) == len(space.transitions(0))
+    assert all(np.isfinite(value) for value in values.values())
+
+
 def test_periodic_tda_and_full_bse_build_polarized_optical_absorption(
     two_k_h2_reference,
 ):
@@ -5407,7 +6516,7 @@ def test_periodic_tda_and_full_bse_build_polarized_optical_absorption(
     assert isinstance(optical_x, PeriodicBSEOpticalResult)
     np.testing.assert_allclose(
         optical_x.excitation_energies,
-        np.asarray([1.5, 1.8]) * 27.211386245988,
+        np.asarray([1.5, 1.8]) * au2ev,
     )
     np.testing.assert_allclose(optical_x.oscillator_strengths, [0.12, 0.0])
     np.testing.assert_allclose(abs(optical_x.exciton_dipoles[0]), [0.2, 0.0, 0.0])
@@ -5585,6 +6694,717 @@ def test_periodic_tda_operator_eigensolve_matches_dense_roots(two_k_h2_reference
     assert result.info["residual_norms"][0] < 1.0e-11
     with pytest.raises(ValueError, match="nroots < dimension"):
         operator.eigensolve(nroots=operator.shape[0])
+
+
+def test_periodic_tda_operator_matches_dense_finite_momentum(two_k_h2_reference):
+    space = KPointTransitionSpace(two_k_h2_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    q_index = next(index for index in range(space.nqpts) if index != zero_index)
+    common = dict(
+        q_index=q_index,
+        direct_scale=1.25,
+        exchange_scale=0.25,
+        screened_exchange_scale=0.75,
+        g2_tol=1.0e-12,
+    )
+    dense = periodic_bse_matrices(space, **common)
+    operator = periodic_tda_operator(space, **common)
+    vector = np.asarray([0.3 + 0.2j, -0.4 + 0.1j])
+
+    np.testing.assert_allclose(operator.matvec(vector), dense.A @ vector, atol=1.0e-10)
+    assert operator.q_index == q_index
+    with pytest.raises(ValueError, match="q=0"):
+        operator.absorption(transition_velocity=np.zeros((2, 3)))
+
+
+def test_projected_tda_continuum_matches_explicit_q_basis():
+    hamiltonian = np.asarray(
+        [
+            [-0.5, 0.12 - 0.04j, 0.03, 0.0],
+            [0.12 + 0.04j, 0.1, -0.08j, 0.05],
+            [0.03, 0.08j, 0.8, -0.09],
+            [0.0, 0.05, -0.09, 1.4],
+        ],
+        dtype=np.complex128,
+    )
+    energies, vectors = np.linalg.eigh(hamiltonian)
+    active = vectors[:, :1]
+    coupling = np.asarray([[0.21, -0.07j, 0.13, 0.04 + 0.02j]])
+    continuum = ProjectedTDAContinuum(
+        hamiltonian,
+        active,
+        coupling,
+        solver_tol=1.0e-13,
+    )
+    energy = 0.37
+    eta = 0.025
+    q_vectors = vectors[:, 1:]
+    q_coupling = coupling @ q_vectors
+    expected = (
+        q_coupling / (energy + 1.0j * eta - energies[1:])[None, :]
+    ) @ q_coupling.conj().T
+
+    np.testing.assert_allclose(
+        continuum.self_energy(energy, eta=eta),
+        expected,
+        atol=2.0e-12,
+    )
+    times = np.asarray([0.0, 0.3, 1.1])
+    expected_memory = np.einsum(
+        "ac,tc,bc->tab",
+        q_coupling,
+        np.exp(-1.0j * np.outer(times, energies[1:])),
+        q_coupling.conj(),
+        optimize=True,
+    )
+    np.testing.assert_allclose(
+        continuum.memory_kernel(times),
+        expected_memory,
+        atol=3.0e-12,
+    )
+    sigma_operator = continuum.self_energy_operator(energy, eta=eta)
+    np.testing.assert_allclose(
+        sigma_operator.matvec(np.ones(1)),
+        expected[:, 0],
+        atol=2.0e-12,
+    )
+    np.testing.assert_allclose(continuum.excluded_hamiltonian, energies[:1, None])
+    assert continuum.ncontinuum == 3
+    assert continuum.removed_pole_coupling_norm > 0.0
+    assert continuum.excluded_residual_norms[0] < 1.0e-12
+    assert max(continuum.last_solve_info["residual_norms"]) < 1.0e-11
+    assert np.linalg.eigvalsh(continuum.hybridization(energy, eta=eta))[0] >= 0.0
+
+
+def test_projected_tda_continuum_is_active_phase_invariant():
+    hamiltonian = np.diag([-0.4, 0.2, 0.9]).astype(np.complex128)
+    active = np.asarray([[1.0], [0.0], [0.0]], dtype=np.complex128)
+    coupling = np.asarray([[0.3, 0.12 - 0.02j, -0.08j]])
+    reference = ProjectedTDAContinuum(hamiltonian, active, coupling)
+    transformed = ProjectedTDAContinuum(
+        hamiltonian,
+        active * np.exp(0.73j),
+        coupling,
+    )
+
+    np.testing.assert_allclose(
+        transformed.self_energy(0.4, eta=0.03),
+        reference.self_energy(0.4, eta=0.03),
+        atol=2.0e-14,
+    )
+
+
+def test_projected_tda_continuum_allows_no_excluded_target_poles():
+    hamiltonian = np.diag([0.2, 0.7, 1.1]).astype(np.complex128)
+    coupling = np.asarray(
+        [
+            [0.12, -0.04j, 0.08],
+            [0.03j, 0.09, -0.02],
+        ]
+    )
+    continuum = ProjectedTDAContinuum(
+        hamiltonian,
+        np.zeros((3, 0)),
+        coupling,
+    )
+    energy = 0.5
+    eta = 0.04
+    expected = (
+        coupling / (energy + 1.0j * eta - np.diag(hamiltonian))[None, :]
+    ) @ coupling.conj().T
+
+    np.testing.assert_allclose(
+        continuum.self_energy(energy, eta=eta),
+        expected,
+        atol=2.0e-13,
+    )
+    assert continuum.nactive == 2
+    assert continuum.nexcluded == 0
+    assert continuum.ncontinuum == 3
+
+
+def test_total_momentum_sector_wraps_phonon_momentum(two_k_h2_reference):
+    space = KPointTransitionSpace(two_k_h2_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    finite_index = next(index for index in range(space.nqpts) if index != zero_index)
+    sector = TotalMomentumSector(space, total_q_index=zero_index)
+
+    exciton_index = sector.exciton_q_index([finite_index], [1])
+    assert sector.contains(exciton_index, [finite_index], [1])
+    assert sector.exciton_q_index([finite_index], [2]) == zero_index
+    assert not sector.contains(zero_index, [finite_index], [1])
+
+
+def test_exciton_phonon_coupling_finite_difference_and_selection_rule(
+    two_k_h2_reference,
+):
+    space = KPointTransitionSpace(two_k_h2_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    finite_index = next(index for index in range(space.nqpts) if index != zero_index)
+    derivative = np.asarray(
+        [
+            [0.2, 0.04 - 0.03j],
+            [-0.07j, -0.1],
+        ]
+    )
+    reference = np.diag([0.4, 0.9]).astype(np.complex128)
+    displacement = 0.015
+    frequency = 0.25
+    coupling = ExcitonPhononCoupling.from_finite_difference(
+        reference + displacement * derivative,
+        reference - displacement * derivative,
+        displacement,
+        frequency,
+        phonon_q_index=finite_index,
+        source_q_index=zero_index,
+        target_q_index=finite_index,
+        branch=0,
+    ).validate_momentum(space)
+    source = np.asarray([[1.0], [0.0]])
+    target = np.eye(2)
+    expected = derivative @ source / np.sqrt(2.0 * frequency)
+
+    np.testing.assert_allclose(coupling.between(target, source), expected)
+    np.testing.assert_allclose(coupling.active_to_target(source), expected.conj().T)
+    channel = ExcitonPhononChannel.from_coupling(
+        coupling,
+        reference,
+        source,
+        occupation=0.2,
+    )
+    expected_sigma = (
+        expected.conj().T
+        / (0.6 + 0.02j - np.diag(reference))[None, :]
+    ) @ expected
+    np.testing.assert_allclose(
+        channel.continuum.self_energy(0.6, eta=0.02),
+        expected_sigma,
+        atol=2.0e-13,
+    )
+    assert channel.phonon_q_index == finite_index
+    assert channel.branch == 0
+    assert channel.occupation == 0.2
+    with pytest.raises(ValueError, match="momentum conservation"):
+        ExcitonPhononCoupling(
+            derivative,
+            frequency,
+            phonon_q_index=finite_index,
+            source_q_index=zero_index,
+            target_q_index=zero_index,
+        ).validate_momentum(space)
+
+
+def test_analytic_tda_electron_phonon_derivative_obeys_finite_q_rules(
+    four_band_two_k_reference,
+):
+    space = KPointTransitionSpace(four_band_two_k_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    phonon_index = next(
+        index for index in range(space.nqpts) if index != zero_index
+    )
+    mo_couplings = (
+        np.asarray(
+            [
+                [0.11, 0.02j, -0.03, 0.07],
+                [0.04, -0.05, 0.09j, -0.02],
+                [0.08j, 0.01, 0.13, -0.06],
+                [-0.03, 0.05j, 0.04, -0.10],
+            ],
+            dtype=np.complex128,
+        ),
+        np.asarray(
+            [
+                [-0.04, 0.03, 0.05j, 0.02],
+                [0.07j, 0.06, -0.01, 0.08],
+                [0.02, -0.09j, 0.12, 0.04],
+                [0.01j, -0.02, 0.03, -0.07],
+            ],
+            dtype=np.complex128,
+        ),
+    )
+    source_table = space.as_table(zero_index)
+    target_table = space.as_table(phonon_index)
+    expected = np.zeros(
+        (len(target_table), len(source_table)),
+        dtype=np.complex128,
+    )
+    qvec = space.qpts[phonon_index]
+    reference = space.reference
+    for row, target in enumerate(target_table):
+        for column, source in enumerate(source_table):
+            if (
+                target["k"] == source["k"]
+                and target["occ"] == source["occ"]
+            ):
+                expected[row, column] += mo_couplings[int(source["kq"])][
+                    int(target["vir"]),
+                    int(source["vir"]),
+                ]
+            target_plus_q = reference.find_kpoint_index(
+                reference.kpts[int(target["k"])] + qvec
+            )
+            if (
+                target["kq"] == source["kq"]
+                and target["vir"] == source["vir"]
+                and target_plus_q == source["k"]
+            ):
+                expected[row, column] -= mo_couplings[int(target["k"])][
+                    int(source["occ"]),
+                    int(target["occ"]),
+                ]
+
+    kernel_derivative = np.arange(expected.size).reshape(expected.shape) * 1.0e-4j
+    derivative = PeriodicTDAElectronPhononDerivative(
+        space,
+        zero_index,
+        phonon_index,
+        mo_couplings,
+        kernel_derivative=kernel_derivative,
+    )
+    expected += kernel_derivative
+    vector = np.linspace(0.2, 1.0, expected.shape[1]).astype(np.complex128)
+    target_vector = np.linspace(-0.3, 0.4, expected.shape[0]).astype(
+        np.complex128
+    )
+
+    np.testing.assert_allclose(derivative.toarray(), expected, atol=1.0e-14)
+    np.testing.assert_allclose(derivative.matvec(vector), expected @ vector)
+    np.testing.assert_allclose(
+        derivative.rmatvec(target_vector),
+        expected.conj().T @ target_vector,
+    )
+    assert derivative.target_q_index == phonon_index
+    assert derivative.info["kernel_derivative_included"]
+
+
+def test_static_transition_screening_response_matches_finite_difference():
+    from pyqed.pbc.gw.electron_phonon import (
+        _static_transition_screening_derivative,
+    )
+
+    rng = np.random.default_rng(14)
+    target_factor = rng.normal(size=(3, 3)) + 1j * rng.normal(size=(3, 3))
+    source_factor = rng.normal(size=(2, 2)) + 1j * rng.normal(size=(2, 2))
+    target_matrix = target_factor @ target_factor.conj().T + np.eye(3)
+    source_matrix = source_factor @ source_factor.conj().T + np.eye(2)
+    matrix1 = rng.normal(size=(3, 2)) + 1j * rng.normal(size=(3, 2))
+    left = rng.normal(size=3) + 1j * rng.normal(size=3)
+    right = rng.normal(size=2) + 1j * rng.normal(size=2)
+    left1 = rng.normal(size=2) + 1j * rng.normal(size=2)
+    right1 = rng.normal(size=3) + 1j * rng.normal(size=3)
+    scale = 1.7
+    actual = _static_transition_screening_derivative(
+        left,
+        right,
+        left1,
+        right1,
+        np.linalg.inv(target_matrix),
+        np.linalg.inv(source_matrix),
+        matrix1,
+        scale,
+    )
+
+    matrix0 = np.block(
+        [
+            [target_matrix, np.zeros((3, 2))],
+            [np.zeros((2, 3)), source_matrix],
+        ]
+    )
+    matrix_derivative = np.block(
+        [
+            [np.zeros((3, 3)), matrix1],
+            [np.zeros((2, 3)), np.zeros((2, 2))],
+        ]
+    )
+    left0 = np.concatenate((left.conj(), np.zeros(2)))
+    left_derivative = np.concatenate((np.zeros(3), left1))
+    right0 = np.concatenate((np.zeros(3), right))
+    right_derivative = np.concatenate((right1, np.zeros(2)))
+
+    def value(displacement):
+        return scale**2 * (
+            left0 + displacement * left_derivative
+        ) @ np.linalg.solve(
+            matrix0 + displacement * matrix_derivative,
+            right0 + displacement * right_derivative,
+        )
+
+    step = 1.0e-6
+    np.testing.assert_allclose(
+        actual,
+        (value(step) - value(-step)) / (2.0 * step),
+        atol=3.0e-8,
+        rtol=2.0e-8,
+    )
+
+
+def test_analytic_gamma_electron_phonon_gap_derivative_matches_displacement(
+    gamma_h2_mf,
+):
+    space = KPointTransitionSpace(gamma_h2_mf, qpts="gamma")
+    operator = periodic_tda_operator(
+        space,
+        q_index=0,
+        direct_scale=0.0,
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+    )
+    mode = np.zeros((2, 3))
+    mode[0, 0] = 1.0
+    frequency = 0.2
+    coupling = gamma_tda_electron_phonon_coupling(
+        operator,
+        mode,
+        frequency,
+        branch=0,
+        cphf_tol=1.0e-11,
+    )
+
+    def displaced_gap(displacement):
+        cell = Cell(
+            atom=[("H", (displacement, 0.0, 0.0)), ("H", (1.4, 0.0, 0.0))],
+            a=np.diag([5.0, 5.0, 5.0]),
+            basis="sto-3g",
+            unit="bohr",
+            dimension=3,
+            spin=0,
+        ).build()
+        mean_field = cell.KRHF(
+            eta=0.5,
+            real_cut=0,
+            pair_cut=0,
+            recip_cut=2,
+            jk_builder="ewald",
+        ).run(max_cycle=80, conv_tol=1.0e-11, conv_tol_dm=1.0e-9)
+        assert mean_field.converged
+        energies = np.asarray(mean_field.mo_energy, dtype=float).reshape(-1)
+        return energies[1] - energies[0]
+
+    step = 1.0e-4
+    cartesian_derivative = (
+        displaced_gap(step) - displaced_gap(-step)
+    ) / (2.0 * step)
+    from pyqed.units import amu_to_au
+
+    mass = gamma_h2_mf.cell.unit_molecule.atom_mass_list()[0] * amu_to_au
+    expected = cartesian_derivative / np.sqrt(mass)
+    actual = coupling.derivative.matvec(np.ones(1))[0]
+
+    np.testing.assert_allclose(actual.imag, 0.0, atol=2.0e-11)
+    np.testing.assert_allclose(actual.real, expected, atol=5.0e-6, rtol=0.0)
+    assert coupling.response.converged
+    assert coupling.info["analytic_driver"] == "gamma_krhf_cphf"
+    assert coupling.info["bse_screening_derivative"] == "frozen"
+    assert not coupling.info["kernel_derivative_included"]
+
+
+def test_analytic_tda_electron_phonon_coupling_applies_zero_point_scale(
+    two_k_h2_reference,
+):
+    space = KPointTransitionSpace(two_k_h2_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    phonon_index = next(
+        index for index in range(space.nqpts) if index != zero_index
+    )
+    fock_derivative = (
+        np.asarray([[0.2, -0.03j], [0.04, -0.1]]),
+        np.asarray([[-0.05, 0.02], [0.07j, 0.13]]),
+    )
+    frequency = 0.25
+    coupling = analytic_tda_electron_phonon_coupling(
+        space,
+        zero_index,
+        phonon_index,
+        frequency,
+        fock_derivative,
+        branch=2,
+    ).validate_momentum(space)
+    source = np.ones((coupling.derivative.shape[1], 1))
+    raw = coupling.derivative.matvec(source[:, 0])
+
+    np.testing.assert_allclose(
+        coupling.active_to_target(source),
+        (raw / np.sqrt(2.0 * frequency))[None, :].conj(),
+    )
+    assert coupling.branch == 2
+    assert coupling.info["approximation"] == "frozen_screening_one_body_fan"
+
+
+def test_commensurate_tda_electron_phonon_driver_uses_folded_q_blocks(
+    four_band_two_k_reference,
+    monkeypatch,
+):
+    space = KPointTransitionSpace(four_band_two_k_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    phonon_index = next(index for index in range(space.nqpts) if index != zero_index)
+    operator = periodic_tda_operator(
+        space,
+        q_index=zero_index,
+        direct_scale=0.0,
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+    )
+    fock = (
+        np.asarray([[0.2, -0.03j], [0.04, -0.1]]),
+        np.asarray([[-0.05, 0.02], [0.07j, 0.13]]),
+    )
+    overlap = tuple(np.zeros_like(block) for block in fock)
+
+    class FakeQDerivative:
+        fock_derivative = fock
+        overlap_derivative = overlap
+        response = object()
+        mode_vector = np.asarray([[1.0, 0.0, 0.0]])
+        cartesian_mode = mode_vector
+        info = {
+            "backend": "commensurate_twisted_supercell_gdf",
+            "mesh": (2, 1, 1),
+        }
+
+    def fake_q_derivative(mean_field, qpoint, mode_vector, **kwargs):
+        assert mean_field is four_band_two_k_reference
+        np.testing.assert_allclose(qpoint, space.qpts[phonon_index])
+        np.testing.assert_allclose(mode_vector, [[1.0, 0.0, 0.0]])
+        assert kwargs["mesh"] == (2, 1, 1)
+        return FakeQDerivative()
+
+    monkeypatch.setattr(
+        "pyqed.qchem.pbc.gdf_q_derivative",
+        fake_q_derivative,
+    )
+    kernel1 = np.full(
+        (
+            len(space.transitions(phonon_index)),
+            len(space.transitions(zero_index)),
+        ),
+        2.0e-4j,
+        dtype=np.complex128,
+    )
+    monkeypatch.setattr(
+        "pyqed.pbc.gw.electron_phonon."
+        "commensurate_gdf_bare_tda_kernel_derivative",
+        lambda source_operator, q_derivative: kernel1,
+    )
+    coupling = commensurate_tda_electron_phonon_coupling(
+        operator,
+        phonon_index,
+        [[1.0, 0.0, 0.0]],
+        0.25,
+        kernel_derivative="bare_gdf",
+        supercell_mesh=(2, 1, 1),
+    )
+    expected = analytic_tda_electron_phonon_coupling(
+        space,
+        zero_index,
+        phonon_index,
+        0.25,
+        fock,
+        overlap_derivative=overlap,
+        kernel_derivative=kernel1,
+    )
+
+    np.testing.assert_allclose(
+        coupling.electron_phonon_derivative.toarray(),
+        expected.electron_phonon_derivative.toarray(),
+    )
+    assert coupling.info["analytic_driver"] == (
+        "commensurate_twisted_supercell_gdf_cphf"
+    )
+    assert coupling.info["bse_screening_derivative"] == "frozen"
+    assert coupling.info["bse_kernel_derivative"] == "frozen_orbital_bare_gdf"
+
+    screened_response = object()
+    screened_components = {
+        "bare": 0.4 * kernel1,
+        "screened": 0.6 * kernel1,
+    }
+    monkeypatch.setattr(
+        "pyqed.pbc.gw.electron_phonon."
+        "_commensurate_gdf_screened_tda_kernel_derivative",
+        lambda source_operator, q_derivative: (
+            kernel1,
+            screened_response,
+            screened_components,
+        ),
+    )
+    screened = commensurate_tda_electron_phonon_coupling(
+        operator,
+        phonon_index,
+        [[1.0, 0.0, 0.0]],
+        0.25,
+        kernel_derivative="screened_gdf",
+        supercell_mesh=(2, 1, 1),
+    )
+    assert screened.gdf_screened_interaction_derivative is screened_response
+    assert screened.gdf_kernel_derivative_components is screened_components
+    assert screened.info["bse_screening_derivative"] == (
+        "static_off_diagonal_direct_rpa_gdf"
+    )
+    assert screened.info["bse_kernel_derivative"] == (
+        "bare_plus_static_screened_gdf"
+    )
+
+
+def test_gamma_one_body_tda_electron_phonon_derivative_is_hermitian(
+    four_band_two_k_reference,
+):
+    space = KPointTransitionSpace(four_band_two_k_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    source_index = next(
+        index for index in range(space.nqpts) if index != zero_index
+    )
+    first = np.asarray(
+        [
+            [0.11, 0.02j, -0.03, 0.07],
+            [-0.02j, -0.05, 0.09j, -0.02],
+            [-0.03, -0.09j, 0.13, -0.06],
+            [0.07, -0.02, -0.06, -0.10],
+        ],
+        dtype=np.complex128,
+    )
+    second = np.asarray(
+        [
+            [-0.04, 0.03, 0.05j, 0.02],
+            [0.03, 0.06, -0.01, 0.08],
+            [-0.05j, -0.01, 0.12, 0.04],
+            [0.02, 0.08, 0.04, -0.07],
+        ],
+        dtype=np.complex128,
+    )
+    derivative = PeriodicTDAElectronPhononDerivative(
+        space,
+        source_index,
+        zero_index,
+        (first, second),
+    ).toarray()
+
+    np.testing.assert_allclose(derivative, derivative.conj().T, atol=1.0e-14)
+
+
+def test_exciton_phonon_continuum_sums_emission_and_absorption_channels():
+    from pyqed.ldr import FeshbachEmbedding
+
+    hamiltonian_1 = np.diag([0.4, 0.8]).astype(np.complex128)
+    hamiltonian_2 = np.diag([0.6, 1.1]).astype(np.complex128)
+    coupling_1 = np.asarray([[0.12, -0.05j], [0.03, 0.08]])
+    coupling_2 = np.asarray([[0.04j, 0.09], [-0.07, 0.02j]])
+    continuum_1 = ProjectedTDAContinuum(
+        hamiltonian_1,
+        np.zeros((2, 0)),
+        coupling_1,
+    )
+    continuum_2 = ProjectedTDAContinuum(
+        hamiltonian_2,
+        np.zeros((2, 0)),
+        coupling_2,
+    )
+    channels = (
+        ExcitonPhononChannel(continuum_1, frequency=0.1, occupation=0.0),
+        ExcitonPhononChannel(continuum_2, frequency=0.2, occupation=0.35),
+    )
+    continuum = ExcitonPhononContinuum(channels)
+    energy = 0.7
+    eta = 0.03
+    expected = continuum_1.self_energy(energy - 0.1, eta=eta)
+    expected += 1.35 * continuum_2.self_energy(energy - 0.2, eta=eta)
+    expected += 0.35 * continuum_2.self_energy(energy + 0.2, eta=eta)
+
+    np.testing.assert_allclose(
+        continuum.self_energy(energy, eta=eta),
+        expected,
+        atol=2.0e-13,
+    )
+    times = np.asarray([0.0, 0.2, 0.7])
+    expected_memory = (
+        np.exp(-1.0j * 0.1 * times)[:, None, None]
+        * continuum_1.memory_kernel(times)
+    )
+    expected_memory += (
+        1.35 * np.exp(-1.0j * 0.2 * times)
+        + 0.35 * np.exp(1.0j * 0.2 * times)
+    )[:, None, None] * continuum_2.memory_kernel(times)
+    np.testing.assert_allclose(
+        continuum.memory_kernel(times),
+        expected_memory,
+        atol=3.0e-12,
+    )
+    assert np.min(np.linalg.eigvalsh(continuum.hybridization(energy, eta=eta))) > -1e-14
+    active_hamiltonian = np.diag([0.25, 0.45])
+    embedded = FeshbachEmbedding(active_hamiltonian, continuum)
+    expected_green = np.linalg.inv(
+        (energy + 1.0j * eta) * np.eye(2)
+        - active_hamiltonian
+        - expected
+    )
+    np.testing.assert_allclose(
+        embedded.green_function(energy, eta=eta),
+        expected_green,
+        atol=2.0e-12,
+    )
+    convenience = continuum.run_spectrum(
+        active_hamiltonian,
+        np.linspace(0.2, 1.2, 9),
+        eta=eta,
+    )
+    assert convenience is continuum.embedding
+    assert convenience.success
+    assert convenience.spectral_density.shape == (9,)
+    augmented = continuum.augmented_hamiltonian(active_hamiltonian)
+    identity = np.eye(augmented.shape[0], dtype=np.complex128)
+    dense_augmented = np.column_stack(
+        [augmented.matvec(identity[:, column]) for column in range(augmented.shape[0])]
+    )
+    complete_green = np.linalg.inv(
+        (energy + 1.0j * eta) * identity - dense_augmented
+    )
+    np.testing.assert_allclose(
+        complete_green[:2, :2],
+        expected_green,
+        atol=2.0e-12,
+    )
+    dynamics = continuum.run_dynamics(
+        active_hamiltonian,
+        np.asarray([1.0, 0.0]),
+        np.linspace(0.0, 8.0, 41),
+    )
+    assert dynamics.success
+    assert np.max(dynamics.continuum_population) > 1.0e-4
+    np.testing.assert_allclose(dynamics.total_norm, 1.0, atol=2.0e-12)
+
+
+def test_bose_occupation_uses_kelvin_and_exact_zero_temperature():
+    from pyqed.pbc.gw import bose_occupation
+    from pyqed.units import kelvin
+
+    frequency = 0.008
+    assert bose_occupation(frequency, 0.0) == 0.0
+    np.testing.assert_allclose(
+        bose_occupation(frequency, 300.0),
+        1.0 / np.expm1(frequency / (300.0 * kelvin)),
+        atol=1.0e-15,
+    )
+    with pytest.raises(ValueError, match="nonnegative"):
+        bose_occupation(frequency, -1.0)
+
+
+def test_gdf_q_derivative_factor_cache_is_shared(monkeypatch):
+    from pyqed.pbc.gw import electron_phonon as module
+
+    reference = object()
+    source_operator = SimpleNamespace(space=SimpleNamespace(reference=reference))
+    q_derivative = SimpleNamespace()
+    created = []
+
+    class FakeFactors:
+        def __init__(self, operator, derivative):
+            created.append((operator, derivative))
+
+    monkeypatch.setattr(module, "GDFQDerivativeFactors", FakeFactors)
+    first = module.gdf_q_derivative_factors(source_operator, q_derivative)
+    second = module.gdf_q_derivative_factors(source_operator, q_derivative)
+
+    assert first is second
+    assert created == [(source_operator, q_derivative)]
 
 
 def test_periodic_haydock_absorption_matches_explicit_tda_roots(two_k_h2_reference):

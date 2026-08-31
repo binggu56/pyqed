@@ -127,7 +127,7 @@ def _approximate_hessian_from_inverse(inv_hessian):
 def _evaluate_geometry(mf, mol_template, coords, trajectory, callback):
     mol = _copy_molecule(mol_template)
     mol.set_geom(coords)
-    mol.build(driver='gbasis')
+    mol.build()
 
     grid = _build_grid(mf, mol)
     step_mf = mf.__class__(mol, grid=grid, xc=mf.xc, init_guess=mf.init_guess)

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from pyqed.qchem import Molecule, RHF
+from pyqed.units import amu_to_au
 
 
 def _total_dipole_origin_zero(method):
@@ -20,7 +21,7 @@ def _rhf_at(coords):
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     return RHF(mol).run(tol=1.0e-11)
 
 
@@ -33,7 +34,7 @@ def test_native_rhf_hessian_matches_pyscf_h2():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(tol=1.0e-11)
 
     hess = mf.Hessian().run()
@@ -78,8 +79,31 @@ def test_native_rhf_hessian_rejects_density_fit_reference():
         unit="bohr",
         basis="sto-3g",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(density_fit=True)
 
     with pytest.raises(NotImplementedError, match="builtin RHF reference"):
         mf.Hessian().run()
+
+
+def test_normal_modes_select_distinct_targets_and_scale_dimensionless():
+    hessian = _rhf_at(np.array([[0.0, 0.0, -0.7], [0.0, 0.0, 0.7]])).Hessian()
+    omega_all = np.array((-0.01, 0.02, 0.03, 0.04))
+    modes_all = np.arange(24.0).reshape(4, 2, 3) + 1.0
+    hessian.vibrational_analysis = lambda **kwargs: {
+        "freq_au": omega_all,
+        "freq_cm1": np.array((-200.0, 500.0, 800.0, 1000.0)),
+        "modes": modes_all,
+    }
+
+    omega, modes = hessian.normal_modes(
+        targets=(990.0, 510.0),
+        dimensionless=True,
+    )
+
+    selected = np.array((3, 1))
+    np.testing.assert_allclose(omega, omega_all[selected])
+    np.testing.assert_allclose(
+        modes,
+        modes_all[selected] / np.sqrt(amu_to_au * omega)[:, None, None],
+    )

@@ -37,7 +37,7 @@ CASES = [
 
 def pyqed_rhf(case, x2c=False):
     mol = Molecule(atom=case.atom, basis=case.basis, unit=case.unit)
-    mol.build(driver="builtin", options={"coord_type": "spherical", "eri_representation": "dense", "aosym": "s1"})
+    mol.build(options={"coord_type": "spherical", "eri_representation": "dense", "aosym": "s1"})
     return RHF(mol).run(x2c=x2c, tol=1e-11, conv_tol_dm=1e-9, max_cycle=100)
 
 

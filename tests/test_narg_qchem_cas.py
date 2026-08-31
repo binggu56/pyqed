@@ -4,6 +4,10 @@ from scipy.sparse.linalg import eigsh
 from pyqed.narg.qchem import NARG, NARGSCF
 from pyqed.narg.qchem import abelian as abelian_narg
 from pyqed.narg.qchem.active_space import prepare_active_space
+from pyqed.narg.qchem.rdm import (
+    spin_traced_rdm1_from_state,
+    spin_traced_rdm2_from_state,
+)
 from pyqed.narg.core import narg_state_vector
 from pyqed.qchem import CASCI, Molecule
 from pyqed.mps.fermion import SpinHalfFermionChain
@@ -23,6 +27,15 @@ def _hubbard_integrals(nsites, *, t, u):
     for i in range(nsites):
         eri[i, i, i, i] = float(u)
     return h1e, eri
+
+
+def _assert_stored_state_energy(solver, h1e, eri, energy, *, atol=1.0e-10):
+    psi = narg_state_vector(solver.tensors[:-1], solver.tensors[-1], root=0)
+    hamiltonian = SpinHalfFermionChain(h1e, eri).jordan_wigner(
+        forward=False
+    ).toarray()
+    expectation = np.vdot(psi, hamiltonian @ psi) / np.vdot(psi, psi)
+    np.testing.assert_allclose(np.real(expectation), energy, atol=atol)
 
 
 def _periodic_hubbard_integrals(nsites, *, t, u):
@@ -104,7 +117,7 @@ def _hchain_sto3g_mf(nsites, spacing):
 
 def _h2_sto3g_mf():
     mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     return mol.RHF().run(verbose=0)
 
 
@@ -567,8 +580,46 @@ def test_abelian_narg_exposes_e_tot_and_rdms_directly():
     assert narg.e_tot.shape == (1,)
     assert dm1.shape == (2, 2)
     assert dm2.shape == (2, 2, 2, 2)
+    assert narg.rdm_backend == "tensor"
     np.testing.assert_allclose(np.trace(dm1), 2.0, atol=1.0e-10)
     np.testing.assert_allclose(e_active + narg.e_core, narg.e_tot[0], atol=1.0e-10)
+
+
+def test_abelian_standard_narg_tensor_rdms_match_dense_reference():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        @staticmethod
+        def energy_nuc():
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6, t=0.7, u=2.0)
+    solver = abelian_narg.NARG(
+        object(),
+        mol=DummyMol(),
+        D=8,
+        n0=1,
+        nstates=1,
+        growth_sites=1,
+    )
+    solver.run(h1e=h1e, eri=eri)
+
+    psi = narg_state_vector(solver.tensors[:-1], solver.tensors[-1], root=0)
+    dm1 = solver.make_rdm1()
+    dm2 = solver.make_rdm2()
+
+    assert solver.rdm_backend == "tensor"
+    assert solver.rdm_implicit_factor_count == 4
+    assert solver.rdm_factor_storage_bytes > 0
+    assert solver.rdm_environment_storage_bytes > 0
+    assert max(tensor.shape[0] for tensor in solver.tensors[1:-1]) >= 4 * 8
+    np.testing.assert_allclose(
+        dm1, spin_traced_rdm1_from_state(psi, 6), atol=1.0e-10
+    )
+    np.testing.assert_allclose(
+        dm2, spin_traced_rdm2_from_state(psi, 6), atol=1.0e-10
+    )
 
 
 def test_abelian_narg_rdm_requires_stored_tensors():
@@ -789,6 +840,111 @@ def test_sparse_operator_entries_reduce_hubbard_table():
     sparse_count = sum(len(required[pattern]) for pattern in abelian_narg.OPERATOR_PATTERNS)
     assert sparse_count < full_count // 4
     assert all(len(required[(name,)]) == 4 for name in ("Cu", "Cd", "Cdu", "Cdd"))
+
+
+def test_mo_pair_factors_match_dense_narg_energy():
+    class DummyMol:
+        nelec = (2, 2)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(4, t=0.7, u=2.0)
+    factors = np.zeros((4, 4, 4))
+    for site in range(4):
+        factors[site, site, site] = np.sqrt(2.0)
+    abelian_narg.mol = DummyMol()
+
+    np.testing.assert_allclose(abelian_narg.eri_to_dense(factors), eri, atol=1.0e-12)
+    dense_energy = abelian_narg.kernel(
+        h1e,
+        eri,
+        D=16,
+        n0=2,
+        nstates=1,
+    )[0]
+    factor_energy = abelian_narg.kernel(
+        h1e,
+        factors,
+        D=16,
+        n0=2,
+        nstates=1,
+    )[0]
+    dense_cluster_energy = abelian_narg.reduced_supersite_kernel(
+        h1e,
+        eri,
+        ((0, 1), (2, 3)),
+        D=16,
+        nstates=1,
+        nelec=DummyMol.nelec,
+    )[0]
+    factor_cluster_energy = abelian_narg.reduced_supersite_kernel(
+        h1e,
+        factors,
+        ((0, 1), (2, 3)),
+        D=16,
+        nstates=1,
+        nelec=DummyMol.nelec,
+    )[0]
+
+    np.testing.assert_allclose(factor_energy, dense_energy, atol=1.0e-12)
+    np.testing.assert_allclose(factor_cluster_energy, dense_cluster_energy, atol=1.0e-12)
+    assert factors.nbytes < eri.nbytes
+
+
+def test_cd_mean_field_stays_factorized_through_abelian_narg():
+    mol = Molecule(
+        atom="H 0 0 0; H 0 0 1.4",
+        unit="bohr",
+        basis="sto-3g",
+    )
+    mol.build(eri="cd",
+        options={"low_rank_tol": 1.0e-12},
+    )
+    mf = mol.RHF().run(verbose=0)
+    solver = abelian_narg.NARG(mf, mol=mol, D=4, n0=1, nstates=1)
+    factor_energy = solver.run()[0]
+
+    h1e = mf.get_hcore_mo()
+    dense_eri = mf.get_eri_mo()
+    abelian_narg.mol = mol
+    dense_energy = abelian_narg.kernel(
+        h1e,
+        dense_eri,
+        D=4,
+        n0=1,
+        nstates=1,
+    )[0]
+
+    assert solver.eri.ndim == 3
+    assert solver.eri.shape[1:] == h1e.shape
+    np.testing.assert_allclose(factor_energy, dense_energy, atol=1.0e-12)
+
+
+def test_one_site_hamiltonian_action_matches_explicit_kronecker_matrix():
+    rng = np.random.default_rng(9)
+    block = rng.normal(size=(5, 5))
+    block = 0.5 * (block + block.T)
+    coupling = rng.normal(size=(5, 5))
+    local = np.diag([0.0, 1.0, 2.0, 3.0])
+    transition = abelian_narg.cdu @ abelian_narg.cd
+    action = abelian_narg.OneSiteHamiltonianAction(5, 4)
+    action.add(block, local, 0.7)
+    action.add(coupling, transition, -0.2, hermitian=True)
+    explicit = 0.7 * np.kron(block, local)
+    term = -0.2 * np.kron(coupling, transition)
+    explicit += term + term.T.conj()
+    vectors = rng.normal(size=(20, 3))
+
+    np.testing.assert_allclose(action.matmat(vectors), explicit @ vectors, atol=1.0e-12)
+    for state in range(4):
+        rows = np.arange(5) * 4 + state
+        np.testing.assert_allclose(
+            action.diagonal_block(state),
+            explicit[np.ix_(rows, rows)],
+            atol=1.0e-12,
+        )
 
 
 def test_abelian_narg_sparse_operator_table_matches_dense_hubbard():
@@ -1066,9 +1222,10 @@ def test_abelian_recursive_conditional_cc_improves_truncated_hubbard_chain():
     assert plain - exact > 0.3
     assert dressed[0] - exact < 0.1
     assert dressed[0] < plain - 0.2
-    assert len(diagnostics) == 2
-    assert all(item["response_rank"] > 0 for item in diagnostics)
-    assert all(item["discarded_residual_norm"] > 0.0 for item in diagnostics)
+    assert len(diagnostics) == 3
+    assert diagnostics[0]["response_rank"] == 0
+    assert all(item["response_rank"] > 0 for item in diagnostics[1:])
+    assert all(item["discarded_residual_norm"] > 0.0 for item in diagnostics[1:])
     assert solver.tensors is None
 
 
@@ -1098,9 +1255,11 @@ def test_abelian_one_site_conditional_cc_projects_later_growth_operators():
     assert plain - exact > 0.5
     assert dressed[0] - exact < 0.16
     assert dressed[0] < plain - 0.4
-    assert len(solver.dressing_history) == 4
-    assert all(item["response_rank"] > 0 for item in solver.dressing_history)
-    assert solver.tensors is None
+    assert len(solver.dressing_history) == 5
+    assert solver.dressing_history[0]["response_rank"] == 0
+    assert all(item["response_rank"] > 0 for item in solver.dressing_history[1:])
+    assert solver.tensors is not None
+    _assert_stored_state_energy(solver, h1e, eri, dressed[0])
 
 
 def test_abelian_detached_frames_improve_same_dimension_hubbard_chain():
@@ -1118,7 +1277,7 @@ def test_abelian_detached_frames_improve_same_dimension_hubbard_chain():
     plain = abelian_narg.kernel(
         h1e,
         eri,
-        D=3,
+        D=2,
         n0=2,
         nstates=1,
         growth_sites=1,
@@ -1137,12 +1296,23 @@ def test_abelian_detached_frames_improve_same_dimension_hubbard_chain():
 
     assert exact <= detached + 1.0e-10
     assert detached < plain - 0.2
-    assert len(solver.detached_history) == 3
-    assert all(item["branch_ranks"] == (2, 2, 2, 2) for item in solver.detached_history)
-    assert all(item["detached_dim"] == 32 for item in solver.detached_history)
+    assert len(solver.detached_history) == 4
+    assert solver.detached_history[0]["branch_ranks"] == (2, 2, 2, 2)
+    assert all(
+        item["anchor_rank"] == sum(item["branch_ranks"])
+        for item in solver.detached_history
+    )
+    assert all(
+        item["detached_dim"] == 4 * item["frame_rank"]
+        for item in solver.detached_history
+    )
     assert all(item["retained_dim"] <= 12 for item in solver.detached_history)
     assert all(item["orthogonality_error"] < 1.0e-12 for item in solver.detached_history)
-    assert solver.tensors is None
+    assert all(item["anchor_inclusion_error"] < 1.0e-12 for item in solver.detached_history)
+    assert all(item["retained_anchor_error"] < 1.0e-12 for item in solver.detached_history)
+    assert all(item["detached_improvement"] >= -1.0e-12 for item in solver.detached_history)
+    assert solver.tensors is not None
+    _assert_stored_state_energy(solver, h1e, eri, detached)
 
 
 def test_abelian_detached_frames_adapt_rank_from_projected_residual():
@@ -1187,6 +1357,105 @@ def test_abelian_detached_frames_adapt_rank_from_projected_residual():
         <= item["frame_residual_history"][0] + 1.0e-12
         for item in adaptive.detached_history
     )
+
+
+def test_abelian_detached_cc_dresses_detached_projector_at_every_step():
+    class DummyMol:
+        nelec = (3, 3)
+        spin = 0
+
+        def energy_nuc(self):
+            return 0.0
+
+    h1e, eri = _hubbard_integrals(6, t=0.7, u=2.0)
+    exact = float(_sector_ground_energy(h1e, eri, DummyMol.nelec)[0])
+    abelian_narg.mol = DummyMol()
+    common = dict(
+        mol=DummyMol(),
+        D=2,
+        chi=12,
+        n0=2,
+        nstates=1,
+        growth_sites=1,
+    )
+    detached = abelian_narg.NARG(
+        object(), **common, dressing="detached_frames"
+    )
+    detached_energy = detached.run(h1e=h1e, eri=eri)[0][0]
+    combined = abelian_narg.NARG(
+        object(), **common, dressing="detached+cc"
+    )
+    combined_energy = combined.run(h1e=h1e, eri=eri)[0][0]
+
+    assert exact <= combined_energy + 1.0e-10
+    assert combined_energy < detached_energy - 0.4
+    assert len(combined.detached_history) == 4
+    assert len(combined.dressing_history) == 4
+    assert all(item["response_rank"] > 0 for item in combined.dressing_history)
+    assert all(
+        item["maximum_sector_leakage"] < 1.0e-8
+        for item in combined.detached_history
+    )
+    assert all(
+        item["sector_label_corrections"] >= 0
+        for item in combined.detached_history
+    )
+    _assert_stored_state_energy(combined, h1e, eri, combined_energy)
+    psi = narg_state_vector(combined.tensors[:-1], combined.tensors[-1], root=0)
+    dm1 = combined.make_rdm1()
+    dm2 = combined.make_rdm2()
+    assert combined.rdm_backend == "tensor"
+    np.testing.assert_allclose(
+        dm1, spin_traced_rdm1_from_state(psi, 6), atol=1.0e-10
+    )
+    np.testing.assert_allclose(
+        dm2, spin_traced_rdm2_from_state(psi, 6), atol=1.0e-10
+    )
+    np.testing.assert_allclose(np.trace(dm1), 6.0, atol=1.0e-10)
+    np.testing.assert_allclose(
+        np.einsum("pprr", dm2), 30.0, atol=1.0e-10
+    )
+
+
+def test_conditional_cc_uses_iterative_discarded_space_for_large_sector():
+    rng = np.random.default_rng(91)
+    old_dim = 20
+    local_dim = 4
+    full_dim = old_dim * local_dim
+    matrix = rng.normal(size=(full_dim, full_dim))
+    matrix = 0.5 * (matrix + matrix.T)
+    h_lloo = matrix.reshape(
+        old_dim, local_dim, old_dim, local_dim
+    ).transpose(1, 3, 0, 2)
+    trial = rng.normal(size=(full_dim, 4))
+    projector, _upper = np.linalg.qr(trial, mode="reduced")
+    projector = projector.reshape(old_dim, local_dim, 4)
+    primitive_qn = np.zeros((full_dim, 2), dtype=int)
+    output_qn = np.zeros((4, 2), dtype=int)
+    plain = projector.reshape(full_dim, 4)
+    plain_h = plain.conj().T @ matrix @ plain
+
+    dressed_h, dressed, diagnostics = (
+        abelian_narg.conditional_cc_transition_projector(
+            h_lloo,
+            primitive_qn,
+            projector,
+            output_qn,
+            level_shift=20.0,
+            response_tol=1.0e-9,
+        )
+    )
+
+    dressed_flat = dressed.reshape(full_dim, 4)
+    np.testing.assert_allclose(
+        dressed_flat.conj().T @ dressed_flat,
+        np.eye(4),
+        atol=1.0e-9,
+    )
+    assert np.trace(dressed_h).real <= np.trace(plain_h).real + 1.0e-10
+    assert diagnostics["iterative_solves"] == 4
+    assert diagnostics["iterative_fallbacks"] == 0
+    assert diagnostics["maximum_response_residual"] < 1.0e-8
 
 
 def test_abelian_narg_supersite_hubbard_uses_literal_d16_sites():
@@ -1301,7 +1570,7 @@ def test_abelian_narg_two_site_longer_hubbard_matches_exact_without_truncation()
     np.testing.assert_allclose(e, exact, atol=1e-10)
     assert x.shape[1] == 1
     assert sum(tensor.ndim == 4 for tensor in tensors[:-1]) == 1
-    assert [factor.get("growth_sites") for factor in tensor_qns["factors"]] == [None, 2, 1]
+    assert [factor.get("growth_sites") for factor in tensor_qns["factors"]] == [1, 2, 1]
 
 
 def test_abelian_narg_small_d_two_site_hubbard_improves_one_site():

@@ -18,8 +18,17 @@ clebsch_gordan_doubled = None
 reduced_product_block_sum = None
 reduced_product_block_sum_batch = None
 product_tensor_pair_entries = None
+product_tensor_pair_entries_batch = None
+scalar_product_pair_entries = None
 product_tensor_group_indices = None
 accumulate_bilinear = None
+accumulate_bilinear_wave = None
+reduced_growth_graph = None
+rotate_operator_blocks = None
+openmp_available = None
+set_num_threads = None
+get_num_threads = None
+openmp_info = None
 
 
 def _disabled(value) -> bool:
@@ -64,6 +73,49 @@ def _darwin_compile_setup():
     return cxx, flags
 
 
+def _openmp_build_setup():
+    """Return optional OpenMP compiler and linker flags."""
+    requested = os.environ.get("PYQED_NARG_OPENMP", "auto").strip().lower()
+    if requested in {"0", "false", "no", "off"}:
+        return [], [], "disabled"
+    if sys.platform == "win32":
+        return ["/openmp"], [], "msvc"
+    if sys.platform != "darwin":
+        return ["-fopenmp"], ["-fopenmp"], "gnu"
+
+    prefixes = []
+    explicit = os.environ.get("PYQED_OPENMP_PREFIX")
+    if explicit:
+        prefixes.append(Path(explicit))
+    prefixes.extend((Path("/opt/homebrew/opt/libomp"), Path("/usr/local/opt/libomp")))
+    prefixes.extend(
+        Path(value)
+        for value in (sys.prefix, os.environ.get("CONDA_PREFIX"))
+        if value
+    )
+    for prefix in dict.fromkeys(prefixes):
+        include = prefix / "include"
+        library = prefix / "lib"
+        dylib = library / "libomp.dylib"
+        archive = library / "libomp.a"
+        runtime = dylib if dylib.exists() else archive
+        if (include / "omp.h").exists() and runtime.exists():
+            link_flags = [str(runtime)]
+            if runtime.suffix == ".dylib":
+                link_flags.append("-Wl,-rpath," + str(library))
+            return (
+                ["-Xpreprocessor", "-fopenmp", "-I" + str(include)],
+                link_flags,
+                str(prefix),
+            )
+    if requested in {"1", "true", "yes", "on", "required"}:
+        raise RuntimeError(
+            "OpenMP was requested for SU2-NARG but libomp was not found; "
+            "set PYQED_OPENMP_PREFIX"
+        )
+    return [], [], "unavailable"
+
+
 def _compile_extension():
     global CPP_PRODUCT_BUILD_ERROR
 
@@ -92,6 +144,13 @@ def _compile_extension():
     stamp_path = build_dir / "_su2_native.stamp"
     fail_stamp_path = build_dir / "_su2_native.failed"
     source_mtime = str(source.stat().st_mtime_ns)
+    try:
+        openmp_compile_flags, openmp_link_flags, openmp_signature = (
+            _openmp_build_setup()
+        )
+    except Exception as exc:
+        CPP_PRODUCT_BUILD_ERROR = str(exc)
+        return None
     compile_signature = "|".join(
         [
             source.name,
@@ -100,6 +159,7 @@ def _compile_extension():
             sys.version.split()[0],
             sysconfig.get_config_var("CXX") or "",
             os.environ.get("CXX", ""),
+            "openmp=" + openmp_signature,
         ]
     )
     force_rebuild = _enabled(os.environ.get("SU2_NARG_FORCE_CPP_PRODUCT_REBUILD", "0"))
@@ -134,12 +194,14 @@ def _compile_extension():
             "-shared",
             "-fPIC",
             *darwin_flags,
+            *openmp_compile_flags,
             "-I" + sysconfig.get_paths()["include"],
             "-I" + pybind11.get_include(),
             "-I" + np.get_include(),
             str(source),
             "-o",
             str(ext_path),
+            *openmp_link_flags,
         ]
     )
     if sys.platform == "darwin":
@@ -181,8 +243,17 @@ def _initialize():
     global reduced_product_block_sum
     global reduced_product_block_sum_batch
     global product_tensor_pair_entries
+    global product_tensor_pair_entries_batch
+    global scalar_product_pair_entries
     global product_tensor_group_indices
     global accumulate_bilinear
+    global accumulate_bilinear_wave
+    global reduced_growth_graph
+    global rotate_operator_blocks
+    global openmp_available
+    global set_num_threads
+    global get_num_threads
+    global openmp_info
 
     if _disabled(os.environ.get("SU2_NARG_DISABLE_CPP_PRODUCT", "0")):
         return
@@ -197,8 +268,25 @@ def _initialize():
         None,
     )
     product_tensor_pair_entries = getattr(module, "product_tensor_pair_entries", None)
+    product_tensor_pair_entries_batch = getattr(
+        module,
+        "product_tensor_pair_entries_batch",
+        None,
+    )
+    scalar_product_pair_entries = getattr(module, "scalar_product_pair_entries", None)
     product_tensor_group_indices = getattr(module, "product_tensor_group_indices", None)
     accumulate_bilinear = getattr(module, "accumulate_bilinear", None)
+    accumulate_bilinear_wave = getattr(
+        module,
+        "accumulate_bilinear_wave",
+        None,
+    )
+    reduced_growth_graph = getattr(module, "reduced_growth_graph", None)
+    rotate_operator_blocks = getattr(module, "rotate_operator_blocks", None)
+    openmp_available = getattr(module, "openmp_available", None)
+    set_num_threads = getattr(module, "set_num_threads", None)
+    get_num_threads = getattr(module, "get_num_threads", None)
+    openmp_info = getattr(module, "openmp_info", None)
     CPP_PRODUCT_AVAILABLE = reduced_product_block_sum is not None
     CPP_ANGULAR_AVAILABLE = (
         product_tensor_pair_entries is not None

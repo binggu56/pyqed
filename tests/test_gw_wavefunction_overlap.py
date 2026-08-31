@@ -13,7 +13,7 @@ def _h2_gw(distance):
         basis="sto-3g",
         unit="angstrom",
     )
-    mol.build(driver="builtin", eri="dense")
+    mol.build(eri="dense")
     mf = RHF(mol).run(verbose=0)
     return GW(mf, screening="TDH", eta=1.0e-3).run()
 
@@ -56,7 +56,7 @@ def test_h2o_ccpvdz_wavefunction_overlap_keeps_cartesian_ao_metric():
             f"H 0  0.757 0.587"
         )
         mol = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-        mol.build(driver="builtin", eri="dense")
+        mol.build(eri="dense")
         mf = RHF(mol).run(verbose=0)
         tda = TDA(mf, screening="TDH", eta=1.0e-3).run(
             nroots=2,

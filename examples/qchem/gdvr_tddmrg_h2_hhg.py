@@ -29,7 +29,6 @@ from examples.qchem.gdvr_h2_hhg import (
     symmetry_diagnostics,
     write_csv,
 )
-from pyqed.mps.mps import expect_mps
 from pyqed.mps.tdmps import TDMPS
 from pyqed.qchem.gdvr import (
     acceleration_mpo,
@@ -120,8 +119,7 @@ def _expect_initial(td, psi, mpo, args):
             projection=_projection(args),
         )
         return helper._expectation(psi, mpo)
-    factors = mpo.factors if hasattr(mpo, "factors") else mpo
-    return expect_mps(psi.factors, factors)
+    return psi.expectation(mpo)
 
 
 def _tddmrg_trace(td, psi0, pulse, args, acc_mpo=None):
@@ -575,8 +573,8 @@ def run_case(args):
             "max_pre_normalization_norm_loss": float(np.nanmax(norm_loss)) if norm_loss.size else 0.0,
             "max_tdvp_truncation": None if trunc_error is None else float(np.nanmax(trunc_error)),
             "max_abs_energy_drift_ha": None if energy_drift is None else float(np.nanmax(np.abs(energy_drift))),
-            "symbolic_terms": int(td._active_integral_build_info["symbolic_terms"]),
-            "mpo_max_bond": int(td._active_integral_build_info["mpo_max_bond"]),
+            "symbolic_terms": int(td.build_info["symbolic_terms"]),
+            "mpo_max_bond": int(td.build_info["mpo_max_bond"]),
         },
         "analysis": {
             "window": str(analysis_window_name),

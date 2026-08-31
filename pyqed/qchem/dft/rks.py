@@ -108,6 +108,25 @@ class RKS:
     def get_ovlp(self):
         return self.mol.overlap
 
+    def dipole(self, center=None, basis='ao'):
+        if center is None:
+            center = self.mol.center_of_mass()
+        operator = -np.asarray(self.mol.moment_integral(center=center), dtype=float)
+        key = str(basis).lower()
+        if key == 'ao':
+            return operator
+        if key == 'mo':
+            if self.mo_coeff is None:
+                raise ValueError("Run RKS before requesting MO dipole integrals.")
+            return np.einsum(
+                'xpq,pi,qj->xij',
+                operator,
+                self.mo_coeff.conj(),
+                self.mo_coeff,
+                optimize=True,
+            )
+        raise ValueError("basis must be 'ao' or 'mo'.")
+
     def energy_nuc(self):
         return self.mol.energy_nuc()
 

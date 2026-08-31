@@ -4,6 +4,7 @@ from scipy.fft import fftn, fftfreq
 from scipy.interpolate import RegularGridInterpolator
 from pyqed.fft import fft3
 from pyqed.qchem.atomic_data import atomic_number, element_name
+from pyqed.units import au2angstrom
 
 
 def _require_pyscf():
@@ -545,7 +546,7 @@ _CROMER_MANN = {
     ),
 }
 
-_BOHR_TO_ANGSTROM = 0.529177210903
+_BOHR_TO_ANGSTROM = au2angstrom
 
 
 def _symbol_from_atom(atom):
@@ -1213,7 +1214,7 @@ class UED:
                     for sym, xyz in zip(symbols, coords_grid[idx], strict=True)
                 )
                 mol = Molecule(atom=atom, basis=basis, charge=charge, spin=spin, unit=unit)
-                mol.build(driver=self._data_value(data, ("build_driver",), default="gbasis"))
+                mol.build()
                 mol_grid[idx] = mol
             return mol_grid
 

@@ -80,7 +80,7 @@ def _capture_pyscf_macro_history(mc, mo_coeff):
 
 def _run_pyqed_case(case):
     mol = Molecule(atom=copy.deepcopy(case["atom_list"]), unit=case["unit"], basis=case["basis"])
-    mol.build(driver="pyscf")
+    mol.build()
     mf = mol.RHF().run()
 
     mc = CASSCF(

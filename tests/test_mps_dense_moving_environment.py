@@ -11,6 +11,8 @@ from pyqed.mps.mps import (
     coarse_grain_MPS,
     contract_from_left,
     contract_from_right,
+    initial_E,
+    initial_F,
 )
 
 
@@ -25,7 +27,7 @@ def test_dense_dmrg_uses_moving_environment_with_old_path_parity():
         init_guess=initial,
         not_conv_err=False,
         verbose=0,
-        performance="generic",
+        performance="reference",
     )
     moved = DMRG(hamiltonian, **common).run()
     direct = DMRG(
@@ -49,6 +51,17 @@ def test_dense_dmrg_uses_moving_environment_with_old_path_parity():
         "dense_cpp_matvec",
     }
     assert matvec_profile["local_solver"]["kind"] in {"eigsh", "dense_fallback"}
+
+
+def test_dense_dmrg_requires_mpo_and_mps_owners():
+    model = Heisenberg(L=4)
+    hamiltonian = model.build_H_mpo()
+    initial = model.build_neel_state()
+
+    with pytest.raises(TypeError, match="MPO Hamiltonian"):
+        DMRG(hamiltonian.factors, D=4, init_guess=initial)
+    with pytest.raises(TypeError, match="MPS initial guess"):
+        DMRG(hamiltonian, D=4, init_guess=initial.factors)
 
 
 def test_dense_cpp_matvec_matches_numpy_when_available():
@@ -79,6 +92,90 @@ def test_dense_cpp_matvec_matches_numpy_when_available():
 
     np.testing.assert_allclose(cpp_op.matvec(v), py_op.matvec(v), atol=1.0e-10)
     assert cpp_op.profile_summary()["dominant_path"] == "dense_cpp_matvec"
+
+
+def test_dense_cpp_openmp_matvec_matches_serial_when_available():
+    if (
+        not cpp_davidson.CPP_DAVIDSON_AVAILABLE
+        or cpp_davidson.DenseDavidsonWorkspace is None
+        or not callable(cpp_davidson.openmp_available)
+        or not cpp_davidson.openmp_available()
+    ):
+        pytest.skip("C++ OpenMP DMRG backend is unavailable")
+
+    rng = np.random.default_rng(29)
+    e = rng.normal(size=(3, 7, 7)) + 1j * rng.normal(size=(3, 7, 7))
+    w = rng.normal(size=(3, 4, 4, 4)) + 1j * rng.normal(size=(3, 4, 4, 4))
+    f = rng.normal(size=(4, 8, 8)) + 1j * rng.normal(size=(4, 8, 8))
+    v = rng.normal(size=7 * 4 * 8) + 1j * rng.normal(size=7 * 4 * 8)
+    previous = cpp_davidson.get_num_threads()
+    try:
+        workspace = cpp_davidson.DenseDavidsonWorkspace()
+        workspace.bind(e, w, f)
+        cpp_davidson.set_num_threads(1)
+        serial = workspace.matvec(v, "loop")
+        cpp_davidson.set_num_threads(2)
+        parallel = workspace.matvec(v, "openmp")
+        np.testing.assert_allclose(parallel, serial, atol=1.0e-12)
+        stats = dict(workspace.stats())
+        assert stats["last_matvec_backend"] == "openmp"
+        assert stats["openmp_matvec_calls"] == 1
+        assert stats["openmp"]["threads"] == 2
+    finally:
+        cpp_davidson.set_num_threads(previous)
+
+
+def test_dmrg_n_threads_configures_native_and_numba_backends():
+    model = Heisenberg(L=4)
+    native_previous = (
+        cpp_davidson.get_num_threads()
+        if callable(cpp_davidson.get_num_threads)
+        else None
+    )
+    from numba import get_num_threads, set_num_threads
+
+    numba_previous = get_num_threads()
+    try:
+        dmrg = DMRG(
+            model.build_H_mpo(),
+            D=4,
+            init_guess=model.build_neel_state(),
+            nsweeps=1,
+            not_conv_err=False,
+            performance="dense",
+            n_threads=2,
+        )
+        assert dmrg.n_threads == 2
+        assert dmrg.threading_info["numba"]["threads"] == 2
+        native = dmrg.threading_info["native_openmp"]
+        if native.get("available", False):
+            assert native["threads"] == 2
+            assert (
+                dmrg.abelian_matvec_options[
+                    "moving_environment_dense_cpp_davidson_backend"
+                ]
+                == "openmp"
+            )
+            dmrg.run()
+            update = dmrg.sweep_history[-1]["updates"][-1]
+            assert update["matvec_profile"]["dominant_path"].endswith(
+                "_openmp"
+            )
+    finally:
+        set_num_threads(numba_previous)
+        if native_previous is not None:
+            cpp_davidson.set_num_threads(native_previous)
+
+
+def test_dmrg_rejects_invalid_thread_count():
+    model = Heisenberg(L=4)
+    with pytest.raises(ValueError, match="n_threads"):
+        DMRG(
+            model.build_H_mpo(),
+            D=4,
+            init_guess=model.build_neel_state(),
+            n_threads=0,
+        )
 
 
 def test_dense_cpp_tensor_primitives_match_numpy_when_available():
@@ -402,6 +499,91 @@ def test_dense_cpp_sweep_workspace_two_site_solve_when_available():
     assert owner.stats()["two_site_static_w_reuses"] == 1
 
 
+def test_dense_cpp_workspace_runs_complete_dmrg_half_sweeps_when_available():
+    if (
+        not cpp_davidson.CPP_DAVIDSON_AVAILABLE
+        or cpp_davidson.DenseSweepWorkspace is None
+        or not hasattr(cpp_davidson.DenseSweepWorkspace(), "dmrg_half_sweep")
+    ):
+        pytest.skip("C++ dense DMRG sweep controller is unavailable")
+
+    model = Heisenberg(L=4)
+    hamiltonian = model.build_H_mpo()
+    initial = model.build_neel_state()
+    reference = DMRG(
+        hamiltonian,
+        D=4,
+        nsweeps=2,
+        init_guess=initial,
+        not_conv_err=False,
+        verbose=0,
+        performance="reference",
+        recenter_final=False,
+        final_expectation=False,
+    ).run()
+
+    owner = cpp_davidson.DenseSweepWorkspace()
+    left = owner.dmrg_half_sweep(
+        initial.factors,
+        hamiltonian.factors,
+        initial_E(hamiltonian.factors[0]),
+        initial_F(hamiltonian.factors[-1]),
+        "lr",
+        4,
+        1.0e-9,
+        5000,
+        64,
+        False,
+        "blas",
+        True,
+        chain_key="test-dmrg-chain",
+    )
+    right = owner.dmrg_half_sweep(
+        left["factors"],
+        hamiltonian.factors,
+        initial_E(hamiltonian.factors[0]),
+        initial_F(hamiltonian.factors[-1]),
+        "rl",
+        4,
+        1.0e-9,
+        5000,
+        64,
+        False,
+        "blas",
+        True,
+        chain_key="test-dmrg-chain",
+    )
+    final = owner.dmrg_half_sweep(
+        right["factors"],
+        hamiltonian.factors,
+        initial_E(hamiltonian.factors[0]),
+        initial_F(hamiltonian.factors[-1]),
+        "lr",
+        4,
+        1.0e-9,
+        5000,
+        64,
+        False,
+        "blas",
+        True,
+        chain_key="test-dmrg-chain",
+    )
+
+    assert len(left["updates"]) == len(initial.factors) - 2
+    assert len(left["left_environments"]) == len(initial.factors) - 1
+    assert len(left["right_environments"]) == 1
+    assert len(right["left_environments"]) == 1
+    assert len(right["right_environments"]) == len(initial.factors) - 1
+    assert np.allclose(final["energy"], reference.e_tot, atol=1.0e-10)
+    stats = owner.stats()
+    assert stats["dmrg_half_sweep_calls"] == 3
+    assert stats["dmrg_half_sweep_bonds"] == 3 * (len(initial.factors) - 2)
+    assert stats["dmrg_chain_installs"] == 1
+    assert stats["dmrg_chain_reuses"] == 2
+    assert stats["dmrg_environment_chain_reuses"] == 2
+    assert stats["dmrg_environment_buffer_reuses"] >= 1
+
+
 def test_dense_dmrg_can_use_cpp_davidson_workspace_when_enabled():
     if (
         not cpp_davidson.CPP_DAVIDSON_AVAILABLE
@@ -418,7 +600,7 @@ def test_dense_dmrg_can_use_cpp_davidson_workspace_when_enabled():
         init_guess=initial,
         not_conv_err=False,
         verbose=0,
-        performance="generic",
+        performance="reference",
     )
     reference = DMRG(hamiltonian, **common).run()
     moved = DMRG(
@@ -481,7 +663,7 @@ def test_dense_dmrg_can_use_fused_cpp_two_site_solve_when_enabled():
         init_guess=initial,
         not_conv_err=False,
         verbose=0,
-        performance="generic",
+        performance="reference",
     )
     reference = DMRG(hamiltonian, **common).run()
     moved = DMRG(
@@ -523,7 +705,7 @@ def test_dense_dmrg_can_use_fused_cpp_block_davidson_when_enabled():
         init_guess=initial,
         not_conv_err=False,
         verbose=0,
-        performance="generic",
+        performance="reference",
     )
     reference = DMRG(hamiltonian, **common).run()
     moved = DMRG(
@@ -566,7 +748,7 @@ def test_dense_dmrg_accepts_mpo_wrapper_when_final_gauge_is_left():
         init_guess=initial,
         not_conv_err=False,
         verbose=0,
-        performance="generic",
+        performance="reference",
         abelian_matvec_options={
             "moving_environment_dense_cpp_davidson": True,
             "moving_environment_dense_cpp_davidson_backend": "blas",
@@ -576,9 +758,11 @@ def test_dense_dmrg_accepts_mpo_wrapper_when_final_gauge_is_left():
     assert np.isfinite(dmrg.e_tot)
     assert dmrg.gauge.lower() == "left"
     assert dmrg.ground_state.center == len(hamiltonian.factors) - 1
+    assert dmrg.ground_state.sites == hamiltonian.sites == initial.sites
+    assert dmrg.ground_state.legs == tuple(site.leg for site in model.sites)
 
 
-def test_dense_dmrg_generic_cpp_policy_uses_fused_local_solve():
+def test_dense_dmrg_dense_policy_uses_fused_local_solve():
     model = Heisenberg(L=8)
     hamiltonian = model.build_H_mpo()
     initial = model.build_neel_state()
@@ -590,7 +774,7 @@ def test_dense_dmrg_generic_cpp_policy_uses_fused_local_solve():
         init_guess=initial,
         not_conv_err=False,
         verbose=0,
-        performance="generic-cpp",
+        performance="dense",
     ).run()
 
     moving_profile = dmrg.sweep_history[-1]["environment_profile"][
@@ -602,10 +786,14 @@ def test_dense_dmrg_generic_cpp_policy_uses_fused_local_solve():
     assert last_profile["local_solver"]["two_site_solver"]
     assert moving_profile["dense_cpp_sweep_workspace_two_site_solve_calls"] >= 1
     assert moving_profile["dense_cpp_environment_update_calls"] == 0
+    assert moving_profile["dense_cpp_dmrg_sweep_accepts"] >= 1
+    assert moving_profile["dense_cpp_dmrg_sweep_backend_actual"] == (
+        "cpp_dense_dmrg_half_sweep"
+    )
 
 
-def test_dense_dmrg_auto_policy_uses_generic_cpp_for_dense_mpo():
-    model = Heisenberg(L=8)
+def test_dense_dmrg_auto_policy_uses_dense_backend_for_dense_mpo():
+    model = Heisenberg(L=12)
     hamiltonian = model.build_H_mpo()
     initial = model.build_neel_state()
 
@@ -623,7 +811,20 @@ def test_dense_dmrg_auto_policy_uses_generic_cpp_for_dense_mpo():
     ]
     last_profile = dmrg.sweep_history[-1]["updates"][-1]["matvec_profile"]
     assert dmrg.performance == "auto"
-    assert dmrg.resolved_performance == "generic-cpp"
+    assert dmrg.resolved_performance == "dense"
     assert last_profile["local_solver"]["kind"] == "cpp_dense_davidson"
     assert last_profile["local_solver"]["two_site_solver"]
     assert moving_profile["dense_cpp_sweep_workspace_two_site_solve_calls"] >= 1
+
+
+def test_symmetric_dmrg_auto_policy_uses_symmetric_backend():
+    model = Heisenberg(L=4)
+    dmrg = DMRG(
+        model.build_H_mpo(),
+        D=4,
+        init_guess=model.build_neel_state(),
+        symmetry=True,
+    )
+
+    assert dmrg.performance == "auto"
+    assert dmrg.resolved_performance == "symmetric"

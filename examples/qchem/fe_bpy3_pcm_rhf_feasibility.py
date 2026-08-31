@@ -85,7 +85,6 @@ def build_parser():
     parser.add_argument("--basis", default="6-31g")
     parser.add_argument("--charge", type=int, default=2)
     parser.add_argument("--spin", type=int, default=0)
-    parser.add_argument("--driver", default="builtin")
     parser.add_argument("--eri", choices=("auto", "dense", "s4", "s8", "direct", "factors", "ri"), default="ri")
     parser.add_argument("--auxbasis", default="def2-svp-rifit")
     parser.add_argument("--parallel", action=argparse.BooleanOptionalAction, default=True)
@@ -141,9 +140,7 @@ def main(argv=None):
 
     _, build_seconds = timed(
         "PyQED integral build",
-        lambda: mol.build(
-            driver=args.driver,
-            eri=args.eri,
+        lambda: mol.build(eri=args.eri,
             auxbasis=args.auxbasis,
             options=build_options,
         ),
@@ -257,7 +254,7 @@ def main(argv=None):
         "charge": args.charge,
         "spin": args.spin,
         "basis": args.basis,
-        "driver": args.driver,
+        "integral_engine": "native",
         "eri": args.eri,
         "auxbasis": args.auxbasis,
         "build_options": build_options,

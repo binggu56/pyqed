@@ -8,6 +8,7 @@ from pyqed.qchem.dmrg.backends.reduced import (
 from pyqed.qchem.dmrg.spatial_terms import (
     dense_from_spatial_term_map,
     spatial_complementary_family_term_maps,
+    spatial_jw_pattern_spec,
     spatial_local_ops,
 )
 
@@ -132,6 +133,56 @@ def test_cpp_spatial_block2_carrier_shape():
     assert factors[0].shape == (1, 1, 4, 4)
     assert np.allclose(factors[0][0, 0], np.eye(4))
     assert dict(native["info"])["qchem_compile_backend_actual"] == "cpp"
+
+
+def test_cpp_same_side_p_pattern_spans_match_python_operator_algebra():
+    builder = cpp_davidson.build_spatial_same_side_p_pattern_spans
+    if not cpp_davidson.CPP_DAVIDSON_AVAILABLE or builder is None:
+        pytest.skip("C++ same-side P pattern compiler is unavailable")
+
+    n_sites = 3
+    raw_keys = tuple(
+        (p, q, r, s)
+        for p in range(n_sites)
+        for q in range(n_sites)
+        for r in range(n_sites)
+        for s in range(n_sites)
+    )
+    native = builder(raw_keys, n_sites)
+    native_ops = dict(native["local_ops"])
+    symbol_sets = (
+        ("cdu", "cu", "cdu", "cu"),
+        ("cdu", "cu", "cdd", "cd"),
+        ("cdd", "cd", "cdu", "cu"),
+        ("cdd", "cd", "cdd", "cd"),
+    )
+    for raw_key in raw_keys:
+        expected = []
+        for symbols in symbol_sets:
+            pattern, factor = spatial_jw_pattern_spec(
+                symbols,
+                raw_key,
+                n_sites,
+            )
+            if pattern and abs(factor) > 1.0e-14:
+                expected.append((pattern, factor))
+        actual = tuple(native["spans"][raw_key])
+        assert len(actual) == len(expected)
+        for (pattern, factor, min_site, max_site), (ref_pattern, ref_factor) in zip(
+            actual,
+            expected,
+        ):
+            assert factor == pytest.approx(ref_factor, abs=1.0e-14)
+            python_ops = spatial_local_ops()
+            for piece, ref_piece in zip(pattern, ref_pattern):
+                np.testing.assert_allclose(
+                    native_ops.get(piece, python_ops.get(piece)),
+                    native_ops.get(ref_piece, python_ops.get(ref_piece)),
+                    atol=1.0e-14,
+                )
+            active = [site for site, piece in enumerate(pattern) if piece != "I"]
+            assert min_site == (active[0] if active else n_sites)
+            assert max_site == (active[-1] if active else -1)
 
 
 def _sparse_coefficients_from_spatial_term_map(term_map, n_sites, local_ops=None):

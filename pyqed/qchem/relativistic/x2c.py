@@ -1,15 +1,14 @@
 """Spin-free one-electron X2C Hamiltonian."""
 
-from collections import defaultdict, deque
 from functools import reduce
 
 import numpy as np
 from scipy import linalg
 
-from pyqed import dag
+from pyqed import dag, fine_structure
 from pyqed.qchem._libcint import CBasis1e
 
-LIGHT_SPEED = 137.03599967994
+LIGHT_SPEED = 1.0 / fine_structure
 LINEAR_DEP_THRESHOLD = 1.0e-14
 
 
@@ -72,10 +71,6 @@ def _pyscf_integrals(mol):
     )
 
 
-def _normalize_ao_label(label):
-    return " ".join(str(label).split())
-
-
 def _pyscf_integrals_in_mol_order(mol):
     """
     Return PySCF one-electron X2C integrals reordered to ``mol`` AO labels.
@@ -86,18 +81,7 @@ def _pyscf_integrals_in_mol_order(mol):
     ``mol.overlap``/``mol.hcore``.
     """
     pmol = mol.topyscf()
-    pyqed_labels = [_normalize_ao_label(label) for label in mol.ao_labels()]
-    pyscf_labels = [_normalize_ao_label(label) for label in pmol.ao_labels()]
-    positions = defaultdict(deque)
-    for idx, label in enumerate(pyscf_labels):
-        positions[label].append(idx)
-
-    try:
-        perm = np.asarray([positions[label].popleft() for label in pyqed_labels], dtype=int)
-    except (IndexError, KeyError) as exc:
-        raise ValueError("Cannot align PySCF AO labels with the pyqed molecule AO labels.") from exc
-    if any(positions[label] for label in positions):
-        raise ValueError("Cannot align PySCF AO labels with the pyqed molecule AO labels.")
+    perm = mol.pyscf_ao_permutation(pmol)
 
     integrals = _pyscf_integrals(mol)
     reordered = tuple(mat[np.ix_(perm, perm)] for mat in integrals)

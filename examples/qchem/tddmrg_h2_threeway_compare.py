@@ -20,7 +20,6 @@ from pyqed.qchem.hf import RHF
 from pyqed.qchem.dmrg import TDDMRG
 from pyqed.qchem.dmrg.tddmrg import _mpo_to_dense_matrix
 from pyqed.mps.decompose import tt_to_tensor
-from pyqed.mps.mps import expect_mps
 
 
 def main():
@@ -34,7 +33,7 @@ def main():
         basis="sto-3g",
     )
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        mol.build(driver="gbasis")
+        mol.build()
         mf = RHF(mol).run()
 
     omega = 0.6
@@ -61,7 +60,7 @@ def main():
 
     psi0 = td.export_ground_state(dense=True)
     mu_mpo = td.get_interaction_mpo(axis=2)
-    mu0 = float(np.real(expect_mps(psi0.factors, mu_mpo.factors)))
+    mu0 = float(np.real(psi0.expectation(mu_mpo)))
 
     with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
         td.run(dt=dt, steps=steps, interval=1, field=pulse, e_ops=["mu_z"])

@@ -21,12 +21,30 @@
 #include <Accelerate/Accelerate.h>
 #include <malloc/malloc.h>
 #define PYQED_TDVP_HAS_BLAS 1
+#elif defined(PYQED_TDVP_USE_CBLAS)
+#include <cblas.h>
+#define PYQED_TDVP_HAS_BLAS 1
 #else
 #define PYQED_TDVP_HAS_BLAS 0
 #endif
 
 namespace py = pybind11;
 using cdouble = std::complex<double>;
+#ifdef __APPLE__
+using lapack_complex = __CLPK_doublecomplex;
+#elif defined(PYQED_TDVP_USE_CBLAS)
+using lapack_complex = cdouble;
+extern "C" {
+void zgeqrf_(
+    const int*, const int*, lapack_complex*, const int*, lapack_complex*,
+    lapack_complex*, const int*, int*
+);
+void zungqr_(
+    const int*, const int*, const int*, lapack_complex*, const int*,
+    const lapack_complex*, lapack_complex*, const int*, int*
+);
+}
+#endif
 using CArray = py::array_t<
     cdouble,
     py::array::c_style | py::array::forcecast
@@ -2516,10 +2534,10 @@ static DenseQRResult dense_thin_qr(
     zgeqrf_(
         &m_arg,
         &n_arg,
-        reinterpret_cast<__CLPK_doublecomplex*>(a.data()),
+        reinterpret_cast<lapack_complex*>(a.data()),
         &lda_arg,
-        reinterpret_cast<__CLPK_doublecomplex*>(tau.data()),
-        reinterpret_cast<__CLPK_doublecomplex*>(&work_query),
+        reinterpret_cast<lapack_complex*>(tau.data()),
+        reinterpret_cast<lapack_complex*>(&work_query),
         &lwork,
         &info
     );
@@ -2533,10 +2551,10 @@ static DenseQRResult dense_thin_qr(
     zgeqrf_(
         &m_arg,
         &n_arg,
-        reinterpret_cast<__CLPK_doublecomplex*>(a.data()),
+        reinterpret_cast<lapack_complex*>(a.data()),
         &lda_arg,
-        reinterpret_cast<__CLPK_doublecomplex*>(tau.data()),
-        reinterpret_cast<__CLPK_doublecomplex*>(work.data()),
+        reinterpret_cast<lapack_complex*>(tau.data()),
+        reinterpret_cast<lapack_complex*>(work.data()),
         &lwork,
         &info
     );
@@ -2562,10 +2580,10 @@ static DenseQRResult dense_thin_qr(
         &q_m,
         &q_n,
         &q_k,
-        reinterpret_cast<__CLPK_doublecomplex*>(a.data()),
+        reinterpret_cast<lapack_complex*>(a.data()),
         &lda_arg,
-        reinterpret_cast<__CLPK_doublecomplex*>(tau.data()),
-        reinterpret_cast<__CLPK_doublecomplex*>(&work_query),
+        reinterpret_cast<lapack_complex*>(tau.data()),
+        reinterpret_cast<lapack_complex*>(&work_query),
         &lwork,
         &info
     );
@@ -2580,10 +2598,10 @@ static DenseQRResult dense_thin_qr(
         &q_m,
         &q_n,
         &q_k,
-        reinterpret_cast<__CLPK_doublecomplex*>(a.data()),
+        reinterpret_cast<lapack_complex*>(a.data()),
         &lda_arg,
-        reinterpret_cast<__CLPK_doublecomplex*>(tau.data()),
-        reinterpret_cast<__CLPK_doublecomplex*>(work.data()),
+        reinterpret_cast<lapack_complex*>(tau.data()),
+        reinterpret_cast<lapack_complex*>(work.data()),
         &lwork,
         &info
     );

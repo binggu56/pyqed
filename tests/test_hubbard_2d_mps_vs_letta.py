@@ -9,7 +9,7 @@ from examples.mps.hubbard_2d_mps_vs_letta import (
     rung_site_qn_maps,
     site_qn_maps,
 )
-from pyqed.mps import MPO, dense_to_symmetric_mpo
+from pyqed.mps import MPO, MPS, dense_to_symmetric_mpo
 from pyqed.mps.abelian_storage import SymmetryManager
 from pyqed.mps.dmrg import DMRG, dmrg_matvec_options
 
@@ -23,7 +23,7 @@ def test_abelian_dmrg_history_reports_post_truncation_energy_for_2d_hubbard():
         ordering="snake",
     )
     qn_maps = site_qn_maps(4)
-    opts = dmrg_matvec_options("packed-cpp-fast")
+    opts = dmrg_matvec_options("symmetric")
     symmetric_mpo = dense_to_symmetric_mpo(
         dense_mpo,
         qn_maps,
@@ -41,10 +41,15 @@ def test_abelian_dmrg_history_reports_post_truncation_energy_for_2d_hubbard():
         seed=9,
     )
 
+    hamiltonian = MPO(symmetric_mpo)
     dmrg = DMRG(
-        MPO(symmetric_mpo),
+        hamiltonian,
         D=8,
-        init_guess=initial,
+        init_guess=MPS(
+            initial,
+            labels=["lv", "rv", "p"],
+            sites=hamiltonian.input_sites,
+        ),
         nsweeps=2,
         opt="2site",
         symmetry=True,
@@ -52,7 +57,7 @@ def test_abelian_dmrg_history_reports_post_truncation_energy_for_2d_hubbard():
         sym_mgr=sym_mgr,
         site_qn_maps=qn_maps,
         not_conv_err=False,
-        performance="packed-cpp-fast",
+        performance="symmetric",
         abelian_matvec_options=opts,
         sweep_tol=1.0e-10,
         davidson_tol=1.0e-9,

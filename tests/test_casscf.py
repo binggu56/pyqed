@@ -11,6 +11,7 @@ from pyqed.qchem import (
     soc_state_interaction,
 )
 from pyqed.qchem.mcscf import casci as casci_module
+from pyqed.qchem.mcscf import casscf as casscf_module
 from pyqed.qchem.mcscf import cocas as cocas_module
 from pyqed.qchem.mcscf import direct_ci as direct_ci_module
 from pyqed.qchem.mcscf.casci import (
@@ -91,7 +92,7 @@ def test_cpp_dense_ci_hamiltonian_matches_numpy_path():
     direct_ci_module.CI_H = capture_ci_h
     try:
         mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-        mol.build(driver='builtin', eri='dense', aosym='s1')
+        mol.build(eri='dense', aosym='s1')
         mf = mol.RHF().run()
         CASCI(mf, ncas=4, nelecas=4, verbose=0).run(nstates=1, method='direct_ci')
     finally:
@@ -114,6 +115,7 @@ def test_cpp_spin_string_sigma_matches_numba_path():
 
     captured = {}
     original_sigma = direct_ci_module._sigma_compact_spin_string
+    original_blas = direct_ci_module._make_sigma_compact_rhf_blas_cpp_matvec
 
     def capture_sigma(*args):
         if not captured:
@@ -121,16 +123,20 @@ def test_cpp_spin_string_sigma_matches_numba_path():
         return direct_ci_module._sigma_compact_spin_string_numba(*args[:31])
 
     direct_ci_module._sigma_compact_spin_string = capture_sigma
+    direct_ci_module._make_sigma_compact_rhf_blas_cpp_matvec = lambda *args: None
     try:
         mol = Molecule(atom='H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2',
                        unit='angstrom', basis='sto-3g')
-        mol.build(driver='builtin', eri='dense', aosym='s1')
+        mol.build(eri='dense', aosym='s1')
         mf = mol.RHF().run()
         mc = CASCI(mf, ncas=4, nelecas=4, verbose=0)
+        mc.direct_ci_auto_spin0 = False
+        mc.direct_ci_native_davidson = False
         mc.direct_ci_dense_fallback_ndets = 0
         mc.run(nstates=1, method='direct_ci')
     finally:
         direct_ci_module._sigma_compact_spin_string = original_sigma
+        direct_ci_module._make_sigma_compact_rhf_blas_cpp_matvec = original_blas
 
     args = captured["args"]
     cpp_sigma = original_sigma(*args)
@@ -145,7 +151,7 @@ def test_cpp_opposite_spin_rdm2_scatter_matches_numba_path():
 
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4; H 0 0 2.8; H 0 0 4.2',
                    unit='angstrom', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense', aosym='s1')
+    mol.build(eri='dense', aosym='s1')
     mf = mol.RHF().run()
     mc = CASCI(mf, ncas=4, nelecas=4, verbose=0)
     mc.direct_ci_dense_fallback_ndets = 0
@@ -163,10 +169,34 @@ def test_cpp_opposite_spin_rdm2_scatter_matches_numba_path():
     np.testing.assert_allclose(cpp_dm2, numba_dm2, atol=1e-12)
 
 
+def test_native_state_average_rdms_match_root_by_root_with_core():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build(eri='dense', aosym='s1')
+    mf = mol.RHF().run()
+    mc = CASCI(mf, ncas=2, nelecas=2, verbose=0).run(
+        nstates=2,
+        method='direct_ci',
+    )
+    weights = np.array([0.35, 0.65])
+
+    expected_dm1 = sum(
+        weight * mc.make_rdm1(root, with_core=True)
+        for root, weight in enumerate(weights)
+    )
+    expected_dm2 = sum(
+        weight * mc.make_rdm2(root, with_core=True)
+        for root, weight in enumerate(weights)
+    )
+    actual_dm1, actual_dm2 = mc.make_state_average_rdms(weights, with_core=True)
+
+    np.testing.assert_allclose(actual_dm1, expected_dm1, atol=1.0e-11)
+    np.testing.assert_allclose(actual_dm2, expected_dm2, atol=1.0e-11)
+
+
 def test_casscf_lih_lowers_the_initial_casci_energy():
     """Exercise the native U-matrix orbital optimizer on a nontrivial case."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -179,7 +209,7 @@ def test_casscf_lih_lowers_the_initial_casci_energy():
 
 def test_casci_verbose_zero_is_clean_and_verbose_one_reports_roots(capsys):
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     capsys.readouterr()
@@ -196,7 +226,7 @@ def test_casci_verbose_zero_is_clean_and_verbose_one_reports_roots(capsys):
 def test_casscf_lih_lbfgs_matches_rcg_energy():
     """The alternative orbital optimizer should reach the same LiH minimum."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -209,7 +239,7 @@ def test_casscf_lih_lbfgs_matches_rcg_energy():
 def test_casscf_lih_diis_matches_non_diis_energy():
     """DIIS should accelerate the U updates without changing the LiH minimum."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -265,6 +295,158 @@ def test_stiefel_minimize_clips_large_tangent_steps():
     expected = optimize_module.retract(U0, -expected_step * df)
 
     np.testing.assert_allclose(X, expected)
+
+
+def test_co_macro_trust_radius_caps_total_stiefel_displacement():
+    """The CO trust radius must cap the whole macro step, not each inner step."""
+    base = np.array([[1.0], [0.0], [0.0]])
+    candidate = np.array([[0.0], [1.0], [0.0]])
+
+    limited, step_norm = cocas_module._limit_stiefel_displacement(
+        base, candidate, 0.2
+    )
+
+    assert step_norm <= 0.2 * (1.0 + 1.0e-9)
+    assert step_norm > 0.199
+    np.testing.assert_allclose(limited.T @ limited, np.eye(1), atol=1.0e-12)
+
+
+def test_co_gradient_keeps_active_rotations_for_finite_bond_dmrg():
+    """Active-active rotations are gauge only for exact CAS, not finite-D MPS."""
+    U = np.eye(5, 4)
+    tangent = np.zeros_like(U)
+    tangent[0, 1], tangent[1, 0] = 0.5, -0.5  # core-core gauge
+    tangent[1, 2], tangent[2, 1] = 1.0, -1.0  # core-active
+    tangent[2, 3], tangent[3, 2] = 2.0, -2.0  # active-active
+    tangent[4, 3] = 3.0  # active-external
+
+    exact = cocas_module._physical_orbital_gradient(
+        U, tangent, 2, 2, active_active=False
+    )
+    finite_dmrg = cocas_module._physical_orbital_gradient(
+        U, tangent, 2, 2, active_active=True
+    )
+
+    assert exact[2, 3] == pytest.approx(0.0)
+    assert finite_dmrg[2, 3] == pytest.approx(2.0)
+    assert finite_dmrg[0, 1] == pytest.approx(0.0)
+    assert finite_dmrg[1, 2] == pytest.approx(1.0)
+    assert finite_dmrg[4, 3] == pytest.approx(3.0)
+
+
+def test_co_gauge_alignment_does_not_remove_finite_dmrg_active_rotation():
+    base = np.eye(5, 4)
+    candidate = base.copy()
+    angle = 0.3
+    rotation = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+    )
+    candidate[:, :2] = candidate[:, :2] @ rotation
+    candidate[:, 2:4] = candidate[:, 2:4] @ rotation
+
+    exact = cocas_module._align_redundant_gauge(
+        base, candidate, 2, 2, active_active=False
+    )
+    finite_dmrg = cocas_module._align_redundant_gauge(
+        base, candidate, 2, 2, active_active=True
+    )
+
+    np.testing.assert_allclose(exact, base, atol=1.0e-12)
+    np.testing.assert_allclose(finite_dmrg[:, :2], base[:, :2], atol=1.0e-12)
+    np.testing.assert_allclose(finite_dmrg[:, 2:4], candidate[:, 2:4], atol=1.0e-12)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Raw factor route sector shapes are incompatible: test",
+        "Right boundary update route dimensions are inconsistent at route 0",
+    ],
+)
+def test_co_macro_solver_rebuilds_only_after_stale_su2_route_failure(
+    monkeypatch, message
+):
+    builds = []
+
+    class Trial:
+        D = 8
+        symmetry = ("charge", "su2")
+        spatial_reduced_mpo = True
+
+        def __init__(self, rebuilt):
+            self.rebuilt = rebuilt
+
+    def fake_fresh(_source, *, rebuild_runtime=False):
+        builds.append(rebuild_runtime)
+        return Trial(rebuild_runtime)
+
+    def fake_run(trial, *args, **kwargs):
+        if not trial.rebuilt:
+            raise ValueError(message)
+
+    monkeypatch.setattr(cocas_module, "_fresh_macro_casci", fake_fresh)
+    monkeypatch.setattr(cocas_module, "_run_casci_like", fake_run)
+
+    trial = cocas_module._run_macro_casci(object(), warm_start=False)
+
+    assert builds == [False, True]
+    assert trial.rebuilt
+    assert trial._co_su2_runtime_rebuilt is True
+
+
+def test_co_macro_solver_warm_continues_unconverged_dmrg(monkeypatch):
+    runs = []
+
+    class DMRG:
+        def __init__(self, converged):
+            self.converged = converged
+
+    class Trial:
+        D = 8
+        symmetry = ("charge", "su2")
+        spatial_reduced_mpo = True
+
+    def fake_fresh(_source, *, rebuild_runtime=False):
+        return Trial()
+
+    def fake_run(trial, *args, **kwargs):
+        runs.append(trial)
+        trial.dmrg = DMRG(converged=len(runs) >= 2)
+
+    monkeypatch.setattr(cocas_module, "_fresh_macro_casci", fake_fresh)
+    monkeypatch.setattr(cocas_module, "_run_casci_like", fake_run)
+    monkeypatch.setattr(cocas_module, "_wguess", lambda source, trial: None)
+
+    trial = cocas_module._run_macro_casci(object())
+
+    assert len(runs) == 2
+    assert trial.dmrg.converged
+    assert trial._co_solver_retried is True
+
+
+def test_stiefel_minimize_uses_custom_gradient():
+    """A compiled objective can supply its matching Euclidean gradient."""
+    U0 = np.array([[1.0], [0.0]])
+    calls = []
+
+    def objective(X):
+        return -X[1, 0]
+
+    def custom_gradient(X):
+        calls.append(X.copy())
+        return np.array([[0.0], [-1.0]])
+
+    X, value = optimize_module.minimize(
+        objective,
+        U0,
+        tau=0.1,
+        max_iterations=1,
+        gradient_fn=custom_gradient,
+    )
+
+    assert len(calls) == 2
+    assert value < objective(U0)
+    np.testing.assert_allclose(X.T @ X, np.eye(1), atol=1e-12)
 
 
 def test_stiefel_minimize_accepts_newton_algorithm():
@@ -456,7 +638,7 @@ def test_legacy_kernel_runs_orbital_update_before_convergence_check(monkeypatch)
 def test_cocasci_accepts_inner_optimizer_tolerance():
     """COCASCI should expose configurable inner manifold optimizer controls."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = COCASCI(
@@ -466,17 +648,21 @@ def test_cocasci_accepts_inner_optimizer_tolerance():
         optimizer_tol=5.0e-4,
         optimizer_max_steps=12,
         optimizer_max_step_norm=0.3,
+        macro_tol=2.0e-6,
+        ci_tol=1.0e-10,
     )
 
     assert mc.optimizer_tol == pytest.approx(5.0e-4)
     assert mc.optimizer_max_steps == 12
     assert mc.optimizer_max_step_norm == pytest.approx(0.3)
+    assert mc.macro_tol == pytest.approx(2.0e-6)
+    assert mc.tol == pytest.approx(1.0e-10)
 
 
 def test_first_order_casscf_lih_lowers_initial_casci_energy():
     """The public CASSCF class should improve on the initial CASCI reference."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -497,7 +683,7 @@ def test_first_order_casscf_lih_lowers_initial_casci_energy():
 def test_first_order_casscf_accepts_max_cycles_alias():
     """CASSCF should accept the legacy max_cycles keyword."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -516,7 +702,7 @@ def test_first_order_casscf_accepts_max_cycles_alias():
 def test_first_order_casscf_repeated_run_resets_history():
     """Reusing the same CASSCF object should start from a clean history."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = FirstOrderCASSCF(
@@ -544,7 +730,7 @@ def test_first_order_casscf_repeated_run_resets_history():
 def test_cocasci_lih_4e4o_matches_first_order_casscf():
     """Regression test for the LiH (4e,4o) COCASCI energy consistency bug."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -569,7 +755,7 @@ def test_cocasci_lih_4e4o_matches_first_order_casscf():
 def test_first_order_casscf_state_average_two_roots():
     """State-averaged first-order CASSCF should support 2-root optimization."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
 
@@ -598,7 +784,7 @@ def test_first_order_casscf_cholesky_matches_pyscf():
     basis = 'sto-3g'
 
     mol = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     mc = FirstOrderCASSCF(
@@ -628,7 +814,7 @@ def test_first_order_casscf_cholesky_matches_pyscf():
 def test_first_order_casscf_factorized_fock_matches_dense():
     """Factorized orbital gradients should reproduce the dense generalized Fock."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     mc = CASCI(mf, ncas=4, nelecas=4).run(nstates=1, method='direct_ci', use_cholesky=True)
@@ -655,10 +841,88 @@ def test_first_order_casscf_factorized_fock_matches_dense():
     np.testing.assert_allclose(fock_factor, fock_dense, atol=1e-8)
 
 
+def test_factorized_orbital_hessian_cached_blas_matches_dense():
+    rng = np.random.default_rng(14)
+    naux, nmo, nocc = 7, 6, 3
+    pair_factors = rng.normal(size=(naux, nmo, nmo))
+    pair_factors = 0.5 * (pair_factors + pair_factors.transpose(0, 2, 1))
+    h1 = rng.normal(size=(nmo, nmo))
+    h1 = 0.5 * (h1 + h1.T)
+    dm1_occ = rng.normal(size=(nocc, nocc))
+    dm1_occ = 0.5 * (dm1_occ + dm1_occ.T)
+    dm2_occ = rng.normal(size=(nocc, nocc, nocc, nocc))
+    kappa = rng.normal(size=(nmo, nmo))
+    kappa -= kappa.T
+
+    eri = np.einsum("Ppq,Prs->pqrs", pair_factors, pair_factors, optimize=True)
+    dm1 = np.zeros((nmo, nmo))
+    dm1[:nocc, :nocc] = dm1_occ
+    dm2 = embed_rdm2(dm2_occ, nmo)
+    expected = orbital_hessian_action_from_integrals(h1, eri, dm1, dm2, kappa)
+
+    solver = CASSCF.__new__(CASSCF)
+    factor_cache = {}
+    actual = solver._orbital_hessian_action_from_factors(
+        h1,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappa,
+        factor_cache=factor_cache,
+    )
+    cached_contraction = factor_cache["contracted_dm2"]
+    cached_workspace = factor_cache["native_workspace"]
+    repeated = solver._orbital_hessian_action_from_factors(
+        h1,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappa,
+        factor_cache=factor_cache,
+    )
+    kappas = np.stack((kappa, 0.3 * kappa, -0.8 * kappa))
+    batched = solver._orbital_hessian_action_from_factors_batch(
+        h1,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappas,
+        factor_cache=factor_cache,
+    )
+    numpy_cache = {"native_workspace": None}
+    numpy_scalar = solver._orbital_hessian_action_from_factors(
+        h1,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappa,
+        factor_cache=numpy_cache,
+    )
+    numpy_batch = solver._orbital_hessian_action_from_factors_batch(
+        h1,
+        pair_factors,
+        dm1_occ,
+        dm2_occ,
+        kappas,
+        factor_cache=numpy_cache,
+    )
+
+    assert factor_cache["contracted_dm2"] is cached_contraction
+    assert factor_cache["native_workspace"] is cached_workspace
+    assert "native_workspace" in factor_cache
+    np.testing.assert_allclose(actual, expected, atol=1.0e-10)
+    np.testing.assert_allclose(repeated, expected, atol=1.0e-10)
+    np.testing.assert_allclose(numpy_scalar, expected, atol=1.0e-10)
+    np.testing.assert_allclose(numpy_batch, batched, atol=1.0e-10)
+    np.testing.assert_allclose(batched[0], expected, atol=1.0e-10)
+    np.testing.assert_allclose(batched[1], 0.3 * expected, atol=1.0e-10)
+    np.testing.assert_allclose(batched[2], -0.8 * expected, atol=1.0e-10)
+
+
 def test_first_order_casscf_factorized_evaluate_avoids_dense_mo_eri(monkeypatch):
     """The factorized CASSCF orbital step should not request dense MO ERIs."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.8; H 0 0 1.6; H 0 0 2.4', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     casscf = FirstOrderCASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
@@ -678,7 +942,7 @@ def test_first_order_casscf_factorized_evaluate_avoids_dense_mo_eri(monkeypatch)
 def test_first_order_casscf_reuses_direct_ci_setup_cache(monkeypatch):
     """Repeated trial CASCI solves should reuse determinant setup across line-search calls."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.8; H 0 0 1.6; H 0 0 2.4', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     casscf = FirstOrderCASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
@@ -707,7 +971,7 @@ def test_first_order_casscf_reuses_direct_ci_setup_cache(monkeypatch):
 def test_cocas_fresh_casci_reuses_direct_ci_setup_cache(monkeypatch):
     """Fresh COCAS-style CASCI clones should reuse determinant setup tables."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.8; H 0 0 1.6; H 0 0 2.4', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     mc0 = CASCI(mf, ncas=4, nelecas=4)
@@ -741,7 +1005,7 @@ def test_cocas_fresh_casci_reuses_direct_ci_setup_cache(monkeypatch):
 def test_cocas_factorized_objective_and_gradient_match_dense():
     """COCAS orbital objective should agree between dense and factorized ERIs."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.8; H 0 0 1.6; H 0 0 2.4', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     mc = CASCI(mf, ncas=4, nelecas=4)
@@ -763,11 +1027,29 @@ def test_cocas_factorized_objective_and_gradient_match_dense():
     g_factor = optimize_module.gradient(U, h1e, eri_factors, dm1, dm2)
     np.testing.assert_allclose(g_factor, g_dense, atol=1e-10)
 
+    dense_plan = optimize_module.OrbitalContractionPlan(
+        h1e, eri_dense, U.shape, dm1.shape, dm2.shape
+    )
+    factor_plan = optimize_module.OrbitalContractionPlan(
+        h1e, eri_factors, U.shape, dm1.shape, dm2.shape
+    )
+    args_dense = (h1e, eri_dense, dm1, dm2)
+    args_factor = (h1e, eri_factors, dm1, dm2)
+
+    np.testing.assert_allclose(dense_plan.energy(U, *args_dense), e_dense, atol=1e-12)
+    np.testing.assert_allclose(factor_plan.energy(U, *args_factor), e_factor, atol=1e-12)
+    np.testing.assert_allclose(
+        dense_plan.gradient(U, *args_dense), g_dense, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        factor_plan.gradient(U, *args_factor), g_factor, atol=1e-12
+    )
+
 
 def test_casci_overlap_self_is_identity():
     """The determinant-overlap contraction should preserve orthonormal roots."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = CASCI(mf, ncas=4, nelecas=4).run(nstates=2, method='direct_ci')
@@ -784,7 +1066,7 @@ def test_casci_overlap_self_is_identity():
 def test_casci_spin_orbital_tdm_matches_spin_blocks():
     """Spin-orbital TDMs should reduce to the alpha/beta RDM blocks on the diagonal."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
@@ -802,7 +1084,7 @@ def test_casci_spin_orbital_tdm_matches_spin_blocks():
 def test_casci_spin_orbital_tdm_matches_bruteforce_between_spin_sectors():
     """Spin-flip blocks should agree with an explicit determinant-space contraction."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc_singlet = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
@@ -823,7 +1105,7 @@ def test_casci_spin_orbital_tdm_matches_bruteforce_between_spin_sectors():
 def test_soc_state_interaction_builds_hermitian_matrix():
     """The SOC SI helper should build a Hermitian total Hamiltonian."""
     mol = Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc_singlet = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
@@ -868,12 +1150,12 @@ def test_soc_state_interaction_builds_hermitian_matrix():
         ),
     ],
 )
-def test_gbasis_pyscf_soc_ao_matches_direct_pyscf_operator(atom, basis):
-    """The gbasis-pyscf SOC AO build should reproduce the PySCF one-center operator."""
+def test_native_soc_ao_matches_direct_pyscf_operator(atom, basis):
+    """The native molecule SOC AO build should reproduce the PySCF operator."""
     from pyscf import gto
 
     mol = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
     hso = get_soc_1e_ao(mol, one_center=True)
 
     pmol = gto.M(atom=atom, basis=basis, unit='angstrom', verbose=0)
@@ -885,11 +1167,13 @@ def test_gbasis_pyscf_soc_ao_matches_direct_pyscf_operator(atom, basis):
             w = pmol.intor('int1e_prinvxp', comp=3)
         hso_ref[:, p0:p1, p0:p1] += (-pmol.atom_charge(ia)) * w[:, p0:p1, p0:p1]
     hso_ref *= soc_1e_prefactor()
+    permutation = mol.pyscf_ao_permutation(pmol)
+    hso_ref = hso_ref[:, permutation][:, :, permutation]
 
     np.testing.assert_allclose(hso, hso_ref, atol=1e-11)
 
 
-def test_gbasis_pyscf_somf_ao_matches_manual_contraction():
+def test_native_somf_ao_matches_manual_pyscf_contraction():
     """The SOMF AO builder should match a direct PySCF int2e_p1vxp1 contraction."""
     from pyscf import gto
 
@@ -901,18 +1185,21 @@ def test_gbasis_pyscf_somf_ao_matches_manual_contraction():
     basis = 'sto-3g'
 
     mol = Molecule(atom=atom, unit='angstrom', basis=basis)
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
     mf = mol.RHF().run()
     hso = get_soc_2e_somf_ao(mf)
 
     pmol = gto.M(atom=atom, basis=basis, unit='angstrom', verbose=0)
-    dm = mf.make_rdm1()
+    permutation = mol.pyscf_ao_permutation(pmol)
+    inverse = np.argsort(permutation)
+    dm = mf.make_rdm1()[np.ix_(inverse, inverse)]
     g = pmol.intor('int2e_p1vxp1', comp=3)
     hso_ref = (
         np.einsum('xpqrs,rs->xpq', g, dm, optimize=True)
         - 1.5 * np.einsum('xprsq,rs->xpq', g, dm, optimize=True)
         - 1.5 * np.einsum('xsqpr,rs->xpq', g, dm, optimize=True)
     ) * soc_1e_prefactor()
+    hso_ref = hso_ref[:, permutation][:, :, permutation]
 
     np.testing.assert_allclose(hso, hso_ref, atol=1e-11)
 
@@ -928,7 +1215,7 @@ def test_soc_state_interaction_somf_matches_explicit_operator():
         unit='angstrom',
         basis='sto-3g',
     )
-    mol.build(driver='gbasis-pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
     mc_singlet = CASCI(mf, ncas=2, nelecas=2, spin=0).run(nstates=1, method='direct_ci')
@@ -954,7 +1241,7 @@ def test_soc_state_interaction_somf_matches_explicit_operator():
 
 def test_st_soc_matches_explicit_sectors():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     hso = np.array(
@@ -1000,7 +1287,7 @@ def test_st_soc_matches_explicit_sectors():
 def test_first_order_casscf_line_search_failure_raises(monkeypatch):
     """A rejected orbital step should surface as a RuntimeError."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, max_cycle=4, ci_method='direct_ci')
@@ -1017,7 +1304,7 @@ def test_first_order_casscf_line_search_failure_raises(monkeypatch):
 def test_first_order_casscf_stall_message_includes_diagnostics():
     """Non-convergence diagnostics should report the last and best macro cycles."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='pyscf')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
@@ -1038,7 +1325,7 @@ def test_first_order_casscf_stall_message_includes_diagnostics():
 def test_first_order_casscf_line_search_fallback_generates_smaller_steps():
     """Rejected orbital steps should produce smaller fallback candidates."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
@@ -1056,7 +1343,7 @@ def test_first_order_casscf_line_search_fallback_generates_smaller_steps():
 def test_augmented_hessian_direction_is_a_descent_step():
     """The diagonal AH model should return a downhill packed orbital step."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = FirstOrderCASSCF(mf, ncas=2, nelecas=2, ci_method='direct_ci')
@@ -1098,6 +1385,143 @@ def test_augmented_hessian_direction_is_a_descent_step():
     )
 
 
+def test_diagonal_augmented_hessian_secular_step_matches_dense_lowest_root():
+    grad = np.array([0.31, -0.17, 0.08, -0.04])
+    diagonal = np.array([0.7, 1.1, 1.8, 2.3])
+    ah = np.zeros((5, 5))
+    ah[0, 1:] = ah[1:, 0] = grad
+    ah[1:, 1:] = np.diag(diagonal)
+    _values, vectors = np.linalg.eigh(ah)
+    reference = vectors[1:, 0] / vectors[0, 0]
+
+    step = augmented_hessian_direction(grad, diagonal)
+
+    np.testing.assert_allclose(step, reference, atol=1.0e-12, rtol=1.0e-12)
+
+
+def test_converged_exact_keyframe_with_zero_step_terminates_before_trial(monkeypatch):
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mf = mol.RHF().run()
+
+    def zero_augmented_hessian(gradient, *_args, **_kwargs):
+        step = np.zeros_like(gradient)
+        return step, {
+            "converged": True,
+            "iterations": 1,
+            "residual_norm": 0.0,
+            "eigenvalue": 0.0,
+            "model": 0.0,
+            "subspace_dim": 1,
+            "used_fallback": False,
+        }
+
+    monkeypatch.setattr(
+        casscf_module,
+        "davidson_augmented_hessian_direction",
+        zero_augmented_hessian,
+    )
+    mc = CASSCF(
+        mf,
+        ncas=2,
+        nelecas=2,
+        max_cycle=1,
+        max_micro_cycle=4,
+        conv_tol_grad_relaxed=1.0e6,
+        micro_ci_mode="keyframe",
+        coupling="qn",
+        use_cholesky=False,
+        auto_active_restarts=False,
+    )
+
+    def unexpected_trial(*_args, **_kwargs):
+        raise AssertionError("a zero-step converged keyframe must not run another CASCI")
+
+    mc._micro_line_search = unexpected_trial
+    mc._make_casci = unexpected_trial
+    mc.run()
+
+    assert mc.converged is True
+    assert len(mc.history) == 1
+    assert mc.history[0]["step_norm"] == 0.0
+    assert mc.micro_history[-1]["stationary_keyframe"] is True
+    assert (
+        mc.micro_history[-1]["termination_reason"]
+        == "converged_exact_keyframe_zero_step"
+    )
+
+
+def test_unconverged_zero_step_keyframe_recovers_once_then_fails_fast(monkeypatch):
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mf = mol.RHF().run()
+
+    def zero_augmented_hessian(gradient, *_args, **_kwargs):
+        return np.zeros_like(gradient), {
+            "converged": True,
+            "iterations": 1,
+            "residual_norm": 0.0,
+            "eigenvalue": 0.0,
+            "model": 0.0,
+            "subspace_dim": 1,
+            "used_fallback": False,
+        }
+
+    monkeypatch.setattr(
+        casscf_module,
+        "davidson_augmented_hessian_direction",
+        zero_augmented_hessian,
+    )
+    mc = CASSCF(
+        mf,
+        ncas=2,
+        nelecas=2,
+        max_cycle=5,
+        max_micro_cycle=1,
+        conv_tol_grad=0.0,
+        conv_tol_grad_relaxed=0.0,
+        micro_ci_mode="keyframe",
+        coupling="qn",
+        use_cholesky=False,
+        zero_step_recovery_max=1,
+        auto_active_restarts=False,
+    )
+
+    def reject_trial(_h1, _eri, U, _kappa, energy, _ci0, **_kwargs):
+        return False, U, energy, None, 0.0
+
+    mc._micro_line_search = reject_trial
+    with pytest.raises(RuntimeError, match="repeated zero-step plateau"):
+        mc.run()
+
+    assert len(mc.history) == 2
+    assert mc.history[0]["zero_step_recovery"] is True
+    assert mc.zero_step_recovery_history == [
+        {
+            "macro": 1,
+            "energy": mc.history[0]["energy"],
+            "gradient_norm": mc.history[0]["gradient_norm"],
+            "action": "reset_ah_and_active_reference",
+        }
+    ]
+    assert mc.micro_history[-1]["termination_reason"] == "unresolved_zero_step_plateau"
+
+
+def test_ah_trust_radius_tracks_backtracked_accepted_step():
+    mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
+    mol.build()
+    mc = CASSCF(mol.RHF().run(), ncas=2, nelecas=2, max_step=0.025)
+
+    mc._update_ah_trust_radius(
+        radius=0.025,
+        ratio=0.8,
+        accepted_scale=0.25,
+        step_vec=np.array([0.025, -0.01]),
+    )
+
+    assert mc._ah_trust_radius == pytest.approx(0.00625)
+
+
 def test_davidson_augmented_hessian_matches_diagonal_model():
     """Matrix-free AH should recover the diagonal-model step on a diagonal test problem."""
     grad_vec = np.array([0.4, -0.2, 0.1, -0.05])
@@ -1122,10 +1546,42 @@ def test_davidson_augmented_hessian_matches_diagonal_model():
     np.testing.assert_allclose(step_vec, limit_step_norm(fallback, 0.5), atol=1.0e-2)
 
 
+def test_davidson_augmented_hessian_uses_block_action():
+    gradient = np.array([0.3, -0.2, 0.1, -0.04])
+    diagonal = np.array([1.5, 2.0, 2.5, 3.0])
+    guess = np.eye(4)[:, :3]
+    block_shapes = []
+
+    def block_action(vectors):
+        block_shapes.append(vectors.shape)
+        return diagonal[:, None] * vectors
+
+    scalar = davidson_augmented_hessian_direction(
+        gradient,
+        diagonal,
+        matvec=lambda vector: diagonal * vector,
+        guess=guess,
+        max_cycle=3,
+        max_subspace=5,
+    )
+    blocked = davidson_augmented_hessian_direction(
+        gradient,
+        diagonal,
+        matvec=lambda vector: diagonal * vector,
+        matvec_block=block_action,
+        guess=guess,
+        max_cycle=3,
+        max_subspace=5,
+    )
+
+    assert block_shapes and block_shapes[0][1] > 1
+    np.testing.assert_allclose(blocked, scalar, atol=1.0e-12)
+
+
 def test_orbital_hessian_action_from_integrals_matches_finite_difference():
     """Analytic orbital-only Hessian action should match a frozen-RDM finite difference."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     mc = CASCI(mf, ncas=2, nelecas=2).run(nstates=1, method='direct_ci')
@@ -1169,7 +1625,7 @@ def test_orbital_hessian_action_from_integrals_matches_finite_difference():
 def test_analytic_hessian_action_reuses_reference_cache(monkeypatch):
     """Repeated analytic AH matvecs should reuse the same MO-integral/RDM bundle."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     solver = FirstOrderCASSCF(mf, ncas=2, nelecas=2, optimizer='AH', ah_hessian='analytic')
@@ -1220,7 +1676,7 @@ def test_analytic_hessian_action_reuses_reference_cache(monkeypatch):
 def test_evaluate_populates_analytic_hessian_cache_for_state_average(monkeypatch):
     """The current-point SA bundle from `_evaluate` should feed AH matvecs directly."""
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = mol.RHF().run()
     solver = FirstOrderCASSCF(mf, ncas=2, nelecas=2, optimizer='AH', ah_hessian='analytic')

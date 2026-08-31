@@ -1018,7 +1018,7 @@ def parse_args(argv: list[str] | None = None):
     parser.add_argument("--noise", type=float, default=1.0e-6)
     parser.add_argument("--noise-decay", type=float, default=0.2)
     parser.add_argument("--init", choices=("sector-random", "product"), default="sector-random")
-    parser.add_argument("--dmrg-policy", default="packed-cpp-fast")
+    parser.add_argument("--dmrg-policy", default="symmetric")
     parser.add_argument("--dmrg-only", action="store_true")
     parser.add_argument("--dmrg-checkpoint", default=None)
     parser.add_argument("--resume-dmrg", default=None)

@@ -29,9 +29,9 @@ if str(ROOT) not in sys.path:
 
 from pyqed.dvr import FEDVR, SineDVR
 from pyqed.qchem import CASCI, Molecule
-from pyqed.units import amu2au, au2fs
+from pyqed.units import amu2au, au2ev, au2fs
 
-HARTREE_TO_EV = 27.211386245988
+HARTREE_TO_EV = au2ev
 
 
 def h3plus_body_frame(r1, r2, theta):

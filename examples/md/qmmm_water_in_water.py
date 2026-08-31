@@ -111,7 +111,7 @@ def qm_water_reference(positions):
         for symbol, (x, y, z) in zip(symbols, positions)
     )
     mol = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    mol.build(driver="builtin")
+    mol.build()
     return mol.RHF()
 
 

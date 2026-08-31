@@ -2,7 +2,7 @@ from pyqed import Molecule
 from pyqed.qchem.dmrg.dmrgscf import DMRGSCF
 
 mol = Molecule(atom='Li 0 0 0; F 0 0 1.4', unit='b', basis='6311g')
-mol.build(driver='pyscf')
+mol.build()
 
 mf = mol.RHF().run()
 

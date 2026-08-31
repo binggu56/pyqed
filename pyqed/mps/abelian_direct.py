@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from pyqed.symmetry import IrrepTensor
+
 try:  # Optional fast block kernels; all callers keep NumPy fallbacks.
     from pyqed.mps import packed_cython as _packed_cython
 except Exception:  # pragma: no cover - optional extension import guard
@@ -1917,8 +1919,8 @@ def _abelian_block_data_result_dtype(data, *extra):
     return np.result_type(*(dtypes or [complex]))
 
 
-class AbelianSiteTensorData:
-    """Native Abelian site tensor carrier backed by plain block data."""
+class AbelianSiteTensorData(IrrepTensor):
+    """Optimized Abelian storage implementing the shared tensor contract."""
 
     __slots__ = ("data", "qns", "dirs", "_layout_signature")
 
@@ -1935,6 +1937,10 @@ class AbelianSiteTensorData:
         self.qns = tuple(tuple(axis_qns) for axis_qns in (qns or ()))
         self.dirs = tuple(int(d) for d in (dirs or ()))
         self._layout_signature = None
+        self.legs = IrrepTensor._legs_from_layout(self.data, self.qns, self.dirs)
+        self.fusion_legs = [None] * len(self.dirs)
+        self.metadata = {}
+        self._operator_mode = False
 
     @property
     def rank(self):

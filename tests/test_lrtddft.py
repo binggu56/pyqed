@@ -14,7 +14,7 @@ def test_tddft_module_aliases_remain_compatible():
 
 def test_lrtddft_lda_smoke():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='lda').run()
 
@@ -35,7 +35,7 @@ def test_native_tddft_excited_state_gradients_match_pyscf():
     from pyscf import tdscf as pyscf_tdscf
 
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='lda').run()
     tda = TDA(mf).run(nstates=1)
@@ -71,7 +71,7 @@ def test_native_tddft_excited_state_gradients_match_pyscf():
 
 def test_native_tddft_native_gradient_backend_is_not_implemented():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RKS(mol, xc='lda').run()
     tddft = TDDFT(mf).run(nstates=1)
@@ -95,7 +95,7 @@ def test_native_tddft_transition_magnetic_dipoles_match_pyscf_tdhf():
     atom = 'O 0 0 0; H 0 -1.43233673 1.10715266; H 0 1.43233673 1.10715266'
 
     mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol.build(driver='builtin', eri='dense')
+    mol.build(eri='dense')
     mf = mol.RHF().run(tol=1e-10, max_cycle=80)
 
     pyqed_tda = NativeTDA(mf).run(nstates=3)

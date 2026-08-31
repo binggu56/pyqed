@@ -19,15 +19,23 @@ from examples.ldr.so2_casci_cgldr import (
     sampled_product_gaussian_support,
     so2_qa_mode,
     so2_qs_theta_body_frame,
+    so2_theta_qa_modes,
     so2_theta_modes,
     symmetric_stretch_nodes,
+    theta_qa_vibronic_couplings,
     theta_vibronic_couplings,
     theta_center_hamiltonian,
     theta_quadratic_derivatives,
     transformed_stretch_nodes,
 )
+from examples.ldr.so2_casci_cgldr_dense import (
+    harmonic_matrix_extension,
+    overlap_quantum_metric,
+    single_anchor_quadratic,
+)
 from pyqed.dvr.dvr import DVR
 from pyqed.dvr.dvr_1d import LegendreDVR, SineDVR
+from pyqed.ldr import CGLDRElectronicData
 from pyqed.mps.decompose import tt_to_tensor
 
 
@@ -117,6 +125,35 @@ def test_so2_theta_modes_are_curvilinear_geometry_derivatives():
     np.testing.assert_allclose(numerical_second, curvature, atol=2.0e-8)
 
 
+def test_so2_theta_qa_modes_include_mixed_geometry_curvature():
+    qs = 3.8
+    qa = 0.1
+    theta = np.deg2rad(104.0)
+    step = 1.0e-4
+
+    def geometry(angle, antisymmetric):
+        return np.asarray([
+            coord
+            for _symbol, coord in so2_qs_theta_body_frame(
+                qs, angle, antisymmetric
+            )
+        ])
+
+    first, curvature = so2_theta_qa_modes(qs, qa, theta)
+    mixed = (
+        geometry(theta + step, qa + step)
+        - geometry(theta + step, qa - step)
+        - geometry(theta - step, qa + step)
+        + geometry(theta - step, qa - step)
+    ) / (4.0 * step**2)
+
+    np.testing.assert_allclose(first[0], so2_theta_modes(qs, qa, theta)[0])
+    np.testing.assert_allclose(first[1], so2_qa_mode(theta))
+    np.testing.assert_allclose(curvature[0, 1], mixed, atol=1.0e-8)
+    np.testing.assert_allclose(curvature[1, 0], mixed, atol=1.0e-8)
+    np.testing.assert_allclose(curvature[1, 1], 0.0)
+
+
 def test_theta_vibronic_hessian_includes_coordinate_curvature_term():
     class Point:
         def vibronic_couplings(self, **kwargs):
@@ -134,6 +171,28 @@ def test_theta_vibronic_hessian_includes_coordinate_curvature_term():
 
     np.testing.assert_allclose(first, [[2.0]])
     np.testing.assert_allclose(second, [[8.0]])
+
+
+def test_theta_qa_vibronic_hessian_includes_both_curvature_terms():
+    class Point:
+        def vibronic_couplings(self, **kwargs):
+            assert kwargs["modes"].shape == (4, 3, 3)
+            first = np.array([[[2.0, 3.0, 5.0, 7.0]]])
+            second = np.zeros((1, 1, 4, 4))
+            second[..., 0, 0] = 11.0
+            second[..., 0, 1] = second[..., 1, 0] = 13.0
+            second[..., 1, 1] = 17.0
+            return first, second
+
+    first, second = theta_qa_vibronic_couplings(
+        Point(), (0,), 3.8, 0.1, np.deg2rad(104.0)
+    )
+
+    np.testing.assert_allclose(first, [[[2.0, 3.0]]])
+    np.testing.assert_allclose(second[..., 0, 0], [[16.0]])
+    np.testing.assert_allclose(second[..., 0, 1], [[20.0]])
+    np.testing.assert_allclose(second[..., 1, 0], [[20.0]])
+    np.testing.assert_allclose(second[..., 1, 1], [[17.0]])
 
 
 def test_casci_sampled_overlap_preserves_nonunitary_part_by_default():
@@ -164,6 +223,30 @@ def test_relaxed_fg_rejects_active_space_boundary_crossing():
 
 def test_qa_default_initial_packet_matches_valence_reference_widths():
     center_text, width_text, angle_indices = default_initial_packet_spec("qa")
+
+    center = parse_triplet(center_text, degree_indices=angle_indices)
+    width = parse_triplet(width_text, degree_indices=angle_indices)
+
+    np.testing.assert_allclose(
+        center,
+        (SQRT2 * REFERENCE_BOND, np.deg2rad(REFERENCE_THETA_DEG), 0.0),
+        atol=1.0e-15,
+    )
+    np.testing.assert_allclose(
+        width,
+        (
+            REFERENCE_BOND_WIDTH,
+            np.deg2rad(REFERENCE_THETA_WIDTH_DEG),
+            REFERENCE_BOND_WIDTH,
+        ),
+        atol=1.0e-15,
+    )
+
+
+def test_theta_qa_default_packet_uses_qs_theta_qa_order():
+    center_text, width_text, angle_indices = default_initial_packet_spec(
+        "theta-qa"
+    )
 
     center = parse_triplet(center_text, degree_indices=angle_indices)
     width = parse_triplet(width_text, degree_indices=angle_indices)
@@ -374,6 +457,71 @@ def test_sampled_product_gaussian_support_is_writable_after_broadcast():
 
     assert mask.shape == (2, 2)
     assert mask[0, 0]
+
+
+def test_cached_single_anchor_model_is_quadratic_analytical_fg():
+    qa = np.array([-0.2, 0.0, 0.2])
+    energies = np.array([[1.0, 2.0]])
+    gradient = np.array([[0.3, 0.1], [0.1, -0.2]])
+    hessian = np.array([[0.4, -0.05], [-0.05, 0.6]])
+    data = CGLDRElectronicData(
+        energies=energies,
+        overlaps=np.eye(2).reshape(1, 2, 1, 2),
+        hamiltonian_gradients=gradient.reshape(1, 1, 2, 2),
+        hamiltonian_hessians=hessian.reshape(1, 1, 1, 2, 2),
+        reactive_grids=(np.array([0.0]),),
+        expanded_grids=(qa,),
+        metadata={"qa_model": "3-anchor-relaxed-pt-quintic"},
+    )
+
+    quadratic = single_anchor_quadratic(data)
+    expected = np.asarray(
+        [np.diag(energies[0]) + q * gradient + 0.5 * q**2 * hessian for q in qa]
+    )
+
+    np.testing.assert_allclose(quadratic.separable_hamiltonian.evaluate()[0], expected)
+    assert quadratic.metadata["qa_model"] == "single-reference-quadratic"
+    assert quadratic.metadata["electronic_structure_recomputed"] is False
+
+
+def test_overlap_quantum_metric_recovers_matrix_exponential():
+    angle = 0.37
+    rotation = np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+    )
+    expected = rotation @ np.diag([0.8, 3.0]) @ rotation.T
+    displacement = 0.4
+    values, vectors = np.linalg.eigh(expected)
+    positive = (vectors * np.exp(-0.5 * values * displacement**2)) @ vectors.T
+    unitary = np.array([[0.0, 1.0], [-1.0, 0.0]])
+
+    metric, singular_values, ratio = overlap_quantum_metric(
+        positive @ unitary,
+        displacement,
+    )
+
+    np.testing.assert_allclose(metric, expected, atol=1.0e-13)
+    np.testing.assert_allclose(
+        singular_values,
+        np.sort(np.exp(-0.5 * values * displacement**2)),
+        atol=1.0e-13,
+    )
+    np.testing.assert_allclose(ratio, singular_values[0] / singular_values[-1])
+
+
+def test_harmonic_matrix_extension_preserves_data_and_fills_center():
+    values = np.zeros((3, 3, 2, 2), dtype=complex)
+    valid = np.ones((3, 3), dtype=bool)
+    valid[1, 1] = False
+    values[0, 1] = np.diag([1.0, 2.0])
+    values[2, 1] = np.diag([3.0, 4.0])
+    values[1, 0] = np.diag([5.0, 6.0])
+    values[1, 2] = np.diag([7.0, 8.0])
+
+    continued = harmonic_matrix_extension(values, valid)
+
+    np.testing.assert_allclose(continued[valid], values[valid])
+    np.testing.assert_allclose(continued[1, 1], np.diag([4.0, 5.0]))
 
 
 def test_pyscf_fallback_electron_nuclear_derivatives_for_pyqed_molecule():

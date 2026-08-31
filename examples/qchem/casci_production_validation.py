@@ -39,7 +39,7 @@ def main():
 
     atom = "\n".join(f"H 0 0 {1.8 * index:.10f}" for index in range(6))
     mol = Molecule(atom=atom, unit="bohr", basis="sto-6g")
-    mol.build(driver="gbasis")
+    mol.build()
     mf = RHF(mol).run()
 
     reference, reference_time = solve(mf, eigensolver="eigsh")

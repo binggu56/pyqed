@@ -7,7 +7,7 @@ from pathlib import Path
 
 import numpy as np
 
-from pyqed.units import au2nm
+from pyqed.units import au2kjmol, au2nm
 
 from .atoms import Atoms
 from .calculators import MM
@@ -16,7 +16,7 @@ from .pme import pme_mesh_for_accuracy
 from .topology import Topology
 
 
-HARTREE_TO_KJMOL = 2625.4996394799
+HARTREE_TO_KJMOL = au2kjmol
 
 
 @dataclass(frozen=True)

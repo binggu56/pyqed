@@ -58,8 +58,12 @@ from .response import KPointTransitionSpace
 
 
 _GDF_DEFAULT_WEIGHTED_AUX_SCREEN_TOL_FACTOR = 5.0e-3
-_GDF_DEFAULT_PAIR_IMAGE_TOL_FACTOR = 1.0e-4
-_GDF_DEFAULT_SHORT_RANGE_SCREEN_TOL_FACTOR = 1.0e-4
+_GDF_DEFAULT_PAIR_IMAGE_TOL_FACTOR = 1.0e-2
+_GDF_DEFAULT_PAIR_FT_COEFF_TOL_FACTOR = 1.0e-3
+_GDF_DEFAULT_PAIR_CUT = 3
+_GDF_DEFAULT_RECIP_CUT = 15
+_GDF_DEFAULT_METRIC_TOL = 1.0e-14
+_GDF_DEFAULT_METRIC_PRECISION_FACTOR = 1.0e-1
 
 
 @dataclass
@@ -468,6 +472,41 @@ def _pyscf_gdf_imports():
     return gto, scf, _ao2mo, _conc_mos
 
 
+def _pyscf_builtin_basis_dict(basis_name, symbols):
+    """Represent a bundled basis in PySCF without rotating contractions."""
+
+    parsed = (
+        parse_gbs(_basis_path(basis_name))
+        if isinstance(basis_name, str)
+        else basis_name
+    )
+    out = {}
+    for symbol in dict.fromkeys(symbols):
+        try:
+            entries = parsed[symbol]
+        except KeyError as exc:
+            raise ValueError(
+                f"Basis {basis_name!r} does not define element {symbol!r}."
+            ) from exc
+        shells = []
+        for angular_momentum, exponents, coefficients in entries:
+            coefficients = np.asarray(coefficients, dtype=float)
+            if coefficients.ndim == 1:
+                coefficients = coefficients[:, None]
+            for contraction in range(coefficients.shape[1]):
+                shell = [int(angular_momentum)]
+                shell.extend(
+                    [float(exponent), float(coefficient)]
+                    for exponent, coefficient in zip(
+                        np.asarray(exponents, dtype=float),
+                        coefficients[:, contraction],
+                    )
+                )
+                shells.append(shell)
+        out[str(symbol)] = shells
+    return out
+
+
 def _pyscf_cell_from_reference(ref):
     gto, _scf, _ao2mo, _conc_mos = _pyscf_gdf_imports()
     src_cell = ref.cell
@@ -480,7 +519,10 @@ def _pyscf_cell_from_reference(ref):
         for symbol, coord in zip(src_cell._atom_symbols, src_cell._atom_coords)
     ]
     cell.a = np.asarray(src_cell.lattice_vectors, dtype=float)
-    cell.basis = src_cell.basis
+    cell.basis = _pyscf_builtin_basis_dict(
+        src_cell.basis,
+        src_cell._atom_symbols,
+    )
     cell.unit = "B"
     cell.charge = int(getattr(src_cell, "charge", 0))
     cell.spin = int(getattr(src_cell, "spin", 0))
@@ -551,10 +593,12 @@ def _pyscf_gdf_mean_field(space):
     _gto, scf, _ao2mo, _conc_mos = _pyscf_gdf_imports()
     cell = _pyscf_cell_from_reference(ref)
     mf = scf.KRHF(cell, kpts=np.asarray(ref.kpts, dtype=float), exxdiv="ewald")
-    if auxbasis is None:
-        mf = mf.density_fit()
-    else:
-        mf = mf.density_fit(auxbasis=auxbasis)
+    native_auxbasis = _gdf_auxbasis_name(ref, auxbasis=auxbasis)
+    pyscf_auxbasis = _pyscf_builtin_basis_dict(
+        native_auxbasis,
+        ref.cell._atom_symbols,
+    )
+    mf = mf.density_fit(auxbasis=pyscf_auxbasis)
     mf.verbose = 0
     max_memory = getattr(ref._pbc_mf, "max_memory", None)
     if max_memory is not None:
@@ -795,6 +839,44 @@ def _gdf_aux_transform(aux_basis, coord_type):
     return _cartesian_to_spherical_transform(aux_basis)
 
 
+def _gdf_charge_normalized_auxiliary_basis(aux_basis):
+    """Rescale each fitting shell to a common radial multipole moment."""
+
+    normalized = list(aux_basis)
+    half_spherical_norm = math.sqrt(0.25 / math.pi)
+    for start, stop, l in _cart_shell_blocks(aux_basis):
+        representative = aux_basis[start]
+        power = 2 * int(l) + 2
+        moment_order = 0.5 * (power + 1)
+        radial_moment = (
+            math.gamma(moment_order)
+            / (2.0 * np.asarray(representative.exps, dtype=float) ** moment_order)
+        )
+        radial_norm = 1.0 / np.sqrt(
+            math.gamma(moment_order)
+            / (
+                2.0
+                * (2.0 * np.asarray(representative.exps, dtype=float))
+                ** moment_order
+            )
+        )
+        multipole = np.dot(
+            np.asarray(representative.coefs, dtype=float) * radial_norm,
+            radial_moment,
+        )
+        if not np.isfinite(multipole) or abs(multipole) <= np.finfo(float).tiny:
+            raise ValueError("Auxiliary fitting shell has a zero radial multipole.")
+        scale = half_spherical_norm / float(multipole)
+        for index in range(start, stop):
+            fn = aux_basis[index]
+            scaled = object.__new__(fn.__class__)
+            scaled.__dict__ = dict(fn.__dict__)
+            scaled.coefs = np.asarray(fn.coefs, dtype=float) * scale
+            scaled.prim_weights = np.asarray(fn.prim_weights, dtype=float) * scale
+            normalized[index] = scaled
+    return tuple(normalized)
+
+
 def _gdf_normalize_mesh(mesh):
     if mesh is None:
         return None
@@ -833,9 +915,28 @@ def _gdf_is_auto(value):
     return isinstance(value, str) and value.strip().lower() in {"auto", "estimate", "estimated"}
 
 
+def _gdf_automatic_policy(mf):
+    return not any(
+        hasattr(mf, name)
+        for name in (
+            "gdf_precision",
+            "df_precision",
+            "gdf_recip_cut",
+            "gdf_default_recip_cut",
+            "gdf_mesh",
+            "gdf_pair_cut",
+            "gdf_default_pair_cut",
+            "gdf_reciprocal_kernel",
+            "gdf_kernel",
+            "gdf_omega",
+        )
+    )
+
+
 def _gdf_precision(ref, default=None):
     mf = ref._pbc_mf
-    value = getattr(mf, "gdf_precision", getattr(mf, "df_precision", default))
+    fallback = 1.0e-8 if _gdf_automatic_policy(mf) else default
+    value = getattr(mf, "gdf_precision", getattr(mf, "df_precision", fallback))
     if value is None:
         return None
     value = float(value)
@@ -854,12 +955,13 @@ def _gdf_basis_lmax(basis):
 def _gdf_auto_basis(ref):
     mf = ref._pbc_mf
     auxbasis = _gdf_auxbasis_name(ref)
+    aux_min_exponent = _gdf_aux_min_exponent(ref)
     cache = _gdf_mf_cache(mf, "auto_basis")
-    key = (id(getattr(mf, "_basis", None)), auxbasis)
+    key = (id(getattr(mf, "_basis", None)), auxbasis, aux_min_exponent)
     if key in cache:
         return cache[key]
 
-    aux_dict = parse_gbs(_basis_path(auxbasis))
+    aux_dict = _gdf_pruned_auxiliary_basis_dict(auxbasis, aux_min_exponent)
     try:
         aux_basis = tuple(
             make_contractions(
@@ -874,9 +976,33 @@ def _gdf_auto_basis(ref):
             f"Auxiliary basis {auxbasis!r} does not define element {exc.args[0]!r} "
             "needed by this periodic cell."
         ) from exc
+    aux_basis = _gdf_charge_normalized_auxiliary_basis(aux_basis)
     basis = tuple(getattr(mf, "_basis", None) or ()) + aux_basis
     cache[key] = basis
     return basis
+
+
+def _gdf_auto_auxiliary_basis(ref):
+    mf = ref._pbc_mf
+    auxbasis = _gdf_auxbasis_name(ref)
+    aux_min_exponent = _gdf_aux_min_exponent(ref)
+    cache = _gdf_mf_cache(mf, "auto_auxiliary_basis")
+    key = (auxbasis, tuple(ref.cell._atom_symbols), aux_min_exponent)
+    if key in cache:
+        return cache[key]
+
+    aux_dict = _gdf_pruned_auxiliary_basis_dict(auxbasis, aux_min_exponent)
+    aux_basis = tuple(
+        make_contractions(
+            aux_dict,
+            list(ref.cell._atom_symbols),
+            np.asarray(ref.cell._atom_coords, dtype=float),
+            coord_types="c",
+        )
+    )
+    aux_basis = _gdf_charge_normalized_auxiliary_basis(aux_basis)
+    cache[key] = aux_basis
+    return aux_basis
 
 
 def _gdf_estimate_ke_cutoff_for_precision(ref, precision, omega=None):
@@ -887,14 +1013,25 @@ def _gdf_estimate_ke_cutoff_for_precision(ref, precision, omega=None):
     if key in cache:
         return cache[key]
 
-    ecut_max = 20.0
-    for fn in _gdf_auto_basis(ref):
-        l = int(sum(fn.shell))
+    aux_basis = _gdf_auto_auxiliary_basis(ref)
+    nkpts = max(1, len(np.asarray(ref.kpts).reshape(-1, 3)))
+    # Match PySCF's GDF mesh floor.  The auxiliary-shell estimate below may
+    # tighten it, but the floor must not acquire an extra basis-size scaling.
+    ecut_max = 30.0 * nkpts ** (-1.0 / 3.0)
+    for start, _stop, l in _cart_shell_blocks(aux_basis):
+        fn = aux_basis[start]
+        l = int(l)
         norm_ang = ((2 * l + 1) / (4.0 * np.pi)) ** 2
         power = 2 * l - 0.5
-        for exponent, weight in zip(fn.exps, fn.prim_weights):
+        radial_order = l + 1.5
+        radial_norm = 1.0 / np.sqrt(
+            math.gamma(radial_order)
+            / (2.0 * (2.0 * np.asarray(fn.exps, dtype=float)) ** radial_order)
+        )
+        radial_coefficients = np.asarray(fn.coefs, dtype=float) * radial_norm
+        for exponent, coefficient in zip(fn.exps, radial_coefficients):
             exponent = float(exponent)
-            coeff = abs(float(weight))
+            coeff = abs(float(coefficient))
             if exponent <= 0.0 or coeff == 0.0:
                 continue
             fac = (
@@ -923,15 +1060,16 @@ def _gdf_mesh_from_ke_cutoff(ref, ke_cutoff):
     recip = 2.0 * np.pi * np.linalg.inv(lattice).T
     gmax = math.sqrt(max(0.0, 2.0 * float(ke_cutoff)))
     dimension = int(getattr(ref.cell, "dimension", 3))
+    reciprocal_dual = np.linalg.inv(recip)
     mesh = []
     for axis in range(3):
         if dimension == 1 and axis > 0:
             mesh.append(1)
             continue
-        bnorm = float(np.linalg.norm(recip[axis]))
-        if bnorm <= 0.0:
+        dual_norm = float(np.linalg.norm(reciprocal_dual[:, axis]))
+        if dual_norm <= 0.0:
             raise ValueError("Cannot derive gdf_mesh from a singular reciprocal lattice.")
-        half_width = max(1, int(math.ceil(gmax / bnorm)))
+        half_width = max(1, int(math.ceil(gmax * dual_norm)))
         mesh.append(2 * half_width + 1)
     return tuple(mesh)
 
@@ -942,13 +1080,16 @@ def _gdf_ke_cutoff_from_mesh(ref, mesh):
         return None
     lattice = np.asarray(ref.cell.lattice_vectors, dtype=float)
     recip = 2.0 * np.pi * np.linalg.inv(lattice).T
+    reciprocal_dual = np.linalg.inv(recip)
     dimension = int(getattr(ref.cell, "dimension", 3))
     axes = range(1) if dimension == 1 else range(3)
     cutoffs = []
     for axis in axes:
         half_width = int(mesh[axis]) // 2
-        bnorm = float(np.linalg.norm(recip[axis]))
-        cutoffs.append(0.5 * (half_width * bnorm) ** 2)
+        dual_norm = float(np.linalg.norm(reciprocal_dual[:, axis]))
+        if dual_norm <= 0.0:
+            raise ValueError("Cannot derive GDF cutoff from a singular reciprocal lattice.")
+        cutoffs.append(0.5 * (half_width / dual_norm) ** 2)
     return float(min(cutoffs)) if cutoffs else None
 
 
@@ -969,11 +1110,20 @@ def _gdf_estimate_omega_for_ke_cutoff(ref, ke_cutoff, precision):
 
 def _gdf_reciprocal_kernel(ref):
     mf = ref._pbc_mf
+    automatic = _gdf_automatic_policy(mf)
+    precision_controlled = _gdf_precision(ref) is not None
+    range_separated_default = (
+        automatic or precision_controlled or hasattr(mf, "gdf_omega")
+    )
     value = str(
         getattr(
             mf,
             "gdf_reciprocal_kernel",
-            getattr(mf, "gdf_kernel", "full"),
+            getattr(
+                mf,
+                "gdf_kernel",
+                "range_separated" if range_separated_default else "full",
+            ),
         )
     ).lower()
     aliases = {
@@ -995,7 +1145,11 @@ def _gdf_reciprocal_kernel(ref):
             "gdf_reciprocal_kernel must be 'full', 'long_range', or 'range_separated'."
         ) from exc
 
-    omega = getattr(mf, "gdf_omega", None)
+    omega = getattr(
+        mf,
+        "gdf_omega",
+        "auto" if range_separated_default else None,
+    )
     if kernel in ("long_range", "range_separated"):
         if omega is None and _gdf_precision(ref) is None:
             raise ValueError(f"gdf_omega must be set for gdf_reciprocal_kernel='{kernel}'.")
@@ -1014,6 +1168,7 @@ def _gdf_resolved_reciprocal_settings(ref, recip_cut, mesh, kernel, omega):
     omega_auto = kernel in ("long_range", "range_separated") and (
         _gdf_is_auto(omega) or (omega is None and precision is not None)
     )
+    mesh_safety_pad = 0
 
     if mesh == "auto" and precision is None:
         precision = _gdf_precision(ref, default=1.0e-8)
@@ -1030,6 +1185,11 @@ def _gdf_resolved_reciprocal_settings(ref, recip_cut, mesh, kernel, omega):
             ke_omega = omega
         ke_cutoff = _gdf_estimate_ke_cutoff_for_precision(ref, precision, omega=ke_omega)
         mesh = _gdf_mesh_from_ke_cutoff(ref, ke_cutoff)
+        mesh_safety_pad = int(getattr(ref._pbc_mf, "gdf_mesh_safety_pad", 6))
+        if mesh_safety_pad < 0 or mesh_safety_pad % 2:
+            raise ValueError("gdf_mesh_safety_pad must be a non-negative even integer.")
+        mesh = tuple(int(value) + mesh_safety_pad for value in mesh)
+        ke_cutoff = _gdf_ke_cutoff_from_mesh(ref, mesh)
     elif mesh is not None:
         ke_cutoff = _gdf_ke_cutoff_from_mesh(ref, mesh)
     elif recip_cut is not None:
@@ -1048,17 +1208,50 @@ def _gdf_resolved_reciprocal_settings(ref, recip_cut, mesh, kernel, omega):
         "omega_auto": bool(omega_auto),
         "ke_cutoff": None if ke_cutoff is None else float(ke_cutoff),
         "omega_seed": float(ke_omega) if mesh_auto and omega_auto else None,
+        "mesh_safety_pad": int(mesh_safety_pad),
     }
     return mesh, omega, info
 
 
 def _gdf_backend_settings(ref):
     mf = ref._pbc_mf
-    recip_cut = int(getattr(mf, "gdf_recip_cut", getattr(mf, "recip_cut", 0)))
-    pair_cut = _gdf_normalize_pair_cut(
-        getattr(mf, "gdf_pair_cut", getattr(mf, "pair_cut", 0))
+    automatic = _gdf_automatic_policy(mf)
+    has_explicit_gdf_recip = hasattr(mf, "gdf_recip_cut")
+    has_explicit_gdf_mesh = hasattr(mf, "gdf_mesh")
+    has_explicit_gdf_pair = hasattr(mf, "gdf_pair_cut")
+    use_default_gdf_cutoffs = (
+        _gdf_precision(ref) is None
+        and not has_explicit_gdf_recip
+        and not has_explicit_gdf_mesh
+        and not has_explicit_gdf_pair
     )
-    mesh = _gdf_normalize_mesh(getattr(mf, "gdf_mesh", None))
+    recip_cut = int(getattr(mf, "gdf_recip_cut", getattr(mf, "recip_cut", 0)))
+    if use_default_gdf_cutoffs:
+        recip_cut = max(
+            recip_cut,
+            int(getattr(mf, "gdf_default_recip_cut", _GDF_DEFAULT_RECIP_CUT)),
+        )
+    pair_cut = _gdf_normalize_pair_cut(
+        getattr(
+            mf,
+            "gdf_pair_cut",
+            "auto"
+            if automatic or _gdf_precision(ref) is not None
+            else getattr(mf, "pair_cut", 0),
+        )
+    )
+    if use_default_gdf_cutoffs and pair_cut != "auto":
+        pair_cut = max(
+            pair_cut,
+            int(getattr(mf, "gdf_default_pair_cut", _GDF_DEFAULT_PAIR_CUT)),
+        )
+    mesh = _gdf_normalize_mesh(
+        getattr(
+            mf,
+            "gdf_mesh",
+            "auto" if _gdf_precision(ref) is not None and not has_explicit_gdf_recip else None,
+        )
+    )
     kernel, omega = _gdf_reciprocal_kernel(ref)
     if recip_cut < 0 or (pair_cut != "auto" and pair_cut < 0):
         raise ValueError("gdf_recip_cut and gdf_pair_cut must be non-negative.")
@@ -1074,6 +1267,13 @@ def _gdf_backend_settings(ref):
 def _gdf_backend_cutoffs(ref):
     recip_cut, pair_cut, *_rest = _gdf_backend_settings(ref)
     return recip_cut, pair_cut
+
+
+def _gdf_self_opposite_pair_reuse(mf):
+    value = getattr(mf, "gdf_self_opposite_pair_reuse", True)
+    if not isinstance(value, (bool, np.bool_)):
+        raise ValueError("gdf_self_opposite_pair_reuse must be a boolean.")
+    return bool(value)
 
 
 def _gdf_normalize_image_cut(value, dimension, name):
@@ -1138,6 +1338,32 @@ def _gdf_image_keys(cell, cut):
     return [(i, j, k) for i in ranges[0] for j in ranges[1] for k in ranges[2]]
 
 
+def _gdf_short_range_image_domain(ref):
+    mf = ref._pbc_mf
+    value = getattr(mf, "gdf_short_range_image_domain", None)
+    if value is None:
+        requested_cut = getattr(
+            mf,
+            "gdf_short_range_cut",
+            getattr(mf, "gdf_real_cut", None),
+        )
+        automatic = requested_cut is None or _gdf_is_auto(requested_cut)
+        value = "radial" if automatic and _gdf_precision(ref) is not None else "box"
+    key = str(value).strip().lower().replace("-", "_")
+    aliases = {"sphere": "radial", "spherical": "radial", "cube": "box"}
+    key = aliases.get(key, key)
+    if key not in ("radial", "box"):
+        raise ValueError("gdf_short_range_image_domain must be 'radial' or 'box'.")
+    return key
+
+
+def _gdf_short_range_radius_factor(ref):
+    value = float(getattr(ref._pbc_mf, "gdf_short_range_radius_factor", 1.25))
+    if not np.isfinite(value) or value < 1.0:
+        raise ValueError("gdf_short_range_radius_factor must be finite and at least 1.")
+    return value
+
+
 def _gdf_short_range_cut(ref):
     mf = ref._pbc_mf
     value = getattr(mf, "gdf_short_range_cut", None)
@@ -1166,21 +1392,38 @@ def _gdf_uses_short_range(kernel):
     return kernel == "range_separated"
 
 
-def _gdf_auto_short_range_cut(ref, omega):
+def _gdf_auto_short_range_radius(ref, omega):
     precision = _gdf_precision(ref, default=1.0e-8)
-    exponents = [
+    ao_basis = tuple(getattr(ref._pbc_mf, "_basis", None) or ())
+    all_basis = _gdf_auto_basis(ref)
+    ao_exponents = [
         float(exponent)
-        for fn in _gdf_auto_basis(ref)
+        for fn in ao_basis
         for exponent in np.asarray(fn.exps, dtype=float)
         if float(exponent) > 0.0
     ]
-    if not exponents:
-        return 0
-    exponent_min = min(exponents)
+    aux_exponents = [
+        float(exponent)
+        for fn in all_basis[len(ao_basis):]
+        for exponent in np.asarray(fn.exps, dtype=float)
+        if float(exponent) > 0.0
+    ]
+    if not ao_exponents or not aux_exponents:
+        return 0.0
+    pair_exponent = 2.0 * min(ao_exponents)
+    aux_exponent = min(aux_exponents)
     omega = float(omega)
-    theta = 1.0 / (2.0 / exponent_min + 1.0 / (omega * omega))
-    target = max(float(precision) ** 1.5, np.finfo(float).tiny)
-    radius = math.sqrt(max(0.0, math.log(1.0 / target)) / theta)
+    theta = 1.0 / (
+        1.0 / pair_exponent
+        + 1.0 / aux_exponent
+        + 1.0 / (omega * omega)
+    )
+    target = max(float(precision) ** 0.75, np.finfo(float).tiny)
+    return math.sqrt(max(0.0, math.log(1.0 / target)) / theta)
+
+
+def _gdf_auto_short_range_cut(ref, omega):
+    radius = _gdf_auto_short_range_radius(ref, omega)
     dimension = int(getattr(ref.cell, "dimension", 3))
     max_cut = int(getattr(ref._pbc_mf, "gdf_short_range_cut_max", 64))
     for cut in range(max_cut + 1):
@@ -1205,27 +1448,34 @@ def _gdf_auto_short_range_cut(ref, omega):
     )
 
 
+def _gdf_short_range_image_keys(ref, cut, omega):
+    keys = list(_gdf_image_keys(ref.cell, cut))
+    if _gdf_short_range_image_domain(ref) == "box":
+        return keys
+    radius = (
+        _gdf_short_range_radius_factor(ref)
+        * _gdf_auto_short_range_radius(ref, omega)
+    )
+    tolerance = 32.0 * np.finfo(float).eps * max(1.0, radius)
+    return [
+        key
+        for key in keys
+        if float(np.linalg.norm(ref.cell.translation_vector(key)))
+        < radius + tolerance
+    ]
+
+
 def _gdf_short_range_screen_tol(ref):
     mf = ref._pbc_mf
     value = getattr(mf, "gdf_short_range_screen_tol", None)
     if value is None:
         value = getattr(mf, "gdf_sr_screen_tol", None)
-    automatic = value is None and _gdf_precision(ref) is not None
-    if automatic:
-        factor = float(
-            getattr(
-                mf,
-                "gdf_short_range_screen_tol_factor",
-                _GDF_DEFAULT_SHORT_RANGE_SCREEN_TOL_FACTOR,
-            )
-        )
-        value = factor * float(_gdf_precision(ref))
     if value is None:
         return 0.0
     value = float(value)
     if value < 0.0:
         raise ValueError("gdf_short_range_screen_tol must be non-negative.")
-    if value > 0.0 and not automatic and not bool(
+    if value > 0.0 and not bool(
         getattr(mf, "gdf_allow_heuristic_short_range_screening", False)
     ):
         raise ValueError(
@@ -1238,15 +1488,90 @@ def _gdf_short_range_screen_tol(ref):
     return value
 
 
+def _gdf_short_range_primitive_exp_cutoff(ref):
+    mf = ref._pbc_mf
+    value = getattr(mf, "gdf_short_range_primitive_exp_cutoff", "auto")
+    if _gdf_is_auto(value):
+        precision = _gdf_precision(ref, default=1.0e-8)
+        safety_digits = float(
+            getattr(mf, "gdf_short_range_primitive_safety_digits", 4.0)
+        )
+        if not np.isfinite(safety_digits) or safety_digits < 0.0:
+            raise ValueError(
+                "gdf_short_range_primitive_safety_digits must be non-negative "
+                "and finite."
+            )
+        value = -math.log(float(precision)) + safety_digits * math.log(10.0)
+    value = float(value)
+    if not np.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "gdf_short_range_primitive_exp_cutoff must be non-negative and finite."
+        )
+    return value
+
+
 def _gdf_metric_relative_tol(ref):
     mf = ref._pbc_mf
     value = getattr(mf, "gdf_metric_relative_tol", None)
     if value is None:
-        precision = _gdf_precision(ref)
-        return 0.0 if precision is None else math.sqrt(float(precision))
+        return 0.0
     value = float(value)
     if not math.isfinite(value) or value < 0.0 or value >= 1.0:
         raise ValueError("gdf_metric_relative_tol must be finite and in [0, 1).")
+    return value
+
+
+def _gdf_aux_min_exponent(ref):
+    mf = ref._pbc_mf
+    value = getattr(mf, "gdf_aux_min_exponent", None)
+    if value is None:
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("gdf_aux_min_exponent must be non-negative and finite.")
+    return value
+
+
+def _gdf_pruned_auxiliary_basis_dict(auxbasis, min_exponent):
+    aux_dict = parse_gbs(_basis_path(auxbasis))
+    if min_exponent is None or float(min_exponent) == 0.0:
+        return aux_dict
+
+    threshold = float(min_exponent)
+    pruned = {}
+    for symbol, shells in aux_dict.items():
+        retained_shells = []
+        for angular_momentum, exponents, coefficients in shells:
+            exponents = np.asarray(exponents, dtype=float)
+            coefficients = np.asarray(coefficients, dtype=float)
+            if coefficients.ndim == 1:
+                coefficients = coefficients[:, None]
+            keep = exponents >= threshold
+            if np.any(keep):
+                retained_shells.append(
+                    (
+                        int(angular_momentum),
+                        exponents[keep],
+                        coefficients[keep],
+                    )
+                )
+        if retained_shells:
+            pruned[symbol] = retained_shells
+    return pruned
+
+
+def _gdf_metric_tol(ref, value=None):
+    if value is None:
+        value = getattr(ref._pbc_mf, "gdf_metric_tol", None)
+    if value is None:
+        precision = _gdf_precision(ref, default=1.0e-8)
+        value = max(
+            _GDF_DEFAULT_METRIC_TOL,
+            _GDF_DEFAULT_METRIC_PRECISION_FACTOR * float(precision),
+        )
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError("gdf_metric_tol must be a non-negative finite number.")
     return value
 
 
@@ -1305,15 +1630,20 @@ def _gdf_rs_pair_partition_mode(mf):
     return aliases[text]
 
 
-def _gdf_rs_smooth_exponent_cutoff(ref, omega, mesh):
+def _gdf_rs_explicit_smooth_exponent_cutoff(ref):
     mf = ref._pbc_mf
     value = getattr(mf, "gdf_smooth_exponent_cutoff", None)
     if value is None:
         value = getattr(mf, "gdf_rs_smooth_exponent_cutoff", None)
     if value is None:
         value = os.environ.get("PYQED_GDF_SMOOTH_EXPONENT_CUTOFF")
+    return None if value is None else float(value)
+
+
+def _gdf_rs_smooth_exponent_cutoff(ref, omega, mesh):
+    value = _gdf_rs_explicit_smooth_exponent_cutoff(ref)
     if value is not None:
-        return float(value)
+        return value
 
     precision = _gdf_precision(ref, default=1.0e-8)
     ke_cutoff = _gdf_ke_cutoff_from_mesh(ref, mesh) if mesh is not None else None
@@ -1324,6 +1654,36 @@ def _gdf_rs_smooth_exponent_cutoff(ref, omega, mesh):
     if omega is not None and float(omega) > 0.0:
         return float(omega) * float(omega)
     return 0.0
+
+
+def _gdf_shell_kinetic_cutoffs(fn, angular_momentum, precision):
+    l = int(angular_momentum)
+    exponents = np.asarray(fn.exps, dtype=float)
+    radial_order = l + 1.5
+    radial_norm = 1.0 / np.sqrt(
+        math.gamma(radial_order)
+        / (2.0 * (2.0 * exponents) ** radial_order)
+    )
+    coefficients = np.abs(np.asarray(fn.coefs, dtype=float) * radial_norm)
+    norm_ang = (2 * l + 1) / (4.0 * np.pi)
+    fac = (
+        32.0
+        * np.pi ** 2
+        * (2.0 * np.pi) ** 1.5
+        * coefficients ** 2
+        * norm_ang
+        / (2.0 * exponents) ** (2 * l + 0.5)
+        / float(precision)
+    )
+    cutoffs = np.full_like(exponents, 20.0)
+    power = l - 0.5
+    for _ in range(2):
+        cutoffs = (
+            np.log(fac * np.maximum(2.0 * cutoffs, 1.0e-12) ** power + 1.0)
+            * 4.0
+            * exponents
+        )
+    return cutoffs
 
 
 def _gdf_basis_exponent_stat(fn, stat):
@@ -1427,6 +1787,8 @@ class _GDFRangeSeparatedAuxEngine:
     compact_cart_mask: np.ndarray
     compact_aux_mask: np.ndarray
     smooth_exponent_cutoff: float | None = None
+    kinetic_cutoff: float | None = None
+    classification: str = "exponent"
 
     @property
     def partition_active(self):
@@ -1443,6 +1805,9 @@ class _GDFRangeSeparatedAuxEngine:
         timings["rs_aux_total_cart"] = int(self.compact_cart_mask.size)
         timings["rs_aux_compact_functions"] = int(np.count_nonzero(self.compact_aux_mask))
         timings["rs_aux_total_functions"] = int(self.compact_aux_mask.size)
+        timings["rs_aux_classification"] = self.classification
+        if self.kinetic_cutoff is not None:
+            timings["rs_aux_kinetic_cutoff"] = float(self.kinetic_cutoff)
 
 
 def _gdf_rs_aux_partition_mode(mf):
@@ -1474,7 +1839,12 @@ def _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh, timings=None):
         return None
     mf = ref._pbc_mf
     mode = _gdf_rs_aux_partition_mode(mf)
+    explicit_smooth_cutoff = _gdf_rs_explicit_smooth_exponent_cutoff(ref)
     smooth_cutoff = _gdf_rs_smooth_exponent_cutoff(ref, omega, mesh)
+    kinetic_cutoff = _gdf_ke_cutoff_from_mesh(ref, mesh)
+    classification = (
+        "exponent" if explicit_smooth_cutoff is not None else "kinetic_cutoff"
+    )
     cache = _gdf_mf_cache(mf, "rs_aux_engine")
     cache_key = (
         aux.name,
@@ -1482,6 +1852,8 @@ def _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh, timings=None):
         aux.ncart,
         mode,
         round(float(smooth_cutoff), 14),
+        None if kinetic_cutoff is None else round(float(kinetic_cutoff), 14),
+        classification,
     )
     engine = cache.get(cache_key)
     if engine is None:
@@ -1489,15 +1861,30 @@ def _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh, timings=None):
         compact_cart_mask = np.ones(aux.ncart, dtype=np.bool_)
         shell_classes = []
         shell_exponents = []
-        for start, stop, _l in shell_blocks:
+        precision = _gdf_precision(ref, default=1.0e-8)
+        for start, stop, l in shell_blocks:
             exponent = max(
                 _gdf_basis_exponent_stat(fn, "max")
                 for fn in aux.cart_basis[int(start):int(stop)]
             )
             shell_exponents.append(float(exponent))
-            smooth = mode == "all" or (
-                mode == "smooth" and exponent <= float(smooth_cutoff)
-            )
+            if mode == "all":
+                smooth = True
+            elif mode != "smooth":
+                smooth = False
+            elif classification == "exponent":
+                smooth = exponent <= float(smooth_cutoff)
+            else:
+                representative = aux.cart_basis[int(start)]
+                primitive_cutoffs = _gdf_shell_kinetic_cutoffs(
+                    representative,
+                    l,
+                    precision,
+                )
+                smooth = bool(
+                    kinetic_cutoff is not None
+                    and np.all(primitive_cutoffs < float(kinetic_cutoff))
+                )
             shell_classes.append("smooth" if smooth else "compact")
             if smooth:
                 compact_cart_mask[int(start):int(stop)] = False
@@ -1523,6 +1910,8 @@ def _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh, timings=None):
             compact_cart_mask=np.ascontiguousarray(compact_cart_mask),
             compact_aux_mask=np.ascontiguousarray(compact_aux_mask),
             smooth_exponent_cutoff=float(smooth_cutoff),
+            kinetic_cutoff=kinetic_cutoff,
+            classification=classification,
         )
         cache[cache_key] = engine
     engine.record_timings(timings)
@@ -1725,13 +2114,14 @@ def _gdf_rs_reciprocal_only_pair_mask(ref, kernel, omega, mesh, timings=None):
 
 def _gdf_pair_screen_tol(ref):
     mf = ref._pbc_mf
-    value = float(
-        getattr(
-            mf,
-            "gdf_pair_ft_screen_tol",
-            getattr(mf, "pair_ft_screen_tol", 0.0),
+    value = getattr(mf, "gdf_pair_ft_screen_tol", None)
+    if value is None:
+        value = (
+            0.0
+            if _gdf_precision(ref) is not None
+            else getattr(mf, "pair_ft_screen_tol", 0.0)
         )
-    )
+    value = float(value)
     if not math.isfinite(value) or value < 0.0:
         raise ValueError("gdf_pair_ft_screen_tol must be a non-negative finite number.")
     return value
@@ -1819,12 +2209,13 @@ def _gdf_mo_coeff_cache_key(ref):
 
 def _gdf_auxiliary_basis(space, auxbasis, coord_type):
     ref = space.reference
+    aux_min_exponent = _gdf_aux_min_exponent(ref)
     cache = _gdf_mf_cache(ref._pbc_mf, "auxiliary_basis")
-    key = (auxbasis, coord_type)
+    key = (auxbasis, coord_type, aux_min_exponent)
     if key in cache:
         return cache[key]
 
-    aux_dict = parse_gbs(_basis_path(auxbasis))
+    aux_dict = _gdf_pruned_auxiliary_basis_dict(auxbasis, aux_min_exponent)
     try:
         aux_basis = tuple(
             make_contractions(
@@ -1839,6 +2230,7 @@ def _gdf_auxiliary_basis(space, auxbasis, coord_type):
             f"Auxiliary basis {auxbasis!r} does not define element {exc.args[0]!r} "
             "needed by this periodic cell."
         ) from exc
+    aux_basis = _gdf_charge_normalized_auxiliary_basis(aux_basis)
     aux = _GDFAuxiliaryBasis(
         name=auxbasis,
         coord_type=coord_type,
@@ -2371,6 +2763,18 @@ def _gdf_default_workers():
     return max(1, min(8, int(cpu_count)))
 
 
+def _gdf_default_short_range_workers():
+    value = os.environ.get("PYQED_GDF_SR_MAX_WORKERS")
+    try:
+        cap = 24 if value is None else max(1, int(value))
+    except (TypeError, ValueError):
+        cap = 24
+    cpu_count = os.cpu_count()
+    if cpu_count is None:
+        return 1
+    return max(1, min(cap, int(cpu_count)))
+
+
 def _gdf_default_pair_ft_workers():
     value = os.environ.get("PYQED_GDF_WORKERS")
     if value is not None:
@@ -2412,12 +2816,23 @@ def _gdf_short_range_workers(mf):
     if value is None:
         value = os.environ.get("PYQED_GDF_CPP_THREADS")
     if value is None:
-        return _gdf_default_workers()
+        return _gdf_default_short_range_workers()
     try:
         workers = int(value)
     except (TypeError, ValueError):
-        return _gdf_default_workers()
+        return _gdf_default_short_range_workers()
     return max(1, workers)
+
+
+def _gdf_short_range_task_chunk_size(mf):
+    value = getattr(mf, "gdf_short_range_task_chunk_size", None)
+    if value is None:
+        value = os.environ.get("PYQED_GDF_SR_TASK_CHUNK_SIZE", 16)
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        size = 16
+    return max(1, size)
 
 
 def _gdf_pair_ft_workers(mf):
@@ -2603,11 +3018,33 @@ def _gdf_pair_ft_coeff_tol(mf, pair_screen_tol):
             factor = getattr(mf, "gdf_pair_ft_coeff_tol_factor", None)
             if factor is None:
                 factor = os.environ.get("PYQED_GDF_PAIR_FT_COEFF_TOL_FACTOR")
-            factor = 1.0e-4 if factor is None else float(factor)
+            factor = (
+                _GDF_DEFAULT_PAIR_FT_COEFF_TOL_FACTOR
+                if factor is None
+                else float(factor)
+            )
             value = max(float(pair_screen_tol), factor * float(precision))
     value = float(value)
     if not math.isfinite(value) or value < 0.0:
         raise ValueError("gdf_pair_ft_coeff_tol must be a non-negative finite number.")
+    return value
+
+
+def _gdf_pair_ft_factor_screen_tol(mf, coeff_tol):
+    value = getattr(mf, "gdf_pair_ft_factor_screen_tol", None)
+    if value is None:
+        value = os.environ.get("PYQED_GDF_PAIR_FT_FACTOR_SCREEN_TOL")
+    if value is None:
+        factor = getattr(mf, "gdf_pair_ft_factor_screen_tol_factor", None)
+        if factor is None:
+            factor = os.environ.get("PYQED_GDF_PAIR_FT_FACTOR_SCREEN_TOL_FACTOR")
+        factor = 1.0 if factor is None else float(factor)
+        value = factor * float(coeff_tol)
+    value = float(value)
+    if not math.isfinite(value) or value < 0.0:
+        raise ValueError(
+            "gdf_pair_ft_factor_screen_tol must be a non-negative finite number."
+        )
     return value
 
 
@@ -2839,6 +3276,25 @@ def _gdf_pair_image_screen(mf):
     return aliases[text]
 
 
+def _gdf_pair_plan_settings_key(mf, pair_cut, pair_screen_tol):
+    pair_cut = _gdf_normalize_pair_cut(pair_cut)
+    pair_screen_tol = float(pair_screen_tol)
+    if pair_cut == "auto":
+        image_tolerance = _gdf_pair_image_tolerance(mf, pair_screen_tol)
+        image_extent = _gdf_pair_image_auto_max_cut(mf)
+    else:
+        image_tolerance = pair_screen_tol
+        image_extent = int(pair_cut)
+    coeff_tol = _gdf_pair_ft_coeff_tol(mf, pair_screen_tol)
+    return (
+        round(float(image_tolerance), 18),
+        int(image_extent),
+        _gdf_pair_image_screen(mf),
+        round(float(coeff_tol), 18),
+        round(float(_gdf_pair_ft_factor_screen_tol(mf, coeff_tol)), 18),
+    )
+
+
 def _gdf_pair_overlap_screen_bound(a, b, shift, volume):
     a_origin = np.asarray(a.origin, dtype=float)
     b_origin = np.asarray(b.origin, dtype=float) + np.asarray(shift, dtype=float)
@@ -2892,19 +3348,14 @@ def _gdf_shell_pair_keep_mask(basis, shell_blocks, shift, tolerance, volume, scr
     pair_mask = np.zeros((nao, nao), dtype=np.bool_)
     for p0, p1, _lp in shell_blocks:
         for q0, q1, _lq in shell_blocks:
-            keep = False
-            for p in range(int(p0), int(p1)):
-                bp = basis[p]
-                for q in range(int(q0), int(q1)):
-                    if (
-                        _gdf_pair_image_bound(bp, basis[q], shift, volume, screen)
-                        > float(tolerance)
-                    ):
-                        keep = True
-                        break
-                if keep:
-                    break
-            if keep:
+            bound = _gdf_pair_image_bound(
+                basis[int(p0)],
+                basis[int(q0)],
+                shift,
+                volume,
+                screen,
+            )
+            if bound > float(tolerance):
                 pair_mask[int(p0):int(p1), int(q0):int(q1)] = True
     return pair_mask
 
@@ -3047,8 +3498,14 @@ def _gdf_record_pair_image_plan_timings(data, timings):
         np.count_nonzero(data["image_pair_mask"])
     )
     timings["pair_ft_coeff_tol"] = float(data.get("pair_ft_coeff_tol", 0.0))
+    timings["pair_ft_factor_screen_tol"] = float(
+        data.get("pair_ft_factor_screen_tol", 0.0)
+    )
     primitive_terms = data.get("primitive_terms")
     if primitive_terms is not None:
+        timings["pair_ft_plan_backend"] = str(
+            primitive_terms.get("builder_backend", "python")
+        )
         timings["pair_ft_product_groups"] = int(
             len(primitive_terms.get("product_group_term_start", ()))
         )
@@ -3469,6 +3926,7 @@ def _gdf_stream_weighted_pair_ao_many(
     timings=None,
     pair_mask=None,
     contract_pair_mask=None,
+    raw_pair_cache=None,
 ):
     ref = space.reference
     mf = ref._pbc_mf
@@ -3519,27 +3977,56 @@ def _gdf_stream_weighted_pair_ao_many(
                 pair_mask=pair_mask,
             )
         else:
-            if resolved_backend == "phase_blas":
-                pair_batch = _gdf_pair_ft_phase_blas_many(
-                    space,
-                    block_gqvecs,
-                    kvecs,
-                    pair_cut,
-                    pair_screen_tol,
-                    timings=timings,
-                    pair_mask=pair_mask,
+            raw_key = None
+            pair_batch = None
+            if raw_pair_cache is not None:
+                raw_key = (
+                    resolved_backend,
+                    _gdf_pair_mask_key(pair_mask),
+                    block_gqvecs.shape,
+                    block_gqvecs.tobytes(),
+                    kvecs.shape,
+                    kvecs.tobytes(),
                 )
-            else:
-                pair_batch = _gdf_pair_ft_batch_many(
-                    space,
-                    block_gqvecs,
-                    kvecs,
-                    pair_cut,
-                    pair_screen_tol,
-                    timings=timings,
-                    cache_enabled=False,
-                    pair_mask=pair_mask,
-                )
+                pair_batch = raw_pair_cache.get(raw_key)
+                if pair_batch is None:
+                    _gdf_count(timings, "pair_ft_stream_raw_cache_misses")
+                else:
+                    _gdf_count(timings, "pair_ft_stream_raw_cache_hits")
+            if pair_batch is None:
+                if resolved_backend == "phase_blas":
+                    pair_batch = _gdf_pair_ft_phase_blas_many(
+                        space,
+                        block_gqvecs,
+                        kvecs,
+                        pair_cut,
+                        pair_screen_tol,
+                        timings=timings,
+                        pair_mask=pair_mask,
+                    )
+                else:
+                    pair_batch = _gdf_pair_ft_batch_many(
+                        space,
+                        block_gqvecs,
+                        kvecs,
+                        pair_cut,
+                        pair_screen_tol,
+                        timings=timings,
+                        cache_enabled=False,
+                        pair_mask=pair_mask,
+                    )
+                if raw_key is not None:
+                    raw_pair_cache[raw_key] = pair_batch
+                    if timings is not None:
+                        timings["pair_ft_stream_raw_cache_peak_bytes"] = max(
+                            int(
+                                timings.get(
+                                    "pair_ft_stream_raw_cache_peak_bytes",
+                                    0,
+                                )
+                            ),
+                            sum(array.nbytes for array in raw_pair_cache.values()),
+                        )
             block_t0 = time.perf_counter()
             if timings is not None:
                 timings["pair_ft_stream_contract_backend"] = "matmul"
@@ -3558,6 +4045,7 @@ def _gdf_pair_ft_plan_data(mf, pair_cut, pair_screen_tol, pair_mask=None):
     pair_cut = _gdf_normalize_pair_cut(pair_cut)
     pair_screen_tol = float(pair_screen_tol)
     coeff_tol = _gdf_pair_ft_coeff_tol(mf, pair_screen_tol)
+    factor_screen_tol = _gdf_pair_ft_factor_screen_tol(mf, coeff_tol)
     pair_mask = _gdf_normalize_pair_mask(pair_mask, len(basis))
     image_plan = _gdf_pair_image_plan(mf, pair_cut, pair_screen_tol)
     key = (
@@ -3565,6 +4053,7 @@ def _gdf_pair_ft_plan_data(mf, pair_cut, pair_screen_tol, pair_mask=None):
         image_plan.key,
         float(pair_screen_tol),
         float(coeff_tol),
+        float(factor_screen_tol),
         _gdf_pair_mask_key(pair_mask),
     )
     if key in cache:
@@ -3601,6 +4090,7 @@ def _gdf_pair_ft_plan_data(mf, pair_cut, pair_screen_tol, pair_mask=None):
         image_pair_mask=image_pair_mask,
         coeff_tol=coeff_tol,
     )
+    primitive_terms["factor_screen_tol"] = float(factor_screen_tol)
     product_terms = None
     if has_periodic_pair_ft_product_backend() and _gdf_pair_product_kernel_enabled():
         product_terms = plan.periodic_product_terms(
@@ -3621,6 +4111,7 @@ def _gdf_pair_ft_plan_data(mf, pair_cut, pair_screen_tol, pair_mask=None):
         "primitive_terms": primitive_terms,
         "product_terms": product_terms,
         "pair_ft_coeff_tol": float(coeff_tol),
+        "pair_ft_factor_screen_tol": float(factor_screen_tol),
         "pair_image_plan_auto": image_plan.auto,
         "pair_image_plan_tol": image_plan.tolerance,
         "pair_image_plan_max_cut": image_plan.max_cut,
@@ -3748,6 +4239,16 @@ def _gdf_compiled_short_range_shell_blocked_available():
         and hasattr(
             _basis_cy,
             "compute_short_range_three_center_tensor_shell_blocked_masked",
+        )
+    )
+
+
+def _gdf_compiled_short_range_grouped_bloch_available():
+    return (
+        _gdf_compiled_short_range_shell_blocked_available()
+        and hasattr(
+            _basis_cy,
+            "compute_short_range_three_center_bloch_shell_blocked_group_masked",
         )
     )
 
@@ -3896,47 +4397,97 @@ def _gdf_sr3c_screen_masks(
     return pair_mask, aux_pair_mask, kept_pairs, skipped_pairs, skipped_aux
 
 
-def _gdf_aux_metric_short_range(
+def _gdf_aux_metric_short_range_key(
     space,
     q_index,
     aux,
     omega,
     short_range_cut,
     short_range_screen_tol=0.0,
-    timings=None,
     allowed_aux_mask=None,
 ):
     ref = space.reference
-    mf = ref._pbc_mf
     qvec = np.asarray(space.qpts[q_index], dtype=float)
-    if allowed_aux_mask is not None:
-        allowed_aux_mask = np.asarray(allowed_aux_mask, dtype=np.bool_)
-        if allowed_aux_mask.shape != (aux.ncart,):
-            raise ValueError(f"allowed_aux_mask must have shape ({aux.ncart},).")
-        allowed_aux_mask = np.ascontiguousarray(allowed_aux_mask)
-    cache = _gdf_mf_cache(mf, "aux_metric_short_range")
-    key = (
+    return (
         _gdf_vector_key(qvec),
         aux.name,
         aux.coord_type,
         aux.ncart,
         round(float(omega), 14),
         _gdf_image_cut_key(short_range_cut),
+        _gdf_short_range_image_domain(ref),
+        _gdf_short_range_radius_factor(ref),
         float(short_range_screen_tol),
         None
         if allowed_aux_mask is None
         else np.packbits(allowed_aux_mask).tobytes(),
     )
-    if key in cache:
-        _gdf_count(timings, "aux_metric_sr_cache_hits")
-        return cache[key]
-    _gdf_count(timings, "aux_metric_sr_cache_misses")
+
+
+def _gdf_aux_metric_short_range_many(
+    space,
+    q_indices,
+    aux,
+    omega,
+    short_range_cut,
+    short_range_screen_tol=0.0,
+    timings=None,
+    allowed_aux_mask=None,
+    cache_results=True,
+    consume_cached_results=False,
+):
+    """Build short-range auxiliary metrics while sharing image integrals over q."""
+
+    ref = space.reference
+    mf = ref._pbc_mf
+    if allowed_aux_mask is not None:
+        allowed_aux_mask = np.asarray(allowed_aux_mask, dtype=np.bool_)
+        if allowed_aux_mask.shape != (aux.ncart,):
+            raise ValueError(f"allowed_aux_mask must have shape ({aux.ncart},).")
+        allowed_aux_mask = np.ascontiguousarray(allowed_aux_mask)
+    q_indices = list(
+        dict.fromkeys(space.normalize_q_index(q_index) for q_index in q_indices)
+    )
+    cache = _gdf_mf_cache(mf, "aux_metric_short_range")
+    results = {}
+    missing = []
+    read_cache = bool(cache_results or consume_cached_results)
+    for q_index in q_indices:
+        key = _gdf_aux_metric_short_range_key(
+            space,
+            q_index,
+            aux,
+            omega,
+            short_range_cut,
+            short_range_screen_tol,
+            allowed_aux_mask=allowed_aux_mask,
+        )
+        if read_cache and key in cache:
+            _gdf_count(timings, "aux_metric_sr_cache_hits")
+            if consume_cached_results:
+                results[q_index] = cache.pop(key)
+                _gdf_count(timings, "aux_metric_sr_cache_consumes")
+            else:
+                results[q_index] = cache[key]
+        else:
+            _gdf_count(timings, "aux_metric_sr_cache_misses")
+            missing.append((q_index, key))
+    if not missing:
+        return results
 
     t0 = time.perf_counter()
-    metric_cart = np.zeros((aux.ncart, aux.ncart), dtype=np.complex128)
-    image_keys = list(_gdf_image_keys(mf.cell, short_range_cut))
+    qvecs = np.ascontiguousarray(
+        [space.qpts[q_index] for q_index, _key in missing],
+        dtype=float,
+    )
+    metric_cart = np.zeros(
+        (len(missing), aux.ncart, aux.ncart),
+        dtype=np.complex128,
+    )
+    image_keys = _gdf_short_range_image_keys(ref, short_range_cut, omega)
     metric_pairs = 0
     metric_pair_skips = 0
+    workspace_upper_bound = int(metric_cart.nbytes)
     if _gdf_compiled_short_range_available():
         (
             aux_shells,
@@ -3966,14 +4517,21 @@ def _gdf_aux_metric_short_range(
                 image_tasks.append((image_shift_by_key[image_key], False))
         sr_workers = min(_gdf_short_range_workers(mf), max(1, len(image_tasks)))
         compiled_calls = 0
+        aux_pair_mask = None
+        if allowed_aux_mask is not None:
+            aux_pair_mask = np.ascontiguousarray(
+                allowed_aux_mask[:, None] & allowed_aux_mask[None, :],
+                dtype=np.uint8,
+            )
+        workspace_upper_bound = int((sr_workers + 1) * metric_cart.nbytes)
 
         def build_metric_chunk(indices):
-            local_metric = np.zeros((aux.ncart, aux.ncart), dtype=np.complex128)
+            local_metric = np.zeros_like(metric_cart)
             local_pairs = 0
             local_calls = 0
             for task_index in indices:
                 shift, has_opposite = image_tasks[int(task_index)]
-                phase = np.exp(1.0j * np.dot(qvec, shift))
+                phases = np.exp(1.0j * (qvecs @ shift))
                 shifted_origins = np.ascontiguousarray(
                     aux_origins + shift[None, :],
                     dtype=np.float64,
@@ -3990,10 +4548,6 @@ def _gdf_aux_metric_short_range(
                     )
                     local_pairs += aux.ncart * aux.ncart
                 else:
-                    aux_pair_mask = np.ascontiguousarray(
-                        allowed_aux_mask[:, None] & allowed_aux_mask[None, :],
-                        dtype=np.uint8,
-                    )
                     block = _basis_cy.compute_short_range_aux_metric_masked(
                         aux_shells,
                         aux_origins,
@@ -4005,10 +4559,12 @@ def _gdf_aux_metric_short_range(
                         float(omega),
                     )
                     local_pairs += int(np.count_nonzero(aux_pair_mask))
-                local_metric += phase * block
+                local_metric += phases[:, None, None] * block[None, :, :]
                 local_calls += 1
                 if has_opposite:
-                    local_metric += phase.conjugate() * block.T
+                    local_metric += (
+                        phases.conj()[:, None, None] * block.T[None, :, :]
+                    )
                     if allowed_aux_mask is None:
                         local_pairs += aux.ncart * aux.ncart
                     else:
@@ -4042,7 +4598,7 @@ def _gdf_aux_metric_short_range(
         aux_centers, aux_scales = _gdf_sr_aux_screen_data(aux)
         for image_key in image_keys:
             shift = mf.cell.translation_vector(image_key)
-            phase = np.exp(1.0j * np.dot(qvec, shift))
+            phases = np.exp(1.0j * (qvecs @ shift))
             shifted_aux = [_shifted_gaussian(fn, shift) for fn in aux.cart_basis]
             keep_mask = None
             if short_range_screen_tol != 0.0:
@@ -4082,20 +4638,64 @@ def _gdf_aux_metric_short_range(
                         metric_pair_skips += 1
                         continue
                     metric_pairs += 1
-                    metric_cart[p, q] += phase * short_range_two_center_coulomb(
-                        bp,
-                        bq,
-                        omega,
+                    metric_cart[:, p, q] += phases * (
+                        short_range_two_center_coulomb(bp, bq, omega)
                     )
 
-    metric = aux.transform.T @ metric_cart @ aux.transform
-    metric = 0.5 * (metric + metric.conj().T)
+    metrics = np.einsum(
+        "aP,xab,bQ->xPQ",
+        aux.transform,
+        metric_cart,
+        aux.transform,
+        optimize=True,
+    )
+    metrics = 0.5 * (metrics + metrics.conj().transpose(0, 2, 1))
+    for row, (q_index, key) in enumerate(missing):
+        metric = np.ascontiguousarray(metrics[row])
+        if cache_results:
+            cache[key] = metric
+        results[q_index] = metric
     _gdf_add_timing(timings, "aux_metric_short_range_seconds", time.perf_counter() - t0)
     _gdf_count(timings, "aux_metric_short_range_images", len(image_keys))
     _gdf_count(timings, "aux_metric_short_range_pairs", metric_pairs)
     _gdf_count(timings, "aux_metric_short_range_pair_skips", metric_pair_skips)
-    cache[key] = metric
-    return metric
+    if timings is not None:
+        timings["aux_metric_short_range_qpoints"] = int(len(missing))
+        timings["aux_metric_short_range_output_bytes"] = int(metric_cart.nbytes)
+        timings["aux_metric_short_range_workspace_bytes_upper_bound"] = int(
+            workspace_upper_bound
+        )
+        timings["aux_metric_short_range_result_cache_enabled"] = bool(
+            cache_results
+        )
+    return results
+
+
+def _gdf_aux_metric_short_range(
+    space,
+    q_index,
+    aux,
+    omega,
+    short_range_cut,
+    short_range_screen_tol=0.0,
+    timings=None,
+    allowed_aux_mask=None,
+    cache_results=True,
+    consume_cached_results=False,
+):
+    q_index = space.normalize_q_index(q_index)
+    return _gdf_aux_metric_short_range_many(
+        space,
+        [q_index],
+        aux,
+        omega,
+        short_range_cut,
+        short_range_screen_tol,
+        timings=timings,
+        allowed_aux_mask=allowed_aux_mask,
+        cache_results=cache_results,
+        consume_cached_results=consume_cached_results,
+    )[q_index]
 
 
 def _gdf_three_center_sr_components(
@@ -4127,6 +4727,8 @@ def _gdf_three_center_sr_components(
         aux.ncart,
         round(float(omega), 14),
         _gdf_image_cut_key(short_range_cut),
+        _gdf_short_range_image_domain(ref),
+        _gdf_short_range_radius_factor(ref),
         float(pair_screen_tol),
         float(short_range_screen_tol),
         _gdf_pair_mask_key(allowed_pair_mask),
@@ -4143,7 +4745,7 @@ def _gdf_three_center_sr_components(
     pair_screen_tol = float(pair_screen_tol)
     short_range_screen_tol = float(short_range_screen_tol)
     t0 = time.perf_counter()
-    image_keys = list(_gdf_image_keys(mf.cell, short_range_cut))
+    image_keys = _gdf_short_range_image_keys(ref, short_range_cut, omega)
     if _gdf_compiled_short_range_available():
         (
             shells,
@@ -4490,13 +5092,35 @@ def _gdf_three_center_sr_components(
                 for left_shift, right_shift, tensor in task_components:
                     component_consumer(left_shift, right_shift, tensor)
 
+        def build_component_chunk(tasks):
+            chunk_components = []
+            chunk_counts = np.zeros(7, dtype=np.int64)
+            for task in tasks:
+                result = build_component_task(task)
+                chunk_components.extend(result[0])
+                chunk_counts += np.asarray(result[1:], dtype=np.int64)
+            return (chunk_components, *[int(value) for value in chunk_counts])
+
         max_inflight_tasks = 1
+        max_inflight_image_pairs = 1
         if sr_workers > 1 and len(image_pair_tasks) > 1:
-            max_inflight_tasks = min(len(image_pair_tasks), 2 * sr_workers)
+            task_chunk_size = _gdf_short_range_task_chunk_size(mf)
+            task_chunks = [
+                image_pair_tasks[start:start + task_chunk_size]
+                for start in range(0, len(image_pair_tasks), task_chunk_size)
+            ]
+            max_inflight_chunks = min(len(task_chunks), 2 * sr_workers)
+            max_inflight_tasks = max_inflight_chunks
+            max_inflight_image_pairs = min(
+                len(image_pair_tasks),
+                max_inflight_tasks * task_chunk_size,
+            )
             with ThreadPoolExecutor(max_workers=sr_workers) as executor:
-                for task0 in range(0, len(image_pair_tasks), max_inflight_tasks):
-                    task_batch = image_pair_tasks[task0:task0 + max_inflight_tasks]
-                    for result in executor.map(build_component_task, task_batch):
+                for chunk0 in range(0, len(task_chunks), max_inflight_chunks):
+                    chunk_batch = task_chunks[
+                        chunk0:chunk0 + max_inflight_chunks
+                    ]
+                    for result in executor.map(build_component_chunk, chunk_batch):
                         (
                             task_components,
                             task_kept_pairs,
@@ -4544,6 +5168,12 @@ def _gdf_three_center_sr_components(
         if timings is not None:
             timings["three_center_sr_component_streamed"] = bool(stream_components)
             timings["three_center_sr_max_inflight_tasks"] = int(max_inflight_tasks)
+            timings["three_center_sr_task_chunk_size"] = int(
+                _gdf_short_range_task_chunk_size(mf)
+            )
+            timings["three_center_sr_max_inflight_image_pairs"] = int(
+                max_inflight_image_pairs
+            )
         _gdf_count(timings, "three_center_sr_component_images", len(image_keys))
         _gdf_count(timings, "three_center_sr_component_terms", component_terms)
         _gdf_count(timings, "three_center_short_range_pairs", kept_pairs)
@@ -4666,6 +5296,330 @@ def _gdf_three_center_sr_components(
     return None
 
 
+def _gdf_three_center_ao_short_range_grouped_bloch(
+    space,
+    pair_keys,
+    aux,
+    omega,
+    short_range_cut,
+    timings=None,
+    allowed_pair_mask=None,
+    allowed_aux_mask=None,
+):
+    """Exactly accumulate image-pair groups with shared AO-pair geometry."""
+
+    ref = space.reference
+    mf = ref._pbc_mf
+    basis = tuple(mf._basis)
+    nao = len(basis)
+    (
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+    ) = _gdf_cached_packed_basis(mf, "ao_short_range_packed_basis", basis)
+    (
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+    ) = _gdf_cached_packed_basis(
+        mf,
+        "aux_short_range_packed_basis",
+        aux.cart_basis,
+    )
+    shell_starts, shell_stops = _gdf_cached_cart_shell_slices(
+        mf,
+        "ao_short_range_cart_shell_slices",
+        basis,
+    )
+    aux_shell_starts, aux_shell_stops = _gdf_cached_cart_shell_slices(
+        mf,
+        "aux_short_range_cart_shell_slices",
+        aux.cart_basis,
+    )
+    image_keys = _gdf_short_range_image_keys(ref, short_range_cut, omega)
+    shifts = np.ascontiguousarray(
+        [mf.cell.translation_vector(image_key) for image_key in image_keys],
+        dtype=np.float64,
+    )
+    pair_mask = (
+        np.ones((nao, nao), dtype=np.uint8)
+        if allowed_pair_mask is None
+        else np.ascontiguousarray(allowed_pair_mask, dtype=np.uint8)
+    )
+    aux_pair_mask = np.broadcast_to(
+        pair_mask[None, :, :],
+        (aux.ncart, nao, nao),
+    ).copy()
+    if allowed_aux_mask is not None:
+        aux_pair_mask *= np.asarray(allowed_aux_mask, dtype=np.uint8)[:, None, None]
+
+    groups = {}
+    for left_index in range(len(shifts)):
+        for right_index in range(left_index, len(shifts)):
+            relative_shift = shifts[right_index] - shifts[left_index]
+            key = _gdf_vector_key(relative_shift)
+            group = groups.setdefault(
+                key,
+                {"relative_shift": relative_shift, "tasks": []},
+            )
+            group["tasks"].append((left_index, right_index))
+    group_rows = list(groups.values())
+    kvec_left = np.ascontiguousarray(
+        [ref.kpts[k_index] for k_index, _kq_index in pair_keys],
+        dtype=np.float64,
+    )
+    kvec_right = np.ascontiguousarray(
+        [ref.kpts[kq_index] for _k_index, kq_index in pair_keys],
+        dtype=np.float64,
+    )
+    primitive_exp_cutoff = _gdf_short_range_primitive_exp_cutoff(ref)
+
+    def build_group(group):
+        tasks = np.asarray(group["tasks"], dtype=np.int64)
+        left_shifts = np.ascontiguousarray(shifts[tasks[:, 0]], dtype=np.float64)
+        right_shifts = np.ascontiguousarray(shifts[tasks[:, 1]], dtype=np.float64)
+        relative_shift = np.asarray(group["relative_shift"], dtype=np.float64)
+        right_origins = np.ascontiguousarray(
+            origins + relative_shift[None, :],
+            dtype=np.float64,
+        )
+        aux_origins_many = np.ascontiguousarray(
+            aux_origins[None, :, :] - left_shifts[:, None, :],
+            dtype=np.float64,
+        )
+        phases = np.exp(
+            -1.0j * (kvec_left @ left_shifts.T)
+            + 1.0j * (kvec_right @ right_shifts.T)
+        )
+        mirror_phases = np.exp(
+            -1.0j * (kvec_left @ right_shifts.T)
+            + 1.0j * (kvec_right @ left_shifts.T)
+        )
+        mirror_flags = np.ascontiguousarray(
+            tasks[:, 0] != tasks[:, 1],
+            dtype=np.uint8,
+        )
+        (
+            _real,
+            _imag,
+            primitive_candidates,
+            primitive_skips,
+            shell_task_skips,
+        ) = (
+            _basis_cy.compute_short_range_three_center_bloch_shell_blocked_group_masked(
+                shells,
+                origins,
+                right_origins,
+                exps,
+                weights,
+                nprim,
+                aux_shells,
+                aux_origins_many,
+                aux_exps,
+                aux_weights,
+                aux_nprim,
+                shell_starts,
+                shell_stops,
+                aux_shell_starts,
+                aux_shell_stops,
+                pair_mask,
+                aux_pair_mask,
+                np.ascontiguousarray(phases.real.T, dtype=np.float64),
+                np.ascontiguousarray(phases.imag.T, dtype=np.float64),
+                np.ascontiguousarray(mirror_phases.real.T, dtype=np.float64),
+                np.ascontiguousarray(mirror_phases.imag.T, dtype=np.float64),
+                mirror_flags,
+                float(omega),
+                float(primitive_exp_cutoff),
+            )
+        )
+        return (
+            np.moveaxis(np.asarray(_real), -1, 0)
+            + 1.0j * np.moveaxis(np.asarray(_imag), -1, 0),
+            len(tasks),
+            int(primitive_candidates),
+            int(primitive_skips),
+            int(shell_task_skips),
+        )
+
+    t0 = time.perf_counter()
+    ao_cart = np.zeros(
+        (len(pair_keys), aux.ncart, nao, nao),
+        dtype=np.complex128,
+    )
+    worker_count = min(_gdf_short_range_workers(mf), max(1, len(group_rows)))
+    worker_groups = [[] for _index in range(worker_count)]
+    worker_loads = np.zeros(worker_count, dtype=np.int64)
+    for group in sorted(group_rows, key=lambda row: len(row["tasks"]), reverse=True):
+        worker = int(np.argmin(worker_loads))
+        worker_groups[worker].append(group)
+        worker_loads[worker] += len(group["tasks"])
+    worker_groups = [rows for rows in worker_groups if rows]
+    max_inflight = len(worker_groups)
+
+    def build_worker_groups(rows):
+        worker_t0 = time.perf_counter()
+        contribution = np.zeros_like(ao_cart)
+        primitive_candidates = 0
+        primitive_skips = 0
+        shell_task_skips = 0
+        image_pairs = 0
+        for group in rows:
+            (
+                group_contribution,
+                task_count,
+                group_primitive_candidates,
+                group_primitive_skips,
+                group_shell_task_skips,
+            ) = build_group(group)
+            contribution += group_contribution
+            image_pairs += task_count
+            primitive_candidates += group_primitive_candidates
+            primitive_skips += group_primitive_skips
+            shell_task_skips += group_shell_task_skips
+        return (
+            contribution,
+            primitive_candidates,
+            primitive_skips,
+            shell_task_skips,
+            image_pairs,
+            time.perf_counter() - worker_t0,
+        )
+
+    primitive_candidates = 0
+    primitive_skips = 0
+    shell_task_skips = 0
+    worker_diagnostics = []
+    if worker_count > 1 and len(group_rows) > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for (
+                contribution,
+                worker_primitive_candidates,
+                worker_primitive_skips,
+                worker_shell_task_skips,
+                worker_image_pairs,
+                worker_seconds,
+            ) in executor.map(build_worker_groups, worker_groups):
+                ao_cart += contribution
+                primitive_candidates += worker_primitive_candidates
+                primitive_skips += worker_primitive_skips
+                shell_task_skips += worker_shell_task_skips
+                worker_diagnostics.append(
+                    (
+                        worker_image_pairs,
+                        worker_primitive_candidates,
+                        worker_primitive_skips,
+                        worker_shell_task_skips,
+                        worker_seconds,
+                    )
+                )
+    else:
+        (
+            contribution,
+            primitive_candidates,
+            primitive_skips,
+            shell_task_skips,
+            worker_image_pairs,
+            worker_seconds,
+        ) = build_worker_groups(group_rows)
+        ao_cart += contribution
+        worker_diagnostics.append(
+            (
+                worker_image_pairs,
+                primitive_candidates,
+                primitive_skips,
+                shell_task_skips,
+                worker_seconds,
+            )
+        )
+
+    nimages = len(shifts)
+    ordered_tasks = nimages * nimages
+    full_pair_count = int(np.count_nonzero(pair_mask))
+    full_aux_pair_count = int(np.count_nonzero(aux_pair_mask))
+    _gdf_add_timing(
+        timings,
+        "three_center_sr_component_seconds",
+        time.perf_counter() - t0,
+    )
+    _gdf_count(timings, "three_center_short_range_workers", worker_count)
+    _gdf_count(timings, "three_center_sr_component_images", nimages)
+    _gdf_count(timings, "three_center_sr_component_terms", ordered_tasks)
+    _gdf_count(
+        timings,
+        "three_center_short_range_pairs",
+        ordered_tasks * full_pair_count,
+    )
+    _gdf_count(
+        timings,
+        "three_center_short_range_pair_skips",
+        ordered_tasks * (nao * nao - full_pair_count),
+    )
+    _gdf_count(
+        timings,
+        "three_center_short_range_aux_skips",
+        ordered_tasks * (aux.ncart * nao * nao - full_aux_pair_count),
+    )
+    _gdf_count(
+        timings,
+        "three_center_short_range_compiled_calls",
+        len(group_rows),
+    )
+    _gdf_count(
+        timings,
+        "three_center_short_range_shell_blocked_compiled_calls",
+        len(group_rows),
+    )
+    _gdf_count(
+        timings,
+        "three_center_short_range_image_pair_symmetry_reuses",
+        nimages * (nimages - 1) // 2,
+    )
+    if timings is not None:
+        timings["three_center_sr_component_streamed"] = True
+        timings["three_center_sr_grouped_bloch"] = True
+        timings["three_center_sr_bloch_contiguous"] = True
+        timings["three_center_sr_relative_translation_groups"] = int(
+            len(group_rows)
+        )
+        timings["three_center_sr_max_inflight_tasks"] = int(max_inflight)
+        timings["three_center_sr_max_inflight_image_pairs"] = int(
+            np.max(worker_loads, initial=0)
+        )
+        timings["three_center_sr_primitive_exp_cutoff"] = float(
+            primitive_exp_cutoff
+        )
+        timings["three_center_sr_primitive_candidates"] = int(
+            primitive_candidates
+        )
+        timings["three_center_sr_primitive_skips"] = int(primitive_skips)
+        timings["three_center_sr_shell_task_skips"] = int(shell_task_skips)
+        timings["three_center_sr_worker_image_pairs"] = [
+            int(row[0]) for row in worker_diagnostics
+        ]
+        timings["three_center_sr_worker_primitive_candidates"] = [
+            int(row[1]) for row in worker_diagnostics
+        ]
+        timings["three_center_sr_worker_primitive_retained"] = [
+            int(row[1] - row[2]) for row in worker_diagnostics
+        ]
+        timings["three_center_sr_worker_shell_task_skips"] = [
+            int(row[3]) for row in worker_diagnostics
+        ]
+        timings["three_center_sr_worker_seconds"] = [
+            float(row[4]) for row in worker_diagnostics
+        ]
+        timings["three_center_sr_group_output_bytes"] = int(ao_cart.nbytes)
+        timings["three_center_sr_group_workspace_bytes_upper_bound"] = int(
+            (3 * worker_count + 1) * ao_cart.nbytes
+        )
+    return ao_cart
+
+
 def _gdf_three_center_ao_short_range_key(
     space,
     q_index,
@@ -4688,6 +5642,9 @@ def _gdf_three_center_ao_short_range_key(
         aux.ncart,
         round(float(omega), 14),
         _gdf_image_cut_key(short_range_cut),
+        _gdf_short_range_image_domain(space.reference),
+        _gdf_short_range_radius_factor(space.reference),
+        _gdf_short_range_primitive_exp_cutoff(space.reference),
         float(pair_screen_tol),
         float(short_range_screen_tol),
         _gdf_pair_mask_key(allowed_pair_mask),
@@ -4697,10 +5654,9 @@ def _gdf_three_center_ao_short_range_key(
     )
 
 
-def _gdf_three_center_ao_short_range_many(
+def _gdf_three_center_ao_short_range_many_q(
     space,
-    q_index,
-    pair_keys,
+    q_pair_keys,
     aux,
     omega,
     short_range_cut,
@@ -4710,8 +5666,9 @@ def _gdf_three_center_ao_short_range_many(
     allowed_pair_mask=None,
     allowed_aux_mask=None,
     cache_results=True,
+    consume_cached_results=False,
 ):
-    """Build Bloch-summed short-range AO tensors without retaining image tensors."""
+    """Build short-range AO tensors for arbitrary q-resolved k-pair rows."""
 
     ref = space.reference
     mf = ref._pbc_mf
@@ -4722,13 +5679,21 @@ def _gdf_three_center_ao_short_range_many(
         if allowed_aux_mask.shape != (aux.ncart,):
             raise ValueError(f"allowed_aux_mask must have shape ({aux.ncart},).")
         allowed_aux_mask = np.ascontiguousarray(allowed_aux_mask)
-    pair_keys = list(
-        dict.fromkeys((int(k_index), int(kq_index)) for k_index, kq_index in pair_keys)
+    q_pair_keys = list(
+        dict.fromkeys(
+            (
+                space.normalize_q_index(q_index),
+                int(k_index),
+                int(kq_index),
+            )
+            for q_index, k_index, kq_index in q_pair_keys
+        )
     )
     cache = _gdf_mf_cache(mf, "three_center_ao_short_range")
     results = {}
     missing = []
-    for k_index, kq_index in pair_keys:
+    read_cache = bool(cache_results or consume_cached_results)
+    for q_index, k_index, kq_index in q_pair_keys:
         key = _gdf_three_center_ao_short_range_key(
             space,
             q_index,
@@ -4742,12 +5707,16 @@ def _gdf_three_center_ao_short_range_many(
             allowed_pair_mask=allowed_pair_mask,
             allowed_aux_mask=allowed_aux_mask,
         )
-        if cache_results and key in cache:
+        if read_cache and key in cache:
             _gdf_count(timings, "three_center_ao_sr_cache_hits")
-            results[(k_index, kq_index)] = cache[key]
+            if consume_cached_results:
+                results[(q_index, k_index, kq_index)] = cache.pop(key)
+                _gdf_count(timings, "three_center_ao_sr_cache_consumes")
+            else:
+                results[(q_index, k_index, kq_index)] = cache[key]
         else:
             _gdf_count(timings, "three_center_ao_sr_cache_misses")
-            missing.append((k_index, kq_index, key))
+            missing.append((q_index, k_index, kq_index, key))
 
     if not missing:
         return results
@@ -4758,11 +5727,11 @@ def _gdf_three_center_ao_short_range_many(
         dtype=np.complex128,
     )
     kvec_left = np.asarray(
-        [ref.kpts[k_index] for k_index, _kq_index, _key in missing],
+        [ref.kpts[k_index] for _q_index, k_index, _kq_index, _key in missing],
         dtype=float,
     )
     kvec_right = np.asarray(
-        [ref.kpts[kq_index] for _k_index, kq_index, _key in missing],
+        [ref.kpts[kq_index] for _q_index, _k_index, kq_index, _key in missing],
         dtype=float,
     )
     peak_tensor_bytes = 0
@@ -4782,7 +5751,28 @@ def _gdf_three_center_ao_short_range_many(
     ) and (
         allowed_aux_mask is None or bool(np.any(allowed_aux_mask))
     )
-    if has_short_range_pairs:
+    use_grouped_bloch = (
+        has_short_range_pairs
+        and pair_screen_tol == 0.0
+        and short_range_screen_tol == 0.0
+        and _gdf_compiled_short_range_grouped_bloch_available()
+    )
+    if use_grouped_bloch:
+        ao_cart += _gdf_three_center_ao_short_range_grouped_bloch(
+            space,
+            [
+                (k_index, kq_index)
+                for _q_index, k_index, kq_index, _key in missing
+            ],
+            aux,
+            omega,
+            short_range_cut,
+            timings=timings,
+            allowed_pair_mask=allowed_pair_mask,
+            allowed_aux_mask=allowed_aux_mask,
+        )
+        peak_tensor_bytes = 0
+    elif has_short_range_pairs:
         _gdf_three_center_sr_components(
             space,
             aux,
@@ -4812,11 +5802,11 @@ def _gdf_three_center_ao_short_range_many(
         ao_cart,
         optimize=True,
     )
-    for row, (k_index, kq_index, key) in enumerate(missing):
+    for row, (q_index, k_index, kq_index, key) in enumerate(missing):
         ao_tensor = np.ascontiguousarray(ao_tensors[row])
         if cache_results:
             cache[key] = ao_tensor
-        results[(k_index, kq_index)] = ao_tensor
+        results[(q_index, k_index, kq_index)] = ao_tensor
 
     _gdf_add_timing(
         timings,
@@ -4825,11 +5815,175 @@ def _gdf_three_center_ao_short_range_many(
     )
     if timings is not None:
         timings["three_center_sr_bloch_batch_pairs"] = int(len(missing))
+        timings["three_center_sr_bloch_batch_qpoints"] = int(
+            len({q_index for q_index, *_rest in missing})
+        )
         timings["three_center_sr_bloch_output_bytes"] = int(ao_cart.nbytes)
         timings["three_center_sr_peak_image_tensor_bytes"] = int(peak_tensor_bytes)
         timings["three_center_sr_retained_image_tensor_bytes"] = 0
         timings["three_center_sr_result_cache_enabled"] = bool(cache_results)
     return results
+
+
+def _gdf_three_center_ao_short_range_many(
+    space,
+    q_index,
+    pair_keys,
+    aux,
+    omega,
+    short_range_cut,
+    pair_screen_tol,
+    short_range_screen_tol,
+    timings=None,
+    allowed_pair_mask=None,
+    allowed_aux_mask=None,
+    cache_results=True,
+    consume_cached_results=False,
+):
+    """Build one q block without retaining individual image tensors."""
+
+    q_index = space.normalize_q_index(q_index)
+    rows = [
+        (q_index, int(k_index), int(kq_index))
+        for k_index, kq_index in pair_keys
+    ]
+    results = _gdf_three_center_ao_short_range_many_q(
+        space,
+        rows,
+        aux,
+        omega,
+        short_range_cut,
+        pair_screen_tol,
+        short_range_screen_tol,
+        timings=timings,
+        allowed_pair_mask=allowed_pair_mask,
+        allowed_aux_mask=allowed_aux_mask,
+        cache_results=cache_results,
+        consume_cached_results=consume_cached_results,
+    )
+    return {
+        (k_index, kq_index): results[(q_index, k_index, kq_index)]
+        for _q_index, k_index, kq_index in rows
+    }
+
+
+def _gdf_prebuild_short_range_q_batch(space, q_indices, timings=None):
+    """Cache one bounded batch of q-resolved short-range AO and metric blocks."""
+
+    ref = space.reference
+    mf = ref._pbc_mf
+    (
+        _recip_cut,
+        _pair_cut,
+        mesh,
+        _recip_key,
+        kernel,
+        omega,
+        _kernel_key,
+        _auto_info,
+    ) = _gdf_backend_settings(ref)
+    if not _gdf_uses_short_range(kernel):
+        return 0
+
+    q_indices = list(
+        dict.fromkeys(space.normalize_q_index(q_index) for q_index in q_indices)
+    )
+    if not q_indices:
+        return 0
+    aux = _gdf_auxiliary_basis(
+        space,
+        _gdf_auxbasis_name(ref),
+        _gdf_aux_coord_type(ref),
+    )
+    rs_engine = _gdf_rs_shell_engine(ref, kernel, omega, mesh, timings=timings)
+    rs_aux_engine = _gdf_rs_aux_engine(
+        ref,
+        aux,
+        kernel,
+        omega,
+        mesh,
+        timings=timings,
+    )
+    short_range_aux = _gdf_rs_compact_auxiliary_basis(aux, rs_aux_engine)
+    if short_range_aux.ncart == 0:
+        return 0
+    compact_pair_mask = None
+    if rs_engine is not None and rs_engine.partition_active:
+        compact_pair_mask = rs_engine.compact_pair_mask
+    rows = []
+    self_opposite_reuses = 0
+    for q_index in q_indices:
+        pair_keys = list(_pair_keys_for_q(space, q_index))
+        source_pairs, _source_by_pair = _gdf_self_opposite_pair_sources(
+            space,
+            q_index,
+            pair_keys,
+        )
+        rows.extend(
+            (q_index, int(k_index), int(kq_index))
+            for k_index, kq_index in source_pairs
+        )
+        self_opposite_reuses += len(pair_keys) - len(source_pairs)
+    total_t0 = time.perf_counter()
+    t0 = time.perf_counter()
+    _gdf_three_center_ao_short_range_many_q(
+        space,
+        rows,
+        short_range_aux,
+        omega,
+        _gdf_short_range_cut(ref),
+        _gdf_pair_screen_tol(ref),
+        _gdf_short_range_screen_tol(ref),
+        timings=timings,
+        allowed_pair_mask=compact_pair_mask,
+        cache_results=True,
+    )
+    _gdf_add_timing(
+        timings,
+        "three_center_sr_multi_q_prebuild_seconds",
+        time.perf_counter() - t0,
+    )
+    t0 = time.perf_counter()
+    _gdf_aux_metric_short_range_many(
+        space,
+        q_indices,
+        short_range_aux,
+        omega,
+        _gdf_short_range_cut(ref),
+        _gdf_short_range_screen_tol(ref),
+        timings=timings,
+        cache_results=True,
+    )
+    _gdf_add_timing(
+        timings,
+        "aux_metric_sr_multi_q_prebuild_seconds",
+        time.perf_counter() - t0,
+    )
+    _gdf_add_timing(
+        timings,
+        "short_range_multi_q_prebuild_seconds",
+        time.perf_counter() - total_t0,
+    )
+    if timings is not None:
+        timings["short_range_multi_q_prebuild"] = True
+        timings["short_range_multi_q_qpoints"] = int(len(q_indices))
+        timings["short_range_multi_q_pairs"] = int(len(rows))
+        timings["short_range_multi_q_self_opposite_pair_reuses"] = int(
+            self_opposite_reuses
+        )
+        timings["three_center_sr_multi_q_cache_bytes"] = int(
+            sum(array.nbytes for array in _gdf_mf_cache(
+                mf,
+                "three_center_ao_short_range",
+            ).values())
+        )
+        timings["aux_metric_sr_multi_q_cache_bytes"] = int(
+            sum(array.nbytes for array in _gdf_mf_cache(
+                mf,
+                "aux_metric_short_range",
+            ).values())
+        )
+    return len(rows)
 
 
 def _gdf_three_center_ao_short_range(
@@ -4950,6 +6104,7 @@ def _periodic_gdf_aux_metric(space, q_index, aux, g2_tol, timings=None):
         recip_key,
         kernel_key,
         short_range_key,
+        _gdf_short_range_image_domain(ref),
         pair_cut,
         _gdf_pair_screen_tol(ref),
         short_range_screen_tol,
@@ -5021,6 +6176,8 @@ def _periodic_gdf_aux_metric(space, q_index, aux, g2_tol, timings=None):
                 short_range_cut,
                 short_range_screen_tol,
                 timings=timings,
+                cache_results=False,
+                consume_cached_results=True,
             )
         if has_compact_aux and _gdf_is_zero_vector(qvec):
             qaux = _gdf_auxiliary_charge(space, aux, timings=timings)
@@ -5296,7 +6453,11 @@ def _gdf_metric_invsqrt(
     precision=None,
     relative_threshold=0.0,
 ):
-    evals, evecs = np.linalg.eigh(0.5 * (metric + metric.conj().T))
+    metric = 0.5 * (metric + metric.conj().T)
+    real_scale = max(float(np.max(np.abs(metric.real))), 1.0)
+    if float(np.max(np.abs(metric.imag))) <= 1.0e-12 * real_scale:
+        metric = np.asarray(metric.real)
+    evals, evecs = np.linalg.eigh(metric)
     threshold = max(float(threshold), 0.0)
     scale = max(float(np.max(np.abs(evals))) if evals.size else 0.0, 1.0)
     precision_tol = 0.0 if precision is None else float(precision) * scale
@@ -5312,13 +6473,8 @@ def _gdf_metric_invsqrt(
             f"lowest eigenvalue = {evals[0]:.6e}."
         )
     evals = np.clip(evals, 0.0, None)
-    precision_floor = (
-        0.0
-        if precision is None
-        else float(precision) ** 1.5 * scale
-    )
     relative_floor = max(0.0, float(relative_threshold)) * scale
-    eigenvalue_threshold = max(threshold, precision_floor, relative_floor)
+    eigenvalue_threshold = max(threshold, relative_floor)
     keep = evals > eigenvalue_threshold
     if not np.any(keep):
         raise ValueError(
@@ -5366,6 +6522,7 @@ def _periodic_gdf_three_center_ao(
     pair_screen_tol = _gdf_pair_screen_tol(ref)
     weighted_aux_screen_tol = _gdf_weighted_aux_screen_tol(ref)
     short_range_screen_tol = _gdf_short_range_screen_tol(ref)
+    primitive_exp_cutoff = _gdf_short_range_primitive_exp_cutoff(ref)
     rs_aux_engine = _gdf_rs_aux_engine(
         ref,
         aux,
@@ -5421,10 +6578,12 @@ def _periodic_gdf_three_center_ao(
         recip_key,
         kernel_key,
         short_range_key,
+        _gdf_short_range_image_domain(ref),
         pair_cut,
         pair_screen_tol,
         weighted_aux_screen_tol,
         short_range_screen_tol,
+        primitive_exp_cutoff,
         _gdf_precision(ref),
         partition_key,
     )
@@ -5632,6 +6791,7 @@ def _periodic_gdf_stream_reciprocal_ao_many(
     timings=None,
     reciprocal_only_pair_mask=None,
     rs_engine=None,
+    accumulate_metric=False,
 ):
     if not kq_indices or int(g_block_size) <= 0:
         return {}
@@ -5686,6 +6846,11 @@ def _periodic_gdf_stream_reciprocal_ao_many(
         (len(kq_indices), aux.naux, nao, nao),
         dtype=np.complex128,
     )
+    metric = (
+        np.zeros((aux.naux, aux.naux), dtype=np.complex128)
+        if accumulate_metric
+        else None
+    )
     backend = _gdf_pair_ft_stream_backend(mf)
     if backend == "contract_many" and not has_periodic_pair_ft_contract_backend():
         return {}
@@ -5726,6 +6891,25 @@ def _periodic_gdf_stream_reciprocal_ao_many(
             timings=timings,
             cache_enabled=False,
         )
+        if metric is not None:
+            metric += _gdf_weighted_aux_metric(
+                aux_ft,
+                coulomb_weights,
+                timings=timings,
+            )
+            if use_aux_partition and np.any(compact_aux_mask):
+                compact_indices = np.flatnonzero(compact_aux_mask)
+                g2 = np.einsum("gi,gi->g", gqvecs, gqvecs)
+                short_range_weights = coulomb_weights * (
+                    1.0 - np.exp(-g2 / (4.0 * float(omega) * float(omega)))
+                )
+                metric[np.ix_(compact_indices, compact_indices)] -= (
+                    _gdf_weighted_aux_metric(
+                        aux_ft[:, compact_indices],
+                        short_range_weights,
+                        timings=timings,
+                    )
+                )
 
         if use_compensated_partition:
             g2 = np.einsum("gi,gi->g", gqvecs, gqvecs)
@@ -5748,6 +6932,8 @@ def _periodic_gdf_stream_reciprocal_ao_many(
         else:
             weighted_terms = (("default", coulomb_weights, None, None),)
 
+        screened_terms = []
+        signature_counts = {}
         for label, weights, pair_mask, aux_mask in weighted_terms:
             if pair_mask is not None and not np.any(pair_mask):
                 continue
@@ -5767,6 +6953,34 @@ def _periodic_gdf_stream_reciprocal_ao_many(
             )
             if len(pair_gqvecs) == 0:
                 continue
+            signature = (
+                _gdf_pair_mask_key(pair_mask),
+                pair_gqvecs.shape,
+                pair_gqvecs.tobytes(),
+            )
+            signature_counts[signature] = signature_counts.get(signature, 0) + 1
+            screened_terms.append(
+                (
+                    pair_gqvecs,
+                    pair_weighted_aux,
+                    pair_mask,
+                    contract_pair_mask,
+                    signature,
+                )
+            )
+
+        raw_pair_cache = (
+            {}
+            if any(count > 1 for count in signature_counts.values())
+            else None
+        )
+        for (
+            pair_gqvecs,
+            pair_weighted_aux,
+            pair_mask,
+            contract_pair_mask,
+            signature,
+        ) in screened_terms:
             pair_contribution, block_contract_seconds = _gdf_stream_weighted_pair_ao_many(
                 space,
                 pair_gqvecs,
@@ -5779,6 +6993,11 @@ def _periodic_gdf_stream_reciprocal_ao_many(
                 timings=timings,
                 pair_mask=pair_mask,
                 contract_pair_mask=contract_pair_mask,
+                raw_pair_cache=(
+                    raw_pair_cache
+                    if signature_counts[signature] > 1
+                    else None
+                ),
             )
             if pair_contribution is None:
                 return {}
@@ -5793,10 +7012,38 @@ def _periodic_gdf_stream_reciprocal_ao_many(
     _gdf_add_timing(timings, "pair_ft_stream_contract_seconds", contract_seconds)
     _gdf_count(timings, "pair_ft_stream_g_blocks", block_count)
     _gdf_count(timings, "pair_ft_stream_g_vectors", vector_count)
-    return {
+    if metric is not None:
+        _gdf_count(timings, "g_blocks", block_count)
+        _gdf_count(timings, "g_vectors", vector_count)
+    ao_by_kq = {
         int(kq_index): np.ascontiguousarray(ao_batch[row])
         for row, kq_index in enumerate(kq_indices)
     }
+    if metric is None:
+        return ao_by_kq
+    if _gdf_uses_short_range(kernel):
+        short_range_aux = _gdf_rs_compact_auxiliary_basis(aux, rs_aux_engine)
+        if short_range_aux.ncart > 0:
+            metric += _gdf_aux_metric_short_range(
+                space,
+                q_index,
+                short_range_aux,
+                omega,
+                _gdf_short_range_cut(ref),
+                _gdf_short_range_screen_tol(ref),
+                timings=timings,
+                cache_results=False,
+                consume_cached_results=True,
+            )
+            if _gdf_is_zero_vector(qvec):
+                qaux = _gdf_auxiliary_charge(space, aux, timings=timings)
+                if compact_aux_mask is not None:
+                    qaux = qaux * compact_aux_mask
+                g0 = math.pi / (float(omega) ** 2 * _gdf_lattice_volume(ref))
+                metric -= g0 * np.outer(qaux, qaux)
+                _gdf_count(timings, "aux_metric_short_range_g0_corrections")
+    _gdf_count(timings, "q_ao_store_shared_range_separated_passes")
+    return 0.5 * (metric + metric.conj().T), ao_by_kq
 
 
 def _gdf_q_ao_store(
@@ -5847,6 +7094,13 @@ def _gdf_q_ao_store(
         None if metric_precision is None else round(float(metric_precision), 18)
     )
     metric_relative_tol = _gdf_metric_relative_tol(ref)
+    primitive_exp_cutoff = _gdf_short_range_primitive_exp_cutoff(ref)
+    self_opposite_pair_reuse = _gdf_self_opposite_pair_reuse(mf)
+    pair_plan_settings_key = _gdf_pair_plan_settings_key(
+        mf,
+        pair_cut,
+        pair_screen_tol,
+    )
     store_key = (
         q_key,
         auxbasis,
@@ -5859,16 +7113,27 @@ def _gdf_q_ao_store(
         pair_screen_tol,
         weighted_aux_screen_tol,
         short_range_screen_tol,
+        primitive_exp_cutoff,
         metric_precision_key,
         metric_relative_tol,
         partition_key,
+        self_opposite_pair_reuse,
+        pair_plan_settings_key,
     )
     store_cache = _gdf_mf_cache(mf, "q_ao_store")
     store = store_cache.get(store_key)
+    shared_reciprocal_ao_by_kq_index = {}
+    q_pair_keys = [
+        (int(k_index), int(kq_index)) for k_index, kq_index in q_pair_keys
+    ]
+    initial_source_pairs, _initial_source_by_pair = _gdf_self_opposite_pair_sources(
+        space,
+        q_index,
+        q_pair_keys,
+    )
+    if timings is not None:
+        timings["q_ao_store_source_pair_blocks"] = int(len(initial_source_pairs))
     if store is None:
-        q_pair_keys = [
-            (int(k_index), int(kq_index)) for k_index, kq_index in q_pair_keys
-        ]
         if allow_opposite:
             opposite_q_index = _gdf_should_use_opposite_q(space, q_index)
             if opposite_q_index is not None:
@@ -5945,7 +7210,6 @@ def _gdf_q_ao_store(
                     return store
 
         _gdf_count(timings, "q_ao_store_cache_misses")
-        shared_reciprocal_ao_by_kq_index = {}
         metric_cache = _gdf_mf_cache(mf, "metric_invsqrt")
         metric_key = (
             q_key,
@@ -5966,18 +7230,27 @@ def _gdf_q_ao_store(
             metric_invsqrt, evals = metric_cache[metric_key]
         else:
             _gdf_count(timings, "metric_invsqrt_cache_misses")
-            can_share_aux_ft_pass = (
+            can_share_full_aux_ft_pass = (
                 kernel == "full"
                 and short_range_key is None
                 and rs_engine is None
                 and int(g_block_size) > 0
-                and bool(q_pair_keys)
+                and bool(initial_source_pairs)
+            )
+            can_share_range_separated_aux_ft_pass = (
+                kernel == "range_separated"
+                and rs_engine is None
+                and int(g_block_size) > 0
+                and bool(initial_source_pairs)
             )
             t0 = time.perf_counter()
             aux_metric = None
-            if can_share_aux_ft_pass:
+            if can_share_full_aux_ft_pass:
                 shared_kq_indices = sorted(
-                    {int(kq_index) for _k_index, kq_index in q_pair_keys}
+                    {
+                        int(kq_index)
+                        for _k_index, kq_index in initial_source_pairs
+                    }
                 )
                 (
                     aux_metric,
@@ -5996,6 +7269,37 @@ def _gdf_q_ao_store(
                     timings=timings,
                 )
                 if aux_metric is not None:
+                    _gdf_add_timing(
+                        timings,
+                        "q_ao_store_shared_metric_ao_seconds",
+                        time.perf_counter() - t0,
+                    )
+            elif can_share_range_separated_aux_ft_pass:
+                shared_kq_indices = sorted(
+                    {
+                        int(kq_index)
+                        for _k_index, kq_index in initial_source_pairs
+                    }
+                )
+                shared = _periodic_gdf_stream_reciprocal_ao_many(
+                    space,
+                    q_index,
+                    aux,
+                    factor_threshold,
+                    shared_kq_indices,
+                    recip_cut,
+                    mesh,
+                    kernel,
+                    omega,
+                    pair_cut,
+                    pair_screen_tol,
+                    g_block_size,
+                    timings=timings,
+                    rs_engine=rs_engine,
+                    accumulate_metric=True,
+                )
+                if isinstance(shared, tuple):
+                    aux_metric, shared_reciprocal_ao_by_kq_index = shared
                     _gdf_add_timing(
                         timings,
                         "q_ao_store_shared_metric_ao_seconds",
@@ -6026,14 +7330,8 @@ def _gdf_q_ao_store(
             if timings is not None:
                 metric_scale = max(float(np.max(np.abs(evals))), 1.0)
                 metric_precision = _gdf_precision(ref)
-                metric_precision_floor = (
-                    0.0
-                    if metric_precision is None
-                    else float(metric_precision) ** 1.5 * metric_scale
-                )
                 metric_eigenvalue_threshold = max(
                     float(factor_threshold),
-                    metric_precision_floor,
                     float(metric_relative_tol) * metric_scale,
                 )
                 timings["metric_relative_tol"] = float(metric_relative_tol)
@@ -6044,6 +7342,20 @@ def _gdf_q_ao_store(
                     np.count_nonzero(evals <= metric_eigenvalue_threshold)
                 )
                 timings["metric_rank"] = int(metric_invsqrt.shape[1])
+                retained = evals[evals > metric_eigenvalue_threshold]
+                if retained.size:
+                    metric_min = float(retained[0])
+                    metric_max = float(retained[-1])
+                    metric_condition = metric_max / metric_min
+                    timings["metric_min_retained_eigenvalue"] = metric_min
+                    timings["metric_max_eigenvalue"] = metric_max
+                    timings["metric_condition_number"] = metric_condition
+                    timings["metric_whitening_condition_number"] = math.sqrt(
+                        metric_condition
+                    )
+                    timings["metric_inverse_sqrt_norm"] = 1.0 / math.sqrt(
+                        metric_min
+                    )
             metric_cache[metric_key] = (metric_invsqrt, evals)
         store = _GDFQAOStore(
             key=store_key,
@@ -6056,9 +7368,11 @@ def _gdf_q_ao_store(
             metric_eigenvalues=evals,
         )
         store_cache[store_key] = store
-        for k_index, kq_index in q_pair_keys:
+        for k_index, kq_index in initial_source_pairs:
             reciprocal_ao = shared_reciprocal_ao_by_kq_index.get(int(kq_index))
             if reciprocal_ao is None:
+                continue
+            if _gdf_uses_short_range(kernel):
                 continue
             store.ao_blocks[(int(k_index), int(kq_index))] = _periodic_gdf_three_center_ao(
                 space,
@@ -6074,22 +7388,56 @@ def _gdf_q_ao_store(
     else:
         _gdf_count(timings, "q_ao_store_cache_hits")
 
-    q_pair_keys = [(int(k_index), int(kq_index)) for k_index, kq_index in q_pair_keys]
+    def populate_self_opposite_pairs(pair_keys):
+        _sources, source_by_pair = _gdf_self_opposite_pair_sources(
+            space,
+            q_index,
+            pair_keys,
+        )
+        reused = 0
+        for pair in pair_keys:
+            source = source_by_pair[pair]
+            if pair == source or pair in store.ao_blocks:
+                continue
+            source_block = store.ao_blocks.get(source)
+            if source_block is None:
+                continue
+            store.ao_blocks[pair] = np.ascontiguousarray(
+                source_block.conj().transpose(0, 2, 1)
+            )
+            reused += 1
+        return reused
+
+    self_opposite_reuses = populate_self_opposite_pairs(q_pair_keys)
     missing_pairs = [pair for pair in q_pair_keys if pair not in store.ao_blocks]
+    source_missing_pairs, _source_by_pair = _gdf_self_opposite_pair_sources(
+        space,
+        q_index,
+        missing_pairs,
+    )
+    source_missing_pairs = [
+        pair for pair in source_missing_pairs if pair not in store.ao_blocks
+    ]
     if timings is not None:
         timings["q_ao_store_requested_pair_blocks"] = int(len(q_pair_keys))
         timings["q_ao_store_existing_pair_blocks"] = int(
             len(q_pair_keys) - len(missing_pairs)
         )
         timings["q_ao_store_missing_pair_blocks"] = int(len(missing_pairs))
+        timings["q_ao_store_computed_pair_blocks"] = int(
+            len(source_missing_pairs)
+        )
     if not missing_pairs:
         if timings is not None:
+            timings["q_ao_store_self_opposite_pair_reuses"] = int(
+                self_opposite_reuses
+            )
             timings["q_ao_store_pair_blocks"] = int(len(store.ao_blocks))
         return store
 
     t_store = time.perf_counter()
     missing_kq_indices = []
-    for _k_index, kq_index in missing_pairs:
+    for _k_index, kq_index in source_missing_pairs:
         if int(kq_index) not in missing_kq_indices:
             missing_kq_indices.append(int(kq_index))
     stream_g_block_size = int(g_block_size)
@@ -6107,23 +7455,34 @@ def _gdf_q_ao_store(
             timings["g_block_size"] = int(stream_g_block_size)
 
     pair_ao_by_kq_index = {}
-    reciprocal_ao_by_kq_index = {}
-    if missing_kq_indices and int(stream_g_block_size) > 0:
-        reciprocal_ao_by_kq_index = _periodic_gdf_stream_reciprocal_ao_many(
-            space,
-            q_index,
-            aux,
-            factor_threshold,
-            missing_kq_indices,
-            recip_cut,
-            mesh,
-            kernel,
-            omega,
-            pair_cut,
-            pair_screen_tol,
-            stream_g_block_size,
-            timings=timings,
-            rs_engine=rs_engine,
+    reciprocal_ao_by_kq_index = dict(shared_reciprocal_ao_by_kq_index)
+    pending_reciprocal_kq_indices = [
+        kq_index
+        for kq_index in missing_kq_indices
+        if int(kq_index) not in reciprocal_ao_by_kq_index
+    ]
+    if timings is not None and shared_reciprocal_ao_by_kq_index:
+        timings["q_ao_store_shared_reciprocal_blocks_reused"] = int(
+            len(missing_kq_indices) - len(pending_reciprocal_kq_indices)
+        )
+    if pending_reciprocal_kq_indices and int(stream_g_block_size) > 0:
+        reciprocal_ao_by_kq_index.update(
+            _periodic_gdf_stream_reciprocal_ao_many(
+                space,
+                q_index,
+                aux,
+                factor_threshold,
+                pending_reciprocal_kq_indices,
+                recip_cut,
+                mesh,
+                kernel,
+                omega,
+                pair_cut,
+                pair_screen_tol,
+                stream_g_block_size,
+                timings=timings,
+                rs_engine=rs_engine,
+            )
         )
     if (
         missing_kq_indices
@@ -6208,7 +7567,7 @@ def _gdf_q_ao_store(
             pair_ao_by_kq_index[int(kq_index)] = batch[row]
 
     short_range_ao_by_pair = {}
-    if missing_pairs and _gdf_uses_short_range(kernel):
+    if source_missing_pairs and _gdf_uses_short_range(kernel):
         compact_pair_mask = None
         if rs_engine is not None and rs_engine.partition_active:
             compact_pair_mask = rs_engine.compact_pair_mask
@@ -6217,7 +7576,7 @@ def _gdf_q_ao_store(
             short_range_ao_by_pair = _gdf_three_center_ao_short_range_many(
                 space,
                 q_index,
-                missing_pairs,
+                source_missing_pairs,
                 short_range_aux,
                 omega,
                 short_range_key,
@@ -6226,11 +7585,12 @@ def _gdf_q_ao_store(
                 timings=timings,
                 allowed_pair_mask=compact_pair_mask,
                 cache_results=False,
+                consume_cached_results=True,
             )
         elif timings is not None:
             timings.setdefault("three_center_short_range_pairs", 0)
 
-    for k_index, kq_index in missing_pairs:
+    for k_index, kq_index in source_missing_pairs:
         pair_key = (int(k_index), int(kq_index))
         store.ao_blocks[(int(k_index), int(kq_index))] = _periodic_gdf_three_center_ao(
             space,
@@ -6245,8 +7605,12 @@ def _gdf_q_ao_store(
             timings=timings,
             rs_engine=rs_engine,
         )
+    self_opposite_reuses += populate_self_opposite_pairs(q_pair_keys)
     _gdf_add_timing(timings, "q_ao_store_build_seconds", time.perf_counter() - t_store)
     if timings is not None:
+        timings["q_ao_store_self_opposite_pair_reuses"] = int(
+            self_opposite_reuses
+        )
         timings["q_ao_store_pair_blocks"] = int(len(store.ao_blocks))
     return store
 
@@ -6331,6 +7695,28 @@ def _gdf_opposite_q_index(space, q_index, tol=1.0e-8):
     return index
 
 
+def _gdf_self_opposite_pair_sources(space, q_index, pair_keys):
+    """Return unique AO-pair sources and the source for each requested pair."""
+
+    pair_keys = [(int(k_index), int(kq_index)) for k_index, kq_index in pair_keys]
+    if (
+        not _gdf_self_opposite_pair_reuse(space.reference._pbc_mf)
+        or _gdf_opposite_q_index(space, q_index) != int(q_index)
+    ):
+        return pair_keys, {pair: pair for pair in pair_keys}
+
+    valid_pairs = set(_pair_keys_for_q(space, q_index))
+    sources = []
+    source_by_pair = {}
+    for pair in pair_keys:
+        reverse = (pair[1], pair[0])
+        source = min(pair, reverse) if reverse in valid_pairs else pair
+        source_by_pair[pair] = source
+        if source not in sources:
+            sources.append(source)
+    return sources, source_by_pair
+
+
 def _gdf_should_use_opposite_q(space, q_index):
     opposite = _gdf_opposite_q_index(space, q_index)
     if opposite is None or opposite == int(q_index):
@@ -6384,6 +7770,82 @@ def _gdf_transition_factors_from_opposite_q(
     )
 
 
+def _gdf_transition_factors_from_periodic_backend(
+    space,
+    q_index,
+    auxbasis,
+    aux_coord_type,
+    factor_threshold,
+):
+    """Transform persistent SCF AO factors without rebuilding raw GDF tensors."""
+
+    ref = space.reference
+    backend = getattr(ref._pbc_mf, "with_df", None)
+    required = ("cderi", "metric_info", "find_qpoint_index", "pair_keys")
+    if backend is None or not all(hasattr(backend, name) for name in required):
+        return None
+    try:
+        backend_q = backend.find_qpoint_index(space.qpts[q_index])
+        metadata = backend.metric_info(backend_q)
+    except (IndexError, KeyError, ValueError):
+        return None
+    if metadata["auxbasis"] != auxbasis:
+        return None
+    if metadata["aux_coord_type"] != aux_coord_type:
+        return None
+    if not np.isclose(
+        metadata["factor_threshold"], factor_threshold, rtol=0.0, atol=1.0e-18
+    ):
+        return None
+
+    pair_blocks = {}
+    t0 = time.perf_counter()
+    for k_index, kq_index in _pair_keys_for_q(space, q_index):
+        ao_block = backend.cderi(backend_q, k_index, kq_index)
+        left = np.asarray(ref.mo_coeff[k_index])
+        right = np.asarray(ref.mo_coeff[kq_index])
+        pair_blocks[(int(k_index), int(kq_index))] = np.ascontiguousarray(
+            np.einsum(
+                "pi,Ppq,qj->Pij",
+                left.conj(),
+                ao_block,
+                right,
+                optimize=True,
+            )
+        )
+    transitions = space.transitions(q_index)
+    rank = int(metadata["metric_rank"])
+    transition_vectors = _gdf_extract_transition_vectors(
+        pair_blocks,
+        space.transition_indices(q_index),
+        rank,
+    )
+    timings = {
+        "q_index": int(q_index),
+        "persistent_backend_reuse": True,
+        "persistent_backend_storage": str(getattr(backend, "storage", "memory")),
+        "persistent_backend_transform_seconds": float(time.perf_counter() - t0),
+        "persistent_backend_memory_bytes": int(getattr(backend, "memory_bytes", 0)),
+        "persistent_backend_disk_bytes": int(getattr(backend, "disk_bytes", 0)),
+    }
+    return GDFTransitionFactors(
+        q_index=int(q_index),
+        qvec=np.asarray(space.qpts[q_index], dtype=float),
+        coulomb_component=GDF,
+        auxbasis=auxbasis,
+        aux_coord_type=aux_coord_type,
+        naux_cart=int(metadata["naux_cart"]),
+        factor_method=f'{metadata["factor_method"]}:persistent_ao',
+        factor_threshold=float(metadata["factor_threshold"]),
+        metric_rank=rank,
+        metric_eigenvalues=np.array(metadata["metric_eigenvalues"], copy=True),
+        pair_blocks=pair_blocks,
+        transitions=transitions,
+        transition_vectors=transition_vectors,
+        build_timings=timings,
+    )
+
+
 def gdf_transition_factors(
     space,
     q_index=0,
@@ -6408,7 +7870,7 @@ def gdf_transition_factors(
     aux_coord_type = _gdf_aux_coord_type(ref)
     factor_threshold = max(
         float(g2_tol),
-        float(metric_tol) if metric_tol is not None else 1.0e-12,
+        _gdf_metric_tol(ref, metric_tol),
     )
     (
         recip_cut,
@@ -6429,6 +7891,13 @@ def gdf_transition_factors(
     pair_screen_tol = _gdf_pair_screen_tol(ref)
     weighted_aux_screen_tol = _gdf_weighted_aux_screen_tol(ref)
     short_range_screen_tol = _gdf_short_range_screen_tol(ref)
+    primitive_exp_cutoff = _gdf_short_range_primitive_exp_cutoff(ref)
+    self_opposite_pair_reuse = _gdf_self_opposite_pair_reuse(mf)
+    pair_plan_settings_key = _gdf_pair_plan_settings_key(
+        mf,
+        pair_cut,
+        pair_screen_tol,
+    )
     rs_engine = _gdf_rs_shell_engine(ref, kernel, omega, mesh)
     pair_partition_key = None if rs_engine is None else rs_engine.key
     aux_partition_request_key = (
@@ -6453,16 +7922,32 @@ def gdf_transition_factors(
         recip_key,
         kernel_key,
         short_range_key,
+        _gdf_short_range_image_domain(ref),
+        _gdf_short_range_radius_factor(ref),
         pair_cut,
         pair_screen_tol,
         weighted_aux_screen_tol,
         short_range_screen_tol,
+        primitive_exp_cutoff,
         auto_info["precision"],
         _gdf_metric_relative_tol(ref),
         partition_key,
+        self_opposite_pair_reuse,
+        pair_plan_settings_key,
     )
     if key in cache:
         return cache[key]
+
+    persistent = _gdf_transition_factors_from_periodic_backend(
+        space,
+        q_index,
+        auxbasis,
+        aux_coord_type,
+        factor_threshold,
+    )
+    if persistent is not None:
+        cache[key] = persistent
+        return persistent
 
     timings = {
         "q_index": int(q_index),
@@ -6472,13 +7957,34 @@ def gdf_transition_factors(
         "gdf_omega": None if omega is None else float(omega),
         "gdf_precision": auto_info["precision"],
         "gdf_mesh_auto": bool(auto_info["mesh_auto"]),
+        "gdf_mesh_safety_pad": int(auto_info["mesh_safety_pad"]),
         "gdf_omega_auto": bool(auto_info["omega_auto"]),
         "gdf_ke_cutoff": auto_info["ke_cutoff"],
         "short_range_cut": (
             None if short_range_key is None else _gdf_image_cut_timing_value(short_range_key)
         ),
+        "short_range_image_domain": (
+            _gdf_short_range_image_domain(ref)
+            if _gdf_uses_short_range(kernel)
+            else None
+        ),
+        "short_range_radius": (
+            _gdf_short_range_radius_factor(ref)
+            * _gdf_auto_short_range_radius(ref, omega)
+            if _gdf_uses_short_range(kernel)
+            and _gdf_short_range_image_domain(ref) == "radial"
+            else None
+        ),
+        "short_range_radius_factor": (
+            _gdf_short_range_radius_factor(ref)
+            if _gdf_uses_short_range(kernel)
+            else None
+        ),
         "short_range_screen_tol": (
             short_range_screen_tol if _gdf_uses_short_range(kernel) else None
+        ),
+        "short_range_primitive_exp_cutoff": (
+            primitive_exp_cutoff if _gdf_uses_short_range(kernel) else None
         ),
         "recip_cut": int(recip_cut),
         "mesh": None if mesh is None else [int(x) for x in mesh],
@@ -6667,6 +8173,8 @@ def prebuild_gdf_q_ao_stores(
     metric_tol=None,
     workers=None,
     materialize_cderi=False,
+    stream_pair_batch_mb=128.0,
+    stream_pair_batch_size=None,
 ):
     """Build native GDF q-resolved AO three-center stores ahead of GW use."""
 
@@ -6679,7 +8187,7 @@ def prebuild_gdf_q_ao_stores(
     aux_coord_type = _gdf_aux_coord_type(ref)
     factor_threshold = max(
         float(g2_tol),
-        float(metric_tol) if metric_tol is not None else 1.0e-12,
+        _gdf_metric_tol(ref, metric_tol),
     )
     (
         recip_cut,
@@ -6718,6 +8226,27 @@ def prebuild_gdf_q_ao_stores(
         )
     )
     worker_count = min(_gdf_prebuild_workers(mf, workers), max(1, len(q_indices)))
+    stream_pair_batch_mb = float(stream_pair_batch_mb)
+    if not np.isfinite(stream_pair_batch_mb) or stream_pair_batch_mb <= 0.0:
+        raise ValueError("stream_pair_batch_mb must be a positive finite value.")
+    if stream_pair_batch_size is not None:
+        value = stream_pair_batch_size
+        if isinstance(value, str) and value.strip().lower() == "auto":
+            stream_pair_batch_size = None
+        else:
+            if isinstance(value, (bool, np.bool_)):
+                raise ValueError("stream_pair_batch_size must be a positive integer.")
+            try:
+                integer = int(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "stream_pair_batch_size must be a positive integer."
+                ) from exc
+            if integer <= 0 or (
+                not isinstance(value, str) and integer != value
+            ):
+                raise ValueError("stream_pair_batch_size must be a positive integer.")
+            stream_pair_batch_size = integer
     prewarmed_pair_ft_plan = False
     prewarmed_hermitian_q0_pair_ft_plan = False
     if (
@@ -6760,6 +8289,7 @@ def prebuild_gdf_q_ao_stores(
             "gdf_omega": None if omega is None else float(omega),
             "gdf_precision": auto_info["precision"],
             "gdf_mesh_auto": bool(auto_info["mesh_auto"]),
+            "gdf_mesh_safety_pad": int(auto_info["mesh_safety_pad"]),
             "gdf_omega_auto": bool(auto_info["omega_auto"]),
             "gdf_ke_cutoff": auto_info["ke_cutoff"],
             "short_range_cut": (
@@ -6900,9 +8430,6 @@ def prebuild_gdf_q_ao_stores(
             "timings": timings,
         }
 
-    if worker_count <= 1 or len(q_indices) <= 1:
-        return [build_one(q_index) for q_index in q_indices]
-
     requested = set(q_indices)
     primary_indices = []
     derived_indices = []
@@ -6914,9 +8441,145 @@ def prebuild_gdf_q_ao_stores(
             primary_indices.append(q_index)
 
     summaries_by_q = {}
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        for summary in executor.map(build_one, primary_indices):
+    short_range_q_batches = []
+    if _gdf_uses_short_range(kernel) and len(primary_indices) >= 2:
+        short_range_aux = _gdf_rs_compact_auxiliary_basis(aux, rs_aux_engine)
+        nao = int(mf.cell.nao)
+        itemsize = np.dtype(np.complex128).itemsize
+        raw_pair_bytes = int(
+            max(int(short_range_aux.ncart), int(short_range_aux.naux))
+            * nao
+            * nao
+            * itemsize
+        )
+        pair_count = max(
+            len(list(_pair_keys_for_q(space, q_index)))
+            for q_index in primary_indices
+        )
+        if short_range_aux.ncart == 0:
+            q_batch_size = 0
+        else:
+            workspace_factor = 3 * _gdf_short_range_workers(mf) + 4
+            pair_workspace_per_q = int(
+                workspace_factor * raw_pair_bytes * pair_count
+            )
+            metric_workspace_per_q = int(
+                (_gdf_short_range_workers(mf) + 1)
+                * short_range_aux.ncart**2
+                * itemsize
+            )
+            budget_q_batch_size = max(
+                1,
+                int(stream_pair_batch_mb * 1.0e6)
+                // max(1, pair_workspace_per_q + metric_workspace_per_q),
+            )
+            if stream_pair_batch_size is None:
+                q_batch_size = budget_q_batch_size
+            else:
+                q_batch_size = min(
+                    int(stream_pair_batch_size) // max(1, pair_count),
+                    budget_q_batch_size,
+                )
+        if q_batch_size >= 2:
+            candidate_batches = [
+                primary_indices[start : start + q_batch_size]
+                for start in range(0, len(primary_indices), q_batch_size)
+            ]
+            short_range_q_batches = [
+                batch for batch in candidate_batches if len(batch) >= 2
+            ]
+
+    if short_range_q_batches:
+        short_range_cache = _gdf_mf_cache(mf, "three_center_ao_short_range")
+        metric_cache = _gdf_mf_cache(mf, "aux_metric_short_range")
+        inner_workers = max(
+            _gdf_pair_ft_workers(mf),
+            _gdf_short_range_workers(mf),
+        )
+        outer_workers = 1 if inner_workers > 1 else worker_count
+        for batch in short_range_q_batches:
+            existing_keys = set(short_range_cache)
+            existing_metric_keys = set(metric_cache)
+            shared_timings = {}
+            shared_seconds = 0.0
+            try:
+                shared_t0 = time.perf_counter()
+                _gdf_prebuild_short_range_q_batch(
+                    space,
+                    batch,
+                    timings=shared_timings,
+                )
+                shared_seconds = float(time.perf_counter() - shared_t0)
+                if outer_workers <= 1 or len(batch) <= 1:
+                    summaries = [build_one(q_index) for q_index in batch]
+                else:
+                    with ThreadPoolExecutor(max_workers=outer_workers) as executor:
+                        summaries = list(executor.map(build_one, batch))
+            finally:
+                added_keys = set(short_range_cache) - existing_keys
+                shared_timings["unconsumed_pair_blocks"] = int(len(added_keys))
+                for key in added_keys:
+                    short_range_cache.pop(key, None)
+                added_metric_keys = set(metric_cache) - existing_metric_keys
+                shared_timings["unconsumed_metric_blocks"] = int(
+                    len(added_metric_keys)
+                )
+                for key in added_metric_keys:
+                    metric_cache.pop(key, None)
+            for index, summary in enumerate(summaries):
+                timing = summary["timings"]
+                timing["prebuild_requested_workers"] = int(worker_count)
+                timing["prebuild_workers"] = int(outer_workers)
+                timing["prebuild_parallel"] = bool(outer_workers > 1)
+                timing["multi_q_short_range_prebuild"] = True
+                timing["multi_q_short_range_qpoints"] = int(len(batch))
+                timing["multi_q_short_range_inner_workers"] = int(inner_workers)
+                timing["multi_q_short_range_outer_workers"] = int(outer_workers)
+                timing["multi_q_short_range_shared_seconds"] = (
+                    shared_seconds if index == 0 else 0.0
+                )
+                if index == 0:
+                    workspace_upper_bound = int(
+                        shared_timings.get(
+                            "three_center_sr_group_workspace_bytes_upper_bound",
+                            0,
+                        )
+                        + shared_timings.get(
+                            "aux_metric_short_range_workspace_bytes_upper_bound",
+                            0,
+                        )
+                    )
+                    shared_timings["stream_pair_workspace_budget_bytes"] = int(
+                        stream_pair_batch_mb * 1.0e6
+                    )
+                    shared_timings["stream_pair_workspace_within_budget"] = bool(
+                        workspace_upper_bound
+                        <= shared_timings["stream_pair_workspace_budget_bytes"]
+                    )
+                    shared_timings["stream_pair_workspace_upper_bound_bytes"] = int(
+                        workspace_upper_bound
+                    )
+                    timing["multi_q_short_range_shared_timings"] = shared_timings
+                    timing["total_seconds"] += shared_seconds
+                summaries_by_q[int(summary["q_index"])] = summary
+    elif worker_count <= 1 or len(primary_indices) <= 1:
+        for q_index in primary_indices:
+            summary = build_one(q_index)
             summaries_by_q[int(summary["q_index"])] = summary
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            for summary in executor.map(build_one, primary_indices):
+                summaries_by_q[int(summary["q_index"])] = summary
+    remaining_primary = [
+        q_index for q_index in primary_indices if q_index not in summaries_by_q
+    ]
+    if worker_count <= 1 or len(remaining_primary) <= 1:
+        remaining_summaries = [build_one(q_index) for q_index in remaining_primary]
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            remaining_summaries = list(executor.map(build_one, remaining_primary))
+    for summary in remaining_summaries:
+        summaries_by_q[int(summary["q_index"])] = summary
     for q_index in derived_indices:
         summary = build_one(q_index)
         summaries_by_q[int(summary["q_index"])] = summary
@@ -6931,6 +8594,84 @@ def gdf_transition_metric(space, q_index=0, g2_tol=1.0e-16):
         q_index=q_index,
         g2_tol=g2_tol,
     ).coulomb_metric()
+
+
+def gdf_mo_jk(space, coulomb_component=GDF, g2_tol=1.0e-16, dm=None):
+    """Contract q-resolved GDF factors into closed-shell MO J/K matrices.
+
+    ``dm`` may contain AO density matrices.  When omitted, canonical diagonal
+    densities are formed from the reference occupations.
+    """
+
+    if not isinstance(space, KPointTransitionSpace):
+        space = KPointTransitionSpace(space)
+    component = normalize_coulomb_component(coulomb_component)
+    if component == GDF:
+        factor_builder = lambda q: gdf_transition_factors(
+            space, q_index=q, g2_tol=g2_tol
+        )
+    elif component == PYSCF_GDF:
+        factor_builder = lambda q: pyscf_gdf_transition_factors(space, q_index=q)
+    else:
+        raise ValueError("gdf_mo_jk requires 'gdf' or 'pyscf_gdf'.")
+
+    ref = space.reference
+    nkpts = int(ref.nkpts)
+    if dm is None:
+        dm_mo = [
+            np.diag(np.asarray(ref.mo_occ[k_index], dtype=float))
+            for k_index in range(nkpts)
+        ]
+    else:
+        dm_ao = [np.asarray(dm)] if nkpts == 1 and np.asarray(dm).ndim == 2 else list(dm)
+        if len(dm_ao) != nkpts:
+            raise ValueError(f"dm must provide one AO density for each of {nkpts} k-points.")
+        dm_mo = []
+        for k_index, density in enumerate(dm_ao):
+            coeff = np.asarray(ref.mo_coeff[k_index])
+            if density.shape != (coeff.shape[0], coeff.shape[0]):
+                raise ValueError("Each AO density must have shape (nao, nao).")
+            coeff_inv = np.linalg.inv(coeff)
+            dm_mo.append(coeff_inv @ density @ coeff_inv.conj().T)
+
+    q0 = space.find_qpoint_index(np.zeros(3))
+    factors0 = factor_builder(q0)
+    density_factor = np.zeros(factors0.naux, dtype=np.complex128)
+    for k_index in range(nkpts):
+        density_factor += np.einsum(
+            "Pij,ji->P",
+            factors0.pair_blocks[(k_index, k_index)],
+            dm_mo[k_index],
+            optimize=True,
+        )
+    density_factor /= nkpts
+
+    j_mo = []
+    k_mo = []
+    for k_index in range(nkpts):
+        j_block = np.einsum(
+            "Pij,P->ij",
+            factors0.pair_blocks[(k_index, k_index)],
+            density_factor.conj(),
+            optimize=True,
+        )
+        k_block = np.zeros_like(j_block)
+        for kq_index in range(nkpts):
+            q_index = space.find_qpoint_index(
+                ref.kpts[kq_index] - ref.kpts[k_index]
+            )
+            pair_block = factor_builder(q_index).pair_blocks[(k_index, kq_index)]
+            k_block += np.einsum(
+                "Pim,mn,Pjn->ij",
+                pair_block,
+                dm_mo[kq_index],
+                pair_block.conj(),
+                optimize=True,
+            )
+        j_mo.append(0.5 * (j_block + j_block.conj().T))
+        k_block /= nkpts
+        k_mo.append(0.5 * (k_block + k_block.conj().T))
+    return np.asarray(j_mo), np.asarray(k_mo)
 
 
 def gdf_orbital_pair_coupling(

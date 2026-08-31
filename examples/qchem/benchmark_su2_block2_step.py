@@ -61,9 +61,7 @@ def build_pyqed_cpp_molecule(case, basis):
     """Build PyQED AO integrals with the compiled C++ backend."""
 
     mol = Molecule(atom=case["atom"], basis=basis, unit="bohr")
-    mol.build(
-        driver="builtin",
-        eri="dense",
+    mol.build(eri="dense",
         aosym="s1",
         options={"eri_backend": "cpp"},
     )

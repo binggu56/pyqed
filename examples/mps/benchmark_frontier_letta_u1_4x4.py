@@ -76,7 +76,7 @@ def _dense_mps_run(mpo, initial_cores, *, bond_dim, sweeps, tolerance):
         davidson_max_iter=100,
         noise=0.0,
         recenter_final=False,
-        performance="generic",
+        performance="reference",
     ).run()
     seconds = perf_counter() - start
     cores = solver.ground_state.to_order(["lv", "p", "rv"]).factors
@@ -121,7 +121,7 @@ def _u1_mps_run(dense_mpo, initial_cores, *, bond_dim, sweeps, tolerance):
         davidson_max_iter=100,
         noise=0.0,
         recenter_final=False,
-        performance="generic",
+        performance="reference",
     ).run()
     seconds = perf_counter() - start
     block_parameters = int(

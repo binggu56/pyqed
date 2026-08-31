@@ -7,13 +7,14 @@ Run from the repository root:
 
 import numpy as np
 
+from pyqed.units import au2ev
 from pyqed.gw.bse import BSE, TDA
 from pyqed.gw.gw import GW
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf import RHF
 
 
-AU2EV = 27.211386245988
+AU2EV = au2ev
 
 
 def print_roots(label, roots, n=5):
@@ -28,7 +29,7 @@ mol = Molecule(
     basis="cc-pvdz",
     unit="angstrom",
 )
-mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
 
 mf = RHF(mol).run(verbose=0)
 print(f"RHF total energy = {mf.e_tot:.12f} Ha")

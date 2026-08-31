@@ -35,7 +35,7 @@ Basic Example
        basis="sto-3g",
        unit="angstrom",
    )
-   mol.build(driver="builtin", eri="dense")
+   mol.build(eri="dense")
 
    mf = RHF(mol).run()
    gw = GW(mf, screening="TDH", eta=1e-3).run()
@@ -491,7 +491,7 @@ mean-field reference:
 
 .. code-block:: python
 
-   mol.build(driver="builtin", eri="ri", auxbasis="cc-pvdz-rifit")
+   mol.build(eri="ri", auxbasis="cc-pvdz-rifit")
    mf = RHF(mol).run(cholesky_jk=True)
    gw = GW(mf).run()
    bse = BSE(gw).run(nroots=5)

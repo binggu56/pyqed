@@ -1,0 +1,207 @@
+{
+  "model": {
+    "shape": [
+      8,
+      8
+    ],
+    "j1": 1.0,
+    "j2": 0.5,
+    "boundary": "open",
+    "target_two_sz": 0
+  },
+  "blocking": {
+    "shape": [
+      2,
+      2
+    ],
+    "nblocks": 16,
+    "blocks": [
+      [
+        0,
+        1,
+        15,
+        14
+      ],
+      [
+        2,
+        3,
+        13,
+        12
+      ],
+      [
+        4,
+        5,
+        11,
+        10
+      ],
+      [
+        6,
+        7,
+        9,
+        8
+      ],
+      [
+        22,
+        23,
+        25,
+        24
+      ],
+      [
+        20,
+        21,
+        27,
+        26
+      ],
+      [
+        18,
+        19,
+        29,
+        28
+      ],
+      [
+        16,
+        17,
+        31,
+        30
+      ],
+      [
+        32,
+        33,
+        47,
+        46
+      ],
+      [
+        34,
+        35,
+        45,
+        44
+      ],
+      [
+        36,
+        37,
+        43,
+        42
+      ],
+      [
+        38,
+        39,
+        41,
+        40
+      ],
+      [
+        54,
+        55,
+        57,
+        56
+      ],
+      [
+        52,
+        53,
+        59,
+        58
+      ],
+      [
+        50,
+        51,
+        61,
+        60
+      ],
+      [
+        48,
+        49,
+        63,
+        62
+      ]
+    ],
+    "block_dims": [
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16,
+      16
+    ],
+    "unfused_physical_shape": [
+      2,
+      2,
+      2,
+      2
+    ],
+    "parent_sets": [
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      [],
+      []
+    ],
+    "intra_block_ties": false,
+    "hamiltonian_mapping": "exact product-basis permutation",
+    "blocking_seconds": 0.061841875009122305
+  },
+  "solver": {
+    "bond_dims": [
+      1,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      4,
+      1
+    ],
+    "optimizer": "two_site",
+    "solver": "matrix_free",
+    "pair_backend": "block",
+    "frontier_backend": "identity_block",
+    "sweeps": 2,
+    "symmetry_parameters": 758,
+    "dense_parameters": 3712,
+    "setup_seconds": 0.9999385410046671,
+    "sweep_seconds": 19.696011583000654,
+    "initial_energy": -2.478239984411465,
+    "energy": -28.71605160380516,
+    "history": [
+      -28.288910952087782,
+      -28.71605160380516
+    ],
+    "peak_frontier_elements": 470,
+    "cached_environment_elements": 5870
+  },
+  "exact": {
+    "energy": null,
+    "seconds": null,
+    "block_tt_svd_reference": null,
+    "energy_error": null,
+    "energy_error_per_site": null
+  }
+}

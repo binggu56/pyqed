@@ -8,7 +8,7 @@ from pyqed.qchem.hf.rhf import get_jk as pyqed_get_jk
 
 def test_rttdhf_ground_state_is_stationary_without_field():
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
 
     mf = RHF(mol).run()
     rt = RTTDHF(mf).run(dt=0.05, nsteps=5, store_dm=True)
@@ -22,7 +22,7 @@ def test_rttdhf_small_kick_shows_spectral_weight_near_pyscf_tdhf_root():
     atom = 'H 0 0 0; H 0 0 1.4'
 
     mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     mf = RHF(mol).run()
 
     pyscf_mol = gto.M(atom=atom, unit='Bohr', basis='sto-3g')
@@ -58,7 +58,7 @@ def test_complex_jk_matches_pyscf_for_rt_coherences():
     atom = 'H 0 0 0; H 0 0 1.4'
 
     mol = Molecule(atom=atom, unit='bohr', basis='sto-3g')
-    mol.build(driver='gbasis')
+    mol.build()
     RHF(mol).run()
 
     pyscf_mol = gto.M(atom=atom, unit='Bohr', basis='sto-3g')

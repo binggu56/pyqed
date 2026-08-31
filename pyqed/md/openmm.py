@@ -2,10 +2,10 @@
 
 import numpy as np
 
-from pyqed.units import au2angstrom
+from pyqed.units import au2angstrom, au2kjmol
 
 
-HARTREE_TO_KJMOL = 2625.4996394799
+HARTREE_TO_KJMOL = au2kjmol
 BOHR_TO_NM = au2angstrom * 0.1
 FORCE_GROUPS = {
     "bonds": 0,

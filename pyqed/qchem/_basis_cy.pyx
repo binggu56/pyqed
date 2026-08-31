@@ -3,7 +3,7 @@
 import numpy as np
 cimport numpy as cnp
 
-from libc.math cimport exp, sqrt, fabs, NAN
+from libc.math cimport exp, sqrt, fabs, floor, log, tgamma, NAN
 from libc.stdlib cimport malloc, free
 from libc.stdint cimport int64_t, uint64_t, uint8_t
 from libc.string cimport memset
@@ -18,6 +18,7 @@ DEF OS_VRR_PAIR_MAX_L = 4
 DEF OS_VRR_MAX_CART = 15
 DEF THREE_CENTER_E_CAP = 128
 DEF THREE_CENTER_R_CAP = 2048
+DEF PAIR_FT_E_CAP = 1024
 
 
 cdef inline size_t idx3(int i, int j, int t, int jdim, int tdim) noexcept nogil:
@@ -121,6 +122,90 @@ cdef inline double primitive_overlap(
     return Sx * Sy * Sz * ((PI / (a + b)) ** 1.5)
 
 
+cdef inline double binomial_int(int n, int k) noexcept nogil:
+    cdef int i
+    cdef double value = 1.0
+    if k < 0 or k > n:
+        return 0.0
+    if k > n - k:
+        k = n - k
+    for i in range(1, k + 1):
+        value *= <double>(n - k + i) / <double>i
+    return value
+
+
+cdef inline double triple_gaussian_axis(
+    double p, double P,
+    int la, double A,
+    int lb, double B,
+    int lc, double C,
+) noexcept nogil:
+    cdef int ia, ib, ic, degree
+    cdef double ca, cab, coefficient, value = 0.0
+    for ia in range(la + 1):
+        ca = binomial_int(la, ia) * ((P - A) ** (la - ia))
+        for ib in range(lb + 1):
+            cab = ca * binomial_int(lb, ib) * ((P - B) ** (lb - ib))
+            for ic in range(lc + 1):
+                degree = ia + ib + ic
+                if degree & 1:
+                    continue
+                coefficient = cab * binomial_int(lc, ic) * ((P - C) ** (lc - ic))
+                value += coefficient * tgamma(0.5 * (degree + 1)) / (p ** (0.5 * (degree + 1)))
+    return value
+
+
+cdef inline double primitive_three_gaussian_overlap(
+    double a, int lax, int lay, int laz, double Ax, double Ay, double Az,
+    double b, int lbx, int lby, int lbz, double Bx, double By, double Bz,
+    double c, int lcx, int lcy, int lcz, double Cx, double Cy, double Cz,
+) noexcept nogil:
+    cdef double p = a + b + c
+    cdef double Px = (a * Ax + b * Bx + c * Cx) / p
+    cdef double Py = (a * Ay + b * By + c * Cy) / p
+    cdef double Pz = (a * Az + b * Bz + c * Cz) / p
+    cdef double prefactor = exp(
+        -(a * (Ax*Ax + Ay*Ay + Az*Az)
+          + b * (Bx*Bx + By*By + Bz*Bz)
+          + c * (Cx*Cx + Cy*Cy + Cz*Cz))
+        + p * (Px*Px + Py*Py + Pz*Pz)
+    )
+    return prefactor * (
+        triple_gaussian_axis(p, Px, lax, Ax, lbx, Bx, lcx, Cx)
+        * triple_gaussian_axis(p, Py, lay, Ay, lby, By, lcy, Cy)
+        * triple_gaussian_axis(p, Pz, laz, Az, lbz, Bz, lcz, Cz)
+    )
+
+
+cdef inline double primitive_gth_local_gaussian(
+    double a, int lax, int lay, int laz, double Ax, double Ay, double Az,
+    double b, int lbx, int lby, int lbz, double Bx, double By, double Bz,
+    double Cx, double Cy, double Cz,
+    double radius, double* coefficients, int nlocal,
+) noexcept nogil:
+    cdef int power, ix, iy, iz
+    cdef double exponent_c = 0.5 / (radius * radius)
+    cdef double value = 0.0
+    cdef double multinomial, scale
+    for power in range(nlocal):
+        if coefficients[power] == 0.0:
+            continue
+        scale = coefficients[power] / (radius ** (2 * power))
+        for ix in range(power + 1):
+            for iy in range(power - ix + 1):
+                iz = power - ix - iy
+                multinomial = (
+                    binomial_int(power, ix)
+                    * binomial_int(power - ix, iy)
+                )
+                value += scale * multinomial * primitive_three_gaussian_overlap(
+                    a, lax, lay, laz, Ax, Ay, Az,
+                    b, lbx, lby, lbz, Bx, By, Bz,
+                    exponent_c, 2*ix, 2*iy, 2*iz, Cx, Cy, Cz,
+                )
+    return value
+
+
 cdef inline double primitive_kinetic(
     double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
     double b, int l2, int m2, int n2, double Bx, double By, double Bz
@@ -143,10 +228,11 @@ cdef inline double primitive_kinetic(
     return term0 + term1 + term2
 
 
-cdef inline double primitive_nuclear_attraction(
+cdef inline double primitive_nuclear_attraction_kernel(
     double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
     double b, int l2, int m2, int n2, double Bx, double By, double Bz,
-    double Cx, double Cy, double Cz
+    double Cx, double Cy, double Cz,
+    double radial_p
 ) noexcept nogil:
     cdef double p = a + b
     cdef double px = (a * Ax + b * Bx) / p
@@ -192,10 +278,23 @@ cdef inline double primitive_nuclear_attraction(
             exy = ex * E_rec(m1, m2, u, aby, a, b, memo_y, m2 + 1, tdim_y)
             for v in range(n1 + n2 + 1):
                 value += exy * E_rec(n1, n2, v, abz, a, b, memo_z, n2 + 1, tdim_z) * R_rec(
-                    t, u, v, 0, p, dx, dy, dz, rpc, memo_r, uy_max + 1, vz_max + 1, nmax
+                    t, u, v, 0, radial_p, dx, dy, dz, rpc, memo_r, uy_max + 1, vz_max + 1, nmax
                 )
     free(memo_x); free(memo_y); free(memo_z); free(memo_r)
     return value * (2.0 * PI / p)
+
+
+cdef inline double primitive_nuclear_attraction(
+    double a, int l1, int m1, int n1, double Ax, double Ay, double Az,
+    double b, int l2, int m2, int n2, double Bx, double By, double Bz,
+    double Cx, double Cy, double Cz
+) noexcept nogil:
+    return primitive_nuclear_attraction_kernel(
+        a, l1, m1, n1, Ax, Ay, Az,
+        b, l2, m2, n2, Bx, By, Bz,
+        Cx, Cy, Cz,
+        a + b,
+    )
 
 
 cdef double E_rec(int i, int j, int t, double Qx, double a, double b, double* memo, int jdim, int tdim) noexcept nogil:
@@ -228,6 +327,283 @@ cdef double E_rec(int i, int j, int t, double Qx, double a, double b, double* me
 
     memo[pos] = value
     return value
+
+
+def compute_periodic_pair_ft_primitive_terms(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=3] right_origins_batch,
+    cnp.ndarray[int64_t, ndim=1] pair_p,
+    cnp.ndarray[int64_t, ndim=1] pair_q,
+    int nleft,
+    cnp.ndarray[int64_t, ndim=1] prim_start,
+    cnp.ndarray[double, ndim=1] prim_alpha,
+    cnp.ndarray[double, ndim=1] prim_beta,
+    cnp.ndarray[double, ndim=1] prim_alpha_over_p,
+    cnp.ndarray[double, ndim=1] prim_beta_over_p,
+    cnp.ndarray[double, ndim=1] prim_inv_4p,
+    cnp.ndarray[double, ndim=1] prim_prefactor,
+    cnp.ndarray[uint8_t, ndim=2] image_pair_mask,
+    double coeff_tol=0.0,
+):
+    """Pack periodic AO-pair Fourier primitive terms in compiled loops."""
+
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, :, ::1] right_origins_v = right_origins_batch
+    cdef int64_t[::1] pair_p_v = pair_p
+    cdef int64_t[::1] pair_q_v = pair_q
+    cdef int64_t[::1] prim_start_v = prim_start
+    cdef double[::1] prim_alpha_v = prim_alpha
+    cdef double[::1] prim_beta_v = prim_beta
+    cdef double[::1] prim_alpha_over_p_v = prim_alpha_over_p
+    cdef double[::1] prim_beta_over_p_v = prim_beta_over_p
+    cdef double[::1] prim_inv_4p_v = prim_inv_4p
+    cdef double[::1] prim_prefactor_v = prim_prefactor
+    cdef uint8_t[:, ::1] image_pair_mask_v = image_pair_mask
+    cdef Py_ssize_t npair = pair_p.shape[0]
+    cdef Py_ssize_t nimage = right_origins_batch.shape[0]
+    cdef Py_ssize_t pass_index, pair_idx, image, primitive, idx
+    cdef Py_ssize_t term_count, image_group_count, product_group_count
+    cdef Py_ssize_t image_term_start, image_product_start, product_term_start
+    cdef int pidx, qidx, qlocal
+    cdef int l1, m1, n1, l2, m2, n2, t, u, v
+    cdef int size_x, size_y, size_z
+    cdef double ax, ay, az, bx, by, bz, abx, aby, abz
+    cdef double alpha, beta, alpha_over_p, beta_over_p
+    cdef double center_x, center_y, center_z, inv_4p, prefactor
+    cdef double ex, exy, coeff
+    cdef double memo_x[PAIR_FT_E_CAP]
+    cdef double memo_y[PAIR_FT_E_CAP]
+    cdef double memo_z[PAIR_FT_E_CAP]
+
+    cdef cnp.ndarray[int64_t, ndim=1] pair_term_starts = np.empty(
+        (npair + 1,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] pair_image_group_starts = np.empty(
+        (npair + 1,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] term_image = np.empty((0,), dtype=np.int64)
+    cdef cnp.ndarray[double, ndim=2] term_center = np.empty((0, 3), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=1] term_inv_4p = np.empty((0,), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=1] term_coeff = np.empty((0,), dtype=np.float64)
+    cdef cnp.ndarray[int64_t, ndim=2] term_power = np.empty((0, 3), dtype=np.int64)
+    cdef cnp.ndarray[int64_t, ndim=1] image_group_image = np.empty(
+        (0,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] image_group_term_start = np.empty(
+        (0,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] image_group_term_stop = np.empty(
+        (0,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] image_group_product_start = np.empty(
+        (0,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] image_group_product_stop = np.empty(
+        (0,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] product_group_term_start = np.empty(
+        (0,), dtype=np.int64
+    )
+    cdef cnp.ndarray[int64_t, ndim=1] product_group_term_stop = np.empty(
+        (0,), dtype=np.int64
+    )
+
+    cdef int64_t[::1] pair_term_starts_v = pair_term_starts
+    cdef int64_t[::1] pair_image_group_starts_v = pair_image_group_starts
+    cdef int64_t[::1] term_image_v = term_image
+    cdef double[:, ::1] term_center_v = term_center
+    cdef double[::1] term_inv_4p_out_v = term_inv_4p
+    cdef double[::1] term_coeff_v = term_coeff
+    cdef int64_t[:, ::1] term_power_v = term_power
+    cdef int64_t[::1] image_group_image_v = image_group_image
+    cdef int64_t[::1] image_group_term_start_v = image_group_term_start
+    cdef int64_t[::1] image_group_term_stop_v = image_group_term_stop
+    cdef int64_t[::1] image_group_product_start_v = image_group_product_start
+    cdef int64_t[::1] image_group_product_stop_v = image_group_product_stop
+    cdef int64_t[::1] product_group_term_start_v = product_group_term_start
+    cdef int64_t[::1] product_group_term_stop_v = product_group_term_stop
+
+    if pair_q.shape[0] != npair or prim_start.shape[0] != npair + 1:
+        raise ValueError("pair and primitive-start arrays have inconsistent lengths")
+    if image_pair_mask.shape[0] != nimage or image_pair_mask.shape[1] != npair:
+        raise ValueError("image_pair_mask has an inconsistent shape")
+    if left_origins.shape[0] != nleft or left_origins.shape[1] != 3:
+        raise ValueError("left_origins has an inconsistent shape")
+    if right_origins_batch.shape[2] != 3:
+        raise ValueError("right_origins_batch must have a final dimension of three")
+    coeff_tol = max(coeff_tol, 0.0)
+
+    for pass_index in range(2):
+        term_count = 0
+        image_group_count = 0
+        product_group_count = 0
+        if pass_index == 1:
+            pair_term_starts_v[0] = 0
+            pair_image_group_starts_v[0] = 0
+
+        for pair_idx in range(npair):
+            pidx = <int>pair_p_v[pair_idx]
+            qidx = <int>pair_q_v[pair_idx]
+            qlocal = qidx - nleft
+            if pidx < 0 or pidx >= nleft or qlocal < 0 or qlocal >= right_origins_batch.shape[1]:
+                raise ValueError("pair index is outside the AO basis")
+            l1 = <int>shells_v[pidx, 0]
+            m1 = <int>shells_v[pidx, 1]
+            n1 = <int>shells_v[pidx, 2]
+            l2 = <int>shells_v[qidx, 0]
+            m2 = <int>shells_v[qidx, 1]
+            n2 = <int>shells_v[qidx, 2]
+            size_x = (l1 + 1) * (l2 + 1) * (l1 + l2 + 2)
+            size_y = (m1 + 1) * (m2 + 1) * (m1 + m2 + 2)
+            size_z = (n1 + 1) * (n2 + 1) * (n1 + n2 + 2)
+            if size_x > PAIR_FT_E_CAP or size_y > PAIR_FT_E_CAP or size_z > PAIR_FT_E_CAP:
+                raise NotImplementedError("angular momentum exceeds compiled pair-FT plan capacity")
+            ax = left_origins_v[pidx, 0]
+            ay = left_origins_v[pidx, 1]
+            az = left_origins_v[pidx, 2]
+
+            for image in range(nimage):
+                if image_pair_mask_v[image, pair_idx] == 0:
+                    continue
+                image_term_start = term_count
+                image_product_start = product_group_count
+                bx = right_origins_v[image, qlocal, 0]
+                by = right_origins_v[image, qlocal, 1]
+                bz = right_origins_v[image, qlocal, 2]
+                abx = ax - bx
+                aby = ay - by
+                abz = az - bz
+
+                for primitive in range(prim_start_v[pair_idx], prim_start_v[pair_idx + 1]):
+                    alpha = prim_alpha_v[primitive]
+                    beta = prim_beta_v[primitive]
+                    alpha_over_p = prim_alpha_over_p_v[primitive]
+                    beta_over_p = prim_beta_over_p_v[primitive]
+                    inv_4p = prim_inv_4p_v[primitive]
+                    prefactor = prim_prefactor_v[primitive]
+                    center_x = alpha_over_p * ax
+                    center_x += beta_over_p * bx
+                    center_y = alpha_over_p * ay
+                    center_y += beta_over_p * by
+                    center_z = alpha_over_p * az
+                    center_z += beta_over_p * bz
+                    product_term_start = term_count
+                    for idx in range(size_x):
+                        memo_x[idx] = NAN
+                    for idx in range(size_y):
+                        memo_y[idx] = NAN
+                    for idx in range(size_z):
+                        memo_z[idx] = NAN
+
+                    for t in range(l1 + l2 + 1):
+                        ex = E_rec(l1, l2, t, abx, alpha, beta, memo_x, l2 + 1, l1 + l2 + 2)
+                        if ex == 0.0:
+                            continue
+                        for u in range(m1 + m2 + 1):
+                            exy = ex * E_rec(m1, m2, u, aby, alpha, beta, memo_y, m2 + 1, m1 + m2 + 2)
+                            if exy == 0.0:
+                                continue
+                            for v in range(n1 + n2 + 1):
+                                coeff = exy * E_rec(n1, n2, v, abz, alpha, beta, memo_z, n2 + 1, n1 + n2 + 2)
+                                coeff *= prefactor
+                                if fabs(coeff) <= coeff_tol:
+                                    continue
+                                if pass_index == 1:
+                                    term_image_v[term_count] = image
+                                    term_center_v[term_count, 0] = center_x
+                                    term_center_v[term_count, 1] = center_y
+                                    term_center_v[term_count, 2] = center_z
+                                    term_inv_4p_out_v[term_count] = inv_4p
+                                    term_coeff_v[term_count] = coeff
+                                    term_power_v[term_count, 0] = t
+                                    term_power_v[term_count, 1] = u
+                                    term_power_v[term_count, 2] = v
+                                term_count += 1
+
+                    if term_count > product_term_start:
+                        if pass_index == 1:
+                            product_group_term_start_v[product_group_count] = product_term_start
+                            product_group_term_stop_v[product_group_count] = term_count
+                        product_group_count += 1
+
+                if term_count > image_term_start:
+                    if pass_index == 1:
+                        image_group_image_v[image_group_count] = image
+                        image_group_term_start_v[image_group_count] = image_term_start
+                        image_group_term_stop_v[image_group_count] = term_count
+                        image_group_product_start_v[image_group_count] = image_product_start
+                        image_group_product_stop_v[image_group_count] = product_group_count
+                    image_group_count += 1
+
+            if pass_index == 1:
+                pair_term_starts_v[pair_idx + 1] = term_count
+                pair_image_group_starts_v[pair_idx + 1] = image_group_count
+
+        if pass_index == 0:
+            term_image = np.empty((term_count,), dtype=np.int64)
+            term_center = np.empty((term_count, 3), dtype=np.float64)
+            term_inv_4p = np.empty((term_count,), dtype=np.float64)
+            term_coeff = np.empty((term_count,), dtype=np.float64)
+            term_power = np.empty((term_count, 3), dtype=np.int64)
+            image_group_image = np.empty((image_group_count,), dtype=np.int64)
+            image_group_term_start = np.empty((image_group_count,), dtype=np.int64)
+            image_group_term_stop = np.empty((image_group_count,), dtype=np.int64)
+            image_group_product_start = np.empty((image_group_count,), dtype=np.int64)
+            image_group_product_stop = np.empty((image_group_count,), dtype=np.int64)
+            product_group_term_start = np.empty((product_group_count,), dtype=np.int64)
+            product_group_term_stop = np.empty((product_group_count,), dtype=np.int64)
+            term_image_v = term_image
+            term_center_v = term_center
+            term_inv_4p_out_v = term_inv_4p
+            term_coeff_v = term_coeff
+            term_power_v = term_power
+            image_group_image_v = image_group_image
+            image_group_term_start_v = image_group_term_start
+            image_group_term_stop_v = image_group_term_stop
+            image_group_product_start_v = image_group_product_start
+            image_group_product_stop_v = image_group_product_stop
+            product_group_term_start_v = product_group_term_start
+            product_group_term_stop_v = product_group_term_stop
+
+    if product_group_count:
+        factor_rows = np.empty((product_group_count, 4), dtype=np.float64)
+        factor_rows[:, :3] = term_center[product_group_term_start]
+        factor_rows[:, 3] = term_inv_4p[product_group_term_start]
+        factor_rows = np.round(factor_rows, decimals=15)
+        unique_factors, product_group_factor_id = np.unique(
+            factor_rows,
+            axis=0,
+            return_inverse=True,
+        )
+        product_group_factor_id = np.ascontiguousarray(
+            product_group_factor_id,
+            dtype=np.int64,
+        )
+        product_factor_count = int(len(unique_factors))
+    else:
+        product_group_factor_id = np.empty((0,), dtype=np.int64)
+        product_factor_count = 0
+
+    return {
+        "pair_term_starts": pair_term_starts,
+        "term_image": term_image,
+        "term_center": term_center,
+        "term_inv_4p": term_inv_4p,
+        "term_coeff": term_coeff,
+        "term_power": term_power,
+        "pair_image_group_starts": pair_image_group_starts,
+        "image_group_image": image_group_image,
+        "image_group_term_start": image_group_term_start,
+        "image_group_term_stop": image_group_term_stop,
+        "image_group_product_start": image_group_product_start,
+        "image_group_product_stop": image_group_product_stop,
+        "product_group_term_start": product_group_term_start,
+        "product_group_term_stop": product_group_term_stop,
+        "product_group_factor_id": product_group_factor_id,
+        "product_group_factor_count": product_factor_count,
+    }
 
 
 cdef double R_rec(
@@ -1273,6 +1649,37 @@ cdef inline void os_vrr_set(
     double value,
 ) noexcept nogil:
     table[os_vrr_idx(ax, ay, az, cx, cy, cz, m, adim, cdim, mdim)] = value
+
+
+cdef void os_subtract_valid_vrr_states(
+    double* table,
+    double* other,
+    int max_a,
+    int max_c,
+    int max_m,
+    double scale,
+) noexcept nogil:
+    cdef int adim = max_a + 1
+    cdef int cdim = max_c + 1
+    cdef int mdim = max_m + 1
+    cdef int ax, ay, az, cx, cy, cz, m, total
+    cdef size_t index
+
+    for ax in range(max_a + 1):
+        for ay in range(max_a + 1 - ax):
+            for az in range(max_a + 1 - ax - ay):
+                for cx in range(max_c + 1):
+                    for cy in range(max_c + 1 - cx):
+                        for cz in range(max_c + 1 - cx - cy):
+                            total = ax + ay + az + cx + cy + cz
+                            if total > max_m:
+                                continue
+                            for m in range(max_m - total + 1):
+                                index = os_vrr_idx(
+                                    ax, ay, az, cx, cy, cz, m,
+                                    adim, cdim, mdim,
+                                )
+                                table[index] -= scale * other[index]
 
 
 cdef void os_fill_vrr_table(
@@ -2336,6 +2743,284 @@ cdef inline double contracted_nuclear_indices(
     return value
 
 
+cdef inline double primitive_nuclear_from_hermite(
+    double* coeff_x, int tx_max,
+    double* coeff_y, int uy_max,
+    double* coeff_z, int vz_max,
+    double pair_p, double radial_p,
+    double px, double py, double pz,
+    double Cx, double Cy, double Cz,
+    double* memo_r, size_t size_r, int nmax,
+) noexcept nogil:
+    cdef int t, u, v
+    cdef size_t idx
+    cdef double dx = px - Cx
+    cdef double dy = py - Cy
+    cdef double dz = pz - Cz
+    cdef double rpc = sqrt(dx * dx + dy * dy + dz * dz)
+    cdef double value = 0.0
+    for idx in range(size_r):
+        memo_r[idx] = NAN
+    for t in range(tx_max + 1):
+        for u in range(uy_max + 1):
+            for v in range(vz_max + 1):
+                value += coeff_x[t] * coeff_y[u] * coeff_z[v] * R_rec(
+                    t, u, v, 0, radial_p,
+                    dx, dy, dz, rpc, memo_r,
+                    uy_max + 1, vz_max + 1, nmax,
+                )
+    return value * (2.0 * PI / pair_p)
+
+
+cdef inline double primitive_periodic_point_charge_precomputed(
+    double* coeff_x, int tx_max,
+    double* coeff_y, int uy_max,
+    double* coeff_z, int vz_max,
+    double px, double py, double pz,
+    double Cx, double Cy, double Cz,
+    double charge, double weight, double pair_p, double radial_p,
+    double lr_scale, int angular, double pair_log_prefactor,
+    double nuclear_screen_tol, double log_tol,
+    double* memo_r, size_t size_r, int nmax,
+) noexcept nogil:
+    cdef double dx, dy, dz, distance2, distance, log_bound
+    cdef double full_value, lr_value
+    if nuclear_screen_tol > 0.0 and lr_scale > 0.0:
+        dx = px - Cx
+        dy = py - Cy
+        dz = pz - Cz
+        distance2 = dx * dx + dy * dy + dz * dz
+        distance = sqrt(distance2)
+        log_bound = (
+            log(fabs(charge) + 1.0e-300)
+            + pair_log_prefactor
+            - radial_p * distance2
+            + (angular + 2.0)
+            * log(2.0 + distance + 1.0 / sqrt(radial_p))
+        )
+        if log_bound < log_tol:
+            return 0.0
+    full_value = primitive_nuclear_from_hermite(
+        coeff_x, tx_max, coeff_y, uy_max, coeff_z, vz_max,
+        pair_p, pair_p, px, py, pz, Cx, Cy, Cz,
+        memo_r, size_r, nmax,
+    )
+    if lr_scale > 0.0:
+        lr_value = primitive_nuclear_from_hermite(
+            coeff_x, tx_max, coeff_y, uy_max, coeff_z, vz_max,
+            pair_p, radial_p, px, py, pz, Cx, Cy, Cz,
+            memo_r, size_r, nmax,
+        )
+    else:
+        lr_value = 0.0
+    return -charge * weight * (full_value - lr_scale * lr_value)
+
+
+cdef inline void contracted_periodic_one_electron_indices(
+    int p, int q,
+    int64_t[:, ::1] left_shells_v,
+    int64_t[:, ::1] right_shells_v,
+    double[:, ::1] left_origins_v,
+    double[:, ::1] right_origins_v,
+    double[:, ::1] left_exps_v,
+    double[:, ::1] right_exps_v,
+    double[:, ::1] left_weights_v,
+    double[:, ::1] right_weights_v,
+    int64_t[::1] left_nprim_v,
+    int64_t[::1] right_nprim_v,
+    double[:, ::1] atcoords_v,
+    double[::1] atnums_v,
+    double[:, ::1] lattice_v,
+    double[:, ::1] inverse_lattice_v,
+    int64_t[:, ::1] nuclear_image_keys_v,
+    bint use_lattice_images,
+    double eta,
+    double nuclear_screen_tol,
+    double* overlap,
+    double* kinetic,
+    double* vnuc,
+) noexcept nogil:
+    cdef int ip, iq, c, image, idx, t, u, v
+    cdef int angular, l1, m1, n1, l2, m2, n2
+    cdef int tx_max, uy_max, vz_max, nmax
+    cdef int size_x, size_y, size_z
+    cdef size_t size_r
+    cdef double alpha, beta, weight, pair_p, radial_p, lr_scale
+    cdef double abx, aby, abz, ab2, pair_q, px, py, pz, log_tol
+    cdef double pair_log_prefactor, fx, fy, fz, cx, cy, cz
+    cdef int64_t nx, ny, nz
+    cdef double* memo_x
+    cdef double* memo_y
+    cdef double* memo_z
+    cdef double* memo_r
+    cdef double* coeff_x
+    cdef double* coeff_y
+    cdef double* coeff_z
+    overlap[0] = 0.0
+    kinetic[0] = 0.0
+    vnuc[0] = 0.0
+    log_tol = log(nuclear_screen_tol) if nuclear_screen_tol > 0.0 else 0.0
+    l1 = <int>left_shells_v[p, 0]
+    m1 = <int>left_shells_v[p, 1]
+    n1 = <int>left_shells_v[p, 2]
+    l2 = <int>right_shells_v[q, 0]
+    m2 = <int>right_shells_v[q, 1]
+    n2 = <int>right_shells_v[q, 2]
+    tx_max = l1 + l2
+    uy_max = m1 + m2
+    vz_max = n1 + n2
+    angular = tx_max + uy_max + vz_max
+    nmax = angular + 2
+    size_x = (l1 + 1) * (l2 + 1) * (tx_max + 2)
+    size_y = (m1 + 1) * (m2 + 1) * (uy_max + 2)
+    size_z = (n1 + 1) * (n2 + 1) * (vz_max + 2)
+    size_r = (
+        <size_t>(tx_max + 1) * <size_t>(uy_max + 1)
+        * <size_t>(vz_max + 1) * <size_t>nmax
+    )
+    memo_x = <double*>malloc(size_x * sizeof(double))
+    memo_y = <double*>malloc(size_y * sizeof(double))
+    memo_z = <double*>malloc(size_z * sizeof(double))
+    memo_r = <double*>malloc(size_r * sizeof(double))
+    coeff_x = <double*>malloc((tx_max + 1) * sizeof(double))
+    coeff_y = <double*>malloc((uy_max + 1) * sizeof(double))
+    coeff_z = <double*>malloc((vz_max + 1) * sizeof(double))
+    if (
+        memo_x == NULL or memo_y == NULL or memo_z == NULL or memo_r == NULL
+        or coeff_x == NULL or coeff_y == NULL or coeff_z == NULL
+    ):
+        free(memo_x); free(memo_y); free(memo_z); free(memo_r)
+        free(coeff_x); free(coeff_y); free(coeff_z)
+        return
+    abx = left_origins_v[p, 0] - right_origins_v[q, 0]
+    aby = left_origins_v[p, 1] - right_origins_v[q, 1]
+    abz = left_origins_v[p, 2] - right_origins_v[q, 2]
+    ab2 = abx * abx + aby * aby + abz * abz
+    for ip in range(left_nprim_v[p]):
+        alpha = left_exps_v[p, ip]
+        for iq in range(right_nprim_v[q]):
+            beta = right_exps_v[q, iq]
+            weight = left_weights_v[p, ip] * right_weights_v[q, iq]
+            overlap[0] += weight * primitive_overlap(
+                alpha,
+                <int>left_shells_v[p, 0], <int>left_shells_v[p, 1], <int>left_shells_v[p, 2],
+                left_origins_v[p, 0], left_origins_v[p, 1], left_origins_v[p, 2],
+                beta,
+                <int>right_shells_v[q, 0], <int>right_shells_v[q, 1], <int>right_shells_v[q, 2],
+                right_origins_v[q, 0], right_origins_v[q, 1], right_origins_v[q, 2],
+            )
+            kinetic[0] += weight * primitive_kinetic(
+                alpha,
+                <int>left_shells_v[p, 0], <int>left_shells_v[p, 1], <int>left_shells_v[p, 2],
+                left_origins_v[p, 0], left_origins_v[p, 1], left_origins_v[p, 2],
+                beta,
+                <int>right_shells_v[q, 0], <int>right_shells_v[q, 1], <int>right_shells_v[q, 2],
+                right_origins_v[q, 0], right_origins_v[q, 1], right_origins_v[q, 2],
+            )
+            pair_p = alpha + beta
+            pair_q = alpha * beta / pair_p
+            for idx in range(size_x):
+                memo_x[idx] = NAN
+            for idx in range(size_y):
+                memo_y[idx] = NAN
+            for idx in range(size_z):
+                memo_z[idx] = NAN
+            for t in range(tx_max + 1):
+                coeff_x[t] = E_rec(
+                    l1, l2, t, abx, alpha, beta,
+                    memo_x, l2 + 1, tx_max + 2,
+                )
+            for u in range(uy_max + 1):
+                coeff_y[u] = E_rec(
+                    m1, m2, u, aby, alpha, beta,
+                    memo_y, m2 + 1, uy_max + 2,
+                )
+            for v in range(vz_max + 1):
+                coeff_z[v] = E_rec(
+                    n1, n2, v, abz, alpha, beta,
+                    memo_z, n2 + 1, vz_max + 2,
+                )
+            pair_log_prefactor = (
+                log(fabs(weight) + 1.0e-300)
+                + log(2.0 * PI / pair_p)
+                - pair_q * ab2
+            )
+            px = (
+                alpha * left_origins_v[p, 0]
+                + beta * right_origins_v[q, 0]
+            ) / pair_p
+            py = (
+                alpha * left_origins_v[p, 1]
+                + beta * right_origins_v[q, 1]
+            ) / pair_p
+            pz = (
+                alpha * left_origins_v[p, 2]
+                + beta * right_origins_v[q, 2]
+            ) / pair_p
+            if eta > 0.0:
+                radial_p = pair_p * eta * eta / (pair_p + eta * eta)
+                lr_scale = eta / sqrt(pair_p + eta * eta)
+            else:
+                radial_p = pair_p
+                lr_scale = 0.0
+            if use_lattice_images:
+                for c in range(atnums_v.shape[0]):
+                    fx = (
+                        (px - atcoords_v[c, 0]) * inverse_lattice_v[0, 0]
+                        + (py - atcoords_v[c, 1]) * inverse_lattice_v[1, 0]
+                        + (pz - atcoords_v[c, 2]) * inverse_lattice_v[2, 0]
+                    )
+                    fy = (
+                        (px - atcoords_v[c, 0]) * inverse_lattice_v[0, 1]
+                        + (py - atcoords_v[c, 1]) * inverse_lattice_v[1, 1]
+                        + (pz - atcoords_v[c, 2]) * inverse_lattice_v[2, 1]
+                    )
+                    fz = (
+                        (px - atcoords_v[c, 0]) * inverse_lattice_v[0, 2]
+                        + (py - atcoords_v[c, 1]) * inverse_lattice_v[1, 2]
+                        + (pz - atcoords_v[c, 2]) * inverse_lattice_v[2, 2]
+                    )
+                    nx = <int64_t>floor(fx + 0.5)
+                    ny = <int64_t>floor(fy + 0.5)
+                    nz = <int64_t>floor(fz + 0.5)
+                    for image in range(nuclear_image_keys_v.shape[0]):
+                        cx = atcoords_v[c, 0] + (
+                            (nx + nuclear_image_keys_v[image, 0]) * lattice_v[0, 0]
+                            + (ny + nuclear_image_keys_v[image, 1]) * lattice_v[1, 0]
+                            + (nz + nuclear_image_keys_v[image, 2]) * lattice_v[2, 0]
+                        )
+                        cy = atcoords_v[c, 1] + (
+                            (nx + nuclear_image_keys_v[image, 0]) * lattice_v[0, 1]
+                            + (ny + nuclear_image_keys_v[image, 1]) * lattice_v[1, 1]
+                            + (nz + nuclear_image_keys_v[image, 2]) * lattice_v[2, 1]
+                        )
+                        cz = atcoords_v[c, 2] + (
+                            (nx + nuclear_image_keys_v[image, 0]) * lattice_v[0, 2]
+                            + (ny + nuclear_image_keys_v[image, 1]) * lattice_v[1, 2]
+                            + (nz + nuclear_image_keys_v[image, 2]) * lattice_v[2, 2]
+                        )
+                        vnuc[0] += primitive_periodic_point_charge_precomputed(
+                            coeff_x, tx_max, coeff_y, uy_max, coeff_z, vz_max,
+                            px, py, pz,
+                            cx, cy, cz, atnums_v[c], weight, pair_p, radial_p,
+                            lr_scale, angular, pair_log_prefactor,
+                            nuclear_screen_tol, log_tol,
+                            memo_r, size_r, nmax,
+                        )
+            else:
+                for c in range(atnums_v.shape[0]):
+                    vnuc[0] += primitive_periodic_point_charge_precomputed(
+                        coeff_x, tx_max, coeff_y, uy_max, coeff_z, vz_max,
+                        px, py, pz,
+                        atcoords_v[c, 0], atcoords_v[c, 1], atcoords_v[c, 2],
+                        atnums_v[c], weight, pair_p, radial_p, lr_scale, angular,
+                        pair_log_prefactor, nuclear_screen_tol, log_tol,
+                        memo_r, size_r, nmax,
+                    )
+    free(memo_x); free(memo_y); free(memo_z); free(memo_r)
+    free(coeff_x); free(coeff_y); free(coeff_z)
+
+
 cdef inline double contracted_two_center_coulomb_indices(
     int p, int q,
     int64_t[:, ::1] shells_v,
@@ -2961,6 +3646,14 @@ cdef int compute_shell_triplet_short_range_vrr_hrr_into_tensor(
                     QC,
                     PQ,
                 )
+                os_subtract_valid_vrr_states(
+                    vrr_table,
+                    lr_vrr_table,
+                    max_a_l,
+                    max_c_l,
+                    max_m_l,
+                    lr_scale,
+                )
             else:
                 lr_scale = 0.0
             for ia in range(np_):
@@ -2991,25 +3684,7 @@ cdef int compute_shell_triplet_short_range_vrr_hrr_into_tensor(
                             AB,
                             CD,
                         )
-                        if use_lr:
-                            lr_value = os_vrr_hrr_eval_expanded(
-                                lr_vrr_table,
-                                ax[ia], ay[ia], az[ia],
-                                bx[ib], by[ib], bz[ib],
-                                cx[ic], cy[ic], cz[ic],
-                                0, 0, 0,
-                                0,
-                                max_a_l,
-                                max_c_l,
-                                max_m_l,
-                                AB,
-                                CD,
-                            )
-                            tensor_v[aux_i, ao_p, ao_q] += prefac * (
-                                full_value - lr_scale * lr_value
-                            )
-                        else:
-                            tensor_v[aux_i, ao_p, ao_q] += prefac * full_value
+                        tensor_v[aux_i, ao_p, ao_q] += prefac * full_value
 
     return 1
 
@@ -3264,6 +3939,612 @@ cpdef compute_short_range_three_center_tensor_shell_blocked_masked(
     free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
     free(direct_vrr_table); free(direct_lr_vrr_table)
     return tensor
+
+
+cdef int accumulate_shell_triplet_short_range_vrr_hrr_bloch(
+    int64_t[:, ::1] shells_v,
+    double[:, ::1] left_origins_v,
+    double[:, ::1] right_origins_v,
+    double[:, ::1] exps_v,
+    double[:, ::1] weights_v,
+    int64_t[::1] nprim_v,
+    int64_t[:, ::1] aux_shells_v,
+    double[:, :, ::1] aux_origins_many_v,
+    double[:, ::1] aux_exps_v,
+    double[:, ::1] aux_weights_v,
+    int64_t[::1] aux_nprim_v,
+    uint8_t[:, ::1] pair_mask_v,
+    uint8_t[:, :, ::1] aux_pair_mask_v,
+    double[:, ::1] phase_real_v,
+    double[:, ::1] phase_imag_v,
+    double[:, ::1] mirror_phase_real_v,
+    double[:, ::1] mirror_phase_imag_v,
+    uint8_t[::1] mirror_flags_v,
+    double[:, :, :, ::1] out_real_v,
+    double[:, :, :, ::1] out_imag_v,
+    int p0,
+    int p1,
+    int q0,
+    int q1,
+    int a0,
+    int a1,
+    double* pq_a,
+    double* pq_b,
+    double* pq_p,
+    double* pq_px,
+    double* pq_py,
+    double* pq_pz,
+    int npq,
+    double eta,
+    double primitive_exp_cutoff,
+    int64_t* primitive_candidates,
+    int64_t* primitive_skips,
+    double* vrr_table,
+    double* lr_vrr_table,
+    size_t vrr_table_cap,
+    int* active_tasks,
+    int64_t* shell_task_skips,
+) noexcept nogil:
+    cdef int np_ = p1 - p0
+    cdef int nq_ = q1 - q0
+    cdef int na_ = a1 - a0
+    cdef int ntask = aux_origins_many_v.shape[0]
+    cdef int nbloch = phase_real_v.shape[1]
+    cdef int lA, lB, lC, max_a_l, max_c_l, max_m_l
+    cdef int ia, ib, ic, idx_pq, ip, iq, iap, task, active_idx, nactive, b
+    cdef int ao_p, ao_q, aux_i
+    cdef int ax[OS_VRR_MAX_CART]
+    cdef int ay[OS_VRR_MAX_CART]
+    cdef int az[OS_VRR_MAX_CART]
+    cdef int bx[OS_VRR_MAX_CART]
+    cdef int by[OS_VRR_MAX_CART]
+    cdef int bz[OS_VRR_MAX_CART]
+    cdef int cx[OS_VRR_MAX_CART]
+    cdef int cy[OS_VRR_MAX_CART]
+    cdef int cz[OS_VRR_MAX_CART]
+    cdef size_t vrr_table_size
+    cdef double abx, aby, abz, ab2
+    cdef double zeta, theta, theta_lr, eta2, lr_scale
+    cdef double dx, dy, dz, pc2, base_pref, decay_exponent, pair_decay
+    cdef double min_pair_decay, min_decay_exponent, lower_bound
+    cdef double pmin[3]
+    cdef double pmax[3]
+    cdef double cexp, prefac, full_value, lr_value, value
+    cdef double PA[3]
+    cdef double QC[3]
+    cdef double PQ[3]
+    cdef double AB[3]
+    cdef double CD[3]
+    cdef bint use_lr = eta > 0.0
+
+    lA = <int>shells_v[p0, 0] + <int>shells_v[p0, 1] + <int>shells_v[p0, 2]
+    lB = <int>shells_v[q0, 0] + <int>shells_v[q0, 1] + <int>shells_v[q0, 2]
+    lC = <int>aux_shells_v[a0, 0] + <int>aux_shells_v[a0, 1] + <int>aux_shells_v[a0, 2]
+    max_a_l = lA + lB
+    max_c_l = lC
+    max_m_l = max_a_l + max_c_l
+    if max_a_l > OS_VRR_PAIR_MAX_L or max_c_l > OS_VRR_PAIR_MAX_L:
+        return 0
+    if np_ != ncart_for_l(lA) or nq_ != ncart_for_l(lB) or na_ != ncart_for_l(lC):
+        return 0
+
+    vrr_table_size = (
+        <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1) * <size_t>(max_a_l + 1)
+        * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1) * <size_t>(max_c_l + 1)
+        * <size_t>(max_m_l + 1)
+    )
+    if vrr_table == NULL or vrr_table_size > vrr_table_cap:
+        return 0
+    if use_lr and lr_vrr_table == NULL:
+        return 0
+
+    fill_cartesian_components(lA, ax, ay, az)
+    fill_cartesian_components(lB, bx, by, bz)
+    fill_cartesian_components(lC, cx, cy, cz)
+
+    abx = left_origins_v[p0, 0] - right_origins_v[q0, 0]
+    aby = left_origins_v[p0, 1] - right_origins_v[q0, 1]
+    abz = left_origins_v[p0, 2] - right_origins_v[q0, 2]
+    ab2 = abx * abx + aby * aby + abz * abz
+    AB[0] = abx; AB[1] = aby; AB[2] = abz
+    CD[0] = 0.0; CD[1] = 0.0; CD[2] = 0.0
+    QC[0] = 0.0; QC[1] = 0.0; QC[2] = 0.0
+    eta2 = eta * eta
+
+    # PySCF/libpbc-style shell screening: bound the primitive product centers
+    # by a box and skip image tasks that cannot pass the exact primitive test.
+    nactive = ntask
+    if primitive_exp_cutoff > 0.0:
+        min_pair_decay = 1e300
+        min_decay_exponent = 1e300
+        pmin[0] = 1e300; pmin[1] = 1e300; pmin[2] = 1e300
+        pmax[0] = -1e300; pmax[1] = -1e300; pmax[2] = -1e300
+        for idx_pq in range(npq):
+            pair_decay = (
+                pq_a[idx_pq] * pq_b[idx_pq] / pq_p[idx_pq]
+            ) * ab2
+            if pair_decay < min_pair_decay:
+                min_pair_decay = pair_decay
+            if pq_px[idx_pq] < pmin[0]:
+                pmin[0] = pq_px[idx_pq]
+            if pq_py[idx_pq] < pmin[1]:
+                pmin[1] = pq_py[idx_pq]
+            if pq_pz[idx_pq] < pmin[2]:
+                pmin[2] = pq_pz[idx_pq]
+            if pq_px[idx_pq] > pmax[0]:
+                pmax[0] = pq_px[idx_pq]
+            if pq_py[idx_pq] > pmax[1]:
+                pmax[1] = pq_py[idx_pq]
+            if pq_pz[idx_pq] > pmax[2]:
+                pmax[2] = pq_pz[idx_pq]
+            for iap in range(aux_nprim_v[a0]):
+                cexp = aux_exps_v[a0, iap]
+                theta = pq_p[idx_pq] * cexp / (pq_p[idx_pq] + cexp)
+                if use_lr:
+                    decay_exponent = theta * eta2 / (theta + eta2)
+                else:
+                    decay_exponent = theta
+                if decay_exponent < min_decay_exponent:
+                    min_decay_exponent = decay_exponent
+
+        nactive = 0
+        for task in range(ntask):
+            pc2 = 0.0
+            if aux_origins_many_v[task, a0, 0] < pmin[0]:
+                dx = pmin[0] - aux_origins_many_v[task, a0, 0]
+                pc2 += dx * dx
+            elif aux_origins_many_v[task, a0, 0] > pmax[0]:
+                dx = aux_origins_many_v[task, a0, 0] - pmax[0]
+                pc2 += dx * dx
+            if aux_origins_many_v[task, a0, 1] < pmin[1]:
+                dy = pmin[1] - aux_origins_many_v[task, a0, 1]
+                pc2 += dy * dy
+            elif aux_origins_many_v[task, a0, 1] > pmax[1]:
+                dy = aux_origins_many_v[task, a0, 1] - pmax[1]
+                pc2 += dy * dy
+            if aux_origins_many_v[task, a0, 2] < pmin[2]:
+                dz = pmin[2] - aux_origins_many_v[task, a0, 2]
+                pc2 += dz * dz
+            elif aux_origins_many_v[task, a0, 2] > pmax[2]:
+                dz = aux_origins_many_v[task, a0, 2] - pmax[2]
+                pc2 += dz * dz
+            lower_bound = min_pair_decay + min_decay_exponent * pc2
+            if lower_bound <= (
+                primitive_exp_cutoff
+                + 1e-12 * (1.0 + primitive_exp_cutoff)
+            ):
+                active_tasks[nactive] = task
+                nactive += 1
+            else:
+                primitive_candidates[0] += npq * aux_nprim_v[a0]
+                primitive_skips[0] += npq * aux_nprim_v[a0]
+                shell_task_skips[0] += 1
+    else:
+        for task in range(ntask):
+            active_tasks[task] = task
+
+    # Primitive and shell metadata are invariant across all image tasks in a
+    # relative-translation group. Keep them outside the task loop and write
+    # each contribution directly into its Bloch-summed destination.
+    for idx_pq in range(npq):
+        ip = idx_pq // <int>nprim_v[q0]
+        iq = idx_pq - ip * <int>nprim_v[q0]
+        PA[0] = pq_px[idx_pq] - left_origins_v[p0, 0]
+        PA[1] = pq_py[idx_pq] - left_origins_v[p0, 1]
+        PA[2] = pq_pz[idx_pq] - left_origins_v[p0, 2]
+        pair_decay = (
+            pq_a[idx_pq] * pq_b[idx_pq] / pq_p[idx_pq]
+        ) * ab2
+        for iap in range(aux_nprim_v[a0]):
+            cexp = aux_exps_v[a0, iap]
+            zeta = pq_p[idx_pq] + cexp
+            theta = pq_p[idx_pq] * cexp / zeta
+            base_pref = (
+                ERI_PREFAC
+                * exp(-pair_decay)
+                / (pq_p[idx_pq] * cexp * sqrt(zeta))
+            )
+            if use_lr:
+                theta_lr = theta * eta2 / (theta + eta2)
+                lr_scale = eta / sqrt(theta + eta2)
+                decay_exponent = theta_lr
+            else:
+                theta_lr = 0.0
+                lr_scale = 0.0
+                decay_exponent = theta
+
+            for active_idx in range(nactive):
+                task = active_tasks[active_idx]
+                dx = pq_px[idx_pq] - aux_origins_many_v[task, a0, 0]
+                dy = pq_py[idx_pq] - aux_origins_many_v[task, a0, 1]
+                dz = pq_pz[idx_pq] - aux_origins_many_v[task, a0, 2]
+                pc2 = dx * dx + dy * dy + dz * dz
+                primitive_candidates[0] += 1
+                if (
+                    primitive_exp_cutoff > 0.0
+                    and pair_decay + decay_exponent * pc2
+                    > primitive_exp_cutoff
+                ):
+                    primitive_skips[0] += 1
+                    continue
+                PQ[0] = dx; PQ[1] = dy; PQ[2] = dz
+                os_fill_vrr_table_kernel(
+                    vrr_table,
+                    max_a_l,
+                    max_c_l,
+                    max_m_l,
+                    pq_p[idx_pq],
+                    cexp,
+                    theta,
+                    theta * pc2,
+                    base_pref,
+                    PA,
+                    QC,
+                    PQ,
+                )
+                if use_lr:
+                    os_fill_vrr_table_kernel(
+                        lr_vrr_table,
+                        max_a_l,
+                        max_c_l,
+                        max_m_l,
+                        pq_p[idx_pq],
+                        cexp,
+                        theta_lr,
+                        theta_lr * pc2,
+                        base_pref,
+                        PA,
+                        QC,
+                        PQ,
+                    )
+                    os_subtract_valid_vrr_states(
+                        vrr_table,
+                        lr_vrr_table,
+                        max_a_l,
+                        max_c_l,
+                        max_m_l,
+                        lr_scale,
+                    )
+                for ia in range(np_):
+                    ao_p = p0 + ia
+                    for ib in range(nq_):
+                        ao_q = q0 + ib
+                        if pair_mask_v[ao_p, ao_q] == 0:
+                            continue
+                        for ic in range(na_):
+                            aux_i = a0 + ic
+                            if aux_pair_mask_v[aux_i, ao_p, ao_q] == 0:
+                                continue
+                            prefac = (
+                                weights_v[ao_p, ip]
+                                * weights_v[ao_q, iq]
+                                * aux_weights_v[aux_i, iap]
+                            )
+                            full_value = os_vrr_hrr_eval_expanded(
+                                vrr_table,
+                                ax[ia], ay[ia], az[ia],
+                                bx[ib], by[ib], bz[ib],
+                                cx[ic], cy[ic], cz[ic],
+                                0, 0, 0,
+                                0,
+                                max_a_l,
+                                max_c_l,
+                                max_m_l,
+                                AB,
+                                CD,
+                            )
+                            value = prefac * full_value
+                            if value == 0.0:
+                                continue
+                            if mirror_flags_v[task] != 0:
+                                for b in range(nbloch):
+                                    out_real_v[aux_i, ao_p, ao_q, b] += (
+                                        phase_real_v[task, b] * value
+                                    )
+                                    out_imag_v[aux_i, ao_p, ao_q, b] += (
+                                        phase_imag_v[task, b] * value
+                                    )
+                                    out_real_v[aux_i, ao_q, ao_p, b] += (
+                                        mirror_phase_real_v[task, b] * value
+                                    )
+                                    out_imag_v[aux_i, ao_q, ao_p, b] += (
+                                        mirror_phase_imag_v[task, b] * value
+                                    )
+                            else:
+                                for b in range(nbloch):
+                                    out_real_v[aux_i, ao_p, ao_q, b] += (
+                                        phase_real_v[task, b] * value
+                                    )
+                                    out_imag_v[aux_i, ao_p, ao_q, b] += (
+                                        phase_imag_v[task, b] * value
+                                    )
+    return 1
+
+
+cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=2] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[int64_t, ndim=2] aux_shells,
+    cnp.ndarray[double, ndim=3] aux_origins_many,
+    cnp.ndarray[double, ndim=2] aux_exps,
+    cnp.ndarray[double, ndim=2] aux_weights,
+    cnp.ndarray[int64_t, ndim=1] aux_nprim,
+    cnp.ndarray[int64_t, ndim=1] shell_starts,
+    cnp.ndarray[int64_t, ndim=1] shell_stops,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_starts,
+    cnp.ndarray[int64_t, ndim=1] aux_shell_stops,
+    cnp.ndarray[uint8_t, ndim=2] pair_mask,
+    cnp.ndarray[uint8_t, ndim=3] aux_pair_mask,
+    cnp.ndarray[double, ndim=2] phase_real,
+    cnp.ndarray[double, ndim=2] phase_imag,
+    cnp.ndarray[double, ndim=2] mirror_phase_real,
+    cnp.ndarray[double, ndim=2] mirror_phase_imag,
+    cnp.ndarray[uint8_t, ndim=1] mirror_flags,
+    double eta,
+    double primitive_exp_cutoff=0.0,
+):
+    """Build one relative-translation group and accumulate its Bloch sums."""
+
+    cdef int nao = shells.shape[0]
+    cdef int naux = aux_shells.shape[0]
+    cdef int ntask = aux_origins_many.shape[0]
+    cdef int nbloch = phase_real.shape[1]
+    cdef int nshell = shell_starts.shape[0]
+    cdef int naux_shell = aux_shell_starts.shape[0]
+    cdef int max_prim = exps.shape[1]
+    cdef int pair_cap = max_prim * max_prim
+    cdef int ish, jsh, ash, p0, p1, q0, q1, a0, a1
+    cdef int p, q, a, b, task, direct_done
+    cdef int* shell_pair_n
+    cdef double* shell_pair_a
+    cdef double* shell_pair_b
+    cdef double* shell_pair_p
+    cdef double* shell_pair_px
+    cdef double* shell_pair_py
+    cdef double* shell_pair_pz
+    cdef double* direct_vrr_table
+    cdef double* direct_lr_vrr_table
+    cdef int* active_tasks
+    cdef size_t pair_storage_size
+    cdef size_t pq_offset
+    cdef int pq_pair_idx
+    cdef int npq
+    cdef int64_t primitive_candidates = 0
+    cdef int64_t primitive_skips = 0
+    cdef int64_t shell_task_skips = 0
+    cdef double value
+    cdef size_t direct_vrr_table_cap = (
+        <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
+        * <size_t>(2 * OS_VRR_PAIR_MAX_L + 1)
+    )
+    cdef cnp.ndarray[double, ndim=4] out_real
+    cdef cnp.ndarray[double, ndim=4] out_imag
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[:, ::1] aux_shells_v = aux_shells
+    cdef double[:, :, ::1] aux_origins_many_v = aux_origins_many
+    cdef double[:, ::1] aux_exps_v = aux_exps
+    cdef double[:, ::1] aux_weights_v = aux_weights
+    cdef int64_t[::1] aux_nprim_v = aux_nprim
+    cdef int64_t[::1] shell_starts_v = shell_starts
+    cdef int64_t[::1] shell_stops_v = shell_stops
+    cdef int64_t[::1] aux_shell_starts_v = aux_shell_starts
+    cdef int64_t[::1] aux_shell_stops_v = aux_shell_stops
+    cdef uint8_t[:, ::1] pair_mask_v = pair_mask
+    cdef uint8_t[:, :, ::1] aux_pair_mask_v = aux_pair_mask
+    cdef double[:, ::1] phase_real_v = phase_real
+    cdef double[:, ::1] phase_imag_v = phase_imag
+    cdef double[:, ::1] mirror_phase_real_v = mirror_phase_real
+    cdef double[:, ::1] mirror_phase_imag_v = mirror_phase_imag
+    cdef uint8_t[::1] mirror_flags_v = mirror_flags
+    cdef double[:, :, :, ::1] out_real_v
+    cdef double[:, :, :, ::1] out_imag_v
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if primitive_exp_cutoff < 0.0:
+        raise ValueError("primitive_exp_cutoff must be non-negative.")
+    if left_origins.shape[0] != nao or right_origins.shape[0] != nao:
+        raise ValueError("left_origins and right_origins must have one row per AO function.")
+    if aux_origins_many.shape[1] != naux or aux_origins_many.shape[2] != 3:
+        raise ValueError("aux_origins_many must have shape (ntask, naux, 3).")
+    if pair_mask.shape[0] != nao or pair_mask.shape[1] != nao:
+        raise ValueError("pair_mask must have shape (nao, nao).")
+    if aux_pair_mask.shape[0] != naux or aux_pair_mask.shape[1] != nao or aux_pair_mask.shape[2] != nao:
+        raise ValueError("aux_pair_mask must have shape (naux, nao, nao).")
+    if phase_real.shape[0] != ntask or phase_imag.shape[0] != ntask or phase_imag.shape[1] != nbloch:
+        raise ValueError("phase arrays must have shape (ntask, nbloch).")
+    if mirror_phase_real.shape[0] != ntask or mirror_phase_real.shape[1] != nbloch:
+        raise ValueError("mirror phase arrays must have shape (ntask, nbloch).")
+    if mirror_phase_imag.shape[0] != ntask or mirror_phase_imag.shape[1] != nbloch:
+        raise ValueError("mirror phase arrays must have shape (ntask, nbloch).")
+    if mirror_flags.shape[0] != ntask:
+        raise ValueError("mirror_flags must have shape (ntask,).")
+
+    pair_storage_size = <size_t>nshell * <size_t>nshell * <size_t>pair_cap
+    shell_pair_n = <int*>malloc(nshell * nshell * sizeof(int))
+    shell_pair_a = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_b = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_p = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_px = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_py = <double*>malloc(pair_storage_size * sizeof(double))
+    shell_pair_pz = <double*>malloc(pair_storage_size * sizeof(double))
+    direct_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    direct_lr_vrr_table = <double*>malloc(direct_vrr_table_cap * sizeof(double))
+    active_tasks = <int*>malloc(ntask * sizeof(int))
+    if (
+        shell_pair_n == NULL or shell_pair_a == NULL or shell_pair_b == NULL
+        or shell_pair_p == NULL or shell_pair_px == NULL or shell_pair_py == NULL
+        or shell_pair_pz == NULL or direct_vrr_table == NULL
+        or direct_lr_vrr_table == NULL or active_tasks == NULL
+    ):
+        free(shell_pair_n)
+        free(shell_pair_a); free(shell_pair_b); free(shell_pair_p)
+        free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+        free(direct_vrr_table); free(direct_lr_vrr_table)
+        free(active_tasks)
+        raise MemoryError("Could not allocate grouped short-range scratch arrays.")
+
+    out_real = np.zeros((naux, nao, nao, nbloch), dtype=np.float64)
+    out_imag = np.zeros((naux, nao, nao, nbloch), dtype=np.float64)
+    out_real_v = out_real
+    out_imag_v = out_imag
+
+    with nogil:
+        for ish in range(nshell):
+            p0 = <int>shell_starts_v[ish]
+            p1 = <int>shell_stops_v[ish]
+            for jsh in range(nshell):
+                q0 = <int>shell_starts_v[jsh]
+                q1 = <int>shell_stops_v[jsh]
+                pq_pair_idx = ish * nshell + jsh
+                pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                if shell_pair_mask_has_work(pair_mask_v, p0, p1, q0, q1):
+                    shell_pair_n[pq_pair_idx] = precompute_primitive_pair_geom_asymmetric(
+                        p0,
+                        q0,
+                        left_origins_v,
+                        right_origins_v,
+                        exps_v,
+                        nprim_v,
+                        shell_pair_a + pq_offset,
+                        shell_pair_b + pq_offset,
+                        shell_pair_p + pq_offset,
+                        shell_pair_px + pq_offset,
+                        shell_pair_py + pq_offset,
+                        shell_pair_pz + pq_offset,
+                    )
+                else:
+                    shell_pair_n[pq_pair_idx] = 0
+
+        for ash in range(naux_shell):
+            a0 = <int>aux_shell_starts_v[ash]
+            a1 = <int>aux_shell_stops_v[ash]
+            for ish in range(nshell):
+                p0 = <int>shell_starts_v[ish]
+                p1 = <int>shell_stops_v[ish]
+                for jsh in range(nshell):
+                    q0 = <int>shell_starts_v[jsh]
+                    q1 = <int>shell_stops_v[jsh]
+                    pq_pair_idx = ish * nshell + jsh
+                    pq_offset = <size_t>pq_pair_idx * <size_t>pair_cap
+                    npq = shell_pair_n[pq_pair_idx]
+                    if npq <= 0:
+                        continue
+                    if not shell_triplet_mask_has_work(
+                        pair_mask_v,
+                        aux_pair_mask_v,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        a0,
+                        a1,
+                    ):
+                        continue
+                    direct_done = accumulate_shell_triplet_short_range_vrr_hrr_bloch(
+                        shells_v,
+                        left_origins_v,
+                        right_origins_v,
+                        exps_v,
+                        weights_v,
+                        nprim_v,
+                        aux_shells_v,
+                        aux_origins_many_v,
+                        aux_exps_v,
+                        aux_weights_v,
+                        aux_nprim_v,
+                        pair_mask_v,
+                        aux_pair_mask_v,
+                        phase_real_v,
+                        phase_imag_v,
+                        mirror_phase_real_v,
+                        mirror_phase_imag_v,
+                        mirror_flags_v,
+                        out_real_v,
+                        out_imag_v,
+                        p0,
+                        p1,
+                        q0,
+                        q1,
+                        a0,
+                        a1,
+                        shell_pair_a + pq_offset,
+                        shell_pair_b + pq_offset,
+                        shell_pair_p + pq_offset,
+                        shell_pair_px + pq_offset,
+                        shell_pair_py + pq_offset,
+                        shell_pair_pz + pq_offset,
+                        npq,
+                        eta,
+                        primitive_exp_cutoff,
+                        &primitive_candidates,
+                        &primitive_skips,
+                        direct_vrr_table,
+                        direct_lr_vrr_table,
+                        direct_vrr_table_cap,
+                        active_tasks,
+                        &shell_task_skips,
+                    )
+                    if direct_done == 0:
+                        for task in range(ntask):
+                            for a in range(a0, a1):
+                                for p in range(p0, p1):
+                                    for q in range(q0, q1):
+                                        if pair_mask_v[p, q] == 0 or aux_pair_mask_v[a, p, q] == 0:
+                                            continue
+                                        value = contracted_short_range_three_center_indices(
+                                            p,
+                                            q,
+                                            a,
+                                            shells_v,
+                                            left_origins_v,
+                                            right_origins_v,
+                                            exps_v,
+                                            weights_v,
+                                            nprim_v,
+                                            aux_shells_v,
+                                            aux_origins_many_v[task],
+                                            aux_exps_v,
+                                            aux_weights_v,
+                                            aux_nprim_v,
+                                            eta,
+                                        )
+                                        if value == 0.0:
+                                            continue
+                                        if mirror_flags_v[task] != 0:
+                                            for b in range(nbloch):
+                                                out_real_v[a, p, q, b] += phase_real_v[task, b] * value
+                                                out_imag_v[a, p, q, b] += phase_imag_v[task, b] * value
+                                                out_real_v[a, q, p, b] += mirror_phase_real_v[task, b] * value
+                                                out_imag_v[a, q, p, b] += mirror_phase_imag_v[task, b] * value
+                                        else:
+                                            for b in range(nbloch):
+                                                out_real_v[a, p, q, b] += phase_real_v[task, b] * value
+                                                out_imag_v[a, p, q, b] += phase_imag_v[task, b] * value
+
+    free(shell_pair_n)
+    free(shell_pair_a); free(shell_pair_b); free(shell_pair_p)
+    free(shell_pair_px); free(shell_pair_py); free(shell_pair_pz)
+    free(direct_vrr_table); free(direct_lr_vrr_table)
+    free(active_tasks)
+    return (
+        out_real,
+        out_imag,
+        primitive_candidates,
+        primitive_skips,
+        shell_task_skips,
+    )
 
 
 cpdef compute_ri_tensors(
@@ -5249,6 +6530,248 @@ cpdef compute_one_electron(
     return overlap, kinetic, vnuc
 
 
+cpdef compute_periodic_one_electron(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=3] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[double, ndim=2] atcoords,
+    cnp.ndarray[double, ndim=1] atnums,
+    double eta,
+    image_pair_mask=None,
+    double nuclear_screen_tol=0.0,
+    lattice=None,
+    nuclear_image_keys=None,
+    right_shells=None,
+    right_exps=None,
+    right_weights=None,
+    right_nprim=None,
+):
+    cdef int nimages = right_origins.shape[0]
+    cdef int nleft = shells.shape[0]
+    cdef int nright
+    cdef cnp.ndarray[int64_t, ndim=2] right_shells_arr
+    cdef cnp.ndarray[double, ndim=2] right_exps_arr
+    cdef cnp.ndarray[double, ndim=2] right_weights_arr
+    cdef cnp.ndarray[int64_t, ndim=1] right_nprim_arr
+    cdef cnp.ndarray[double, ndim=3] overlap
+    cdef cnp.ndarray[double, ndim=3] kinetic
+    cdef cnp.ndarray[double, ndim=3] vnuc
+    cdef int image, p, q
+    cdef double s, t, v
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef int64_t[:, ::1] right_shells_v
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, :, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] right_exps_v
+    cdef double[:, ::1] weights_v = weights
+    cdef double[:, ::1] right_weights_v
+    cdef int64_t[::1] nprim_v = nprim
+    cdef int64_t[::1] right_nprim_v
+    cdef double[:, ::1] atcoords_v = atcoords
+    cdef double[::1] atnums_v = atnums
+    cdef double[:, :, ::1] overlap_v
+    cdef double[:, :, ::1] kinetic_v
+    cdef double[:, :, ::1] vnuc_v
+    cdef cnp.ndarray[uint8_t, ndim=3] image_pair_mask_arr
+    cdef cnp.ndarray[double, ndim=2] lattice_arr
+    cdef cnp.ndarray[double, ndim=2] inverse_lattice_arr
+    cdef cnp.ndarray[int64_t, ndim=2] nuclear_image_keys_arr
+    cdef uint8_t[:, :, ::1] image_pair_mask_v
+    cdef double[:, ::1] lattice_v
+    cdef double[:, ::1] inverse_lattice_v
+    cdef int64_t[:, ::1] nuclear_image_keys_v
+    cdef bint has_image_pair_mask = image_pair_mask is not None
+    cdef bint use_lattice_images = lattice is not None or nuclear_image_keys is not None
+    cdef bint has_right_basis = (
+        right_shells is not None
+        or right_exps is not None
+        or right_weights is not None
+        or right_nprim is not None
+    )
+
+    if eta < 0.0:
+        raise ValueError("eta must be non-negative.")
+    if has_right_basis:
+        if (
+            right_shells is None
+            or right_exps is None
+            or right_weights is None
+            or right_nprim is None
+        ):
+            raise ValueError("All right-basis arrays must be provided together.")
+        right_shells_arr = np.ascontiguousarray(right_shells, dtype=np.int64)
+        right_exps_arr = np.ascontiguousarray(right_exps, dtype=np.float64)
+        right_weights_arr = np.ascontiguousarray(right_weights, dtype=np.float64)
+        right_nprim_arr = np.ascontiguousarray(right_nprim, dtype=np.int64)
+    else:
+        right_shells_arr = np.ascontiguousarray(shells, dtype=np.int64)
+        right_exps_arr = np.ascontiguousarray(exps, dtype=np.float64)
+        right_weights_arr = np.ascontiguousarray(weights, dtype=np.float64)
+        right_nprim_arr = np.ascontiguousarray(nprim, dtype=np.int64)
+    nright = right_shells_arr.shape[0]
+    if left_origins.shape[0] != nleft or right_origins.shape[1] != nright:
+        raise ValueError("Periodic origin arrays do not match the AO basis.")
+    if (
+        right_exps_arr.shape[0] != nright
+        or right_weights_arr.shape[0] != nright
+        or right_nprim_arr.shape[0] != nright
+    ):
+        raise ValueError("Right-basis arrays have inconsistent lengths.")
+    if atcoords.shape[0] != atnums.shape[0]:
+        raise ValueError("atcoords and atnums have inconsistent lengths.")
+    if nuclear_screen_tol < 0.0:
+        raise ValueError("nuclear_screen_tol must be non-negative.")
+    overlap = np.zeros((nimages, nleft, nright), dtype=np.float64)
+    kinetic = np.zeros((nimages, nleft, nright), dtype=np.float64)
+    vnuc = np.zeros((nimages, nleft, nright), dtype=np.float64)
+    right_shells_v = right_shells_arr
+    right_exps_v = right_exps_arr
+    right_weights_v = right_weights_arr
+    right_nprim_v = right_nprim_arr
+    overlap_v = overlap
+    kinetic_v = kinetic
+    vnuc_v = vnuc
+    if has_image_pair_mask:
+        image_pair_mask_arr = np.ascontiguousarray(image_pair_mask, dtype=np.uint8)
+        if (
+            image_pair_mask_arr.shape[0] != nimages
+            or image_pair_mask_arr.shape[1] != nleft
+            or image_pair_mask_arr.shape[2] != nright
+        ):
+            raise ValueError("image_pair_mask has an inconsistent shape.")
+        image_pair_mask_v = image_pair_mask_arr
+    if use_lattice_images:
+        if lattice is None or nuclear_image_keys is None:
+            raise ValueError(
+                "lattice and nuclear_image_keys must be provided together."
+            )
+        lattice_arr = np.ascontiguousarray(lattice, dtype=np.float64)
+        nuclear_image_keys_arr = np.ascontiguousarray(
+            nuclear_image_keys, dtype=np.int64
+        )
+        if lattice_arr.shape[0] != 3 or lattice_arr.shape[1] != 3:
+            raise ValueError("lattice must have shape (3, 3).")
+        if (
+            nuclear_image_keys_arr.shape[1] != 3
+            or nuclear_image_keys_arr.shape[0] == 0
+        ):
+            raise ValueError("nuclear_image_keys must have shape (nimage, 3).")
+        inverse_lattice_arr = np.ascontiguousarray(
+            np.linalg.inv(lattice_arr), dtype=np.float64
+        )
+    else:
+        lattice_arr = np.zeros((3, 3), dtype=np.float64)
+        inverse_lattice_arr = np.zeros((3, 3), dtype=np.float64)
+        nuclear_image_keys_arr = np.zeros((1, 3), dtype=np.int64)
+    lattice_v = lattice_arr
+    inverse_lattice_v = inverse_lattice_arr
+    nuclear_image_keys_v = nuclear_image_keys_arr
+
+    with nogil:
+        for image in range(nimages):
+            for p in range(nleft):
+                for q in range(nright):
+                    if has_image_pair_mask and image_pair_mask_v[image, p, q] == 0:
+                        continue
+                    contracted_periodic_one_electron_indices(
+                        p,
+                        q,
+                        shells_v,
+                        right_shells_v,
+                        left_origins_v,
+                        right_origins_v[image],
+                        exps_v,
+                        right_exps_v,
+                        weights_v,
+                        right_weights_v,
+                        nprim_v,
+                        right_nprim_v,
+                        atcoords_v,
+                        atnums_v,
+                        lattice_v,
+                        inverse_lattice_v,
+                        nuclear_image_keys_v,
+                        use_lattice_images,
+                        eta,
+                        nuclear_screen_tol,
+                        &s,
+                        &t,
+                        &v,
+                    )
+                    overlap_v[image, p, q] = s
+                    kinetic_v[image, p, q] = t
+                    vnuc_v[image, p, q] = v
+
+    return overlap, kinetic, vnuc
+
+
+cpdef compute_periodic_gth_local_gaussian(
+    cnp.ndarray[int64_t, ndim=2] shells,
+    cnp.ndarray[double, ndim=2] left_origins,
+    cnp.ndarray[double, ndim=3] right_origins,
+    cnp.ndarray[double, ndim=2] exps,
+    cnp.ndarray[double, ndim=2] weights,
+    cnp.ndarray[int64_t, ndim=1] nprim,
+    cnp.ndarray[double, ndim=2] pseudo_coords,
+    cnp.ndarray[double, ndim=1] pseudo_radii,
+    cnp.ndarray[double, ndim=2] local_coefficients,
+    cnp.ndarray[int64_t, ndim=1] nlocal,
+):
+    cdef int nimages = right_origins.shape[0]
+    cdef int nao = shells.shape[0]
+    cdef int npseudo = pseudo_coords.shape[0]
+    cdef cnp.ndarray[double, ndim=3] values = np.zeros(
+        (nimages, nao, nao), dtype=np.float64
+    )
+    cdef int image, p, q, atom, ip, iq
+    cdef double value, primitive_weight
+    cdef int64_t[:, ::1] shells_v = shells
+    cdef double[:, ::1] left_origins_v = left_origins
+    cdef double[:, :, ::1] right_origins_v = right_origins
+    cdef double[:, ::1] exps_v = exps
+    cdef double[:, ::1] weights_v = weights
+    cdef int64_t[::1] nprim_v = nprim
+    cdef double[:, ::1] pseudo_coords_v = pseudo_coords
+    cdef double[::1] pseudo_radii_v = pseudo_radii
+    cdef double[:, ::1] local_coefficients_v = local_coefficients
+    cdef int64_t[::1] nlocal_v = nlocal
+    cdef double[:, :, ::1] values_v = values
+
+    if left_origins.shape[0] != nao or right_origins.shape[1] != nao:
+        raise ValueError("Periodic origin arrays do not match the AO basis.")
+    if pseudo_radii.shape[0] != npseudo or local_coefficients.shape[0] != npseudo or nlocal.shape[0] != npseudo:
+        raise ValueError("Inconsistent GTH local-potential arrays.")
+    if local_coefficients.shape[1] < 4:
+        raise ValueError("local_coefficients must have at least four columns.")
+
+    with nogil:
+        for image in range(nimages):
+            for p in range(nao):
+                for q in range(nao):
+                    value = 0.0
+                    for atom in range(npseudo):
+                        for ip in range(nprim_v[p]):
+                            for iq in range(nprim_v[q]):
+                                primitive_weight = weights_v[p, ip] * weights_v[q, iq]
+                                value += primitive_weight * primitive_gth_local_gaussian(
+                                    exps_v[p, ip],
+                                    <int>shells_v[p, 0], <int>shells_v[p, 1], <int>shells_v[p, 2],
+                                    left_origins_v[p, 0], left_origins_v[p, 1], left_origins_v[p, 2],
+                                    exps_v[q, iq],
+                                    <int>shells_v[q, 0], <int>shells_v[q, 1], <int>shells_v[q, 2],
+                                    right_origins_v[image, q, 0], right_origins_v[image, q, 1], right_origins_v[image, q, 2],
+                                    pseudo_coords_v[atom, 0], pseudo_coords_v[atom, 1], pseudo_coords_v[atom, 2],
+                                    pseudo_radii_v[atom], &local_coefficients_v[atom, 0], <int>nlocal_v[atom],
+                                )
+                    values_v[image, p, q] = value
+
+    return values
+
+
 cpdef compute_pivoted_cholesky_factors(
     cnp.ndarray[int64_t, ndim=2] shells,
     cnp.ndarray[double, ndim=2] origins,
@@ -5733,9 +7256,11 @@ cpdef compute_pivoted_cholesky_factors_blocked(
     cdef int nshell = shell_starts.shape[0]
     cdef int npair = nao * (nao + 1) // 2
     cdef int rank_limit = npair if max_rank is None else min(int(max_rank), npair)
+    cdef int rank_capacity = min(rank_limit, 64)
     cdef cnp.ndarray[int64_t, ndim=2] pairs = np.zeros((npair, 2), dtype=np.int64)
     cdef cnp.ndarray[double, ndim=1] diag = np.zeros(npair, dtype=np.float64)
-    cdef cnp.ndarray[double, ndim=2] chol = np.zeros((npair, rank_limit), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] chol = np.zeros((npair, rank_capacity), dtype=np.float64)
+    cdef cnp.ndarray[double, ndim=2] grown_chol
     cdef cnp.ndarray[double, ndim=1] col = np.zeros(npair, dtype=np.float64)
     cdef cnp.ndarray[int64_t, ndim=2] pair_blocks = np.zeros((nshell * (nshell + 1) // 2, 2), dtype=np.int64)
     cdef cnp.ndarray[double, ndim=1] pair_block_max = np.zeros(nshell * (nshell + 1) // 2, dtype=np.float64)
@@ -5785,6 +7310,12 @@ cpdef compute_pivoted_cholesky_factors_blocked(
             block_idx += 1
 
     while rank < rank_limit:
+        if rank == rank_capacity:
+            rank_capacity = min(rank_limit, max(rank_capacity + 1, 2 * rank_capacity))
+            grown_chol = np.zeros((npair, rank_capacity), dtype=np.float64)
+            grown_chol[:, :rank] = chol[:, :rank]
+            chol = grown_chol
+            chol_v = chol
         pivot = 0
         delta = diag_v[0] if npair > 0 else 0.0
         for pair_idx in range(1, npair):

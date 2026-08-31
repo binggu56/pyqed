@@ -90,7 +90,7 @@ def build_cgldr(
         charge=1,
         spin=0,
     )
-    mol.build(driver="gbasis")
+    mol.build()
     mf = mol.RHF().run()
     casci = CASCI(mf, ncas=3, nelecas=2).run(nstates=3)
 

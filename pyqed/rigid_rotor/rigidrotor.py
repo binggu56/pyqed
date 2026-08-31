@@ -1,6 +1,7 @@
 import scipy.linalg as la
 import numpy as np
 
+from pyqed.units import au2wavenumber
 
 
 def build_J_matrices(J):
@@ -87,7 +88,7 @@ class RigidRotor:
         """
         self.masses = np.array(masses)
         self.coords = np.array(coords)
-        self.cm_inv = 219474.63  # 1 Hartree = 219474.63 cm^-1
+        self.cm_inv = au2wavenumber
 
         # Calculate geometric moments of inertia and A, B, C constants
         self.A, self.B, self.C = self._calculate_rotational_constants()

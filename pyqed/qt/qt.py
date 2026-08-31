@@ -17,8 +17,7 @@ from opt_einsum import contract
 
 from pyqed import au2angstrom, au2wavenumber
 
-bohr_angstrom = 0.52917721092
-hartree_wavenumber = 219474.63
+hartree_wavenumber = au2wavenumber
 
 #hartree_wavenumber = scipy.constants.value(u'hartree-inverse meter relationship') / 1e2
 class QT:
@@ -1120,6 +1119,4 @@ plt.show()
 #dE = (Etot-E0) * hartree_wavenumber
 #print('Exact ground-state energy = {} Hartree. \nEnergy deviation = {} cm-1. \n'.format(E0,dE))
 #
-
-
 

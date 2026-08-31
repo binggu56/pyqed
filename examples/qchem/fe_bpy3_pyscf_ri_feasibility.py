@@ -10,6 +10,7 @@ chemical conclusions.
 """
 
 from __future__ import annotations
+from pyqed.units import au2ev
 
 import argparse
 import json
@@ -195,7 +196,7 @@ def print_frontier(mf, n=12):
     print("idx      occ       eps/eV")
     for idx in range(start, stop):
         marker = "H" if idx == homo else ("L" if idx == homo + 1 else " ")
-        print(f"{idx:4d}{marker} {occ[idx]:8.3f} {mo_energy[idx] * 27.211386245988:12.5f}")
+        print(f"{idx:4d}{marker} {occ[idx]:8.3f} {mo_energy[idx] * au2ev:12.5f}")
     return homo
 
 

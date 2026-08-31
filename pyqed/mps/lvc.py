@@ -462,9 +462,9 @@ def strang_evolution(
     )
     yield 0.0, psi
     for step in range(1, nsteps + 1):
-        psi = kinetic.matmul(psi, chi_max=chi_max)
-        psi = potential_u.matmul(psi, chi_max=chi_max)
-        psi = kinetic.matmul(psi, chi_max=chi_max)
+        psi = kinetic.apply(psi, max_bond=chi_max)
+        psi = potential_u.apply(psi, max_bond=chi_max)
+        psi = kinetic.apply(psi, max_bond=chi_max)
         yield step * dt, psi
 
 

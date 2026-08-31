@@ -16,6 +16,7 @@ import scipy
 import numba 
 import sys 
 
+from pyqed.units import au2wavenumber
 
 @numba.autojit
 def derivs(x):
@@ -185,7 +186,7 @@ for k in range(Nt):
 fe.close()
 f.close() 
 
-hartree_wavenumber = scipy.constants.value(u'hartree-inverse meter relationship') / 1e2 
+hartree_wavenumber = au2wavenumber
 
 
 a, x0, De = 1.02, 1.4, 0.176/100 
@@ -193,9 +194,5 @@ print('The well depth = {} cm-1. \n'.format(De * hartree_wavenumber))
 
 omega  = a * np.sqrt(2. * De / am )
 E0 = omega/2. - omega**2/16./De
-dE = (Etot-E0) * hartree_wavenumber 
+dE = (Etot-E0) * hartree_wavenumber
 print('Exact ground-state energy = {} Hartree. \nEnergy deviation = {} cm-1. \n'.format(E0,dE))
-    
-
-
-    

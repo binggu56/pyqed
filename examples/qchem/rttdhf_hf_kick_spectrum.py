@@ -60,7 +60,7 @@ def _gaussian_smooth(y, sigma_bins=3.0):
 atom = "H 0 0 0; F 0 0 1.75"
 
 mol = Molecule(atom=atom, unit="bohr", basis="6311g")
-mol.build(driver="gbasis")
+mol.build()
 mf = RHF(mol).run()
 
 
