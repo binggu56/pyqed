@@ -26809,6 +26809,12 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
     clear_factor_routes();
     reduced_contextual_left_matrices_ = std::move(left_matrices);
     reduced_contextual_right_matrices_ = std::move(right_matrices);
+    if (refreshed_decomposed_plan) {
+        complementary_local_terms_ = plan.execution->local_terms;
+        if (!remapped_decomposed_plan) {
+            complementary_local_actions_ = plan.execution->local_actions;
+        }
+    }
     if (borrows_left_boundary) {
         reduced_contextual_left_revision_source_ =
             &left_boundary.numeric_revision;
@@ -27990,7 +27996,14 @@ bool MovingEnvironment::activate_contextual_factor_route_plan(
         plan.topology_revision == factor_route_topology_revision_ &&
         plan.total_dimension == factor_route_dimension_ &&
         plan.logical_route_count() == factor_route_count_ &&
-        numeric_revision == factor_route_numeric_revision_
+        numeric_revision == factor_route_numeric_revision_ &&
+        (
+            raw_factor_routes_ ||
+            (
+                factor_routes_direct_actions_ &&
+                !complementary_local_actions_.empty()
+            )
+        )
     ) {
         return true;
     }
@@ -31125,9 +31138,14 @@ bool MovingEnvironment::active_bond_complementary_action_ready(
 ) const noexcept {
     if (
         active_bond_ < 0 ||
-        !factor_routes_direct_actions_ ||
-        !reduced_contextual_routes_ ||
-        complementary_local_actions_.empty()
+        (
+            !raw_factor_routes_ &&
+            (
+                !factor_routes_direct_actions_ ||
+                !reduced_contextual_routes_ ||
+                complementary_local_actions_.empty()
+            )
+        )
     ) {
         return false;
     }
@@ -31159,9 +31177,26 @@ MovingEnvironment::active_bond_complementary_davidson(
     bool accept_unconverged
 ) {
     if (!active_bond_complementary_action_ready(key, dimension)) {
-        throw std::logic_error(
-            "The active-bond complementary action is not prepared."
-        );
+        std::ostringstream message;
+        message
+            << "The active-bond complementary action is not prepared"
+            << " (bond=" << active_bond_
+            << ", raw=" << raw_factor_routes_
+            << ", direct=" << factor_routes_direct_actions_
+            << ", reduced=" << reduced_contextual_routes_
+            << ", actions=" << complementary_local_actions_.size()
+            << ", requested_key=" << key
+            << ", factor_key=" << factor_route_key_
+            << ", projection_key=" << projection_key_
+            << ", dimension=" << dimension
+            << ", factor_dimension=" << factor_route_dimension_
+            << ", projection_dimension=" << projection_dimension_
+            << ", projection_parent_dimension="
+            << projection_parent_dimension_
+            << ", active_dimension="
+            << active_bond_complementary_dimension_
+            << ").";
+        throw std::logic_error(message.str());
     }
     const bool projected = key == projection_key_;
     const std::size_t parent_dimension = projected
