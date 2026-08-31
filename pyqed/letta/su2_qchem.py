@@ -355,6 +355,13 @@ class _ChannelResolvedPairSpace:
 def _canonical_graph(nsites, graph):
     if graph is None:
         return ()
+    if isinstance(graph, str):
+        key = graph.lower().replace("-", "_")
+        if key in {"nn", "nearest_neighbor"}:
+            return _nearest_neighbor_graph(nsites)
+        raise ValueError(
+            "SU2LETTA graph strings must be 'nn' or 'nearest_neighbor'."
+        )
     if hasattr(graph, "is_directed") and graph.is_directed():
         raise ValueError("SU2LETTA graph must be undirected.")
     if hasattr(graph, "edges"):
@@ -634,9 +641,10 @@ class NonAbelianFrontierLETTA:
     ):
         """Build the fully reduced qchem MPO and its SU(2)-LETTA state.
 
-        The default LETTA tie graph is the nearest-neighbor orbital chain.
-        Hamiltonian couplings remain complete in the reduced MPO; ``graph``
-        controls only variational tensor ties and may be supplied explicitly.
+        The default LETTA tie graph is the nearest-neighbor orbital chain;
+        ``graph="nn"`` selects it explicitly. Hamiltonian couplings remain
+        complete in the reduced MPO; ``graph`` controls only variational
+        tensor ties and may be supplied explicitly.
         """
         from pyqed.qchem.dmrg.backends.reduced import (
             build_spatial_reduced_hamiltonian_mpo,

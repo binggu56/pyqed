@@ -90,6 +90,21 @@ def test_su2_letta_defaults_to_nearest_neighbor_ties_for_dense_integrals():
     state.close()
 
 
+def test_su2_letta_accepts_nearest_neighbor_graph_alias():
+    state = SU2LETTA.from_integrals(
+        np.diag([-1.0, -0.5, 0.25, 0.75]),
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=1,
+        seed=4,
+    )
+
+    assert state.graph == ((0, 1), (1, 2), (2, 3))
+    assert state.frontier_states == (1, 3, 3, 3, 1)
+    state.close()
+
+
 def _dense_vector_from_reduced_spatial_mps(sites):
     descriptor = SpatialOrbitalSite()
     state_sector = [None] * descriptor.d
