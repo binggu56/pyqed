@@ -582,6 +582,44 @@ def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():
     assert matrix_free_update["solver_info"]["route_backend"] == "block-grouped-gemm"
 
 
+def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
+    norb = 4
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    eri = np.zeros((norb, norb, norb, norb))
+    eri[np.arange(norb), np.arange(norb), np.arange(norb), np.arange(norb)] = 1.0
+    state = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        graph=[(0, 1), (1, 2), (2, 3)],
+        D=2,
+        seed=3,
+    )
+    sites = state.materialize()
+    reference = state._wigner_eckart_matrix_free_problem(1, sites=sites)
+    frontier = state._frontier_wigner_eckart_matrix_free_problem(
+        1, 1, sites=sites
+    )
+    rng = np.random.default_rng(4)
+    vector = rng.normal(size=reference[1].size) + 1j * rng.normal(
+        size=reference[1].size
+    )
+
+    np.testing.assert_array_equal(frontier[1], reference[1])
+    np.testing.assert_allclose(
+        frontier[2](vector), reference[2](vector), atol=2.0e-12
+    )
+    np.testing.assert_allclose(
+        frontier[3](vector), reference[3](vector), atol=2.0e-12
+    )
+    assert frontier[-1]["local_action_backend"] == "frontier_projected_pair"
+    assert frontier[-1]["backend"] == "compiled_contextual_channel_resolved"
+    state.close()
+
+
 def test_native_two_site_su2_letta_reaches_hubbard_dimer_and_reports_truncation():
     hopping = 1.0
     interaction = 4.0

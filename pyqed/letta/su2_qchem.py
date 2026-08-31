@@ -1748,6 +1748,95 @@ class NonAbelianFrontierLETTA:
             diagnostics,
         )
 
+    def _frontier_wigner_eckart_matrix_free_problem(
+        self,
+        site,
+        bond,
+        *,
+        support_rtol=1.0e-13,
+        max_parameters=4096,
+        executor=None,
+        sites=None,
+    ):
+        """Project a reusable reduced bond action onto one-site parameters.
+
+        The one-site tangent map is embedded in the adjacent channel-resolved
+        pair space. Contracting the environments once gives the exact local
+        actions ``E† H_eff E`` and ``E† N_eff E`` without traversing the MPS for
+        every bra parameter in every Davidson iteration.
+        """
+        site = int(site)
+        bond = int(bond)
+        if bond < 0 or bond >= self.nsites - 1 or site not in (bond, bond + 1):
+            raise ValueError("one-site frontier bond must contain the optimized site.")
+        current = self._pack_site(site)
+        if current.size > int(max_parameters):
+            raise MemoryError(
+                f"local SU2LETTA support has {current.size} parameters; "
+                "the matrix-free Wigner--Eckart solver is limited to "
+                f"{int(max_parameters)}."
+            )
+        sites = self.materialize() if sites is None else list(sites)
+        merged = merge_mps_sites(sites[bond], sites[bond + 1])
+        layout = _ChannelResolvedPairSpace(sites[bond], sites[bond + 1])
+        _embedded_current, embedding = self._local_pair_embedding(
+            site, sites, bond, layout
+        )
+        if embedding.shape[1] != current.size:
+            raise RuntimeError("one-site frontier embedding has the wrong size.")
+        h_pair, n_pair, pair_diagnostics = self._reduced_pair_transition_actions(
+            bond, sites, merged, layout
+        )
+
+        n_columns = self._apply_packed_columns(n_pair, embedding, executor=executor)
+        n_diagonal = np.real(np.sum(embedding.conj() * n_columns, axis=0))
+        scale = max(float(np.max(np.abs(n_diagonal), initial=0.0)), 1.0)
+        support = np.flatnonzero(n_diagonal > float(support_rtol) * scale)
+        if support.size == 0:
+            raise np.linalg.LinAlgError("local SU2LETTA parameter support is null.")
+        design = np.asarray(embedding[:, support])
+        h_columns = self._apply_packed_columns(h_pair, design, executor=executor)
+        h_diagonal = np.real(np.sum(design.conj() * h_columns, axis=0))
+        n_diagonal = n_diagonal[support]
+        matvec_counts = {"hamiltonian": 0, "metric": 0}
+
+        def h_action(vector):
+            vector = np.asarray(vector, dtype=complex).reshape(-1)
+            if vector.size != support.size:
+                raise ValueError("frontier Wigner--Eckart vector has the wrong size.")
+            matvec_counts["hamiltonian"] += 1
+            return design.conj().T @ h_pair(design @ vector)
+
+        def n_action(vector):
+            vector = np.asarray(vector, dtype=complex).reshape(-1)
+            if vector.size != support.size:
+                raise ValueError("frontier Wigner--Eckart vector has the wrong size.")
+            matvec_counts["metric"] += 1
+            return design.conj().T @ n_pair(design @ vector)
+
+        routes = self._wigner_eckart_route_plan(site)
+        diagnostics = dict(pair_diagnostics)
+        diagnostics.update(
+            {
+                "route_backend": routes.backend,
+                "route_bytes": int(routes.nbytes),
+                "route_count": int(routes.route_count),
+                "local_action_backend": "frontier_projected_pair",
+                "frontier_dimension": int(layout.size),
+                "embedding_bytes": int(embedding.nbytes),
+                "matvec_counts": matvec_counts,
+            }
+        )
+        return (
+            current,
+            support,
+            h_action,
+            n_action,
+            np.asarray(h_diagonal, dtype=float),
+            np.asarray(n_diagonal, dtype=float),
+            diagnostics,
+        )
+
     def _retract_reduced_pair(
         self,
         bond,
@@ -2748,8 +2837,9 @@ class NonAbelianFrontierLETTA:
                     h_diag,
                     n_diag,
                     solver_info,
-                ) = self._wigner_eckart_matrix_free_problem(
+                ) = self._frontier_wigner_eckart_matrix_free_problem(
                     site,
+                    bond,
                     support_rtol=support_rtol,
                     max_parameters=max_matrix_free_parameters,
                     executor=executor,
