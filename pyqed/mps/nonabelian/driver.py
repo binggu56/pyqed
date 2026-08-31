@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from .mps import MPS
 from .sweep import run_sweeps
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def _as_mps(state):
-    return state.copy() if isinstance(state, MPS) else MPS.from_sites(state)
+    return state.copy() if isinstance(state, MPS) else MPS.from_tensors(state)
 
 
 class SweepDriver:
@@ -94,7 +94,7 @@ class SweepDriver:
 
     @property
     def sites(self):
-        return self.mps.sites
+        return self.mps.tensors
 
     @sites.setter
     def sites(self, value):
@@ -185,7 +185,7 @@ class SweepDriver:
             unknown = ", ".join(sorted(overrides))
             raise TypeError(f"Unknown run() override(s): {unknown}")
 
-        self.mps = result.get("mps", MPS.from_sites(result["sites"]))
+        self.mps = result.get("mps", MPS.from_tensors(result["sites"]))
         self.history = result["history"]
         self.converged = result["converged"]
         self.last_direction = result["last_direction"]

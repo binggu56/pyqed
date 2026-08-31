@@ -33,7 +33,7 @@ from .operators import (
 )
 from pyqed.mps.su2 import SU2Irrep
 from .coupling import left_or_right_fusion
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 _SQRT3 = float(np.sqrt(3.0))
@@ -224,13 +224,13 @@ def _normalize_site_legs(sites_or_legs, *, min_sites=2):
     for item in sites_or_legs:
         if isinstance(item, Leg):
             site_legs.append(item)
-        elif isinstance(item, NonabelianTensor):
+        elif isinstance(item, IrrepTensor):
             site_legs.append(physical_leg_from_spatial_orbital(item))
         elif item.__class__.__name__ == "FullyReducedSpatialOrbitalSite":
             site_legs.append(physical_leg_from_spatial_orbital(item))
         else:
             raise TypeError(
-                "Model builders expect a site count, PhysicalLegs, or rank-3 NonabelianTensor sites."
+                "Model builders expect a site count, PhysicalLegs, or rank-3 IrrepTensor sites."
             )
     if len(site_legs) < min_sites:
         raise ValueError(f"Model builders require at least {min_sites} site(s).")

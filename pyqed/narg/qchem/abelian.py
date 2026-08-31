@@ -50,9 +50,9 @@ except Exception:  # pragma: no cover - optional accelerator
     njit = None
 
 try:
-    from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
+    from pyqed.narg.irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
 except Exception:  # pragma: no cover - optional bridge
-    Irrep = IrrepSite = IrrepTensor = OpIrrep = ProductSymmetry = U1Symmetry = None
+    Irrep = Leg = IrrepTensor = OpIrrep = ProductSymmetry = U1Symmetry = None
 
 try:
     from . import abelian_cython as _abelian_cython
@@ -449,11 +449,11 @@ def qn_array(qns):
 
 
 def irrep_tensor_available():
-    return all(x is not None for x in (Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry))
+    return all(x is not None for x in (Irrep, Leg, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry))
 
 
 def irrep_site_from_qn(basis_qn):
-    """Build an IrrepSite from existing Abelian (Ne, 2Sz) labels."""
+    """Build an Leg from existing Abelian (Ne, 2Sz) labels."""
     if not irrep_tensor_available():
         raise ImportError("irrep_tensor module is not available.")
     basis_qn = qn_array(basis_qn)
@@ -465,7 +465,7 @@ def irrep_site_from_qn(basis_qn):
         idx = np.flatnonzero(np.all(basis_qn == np.asarray(qn), axis=1))
         sector_indices[irrep] = idx
         dims[irrep] = len(idx)
-    return IrrepSite(symmetry, dims), sector_indices
+    return Leg(dims, symmetry=symmetry), sector_indices
 
 
 def op_charge_add(left, right):
@@ -517,7 +517,7 @@ def labeled_dense(tensor, bra_qn, ket_qn=None):
 def matmul_tensors(left, right, *, atol=1e-14):
     """Block-multiply Abelian IrrepTensors, adding their charge shifts."""
     if left.ket != right.bra:
-        raise ValueError("inner IrrepSite mismatch")
+        raise ValueError("inner Leg mismatch")
     op = OpIrrep(op_charge_add(left.op.charge, right.op.charge))
     blocks = {}
     for (bra, mid), left_block in left.blocks.items():
@@ -1843,7 +1843,7 @@ def feasible_multi_branch_qns(target_qn, block_nsites, total_sites, local_qn, nl
 
 
 def charge_diagonalize(H, basis_qn, nroots, allowed_qn=None, allow_empty=False):
-    """Diagonalize H by Abelian (Ne, 2Sz) IrrepSite sectors."""
+    """Diagonalize H by Abelian (Ne, 2Sz) Leg sectors."""
     basis_qn = qn_array(basis_qn)
     allowed = None if allowed_qn is None else {qn_key(q) for q in allowed_qn}
     dim = len(basis_qn)

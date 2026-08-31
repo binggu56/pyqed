@@ -582,7 +582,7 @@ def _nonabelian_mps_to_dense_vector(state):
 
     from pyqed.mps.nonabelian.environment import _site_to_dense
 
-    sites = list(getattr(state, "sites", state))
+    sites = list(getattr(state, "tensors", state))
     psi = np.array([1.0 + 0.0j])
     for site in sites:
         tensor = _site_to_dense(site)

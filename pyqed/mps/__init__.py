@@ -51,7 +51,7 @@ from .cmps import (  # noqa: F401
 
 # Non-Abelian prototype exports (kept available even without SciPy).
 from .nonabelian import (  # noqa: F401
-    NonabelianTensor,
+    IrrepTensor,
     SiteOperator,
     MPS as NonabelianMPS,
     MPO as NonabelianMPO,

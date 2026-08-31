@@ -502,6 +502,7 @@ def validate_case(
         "metric_tol": float(metric_tol),
         "pyscf_metric_eig": bool(pyscf_metric_eig),
         "kmesh": list(case.kmesh),
+        "gamma_centered": bool(case.gamma_centered),
         "nao": int(cell.nao),
         "nkpts": int(len(kpts)),
         "pyscf_gdf_krhf_energy_Ha": scf_energy,

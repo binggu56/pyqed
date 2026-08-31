@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .basis import BondBasis
+from pyqed.symmetry import IrrepTensor, Leg
+
 from .contraction import split_legs
 from .coupling import normalize_coupling_scheme, reduced_bond_space
 from .linalg import (
@@ -24,7 +25,6 @@ from .tensor import (
     FusionPipe,
     FusionPipeEntry,
     IdentityBasisTransform,
-    NonabelianTensor,
 )
 
 
@@ -42,7 +42,7 @@ def _bond_basis_from_singular_values(singular_values, *, direction, name=None):
     sectors = tuple(sector for sector in sectors if sector in dims)
     if not sectors:
         raise ValueError("Cannot build a bond basis from an empty singular-value layout.")
-    return BondBasis(sectors=sectors, dims=dims, direction=direction, name=name)
+    return Leg(sectors, dims, direction=direction, name=name)
 
 
 def _apply_singular_values_left(U_tensor, singular_values):
@@ -51,7 +51,7 @@ def _apply_singular_values_left(U_tensor, singular_values):
         if qM in singular_values:
             new_block = np.tensordot(block, singular_values[qM], axes=([2], [0]))
             new_data[(qL, qP, qM)] = new_block
-    return NonabelianTensor(
+    return IrrepTensor(
         new_data,
         [leg_qns[:] for leg_qns in U_tensor.qns],
         U_tensor.dirs[:],
@@ -66,7 +66,7 @@ def _apply_singular_values_right(V_tensor, singular_values):
         if qM in singular_values:
             new_block = np.tensordot(singular_values[qM], block, axes=([1], [0]))
             new_data[(qM, qP, qR)] = new_block
-    return NonabelianTensor(
+    return IrrepTensor(
         new_data,
         [leg_qns[:] for leg_qns in V_tensor.qns],
         V_tensor.dirs[:],
@@ -191,7 +191,7 @@ def _align_state_average_root_layouts(roots):
                 target[tuple(slice(0, size) for size in source.shape)] = source
             data[key] = target
         aligned.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data,
                 [leg[:] for leg in common_qns],
                 reference.dirs[:],
@@ -621,8 +621,8 @@ def svd_two_site(
     relative discarded squared norm meets the requested bound. ``max_bond``
     remains a hard ceiling when both are provided.
     """
-    if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
-        raise ValueError("svd_two_site expects a rank-4 NonabelianTensor.")
+    if not isinstance(two_site, IrrepTensor) or two_site.rank != 4:
+        raise ValueError("svd_two_site expects a rank-4 IrrepTensor.")
     if absorb not in {"left", "right"}:
         raise ValueError("absorb must be 'left' or 'right'.")
     max_bond_mode = normalize_max_bond_mode(max_bond_mode, default="reduced")
@@ -907,7 +907,7 @@ def svd_two_site(
                 (entry.child_sectors, entry.selected_shape, entry.slot)
             ]
 
-    left_fused_tensor = NonabelianTensor(
+    left_fused_tensor = IrrepTensor(
         left_reduced,
         [list(kept_bond_sectors), bond_qns],
         [1, 1],
@@ -915,14 +915,14 @@ def svd_two_site(
         metadata={"split_basis_maps": {0: left_split_basis_map}},
     )
     U_split = split_legs(left_fused_tensor, 0)
-    U_tensor = NonabelianTensor(
+    U_tensor = IrrepTensor(
         U_split.data,
         U_split.qns,
         U_split.dirs,
         fusion_legs=[two_site.fusion_legs[0], two_site.fusion_legs[1], bond_leg],
         metadata={},
     )
-    right_fused_tensor = NonabelianTensor(
+    right_fused_tensor = IrrepTensor(
         right_reduced,
         [bond_qns, list(kept_bond_sectors)],
         [-1, 1],
@@ -930,7 +930,7 @@ def svd_two_site(
         metadata={"split_basis_maps": {1: right_split_basis_map}},
     )
     V_split = split_legs(right_fused_tensor, 1)
-    V_tensor = NonabelianTensor(
+    V_tensor = IrrepTensor(
         V_split.data,
         V_split.qns,
         V_split.dirs,
@@ -945,7 +945,7 @@ def svd_two_site(
         A_tensor = U_tensor
         B_tensor = _apply_singular_values_right(V_tensor, singular_values)
 
-    A_tensor = NonabelianTensor(
+    A_tensor = IrrepTensor(
         A_tensor.data,
         A_tensor.qns,
         A_tensor.dirs,
@@ -963,7 +963,7 @@ def svd_two_site(
             "bond_bases": {2: right_bond_basis},
         },
     )
-    B_tensor = NonabelianTensor(
+    B_tensor = IrrepTensor(
         B_tensor.data,
         B_tensor.qns,
         B_tensor.dirs,
@@ -1015,11 +1015,11 @@ def state_averaged_svd_two_site(
     weights = weights / weight_sum
 
     ref = roots[0]
-    if not isinstance(ref, NonabelianTensor) or ref.rank != 4:
-        raise ValueError("state_averaged_svd_two_site expects rank-4 NonabelianTensor roots.")
+    if not isinstance(ref, IrrepTensor) or ref.rank != 4:
+        raise ValueError("state_averaged_svd_two_site expects rank-4 IrrepTensor roots.")
     for root in roots[1:]:
-        if not isinstance(root, NonabelianTensor) or root.rank != 4:
-            raise ValueError("state_averaged_svd_two_site expects rank-4 NonabelianTensor roots.")
+        if not isinstance(root, IrrepTensor) or root.rank != 4:
+            raise ValueError("state_averaged_svd_two_site expects rank-4 IrrepTensor roots.")
     if any(root.qns != ref.qns or root.dirs != ref.dirs for root in roots[1:]):
         roots = _align_state_average_root_layouts(roots)
         ref = roots[0]
@@ -1264,7 +1264,7 @@ def state_averaged_svd_two_site(
             ]
 
     def _split_from_reduced(left_reduced, right_reduced, *, source):
-        left_fused_tensor = NonabelianTensor(
+        left_fused_tensor = IrrepTensor(
             left_reduced,
             [list(kept_bond_sectors), bond_qns],
             [1, 1],
@@ -1272,14 +1272,14 @@ def state_averaged_svd_two_site(
             metadata={"split_basis_maps": {0: left_split_basis_map}},
         )
         U_split = split_legs(left_fused_tensor, 0)
-        U_tensor = NonabelianTensor(
+        U_tensor = IrrepTensor(
             U_split.data,
             U_split.qns,
             U_split.dirs,
             fusion_legs=[ref.fusion_legs[0], ref.fusion_legs[1], bond_leg],
             metadata={},
         )
-        right_fused_tensor = NonabelianTensor(
+        right_fused_tensor = IrrepTensor(
             right_reduced,
             [bond_qns, list(kept_bond_sectors)],
             [-1, 1],
@@ -1287,14 +1287,14 @@ def state_averaged_svd_two_site(
             metadata={"split_basis_maps": {1: right_split_basis_map}},
         )
         V_split = split_legs(right_fused_tensor, 1)
-        V_tensor = NonabelianTensor(
+        V_tensor = IrrepTensor(
             V_split.data,
             V_split.qns,
             V_split.dirs,
             fusion_legs=[bond_leg, ref.fusion_legs[2], ref.fusion_legs[3]],
             metadata={},
         )
-        A_tensor = NonabelianTensor(
+        A_tensor = IrrepTensor(
             U_tensor.data,
             U_tensor.qns,
             U_tensor.dirs,
@@ -1307,7 +1307,7 @@ def state_averaged_svd_two_site(
                 "bond_bases": {2: right_bond_basis},
             },
         )
-        B_tensor = NonabelianTensor(
+        B_tensor = IrrepTensor(
             V_tensor.data,
             V_tensor.qns,
             V_tensor.dirs,

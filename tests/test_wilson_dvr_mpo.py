@@ -2,6 +2,7 @@ import numpy as np
 
 from pyqed.lgt import (
     AlternatingWilsonDVRMPO,
+    OpenSineWilsonDVRMPO,
     QuantumSchwingerDVR,
     WilsonDVRMPO,
 )
@@ -199,3 +200,80 @@ def test_gauss_symmetric_mps_compression_preserves_channel_source():
         source.norm_squared(),
         atol=2.0e-12,
     )
+
+
+def test_open_sine_cosine_dirac_spectrum_and_boundaries():
+    builder = OpenSineWilsonDVRMPO(
+        6,
+        7.0,
+        mass=0.3,
+        flux_cutoff=1,
+    )
+    np.testing.assert_allclose(
+        builder.cosine_transform.T @ builder.cosine_transform,
+        np.eye(builder.npts),
+        atol=2.0e-14,
+    )
+    np.testing.assert_allclose(
+        builder.sine_transform.T @ builder.sine_transform,
+        np.eye(builder.npts),
+        atol=2.0e-14,
+    )
+    expected = np.sort(
+        np.concatenate(
+            (
+                -np.sqrt(builder.momenta**2 + builder.mass**2),
+                np.sqrt(builder.momenta**2 + builder.mass**2),
+            )
+        )
+    )
+    np.testing.assert_allclose(
+        np.linalg.eigvalsh(builder.one_particle_matrix()),
+        expected,
+        atol=2.0e-14,
+    )
+    modes = np.arange(builder.npts) + 0.5
+    np.testing.assert_allclose(np.sin(modes * 0.0), 0.0, atol=1.0e-15)
+    np.testing.assert_allclose(np.cos(modes * np.pi), 0.0, atol=3.0e-15)
+
+
+def test_open_sine_wilson_automaton_matches_reference_mpo():
+    builder = OpenSineWilsonDVRMPO(
+        3,
+        5.0,
+        mass=0.2,
+        flux_cutoff=1,
+    )
+    automaton = builder.build_mpo().to_dense()
+    reference = builder.build_reference_mpo().to_dense()
+    np.testing.assert_allclose(automaton, reference, atol=2.0e-14)
+    np.testing.assert_allclose(automaton, automaton.conj().T, atol=2.0e-14)
+    assert max(builder.mpo.bond_orders()) == 4 * (builder.npts - 1) + 2
+    assert max(builder.build_vector_mpo().bond_orders()) == 2
+    assert max(builder.build_scalar_mpo().bond_orders()) == 2
+
+
+def test_open_sine_wilson_exact_gauss_mpo_and_seed():
+    builder = OpenSineWilsonDVRMPO(4, 8.0, flux_cutoff=2)
+    maps, target, manager = builder.gauss_symmetry()
+    symmetric = MPO(
+        dense_to_symmetric_mpo(
+            builder.build_mpo().factors,
+            maps,
+            native_site_storage=True,
+        )
+    )
+    compressed = compress_symmetric_mpo(symmetric, rtol=1.0e-12)
+    seed = builder.gauss_seed_mps(
+        bond_dim=32,
+        seed=11,
+        native_site_storage=True,
+    )
+    assert len(seed.factors) == 2 * builder.npts - 1
+    assert seed.gauss_bond_dimensions[0] == 1
+    assert seed.gauss_bond_dimensions[-1] == 1
+    assert max(seed.gauss_bond_dimensions) <= 32
+    np.testing.assert_allclose(seed.norm_squared(), 1.0, atol=2.0e-12)
+    assert max(compressed.bond_orders()) <= max(symmetric.bond_orders())
+    assert len(target) == builder.npts
+    assert manager is not None

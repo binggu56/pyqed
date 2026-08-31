@@ -117,3 +117,22 @@ PYTHONPATH=. OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
 python examples/lgt/wilson_dvr_mpo_pilot.py
 ```
+
+## Open sine--cosine gauge DVR
+
+`OpenSineWilsonDVRMPO` uses paired DCT-IV/DST-IV half-integer modes for the
+two Dirac components on the same cell-centered grid.  The sine component
+vanishes at the left wall and the cosine component at the right wall, which
+gives a self-adjoint first-order Dirac operator with zero boundary current.
+Dense spectral hops carry unique non-wrapping Wilson lines, and all local
+Gauss laws are exact MPS quantum numbers.  Its finite-state hopping MPO has
+an exact bond dimension linear in the number of DVR cells.
+
+This is an open-boundary spectral adaptation rather than an exact reproduction
+of a published DVR lattice Hamiltonian.  The gauge construction follows
+J. Kogut and L. Susskind, *Phys. Rev. D* **11**, 395 (1975), DOI:
+10.1103/PhysRevD.11.395, and T. Banks, L. Susskind, and J. Kogut, *Phys. Rev.
+D* **13**, 1043 (1976), DOI: 10.1103/PhysRevD.13.1043.  The confined Dirac
+boundary conditions are related to the self-adjoint extensions discussed by
+M. H. Al-Hashimi and U.-J. Wiese, *Ann. Phys.* **327**, 1 (2012), DOI:
+10.1016/j.aop.2011.09.001.

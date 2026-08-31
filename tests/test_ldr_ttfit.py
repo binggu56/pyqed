@@ -621,6 +621,71 @@ def test_ttldr_split_local_cap_has_exact_channel_resolved_norm_loss():
         )
 
 
+def test_ttldr_split_path_validates_dt_and_keeps_the_final_checkpoint():
+    dimensions = (2, 1)
+    zero = MPO(
+        [
+            np.zeros((1, 1, dimensions[0], dimensions[0]), dtype=complex),
+            np.eye(dimensions[1], dtype=complex)[None, None],
+        ]
+    )
+    driver = object.__new__(TTLDR)
+    driver.dims = dimensions
+    driver.nstates = dimensions[-1]
+    driver.components = (zero,)
+    driver.is_hermitian = True
+    driver.fitted_fields = False
+    state = MPS(
+        [
+            np.asarray((1.0, 0.0), dtype=complex).reshape(1, 2, 1),
+            np.ones((1, 1, 1), dtype=complex),
+        ]
+    )
+    projector = MPO(
+        [
+            np.eye(dimensions[0], dtype=complex)[None, None],
+            np.eye(dimensions[1], dtype=complex)[None, None],
+        ]
+    )
+    absorber = np.zeros(dimensions[0])
+
+    for dt in (0.0, -0.1, np.inf):
+        with pytest.raises(ValueError, match="dt must be positive and finite"):
+            driver.run(
+                state,
+                dt=dt,
+                steps=1,
+                progress=False,
+                e_ops=(projector,),
+                absorber=absorber,
+            )
+
+    driver.run(
+        state,
+        dt=0.1,
+        steps=0,
+        progress=False,
+        e_ops=(projector,),
+        absorber=absorber,
+    )
+    np.testing.assert_allclose(driver.times, (0.0,))
+    assert driver.populations.shape == (1, 1)
+    assert driver.absorber_yields.shape == (1, 1)
+
+    driver.run(
+        state,
+        dt=0.1,
+        steps=1,
+        interval=2,
+        progress=False,
+        e_ops=(projector,),
+        absorber=absorber,
+    )
+    np.testing.assert_allclose(driver.times, (0.0, 0.1))
+    assert driver.populations.shape == (2, 1)
+    assert driver.absorber_yields.shape == (2, 1)
+
+
 def test_ttldr_split_cap_accepts_all_nuclear_sites():
     dimensions = (2, 3, 2)
     zero = MPO(
@@ -872,6 +937,9 @@ def test_fitted_ttldr_builds_matrix_free_adiabatic_projector_and_state():
     projector, info = driver.adiabatic_projector(
         1, max_rank=4, sweeps=4, validation=16, seed=3
     )
+    independent_projector, _independent_info = driver.adiabatic_projector(
+        1, max_rank=4, sweeps=4, validation=16, seed=4
+    )
     dense_projector, dense_info = driver.adiabatic_projector(
         1, method="dense", max_rank=None
     )
@@ -882,6 +950,7 @@ def test_fitted_ttldr_builds_matrix_free_adiabatic_projector_and_state():
     )
 
     assert projector.L == 2
+    assert independent_projector is not projector
     assert dense_projector.L == 2
     assert dense_info["backend"] == "dense-local-projector-mpo"
     assert dense_info["validation_error"] < 1.0e-12

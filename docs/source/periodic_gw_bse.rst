@@ -1947,31 +1947,56 @@ and the unpruned end-to-end comparison with
      --case diamond --kmesh 2,2,2 --precision 1e-12 \
      --aux-min-exponent 0 --pyscf-metric-eig
 
-The sampled quasiparticle gap is defined as
+Do not mix even half-shifted meshes with odd Gamma-containing meshes in a
+k-point convergence series.  ``Cell.make_kpts(n, gamma_centered=True)`` uses
+the wrapped fractional coordinates
 
 .. math::
 
-   E_g^{\mathrm{QP}}(n)
-   = \min_{\mathbf{k}} E_{c\mathbf{k}}^{\mathrm{QP}}(n)
-   - \max_{\mathbf{k}} E_{v\mathbf{k}}^{\mathrm{QP}}(n).
+   \kappa_{j_\alpha}
+   = \left[\left(\frac{j_\alpha}{n_\alpha}+\frac12\right)
+     \bmod 1\right]-\frac12,
+   \qquad
+   \mathbf k_{\mathbf j}
+   = \sum_{\alpha=1}^3 \kappa_{j_\alpha}\mathbf b_\alpha,
 
-For cubic :math:`n^3` Monkhorst--Pack meshes, the PySCF values are
-:math:`19.2999`, :math:`20.8977`, and :math:`13.7553` eV for
-:math:`n=1,2,3`; the corresponding maximum PyQED--PySCF residuals are
-:math:`0.0902`, :math:`0.00941`, and :math:`0.01021` meV.  Thus cross-code
-agreement is stable on the multi-k meshes, but the physical gap is not
-k-mesh converged and shows a strong odd/even sampling effect.  A production
-gap requires a larger, symmetry-reduced mesh and a converged orbital basis.
+so every mesh contains :math:`\Gamma` and is closed under wrapped momentum
+addition and subtraction.  ``--gamma-only`` changes only the target QP roots;
+the full :math:`n^3` mesh remains in KRHF, :math:`P(\mathbf q,\omega)`, and
+:math:`W(\mathbf q,\omega)`.  The fixed observable is the direct Gamma gap
+
+.. math::
+
+   E_{g,\Gamma}^{\mathrm{QP}}(n)
+   = E_{c\Gamma}^{\mathrm{QP}}(n)
+   - E_{v\Gamma}^{\mathrm{QP}}(n).
+
+For unpruned :math:`2^3`, :math:`3^3`, and :math:`4^3` Gamma-centered meshes,
+the PySCF values are :math:`15.295487`, :math:`13.755287`, and
+:math:`13.032730` eV.  PyQED gives :math:`15.295533`, :math:`13.755309`, and
+:math:`13.032737` eV, with maximum QP residuals of :math:`0.02276`,
+:math:`0.01156`, and :math:`0.00440` meV.  Cross-code agreement therefore
+improves with mesh size, while the physical Gamma gap is not converged: the
+:math:`3^3\rightarrow4^3` shift is still :math:`0.72256` eV.  The native total
+times are :math:`82.8`, :math:`408.1`, and :math:`2330.2` s, compared with
+:math:`65.9`, :math:`101.6`, and :math:`301.1` s in PySCF.  At :math:`4^3`,
+native GDF construction takes :math:`1965.2` s and is the dominant performance
+target.  A predictive gap requires a larger symmetry-reduced mesh and a
+converged orbital basis.
 
 The convergence figure is reproducible from the saved benchmark JSON files:
 
 .. code-block:: console
 
    PYTHONPATH=. python examples/plot_pbc_gw_kmesh_convergence.py \
-     /private/tmp/pbc_diamond_111_pruned_pyqed_pyscf_kgw.json \
-     /private/tmp/pbc_diamond_222_pruned_pyqed_pyscf_kgw.json \
-     /private/tmp/pbc_diamond_333_pruned_pyqed_pyscf_kgw.json \
-     --output /private/tmp/pbc_diamond_gw_kmesh_convergence
+     /private/tmp/pbc_diamond_gamma_222_pyqed_pyscf_kgw.json \
+     /private/tmp/pbc_diamond_gamma_333_pyqed_pyscf_kgw.json \
+     /private/tmp/pbc_diamond_gamma_444_pyqed_pyscf_kgw.json \
+     --output /private/tmp/pbc_diamond_gamma_gw_kmesh_convergence
+
+Generate each input with ``--gamma-centered --gamma-only --skip-aligned`` and
+otherwise identical precision, metric, auxiliary-basis, finite-size, and
+frequency controls.
 
 The runnable native rocksalt LiH workflow builds GDF-KRHF, exact-pole G0W0,
 the intrinsic spectral function, and the matrix-element-weighted

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.sparse.linalg import LinearOperator, gmres
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, spin_label
+from pyqed.narg.irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep, spin_label
 from .su2_core import (
     Multiplet,
     asarray,
@@ -57,7 +57,7 @@ class TwoSiteSU2NARG:
     """Untruncated two-site SU(2)-NARG data."""
 
     branch_states: list[BranchMultiplet]
-    site: IrrepSite
+    site: Leg
     bases: dict[Irrep, np.ndarray]
     provenance: dict[Irrep, list[BranchMultiplet]]
     hamiltonian: IrrepTensor
@@ -101,7 +101,7 @@ class TruncatedSU2NARG:
 
     source: TwoSiteSU2NARG
     kept_roots: list[SectorRoot]
-    site: IrrepSite
+    site: Leg
     bases: dict[Irrep, np.ndarray]
     transform: IrrepTensor
     hamiltonian: IrrepTensor
@@ -173,8 +173,8 @@ def component_vector(mp: Multiplet, m2: int | None = None) -> np.ndarray | None:
 
 def branch_irrep_site(
     states: list[BranchMultiplet], m2: int | None = None
-) -> tuple[IrrepSite, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
-    """Build an IrrepSite from branch-generated two-site multiplets."""
+) -> tuple[Leg, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
+    """Build an Leg from branch-generated two-site multiplets."""
     sectors: dict[Irrep, list[np.ndarray]] = {}
     provenance: dict[Irrep, list[BranchMultiplet]] = {}
     for state in states:
@@ -187,7 +187,7 @@ def branch_irrep_site(
 
     dims = {irrep: len(cols) for irrep, cols in sectors.items()}
     bases = {irrep: np.column_stack(cols) for irrep, cols in sectors.items()}
-    return IrrepSite(su2_product_symmetry(), dims), bases, provenance
+    return Leg(dims, symmetry=su2_product_symmetry()), bases, provenance
 
 
 def build_two_site_su2_narg(h1e, eri, m2: int | None = None) -> TwoSiteSU2NARG:
@@ -310,7 +310,7 @@ def truncate_to_D(
             bases[irrep] = np.column_stack(primitive_cols)
         blocks[(irrep, irrep)] = np.diag([root.energy for root in roots])
 
-    site = IrrepSite(su2_product_symmetry(), dims)
+    site = Leg(dims, symmetry=su2_product_symmetry())
     transform = IrrepTensor(narg.site, site, OpIrrep((0, 0)), transform_blocks)
     hamiltonian = IrrepTensor(site, site, OpIrrep((0, 0)), blocks)
     return TruncatedSU2NARG(narg, kept, site, bases, transform, hamiltonian)
@@ -557,7 +557,7 @@ def dress_truncation_with_future_couplings(
                 )
             )
 
-    site = IrrepSite(su2_product_symmetry(), dims)
+    site = Leg(dims, symmetry=su2_product_symmetry())
     truncated.kept_roots = sorted(
         new_roots,
         key=lambda root: (root.energy, root.irrep.charge, root.local_index),
@@ -762,7 +762,7 @@ def dress_truncation_with_cc(
             for local_index in range(transform.shape[1])
         )
 
-    site = IrrepSite(su2_product_symmetry(), dims)
+    site = Leg(dims, symmetry=su2_product_symmetry())
     truncated.kept_roots = sorted(
         roots,
         key=lambda root: (root.energy, root.irrep.charge, root.local_index),

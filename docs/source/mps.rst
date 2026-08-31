@@ -190,6 +190,26 @@ rather than all spin components. This requires explicit Clebsch-Gordan and
 fusion-tree bookkeeping, but can substantially reduce the number of states
 needed for spin-adapted calculations.
 
+Tensor and owner model
+----------------------
+
+Finite dense, Abelian, and non-Abelian chains use one object model.  Every
+stored MPS/MPO core implements ``pyqed.symmetry.IrrepTensor`` and every axis is
+described by ``pyqed.symmetry.Leg``.  Dense tensors are represented by one
+trivial block; Abelian tensors use charge blocks; SU(2) tensors store reduced
+multiplet blocks plus fusion metadata.  ``tensor.shape`` always reports the
+actual axis dimensions, while sector counts and reduced multiplicities live on
+the corresponding ``Leg``.
+
+``pyqed.mps.MPS`` and ``pyqed.mps.MPO`` are the finite-chain owners for all
+three storage modes.  ``state.tensors``/``state.factors`` are the owned tensor
+sequence, whereas ``state.sites`` contains physical-site descriptors.  The
+``pyqed.mps.nonabelian`` import path re-exports the same owners; its specialized
+MPO classes are site-core and virtual-channel implementations used inside a
+shared ``MPO`` chain.  ``UniformMPS`` follows the same tensor contract for its
+unit-cell tensor.  NARG operator spaces likewise use the shared ``Leg`` and
+``IrrepTensor`` types rather than a parallel tensor hierarchy.
+
 Cross-geometry SU(2) overlaps
 -----------------------------
 
@@ -298,8 +318,8 @@ The MPS-related code is split across several namespaces:
 * ``pyqed.mps`` contains general MPS, MPO, TEBD, DMRG, symmetry, and AutoMPO
   utilities, plus ``UniformMPS`` for one-site uniform/infinite MPS work.
 * ``pyqed.mps.autompo`` contains automatic MPO construction helpers.
-* ``pyqed.mps.nonabelian`` contains prototype SU(2)/non-Abelian tensor and DMRG
-  components.
+* ``pyqed.mps.nonabelian`` contains SU(2)/non-Abelian algorithms, fusion
+  metadata, and specialized MPO cores; it re-exports the common finite owners.
 * ``pyqed.qchem.dmrg`` contains quantum-chemistry DMRG and DMRG-SCF-facing
   code.
 * ``pyqed.dmrg`` contains older/simple DMRG examples and prototypes.

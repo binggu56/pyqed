@@ -49,11 +49,11 @@ def test_mps_uses_left_physical_right_as_its_default_order():
     assert not hasattr(state, "data")
 
 
-def test_root_mps_names_are_dense_and_nonabelian_names_are_explicit():
+def test_root_and_symmetry_import_paths_share_one_finite_owner():
     assert NonabelianMPS is ReducedMPS
     assert NonabelianMPO is ReducedMPO
-    assert MPS is not NonabelianMPS
-    assert MPO is not NonabelianMPO
+    assert MPS is NonabelianMPS
+    assert MPO is NonabelianMPO
 
 
 def test_mps_preserves_explicit_sites_through_layout_and_compression():

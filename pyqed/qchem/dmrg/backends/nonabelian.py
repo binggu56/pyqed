@@ -171,7 +171,7 @@ def _make_initial_mps(
             )
     else:
         raise ValueError(f"Unsupported non-Abelian initial guess {guess!r}.")
-    return MPS.from_sites(sites, target_sector=target_sector)
+    return MPS.from_tensors(sites, target_sector=target_sector)
 
 
 def _make_state_average_root_sites(

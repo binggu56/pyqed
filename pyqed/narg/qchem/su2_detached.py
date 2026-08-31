@@ -6,7 +6,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import IrrepSite, IrrepTensor, OpIrrep
+from pyqed.narg.irrep_tensor import Leg, IrrepTensor, OpIrrep
 
 from .su2_core import local_su2_branches, su2_product_symmetry
 from .su2_three_site import coupled_product_states
@@ -180,7 +180,7 @@ def _strict_D_baseline(narg, D):
             for index, energy in enumerate(values)
         )
 
-    site = IrrepSite(su2_product_symmetry(), dims)
+    site = Leg(dims, symmetry=su2_product_symmetry())
     baseline = TruncatedSU2NARG(
         source=narg,
         kept_roots=sorted(
@@ -511,7 +511,7 @@ def _solve_detached_space(
 
     if not target_roots:
         raise ValueError("no states remain in the SU2 detached-frame space")
-    parent_site = IrrepSite(su2_product_symmetry(), parent_dims)
+    parent_site = Leg(parent_dims, symmetry=su2_product_symmetry())
     parent = TruncatedSU2NARG(
         source=narg,
         kept_roots=sorted(
@@ -533,7 +533,7 @@ def _solve_detached_space(
             parent_hamiltonian_blocks,
         ),
     )
-    target_site = IrrepSite(su2_product_symmetry(), target_dims)
+    target_site = Leg(target_dims, symmetry=su2_product_symmetry())
     target = TruncatedSU2NARG(
         source=narg,
         kept_roots=sorted(

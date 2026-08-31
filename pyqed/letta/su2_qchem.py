@@ -60,7 +60,7 @@ from pyqed.mps.nonabelian.sweep import (
     MovingEnvironment,
     _identity_mpo_factors_for_sites_and_mpo,
 )
-from pyqed.mps.nonabelian.tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def resolve_workers(workers, *, maximum=4):
@@ -233,7 +233,7 @@ class _ChannelResolvedPairSpace:
         right_block = np.zeros((1, entry.shape[2], entry.shape[3]), dtype=complex)
         left_block[i_l, i_p1, 0] = 1.0
         right_block[0, i_p2, i_r] = 1.0
-        left = NonabelianTensor(
+        left = IrrepTensor(
             {(q_l, q_p1, q_mid): left_block},
             [
                 list(self.left_template.qns[0]),
@@ -244,7 +244,7 @@ class _ChannelResolvedPairSpace:
             fusion_legs=list(self.left_template.fusion_legs),
             metadata=self._clean_metadata(self.left_template.metadata),
         )
-        right = NonabelianTensor(
+        right = IrrepTensor(
             {(q_mid, q_p2, q_r): right_block},
             [
                 [q_mid],
@@ -331,7 +331,7 @@ class _ChannelResolvedPairSpace:
 
         if not bond_sectors:
             raise ValueError("Cannot split a null channel-resolved pair vector.")
-        left = NonabelianTensor(
+        left = IrrepTensor(
             left_data,
             [
                 list(self.left_template.qns[0]),
@@ -342,7 +342,7 @@ class _ChannelResolvedPairSpace:
             fusion_legs=list(self.left_template.fusion_legs),
             metadata=self._clean_metadata(self.left_template.metadata),
         )
-        right = NonabelianTensor(
+        right = IrrepTensor(
             right_data,
             [
                 list(bond_sectors),
@@ -461,7 +461,7 @@ class _WignerEckartRoutePlan:
             # All parameter routes contributing to a compatible reduced block
             # are packed into one BLAS matrix-vector product.
             data[key] = (coefficients[indices] @ matrix).reshape(shape)
-        return NonabelianTensor(
+        return IrrepTensor(
             data=data,
             qns=[list(values) for values in self.template.qns],
             dirs=list(self.template.dirs),
@@ -725,8 +725,8 @@ class NonAbelianFrontierLETTA:
         if len(sites) != self.nsites:
             raise ValueError("base SU(2) MPS and MPO lengths differ.")
         for site_index, site in enumerate(sites):
-            if not isinstance(site, NonabelianTensor) or site.rank != 3:
-                raise TypeError("base_sites must contain rank-3 NonabelianTensor objects.")
+            if not isinstance(site, IrrepTensor) or site.rank != 3:
+                raise TypeError("base_sites must contain rank-3 IrrepTensor objects.")
             if (site.metadata or {}).get("physical_basis") != "fully_reduced_su2":
                 raise ValueError(
                     "NonAbelianFrontierLETTA requires fully reduced SU(2) site tensors."
@@ -1079,7 +1079,7 @@ class NonAbelianFrontierLETTA:
             for sector, dimension in right_dims.items()
             for _ in range(dimension * len(right_assignments))
         ]
-        return NonabelianTensor(
+        return IrrepTensor(
             data=data,
             qns=[left_qns, list(physical_sectors), right_qns],
             dirs=[-1, 1, 1],
@@ -1099,7 +1099,7 @@ class NonAbelianFrontierLETTA:
     def state(self):
         from pyqed.mps.nonabelian.mps import MPS
 
-        return MPS.from_sites(self.materialize(), target_sector=self.target_sector)
+        return MPS.from_tensors(self.materialize(), target_sector=self.target_sector)
 
     def close(self):
         """Release the bounded local-contraction worker pool."""
@@ -1432,7 +1432,7 @@ class NonAbelianFrontierLETTA:
                 basis_data[int(parameter)][key] = matrix[row].reshape(shape)
 
         basis = tuple(
-            NonabelianTensor(
+            IrrepTensor(
                 data=data,
                 qns=[list(values) for values in template.qns],
                 dirs=list(template.dirs),

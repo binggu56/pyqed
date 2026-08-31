@@ -11,7 +11,7 @@ import time
 
 import numpy as np
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep
+from pyqed.narg.irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep
 from .su2_three_site import (
     CDD,
     CDU,
@@ -1968,7 +1968,7 @@ def renormalized_block_from_narg(
                 "no feasible SU2 multiplets remain in the exact cluster interior"
             )
         dims = {irrep: narg.site.sector_dim(irrep) for irrep in selected_irreps}
-        site = IrrepSite(narg.site.symmetry, dims)
+        site = Leg(dims, symmetry=narg.site.symmetry)
         roots = []
         transform_blocks = {}
         hamiltonian_blocks = {}

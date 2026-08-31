@@ -17,7 +17,7 @@ from .builder import identity_operator
 from .contraction import normalize_site_tensor_layout
 from .coupling import clebsch_gordan, ordered_two_m_values
 from .mpo import Leg, SiteOperator
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def _canonical_spatial_leg():
@@ -713,7 +713,7 @@ def physical_leg_from_spatial_orbital(site=None):
     site
         Optional source object describing the local spatial-orbital basis.
         Accepts ``None`` (canonical basis), :class:`SpatialOrbitalSite`,
-        :class:`Leg`, or a rank-3 :class:`NonabelianTensor` MPS site.
+        :class:`Leg`, or a rank-3 :class:`IrrepTensor` MPS site.
     """
     canonical_leg = _canonical_spatial_leg()
     reduced_leg = _fully_reduced_spatial_leg()
@@ -731,10 +731,10 @@ def physical_leg_from_spatial_orbital(site=None):
                 "physical_leg_from_spatial_orbital expects a canonical or fully reduced spatial-orbital Leg."
             )
         return site
-    if isinstance(site, NonabelianTensor):
+    if isinstance(site, IrrepTensor):
         if site.rank != 3:
             raise ValueError(
-                "physical_leg_from_spatial_orbital expects a rank-3 NonabelianTensor site tensor."
+                "physical_leg_from_spatial_orbital expects a rank-3 IrrepTensor site tensor."
             )
         site = normalize_site_tensor_layout(site)
         if site.metadata.get("physical_basis") == "fully_reduced_su2":
@@ -758,7 +758,7 @@ def physical_leg_from_spatial_orbital(site=None):
         return leg
     raise TypeError(
         "physical_leg_from_spatial_orbital expects None, SpatialOrbitalSite, Leg, "
-        "or a rank-3 NonabelianTensor."
+        "or a rank-3 IrrepTensor."
     )
 
 

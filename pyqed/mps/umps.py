@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from pyqed.symmetry import IrrepTensor
+
 
 __all__ = [
     "UniformCanonicalForm",
@@ -328,7 +330,18 @@ class UniformMPS:
     algorithm: str = field(default="", init=False)
 
     def __post_init__(self):
-        object.__setattr__(self, "tensor", _as_square_tensor(self.tensor))
+        array = _as_square_tensor(self.tensor)
+        if array.ndim == 3:
+            dirs = (1, -1, 1)
+            names = ("physical", "left", "right")
+        else:
+            dirs = (1, 1, -1, 1)
+            names = ("unit-cell", "physical", "left", "right")
+        object.__setattr__(
+            self,
+            "tensor",
+            IrrepTensor.from_dense_data(array, dirs=dirs, names=names),
+        )
 
     @property
     def A(self):

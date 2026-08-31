@@ -28,14 +28,14 @@ from .contraction import merge_mps_sites
 from .coupling import clebsch_gordan, ordered_two_m_values
 from .decompose import svd_two_site
 from .mps import MPS
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def is_fully_reduced_su2_mps(state):
     """Return whether every site uses PyQED's fully reduced SU(2) layout."""
     sites = list(getattr(state, "sites", state))
     return bool(sites) and all(
-        isinstance(site, NonabelianTensor)
+        isinstance(site, IrrepTensor)
         and site.rank == 3
         and (site.metadata or {}).get("physical_basis") == "fully_reduced_su2"
         for site in sites
@@ -47,7 +47,7 @@ def _as_reduced_mps(state):
         raise TypeError("Expected a fully reduced charge x SU(2) spatial-orbital MPS.")
     if isinstance(state, MPS):
         return state.copy()
-    return MPS.from_sites(
+    return MPS.from_tensors(
         list(getattr(state, "sites", state)),
         center=getattr(state, "center", None),
         target_sector=getattr(state, "target_sector", None),
@@ -248,7 +248,7 @@ def _apply_adjacent_gate(
     max_bond,
     max_truncation_error=None,
 ):
-    merged = merge_mps_sites(state.sites[bond], state.sites[bond + 1])
+    merged = merge_mps_sites(state.tensors[bond], state.tensors[bond + 1])
     input_channels = merged.metadata["contracted_channel_blocks"]
     fock_gate = _second_quantized_two_orbital_gate(one_particle_gate)
     output_channels = {}
@@ -283,7 +283,7 @@ def _apply_adjacent_gate(
     for (q_left, q_phys1, _q_mid, q_phys2, q_right), block in output_channels.items():
         key = (q_left, q_phys1, q_phys2, q_right)
         data[key] = block.copy() if key not in data else data[key] + block
-    transformed = NonabelianTensor(
+    transformed = IrrepTensor(
         data,
         merged.qns,
         merged.dirs,
@@ -301,8 +301,8 @@ def _apply_adjacent_gate(
         max_truncation_error=max_truncation_error,
         absorb="right",
     )
-    state.sites[bond] = left
-    state.sites[bond + 1] = right
+    state.tensors[bond] = left
+    state.tensors[bond + 1] = right
     state.center = bond + 1
     return float(_error), native_mix_calls, mix_batches
 
@@ -311,8 +311,8 @@ def _apply_diagonal(state, diagonal):
     for site_index, value in enumerate(np.asarray(diagonal, dtype=complex)):
         if value == 1.0:
             continue
-        site = state.sites[site_index]
-        state.sites[site_index] = NonabelianTensor(
+        site = state.tensors[site_index]
+        state.tensors[site_index] = IrrepTensor(
             {
                 key: np.asarray(block) * value ** key[1].charge
                 for key, block in site.data.items()
@@ -420,7 +420,7 @@ def apply_spatial_orbital_transform(
     """
     transformed = _as_reduced_mps(state)
     input_bond = max(
-        [1] + [len(site.qns[2]) for site in transformed.sites[:-1]]
+        [1] + [len(site.qns[2]) for site in transformed.tensors[:-1]]
     )
     requested_max_bond = max_bond
     adaptive = False
@@ -534,13 +534,13 @@ def apply_spatial_orbital_transform(
             truncation_errors.append(error)
             gate_bonds.append(int(bond))
             gate_budgets.append(gate_budget)
-            gate_kept_bonds.append(len(transformed.sites[bond].qns[2]))
+            gate_kept_bonds.append(len(transformed.tensors[bond].qns[2]))
             native_mix_calls += gate_native_mix_calls
             mix_batches += gate_mix_batches
             gate_count += 1
             peak_reduced_bond = max(
                 peak_reduced_bond,
-                *(len(site.qns[2]) for site in transformed.sites[:-1]),
+                *(len(site.qns[2]) for site in transformed.tensors[:-1]),
             )
     if not return_info:
         return transformed

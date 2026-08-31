@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Non-Abelian tensor foundations for future symmetry-adapted MPS/DMRG.
+Non-Abelian tensor foundations for symmetry-adapted MPS/DMRG.
 
 This package intentionally keeps a small, explicit surface:
 
-- :mod:`tensor` stores reduced block tensors and fusion-edge metadata
+- :mod:`pyqed.symmetry` stores the shared ``IrrepTensor``/``Leg`` data model
+- :mod:`tensor` stores fusion and recoupling metadata
 - :mod:`contraction` implements fixed-layout reduced contractions
 - :mod:`linalg` stores reusable reduced projection/SVD/truncation helpers
 - :mod:`decompose` provides the first reduced two-site SVD/truncation helper
@@ -13,17 +14,15 @@ This package intentionally keeps a small, explicit surface:
 Short names are preferred inside this package.
 """
 
-from .tensor import FusionLeg, FusionEdge, FusionPipe, FusionPipeEntry, NonabelianTensor
+from pyqed.symmetry import IrrepTensor, Leg
+
+from .tensor import FusionLeg, FusionEdge, FusionPipe, FusionPipeEntry
 from .basis import (
-    BasisBlock,
-    SymmetryBasis,
-    SiteBasis,
-    BondBasis,
     LocalLayoutEntry,
     MetricOrthonormalization,
     TwoSiteBasis,
 )
-from .mps import MPS
+from pyqed.mps.mps import MPS, MPO
 from .tdvp import two_site_tdvp_step
 from .multiroot import MultiRootMPS, fuse_root_center_tensors, unfuse_root_center_tensor
 from .coupling import (
@@ -40,9 +39,8 @@ from .coupling import (
     recoupling_matrix,
 )
 from .mpo import (
-    Leg,
     SiteOperator,
-    MPO,
+    MPOCore,
     IrreducibleChannelTerm,
     IrreducibleMPO,
     RankCoupledChannelTerm,

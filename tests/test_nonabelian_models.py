@@ -4,7 +4,7 @@ from itertools import permutations
 
 from pyqed.mps.nonabelian import (
     AutoMPO,
-    NonabelianTensor,
+    IrrepTensor,
     RankCoupledChannelTerm,
     RankCoupledMPO,
     SiteOperator,
@@ -50,7 +50,7 @@ def _spatial_chain():
     site = SpatialOrbitalSite()
     q_empty, q_single, q_double = site.qn
 
-    A = NonabelianTensor(
+    A = IrrepTensor(
         data={
             (q_empty, q_empty, q_empty): np.array([[[1.0]]]),
             (q_single, q_single, q_single): np.array([[[1.0], [0.5]]]),
@@ -59,7 +59,7 @@ def _spatial_chain():
         qns=[list(site.qn), list(site.qn), list(site.qn)],
         dirs=[-1, 1, 1],
     )
-    B = NonabelianTensor(
+    B = IrrepTensor(
         data={
             (q_empty, q_empty, q_empty): np.array([[[0.5]]]),
             (q_single, q_single, q_single): np.array([[[0.75], [1.25]]]),
@@ -68,7 +68,7 @@ def _spatial_chain():
         qns=[list(site.qn), list(site.qn), list(site.qn)],
         dirs=[-1, 1, 1],
     )
-    C = NonabelianTensor(
+    C = IrrepTensor(
         data={
             (q_empty, q_empty, q_empty): np.array([[[1.5]]]),
             (q_single, q_single, q_single): np.array([[[0.2], [1.8]]]),
@@ -314,7 +314,7 @@ def _reduced_spatial_path_mps(labels, bonds):
         q_phys = site.qn[label]
         q_right = bonds[site_index + 1]
         tensors.append(
-            NonabelianTensor(
+            IrrepTensor(
                 data={(q_left, q_phys, q_right): np.ones((1, 1, 1))},
                 qns=[[q_left], list(site.qn), [q_right]],
                 dirs=[-1, 1, 1],

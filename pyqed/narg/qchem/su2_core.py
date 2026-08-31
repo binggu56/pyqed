@@ -23,7 +23,7 @@ from pyqed.qchem import Molecule, build_atom_from_coords
 
 from pyqed.narg.irrep_tensor import (
     Irrep,
-    IrrepSite,
+    Leg,
     IrrepTensor,
     OpIrrep,
     ProductSymmetry,
@@ -182,7 +182,7 @@ def local_su2_branches() -> tuple[LocalIrrepBranch, ...]:
     )
 
 
-def local_su2_site() -> IrrepSite:
+def local_su2_site() -> Leg:
     """One spatial orbital as U(1)xSU(2) irreps.
 
     Dims are multiplicity dimensions.  The spin multiplet dimension ``2S+1`` is
@@ -321,8 +321,8 @@ def su2_product_symmetry() -> ProductSymmetry:
     return ProductSymmetry((U1Symmetry("Ne"), SU2Symmetry("SU2")), name="U1xSU2")
 
 
-def csf_irrep_site(nsites: int, m2: int | None = 0) -> tuple[IrrepSite, dict[Irrep, np.ndarray]]:
-    """Build an IrrepSite and CSF basis columns for every sector with this M."""
+def csf_irrep_site(nsites: int, m2: int | None = 0) -> tuple[Leg, dict[Irrep, np.ndarray]]:
+    """Build an Leg and CSF basis columns for every sector with this M."""
     sectors: dict[Irrep, list[np.ndarray]] = {}
     for mp in build_site_csf_multiplets(nsites):
         selected_m2 = mp.j2 if m2 is None else m2
@@ -334,10 +334,10 @@ def csf_irrep_site(nsites: int, m2: int | None = 0) -> tuple[IrrepSite, dict[Irr
 
     dims = {irrep: len(cols) for irrep, cols in sectors.items()}
     bases = {irrep: np.column_stack(cols) for irrep, cols in sectors.items()}
-    return IrrepSite(su2_product_symmetry(), dims), bases
+    return Leg(dims, symmetry=su2_product_symmetry()), bases
 
 
-def scalar_hamiltonian_irrep_tensor(H, site: IrrepSite, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
+def scalar_hamiltonian_irrep_tensor(H, site: Leg, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
     """Represent a scalar Hamiltonian as an IrrepTensor over CSF sectors."""
     H = asarray(H)
     blocks = {}

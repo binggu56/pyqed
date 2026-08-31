@@ -247,7 +247,7 @@ def train_mace(
         finite_group=finite_group,
         hidden=(128, 128) if expanded else (64, 64),
         epochs=(
-            (900 if previous is None else 450)
+            (900 if previous is None else 220)
             if expanded
             else (650 if previous is None else 320)
         ) if epochs is None else epochs,
@@ -264,9 +264,9 @@ def train_mace(
     return fit
 
 
-def assess(fit, fields):
-    predicted_h = fit.neural_energy.predict(fields["coordinates"])
-    feature = fit.neural_feature.predict(fields["coordinates"])
+def assess_models(energy, feature_model, fields):
+    predicted_h = energy.predict(fields["coordinates"])
+    feature = feature_model.predict(fields["coordinates"])
     pairs = fields["pairs"]
     predicted_links = (
         feature[pairs[:, 0]].conj().swapaxes(-1, -2) @ feature[pairs[:, 1]]
@@ -287,6 +287,10 @@ def assess(fit, fields):
             / max(float(np.linalg.norm(fields["links"])), np.finfo(float).tiny)
         ),
     }
+
+
+def assess(fit, fields):
+    return assess_models(fit.neural_energy, fit.neural_feature, fields)
 
 
 def subspace_diagnostics(fields, max_distance=0.15):
@@ -477,6 +481,19 @@ def harmonic_envelope(grid):
         "...i,ij,...j->...", coordinates, np.linalg.inv(covariance), coordinates
     )
     return np.exp(-0.25 * exponent)
+
+
+def fitted_working_packet(fit, grid, state):
+    """Return the same fitted local-adiabatic packet on any dynamics grid."""
+    coordinates = np.stack(
+        np.meshgrid(*grid.x, indexing="ij"), axis=-1
+    ).reshape(-1, grid.ndim)
+    blocks = np.asarray(fit.energy.predict(coordinates))
+    _energies, vectors = np.linalg.eigh(blocks)
+    envelope = harmonic_envelope(grid).reshape(-1)
+    return (envelope[:, None] * vectors[:, :, int(state)]).reshape(
+        *grid.shape, vectors.shape[-2]
+    )
 
 
 def caps(grid):
@@ -753,9 +770,23 @@ def main():
             "independent continuous validation; use a multipatch Y atlas or "
             "a larger tracked electronic manifold"
         )
-    if fit.energy is None or fit.feature is None:
+    if (
+        fit.energy is None
+        or fit.feature is None
+        or fit.energy is fit.neural_energy
+        or fit.feature is fit.neural_feature
+    ):
         fit.distill_y(rank=64, degree=10, method="grid", seed=19)
         fit.save(checkpoint)
+    distilled_validation = assess_models(fit.energy, fit.feature, validation_fields)
+    if (
+        distilled_validation["maximum_hamiltonian_error_hartree"] > 7.5e-4
+        or distilled_validation["relative_link_error"] > 2.0e-2
+    ):
+        raise RuntimeError(
+            "refusing dynamics: the distilled FTT fields did not pass "
+            "independent continuous validation"
+        )
 
     started = perf_counter()
     nuclear_keo = keo.podolsky().bind(coord, grid=grid, molecule=mol)
@@ -779,10 +810,7 @@ def main():
     envelope = harmonic_envelope(grid)
     anchor = tuple(int(np.argmin(np.abs(axis))) for axis in grid.x)
     direct_packet = direct.wavepacket(envelope, state=1, anchor=anchor)
-    frame_blocks = np.swapaxes(direct.procrustes_gauges.conj(), -1, -2)
-    working_packet = np.einsum(
-        "...ai,...i->...a", frame_blocks, direct_packet, optimize=True
-    )
+    working_packet = fitted_working_packet(fit, grid, 1)
     fitted_packet = fitted.state(working_packet, max_rank=64, physical=False)
     projectors = tuple(
         fitted.adiabatic_projector(state, method="dense", max_rank=32)[0]
@@ -830,15 +858,7 @@ def main():
         overlap_rank=40,
         operator_rank=128,
     ).build()
-    fine_coordinates = np.stack(
-        np.meshgrid(*fine_grid.x, indexing="ij"), axis=-1
-    ).reshape(-1, 3)
-    fine_blocks = np.asarray(fit.energy.predict(fine_coordinates))
-    _fine_energies, fine_vectors = np.linalg.eigh(fine_blocks)
-    fine_envelope = harmonic_envelope(fine_grid).reshape(-1)
-    fine_working = (
-        fine_envelope[:, None] * fine_vectors[:, :, 1]
-    ).reshape(*fine_grid.shape, 2)
+    fine_working = fitted_working_packet(fit, fine_grid, 1)
     fine_packet = fine.state(fine_working, max_rank=64, physical=False)
     fine_projectors = tuple(
         fine.adiabatic_projector(state, method="dense", max_rank=32)[0]
@@ -894,14 +914,28 @@ def main():
         "training_points": int(fit.info["energy_samples"]),
         "adaptive_history": history,
         "adaptive_converged": True,
+        "distilled_validation": distilled_validation,
+        "distillation": fit.info.get("distillation", {}),
         "maximum_population_error_vs_direct": float(np.max(population_error)),
-        "maximum_13_to_17_tnldr_population_change": float(np.max(grid_error)),
+        "maximum_coarse_to_fine_tnldr_population_change": float(np.max(grid_error)),
         "final_populations_direct": populations_direct[-1].tolist(),
-        "final_populations_tnldr_13": fitted.populations[-1].tolist(),
-        "final_populations_tnldr_17": fine.populations[-1].tolist(),
+        "final_populations_tnldr_coarse": fitted.populations[-1].tolist(),
+        "final_populations_tnldr_fine": fine.populations[-1].tolist(),
         "final_survival_direct": float(direct.norm[-1]),
-        "final_survival_tnldr_13": float(fitted.norms[-1]),
-        "final_survival_tnldr_17": float(fine.norms[-1]),
+        "final_survival_tnldr_coarse": float(fitted.norms[-1]),
+        "final_survival_tnldr_fine": float(fine.norms[-1]),
+        "maximum_tnldr_coarse_absorption_closure": float(
+            np.max(np.abs(fitted.absorption_closure))
+        ),
+        "maximum_tnldr_fine_absorption_closure": float(
+            np.max(np.abs(fine.absorption_closure))
+        ),
+        "final_tnldr_coarse_tdvp_truncation_error": float(
+            fitted.tdvp_truncation_errors[-1]
+        ),
+        "final_tnldr_fine_tdvp_truncation_error": float(
+            fine.tdvp_truncation_errors[-1]
+        ),
         "maximum_direct_edge_probability": float(np.max(edge)),
         "final_direct_edge_probability": float(edge[-1]),
         "direct_database_writes": int(direct.direct_product_info["database_writes"]),
@@ -910,8 +944,8 @@ def main():
             "fit": fit_seconds,
             "direct_build": direct_build_seconds,
             "direct_propagation": direct_seconds,
-            "tnldr_13_propagation": fitted_seconds,
-            "tnldr_17_propagation": fine_seconds,
+            "tnldr_coarse_propagation": fitted_seconds,
+            "tnldr_fine_propagation": fine_seconds,
         },
     }
     (output / "physical_dynamics_summary.json").write_text(
@@ -921,11 +955,11 @@ def main():
         output / "h3plus_fci_physical_dynamics.npz",
         time_fs=time_fs,
         direct_populations=populations_direct,
-        tnldr_13_populations=fitted.populations,
-        tnldr_17_populations=fine.populations,
+        tnldr_coarse_populations=fitted.populations,
+        tnldr_fine_populations=fine.populations,
         direct_norms=direct.norm,
-        tnldr_13_norms=fitted.norms,
-        tnldr_17_norms=fine.norms,
+        tnldr_coarse_norms=fitted.norms,
+        tnldr_fine_norms=fine.norms,
         direct_edge_probability=edge,
         direct_states=direct.states,
         axes=np.asarray(grid.x),
@@ -950,11 +984,11 @@ def main():
         )
         panels[0].plot(
             time_fs, fitted.populations[:, state], "--", color=color,
-            label=fr"TNLDR-13 $S_{state + 1}$",
+            label=fr"TNLDR-{grid_points} $S_{state + 1}$",
         )
         panels[0].plot(
             time_fs, fine.populations[:, state], ":", color=color,
-            label=fr"TNLDR-17 $S_{state + 1}$",
+            label=fr"TNLDR-{fine_points} $S_{state + 1}$",
         )
     panels[0].set(
         xlabel="time (fs)", ylabel="adiabatic population",
@@ -962,8 +996,14 @@ def main():
     )
     panels[0].legend(frameon=False, ncol=2)
     panels[1].plot(time_fs, direct.norm, color="0.15", label="Direct")
-    panels[1].plot(time_fs, fitted.norms, "--", color="#009E73", label="TNLDR-13")
-    panels[1].plot(time_fs, fine.norms, ":", color="#CC79A7", label="TNLDR-17")
+    panels[1].plot(
+        time_fs, fitted.norms, "--", color="#009E73",
+        label=f"TNLDR-{grid_points}",
+    )
+    panels[1].plot(
+        time_fs, fine.norms, ":", color="#CC79A7",
+        label=f"TNLDR-{fine_points}",
+    )
     panels[1].set(
         xlabel="time (fs)", ylabel="survival probability",
         title="(b) Three-axis CAP",
@@ -971,11 +1011,11 @@ def main():
     panels[1].legend(frameon=False)
     panels[2].semilogy(
         time_fs, np.maximum(np.max(population_error, axis=1), 1.0e-15),
-        color="#7A3E9D", label="TNLDR-13 vs direct",
+        color="#7A3E9D", label=f"TNLDR-{grid_points} vs direct",
     )
     panels[2].semilogy(
         time_fs, np.maximum(np.max(grid_error, axis=1), 1.0e-15),
-        color="#E69F00", label="TNLDR 13 vs 17",
+        color="#E69F00", label=f"TNLDR {grid_points} vs {fine_points}",
     )
     panels[2].set(
         xlabel="time (fs)", ylabel="maximum population difference",

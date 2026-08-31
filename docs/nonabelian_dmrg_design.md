@@ -108,6 +108,23 @@ Key references:
 
 ## Current pyqed Status
 
+### Shared storage architecture
+
+The repository now has one tensor vocabulary. `pyqed.symmetry.Leg` owns axis
+orientation, dimensions, and optional irreducible sectors, and
+`pyqed.symmetry.IrrepTensor` owns dense, Abelian-block, or reduced non-Abelian
+data. Dense finite MPS/MPO cores are one-block tensors under this interface;
+the Abelian direct implementation is an optimized subclass; SU(2) tensors add
+fusion and recoupling metadata without changing the owner API. NARG operator
+spaces and `UniformMPS` use these same objects.
+
+`pyqed.mps.MPS` and `pyqed.mps.MPO` are the only public finite-chain owners.
+The symmetry namespace re-exports them. Specialized non-Abelian `MPOCore`,
+`IrreducibleMPO`, and `RankCoupledMPO` objects describe individual site cores
+and virtual operator channels; they are not competing chain owners. Physical
+site descriptors remain in `state.sites`, and numerical cores are in
+`state.tensors` (also available as `state.factors`).
+
 Implemented pieces:
 
 - `ReducedTensorOperator` for local irreducible spatial-orbital fermion tensors.

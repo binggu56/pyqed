@@ -127,7 +127,10 @@ def _selected(values, bands, kptlist):
         values = values[None, :]
     if values.ndim != 2:
         raise ValueError("Orbital energies must have shape (nmo,) or (nkpts, nmo).")
-    return values[np.asarray(kptlist, dtype=int)[:, None], np.asarray(bands, dtype=int)]
+    return values[
+        np.asarray(kptlist, dtype=int)[:, None],
+        np.asarray(bands, dtype=int),
+    ]
 
 
 def _gamma_index(kpts, tol=1.0e-10):

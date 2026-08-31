@@ -43,7 +43,7 @@ from .renormalized import (
     get_direct_factorized_orthonormal_kernel_policy,
     get_su2_kernel_policy,
 )
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 _BASIS_TRANSFORM_DENSE_MATVEC_SIZE = 0
 _SU2_CPP_DAVIDSON_BLOCK_SIZE = 1
@@ -418,8 +418,8 @@ class PackedBlockPreconditioner:
 
 
 def _pack_tensor_state(tensor, *, layout=None):
-    if not isinstance(tensor, NonabelianTensor):
-        raise ValueError("_pack_tensor_state expects a NonabelianTensor.")
+    if not isinstance(tensor, IrrepTensor):
+        raise ValueError("_pack_tensor_state expects an IrrepTensor.")
 
     if isinstance(layout, TwoSiteBasis):
         blocks = layout.blocks_from_two_site_tensor(
@@ -465,8 +465,8 @@ def _pack_tensor_state(tensor, *, layout=None):
 
 
 def _unpack_tensor_state(vector, template, *, layout):
-    if not isinstance(template, NonabelianTensor):
-        raise ValueError("_unpack_tensor_state expects a NonabelianTensor template.")
+    if not isinstance(template, IrrepTensor):
+        raise ValueError("_unpack_tensor_state expects an IrrepTensor template.")
 
     if isinstance(layout, TwoSiteBasis):
         return layout.tensor_from_blocks(
@@ -480,7 +480,7 @@ def _unpack_tensor_state(vector, template, *, layout):
     for entry in layout:
         piece = vector[entry.offset:entry.offset + entry.size]
         data[entry.key] = piece.reshape(entry.shape)
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [leg[:] for leg in template.qns],
         template.dirs[:],
@@ -517,7 +517,7 @@ def _two_site_basis_for_layout(template, layout):
 
     if isinstance(layout, TwoSiteBasis):
         return layout
-    if not isinstance(template, NonabelianTensor) or template.rank != 4:
+    if not isinstance(template, IrrepTensor) or template.rank != 4:
         return None
     return TwoSiteBasis.from_tensor_and_layout(template, _layout_entries(layout))
 
@@ -622,7 +622,7 @@ def _reduced_state_to_tensor(state, template):
                 data[entry.key] = np.zeros(entry.shape, dtype=float)
     metadata = template.metadata.copy()
     metadata["contracted_channel_blocks_current"] = False
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [leg[:] for leg in template.qns],
         template.dirs[:],
@@ -722,8 +722,8 @@ def _reduced_operator_to_matvec(op, template, state_layout):
             return out
         tensor = _reduced_state_to_tensor(state, template)
         out = op.tensor_matvec(tensor)
-        if not isinstance(out, NonabelianTensor):
-            raise TypeError("tensor_matvec must return a NonabelianTensor.")
+        if not isinstance(out, IrrepTensor):
+            raise TypeError("tensor_matvec must return an IrrepTensor.")
         return _tensor_to_reduced_state(out, state_layout=state_layout)
 
     return matvec
@@ -819,8 +819,8 @@ def pack_two_site_state(two_site, *, layout=None):
     """
     Pack a rank-4 non-Abelian two-site tensor into a dense vector.
     """
-    if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
-        raise ValueError("pack_two_site_state expects a rank-4 NonabelianTensor.")
+    if not isinstance(two_site, IrrepTensor) or two_site.rank != 4:
+        raise ValueError("pack_two_site_state expects a rank-4 IrrepTensor.")
 
     return _pack_tensor_state(two_site, layout=layout)
 
@@ -834,8 +834,8 @@ def two_site_state_basis(two_site, *, layout=None):
         to derive the canonical layout.
     :returns: Explicit ``TwoSiteBasis`` matching the packed layout.
     """
-    if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
-        raise ValueError("two_site_state_basis expects a rank-4 NonabelianTensor.")
+    if not isinstance(two_site, IrrepTensor) or two_site.rank != 4:
+        raise ValueError("two_site_state_basis expects a rank-4 IrrepTensor.")
     if layout is None:
         _, layout = pack_two_site_state(two_site)
     return TwoSiteBasis.from_tensor_and_layout(two_site, _layout_entries(layout))
@@ -845,8 +845,8 @@ def unpack_two_site_state(vector, template, *, layout):
     """
     Rebuild a rank-4 non-Abelian tensor from a packed vector and template.
     """
-    if not isinstance(template, NonabelianTensor) or template.rank != 4:
-        raise ValueError("unpack_two_site_state expects a rank-4 NonabelianTensor template.")
+    if not isinstance(template, IrrepTensor) or template.rank != 4:
+        raise ValueError("unpack_two_site_state expects a rank-4 IrrepTensor template.")
 
     return _unpack_tensor_state(vector, template, layout=layout)
 
@@ -855,8 +855,8 @@ def _coupled_two_site_template(two_site, *, filter_boundary_target=False):
     """
     Build a rank-3 coupled-basis template by fusing the two physical legs.
     """
-    if not isinstance(two_site, NonabelianTensor) or two_site.rank != 4:
-        raise ValueError("_coupled_two_site_template expects a rank-4 NonabelianTensor.")
+    if not isinstance(two_site, IrrepTensor) or two_site.rank != 4:
+        raise ValueError("_coupled_two_site_template expects a rank-4 IrrepTensor.")
     coupled = combine_legs(two_site, (1, 2), new_axis=1, use_cg=True)
     if filter_boundary_target:
         return _filter_coupled_template_to_boundary_target(coupled)
@@ -879,7 +879,7 @@ def _filter_coupled_template_to_boundary_target(coupled):
     Keep only coupled two-site blocks whose left x physical sector can reach the
     right boundary sector.
     """
-    if not isinstance(coupled, NonabelianTensor) or coupled.rank != 3:
+    if not isinstance(coupled, IrrepTensor) or coupled.rank != 3:
         return coupled
     data = {
         key: block
@@ -888,7 +888,7 @@ def _filter_coupled_template_to_boundary_target(coupled):
     }
     if not data:
         raise ValueError("Coupled two-site template has no blocks compatible with the boundary target sector.")
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [leg[:] for leg in coupled.qns],
         coupled.dirs[:],
@@ -909,7 +909,7 @@ def _uncouple_two_site_tensor(coupled_two_site):
     Undo :func:`_coupled_two_site_template` and restore ``(L, P_left, P_right, R)`` order.
     """
     if (
-        not isinstance(coupled_two_site, NonabelianTensor)
+        not isinstance(coupled_two_site, IrrepTensor)
         or coupled_two_site.rank != 3
         or coupled_two_site.fusion_legs[1] is None
         or coupled_two_site.fusion_legs[1].pipe is None
@@ -967,7 +967,7 @@ def _uncouple_two_site_tensor(coupled_two_site):
             else:
                 data[key_out] = piece
 
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [
             list(coupled_two_site.qns[0]),
@@ -1158,7 +1158,7 @@ class _StructuredBasisTransform:
 
 def _build_basis_transform_direct(two_site, coupled, coupled_layout, orig_layout):
     if (
-        not isinstance(coupled, NonabelianTensor)
+        not isinstance(coupled, IrrepTensor)
         or coupled.rank != 3
         or coupled.fusion_legs[1] is None
         or coupled.fusion_legs[1].pipe is None
@@ -1343,8 +1343,8 @@ def _resolve_davidson_operator(local_operator, template, layout):
         def matvec(vec):
             tensor = unpack_two_site_state(vec, template, layout=layout)
             out = op.tensor_matvec(tensor)
-            if not isinstance(out, NonabelianTensor):
-                raise TypeError("tensor_matvec must return a NonabelianTensor.")
+            if not isinstance(out, IrrepTensor):
+                raise TypeError("tensor_matvec must return an IrrepTensor.")
             packed, _ = pack_two_site_state(out, layout=layout)
             return packed
         diag = None if op.diag is None else np.asarray(op.diag, dtype=float)
@@ -1536,7 +1536,7 @@ def _build_iterative_guess_reduced(diag_h, state_layout, *, neigen=1, guess=None
 def _prepare_reduced_guess(template, state_layout, guess):
     guess_state = _tensor_to_reduced_state(template, state_layout=state_layout)
     if guess is not None:
-        if isinstance(guess, NonabelianTensor):
+        if isinstance(guess, IrrepTensor):
             guess_state = _tensor_to_reduced_state(guess, state_layout=state_layout)
         elif isinstance(guess, ReducedStateVector):
             guess_state = guess
@@ -3341,8 +3341,8 @@ def _coupled_operator_tensor_matvec(op, two_site, uncoupled_layout):
         uncoupled_tensor = _uncouple_two_site_tensor(coupled_tensor)
         if op.tensor_matvec is not None:
             out_uncoupled = op.tensor_matvec(uncoupled_tensor)
-            if not isinstance(out_uncoupled, NonabelianTensor):
-                raise TypeError("tensor_matvec must return a NonabelianTensor.")
+            if not isinstance(out_uncoupled, IrrepTensor):
+                raise TypeError("tensor_matvec must return an IrrepTensor.")
         elif op.reduced_matvec is not None:
             uncoupled_state = _tensor_to_reduced_state(uncoupled_tensor, state_layout=uncoupled_state_layout)
             out_state = op.reduced_matvec(uncoupled_state)
@@ -8091,7 +8091,7 @@ def solve_local_two_site(
     layout = local_basis
     if guess is None:
         guess_vec = vec0
-    elif isinstance(guess, NonabelianTensor):
+    elif isinstance(guess, IrrepTensor):
         guess_vec, _ = pack_two_site_state(guess, layout=layout)
     else:
         guess_vec = np.asarray(guess)
@@ -8103,7 +8103,7 @@ def solve_local_two_site(
         root_guess_vecs = []
         for root_guess in root_guesses:
             try:
-                if isinstance(root_guess, NonabelianTensor):
+                if isinstance(root_guess, IrrepTensor):
                     root_vec, _ = pack_two_site_state(root_guess, layout=layout)
                 else:
                     root_vec = np.asarray(root_guess)
@@ -8427,7 +8427,7 @@ def solve_local_two_site(
         if coupled_template is not None:
             if guess is None:
                 guess_coupled = coupled_template
-            elif isinstance(guess, NonabelianTensor):
+            elif isinstance(guess, IrrepTensor):
                 guess_coupled = _couple_two_site_tensor(guess)
             else:
                 guess_uncoupled = unpack_two_site_state(np.asarray(guess_vec), two_site, layout=layout)
@@ -8924,7 +8924,7 @@ def solve_local_two_site(
     if coupled_template is not None:
         if guess is None:
             guess_coupled = coupled_template
-        elif isinstance(guess, NonabelianTensor):
+        elif isinstance(guess, IrrepTensor):
             guess_coupled = _couple_two_site_tensor(guess)
         else:
             guess_uncoupled = unpack_two_site_state(np.asarray(guess_vec), two_site, layout=layout)

@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from pyqed.dvr import ExponentialDVR
-from pyqed.mps import MPS, dense_to_symmetric
+from pyqed.mps import MPO, MPS, dense_to_symmetric
 from pyqed.mps.symmetry import QN, SymmetryManager
 from pyqed.mps.mpo import sop_to_mpo
 
@@ -717,8 +717,465 @@ class AlternatingWilsonDVRMPO:
             native_site_storage=native_site_storage,
         )
         state = MPS(symmetric, labels=["lv", "rv", "p"])
+        norm_squared = float(np.real(state.norm_squared()))
+        if not np.isfinite(norm_squared) or norm_squared <= 0.0:
+            raise RuntimeError("the random Gauss-sector seed has zero norm")
+        local_scale = np.exp(-0.5 * np.log(norm_squared) / self.nsites)
+        state.factors = [factor * local_scale for factor in state.factors]
         state.gauss_bond_dimensions = [len(bond) for bond in bond_qns]
         return state
 
 
-__all__ = ["AlternatingWilsonDVRMPO", "WilsonDVRMPO"]
+class OpenSineWilsonDVRMPO(AlternatingWilsonDVRMPO):
+    r"""Open gauge-DVR MPO with paired DCT-IV/DST-IV Dirac components.
+
+    The two spinor components use the half-integer modes
+
+    .. math::
+
+        C_{jn}=\sqrt{2/N}\cos[\pi(j+1/2)(n+1/2)/N],\qquad
+        S_{jn}=\sqrt{2/N}\sin[\pi(j+1/2)(n+1/2)/N].
+
+    Consequently ``d/dx`` maps the sine component to the cosine component
+    exactly and vice versa.  The endpoint conditions are complementary:
+    the sine component vanishes at the left wall and the cosine component at
+    the right wall.  They make the first-order Dirac operator self-adjoint and
+    set the normal current to zero, rather than overconstraining both spinor
+    components with Dirichlet conditions.
+
+    Every dense spectral hop carries the unique non-wrapping open Wilson line.
+    Matter and the ``N-1`` compact links are separate MPS sites and every local
+    Gauss law is an exact additive quantum number.  The hopping MPO is built by
+    a finite-state automaton with ``O(N)`` bond dimension; the implementation
+    is an open-boundary spectral adaptation, not an exact reproduction of a
+    published DVR lattice Hamiltonian.
+
+    The gauge formulation follows J. Kogut and L. Susskind, Phys. Rev. D 11,
+    395 (1975), DOI: 10.1103/PhysRevD.11.395, and T. Banks, L. Susskind, and
+    J. Kogut, Phys. Rev. D 13, 1043 (1976), DOI:
+    10.1103/PhysRevD.13.1043.  For self-adjoint confined Dirac boundaries see
+    M. H. Al-Hashimi and U.-J. Wiese, Ann. Phys. 327, 1 (2012), DOI:
+    10.1016/j.aop.2011.09.001.
+    """
+
+    def __init__(
+        self,
+        npts: int,
+        length: float,
+        *,
+        coupling: float = 1.0,
+        mass: float = 0.0,
+        flux_cutoff: int = 2,
+        left_flux: int = 0,
+        right_flux: int = 0,
+    ):
+        if int(npts) < 2:
+            raise ValueError("npts must be an integer of at least two")
+        if not np.isfinite(length) or float(length) <= 0.0:
+            raise ValueError("length must be positive and finite")
+        if not np.isfinite(coupling) or float(coupling) <= 0.0:
+            raise ValueError("coupling must be positive and finite")
+        if not np.isfinite(mass):
+            raise ValueError("mass must be finite")
+        if int(flux_cutoff) < 1:
+            raise ValueError("flux_cutoff must be a positive integer")
+        if abs(int(left_flux)) > int(flux_cutoff):
+            raise ValueError("left_flux lies outside the flux cutoff")
+        if abs(int(right_flux)) > int(flux_cutoff):
+            raise ValueError("right_flux lies outside the flux cutoff")
+
+        self.npts = int(npts)
+        self.length = float(length)
+        self.spacing = self.length / self.npts
+        self.coupling = float(coupling)
+        self.mass = float(mass)
+        self.flux_cutoff = int(flux_cutoff)
+        self.left_flux = int(left_flux)
+        self.right_flux = int(right_flux)
+        self.gauss_penalty = 0.0
+        self.link_dim = 2 * self.flux_cutoff + 1
+        self.nlinks = self.npts - 1
+        self.nsites = 2 * self.npts - 1
+        self.dims = tuple(
+            4 if chain_site % 2 == 0 else self.link_dim
+            for chain_site in range(self.nsites)
+        )
+
+        identity_matter = np.eye(4, dtype=complex)
+        annihilation = tuple(_fermion_annihilation(spin) for spin in (0, 1))
+        creation = tuple(operator.conj().T for operator in annihilation)
+        number = tuple(operator.conj().T @ operator for operator in annihilation)
+        parity = np.diag(
+            [(-1) ** bits.bit_count() for bits in range(4)]
+        ).astype(complex)
+        charge = number[0] + number[1] - identity_matter
+        self.matter = {
+            "I": identity_matter,
+            "c": annihilation,
+            "cdag": creation,
+            "P": parity,
+            "q": charge,
+            "q2": charge @ charge,
+            "mass": number[0] - number[1],
+        }
+        flux_values = np.arange(-self.flux_cutoff, self.flux_cutoff + 1)
+        identity_link = np.eye(self.link_dim, dtype=complex)
+        flux = np.diag(flux_values.astype(float)).astype(complex)
+        lower = np.zeros((self.link_dim, self.link_dim), dtype=complex)
+        lower[np.arange(self.link_dim - 1), np.arange(1, self.link_dim)] = 1.0
+        self.link = {
+            "I": identity_link,
+            "L": flux,
+            "L2": flux @ flux,
+            "U": lower,
+            "Udag": lower.conj().T,
+        }
+
+        grid_index = np.arange(self.npts, dtype=float)[:, None] + 0.5
+        mode_index = np.arange(self.npts, dtype=float)[None, :] + 0.5
+        angle = np.pi * grid_index * mode_index / self.npts
+        scale = np.sqrt(2.0 / self.npts)
+        self.cosine_transform = scale * np.cos(angle)
+        self.sine_transform = scale * np.sin(angle)
+        self.momenta = np.pi * (np.arange(self.npts) + 0.5) / self.length
+        self.derivative = (
+            self.cosine_transform
+            @ np.diag(self.momenta)
+            @ self.sine_transform.T
+        )
+        self.kinetic = -1j * self.derivative
+        self.terms = None
+        self.gauss_terms = self._open_gauss_squared_terms()
+        self.mpo = None
+        self.gauss_mpo = None
+        self.vector_mpo = None
+        self.scalar_mpo = None
+
+    def one_particle_matrix(self):
+        """Return the free paired-basis Dirac matrix before gauge dressing."""
+        identity = np.eye(self.npts)
+        return np.block(
+            [
+                [self.mass * identity, self.kinetic],
+                [self.kinetic.conj().T, -self.mass * identity],
+            ]
+        )
+
+    def _term(self, coefficient, matter_actions=None, link_actions=None):
+        operators = [None] * self.nsites
+        for site, operator in (matter_actions or {}).items():
+            operators[2 * int(site)] = operator
+        for link, operator in (link_actions or {}).items():
+            operators[2 * int(link) + 1] = operator
+        return coefficient, tuple(operators)
+
+    def _kinetic_term(
+        self,
+        destination_site,
+        source_site,
+        destination_spin,
+        source_spin,
+        coefficient,
+    ):
+        destination_site = int(destination_site)
+        source_site = int(source_site)
+        if destination_site == source_site:
+            return self._term(
+                coefficient,
+                matter_actions={
+                    destination_site: self.matter["cdag"][destination_spin]
+                    @ self.matter["c"][source_spin]
+                },
+            )
+        matter_actions = {}
+        link_actions = {}
+        if destination_site < source_site:
+            matter_actions[destination_site] = (
+                self.matter["cdag"][destination_spin] @ self.matter["P"]
+            )
+            for site in range(destination_site + 1, source_site):
+                matter_actions[site] = self.matter["P"]
+            matter_actions[source_site] = self.matter["c"][source_spin]
+            for link in range(destination_site, source_site):
+                link_actions[link] = self.link["U"]
+        else:
+            matter_actions[source_site] = (
+                self.matter["P"] @ self.matter["c"][source_spin]
+            )
+            for site in range(source_site + 1, destination_site):
+                matter_actions[site] = self.matter["P"]
+            matter_actions[destination_site] = self.matter["cdag"][destination_spin]
+            for link in range(source_site, destination_site):
+                link_actions[link] = self.link["Udag"]
+        return self._term(coefficient, matter_actions, link_actions)
+
+    def reference_terms(self):
+        """Return explicit SOP terms for small-system validation only."""
+        terms = []
+        electric = 0.5 * self.coupling**2 * self.spacing
+        for link in range(self.nlinks):
+            terms.append(self._term(electric, link_actions={link: self.link["L2"]}))
+        for site in range(self.npts):
+            onsite = (
+                self.kinetic[site, site]
+                * self.matter["cdag"][0]
+                @ self.matter["c"][1]
+                + self.kinetic[site, site].conjugate()
+                * self.matter["cdag"][1]
+                @ self.matter["c"][0]
+                + self.mass * self.matter["mass"]
+            )
+            terms.append(self._term(1.0, matter_actions={site: onsite}))
+        for left in range(self.npts):
+            for right in range(left + 1, self.npts):
+                terms.extend(
+                    (
+                        self._kinetic_term(
+                            left, right, 0, 1, self.kinetic[left, right]
+                        ),
+                        self._kinetic_term(
+                            right,
+                            left,
+                            1,
+                            0,
+                            self.kinetic[left, right].conjugate(),
+                        ),
+                        self._kinetic_term(
+                            right, left, 0, 1, self.kinetic[right, left]
+                        ),
+                        self._kinetic_term(
+                            left,
+                            right,
+                            1,
+                            0,
+                            self.kinetic[right, left].conjugate(),
+                        ),
+                    )
+                )
+        return terms
+
+    def build_reference_mpo(self):
+        """Build the explicit SOP MPO; intended only for tiny validation grids."""
+        return sop_to_mpo(self.dims, self.reference_terms(), dtype=complex)
+
+    def build_mpo(self, *, max_bond=None):
+        """Build the exact ``O(N)``-bond finite-state hopping MPO."""
+        nchannels = 4 * self.nlinks
+        rank = nchannels + 2
+        done = rank - 1
+        families = range(4)
+
+        def channel(family, left):
+            return 1 + int(family) * self.nlinks + int(left)
+
+        starts = (
+            self.matter["cdag"][0] @ self.matter["P"],
+            self.matter["P"] @ self.matter["c"][0],
+            self.matter["P"] @ self.matter["c"][1],
+            self.matter["cdag"][1] @ self.matter["P"],
+        )
+        closes = (
+            self.matter["c"][1],
+            self.matter["cdag"][1],
+            self.matter["cdag"][0],
+            self.matter["c"][0],
+        )
+        link_propagators = (
+            self.link["U"],
+            self.link["Udag"],
+            self.link["Udag"],
+            self.link["U"],
+        )
+        factors = []
+        electric = 0.5 * self.coupling**2 * self.spacing
+        for chain_site, dimension in enumerate(self.dims):
+            core = np.zeros((rank, rank, dimension, dimension), dtype=complex)
+            identity = np.eye(dimension, dtype=complex)
+            core[0, 0] = identity
+            core[done, done] = identity
+            if chain_site % 2 == 0:
+                site = chain_site // 2
+                onsite = (
+                    self.kinetic[site, site]
+                    * self.matter["cdag"][0]
+                    @ self.matter["c"][1]
+                    + self.kinetic[site, site].conjugate()
+                    * self.matter["cdag"][1]
+                    @ self.matter["c"][0]
+                    + self.mass * self.matter["mass"]
+                )
+                core[0, done] += onsite
+                if site < self.nlinks:
+                    for family in families:
+                        core[0, channel(family, site)] = starts[family]
+                for left in range(site):
+                    coefficients = (
+                        self.kinetic[left, site],
+                        self.kinetic[left, site].conjugate(),
+                        self.kinetic[site, left],
+                        self.kinetic[site, left].conjugate(),
+                    )
+                    for family, coefficient in enumerate(coefficients):
+                        active = channel(family, left)
+                        core[active, active] = self.matter["P"]
+                        core[active, done] += coefficient * closes[family]
+            else:
+                link = chain_site // 2
+                core[0, done] += electric * self.link["L2"]
+                for left in range(link + 1):
+                    for family in families:
+                        active = channel(family, left)
+                        core[active, active] = link_propagators[family]
+            if chain_site == 0:
+                core = core[0:1]
+            if chain_site == self.nsites - 1:
+                core = core[:, done : done + 1]
+            factors.append(core)
+        self.mpo = MPO(factors)
+        return self.mpo if max_bond is None else self.mpo.compress(max_bond)
+
+    def _open_gauss_squared_terms(self):
+        terms = []
+        for site in range(self.npts):
+            charge = self.matter["q"]
+            terms.append(self._term(1.0, matter_actions={site: charge @ charge}))
+            previous = site - 1 if site else None
+            outgoing = site if site < self.nlinks else None
+            if previous is not None:
+                terms.append(self._term(1.0, link_actions={previous: self.link["L2"]}))
+                terms.append(
+                    self._term(
+                        -2.0,
+                        matter_actions={site: charge},
+                        link_actions={previous: self.link["L"]},
+                    )
+                )
+            if outgoing is not None:
+                terms.append(self._term(1.0, link_actions={outgoing: self.link["L2"]}))
+                terms.append(
+                    self._term(
+                        2.0,
+                        matter_actions={site: charge},
+                        link_actions={outgoing: self.link["L"]},
+                    )
+                )
+            if previous is not None and outgoing is not None:
+                terms.append(
+                    self._term(
+                        -2.0,
+                        link_actions={
+                            previous: self.link["L"],
+                            outgoing: self.link["L"],
+                        },
+                    )
+                )
+        return terms
+
+    def build_gauss_mpo(self, *, max_bond=None):
+        self.gauss_mpo = sop_to_mpo(
+            self.dims, self.gauss_terms, max_rank=max_bond, dtype=complex
+        )
+        return self.gauss_mpo
+
+    @staticmethod
+    def _additive_mpo(dims, local_operators):
+        factors = []
+        for site, (dimension, operator) in enumerate(zip(dims, local_operators)):
+            core = np.zeros((2, 2, dimension, dimension), dtype=complex)
+            identity = np.eye(dimension, dtype=complex)
+            core[0, 0] = identity
+            core[0, 1] = operator
+            core[1, 1] = identity
+            if site == 0:
+                core = core[0:1]
+            if site == len(dims) - 1:
+                core = core[:, 1:2]
+            factors.append(core)
+        return MPO(factors)
+
+    def build_vector_mpo(self):
+        """Build the normalized open-chain electric-field zero mode."""
+        norm = np.sqrt(self.nlinks)
+        operators = []
+        for chain_site, dimension in enumerate(self.dims):
+            if chain_site % 2:
+                operators.append(self.link["L"] / norm)
+            else:
+                operators.append(np.zeros((dimension, dimension), dtype=complex))
+        self.vector_mpo = self._additive_mpo(self.dims, operators)
+        return self.vector_mpo
+
+    def build_scalar_mpo(self):
+        r"""Build ``sum_j bar(psi_j) psi_j / sqrt(N)``."""
+        operators = []
+        for chain_site, dimension in enumerate(self.dims):
+            if chain_site % 2 == 0:
+                operators.append(self.matter["mass"] / np.sqrt(self.npts))
+            else:
+                operators.append(np.zeros((dimension, dimension), dtype=complex))
+        self.scalar_mpo = self._additive_mpo(self.dims, operators)
+        return self.scalar_mpo
+
+    def product_mps(self, matter_bits=None, fluxes=None):
+        if matter_bits is None:
+            matter_bits = [1 if site % 2 == 0 else 2 for site in range(self.npts)]
+        if fluxes is None:
+            fluxes = [0] * self.nlinks
+        if len(matter_bits) != self.npts or len(fluxes) != self.nlinks:
+            raise ValueError("expected N matter values and N-1 open-link fluxes")
+        factors = []
+        for site, bits in enumerate(matter_bits):
+            matter_tensor = np.zeros((1, 4, 1), dtype=complex)
+            matter_tensor[0, int(bits), 0] = 1.0
+            factors.append(matter_tensor)
+            if site < self.nlinks:
+                flux = int(fluxes[site])
+                if not -self.flux_cutoff <= flux <= self.flux_cutoff:
+                    raise ValueError("product flux lies outside the link cutoff")
+                link_tensor = np.zeros((1, self.link_dim, 1), dtype=complex)
+                link_tensor[0, flux + self.flux_cutoff, 0] = 1.0
+                factors.append(link_tensor)
+        return MPS(factors)
+
+    def gauss_qn_maps(self):
+        maps = []
+        matter_charge = np.real(np.diag(self.matter["q"])).astype(int)
+        flux_values = np.arange(-self.flux_cutoff, self.flux_cutoff + 1)
+        for site in range(self.npts):
+            matter_map = {}
+            for state, charge in enumerate(matter_charge):
+                components = [0] * self.npts
+                components[site] = -int(charge)
+                matter_map[state] = QN(*components)
+            maps.append(matter_map)
+            if site == self.nlinks:
+                continue
+            link_map = {}
+            for state, flux in enumerate(flux_values):
+                components = [0] * self.npts
+                components[site] -= int(flux)
+                components[site + 1] += int(flux)
+                link_map[state] = QN(*components)
+            maps.append(link_map)
+        return maps
+
+    def gauss_symmetry(self):
+        maps = self.gauss_qn_maps()
+        target = QN(
+            -self.left_flux,
+            *([0] * (self.npts - 2)),
+            self.right_flux,
+        )
+        manager = SymmetryManager(
+            list(maps[0].values()),
+            target,
+            sym_types=[f"gauss_{site}" for site in range(self.npts)],
+        )
+        return maps, target, manager
+
+
+__all__ = [
+    "AlternatingWilsonDVRMPO",
+    "OpenSineWilsonDVRMPO",
+    "WilsonDVRMPO",
+]

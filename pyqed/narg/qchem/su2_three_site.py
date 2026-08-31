@@ -18,7 +18,7 @@ import time
 import numpy as np
 from scipy.linalg import eigh
 
-from pyqed.narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, spin_label
+from pyqed.narg.irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep, spin_label
 from pyqed import SpinHalfFermionOperators
 from .su2_core import (
     Multiplet,
@@ -255,7 +255,7 @@ class ThreeSiteSU2NARG:
 
     source_block: TruncatedSU2NARG
     branch_states: list[BranchMultiplet]
-    site: IrrepSite
+    site: Leg
     bases: dict[Irrep, np.ndarray]
     provenance: dict[Irrep, list[BranchMultiplet]]
     hamiltonian: IrrepTensor
@@ -392,7 +392,7 @@ def scalar_product_angular_cache(block: RenormalizedSU2Block) -> dict:
 
 def branch_irrep_site(
     states: list[BranchMultiplet], m2: int | None = None
-) -> tuple[IrrepSite, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
+) -> tuple[Leg, dict[Irrep, np.ndarray], dict[Irrep, list[BranchMultiplet]]]:
     """Build SU(2) sector bases from grown branch multiplets."""
     sectors: dict[Irrep, list[np.ndarray]] = {}
     provenance: dict[Irrep, list[BranchMultiplet]] = {}
@@ -407,7 +407,7 @@ def branch_irrep_site(
 
     dims = {irrep: len(cols) for irrep, cols in sectors.items()}
     bases = {irrep: np.column_stack(cols) for irrep, cols in sectors.items()}
-    return IrrepSite(su2_product_symmetry(), dims), bases, provenance
+    return Leg(dims, symmetry=su2_product_symmetry()), bases, provenance
 
 
 def expanded_component_states(block: TruncatedSU2NARG) -> list[ComponentState]:
@@ -843,7 +843,7 @@ def scalar_product_angular_terms(
 
     grouped = product_states_for_block(block)
     dims = {irrep: len(states) for irrep, states in grouped.items()}
-    site = IrrepSite(su2_product_symmetry(), dims)
+    site = Leg(dims, symmetry=su2_product_symmetry())
     block_dnelec, block_rank2 = block_op.charge
     local_dnelec, local_rank2 = local_op.charge
     terms_by_irrep = {}
@@ -1693,7 +1693,10 @@ def product_tensor_angular_terms(
         return cached
 
     grouped = product_states_for_block(block)
-    site = IrrepSite(su2_product_symmetry(), {irrep: len(states) for irrep, states in grouped.items()})
+    site = Leg(
+        {irrep: len(states) for irrep, states in grouped.items()},
+        symmetry=su2_product_symmetry(),
+    )
     block_dnelec, block_rank2 = block_op.charge
     local_dnelec, local_rank2 = local_op.charge
     dnelec = block_dnelec + local_dnelec
@@ -1896,9 +1899,9 @@ def compiled_reduced_growth_graph(
 
     grouped = product_states_for_block(block)
     sectors = list(grouped)
-    site = IrrepSite(
-        su2_product_symmetry(),
+    site = Leg(
         {irrep: len(grouped[irrep]) for irrep in sectors},
+        symmetry=su2_product_symmetry(),
     )
     sector_specs = [
         (
@@ -2229,8 +2232,14 @@ def direct_reduced_hopping_tensor(block: RenormalizedSU2Block, h1e, site_index: 
     if out is None:
         grouped = product_states_for_block(block)
         return IrrepTensor(
-            IrrepSite(su2_product_symmetry(), {irrep: len(states) for irrep, states in grouped.items()}),
-            IrrepSite(su2_product_symmetry(), {irrep: len(states) for irrep, states in grouped.items()}),
+            Leg(
+                {irrep: len(states) for irrep, states in grouped.items()},
+                symmetry=su2_product_symmetry(),
+            ),
+            Leg(
+                {irrep: len(states) for irrep, states in grouped.items()},
+                symmetry=su2_product_symmetry(),
+            ),
             OpIrrep((0, 0)),
             {},
         )
@@ -2851,7 +2860,7 @@ def product_basis_coordinates(block_basis: np.ndarray, primitive_basis: np.ndarr
     return out
 
 
-def assembled_hamiltonian_irrep_tensor(h_component: np.ndarray, block_basis: np.ndarray, site: IrrepSite, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
+def assembled_hamiltonian_irrep_tensor(h_component: np.ndarray, block_basis: np.ndarray, site: Leg, bases: dict[Irrep, np.ndarray]) -> IrrepTensor:
     """Project an assembled product-basis Hamiltonian into grown SU(2) sectors."""
     blocks = {}
     for irrep, primitive_basis in bases.items():
@@ -2864,7 +2873,7 @@ def assembled_hamiltonian_irrep_tensor(h_component: np.ndarray, block_basis: np.
 def product_operator_irrep_tensor(
     operator_component: np.ndarray,
     block_basis: np.ndarray,
-    site: IrrepSite,
+    site: Leg,
     bases: dict[Irrep, np.ndarray],
 ) -> IrrepTensor:
     """Project a product-basis scalar operator into grown SU(2) sectors."""

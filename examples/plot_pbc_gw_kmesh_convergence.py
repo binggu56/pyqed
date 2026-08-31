@@ -124,14 +124,16 @@ def plot(rows, output):
         axis.spines["top"].set_visible(False)
         axis.spines["right"].set_visible(False)
         axis.text(
-            0.02,
-            0.97,
+            -0.08,
+            1.04,
             panel,
             transform=axis.transAxes,
-            va="top",
+            va="bottom",
+            ha="left",
             fontweight="bold",
+            clip_on=False,
         )
-    fig.subplots_adjust(left=0.08, right=0.99, bottom=0.18, top=0.97, wspace=0.38)
+    fig.subplots_adjust(left=0.08, right=0.99, bottom=0.18, top=0.92, wspace=0.38)
 
     output = Path(output)
     png = output.with_suffix(".png")

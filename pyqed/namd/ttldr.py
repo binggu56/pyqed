@@ -1597,8 +1597,18 @@ class TNLDR:
         if method not in {"cross", "dense"}:
             raise ValueError("projector method must be 'cross' or 'dense'")
         rank_key = None if max_rank is None else int(max_rank)
+        if method == "dense":
+            cross_seed = None
+        else:
+            cross_seed = self.seed + 701 * (state + 1) if seed is None else int(seed)
         key = (
-            state, method, rank_key, int(sweeps), float(rtol), int(validation)
+            state,
+            method,
+            rank_key,
+            int(sweeps),
+            float(rtol),
+            int(validation),
+            cross_seed,
         )
         if key in self._adiabatic_projectors:
             return self._adiabatic_projectors[key]
@@ -1643,7 +1653,6 @@ class TNLDR:
             ).reshape(len(indices), -1)
             return projectors[np.arange(len(indices)), indices[:, -1]]
 
-        cross_seed = self.seed + 701 * (state + 1) if seed is None else int(seed)
         cores, info = tt_cross(
             shape,
             lambda index: batch(np.asarray([index], dtype=int))[0],
@@ -1776,6 +1785,9 @@ class TNLDR:
             raise TypeError("TNLDR.run expects an MPS initial state")
         if state.dims != list(self.dims):
             raise ValueError(f"MPS dimensions {state.dims} != {list(self.dims)}")
+        dt = float(dt)
+        if not np.isfinite(dt) or dt <= 0.0:
+            raise ValueError("dt must be positive and finite")
         if int(steps) < 0 or int(interval) < 1:
             raise ValueError("steps must be nonnegative and interval must be positive")
         if krylov_method is None:
@@ -1880,8 +1892,8 @@ class TNLDR:
                     (
                         site,
                         profile,
-                        np.exp(-0.5 * float(dt) * profile),
-                        1.0 - np.exp(-float(dt) * profile),
+                        np.exp(-0.5 * dt * profile),
+                        1.0 - np.exp(-dt * profile),
                     )
                     for site, profile in absorber_items
                 )
@@ -1912,7 +1924,7 @@ class TNLDR:
                             np.real(current.norm_squared())
                         )
                     current, info = dynamics.step(
-                        current, float(dt), normalize=bool(normalize)
+                        current, dt, normalize=bool(normalize)
                     )
                     if has_absorber:
                         hamiltonian_output_norm = float(
@@ -1936,8 +1948,8 @@ class TNLDR:
                         current_norm = float(np.real(current.norm_squared()))
                     else:
                         current_norm = info["pre_normalization_norm2"]
-                    if step % int(interval) == 0:
-                        checkpoint_times.append(step * float(dt))
+                    if step % int(interval) == 0 or step == int(steps):
+                        checkpoint_times.append(step * dt)
                         checkpoint_norms.append(current_norm)
                         measured.append(measure_populations(current))
                         if has_absorber:
@@ -1963,14 +1975,17 @@ class TNLDR:
             self.history = dynamics
             self.final_state = current
             self.times = np.asarray([0.0, *checkpoint_times], dtype=float)
-            self.populations = np.vstack((initial_populations, measured)).real
+            self.populations = np.asarray(
+                [initial_populations, *measured], dtype=complex
+            ).real
             self.norms = np.asarray([initial_norm, *checkpoint_norms], dtype=float)
             if has_absorber:
-                self.absorber_expectations = np.vstack(
-                    (initial_absorber_expectation, absorber_expectations)
+                self.absorber_expectations = np.asarray(
+                    [initial_absorber_expectation, *absorber_expectations],
+                    dtype=float,
                 )
-                self.absorber_yields = np.vstack(
-                    (np.zeros(self.nstates), absorber_yields)
+                self.absorber_yields = np.asarray(
+                    [np.zeros(self.nstates), *absorber_yields], dtype=float
                 )
                 self.absorbed_probabilities = initial_norm - self.norms
                 self.absorption_closure = (
@@ -1992,7 +2007,7 @@ class TNLDR:
         )
         dynamics.run(
             state.copy(),
-            dt=float(dt),
+            dt=dt,
             steps=int(steps),
             e_ops=operators,
             interval=int(interval),
@@ -2007,7 +2022,7 @@ class TNLDR:
         self.final_state = dynamics.final_state
         self.times = np.concatenate(([0.0], np.asarray(dynamics.times, dtype=float)))
         self.populations = np.vstack((initial_populations, dynamics.observables)).real
-        checkpoint_steps = np.rint(np.asarray(dynamics.times) / float(dt)).astype(int)
+        checkpoint_steps = np.rint(np.asarray(dynamics.times) / dt).astype(int)
         checkpoint_norms = np.asarray(dynamics.pre_normalization_norm2, dtype=float)[
             checkpoint_steps - 1
         ]

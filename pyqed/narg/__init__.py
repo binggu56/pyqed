@@ -231,7 +231,7 @@ from .geometric_rg import (
     Phi4VariationalQGRG,
     gaussian_quantum_metric,
 )
-from .irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, SU2Symmetry, U1Symmetry
+from .irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep, ProductSymmetry, SU2Symmetry, U1Symmetry
 from .hamiltonian import (
     HamiltonianSpec,
     IntegralHamiltonian,
@@ -499,7 +499,7 @@ __all__ = [
     "polynomial_pes_value",
     "stationary_curvature_window",
     "Irrep",
-    "IrrepSite",
+    "Leg",
     "IrrepTensor",
     "HamiltonianSpec",
     "IntegralHamiltonian",

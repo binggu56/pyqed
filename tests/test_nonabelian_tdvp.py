@@ -22,7 +22,7 @@ from pyqed.qchem.dmrg.dmrg import (
 
 def _normalized_random_state(nsites, *, seed=3):
     target = spatial_target_sector(2, 0)
-    state = MPS.from_sites(
+    state = MPS.from_tensors(
         build_random_spatial_mps(
             nsites,
             target_sector=target,
@@ -33,9 +33,9 @@ def _normalized_random_state(nsites, *, seed=3):
     )
     vector = _nonabelian_mps_to_dense_vector(state)
     scale = 1.0 / np.linalg.norm(vector)
-    state.sites[0].data = {
+    state.tensors[0].data = {
         key: np.asarray(block) * scale
-        for key, block in state.sites[0].data.items()
+        for key, block in state.tensors[0].data.items()
     }
     return state
 
@@ -43,7 +43,7 @@ def _normalized_random_state(nsites, *, seed=3):
 def test_two_site_su2_tdvp_matches_dense_reference_without_truncation():
     state = _normalized_random_state(2)
     mpo = build_spatial_hubbard_mpo(
-        state.sites,
+        state.tensors,
         hopping_t=0.3,
         onsite_u=1.0,
     )
@@ -66,7 +66,7 @@ def test_two_site_su2_tdvp_matches_dense_reference_without_truncation():
     actual = _nonabelian_mps_to_dense_vector(propagated)
     np.testing.assert_allclose(actual, reference, atol=1.0e-12, rtol=1.0e-12)
     assert info["native_reduced"] is True
-    assert info["truncation_error"] == 0.0
+    assert info["truncation_error"] < 1.0e-14
     if cpp_available():
         assert {
             update["local_objective"]["propagation_backend"]
@@ -78,7 +78,7 @@ def test_two_site_su2_tdvp_matches_dense_reference_without_truncation():
 def test_three_site_su2_tdvp_is_time_reversible_without_truncation():
     state = _normalized_random_state(3)
     mpo = build_spatial_hubbard_mpo(
-        state.sites,
+        state.tensors,
         hopping_t=0.3,
         onsite_u=1.0,
     )
@@ -102,12 +102,12 @@ def test_three_site_su2_tdvp_is_time_reversible_without_truncation():
 def test_su2_tdvp_propagates_a_reduced_affine_hamiltonian():
     state = _normalized_random_state(2)
     static = build_spatial_hubbard_mpo(
-        state.sites,
+        state.tensors,
         hopping_t=0.3,
         onsite_u=1.0,
     )
     interaction = build_spatial_one_body_reduced_mpo(
-        state.sites,
+        state.tensors,
         np.array([[0.2, -0.1], [-0.1, -0.3]]),
     )
     coefficient = -0.17

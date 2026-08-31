@@ -16,7 +16,7 @@ except Exception:  # pragma: no cover - optional runtime acceleration
     sp = None
 
 from .solver import LocalOperator, ReducedStateVector, pack_two_site_state
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def _cached_einsum_path(signature, *shapes):
@@ -110,7 +110,7 @@ class CompiledLocalActions:
     and identity metadata needed by the eigensolver/preconditioner layer.
 
     :param basis: Explicit local two-site basis.
-    :param tensor_matvec: Callable acting on rank-4 ``NonabelianTensor`` input.
+    :param tensor_matvec: Callable acting on rank-4 ``IrrepTensor`` input.
     :param reduced_matvec: Callable acting on ``ReducedStateVector`` input.
     :param packed_matvec: Callable acting on packed vector input.
     :param diag: Packed diagonal aligned with ``basis``.
@@ -187,11 +187,11 @@ def apply_transition_tensor(transitions, theta, out_entries, *, base_dtype):
     :param theta: Rank-4 two-site input tensor.
     :param out_entries: Output ``(sector_key, block_shape)`` descriptors.
     :param base_dtype: Scalar dtype contribution from the surrounding operator.
-    :returns: Output ``NonabelianTensor`` with the same external metadata.
+    :returns: Output ``IrrepTensor`` with the same external metadata.
     """
 
-    if not isinstance(theta, NonabelianTensor) or theta.rank != 4:
-        raise ValueError("apply_transition_tensor expects a rank-4 NonabelianTensor.")
+    if not isinstance(theta, IrrepTensor) or theta.rank != 4:
+        raise ValueError("apply_transition_tensor expects a rank-4 IrrepTensor.")
 
     dtype = np.result_type(
         base_dtype,
@@ -215,7 +215,7 @@ def apply_transition_tensor(transitions, theta, out_entries, *, base_dtype):
         for (key, _shape), block in zip(out_entries, out_blocks)
     }
 
-    return NonabelianTensor(
+    return IrrepTensor(
         out_data,
         [leg[:] for leg in theta.qns],
         theta.dirs[:],
@@ -492,11 +492,11 @@ class CompiledPackedTransitions:
             compiled operator.
         :param base_dtype: Scalar dtype contribution from the surrounding
             effective operator.
-        :returns: Output ``NonabelianTensor`` with the same external metadata.
+        :returns: Output ``IrrepTensor`` with the same external metadata.
         """
 
-        if not isinstance(theta, NonabelianTensor) or theta.rank != 4:
-            raise ValueError("CompiledPackedTransitions.apply_tensor expects a rank-4 NonabelianTensor.")
+        if not isinstance(theta, IrrepTensor) or theta.rank != 4:
+            raise ValueError("CompiledPackedTransitions.apply_tensor expects a rank-4 IrrepTensor.")
         if not self.basis.compatible_with_layout(pack_two_site_state(theta, layout=self.basis)[1]):
             raise ValueError("Two-site tensor layout is incompatible with the compiled two-site basis.")
 
@@ -525,7 +525,7 @@ class CompiledPackedTransitions:
             key: block
             for (key, _shape), block in zip(self.out_entries, out_blocks)
         }
-        return NonabelianTensor(
+        return IrrepTensor(
             out_data,
             [leg[:] for leg in theta.qns],
             theta.dirs[:],
@@ -1608,7 +1608,7 @@ def build_identity_mpo_local_actions(E_map, F_map, basis, *, base_dtype):
                     out_data[out_entry.key] += contribution
                 else:
                     out_data[out_entry.key] = contribution
-            return NonabelianTensor(
+            return IrrepTensor(
                 out_data,
                 [leg[:] for leg in two_site.qns],
                 two_site.dirs[:],

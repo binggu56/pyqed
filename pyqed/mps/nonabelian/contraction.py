@@ -10,12 +10,12 @@ import numpy as np
 
 from .coupling import normalize_coupling_scheme, reduced_bond_space
 from pyqed.mps.su2 import SU2Irrep, SpinChargeSector, fuse_charge_spin_sectors
+from pyqed.symmetry import IrrepTensor, Leg
 from .tensor import (
     FusionLeg,
     FusionPipe,
     FusionPipeEntry,
     IdentityBasisTransform,
-    NonabelianTensor,
 )
 
 
@@ -73,7 +73,7 @@ def _fuse_site_sectors(left, phys):
 
 
 def _site_is_left_phys_right(site):
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
         return False
     score_new = 0
     score_old = 0
@@ -95,7 +95,7 @@ def normalize_site_tensor_layout(site):
     """
     Return a rank-3 site tensor in canonical ``(left, phys, right)`` order.
     """
-    if not isinstance(site, NonabelianTensor) or site.rank != 3:
+    if not isinstance(site, IrrepTensor) or site.rank != 3:
         return site
     if _site_is_left_phys_right(site):
         return site
@@ -104,15 +104,15 @@ def normalize_site_tensor_layout(site):
 
 def tensordot(A, B, axes):
     """
-    Fixed-layout contraction for :class:`NonabelianTensor`.
+    Fixed-layout contraction for :class:`IrrepTensor`.
 
     This helper intentionally implements only the simplest non-Abelian case:
     contracted legs must carry identical reduced sectors and identical
     fusion-edge metadata.  That is enough to support fixed fusion-tree layouts
     without yet introducing explicit recoupling coefficients.
     """
-    if not isinstance(A, NonabelianTensor) or not isinstance(B, NonabelianTensor):
-        raise TypeError("tensordot expects two NonabelianTensor objects.")
+    if not isinstance(A, IrrepTensor) or not isinstance(B, IrrepTensor):
+        raise TypeError("tensordot expects two IrrepTensor objects.")
 
     a_ax, b_ax = _normalize_axes(axes)
     _validate_contraction_metadata(A, B, a_ax, b_ax)
@@ -215,7 +215,7 @@ def tensordot(A, B, axes):
                 pipe=contracted_pipe,
             )
 
-    return NonabelianTensor(
+    return IrrepTensor(
         new_data,
         new_qns,
         new_dirs,
@@ -427,7 +427,7 @@ def merge_mps_sites_from_packed(A, B, packed):
             pipe=contracted_pipe,
         )
 
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         new_qns,
         new_dirs,
@@ -551,20 +551,18 @@ def split_mps_sites_from_packed(A, B, packed):
         coupling="left",
         pipe=bond_pipe,
     )
-    from .basis import BondBasis
-
-    right_bond_basis = BondBasis(
-        sectors=tuple(bond_sectors),
-        dims={
+    right_bond_basis = Leg(
+        tuple(bond_sectors),
+        {
             sector: int(dim)
             for sector, dim in zip(bond_sectors, bond_dims)
         },
         direction=1,
         name="cpp-split-right-bond",
     )
-    left_bond_basis = BondBasis(
-        sectors=tuple(bond_sectors),
-        dims=right_bond_basis.dims,
+    left_bond_basis = Leg(
+        tuple(bond_sectors),
+        right_bond_basis.dims,
         direction=-1,
         name="cpp-split-left-bond",
     )
@@ -576,7 +574,7 @@ def split_mps_sites_from_packed(A, B, packed):
         "source": "cpp_active_bond_split",
         **({"physical_basis": "fully_reduced_su2"} if fully_reduced else {}),
     }
-    left = NonabelianTensor(
+    left = IrrepTensor(
         left_data,
         [A.qns[0][:], A.qns[1][:], bond_qns],
         [A.dirs[0], A.dirs[1], A.dirs[2]],
@@ -587,7 +585,7 @@ def split_mps_sites_from_packed(A, B, packed):
             "bond_bases": {2: right_bond_basis},
         },
     )
-    right = NonabelianTensor(
+    right = IrrepTensor(
         right_data,
         [bond_qns, B.qns[1][:], B.qns[2][:]],
         [B.dirs[0], B.dirs[1], B.dirs[2]],
@@ -677,8 +675,6 @@ def mps_site_from_packed(
     bond_bases = {}
 
     def install_bond(axis, topology):
-        from .basis import BondBasis
-
         bond_labels, bond_dims = topology
         bond_labels = np.asarray(bond_labels, dtype=np.int64).reshape(-1, 2)
         bond_dims = np.asarray(bond_dims, dtype=np.int64).reshape(-1)
@@ -731,9 +727,9 @@ def mps_site_from_packed(
             pipe=bond_pipe,
         )
         direction = -1 if axis == 0 else 1
-        bond_bases[axis] = BondBasis(
-            sectors=tuple(bond_sectors),
-            dims={
+        bond_bases[axis] = Leg(
+            tuple(bond_sectors),
+            {
                 sector: int(dim)
                 for sector, dim in zip(bond_sectors, bond_dims)
             },
@@ -754,7 +750,7 @@ def mps_site_from_packed(
         **({"svd_role": str(svd_role)} if svd_role is not None else {}),
         **({"bond_bases": bond_bases} if bond_bases else {}),
     }
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         qns,
         list(template.dirs),
@@ -775,8 +771,8 @@ def combine_legs(tensor, legs, new_axis=None, fusion_leg=None, use_cg=False):
     legs this is the ordinary CG transform; for longer products it uses the
     explicit reduced bond spaces defined in :mod:`pyqed.mps.nonabelian.coupling`.
     """
-    if not isinstance(tensor, NonabelianTensor):
-        raise TypeError("combine_legs expects a NonabelianTensor.")
+    if not isinstance(tensor, IrrepTensor):
+        raise TypeError("combine_legs expects an IrrepTensor.")
 
     legs = tuple(int(ax) for ax in legs)
     if len(legs) == 0:
@@ -1020,7 +1016,7 @@ def combine_legs(tensor, legs, new_axis=None, fusion_leg=None, use_cg=False):
     fused_leg = fusion_leg.with_pipe(pipe)
     new_fusion_legs[new_axis] = fused_leg
 
-    return NonabelianTensor(
+    return IrrepTensor(
         new_data,
         new_qns,
         new_dirs,
@@ -1033,8 +1029,8 @@ def split_legs(tensor, axis):
     """
     Split a previously fused leg created by :func:`combine_legs`.
     """
-    if not isinstance(tensor, NonabelianTensor):
-        raise TypeError("split_legs expects a NonabelianTensor.")
+    if not isinstance(tensor, IrrepTensor):
+        raise TypeError("split_legs expects an IrrepTensor.")
 
     axis = int(axis)
     if axis < 0:
@@ -1123,7 +1119,7 @@ def split_legs(tensor, axis):
             else:
                 new_data[key_out] = piece
 
-    return NonabelianTensor(
+    return IrrepTensor(
         new_data,
         new_qns,
         new_dirs,
@@ -1139,8 +1135,8 @@ def recouple_fused_leg(tensor, axis, target_scheme):
     The physical fused sector is unchanged; only the multiplicity-channel basis
     is rotated using the explicit reduced bond-space recoupling matrix.
     """
-    if not isinstance(tensor, NonabelianTensor):
-        raise TypeError("recouple_fused_leg expects a NonabelianTensor.")
+    if not isinstance(tensor, IrrepTensor):
+        raise TypeError("recouple_fused_leg expects an IrrepTensor.")
 
     axis = int(axis)
     if axis < 0:
@@ -1228,7 +1224,7 @@ def recouple_fused_leg(tensor, axis, target_scheme):
     )
     new_fusion_legs = tensor.fusion_legs[:]
     new_fusion_legs[axis] = new_fusion_leg
-    return NonabelianTensor(
+    return IrrepTensor(
         new_data,
         [leg_qns[:] for leg_qns in tensor.qns],
         tensor.dirs[:],

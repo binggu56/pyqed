@@ -540,6 +540,8 @@ def test_gamma_centered_mesh_contains_gamma_and_is_closed():
     kpts = cell.make_kpts((2, 3, 2), gamma_centered=True)
     gamma = np.flatnonzero(np.linalg.norm(kpts, axis=1) < 1.0e-12)
     np.testing.assert_array_equal(gamma, [0])
+    shifted = cell.make_kpts((2, 3, 2))
+    assert np.min(np.linalg.norm(shifted, axis=1)) > 1.0e-12
 
     mf = SimpleNamespace(
         cell=cell,
@@ -554,7 +556,6 @@ def test_gamma_centered_mesh_contains_gamma_and_is_closed():
     for kpt in kpts:
         for qpt in qpts:
             ref.find_kpoint_index(kpt - qpt)
-
 
 
 def test_kpoint_scf_adapter_normalizes_multi_k_reference(two_k_h2_reference):

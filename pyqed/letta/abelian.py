@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ..narg.irrep_tensor import Irrep, IrrepSite, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
+from ..narg.irrep_tensor import Irrep, Leg, IrrepTensor, OpIrrep, ProductSymmetry, U1Symmetry
 
 
 def _as_charge(value) -> tuple[int, ...]:
@@ -162,13 +162,13 @@ class Layout:
         return _product_u1_symmetry(len(self.target))
 
     @property
-    def bond_sites(self) -> list[IrrepSite]:
+    def bond_sites(self) -> list[Leg]:
         sym = self.symmetry
-        return [IrrepSite(sym, _sector_dims(labels)) for labels in self.bond_qns]
+        return [Leg(_sector_dims(labels), symmetry=sym) for labels in self.bond_qns]
 
     @property
-    def target_site(self) -> IrrepSite:
-        return IrrepSite(self.symmetry, {Irrep(self.target): 1})
+    def target_site(self) -> Leg:
+        return Leg({Irrep(self.target): 1}, symmetry=self.symmetry)
 
     def local_masks(self) -> list[np.ndarray]:
         masks = []
@@ -680,18 +680,18 @@ class XLayout:
         return _product_u1_symmetry(len(self.target))
 
     @property
-    def prefix_sites(self) -> list[IrrepSite]:
+    def prefix_sites(self) -> list[Leg]:
         sym = self.symmetry
-        return [IrrepSite(sym, _sector_dims(labels)) for labels in self.prefix_qns]
+        return [Leg(_sector_dims(labels), symmetry=sym) for labels in self.prefix_qns]
 
     @property
-    def view_sites(self) -> list[IrrepSite]:
+    def view_sites(self) -> list[Leg]:
         sym = self.symmetry
-        return [IrrepSite(sym, _sector_dims(labels)) for labels in self.view_qns]
+        return [Leg(_sector_dims(labels), symmetry=sym) for labels in self.view_qns]
 
     @property
-    def target_site(self) -> IrrepSite:
-        return IrrepSite(self.symmetry, {Irrep(self.target): 1})
+    def target_site(self) -> Leg:
+        return Leg({Irrep(self.target): 1}, symmetry=self.symmetry)
 
     @classmethod
     def from_local_charges(

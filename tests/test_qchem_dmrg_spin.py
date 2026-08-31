@@ -53,6 +53,7 @@ from pyqed.mps.nonabelian.solver import (
 from pyqed.mps.nonabelian.solver import solve_local_two_site
 from pyqed.mps.su2 import SU2Irrep, SpinChargeSector
 from pyqed.mps.symmetry import AbelianSector
+from pyqed.symmetry import IrrepTensor, Leg
 
 
 def _build_cpp_integrals(molecule):
@@ -1871,6 +1872,11 @@ def test_spatial_dmrg_routes_su2_to_su2_solver():
     np.testing.assert_allclose(su2.energies, su2.e_tot)
     assert solver.backend == "su2"
     assert solver.ground_state is solver.states[0]
+    assert all(isinstance(site, IrrepTensor) for site in solver.ground_state.tensors)
+    assert all(
+        all(isinstance(leg, Leg) for leg in site.legs)
+        for site in solver.ground_state.tensors
+    )
     assert solver.energy == pytest.approx(su2.e_tot)
     np.testing.assert_allclose(solver.energies, [su2.e_tot])
     assert solver.diagnostics["kernel_backend"] == "cpp"

@@ -289,7 +289,7 @@ def test_su2_moving_environment_owns_blockwise_svd_and_global_truncation():
 
 def test_su2_two_site_split_uses_cpp_sweep_engine():
     from pyqed.mps.nonabelian.decompose import svd_two_site
-    from pyqed.mps.nonabelian.tensor import NonabelianTensor
+    from pyqed.symmetry import IrrepTensor
 
     owner_cls = _require_su2_cpp("SU2MovingEnvironment")
     owner = owner_cls(
@@ -300,7 +300,7 @@ def test_su2_two_site_split_uses_cpp_sweep_engine():
     singlet = SpinChargeSector(0, SU2Irrep(0))
     doublet = SpinChargeSector(1, SU2Irrep(1))
     physical = SpinChargeSector(0, SU2Irrep(0))
-    merged = NonabelianTensor(
+    merged = IrrepTensor(
         data={
             (singlet, physical, physical, physical): np.asarray([[[[0.79]]]]),
             (doublet, physical, physical, physical): np.asarray([[[[0.80]]]]),
@@ -341,14 +341,14 @@ def test_cpp_active_bond_merge_matches_reduced_tensor_channels():
         merge_mps_sites,
         merge_mps_sites_from_packed,
     )
-    from pyqed.mps.nonabelian.tensor import NonabelianTensor
+    from pyqed.symmetry import IrrepTensor
     from pyqed.mps.nonabelian.update import _expand_two_site_support
 
     owner_cls = _require_su2_cpp("SU2MovingEnvironment")
     singlet = SpinChargeSector(0, SU2Irrep(0))
     doublet = SpinChargeSector(1, SU2Irrep(1))
     pair = SpinChargeSector(2, SU2Irrep(0))
-    left = NonabelianTensor(
+    left = IrrepTensor(
         {
             (singlet, singlet, singlet): np.arange(2.0).reshape(1, 1, 2) + 1.0,
             (singlet, doublet, doublet): np.arange(3.0).reshape(1, 1, 3) + 2.0,
@@ -360,7 +360,7 @@ def test_cpp_active_bond_merge_matches_reduced_tensor_channels():
         ],
         [-1, 1, 1],
     )
-    right = NonabelianTensor(
+    right = IrrepTensor(
         {
             (singlet, singlet, singlet): np.arange(2.0).reshape(2, 1, 1) + 3.0,
             (doublet, doublet, pair): np.arange(6.0).reshape(3, 1, 2) + 4.0,
@@ -1811,7 +1811,7 @@ def test_cpp_su2_engine_advances_direct_normal_complementary_boundary(side):
         rtol=1.0e-12,
         atol=1.0e-12,
     )
-    from pyqed.mps.nonabelian.tensor import NonabelianTensor
+    from pyqed.symmetry import IrrepTensor
 
     bra_key = (
         (q_lb, q_pb, q_rb)
@@ -1823,7 +1823,7 @@ def test_cpp_su2_engine_advances_direct_normal_complementary_boundary(side):
         if side == "left"
         else (q_rk, q_pk, q_lk)
     )
-    site_tensor = NonabelianTensor(
+    site_tensor = IrrepTensor(
         data={bra_key: bra, ket_key: ket},
         qns=[
             list(dict.fromkeys((bra_key[0], ket_key[0]))),
@@ -1916,7 +1916,7 @@ def test_cpp_su2_engine_advances_direct_normal_complementary_boundary(side):
 def test_cpp_su2_engine_replays_metric_boundary_from_split_site(side):
     """The cached norm action consumes the current C++-owned split site."""
 
-    from pyqed.mps.nonabelian.tensor import NonabelianTensor
+    from pyqed.symmetry import IrrepTensor
 
     engine_cls = _require_su2_cpp("SU2MovingEnvironment")
     engine = engine_cls(np.eye(2), np.zeros((2,) * 4), 2)
@@ -1924,7 +1924,7 @@ def test_cpp_su2_engine_replays_metric_boundary_from_split_site(side):
     q0 = SpinChargeSector(0, SU2Irrep(0))
     key = (q0, q0, q0)
     site = rng.normal(size=(3, 2, 4))
-    site_tensor = NonabelianTensor(
+    site_tensor = IrrepTensor(
         data={key: site},
         qns=[[q0], [q0], [q0]],
         dirs=[-1, 1, 1],

@@ -5,6 +5,8 @@ import time
 from scipy.sparse.linalg import LinearOperator, eigsh
 import copy
 
+from pyqed.symmetry import IrrepTensor
+
 class QN(tuple):
     """
     Quantum Number class supporting vector addition for U(1) x U(1) x ...
@@ -150,91 +152,8 @@ def is_sector_like(value):
     return isinstance(value, (QN, AbelianSector, Sector))
 
 
-class BlockTensor:
-    """
-    U(1) Symmetric Tensor with Block Sparsity.
-    """
-    def __init__(self, data, qns, dirs):
-        self.data = data  # Dict { (qn_1, qn_2...): np.ndarray }
-        self.qns = qns    # List of [qn_sector_1, qn_sector_2, ...] for each leg
-        self.dirs = dirs  # List of [+1 (Out), -1 (In)]
-        self.rank = len(dirs)
-
-    @property
-    def shape(self):
-        """Virtual dense shape (for debugging)."""
-        return tuple(len(q) for q in self.qns)
-
-    def copy(self):
-        new_data = {k: v.copy() for k, v in self.data.items()}
-        return BlockTensor(new_data, [list(q) for q in self.qns], self.dirs[:])
-
-    def __add__(self, other):
-        """Tensor addition (A + B)."""
-        res_data = self.data.copy()
-        for k, v in other.data.items():
-            if k in res_data:
-                res_data[k] = res_data[k] + v
-            else:
-                res_data[k] = v
-        return BlockTensor(res_data, self.qns, self.dirs)
-
-    def __sub__(self, other):
-        res_data = self.data.copy()
-        for k, v in other.data.items():
-            if k in res_data:
-                res_data[k] = res_data[k] - v
-            else:
-                res_data[k] = -v
-        return BlockTensor(res_data, self.qns, self.dirs)
-
-    def __mul__(self, scalar):
-        """Scalar multiplication (A * 0.5)."""
-        new_data = {k: v * scalar for k, v in self.data.items()}
-        return BlockTensor(new_data, self.qns, self.dirs)
-    
-    def __rmul__(self, scalar):
-        return self.__mul__(scalar)
-
-    def __truediv__(self, scalar):
-        return self.__mul__(1.0 / scalar)
-
-    def dot(self, other):
-        """
-        Scalar Product / Inner Product <A|B>.
-        Returns a single number (float/complex).
-        """
-        total = 0.0
-        for k, block_A in self.data.items():
-            if k in other.data:
-                total += np.vdot(block_A, other.data[k])
-        return total
-
-    def norm(self):
-        """Frobenius norm."""
-        total = 0.0
-        for block in self.data.values():
-            total += float(np.real(np.vdot(block, block)))
-        return np.sqrt(max(total, 0.0))
-
-    def transpose(self, *axes):
-        """Permute legs."""
-        if len(axes) == 1 and isinstance(axes[0], (list, tuple)):
-            axes = axes[0]
-            
-        new_dirs = [self.dirs[i] for i in axes]
-        new_qns = [self.qns[i] for i in axes]
-        new_data = {}
-        for sector, block in self.data.items():
-            new_sector = tuple(sector[i] for i in axes)
-            new_data[new_sector] = np.transpose(block, axes)
-        return BlockTensor(new_data, new_qns, new_dirs)
-
-    def conj(self):
-        """Complex conjugate (Flips arrow directions)."""
-        new_data = {k: v.conj() for k, v in self.data.items()}
-        new_dirs = [-d for d in self.dirs]
-        return BlockTensor(new_data, self.qns, new_dirs)
+class BlockTensor(IrrepTensor):
+    """Legacy U(1) storage spelling backed by the shared tensor model."""
 
 def tensordot(A, B, axes):
     """

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from pyqed.symmetry import IrrepTensor
 from pyqed.mps.nonabelian.environment import contract_chain_expectation
 from pyqed.mps.nonabelian.mps import MPS
 from pyqed.mps.nonabelian.orbital_transform import apply_spatial_orbital_transform
@@ -21,7 +22,6 @@ from pyqed.mps.nonabelian.states import (
     spatial_target_sector,
 )
 from pyqed.mps.nonabelian.sweep import _identity_mpo_factors_for_sites_and_mpo
-from pyqed.mps.nonabelian.tensor import NonabelianTensor
 from pyqed.qchem.mcscf.casci import _prepare_biorthogonal_overlap
 
 from .su2_core import couple_multiplets, local_site_multiplets, local_su2_branches
@@ -58,7 +58,7 @@ def _site_tensor(data, left_qns, physical_qns, right_qns):
         key: (-np.asarray(block) if int(key[1].charge) == 2 else np.asarray(block))
         for key, block in data.items()
     }
-    return NonabelianTensor(
+    return IrrepTensor(
         data=canonical_data,
         qns=[list(left_qns), list(physical_qns), list(right_qns)],
         dirs=[-1, 1, 1],
@@ -250,7 +250,7 @@ def narg_reduced_mps_root_batch(solver, state_ids=None):
                 root_vectors,
             )
         )
-    state = MPS.from_sites(
+    state = MPS.from_tensors(
         sites,
         center=nsites - 1,
         target_sector=target_sector,
@@ -265,7 +265,7 @@ def _root_state_from_batch(batch, root_index):
     right_qns = list(terminal.qns[2])
     if root_index < 0 or root_index >= len(right_qns):
         raise IndexError(f"root_index={root_index} is outside the batched root boundary")
-    terminal_one = NonabelianTensor(
+    terminal_one = IrrepTensor(
         {
             key: np.asarray(block)[..., root_index : root_index + 1]
             for key, block in terminal.data.items()
@@ -275,7 +275,7 @@ def _root_state_from_batch(batch, root_index):
         fusion_legs=terminal.fusion_legs,
         metadata=terminal.metadata,
     )
-    return MPS.from_sites(
+    return MPS.from_tensors(
         [*(site.copy() for site in batch.sites[:-1]), terminal_one],
         center=batch.center,
         target_sector=batch.target_sector,

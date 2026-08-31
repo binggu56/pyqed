@@ -97,7 +97,7 @@ def _apply_dense_orbital_circuit(tensor, circuit):
 
 
 def test_reduced_su2_orbital_circuit_matches_component_reference():
-    state = ReducedMPS.from_sites(
+    state = ReducedMPS.from_tensors(
         build_random_reduced_spatial_mps(
             4,
             target_sector=spatial_target_sector(4, 0),
@@ -188,7 +188,7 @@ def test_reduced_su2_orbital_circuit_matches_component_reference():
 
 
 def test_unitary_orbital_map_uses_one_exact_givens_sweep():
-    state = ReducedMPS.from_sites(
+    state = ReducedMPS.from_tensors(
         build_random_reduced_spatial_mps(
             4,
             target_sector=spatial_target_sector(4, 0),
@@ -226,7 +226,7 @@ def test_unitary_orbital_map_uses_one_exact_givens_sweep():
 
 
 def test_block_diagonal_orbital_circuit_matches_full_factorization():
-    state = ReducedMPS.from_sites(
+    state = ReducedMPS.from_tensors(
         build_random_reduced_spatial_mps(
             4,
             target_sector=spatial_target_sector(4, 0),

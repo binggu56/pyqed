@@ -12,7 +12,7 @@ from .mps import MPS
 from .renormalized import get_su2_kernel_policy
 from .solver import pack_two_site_state, unpack_two_site_state
 from .sweep import MovingEnvironment, sweep_once
-from .tensor import NonabelianTensor
+from pyqed.symmetry import IrrepTensor
 
 
 def _tensor_layout(tensor):
@@ -42,7 +42,7 @@ def _unpack_tensor(vector, template, layout):
         key: vector[section].reshape(shape).copy()
         for key, shape, section in layout
     }
-    return NonabelianTensor(
+    return IrrepTensor(
         data,
         [leg[:] for leg in template.qns],
         template.dirs[:],
@@ -341,7 +341,7 @@ def two_site_tdvp_step(
             max_bond_mode=max_bond_mode,
         )
         moving = MovingEnvironment(
-            work.sites,
+            work.tensors,
             mpo_factors=mpo_factors,
             su2_boundary_environment=boundary_environment,
         )
@@ -365,7 +365,7 @@ def two_site_tdvp_step(
         krylov_method=krylov_method,
     )
     histories = []
-    sites = work.sites
+    sites = work.tensors
     for direction in ("lr", "rl"):
         reuse_side, norm_reuse_side = moving.reuse_sides_for(direction)
         result = sweep_once(
