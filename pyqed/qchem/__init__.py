@@ -169,6 +169,12 @@ except (ImportError, OSError):
     CASCI = None
 
 try:
+    from .tdcasci import TDCASCI, TDCASCITrajectory
+except (ImportError, OSError):
+    TDCASCI = None
+    TDCASCITrajectory = None
+
+try:
     from . import nac
 except (ImportError, OSError):
     nac = None
