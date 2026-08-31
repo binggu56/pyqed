@@ -31,23 +31,14 @@ class _CleanBuildPy(_build_py):
 def _cpp_include_dirs(np):
     include_dirs = [np.get_include()]
     if sys.platform == "darwin":
-        candidates = []
         sdkroot = os.environ.get("SDKROOT")
         if sdkroot:
-            candidates.append(f"{sdkroot}/usr/include/c++/v1")
-        candidates.extend(
-            sorted(
-                glob.glob("/Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk/usr/include/c++/v1"),
-                reverse=True,
-            )
-        )
-        candidates.extend(
-            sorted(glob.glob(f"{sys.prefix}/pkgs/libcxx-*/include/c++/v1"), reverse=True)
-        )
-        for path in candidates:
-            if os.path.isdir(path) and path not in include_dirs:
+            path = f"{sdkroot}/usr/include/c++/v1"
+            if os.path.isdir(path):
                 include_dirs.append(path)
-                break
+        # Otherwise let the active compiler select its matching libc++ headers.
+        # Guessing a Command Line Tools or Conda SDK can mix incompatible Xcode
+        # releases, which fails even on standard headers.
         return include_dirs
     for pattern in (
         f"{sys.prefix}/pkgs/libcxx-*/include/c++/v1",
