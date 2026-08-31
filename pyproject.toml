@@ -92,6 +92,7 @@ test = [
     "build>=1.2",
     "matplotlib>=3.8",
     "numba>=0.59",
+    "pyscf>=2.5",
     "pytest>=8",
     "twine>=5",
 ]
