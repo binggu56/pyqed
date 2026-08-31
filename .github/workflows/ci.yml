@@ -61,6 +61,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
+          python setup.py build_ext --inplace
       - name: Verify native imports and public quickstart
         run: |
           python -c 'from pyqed.qchem import _basis_cy, _casscf_cpp, _integrals_cpp, _rys_cy; from pyqed.heom import _heom_cpp; from pyqed.mps.nonabelian import _su2_kernel; assert all(module is not None for module in (_basis_cy, _casscf_cpp, _integrals_cpp, _rys_cy, _heom_cpp, _su2_kernel))'
@@ -87,6 +88,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[test]"
+          python setup.py build_ext --inplace
           python -c 'from pyqed.qchem import _casscf_cpp; assert _casscf_cpp is not None'
           python -m pytest -q tests/test_casci.py -k native_rhf_davidson
 
