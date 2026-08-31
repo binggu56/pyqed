@@ -1,7 +1,8 @@
 cff-version: 1.2.0
 message: >-
-  If you use PyQED, please cite the exact software release or Git commit and
-  the method-specific references for the algorithms used.
+  If you use PyQED, please cite the exact software release or Git commit, the
+  preferred project paper below, and the method-specific references for the
+  algorithms used.
 title: PyQED
 type: software
 version: 0.2.0
@@ -9,6 +10,25 @@ date-released: 2026-07-11
 authors:
   - family-names: Gu
     given-names: Bing
+preferred-citation:
+  type: article
+  title: "PyQED: A Python Framework for Ab Initio Geometric Quantum Dynamics"
+  authors:
+    - family-names: Xie
+      given-names: Yujuan
+    - family-names: Zhu
+      given-names: Xiaotong
+    - family-names: Gu
+      given-names: Bing
+  journal: "Chinese Journal of Chemical Physics"
+  year: 2026
+  doi: "10.1063/1674-0068/cjcp2510161"
+  url: "https://doi.org/10.1063/1674-0068/cjcp2510161"
 repository-code: https://github.com/binggu56/pyqed
 url: https://pyqed.org
+doi: "10.5281/zenodo.21316544"
+identifiers:
+  - type: doi
+    value: "10.5281/zenodo.21316543"
+    description: "PyQED software archive (all versions)"
 license: MIT
