@@ -17,8 +17,8 @@ QCSchema-compatible records can be supplied with two PyQED extension fields in
 .. code-block:: json
 
    {
-     "pyqed_hamiltonian": [[...], [...]],
-     "pyqed_state_charges": [[...], [...]],
+     "pyqed_hamiltonian": [[0.0, 0.1], [0.1, 1.0]],
+     "pyqed_state_charges": [[0.0, 0.0], [0.1, -0.1]],
      "pyqed_manifold": "singlet-S0S1"
    }
 
