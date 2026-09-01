@@ -8,6 +8,7 @@ from dataclasses import dataclass, replace
 import json
 from pathlib import Path
 import time
+from types import MethodType
 
 import numpy as np
 
@@ -45,6 +46,7 @@ class ValidationCase:
     kmesh: tuple[int, int, int] = (1, 1, 1)
     basis_min_exponent: float | None = None
     gamma_centered: bool = False
+    occupation_mode: str = "aufbau"
 
 
 def _cubic(length):
@@ -55,6 +57,14 @@ def _fcc_primitive(length):
     half = 0.5 * float(length)
     return np.asarray(
         [[0.0, half, half], [half, 0.0, half], [half, half, 0.0]],
+        dtype=float,
+    )
+
+
+def _bcc_primitive(length):
+    half = 0.5 * float(length)
+    return half * np.asarray(
+        [[-1.0, 1.0, 1.0], [1.0, -1.0, 1.0], [1.0, 1.0, -1.0]],
         dtype=float,
     )
 
@@ -128,6 +138,15 @@ CASES = {
         "sto-3g",
         "def2-svp-jkfit",
     ),
+    "li-bcc-metal-2k": ValidationCase(
+        "li-bcc-metal-2k",
+        "Li 0 0 0",
+        _bcc_primitive(6.63),
+        "sto-3g",
+        "def2-svp-jkfit",
+        (2, 2, 2),
+        occupation_mode="fractional",
+    ),
 }
 
 
@@ -160,6 +179,46 @@ def _case_basis(case):
             )
         basis[symbol] = shells
     return basis
+
+
+def _fractional_kpoint_occupations(mf, mo_energy_kpts=None, _mo_coeff=None):
+    energies = mf.mo_energy if mo_energy_kpts is None else mo_energy_kpts
+    energies = [np.asarray(block, dtype=float) for block in energies]
+    total_pairs = int(mf.cell.tot_electrons(len(energies))) // 2
+    flat = sorted(
+        (float(value), k_index, band)
+        for k_index, block in enumerate(energies)
+        for band, value in enumerate(block)
+    )
+    occupations = [np.zeros_like(block) for block in energies]
+    if total_pairs == 0:
+        return occupations
+    fermi = flat[total_pairs - 1][0]
+    tolerance = 1.0e-10
+    full = [item for item in flat if item[0] < fermi - tolerance]
+    frontier = [item for item in flat if abs(item[0] - fermi) <= tolerance]
+    for _energy, k_index, band in full:
+        occupations[k_index][band] = 2.0
+    frontier_occupation = 2.0 * (total_pairs - len(full)) / len(frontier)
+    for _energy, k_index, band in frontier:
+        occupations[k_index][band] = frontier_occupation
+    return occupations
+
+
+def _integer_kpoint_occupations(energies, electron_count):
+    energies = [np.asarray(block, dtype=float) for block in energies]
+    total_electrons = int(electron_count) * len(energies)
+    if total_electrons % 2:
+        raise ValueError("The sampled k-point mesh has an odd electron count.")
+    occupations = [np.zeros_like(block) for block in energies]
+    flat = sorted(
+        (float(value), k_index, band)
+        for k_index, block in enumerate(energies)
+        for band, value in enumerate(block)
+    )
+    for _energy, k_index, band in flat[: total_electrons // 2]:
+        occupations[k_index][band] = 2.0
+    return occupations
 
 
 def _seed_native_reference(case):
@@ -201,6 +260,8 @@ def _pyscf_reference(
         cell._atom_symbols,
     )
     mf = scf.KRHF(pyscf_cell, kpts=kpts, exxdiv="ewald")
+    if case.occupation_mode == "fractional":
+        mf.get_occ = MethodType(_fractional_kpoint_occupations, mf)
     if force_metric_eig:
         from pyscf.pbc.df.df import GDF as PySCFGDF
         from pyscf.pbc.df.gdf_builder import _CCGDFBuilder
@@ -289,7 +350,10 @@ def _native_space(
     metric_tol=1.0e-14,
     reference_precision=1.0e-12,
 ):
-    mf = cell.KRHF(kpts=kpts).density_fit(
+    mf = cell.KRHF(
+        kpts=kpts,
+        occupation_mode=case.occupation_mode,
+    ).density_fit(
         auxbasis=case.auxbasis,
         precision=float(precision),
         mesh="auto",
@@ -318,7 +382,13 @@ def _native_space(
         mf.gdf_short_range_primitive_exp_cutoff = primitive_exp_cutoff
     mf.mo_energy = [np.asarray(block).copy() for block in pyscf_mf.mo_energy]
     mf.mo_coeff = [np.asarray(block).copy() for block in pyscf_mf.mo_coeff]
-    mf.mo_occ = [np.asarray(block).copy() for block in pyscf_mf.mo_occ]
+    if case.occupation_mode == "fractional":
+        # The transition-space tensor benchmark requires a determinant.  Its
+        # occupations do not enter the underlying AO GDF factors; the actual
+        # metallic KRHF comparison below retains fractional occupations.
+        mf.mo_occ = _integer_kpoint_occupations(mf.mo_energy, cell.nelectron)
+    else:
+        mf.mo_occ = [np.asarray(block).copy() for block in pyscf_mf.mo_occ]
     mf._periodic_setup()
     space = KPointTransitionSpace(mf, qpts="mesh")
     attach_pyscf_gdf_context(space, pyscf_mf)
@@ -503,6 +573,12 @@ def validate_case(
         "pyscf_metric_eig": bool(pyscf_metric_eig),
         "kmesh": list(case.kmesh),
         "gamma_centered": bool(case.gamma_centered),
+        "occupation_mode": case.occupation_mode,
+        "factor_reference_occupations": (
+            "global_integer_aufbau"
+            if case.occupation_mode == "fractional"
+            else "self_consistent"
+        ),
         "nao": int(cell.nao),
         "nkpts": int(len(kpts)),
         "pyscf_gdf_krhf_energy_Ha": scf_energy,
@@ -548,6 +624,7 @@ def validate_case(
             pair_cut="auto",
             recip_cut=5,
             jk_builder=native_jk_builder,
+            occupation_mode=case.occupation_mode,
         )
         if native_jk_builder == "gdf":
             native_scf.density_fit(
@@ -589,6 +666,10 @@ def validate_case(
         if native_jk_builder == "gdf":
             native_scf.with_df.build(workers=min(12, max(1, len(kpts))))
         native_scf.run(max_cycle=80, conv_tol=1.0e-10, conv_tol_dm=1.0e-8)
+        occupations = np.asarray(native_scf.mo_occ, dtype=float)
+        orbital_energies = np.asarray(native_scf.mo_energy, dtype=float)
+        occupied = orbital_energies[occupations > 1.0e-12]
+        available = orbital_energies[occupations < 2.0 - 1.0e-12]
         row["native_krhf"] = {
             "converged": bool(native_scf.converged),
             "jk_builder": str(native_jk_builder),
@@ -601,6 +682,17 @@ def validate_case(
             "energy_error_vs_pyscf_gdf_Ha": float(native_scf.e_tot - scf_energy),
             "seconds": float(time.perf_counter() - started),
             "iterations": int(native_scf.niter),
+            "fractional_orbitals": int(
+                np.count_nonzero(
+                    (occupations > 1.0e-12)
+                    & (occupations < 2.0 - 1.0e-12)
+                )
+            ),
+            "frontier_gap_Ha": (
+                None
+                if not occupied.size or not available.size
+                else float(np.min(available) - np.max(occupied))
+            ),
             "last_cycle": (
                 None if not native_scf.scf_history else native_scf.scf_history[-1]
             ),

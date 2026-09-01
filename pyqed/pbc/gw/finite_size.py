@@ -165,21 +165,52 @@ def bloch_ao_gradient_matrices(mf, kvec):
         except Exception:
             cache = None
     cache_key = tuple(np.round(np.where(np.abs(kvec) < 1.0e-14, 0.0, kvec), 12))
+    source_token = (id(mf._pair_ft_terms), len(mf._pair_ft_terms))
+    cached_terms = getattr(mf, "_pair_gradient_overlap_terms", None)
+    if cached_terms is None or cached_terms[0] != source_token:
+        count = len(mf._pair_ft_terms)
+        shifts = np.empty((count, 3), dtype=float)
+        ao_left = np.empty(count, dtype=np.intp)
+        ao_right = np.empty(count, dtype=np.intp)
+        derivatives = np.empty((count, 3), dtype=float)
+        for term_index, (shift, p, q, bp, bq) in enumerate(mf._pair_ft_terms):
+            shifts[term_index] = shift
+            ao_left[term_index] = p
+            ao_right[term_index] = q
+            for axis in range(3):
+                derivatives[term_index, axis] = _contracted_one_deriv(
+                    bp,
+                    bq,
+                    "overlap",
+                    order_b=_axis_order(axis),
+                )
+        cached_terms = (
+            source_token,
+            shifts,
+            ao_left,
+            ao_right,
+            derivatives,
+        )
+        try:
+            mf._pair_gradient_overlap_terms = cached_terms
+            if cache is not None:
+                cache.clear()
+        except Exception:
+            pass
+
     if cache is not None and cache_key in cache:
         return cache[cache_key]
 
+    _source_token, shifts, ao_left, ao_right, derivatives = cached_terms
+    phases = np.exp(1j * (shifts @ kvec))
     nao = int(mf.cell.nao)
     gradient = np.zeros((3, nao, nao), dtype=np.complex128)
-    for shift, p, q, bp, bq in mf._pair_ft_terms:
-        phase = np.exp(1j * np.dot(kvec, shift))
-        for axis in range(3):
-            center_derivative = _contracted_one_deriv(
-                bp,
-                bq,
-                "overlap",
-                order_b=_axis_order(axis),
-            )
-            gradient[axis, p, q] -= phase * center_derivative
+    for axis in range(3):
+        np.add.at(
+            gradient[axis],
+            (ao_left, ao_right),
+            -phases * derivatives[:, axis],
+        )
 
     if cache is not None:
         cache[cache_key] = gradient

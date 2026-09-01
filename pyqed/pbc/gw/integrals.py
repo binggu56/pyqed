@@ -822,11 +822,11 @@ def _gdf_aux_coord_type(ref):
 def _cartesian_to_spherical_transform(basis_cart):
     blocks = _cart_shell_blocks(basis_cart)
     ncart = len(basis_cart)
-    nsph = sum(2 * l + 1 for _start, _stop, l in blocks)
+    nsph = sum(2 * angular_momentum + 1 for _start, _stop, angular_momentum in blocks)
     transform = np.zeros((ncart, nsph), dtype=float)
     col = 0
-    for start, stop, l in blocks:
-        block = _cart2sph_unit_block(l)
+    for start, stop, angular_momentum in blocks:
+        block = _cart2sph_unit_block(angular_momentum)
         ncols = block.shape[1]
         transform[start:stop, col:col + ncols] = block
         col += ncols
@@ -844,9 +844,9 @@ def _gdf_charge_normalized_auxiliary_basis(aux_basis):
 
     normalized = list(aux_basis)
     half_spherical_norm = math.sqrt(0.25 / math.pi)
-    for start, stop, l in _cart_shell_blocks(aux_basis):
+    for start, stop, angular_momentum in _cart_shell_blocks(aux_basis):
         representative = aux_basis[start]
-        power = 2 * int(l) + 2
+        power = 2 * int(angular_momentum) + 2
         moment_order = 0.5 * (power + 1)
         radial_moment = (
             math.gamma(moment_order)
@@ -1018,12 +1018,12 @@ def _gdf_estimate_ke_cutoff_for_precision(ref, precision, omega=None):
     # Match PySCF's GDF mesh floor.  The auxiliary-shell estimate below may
     # tighten it, but the floor must not acquire an extra basis-size scaling.
     ecut_max = 30.0 * nkpts ** (-1.0 / 3.0)
-    for start, _stop, l in _cart_shell_blocks(aux_basis):
+    for start, _stop, angular_momentum in _cart_shell_blocks(aux_basis):
         fn = aux_basis[start]
-        l = int(l)
-        norm_ang = ((2 * l + 1) / (4.0 * np.pi)) ** 2
-        power = 2 * l - 0.5
-        radial_order = l + 1.5
+        angular_momentum = int(angular_momentum)
+        norm_ang = ((2 * angular_momentum + 1) / (4.0 * np.pi)) ** 2
+        power = 2 * angular_momentum - 0.5
+        radial_order = angular_momentum + 1.5
         radial_norm = 1.0 / np.sqrt(
             math.gamma(radial_order)
             / (2.0 * (2.0 * np.asarray(fn.exps, dtype=float)) ** radial_order)
@@ -1039,7 +1039,7 @@ def _gdf_estimate_ke_cutoff_for_precision(ref, precision, omega=None):
                 * np.pi ** 5
                 * coeff ** 4
                 * norm_ang
-                / (2.0 * exponent) ** (4 * l + 2)
+                / (2.0 * exponent) ** (4 * angular_momentum + 2)
                 / precision
             )
             theta = 2.0 * exponent
@@ -1657,26 +1657,26 @@ def _gdf_rs_smooth_exponent_cutoff(ref, omega, mesh):
 
 
 def _gdf_shell_kinetic_cutoffs(fn, angular_momentum, precision):
-    l = int(angular_momentum)
+    angular_momentum = int(angular_momentum)
     exponents = np.asarray(fn.exps, dtype=float)
-    radial_order = l + 1.5
+    radial_order = angular_momentum + 1.5
     radial_norm = 1.0 / np.sqrt(
         math.gamma(radial_order)
         / (2.0 * (2.0 * exponents) ** radial_order)
     )
     coefficients = np.abs(np.asarray(fn.coefs, dtype=float) * radial_norm)
-    norm_ang = (2 * l + 1) / (4.0 * np.pi)
+    norm_ang = (2 * angular_momentum + 1) / (4.0 * np.pi)
     fac = (
         32.0
         * np.pi ** 2
         * (2.0 * np.pi) ** 1.5
         * coefficients ** 2
         * norm_ang
-        / (2.0 * exponents) ** (2 * l + 0.5)
+        / (2.0 * exponents) ** (2 * angular_momentum + 0.5)
         / float(precision)
     )
     cutoffs = np.full_like(exponents, 20.0)
-    power = l - 0.5
+    power = angular_momentum - 0.5
     for _ in range(2):
         cutoffs = (
             np.log(fac * np.maximum(2.0 * cutoffs, 1.0e-12) ** power + 1.0)
@@ -1862,7 +1862,7 @@ def _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh, timings=None):
         shell_classes = []
         shell_exponents = []
         precision = _gdf_precision(ref, default=1.0e-8)
-        for start, stop, l in shell_blocks:
+        for start, stop, angular_momentum in shell_blocks:
             exponent = max(
                 _gdf_basis_exponent_stat(fn, "max")
                 for fn in aux.cart_basis[int(start):int(stop)]
@@ -1878,7 +1878,7 @@ def _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh, timings=None):
                 representative = aux.cart_basis[int(start)]
                 primitive_cutoffs = _gdf_shell_kinetic_cutoffs(
                     representative,
-                    l,
+                    angular_momentum,
                     precision,
                 )
                 smooth = bool(
@@ -1985,8 +1985,8 @@ def _gdf_build_rs_shell_engine(ref, kernel, omega, mesh):
         raise ValueError("gdf_smooth_exponent_stat must be 'max', 'min', or 'mean'.")
 
     shell_blocks = tuple(
-        (int(start), int(stop), int(l))
-        for start, stop, l in _cart_shell_blocks(basis)
+        (int(start), int(stop), int(angular_momentum))
+        for start, stop, angular_momentum in _cart_shell_blocks(basis)
     )
     ao_shell_index = np.empty(nao, dtype=np.int64)
     for shell_index, (start, stop, _l) in enumerate(shell_blocks):
@@ -2380,6 +2380,26 @@ def _gdf_apply_aux_transform(cart_ft, aux, mf, timings=None):
         aux_ft = cart_ft @ payload
     _gdf_add_timing(timings, "aux_ft_transform_seconds", time.perf_counter() - t0)
     return aux_ft
+
+
+def _gdf_apply_three_center_aux_transform(ao_cart, aux, mf, timings=None):
+    """Transform the auxiliary axis of one or more three-center AO tensors."""
+
+    ao_cart = np.asarray(ao_cart)
+    if ao_cart.ndim not in (3, 4):
+        raise ValueError("Three-center AO tensors must have rank 3 or 4.")
+    aux_axis = ao_cart.ndim - 3
+    if ao_cart.shape[aux_axis] != aux.ncart:
+        raise ValueError("Three-center AO tensor has an inconsistent auxiliary axis.")
+    cart_last = np.moveaxis(ao_cart, aux_axis, -1)
+    transformed = _gdf_apply_aux_transform(
+        np.ascontiguousarray(cart_last.reshape(-1, aux.ncart)),
+        aux,
+        mf,
+        timings=timings,
+    )
+    transformed = transformed.reshape(cart_last.shape[:-1] + (aux.naux,))
+    return np.ascontiguousarray(np.moveaxis(transformed, -1, aux_axis))
 
 
 def _gdf_weighted_aux_metric(aux_ft, weights, timings=None):
@@ -2803,6 +2823,17 @@ def _gdf_default_prebuild_workers():
     return max(1, min(8, max(4, int(cpu_count) // 2)))
 
 
+def _gdf_apply_inner_worker_cap(mf, workers):
+    cap = getattr(mf, "_gdf_inner_worker_cap", None)
+    if cap is None:
+        return max(1, int(workers))
+    try:
+        cap = max(1, int(cap))
+    except (TypeError, ValueError):
+        return max(1, int(workers))
+    return max(1, min(int(workers), cap))
+
+
 def _gdf_short_range_workers(mf):
     value = getattr(mf, "gdf_short_range_workers", None)
     if value is None:
@@ -2816,12 +2847,13 @@ def _gdf_short_range_workers(mf):
     if value is None:
         value = os.environ.get("PYQED_GDF_CPP_THREADS")
     if value is None:
-        return _gdf_default_short_range_workers()
-    try:
-        workers = int(value)
-    except (TypeError, ValueError):
-        return _gdf_default_short_range_workers()
-    return max(1, workers)
+        workers = _gdf_default_short_range_workers()
+    else:
+        try:
+            workers = int(value)
+        except (TypeError, ValueError):
+            workers = _gdf_default_short_range_workers()
+    return _gdf_apply_inner_worker_cap(mf, workers)
 
 
 def _gdf_short_range_task_chunk_size(mf):
@@ -2842,12 +2874,13 @@ def _gdf_pair_ft_workers(mf):
     if value is None:
         value = os.environ.get("PYQED_GDF_CPP_THREADS")
     if value is None:
-        return _gdf_default_pair_ft_workers()
-    try:
-        workers = int(value)
-    except (TypeError, ValueError):
-        return _gdf_default_pair_ft_workers()
-    return max(1, workers)
+        workers = _gdf_default_pair_ft_workers()
+    else:
+        try:
+            workers = int(value)
+        except (TypeError, ValueError):
+            workers = _gdf_default_pair_ft_workers()
+    return _gdf_apply_inner_worker_cap(mf, workers)
 
 
 def _gdf_aux_ft_workers(mf):
@@ -2861,12 +2894,13 @@ def _gdf_aux_ft_workers(mf):
     if value is None:
         value = os.environ.get("PYQED_GDF_CPP_THREADS")
     if value is None:
-        return _gdf_default_pair_ft_workers()
-    try:
-        workers = int(value)
-    except (TypeError, ValueError):
-        return _gdf_default_pair_ft_workers()
-    return max(1, workers)
+        workers = _gdf_default_pair_ft_workers()
+    else:
+        try:
+            workers = int(value)
+        except (TypeError, ValueError):
+            workers = _gdf_default_pair_ft_workers()
+    return _gdf_apply_inner_worker_cap(mf, workers)
 
 
 def _gdf_prebuild_workers(mf, value=None):
@@ -3364,8 +3398,8 @@ def _gdf_build_pair_image_plan(mf, pair_cut, pair_screen_tol):
     basis = tuple(mf._basis)
     nao = len(basis)
     shell_blocks = tuple(
-        (int(start), int(stop), int(l))
-        for start, stop, l in _cart_shell_blocks(basis)
+        (int(start), int(stop), int(angular_momentum))
+        for start, stop, angular_momentum in _cart_shell_blocks(basis)
     )
     auto = pair_cut == "auto"
     tolerance = (
@@ -5296,6 +5330,399 @@ def _gdf_three_center_sr_components(
     return None
 
 
+def _gdf_gamma_folded_mesh(ref, tol=1.0e-8):
+    scaled = np.asarray(ref.scaled_kpts, dtype=float).copy()
+    # Floating-point wrapping can leave the same Brillouin-zone boundary at
+    # both +1/2 and -1/2.  Canonicalize it before inferring the mesh axes.
+    scaled[scaled >= 0.5 - float(tol)] -= 1.0
+    mesh = np.asarray(
+        [
+            len(np.unique(np.round(scaled[:, axis], 12)))
+            for axis in range(3)
+        ],
+        dtype=np.int64,
+    )
+    if int(np.prod(mesh)) != ref.nkpts:
+        return None
+    scaled_mesh = scaled * mesh[None, :]
+    rounded = np.rint(scaled_mesh)
+    if np.max(np.abs(scaled_mesh - rounded), initial=0.0) > tol:
+        return None
+    grid_indices = np.mod(rounded.astype(np.int64), mesh[None, :])
+    linear = np.ravel_multi_index(grid_indices.T, tuple(mesh))
+    if len(np.unique(linear)) != ref.nkpts:
+        return None
+    return tuple(int(value) for value in mesh), np.asarray(linear, dtype=np.int64)
+
+
+def _gdf_close_folded_short_range_cache(mf):
+    cache = _gdf_mf_cache(mf, "three_center_ao_short_range_folded")
+    for record in cache.values():
+        data = record.get("data")
+        mmap = getattr(data, "_mmap", None)
+        if mmap is not None:
+            mmap.close()
+        path = record.get("path")
+        if path:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+    cache.clear()
+
+
+def _gdf_stream_three_center_ao_short_range_folded(
+    space,
+    aux,
+    omega,
+    short_range_cut,
+    consumer,
+    timings=None,
+    allowed_pair_mask=None,
+    allowed_aux_mask=None,
+):
+    """Stream Gamma-commensurate BvK auxiliary batches to ``consumer``."""
+
+    ref = space.reference
+    folded_mesh = _gdf_gamma_folded_mesh(ref)
+    if folded_mesh is None:
+        return False
+    mesh, k_grid_indices = folded_mesh
+    nkpts = int(ref.nkpts)
+    min_kpts = max(1, int(getattr(ref._pbc_mf, "gdf_folded_min_kpts", 64)))
+    if nkpts < min_kpts:
+        return False
+    mf = ref._pbc_mf
+    basis = tuple(mf._basis)
+    nao = len(basis)
+    pair_mask = (
+        np.ones((nao, nao), dtype=np.uint8)
+        if allowed_pair_mask is None
+        else np.ascontiguousarray(allowed_pair_mask, dtype=np.uint8)
+    )
+    aux_pair_mask = np.broadcast_to(
+        pair_mask[None, :, :],
+        (aux.ncart, nao, nao),
+    ).copy()
+    if allowed_aux_mask is not None:
+        aux_pair_mask *= np.asarray(allowed_aux_mask, dtype=np.uint8)[:, None, None]
+
+    (
+        shells,
+        origins,
+        exps,
+        weights,
+        nprim,
+    ) = _gdf_cached_packed_basis(mf, "ao_short_range_packed_basis", basis)
+    (
+        aux_shells,
+        aux_origins,
+        aux_exps,
+        aux_weights,
+        aux_nprim,
+    ) = _gdf_cached_packed_basis(
+        mf,
+        "aux_short_range_packed_basis",
+        aux.cart_basis,
+    )
+    shell_starts, shell_stops = _gdf_cached_cart_shell_slices(
+        mf,
+        "ao_short_range_cart_shell_slices",
+        basis,
+    )
+    aux_shell_starts, aux_shell_stops = _gdf_cached_cart_shell_slices(
+        mf,
+        "aux_short_range_cart_shell_slices",
+        aux.cart_basis,
+    )
+    image_keys = _gdf_short_range_image_keys(ref, short_range_cut, omega)
+    image_keys_array = np.asarray(image_keys, dtype=np.int64).reshape(-1, 3)
+    shifts = np.ascontiguousarray(
+        [mf.cell.translation_vector(key) for key in image_keys],
+        dtype=np.float64,
+    )
+    image_bins = np.ravel_multi_index(
+        np.mod(image_keys_array, np.asarray(mesh)[None, :]).T,
+        mesh,
+    )
+    groups = {}
+    for left_index in range(len(shifts)):
+        for right_index in range(left_index, len(shifts)):
+            relative_shift = shifts[right_index] - shifts[left_index]
+            key = _gdf_vector_key(relative_shift)
+            group = groups.setdefault(
+                key,
+                {"relative_shift": relative_shift, "tasks": []},
+            )
+            group["tasks"].append((left_index, right_index))
+    group_rows = list(groups.values())
+    primitive_exp_cutoff = _gdf_short_range_primitive_exp_cutoff(ref)
+    worker_count = min(
+        _gdf_short_range_workers(mf),
+        max(1, len(aux_shell_starts)),
+    )
+    bytes_per_aux = int(
+        nao * nao * nkpts * nkpts * np.dtype(np.float64).itemsize
+    )
+    folded_batch_mb = float(getattr(mf, "gdf_folded_batch_mb", 128.0))
+    if not np.isfinite(folded_batch_mb) or folded_batch_mb <= 0.0:
+        raise ValueError("gdf_folded_batch_mb must be positive and finite.")
+    max_aux_per_batch = max(
+        1,
+        int(folded_batch_mb * 1.0e6) // max(1, bytes_per_aux),
+    )
+    aux_batches = []
+    batch_shell_begin = 0
+    batch_aux_begin = int(aux_shell_starts[0])
+    for shell_index, shell_stop in enumerate(aux_shell_stops):
+        shell_stop = int(shell_stop)
+        if (
+            shell_index > batch_shell_begin
+            and shell_stop - batch_aux_begin > max_aux_per_batch
+        ):
+            previous_stop = int(aux_shell_stops[shell_index - 1])
+            aux_batches.append(
+                (
+                    batch_shell_begin,
+                    shell_index,
+                    batch_aux_begin,
+                    previous_stop,
+                )
+            )
+            batch_shell_begin = shell_index
+            batch_aux_begin = int(aux_shell_starts[shell_index])
+    aux_batches.append(
+        (
+            batch_shell_begin,
+            len(aux_shell_starts),
+            batch_aux_begin,
+            int(aux_shell_stops[-1]),
+        )
+    )
+
+    complex_bytes_per_aux = int(
+        nao * nao * nkpts * nkpts * np.dtype(np.complex128).itemsize
+    )
+    transform_aux_block = max(
+        1,
+        int(folded_batch_mb * 1.0e6)
+        // max(1, 2 * complex_bytes_per_aux),
+    )
+    left_axes = (3, 4, 5)
+    right_axes = (6, 7, 8)
+    build_seconds = 0.0
+    transform_seconds = 0.0
+    consume_seconds = 0.0
+    worker_counters = []
+    peak_folded_bytes = 0
+    peak_transform_bytes = 0
+    for (
+        aux_shell_begin,
+        aux_shell_end,
+        aux_begin,
+        aux_end,
+    ) in aux_batches:
+        folded = np.zeros(
+            (aux_end - aux_begin, nao, nao, nkpts * nkpts),
+            dtype=np.float64,
+        )
+        peak_folded_bytes = max(peak_folded_bytes, int(folded.nbytes))
+        shell_chunks = [
+            chunk
+            for chunk in np.array_split(
+                np.arange(aux_shell_begin, aux_shell_end, dtype=np.int64),
+                min(worker_count, aux_shell_end - aux_shell_begin),
+            )
+            if len(chunk)
+        ]
+
+        def build_aux_shells(shell_chunk):
+            counters = np.zeros(3, dtype=np.int64)
+            for group in group_rows:
+                tasks = np.asarray(group["tasks"], dtype=np.int64)
+                left_shifts = np.ascontiguousarray(
+                    shifts[tasks[:, 0]],
+                    dtype=np.float64,
+                )
+                right_origins = np.ascontiguousarray(
+                    origins + np.asarray(group["relative_shift"])[None, :],
+                    dtype=np.float64,
+                )
+                aux_origins_many = np.ascontiguousarray(
+                    aux_origins[None, :, :] - left_shifts[:, None, :],
+                    dtype=np.float64,
+                )
+                direct_bins = np.ascontiguousarray(
+                    image_bins[tasks[:, 0]] * nkpts + image_bins[tasks[:, 1]],
+                    dtype=np.int64,
+                )
+                mirror_bins = np.ascontiguousarray(
+                    image_bins[tasks[:, 1]] * nkpts + image_bins[tasks[:, 0]],
+                    dtype=np.int64,
+                )
+                mirror_flags = np.ascontiguousarray(
+                    tasks[:, 0] != tasks[:, 1],
+                    dtype=np.uint8,
+                )
+                zero_phases = np.zeros((len(tasks), 1), dtype=np.float64)
+                (
+                    _output,
+                    _unused_imag,
+                    primitive_candidates,
+                    primitive_skips,
+                    shell_task_skips,
+                ) = _basis_cy.compute_short_range_three_center_bloch_shell_blocked_group_masked(
+                    shells,
+                    origins,
+                    right_origins,
+                    exps,
+                    weights,
+                    nprim,
+                    aux_shells,
+                    aux_origins_many,
+                    aux_exps,
+                    aux_weights,
+                    aux_nprim,
+                    shell_starts,
+                    shell_stops,
+                    aux_shell_starts,
+                    aux_shell_stops,
+                    pair_mask,
+                    aux_pair_mask,
+                    zero_phases,
+                    zero_phases,
+                    zero_phases,
+                    zero_phases,
+                    mirror_flags,
+                    float(omega),
+                    float(primitive_exp_cutoff),
+                    output_real=folded,
+                    direct_bins=direct_bins,
+                    mirror_bins=mirror_bins,
+                    aux_shell_begin=int(shell_chunk[0]),
+                    aux_shell_end=int(shell_chunk[-1]) + 1,
+                    output_aux_offset=int(aux_begin),
+                )
+                counters += (
+                    int(primitive_candidates),
+                    int(primitive_skips),
+                    int(shell_task_skips),
+                )
+            return counters
+
+        build_t0 = time.perf_counter()
+        if len(shell_chunks) == 1:
+            batch_counters = [build_aux_shells(shell_chunks[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=len(shell_chunks)) as executor:
+                batch_counters = list(executor.map(build_aux_shells, shell_chunks))
+        build_seconds += time.perf_counter() - build_t0
+        worker_counters.extend(batch_counters)
+
+        folded_aux = folded.reshape(
+            (aux_end - aux_begin, nao, nao) + mesh + mesh,
+        )
+        for local_begin in range(0, aux_end - aux_begin, transform_aux_block):
+            local_end = min(aux_end - aux_begin, local_begin + transform_aux_block)
+            transform_t0 = time.perf_counter()
+            transformed = np.fft.fftn(
+                folded_aux[local_begin:local_end],
+                axes=left_axes,
+            )
+            transformed = np.fft.ifftn(transformed, axes=right_axes)
+            transformed *= nkpts
+            transformed_pairs = transformed.reshape(
+                local_end - local_begin,
+                nao,
+                nao,
+                nkpts,
+                nkpts,
+            ).transpose(3, 4, 0, 1, 2)
+            transform_seconds += time.perf_counter() - transform_t0
+            peak_transform_bytes = max(
+                peak_transform_bytes,
+                int(transformed.nbytes),
+            )
+            consume_t0 = time.perf_counter()
+            consumer(
+                aux_begin + local_begin,
+                aux_begin + local_end,
+                transformed_pairs,
+                k_grid_indices,
+            )
+            consume_seconds += time.perf_counter() - consume_t0
+
+    if timings is not None:
+        timings["three_center_sr_folded"] = True
+        timings["three_center_sr_folded_pipeline"] = "aux_fft_consumer"
+        timings["three_center_sr_folded_mesh"] = list(mesh)
+        timings["three_center_short_range_workers"] = int(worker_count)
+        timings["three_center_sr_folded_build_seconds"] = float(build_seconds)
+        timings["three_center_sr_folded_transform_seconds"] = float(
+            transform_seconds
+        )
+        timings["three_center_sr_folded_consume_seconds"] = float(consume_seconds)
+        timings["three_center_sr_folded_storage_bytes"] = 0
+        timings["three_center_sr_folded_batch_count"] = int(len(aux_batches))
+        timings["three_center_sr_folded_batch_peak_bytes"] = int(
+            peak_folded_bytes
+        )
+        timings["three_center_sr_folded_transform_peak_bytes"] = int(
+            peak_transform_bytes
+        )
+        timings["three_center_sr_group_workspace_bytes_upper_bound"] = int(
+            peak_folded_bytes + 2 * peak_transform_bytes
+        )
+        timings["three_center_sr_folded_image_pairs"] = int(len(shifts) ** 2)
+        timings["three_center_sr_folded_worker_counters"] = [
+            row.tolist() for row in worker_counters
+        ]
+    return True
+
+
+def _gdf_three_center_ao_short_range_folded(
+    space,
+    pair_keys,
+    aux,
+    omega,
+    short_range_cut,
+    timings=None,
+    allowed_pair_mask=None,
+    allowed_aux_mask=None,
+):
+    """Collect selected pairs from the bounded BvK auxiliary stream."""
+
+    pair_keys = list(pair_keys)
+    nao = len(tuple(space.reference._pbc_mf._basis))
+    selected = np.zeros(
+        (len(pair_keys), aux.ncart, nao, nao),
+        dtype=np.complex128,
+    )
+
+    def consume(aux_begin, aux_end, transformed_pairs, k_grid_indices):
+        left = np.asarray(
+            [k_grid_indices[k_index] for k_index, _kq_index in pair_keys],
+            dtype=np.int64,
+        )
+        right = np.asarray(
+            [k_grid_indices[kq_index] for _k_index, kq_index in pair_keys],
+            dtype=np.int64,
+        )
+        selected[:, aux_begin:aux_end] = transformed_pairs[left, right]
+
+    streamed = _gdf_stream_three_center_ao_short_range_folded(
+        space,
+        aux,
+        omega,
+        short_range_cut,
+        consume,
+        timings=timings,
+        allowed_pair_mask=allowed_pair_mask,
+        allowed_aux_mask=allowed_aux_mask,
+    )
+    return selected if streamed else None
+
+
 def _gdf_three_center_ao_short_range_grouped_bloch(
     space,
     pair_keys,
@@ -5378,7 +5805,9 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
     )
     primitive_exp_cutoff = _gdf_short_range_primitive_exp_cutoff(ref)
 
-    def build_group(group):
+    output_shape = (aux.ncart, nao, nao, len(pair_keys))
+
+    def build_group(group, output_real, output_imag):
         tasks = np.asarray(group["tasks"], dtype=np.int64)
         left_shifts = np.ascontiguousarray(shifts[tasks[:, 0]], dtype=np.float64)
         right_shifts = np.ascontiguousarray(shifts[tasks[:, 1]], dtype=np.float64)
@@ -5404,8 +5833,8 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
             dtype=np.uint8,
         )
         (
-            _real,
-            _imag,
+            _output_real,
+            _output_imag,
             primitive_candidates,
             primitive_skips,
             shell_task_skips,
@@ -5435,11 +5864,11 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
                 mirror_flags,
                 float(omega),
                 float(primitive_exp_cutoff),
+                output_real,
+                output_imag,
             )
         )
         return (
-            np.moveaxis(np.asarray(_real), -1, 0)
-            + 1.0j * np.moveaxis(np.asarray(_imag), -1, 0),
             len(tasks),
             int(primitive_candidates),
             int(primitive_skips),
@@ -5447,10 +5876,6 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
         )
 
     t0 = time.perf_counter()
-    ao_cart = np.zeros(
-        (len(pair_keys), aux.ncart, nao, nao),
-        dtype=np.complex128,
-    )
     worker_count = min(_gdf_short_range_workers(mf), max(1, len(group_rows)))
     worker_groups = [[] for _index in range(worker_count)]
     worker_loads = np.zeros(worker_count, dtype=np.int64)
@@ -5463,26 +5888,26 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
 
     def build_worker_groups(rows):
         worker_t0 = time.perf_counter()
-        contribution = np.zeros_like(ao_cart)
+        contribution_real = np.zeros(output_shape, dtype=np.float64)
+        contribution_imag = np.zeros(output_shape, dtype=np.float64)
         primitive_candidates = 0
         primitive_skips = 0
         shell_task_skips = 0
         image_pairs = 0
         for group in rows:
             (
-                group_contribution,
                 task_count,
                 group_primitive_candidates,
                 group_primitive_skips,
                 group_shell_task_skips,
-            ) = build_group(group)
-            contribution += group_contribution
+            ) = build_group(group, contribution_real, contribution_imag)
             image_pairs += task_count
             primitive_candidates += group_primitive_candidates
             primitive_skips += group_primitive_skips
             shell_task_skips += group_shell_task_skips
         return (
-            contribution,
+            contribution_real,
+            contribution_imag,
             primitive_candidates,
             primitive_skips,
             shell_task_skips,
@@ -5494,17 +5919,21 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
     primitive_skips = 0
     shell_task_skips = 0
     worker_diagnostics = []
+    ao_real = np.zeros(output_shape, dtype=np.float64)
+    ao_imag = np.zeros(output_shape, dtype=np.float64)
     if worker_count > 1 and len(group_rows) > 1:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             for (
-                contribution,
+                contribution_real,
+                contribution_imag,
                 worker_primitive_candidates,
                 worker_primitive_skips,
                 worker_shell_task_skips,
                 worker_image_pairs,
                 worker_seconds,
             ) in executor.map(build_worker_groups, worker_groups):
-                ao_cart += contribution
+                ao_real += contribution_real
+                ao_imag += contribution_imag
                 primitive_candidates += worker_primitive_candidates
                 primitive_skips += worker_primitive_skips
                 shell_task_skips += worker_shell_task_skips
@@ -5519,14 +5948,16 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
                 )
     else:
         (
-            contribution,
+            contribution_real,
+            contribution_imag,
             primitive_candidates,
             primitive_skips,
             shell_task_skips,
             worker_image_pairs,
             worker_seconds,
         ) = build_worker_groups(group_rows)
-        ao_cart += contribution
+        ao_real += contribution_real
+        ao_imag += contribution_imag
         worker_diagnostics.append(
             (
                 worker_image_pairs,
@@ -5536,6 +5967,12 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
                 worker_seconds,
             )
         )
+
+    ao_cart = np.moveaxis(ao_real, -1, 0) + 1.0j * np.moveaxis(
+        ao_imag,
+        -1,
+        0,
+    )
 
     nimages = len(shifts)
     ordered_tasks = nimages * nimages
@@ -5615,7 +6052,7 @@ def _gdf_three_center_ao_short_range_grouped_bloch(
         ]
         timings["three_center_sr_group_output_bytes"] = int(ao_cart.nbytes)
         timings["three_center_sr_group_workspace_bytes_upper_bound"] = int(
-            (3 * worker_count + 1) * ao_cart.nbytes
+            (worker_count + 2) * ao_cart.nbytes
         )
     return ao_cart
 
@@ -5758,19 +6195,34 @@ def _gdf_three_center_ao_short_range_many_q(
         and _gdf_compiled_short_range_grouped_bloch_available()
     )
     if use_grouped_bloch:
-        ao_cart += _gdf_three_center_ao_short_range_grouped_bloch(
-            space,
-            [
-                (k_index, kq_index)
-                for _q_index, k_index, kq_index, _key in missing
-            ],
-            aux,
-            omega,
-            short_range_cut,
-            timings=timings,
-            allowed_pair_mask=allowed_pair_mask,
-            allowed_aux_mask=allowed_aux_mask,
-        )
+        pair_keys = [
+            (k_index, kq_index)
+            for _q_index, k_index, kq_index, _key in missing
+        ]
+        folded = None
+        if len({q_index for q_index, *_rest in missing}) >= 2:
+            folded = _gdf_three_center_ao_short_range_folded(
+                space,
+                pair_keys,
+                aux,
+                omega,
+                short_range_cut,
+                timings=timings,
+                allowed_pair_mask=allowed_pair_mask,
+                allowed_aux_mask=allowed_aux_mask,
+            )
+        if folded is None:
+            folded = _gdf_three_center_ao_short_range_grouped_bloch(
+                space,
+                pair_keys,
+                aux,
+                omega,
+                short_range_cut,
+                timings=timings,
+                allowed_pair_mask=allowed_pair_mask,
+                allowed_aux_mask=allowed_aux_mask,
+            )
+        ao_cart += folded
         peak_tensor_bytes = 0
     elif has_short_range_pairs:
         _gdf_three_center_sr_components(
@@ -5796,11 +6248,11 @@ def _gdf_three_center_ao_short_range_many_q(
             timings["three_center_sr_component_streamed"] = True
             timings["three_center_sr_max_inflight_tasks"] = 0
 
-    ao_tensors = np.einsum(
-        "aP,xamn->xPmn",
-        aux.transform,
+    ao_tensors = _gdf_apply_three_center_aux_transform(
         ao_cart,
-        optimize=True,
+        aux,
+        mf,
+        timings=timings,
     )
     for row, (q_index, k_index, kq_index, key) in enumerate(missing):
         ao_tensor = np.ascontiguousarray(ao_tensors[row])
@@ -6054,14 +6506,26 @@ def _gdf_three_center_ao_short_range(
         )
         ao_cart += phase * tensor
 
-    ao_tensor = np.einsum("aP,amn->Pmn", aux.transform, ao_cart, optimize=True)
+    ao_tensor = _gdf_apply_three_center_aux_transform(
+        ao_cart,
+        aux,
+        mf,
+        timings=timings,
+    )
     _gdf_add_timing(timings, "three_center_short_range_seconds", time.perf_counter() - t0)
     _gdf_count(timings, "three_center_short_range_terms", len(components))
     cache[key] = ao_tensor
     return ao_tensor
 
 
-def _periodic_gdf_aux_metric(space, q_index, aux, g2_tol, timings=None):
+def _periodic_gdf_aux_metric(
+    space,
+    q_index,
+    aux,
+    g2_tol,
+    timings=None,
+    g_block_size=None,
+):
     ref = space.reference
     mf = ref._pbc_mf
     qvec = np.asarray(space.qpts[q_index], dtype=float)
@@ -6115,7 +6579,9 @@ def _periodic_gdf_aux_metric(space, q_index, aux, g2_tol, timings=None):
         return cache[key]
     _gdf_count(timings, "aux_metric_cache_misses")
 
-    g_block_size = _gdf_g_block_size(mf, mesh=mesh, naux=aux.naux)
+    if g_block_size is None:
+        g_block_size = _gdf_g_block_size(mf, mesh=mesh, naux=aux.naux)
+    g_block_size = int(g_block_size)
     if timings is not None:
         timings["g_block_size"] = int(g_block_size)
     metric = np.zeros((aux.naux, aux.naux), dtype=np.complex128)
@@ -6481,7 +6947,13 @@ def _gdf_metric_invsqrt(
             f"Auxiliary Coulomb metric for {auxbasis!r} has no eigenvalues above "
             f"gdf_metric_tol={eigenvalue_threshold:g}."
         )
-    invsqrt = evecs[:, keep] / np.sqrt(evals[keep])[None, :]
+    retained = np.array(evecs[:, keep], copy=True)
+    for column in range(retained.shape[1]):
+        vector = retained[:, column]
+        pivot = vector[int(np.argmax(np.abs(vector)))]
+        if abs(pivot) > np.finfo(float).tiny:
+            retained[:, column] /= pivot / abs(pivot)
+    invsqrt = retained / np.sqrt(evals[keep])[None, :]
     return np.asarray(invsqrt, dtype=np.complex128), evals
 
 
@@ -6498,6 +6970,7 @@ def _periodic_gdf_three_center_ao(
     timings=None,
     reciprocal_only_pair_mask=None,
     rs_engine=None,
+    skip_short_range_integrals=False,
 ):
     ref = space.reference
     mf = ref._pbc_mf
@@ -6586,6 +7059,7 @@ def _periodic_gdf_three_center_ao(
         primitive_exp_cutoff,
         _gdf_precision(ref),
         partition_key,
+        bool(skip_short_range_integrals),
     )
     if key in cache:
         _gdf_count(timings, "three_center_ao_cache_hits")
@@ -6738,7 +7212,11 @@ def _periodic_gdf_three_center_ao(
     if _gdf_uses_short_range(kernel):
         has_compact_pairs = compact_pair_mask is None or bool(np.any(compact_pair_mask))
         has_compact_aux = short_range_aux.ncart > 0
-        if has_compact_pairs and has_compact_aux:
+        if (
+            has_compact_pairs
+            and has_compact_aux
+            and not skip_short_range_integrals
+        ):
             if short_range_ao is None:
                 short_range_ao = _gdf_three_center_ao_short_range(
                     space,
@@ -7068,6 +7546,7 @@ def _gdf_q_ao_store(
     timings=None,
     rs_engine=None,
     allow_opposite=True,
+    skip_short_range_integrals=False,
 ):
     ref = space.reference
     mf = ref._pbc_mf
@@ -7119,6 +7598,7 @@ def _gdf_q_ao_store(
         partition_key,
         self_opposite_pair_reuse,
         pair_plan_settings_key,
+        bool(skip_short_range_integrals),
     )
     store_cache = _gdf_mf_cache(mf, "q_ao_store")
     store = store_cache.get(store_key)
@@ -7159,6 +7639,7 @@ def _gdf_q_ao_store(
                     timings=None,
                     rs_engine=rs_engine,
                     allow_opposite=False,
+                    skip_short_range_integrals=skip_short_range_integrals,
                 )
                 t0 = time.perf_counter()
                 ao_blocks = {}
@@ -7312,6 +7793,7 @@ def _gdf_q_ao_store(
                     aux,
                     factor_threshold,
                     timings=timings,
+                    g_block_size=g_block_size,
                 )
                 _gdf_add_timing(
                     timings,
@@ -7567,7 +8049,11 @@ def _gdf_q_ao_store(
             pair_ao_by_kq_index[int(kq_index)] = batch[row]
 
     short_range_ao_by_pair = {}
-    if source_missing_pairs and _gdf_uses_short_range(kernel):
+    if (
+        source_missing_pairs
+        and _gdf_uses_short_range(kernel)
+        and not skip_short_range_integrals
+    ):
         compact_pair_mask = None
         if rs_engine is not None and rs_engine.partition_active:
             compact_pair_mask = rs_engine.compact_pair_mask
@@ -7604,6 +8090,7 @@ def _gdf_q_ao_store(
             short_range_ao=short_range_ao_by_pair.pop(pair_key, None),
             timings=timings,
             rs_engine=rs_engine,
+            skip_short_range_integrals=skip_short_range_integrals,
         )
     self_opposite_reuses += populate_self_opposite_pairs(q_pair_keys)
     _gdf_add_timing(timings, "q_ao_store_build_seconds", time.perf_counter() - t_store)
@@ -7735,7 +8222,6 @@ def _gdf_transition_factors_from_opposite_q(
     aux_coord_type,
     factor_threshold,
 ):
-    ref = space.reference
     pair_blocks = {}
     for k_index, kq_index in _pair_keys_for_q(space, q_index):
         source_key = (int(kq_index), int(k_index))
@@ -7800,19 +8286,24 @@ def _gdf_transition_factors_from_periodic_backend(
 
     pair_blocks = {}
     t0 = time.perf_counter()
-    for k_index, kq_index in _pair_keys_for_q(space, q_index):
-        ao_block = backend.cderi(backend_q, k_index, kq_index)
-        left = np.asarray(ref.mo_coeff[k_index])
-        right = np.asarray(ref.mo_coeff[kq_index])
-        pair_blocks[(int(k_index), int(kq_index))] = np.ascontiguousarray(
-            np.einsum(
-                "pi,Ppq,qj->Pij",
-                left.conj(),
-                ao_block,
-                right,
-                optimize=True,
+    try:
+        for k_index, kq_index in _pair_keys_for_q(space, q_index):
+            ao_block = backend.cderi(backend_q, k_index, kq_index)
+            left = np.asarray(ref.mo_coeff[k_index])
+            right = np.asarray(ref.mo_coeff[kq_index])
+            pair_blocks[(int(k_index), int(kq_index))] = np.ascontiguousarray(
+                np.einsum(
+                    "pi,Ppq,qj->Pij",
+                    left.conj(),
+                    ao_block,
+                    right,
+                    optimize=True,
+                )
             )
-        )
+    finally:
+        release_maps = getattr(backend, "_close_disk_maps", None)
+        if release_maps is not None:
+            release_maps()
     transitions = space.transitions(q_index)
     rank = int(metadata["metric_rank"])
     transition_vectors = _gdf_extract_transition_vectors(
@@ -8459,7 +8950,7 @@ def prebuild_gdf_q_ao_stores(
         if short_range_aux.ncart == 0:
             q_batch_size = 0
         else:
-            workspace_factor = 3 * _gdf_short_range_workers(mf) + 4
+            workspace_factor = _gdf_short_range_workers(mf) + 5
             pair_workspace_per_q = int(
                 workspace_factor * raw_pair_bytes * pair_count
             )
@@ -8583,7 +9074,9 @@ def prebuild_gdf_q_ao_stores(
     for q_index in derived_indices:
         summary = build_one(q_index)
         summaries_by_q[int(summary["q_index"])] = summary
-    return [summaries_by_q[int(q_index)] for q_index in q_indices]
+    summaries = [summaries_by_q[int(q_index)] for q_index in q_indices]
+    _gdf_close_folded_short_range_cache(mf)
+    return summaries
 
 
 def gdf_transition_metric(space, q_index=0, g2_tol=1.0e-16):
@@ -8607,11 +9100,15 @@ def gdf_mo_jk(space, coulomb_component=GDF, g2_tol=1.0e-16, dm=None):
         space = KPointTransitionSpace(space)
     component = normalize_coulomb_component(coulomb_component)
     if component == GDF:
-        factor_builder = lambda q: gdf_transition_factors(
-            space, q_index=q, g2_tol=g2_tol
-        )
+        def factor_builder(q_index):
+            return gdf_transition_factors(
+                space,
+                q_index=q_index,
+                g2_tol=g2_tol,
+            )
     elif component == PYSCF_GDF:
-        factor_builder = lambda q: pyscf_gdf_transition_factors(space, q_index=q)
+        def factor_builder(q_index):
+            return pyscf_gdf_transition_factors(space, q_index=q_index)
     else:
         raise ValueError("gdf_mo_jk requires 'gdf' or 'pyscf_gdf'.")
 

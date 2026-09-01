@@ -1,15 +1,42 @@
-"""Native periodic Gaussian density fitting for SCF consumers."""
+"""Periodic Gaussian density fitting for SCF consumers."""
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+import os
 import tempfile
 import threading
 import time
 
 import numpy as np
+
+
+@contextmanager
+def _temporary_setting(obj, name, value):
+    missing = object()
+    previous = getattr(obj, name, missing)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        if previous is missing:
+            if hasattr(obj, name):
+                delattr(obj, name)
+        else:
+            setattr(obj, name, previous)
+
+
+@contextmanager
+def _folded_short_range_cache_scope(mf):
+    from pyqed.pbc.gw.integrals import _gdf_close_folded_short_range_cache
+
+    try:
+        yield
+    finally:
+        _gdf_close_folded_short_range_cache(mf)
 
 
 @dataclass(frozen=True)
@@ -21,13 +48,22 @@ class DiskCDERI:
     dtype: str
     packed: bool = False
     nao: int | None = None
+    index: int | None = None
 
     @property
     def nbytes(self):
         return int(np.prod(self.shape)) * np.dtype(self.dtype).itemsize
 
     def array(self):
-        return np.load(self.path, mmap_mode="r")
+        array = np.load(self.path, mmap_mode="r")
+        return array if self.index is None else array[int(self.index)]
+
+
+@dataclass(frozen=True)
+class ConjugateCDERI:
+    """Symmetry alias for the Hermitian-transpose of a canonical factor."""
+
+    source_key: tuple
 
 
 @dataclass(frozen=True)
@@ -202,10 +238,11 @@ class _KMeshSpace:
 class PeriodicGDF:
     """Persistent q-resolved periodic GDF backend.
 
-    The expensive auxiliary metrics and three-center AO image integrals use the
-    native range-separated kernels.  Whitened AO factors are cached independently
-    of orbitals, so every SCF cycle contracts the new density directly without
-    constructing a GW transition space or transforming all AO pairs to MOs.
+    The expensive auxiliary metrics and three-center AO image integrals use
+    PyQED's range-separated kernels.  Whitened AO factors are cached
+    independently of orbitals, so every SCF cycle contracts the new density
+    directly without constructing a GW transition space or transforming all
+    AO pairs to MOs.
 
     ``aux_min_exponent`` applies an explicit primitive exponent floor to the
     fitting basis, matching PySCF GDF's ``exp_to_discard`` semantics.  It is an
@@ -215,6 +252,23 @@ class PeriodicGDF:
     ``max(1e-14, 0.1 * precision)``.  The precision-aware floor removes modes
     below the reliable integral scale while preserving an explicit numeric
     override for controlled convergence studies.
+
+    ``build(workers=n)`` uses a bounded two-level schedule.  Independent
+    canonical q blocks and their inner short-range/pair-FT kernels share the
+    available CPU count without oversubscription.  ``stream_pair_batch_mb`` is
+    a global workspace ceiling divided among active q workers.  On a
+    Gamma-commensurate mesh, auxiliary-shell BvK/FFT batches stream selected
+    pairs into bounded temporary q blocks; each complete q block is then
+    whitened once into persistent cderi and deleted.  Symmetry-derived pair
+    blocks are aliases of canonical factors rather than stored copies.  A
+    build is transactional: interruption or an I/O failure removes temporary
+    files and rolls back factors created by that call.
+
+    The factorization is adapted from Q. Sun et al., J. Chem. Phys. 147,
+    164119 (2017), doi:10.1063/1.4998644.  The implementation uses a PyQED
+    scheduler and a Gamma-commensurate Born--von Karman folding/FFT engine; it
+    is not an exact reproduction of PySCF's ``libpbc`` implementation.  Shifted
+    and noncommensurate meshes fall back to direct Bloch-phase accumulation.
     """
 
     mf: object
@@ -238,13 +292,16 @@ class PeriodicGDF:
     stream_pairs: bool = False
     stream_pair_batch_size: int | str | None = None
     stream_pair_batch_mb: float = 128.0
+    folded_batch_mb: float = 128.0
     _space: _KMeshSpace = field(init=False, repr=False)
     _cderi_cache: dict = field(default_factory=dict, init=False, repr=False)
     _q_metadata: dict = field(default_factory=dict, init=False, repr=False)
     _configuration_key: tuple | None = field(default=None, init=False, repr=False)
     _memory_bytes: int = field(default=0, init=False, repr=False)
     _disk_dir: Path | None = field(default=None, init=False, repr=False)
+    _disk_maps: dict = field(default_factory=dict, init=False, repr=False)
     _lock: threading.RLock = field(init=False, repr=False)
+    _build_lock: threading.RLock = field(init=False, repr=False)
     _q_locks: list = field(init=False, repr=False)
     build_timings: dict = field(default_factory=dict, init=False)
     multi_q_build_timings: list = field(default_factory=list, init=False)
@@ -304,6 +361,10 @@ class PeriodicGDF:
             or self.stream_pair_batch_mb <= 0.0
         ):
             raise ValueError("stream_pair_batch_mb must be a positive finite value.")
+        self.folded_batch_mb = float(self.folded_batch_mb)
+        if not np.isfinite(self.folded_batch_mb) or self.folded_batch_mb <= 0.0:
+            raise ValueError("folded_batch_mb must be a positive finite value.")
+        mf.gdf_folded_batch_mb = self.folded_batch_mb
         if self.stream_pair_batch_size is not None:
             value = self.stream_pair_batch_size
             if isinstance(value, str) and value.strip().lower() == "auto":
@@ -324,6 +385,7 @@ class PeriodicGDF:
                 self.stream_pair_batch_size = integer
         self._space = _KMeshSpace(mf)
         self._lock = threading.RLock()
+        self._build_lock = threading.RLock()
         self._q_locks = [threading.RLock() for _qvec in self._space.qpts]
 
     @property
@@ -396,9 +458,11 @@ class PeriodicGDF:
     @property
     def cache_files(self):
         return tuple(
-            factor.path
-            for factor in self._cderi_cache.values()
-            if isinstance(factor, DiskCDERI)
+            dict.fromkeys(
+                factor.path
+                for factor in self._cderi_cache.values()
+                if isinstance(factor, DiskCDERI)
+            )
         )
 
     def _ensure_disk_dir(self):
@@ -434,15 +498,31 @@ class PeriodicGDF:
             directory = self._ensure_disk_dir()
             q_index, k_index, kq_index = key[-3:]
             path = directory / f"q{q_index:05d}-k{k_index:05d}-{kq_index:05d}.npy"
-            mapped = np.lib.format.open_memmap(
-                path,
-                mode="w+",
-                dtype=array.dtype,
-                shape=array.shape,
+            temporary = directory / (
+                f".{path.stem}-{threading.get_ident()}-"
+                f"{time.monotonic_ns()}.tmp.npy"
             )
-            mapped[...] = array
-            mapped.flush()
-            del mapped
+            mapped = None
+            try:
+                mapped = np.lib.format.open_memmap(
+                    temporary,
+                    mode="w+",
+                    dtype=array.dtype,
+                    shape=array.shape,
+                )
+                mapped[...] = array
+                mapped.flush()
+                mmap = getattr(mapped, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+                mapped = None
+                os.replace(temporary, path)
+            except BaseException:
+                mmap = getattr(mapped, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+                temporary.unlink(missing_ok=True)
+                raise
             return DiskCDERI(
                 path=str(path),
                 shape=tuple(int(value) for value in array.shape),
@@ -451,7 +531,13 @@ class PeriodicGDF:
                 nao=None if nao is None else int(nao),
             )
 
-    def _store(self, q_index, pair_keys=None):
+    def _store(
+        self,
+        q_index,
+        pair_keys=None,
+        *,
+        skip_short_range_integrals=False,
+    ):
         from pyqed.pbc.gw.integrals import (
             _gdf_aux_coord_type,
             _gdf_auxbasis_name,
@@ -503,13 +589,19 @@ class PeriodicGDF:
                 (int(k_index), int(kq_index)) for k_index, kq_index in pair_keys
             ]
         nao = int(mf.cell.nao)
+        metric_only_stream = bool(
+            skip_short_range_integrals and not pair_keys
+        )
         g_block_size = _gdf_g_block_size(
             mf,
             mesh=mesh,
             naux=aux.naux,
             nao_pair=nao * nao,
-            nkpts=len(pair_keys),
-            force_stream=_gdf_weighted_aux_screen_tol(ref) > 0.0,
+            nkpts=max(1, len(pair_keys)),
+            force_stream=(
+                _gdf_weighted_aux_screen_tol(ref) > 0.0
+                or metric_only_stream
+            ),
         )
         timings = {"q_index": int(q_index), "consumer": "periodic_gdf_scf"}
         store = _gdf_q_ao_store(
@@ -533,6 +625,7 @@ class PeriodicGDF:
             g_block_size,
             timings=timings,
             rs_engine=rs_engine,
+            skip_short_range_integrals=skip_short_range_integrals,
         )
         self._q_metadata[(self._configuration_key, int(q_index))] = {
             "auxbasis": auxbasis,
@@ -552,6 +645,470 @@ class PeriodicGDF:
             ),
         }
         return store, timings
+
+    def _build_folded_factors(self, q_indices, workers=1):
+        """Stream one BvK build through bounded raw q blocks into CDERI."""
+
+        from pyqed.pbc.gw.integrals import (
+            _gdf_aux_coord_type,
+            _gdf_aux_metric_short_range_many,
+            _gdf_auxbasis_name,
+            _gdf_auxiliary_basis,
+            _gdf_backend_settings,
+            _gdf_compiled_short_range_grouped_bloch_available,
+            _gdf_gamma_folded_mesh,
+            _gdf_mf_cache,
+            _gdf_pair_screen_tol,
+            _gdf_rs_aux_engine,
+            _gdf_rs_compact_auxiliary_basis,
+            _gdf_rs_shell_engine,
+            _gdf_self_opposite_pair_sources,
+            _gdf_short_range_workers,
+            _gdf_short_range_cut,
+            _gdf_short_range_screen_tol,
+            _gdf_stream_three_center_ao_short_range_folded,
+            _gdf_uses_short_range,
+            _gdf_vector_key,
+        )
+
+        q_indices = [self._space.normalize_q_index(q) for q in q_indices]
+        workers = max(1, min(int(workers), max(1, len(q_indices))))
+        if not self.stream_pairs or len(q_indices) < 2:
+            return False
+        ref = self._space.reference
+        mf = self.mf
+        settings = _gdf_backend_settings(ref)
+        mesh, kernel, omega = settings[2], settings[4], settings[5]
+        folded_mesh = _gdf_gamma_folded_mesh(ref)
+        folded_min_kpts = max(1, int(getattr(mf, "gdf_folded_min_kpts", 64)))
+        if (
+            folded_mesh is None
+            or ref.nkpts < folded_min_kpts
+            or not _gdf_uses_short_range(kernel)
+            or _gdf_pair_screen_tol(ref) != 0.0
+            or _gdf_short_range_screen_tol(ref) != 0.0
+            or not _gdf_compiled_short_range_grouped_bloch_available()
+        ):
+            return False
+
+        auxbasis = _gdf_auxbasis_name(ref)
+        aux = _gdf_auxiliary_basis(
+            self._space,
+            auxbasis,
+            _gdf_aux_coord_type(ref),
+        )
+        rs_engine = _gdf_rs_shell_engine(ref, kernel, omega, mesh)
+        rs_aux_engine = _gdf_rs_aux_engine(ref, aux, kernel, omega, mesh)
+        short_aux = _gdf_rs_compact_auxiliary_basis(aux, rs_aux_engine)
+        if short_aux.ncart == 0:
+            return False
+        compact_pair_mask = None
+        if rs_engine is not None and rs_engine.partition_active:
+            compact_pair_mask = rs_engine.compact_pair_mask
+
+        configuration_key = self._sync_configuration()
+        for q_index in q_indices:
+            for pair in self.pair_keys(q_index):
+                key = (configuration_key, q_index, int(pair[0]), int(pair[1]))
+                if key in self._cderi_cache:
+                    return False
+
+        q_data = {}
+        nao = int(mf.cell.nao)
+        spool_parent = None
+        if self.cache_dir is not None:
+            parent = Path(self.cache_dir)
+            parent.mkdir(parents=True, exist_ok=True)
+            spool_parent = str(parent)
+        spool_dir = Path(
+            tempfile.mkdtemp(prefix="pyqed-gdf-j3c-", dir=spool_parent)
+        )
+        spool_bytes = 0
+        folded_timings = {
+            "q_indices": [int(q_index) for q_index in q_indices],
+            "qpoints": int(len(q_indices)),
+            "consumer": "periodic_gdf_bounded_j3c_cderi",
+        }
+        budget_bytes = max(1, int(self.stream_pair_batch_mb * 1.0e6))
+        try:
+            with _temporary_setting(
+                mf,
+                "_gdf_inner_worker_cap",
+                workers,
+            ):
+                metric_workers = _gdf_short_range_workers(mf)
+                metric_bytes_per_q = max(
+                    1,
+                    (metric_workers + 1)
+                    * short_aux.ncart
+                    * short_aux.ncart
+                    * np.dtype(np.complex128).itemsize,
+                )
+                metric_batch_size = max(
+                    1,
+                    min(len(q_indices), budget_bytes // metric_bytes_per_q),
+                )
+                metric_batches = self._chunks(q_indices, metric_batch_size)
+                metric_t0 = time.perf_counter()
+                for batch in metric_batches:
+                    _gdf_aux_metric_short_range_many(
+                        self._space,
+                        batch,
+                        short_aux,
+                        omega,
+                        _gdf_short_range_cut(ref),
+                        _gdf_short_range_screen_tol(ref),
+                        timings=folded_timings,
+                        cache_results=True,
+                    )
+                folded_timings["aux_metric_sr_grouped_seconds"] = float(
+                    time.perf_counter() - metric_t0
+                )
+                folded_timings["aux_metric_sr_grouped_batches"] = int(
+                    len(metric_batches)
+                )
+                folded_timings["aux_metric_sr_grouped_batch_size"] = int(
+                    metric_batch_size
+                )
+                folded_timings["aux_metric_sr_grouped_workers"] = int(
+                    metric_workers
+                )
+                folded_timings[
+                    "aux_metric_sr_grouped_workspace_upper_bound_bytes"
+                ] = int(metric_batch_size * metric_bytes_per_q)
+
+            def prepare_q(q_index):
+                pair_keys = list(self.pair_keys(q_index))
+                cache_keys = {
+                    pair: (
+                        configuration_key,
+                        q_index,
+                        int(pair[0]),
+                        int(pair[1]),
+                    )
+                    for pair in pair_keys
+                }
+                source_pairs, source_by_pair = _gdf_self_opposite_pair_sources(
+                    self._space,
+                    q_index,
+                    pair_keys,
+                )
+                store, metric_timings = self._store(
+                    q_index,
+                    [],
+                    skip_short_range_integrals=True,
+                )
+                path = spool_dir / f"q{q_index:05d}.npy"
+                shape = (len(source_pairs), aux.naux, nao, nao)
+                mapped = np.lib.format.open_memmap(
+                    path,
+                    mode="w+",
+                    dtype=np.complex128,
+                    shape=shape,
+                )
+                mapped[...] = 0.0
+                mmap = getattr(mapped, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+                block_bytes = int(np.prod(shape)) * np.dtype(np.complex128).itemsize
+                return q_index, {
+                    "pair_keys": pair_keys,
+                    "cache_keys": cache_keys,
+                    "source_pairs": source_pairs,
+                    "source_by_pair": source_by_pair,
+                    "source_row": {
+                        pair: row for row, pair in enumerate(source_pairs)
+                    },
+                    "store": store,
+                    "path": path,
+                    "bytes": block_bytes,
+                    "timings": metric_timings,
+                }
+
+            reciprocal_worker_mb = self.stream_pair_batch_mb / workers
+            with _temporary_setting(
+                mf,
+                "gdf_g_block_max_mb",
+                reciprocal_worker_mb,
+            ):
+                if workers == 1:
+                    prepared = [prepare_q(q_index) for q_index in q_indices]
+                else:
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        prepared = list(executor.map(prepare_q, q_indices))
+            q_data.update(prepared)
+            spool_bytes = int(sum(data["bytes"] for data in q_data.values()))
+
+            def consume(aux_begin, aux_end, transformed_pairs, k_grid_indices):
+                transform = np.asarray(
+                    short_aux.transform[aux_begin:aux_end]
+                )
+                active = np.flatnonzero(
+                    np.any(np.abs(transform) > 1.0e-14, axis=0)
+                )
+                if active.size == 0:
+                    return
+                transform = np.ascontiguousarray(transform[:, active])
+                for data in q_data.values():
+                    source_pairs = data["source_pairs"]
+                    left = np.asarray(
+                        [k_grid_indices[pair[0]] for pair in source_pairs],
+                        dtype=np.int64,
+                    )
+                    right = np.asarray(
+                        [k_grid_indices[pair[1]] for pair in source_pairs],
+                        dtype=np.int64,
+                    )
+                    selected = transformed_pairs[left, right]
+                    contribution = np.einsum(
+                        "cP,xcmn->xPmn",
+                        transform,
+                        selected,
+                        optimize=True,
+                    )
+                    mapped = np.load(data["path"], mmap_mode="r+")
+                    try:
+                        mapped[:, active] += contribution
+                    finally:
+                        mmap = getattr(mapped, "_mmap", None)
+                        if mmap is not None:
+                            mmap.close()
+
+            streamed = _gdf_stream_three_center_ao_short_range_folded(
+                self._space,
+                short_aux,
+                omega,
+                _gdf_short_range_cut(ref),
+                consume,
+                timings=folded_timings,
+                allowed_pair_mask=compact_pair_mask,
+            )
+            if not streamed:
+                raise RuntimeError(
+                    "The prevalidated folded GDF stream was unavailable."
+                )
+
+            folded_timings["bounded_j3c_storage_bytes"] = int(spool_bytes)
+            folded_timings["bounded_j3c_q_block_peak_bytes"] = int(
+                max(data["bytes"] for data in q_data.values())
+            )
+            pack_tol = float(
+                getattr(mf, "gdf_hermitian_pack_tol", 1.0e-10)
+            )
+            def finalize_q(item):
+                q_index, data = item
+                q_t0 = time.perf_counter()
+                batches, batch_info = self._pair_batches(data["source_pairs"])
+                reciprocal_timings = []
+                rank = int(data["store"].metric_invsqrt.shape[1])
+                shard_shape = (
+                    len(data["source_pairs"]),
+                    rank,
+                    nao,
+                    nao,
+                )
+                shard_bytes = int(np.prod(shard_shape)) * np.dtype(
+                    np.complex128
+                ).itemsize
+                with self._lock:
+                    use_disk_shard = (
+                        q_index != self._space.q0_index
+                        and self._use_disk(shard_bytes)
+                    )
+                    if use_disk_shard:
+                        directory = self._ensure_disk_dir()
+                shard_path = None
+                shard_temporary = None
+                shard_mapped = None
+                shard_committed = False
+                if use_disk_shard:
+                    shard_path = directory / f"q{q_index:05d}-canonical.npy"
+                    shard_temporary = directory / (
+                        f".{shard_path.stem}-{threading.get_ident()}-"
+                        f"{time.monotonic_ns()}.tmp.npy"
+                    )
+                    data["cderi_temporary"] = shard_temporary
+                    data["cderi_path"] = shard_path
+                    shard_mapped = np.lib.format.open_memmap(
+                        shard_temporary,
+                        mode="w+",
+                        dtype=np.complex128,
+                        shape=shard_shape,
+                    )
+                mapped = np.load(data["path"], mmap_mode="r+")
+                try:
+                    for batch in batches:
+                        store, timing = self._store(
+                            q_index,
+                            batch,
+                            skip_short_range_integrals=True,
+                        )
+                        reciprocal_timings.append(timing)
+                        rows = [data["source_row"][pair] for pair in batch]
+                        for row, pair in zip(rows, batch):
+                            mapped[row] += store.ao_blocks.pop(pair)
+
+                        raw = np.asarray(mapped[rows])
+                        factors = np.einsum(
+                            "Pa,xPmn->xamn",
+                            store.metric_invsqrt.conj(),
+                            raw,
+                            optimize=True,
+                        )
+                        if use_disk_shard:
+                            shard_mapped[rows] = factors
+                        else:
+                            for row, pair in enumerate(batch):
+                                key = data["cache_keys"][pair]
+                                block = np.ascontiguousarray(factors[row])
+                                can_pack = (
+                                    q_index == self._space.q0_index
+                                    and pair[0] == pair[1]
+                                    and _cderi_is_hermitian(block, pack_tol)
+                                )
+                                if can_pack:
+                                    packed = PackedHermitianCDERI.from_dense(
+                                        block
+                                    )
+                                    factor = self._cache_array(
+                                        key,
+                                        packed.values,
+                                        packed=True,
+                                        nao=packed.nao,
+                                    )
+                                else:
+                                    factor = self._cache_array(key, block)
+                                with self._lock:
+                                    self._cderi_cache[key] = factor
+                finally:
+                    mmap = getattr(mapped, "_mmap", None)
+                    if mmap is not None:
+                        mmap.close()
+                data["path"].unlink(missing_ok=True)
+
+                try:
+                    if use_disk_shard:
+                        shard_mapped.flush()
+                        mmap = getattr(shard_mapped, "_mmap", None)
+                        if mmap is not None:
+                            mmap.close()
+                        shard_mapped = None
+                        os.replace(shard_temporary, shard_path)
+                        with self._lock:
+                            for row, pair in enumerate(data["source_pairs"]):
+                                key = data["cache_keys"][pair]
+                                self._cderi_cache[key] = DiskCDERI(
+                                    path=str(shard_path),
+                                    shape=(rank, nao, nao),
+                                    dtype=np.dtype(np.complex128).str,
+                                    index=int(row),
+                                )
+                        shard_committed = True
+                        data.pop("cderi_temporary", None)
+                        data.pop("cderi_path", None)
+                finally:
+                    mmap = getattr(shard_mapped, "_mmap", None)
+                    if mmap is not None:
+                        mmap.close()
+                    if shard_temporary is not None:
+                        shard_temporary.unlink(missing_ok=True)
+                    if shard_path is not None and not shard_committed:
+                        shard_path.unlink(missing_ok=True)
+
+                for pair in data["pair_keys"]:
+                    source = data["source_by_pair"][pair]
+                    if pair == source:
+                        continue
+                    source_key = data["cache_keys"][source]
+                    key = data["cache_keys"][pair]
+                    with self._lock:
+                        self._cderi_cache[key] = ConjugateCDERI(source_key)
+
+                timing = data["timings"]
+                for rows in reciprocal_timings:
+                    for name, value in rows.items():
+                        if name.endswith("_seconds") and isinstance(
+                            value,
+                            (int, float, np.integer, np.floating),
+                        ):
+                            timing[name] = float(timing.get(name, 0.0)) + float(
+                                value
+                            )
+                timing.update(batch_info)
+                timing["stream_pair_batches"] = int(len(batches))
+                timing["stream_pair_batch_pair_counts"] = [
+                    int(len(batch)) for batch in batches
+                ]
+                timing["stream_pair_requested_pair_count"] = int(
+                    len(data["pair_keys"])
+                )
+                timing["stream_pair_source_pair_count"] = int(
+                    len(data["source_pairs"])
+                )
+                timing["stream_pair_self_opposite_pair_reuses"] = int(
+                    len(data["pair_keys"]) - len(data["source_pairs"])
+                )
+                timing.update(
+                    {
+                        key: value
+                        for key, value in folded_timings.items()
+                        if key.startswith("three_center_sr_folded")
+                    }
+                )
+                timing["direct_cderi_stream"] = True
+                timing["direct_cderi_pipeline"] = (
+                    "aux_fft_bounded_j3c_whiten"
+                )
+                timing["direct_cderi_source_pairs"] = int(
+                    len(data["source_pairs"])
+                )
+                timing["direct_cderi_global_budget_bytes"] = int(budget_bytes)
+                timing["direct_cderi_q_seconds"] = float(
+                    time.perf_counter() - q_t0
+                )
+                timing["direct_cderi_disk_shard"] = bool(use_disk_shard)
+                timing["direct_cderi_disk_shard_bytes"] = int(
+                    shard_bytes if use_disk_shard else 0
+                )
+                return q_index, timing
+
+            with _temporary_setting(
+                self,
+                "_active_stream_pair_batch_mb",
+                reciprocal_worker_mb,
+            ), _temporary_setting(
+                mf,
+                "gdf_g_block_max_mb",
+                reciprocal_worker_mb,
+            ):
+                items = list(q_data.items())
+                if workers == 1:
+                    finalized = [finalize_q(item) for item in items]
+                else:
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        finalized = list(executor.map(finalize_q, items))
+            for q_index, timing in finalized:
+                self.build_timings[int(q_index)] = timing
+
+            raw_cache = _gdf_mf_cache(mf, "three_center_ao")
+            q_keys = {
+                _gdf_vector_key(self.qpts[q_index]) for q_index in q_indices
+            }
+            for key in [key for key in raw_cache if key and key[0] in q_keys]:
+                raw_cache.pop(key, None)
+            self.multi_q_build_timings.append(folded_timings)
+            return True
+        finally:
+            for data in q_data.values():
+                data["path"].unlink(missing_ok=True)
+                for name in ("cderi_temporary", "cderi_path"):
+                    path = data.get(name)
+                    if path is not None:
+                        Path(path).unlink(missing_ok=True)
+            try:
+                spool_dir.rmdir()
+            except OSError:
+                pass
 
     def _pair_batches(self, pair_keys):
         pair_keys = list(pair_keys)
@@ -591,10 +1148,17 @@ class PeriodicGDF:
                 * nao
                 * np.dtype(np.complex128).itemsize
             )
-            budget_bytes = int(self.stream_pair_batch_mb * 1.0e6)
+            budget_bytes = int(
+                getattr(
+                    self,
+                    "_active_stream_pair_batch_mb",
+                    self.stream_pair_batch_mb,
+                )
+                * 1.0e6
+            )
             kernel = _gdf_backend_settings(ref)[4]
             workspace_factor = (
-                3 * _gdf_short_range_workers(self.mf) + 4
+                _gdf_short_range_workers(self.mf) + 5
                 if _gdf_uses_short_range(kernel)
                 else 4
             )
@@ -622,12 +1186,32 @@ class PeriodicGDF:
         }
 
     def _resolve_factor(self, factor):
+        if isinstance(factor, ConjugateCDERI):
+            source = self._resolve_factor(self._cderi_cache[factor.source_key])
+            if isinstance(source, PackedHermitianCDERI):
+                source = source.to_dense()
+            return source.conj().transpose(0, 2, 1)
         if not isinstance(factor, DiskCDERI):
             return factor
-        array = factor.array()
+        with self._lock:
+            array = self._disk_maps.get(factor.path)
+            if array is None:
+                array = np.load(factor.path, mmap_mode="r")
+                self._disk_maps[factor.path] = array
+        if factor.index is not None:
+            array = array[int(factor.index)]
         if factor.packed:
             return PackedHermitianCDERI(array, int(factor.nao))
         return array
+
+    def _close_disk_maps(self):
+        with self._lock:
+            mapped_arrays = tuple(self._disk_maps.values())
+            self._disk_maps.clear()
+        for mapped in mapped_arrays:
+            mmap = getattr(mapped, "_mmap", None)
+            if mmap is not None:
+                mmap.close()
 
     def cderi(self, q_index, k_index, kq_index=None):
         """Return one whitened AO three-center block ``(rank, nao, nao)``."""
@@ -640,8 +1224,10 @@ class PeriodicGDF:
 
     def _materialize_q(self, q_index):
         from pyqed.pbc.gw.integrals import (
+            _gdf_mf_cache,
             _gdf_self_opposite_pair_sources,
             _gdf_should_use_opposite_q,
+            _gdf_vector_key,
         )
 
         q_index = self._space.normalize_q_index(q_index)
@@ -667,13 +1253,15 @@ class PeriodicGDF:
             if source_q is not None:
                 self._materialize_q(source_q)
                 for k_index, kq_index in pair_keys:
-                    source = self.cderi(source_q, kq_index, k_index)
-                    block = np.ascontiguousarray(
-                        source.conj().transpose(0, 2, 1)
+                    source_key = (
+                        configuration_key,
+                        int(source_q),
+                        int(kq_index),
+                        int(k_index),
                     )
                     key = cache_keys[(k_index, kq_index)]
                     with self._lock:
-                        self._cderi_cache[key] = self._cache_array(key, block)
+                        self._cderi_cache[key] = ConjugateCDERI(source_key)
                 source_metadata = self.metric_info(source_q)
                 self._q_metadata[(configuration_key, q_index)] = {
                     **source_metadata,
@@ -712,41 +1300,42 @@ class PeriodicGDF:
                 batch_timings.append(timings)
                 for source in batch:
                     source_ao = store.ao_blocks[source]
+                    block = np.ascontiguousarray(
+                        np.einsum(
+                            "Pa,Pmn->amn",
+                            store.metric_invsqrt.conj(),
+                            source_ao,
+                            optimize=True,
+                        )
+                    )
+                    source_key = cache_keys[source]
+                    pack_tol = float(
+                        getattr(self.mf, "gdf_hermitian_pack_tol", 1.0e-10)
+                    )
+                    can_pack = (
+                        q_index == self._space.q0_index
+                        and source[0] == source[1]
+                        and _cderi_is_hermitian(block, pack_tol)
+                    )
+                    if can_pack:
+                        packed = PackedHermitianCDERI.from_dense(block)
+                        factor = self._cache_array(
+                            source_key,
+                            packed.values,
+                            packed=True,
+                            nao=packed.nao,
+                        )
+                    else:
+                        factor = self._cache_array(source_key, block)
+                    with self._lock:
+                        self._cderi_cache[source_key] = factor
                     for k_index, kq_index in targets_by_source[source]:
                         key = cache_keys[(k_index, kq_index)]
-                        ao = (
-                            source_ao
-                            if (k_index, kq_index) == source
-                            else source_ao.conj().transpose(0, 2, 1)
-                        )
-                        block = np.ascontiguousarray(
-                            np.einsum(
-                                "Pa,Pmn->amn",
-                                store.metric_invsqrt.conj(),
-                                ao,
-                                optimize=True,
-                            )
-                        )
-                        pack_tol = float(
-                            getattr(self.mf, "gdf_hermitian_pack_tol", 1.0e-10)
-                        )
-                        can_pack = (
-                            q_index == self._space.q0_index
-                            and k_index == kq_index
-                            and _cderi_is_hermitian(block, pack_tol)
-                        )
-                        if can_pack:
-                            packed = PackedHermitianCDERI.from_dense(block)
-                            factor = self._cache_array(
-                                key,
-                                packed.values,
-                                packed=True,
-                                nao=packed.nao,
-                            )
-                        else:
-                            factor = self._cache_array(key, block)
-                        with self._lock:
-                            self._cderi_cache[key] = factor
+                        if key != source_key:
+                            with self._lock:
+                                self._cderi_cache[key] = ConjugateCDERI(
+                                    source_key
+                                )
                     if self.release_raw_ao:
                         store.ao_blocks.pop(source, None)
                         for target in targets_by_source[source]:
@@ -793,6 +1382,15 @@ class PeriodicGDF:
                 for batch, timings in zip(batches, batch_timings)
             ]
             summary["total_seconds"] = float(time.perf_counter() - total_t0)
+            if self.release_raw_ao:
+                raw_cache = _gdf_mf_cache(self.mf, "three_center_ao")
+                q_key = _gdf_vector_key(self.qpts[q_index])
+                raw_keys = [
+                    key for key in raw_cache if key and key[0] == q_key
+                ]
+                for key in raw_keys:
+                    raw_cache.pop(key, None)
+                summary["released_raw_ao_cache_blocks"] = int(len(raw_keys))
             self.build_timings[int(q_index)] = summary
 
     def _cderi_factor(self, q_index, k_index, kq_index=None):
@@ -847,6 +1445,7 @@ class PeriodicGDF:
             _gdf_backend_settings,
             _gdf_rs_aux_engine,
             _gdf_rs_compact_auxiliary_basis,
+            _gdf_self_opposite_pair_sources,
             _gdf_short_range_workers,
             _gdf_uses_short_range,
         )
@@ -859,9 +1458,16 @@ class PeriodicGDF:
         mesh, kernel, omega = settings[2], settings[4], settings[5]
         if not _gdf_uses_short_range(kernel):
             return []
-        pair_counts = [len(self.pair_keys(q_index)) for q_index in q_indices]
-        max_pairs_per_q = max(pair_counts, default=0)
-        if max_pairs_per_q == 0:
+        q_pair_counts = []
+        for q_index in q_indices:
+            pair_keys = list(self.pair_keys(q_index))
+            source_pairs, _source_by_pair = _gdf_self_opposite_pair_sources(
+                self._space,
+                q_index,
+                pair_keys,
+            )
+            q_pair_counts.append((q_index, len(source_pairs)))
+        if not any(count for _q_index, count in q_pair_counts):
             return []
         aux = _gdf_auxiliary_basis(
             self._space,
@@ -879,33 +1485,63 @@ class PeriodicGDF:
             * int(self.mf.cell.nao) ** 2
             * itemsize
         )
-        pair_workspace_per_q = int(
-            (3 * workers + 4) * raw_pair_bytes * max_pairs_per_q
-        )
         metric_workspace_per_q = int(
             (workers + 1) * compact_aux.ncart**2 * itemsize
         )
-        budget_q_batch_size = max(
-            1,
-            int(self.stream_pair_batch_mb * 1.0e6)
-            // max(1, pair_workspace_per_q + metric_workspace_per_q),
+        budget_bytes = int(
+            getattr(
+                self,
+                "_active_stream_pair_batch_mb",
+                self.stream_pair_batch_mb,
+            )
+            * 1.0e6
         )
-        if self.stream_pair_batch_size is None:
-            q_batch_size = budget_q_batch_size
-        else:
-            q_batch_size = min(
-                int(self.stream_pair_batch_size) // max_pairs_per_q,
-                budget_q_batch_size,
-            )
-        if q_batch_size < 2:
-            return []
+        pair_limit = (
+            None
+            if self.stream_pair_batch_size is None
+            else int(self.stream_pair_batch_size)
+        )
+        rows = sorted(
+            (
+                (
+                    int(q_index),
+                    int(pair_count),
+                    int(
+                        (workers + 5) * raw_pair_bytes * pair_count
+                        + metric_workspace_per_q
+                    ),
+                )
+                for q_index, pair_count in q_pair_counts
+            ),
+            key=lambda row: row[2],
+            reverse=True,
+        )
+        bins = []
+        for q_index, pair_count, workspace_bytes in rows:
+            for batch in bins:
+                within_memory = (
+                    batch["workspace_bytes"] + workspace_bytes <= budget_bytes
+                )
+                within_pairs = pair_limit is None or (
+                    batch["pair_count"] + pair_count <= pair_limit
+                )
+                if within_memory and within_pairs:
+                    batch["q_indices"].append(q_index)
+                    batch["pair_count"] += pair_count
+                    batch["workspace_bytes"] += workspace_bytes
+                    break
+            else:
+                bins.append(
+                    {
+                        "q_indices": [q_index],
+                        "pair_count": pair_count,
+                        "workspace_bytes": workspace_bytes,
+                    }
+                )
         return [
-            batch
-            for batch in self._chunks(
-                q_indices,
-                min(q_batch_size, len(q_indices)),
-            )
-            if len(batch) >= 2
+            batch["q_indices"]
+            for batch in bins
+            if len(batch["q_indices"]) >= 2
         ]
 
     def _materialize_many(self, q_indices, workers):
@@ -920,7 +1556,13 @@ class PeriodicGDF:
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             tuple(executor.map(self._materialize_q, q_indices))
 
-    def _prebuild_and_materialize_q_batch(self, q_indices, workers):
+    def _prebuild_and_materialize_q_batch(
+        self,
+        q_indices,
+        workers,
+        *,
+        materialize_batch_mb,
+    ):
         from pyqed.pbc.gw.integrals import (
             _gdf_mf_cache,
             _gdf_pair_ft_workers,
@@ -948,7 +1590,14 @@ class PeriodicGDF:
                 timings=timings,
             )
             timings["prebuilt_pair_blocks"] = int(prebuilt)
-            workspace_budget = int(self.stream_pair_batch_mb * 1.0e6)
+            workspace_budget = int(
+                getattr(
+                    self,
+                    "_active_stream_pair_batch_mb",
+                    self.stream_pair_batch_mb,
+                )
+                * 1.0e6
+            )
             workspace_upper_bound = int(
                 timings.get("three_center_sr_group_workspace_bytes_upper_bound", 0)
                 + timings.get(
@@ -967,15 +1616,20 @@ class PeriodicGDF:
                 _gdf_pair_ft_workers(self.mf),
                 _gdf_short_range_workers(self.mf),
             )
-            materialize_workers = (
-                1 if prebuilt and inner_workers > 1 else int(workers)
-            )
+            materialize_workers = int(workers)
             timings["inner_workers"] = int(inner_workers)
             timings["materialize_workers"] = int(materialize_workers)
-            timings["nested_parallelism_avoided"] = bool(
-                prebuilt and inner_workers > 1 and int(workers) > 1
+            timings["parallel_policy"] = (
+                "shared_short_range_bounded_nested"
+                if prebuilt
+                else "bounded_nested"
             )
-            self._materialize_many(q_indices, materialize_workers)
+            with _temporary_setting(
+                self,
+                "_active_stream_pair_batch_mb",
+                materialize_batch_mb,
+            ):
+                self._materialize_many(q_indices, materialize_workers)
         finally:
             added_keys = set(short_range_cache) - existing_keys
             timings["unconsumed_pair_blocks"] = int(len(added_keys))
@@ -988,8 +1642,62 @@ class PeriodicGDF:
             timings["total_seconds"] = float(time.perf_counter() - t0)
             self.multi_q_build_timings.append(timings)
 
+    def _rollback_build(self, snapshot):
+        from pyqed.pbc.gw.integrals import _gdf_close_folded_short_range_cache
+
+        with self._lock:
+            for key in set(self._cderi_cache) - snapshot["factor_keys"]:
+                factor = self._cderi_cache.pop(key)
+                if isinstance(factor, DiskCDERI):
+                    mapped = self._disk_maps.pop(factor.path, None)
+                    mmap = getattr(mapped, "_mmap", None)
+                    if mmap is not None:
+                        mmap.close()
+                    Path(factor.path).unlink(missing_ok=True)
+            for key in set(self._q_metadata) - snapshot["metadata_keys"]:
+                self._q_metadata.pop(key, None)
+            for key in set(self.build_timings) - snapshot["timing_keys"]:
+                self.build_timings.pop(key, None)
+            del self.multi_q_build_timings[snapshot["multi_q_count"] :]
+            self._memory_bytes = int(snapshot["memory_bytes"])
+            self._configuration_key = snapshot["configuration_key"]
+
+        _gdf_close_folded_short_range_cache(self.mf)
+        for name, cache in list(vars(self.mf).items()):
+            if (
+                name.startswith("_pbc_gdf_")
+                and name.endswith("_cache")
+                and isinstance(cache, dict)
+            ):
+                cache.clear()
+        if self._disk_dir is not None:
+            try:
+                self._disk_dir.rmdir()
+            except OSError:
+                pass
+            else:
+                self._disk_dir = None
+
     def build(self, q_indices=None, workers=None):
-        """Prebuild persistent AO factors for selected momentum transfers."""
+        """Prebuild persistent AO factors as one rollback-safe transaction."""
+
+        with self._build_lock:
+            snapshot = {
+                "factor_keys": set(self._cderi_cache),
+                "metadata_keys": set(self._q_metadata),
+                "timing_keys": set(self.build_timings),
+                "multi_q_count": len(self.multi_q_build_timings),
+                "memory_bytes": int(self._memory_bytes),
+                "configuration_key": self._configuration_key,
+            }
+            try:
+                return self._build(q_indices=q_indices, workers=workers)
+            except BaseException:
+                self._rollback_build(snapshot)
+                raise
+
+    def _build(self, q_indices=None, workers=None):
+        """Implementation of :meth:`build`; caller holds ``_build_lock``."""
 
         from pyqed.pbc.gw.integrals import _gdf_should_use_opposite_q
 
@@ -1000,26 +1708,107 @@ class PeriodicGDF:
         )
         if workers is None:
             workers = getattr(self.mf, "gdf_prebuild_workers", 1)
-        workers = max(1, min(int(workers), max(1, len(q_indices))))
-        pending = [q_index for q_index in q_indices if not self._q_is_materialized(q_index)]
-        source_indices = []
-        for q_index in pending:
-            source_q = _gdf_should_use_opposite_q(self._space, q_index)
-            source_q = q_index if source_q is None else int(source_q)
-            if source_q not in source_indices and not self._q_is_materialized(source_q):
-                source_indices.append(source_q)
-
-        batches = self._multi_q_prebuild_batches(source_indices)
-        if batches:
-            for batch in batches:
-                self._prebuild_and_materialize_q_batch(batch, workers)
-            remaining = [
-                q_index for q_index in pending if not self._q_is_materialized(q_index)
+        requested_workers = max(
+            1,
+            min(int(workers), max(1, len(q_indices))),
+        )
+        cpu_count = max(1, int(os.cpu_count() or 1))
+        if requested_workers > 1:
+            target_inner_workers = getattr(
+                self.mf,
+                "gdf_inner_worker_target",
+                os.environ.get("PYQED_GDF_INNER_WORKER_TARGET", 3),
+            )
+            try:
+                target_inner_workers = max(1, int(target_inner_workers))
+            except (TypeError, ValueError):
+                target_inner_workers = 3
+            workers = min(
+                requested_workers,
+                max(1, cpu_count // target_inner_workers),
+            )
+            inner_worker_cap = max(1, cpu_count // workers)
+        else:
+            workers = 1
+            inner_worker_cap = None
+        active_batch_mb = self.stream_pair_batch_mb / workers
+        with _temporary_setting(
+            self.mf,
+            "_gdf_inner_worker_cap",
+            inner_worker_cap,
+        ), _temporary_setting(
+            self,
+            "_active_stream_pair_batch_mb",
+            active_batch_mb,
+        ), _folded_short_range_cache_scope(
+            self.mf,
+        ):
+            pending = [
+                q_index
+                for q_index in q_indices
+                if not self._q_is_materialized(q_index)
             ]
-            self._materialize_many(remaining, workers)
-            return self
+            source_indices = []
+            for q_index in pending:
+                source_q = _gdf_should_use_opposite_q(self._space, q_index)
+                source_q = q_index if source_q is None else int(source_q)
+                if (
+                    source_q not in source_indices
+                    and not self._q_is_materialized(source_q)
+                ):
+                    source_indices.append(source_q)
 
-        self._materialize_many(pending, workers)
+            direct_streamed = self._build_folded_factors(
+                source_indices,
+                workers=workers,
+            )
+            if not direct_streamed:
+                shared_batch_mb = self.stream_pair_batch_mb
+                with _temporary_setting(
+                    self,
+                    "_active_stream_pair_batch_mb",
+                    shared_batch_mb,
+                ):
+                    batches = self._multi_q_prebuild_batches(source_indices)
+                    for batch in batches:
+                        self._prebuild_and_materialize_q_batch(
+                            batch,
+                            workers,
+                            materialize_batch_mb=active_batch_mb,
+                        )
+
+            remaining_sources = [
+                q_index
+                for q_index in source_indices
+                if not self._q_is_materialized(q_index)
+            ]
+            self._materialize_many(remaining_sources, workers)
+            remaining_targets = [
+                q_index
+                for q_index in pending
+                if not self._q_is_materialized(q_index)
+            ]
+            self._materialize_many(remaining_targets, workers)
+
+            for q_index in q_indices:
+                timings = self.build_timings.get(int(q_index))
+                if timings is None:
+                    continue
+                timings["prebuild_requested_workers"] = int(requested_workers)
+                timings["prebuild_outer_workers"] = int(workers)
+                timings["inner_worker_cap"] = (
+                    None if inner_worker_cap is None else int(inner_worker_cap)
+                )
+                timings["active_stream_pair_batch_mb"] = float(
+                    active_batch_mb
+                )
+                timings["aggregate_stream_pair_batch_mb"] = float(
+                    active_batch_mb * workers
+                )
+                timings["stream_pair_budget_scope"] = "global"
+                timings["parallel_policy"] = (
+                    "bounded_nested" if workers > 1 else "inner_kernel"
+                )
         return self
 
     def metric_info(self, q_index):
@@ -1072,26 +1861,34 @@ class PeriodicGDF:
         density_factor /= self.nkpts
 
         vj = []
-        vk = []
         for k_index in range(self.nkpts):
             diagonal = self.cderi(q0, k_index, k_index)
             j_block = np.einsum(
                 "Pij,P->ij", diagonal, density_factor.conj(), optimize=True
             )
-            k_block = np.zeros((nao, nao), dtype=np.complex128)
-            for kq_index, density in enumerate(densities):
-                q_index = int(self._space.q_index_by_kpair[k_index, kq_index])
-                block = self.cderi(q_index, k_index, kq_index)
-                k_block += np.einsum(
-                    "Pim,mn,Pjn->ij",
-                    block,
-                    density,
-                    block.conj(),
-                    optimize=True,
-                )
             vj.append(0.5 * (j_block + j_block.conj().T))
-            k_block /= self.nkpts
-            vk.append(0.5 * (k_block + k_block.conj().T))
+        self._close_disk_maps()
+
+        vk = [
+            np.zeros((nao, nao), dtype=np.complex128)
+            for _k_index in range(self.nkpts)
+        ]
+        for q_index in range(len(self.qpts)):
+            try:
+                for k_index, kq_index in self.pair_keys(q_index):
+                    block = self.cderi(q_index, k_index, kq_index)
+                    vk[k_index] += np.einsum(
+                        "Pim,mn,Pjn->ij",
+                        block,
+                        densities[kq_index],
+                        block.conj(),
+                        optimize=True,
+                    )
+            finally:
+                self._close_disk_maps()
+        for k_index, block in enumerate(vk):
+            block /= self.nkpts
+            vk[k_index] = 0.5 * (block + block.conj().T)
         return np.asarray(vj), np.asarray(vk)
 
     def get_jk_response(self, dm_q, q_index):
@@ -1190,13 +1987,19 @@ class PeriodicGDF:
                         )
                         blocks[k_index] = average
                         blocks[kq_index] = average.conj().T
+        self._close_disk_maps()
         return vj, vk
 
     def clear(self):
         """Drop whitened blocks owned by this backend."""
 
-        with self._lock:
+        with self._build_lock, self._lock:
             files = set(self.cache_files)
+            for mapped in self._disk_maps.values():
+                mmap = getattr(mapped, "_mmap", None)
+                if mmap is not None:
+                    mmap.close()
+            self._disk_maps.clear()
             self._cderi_cache.clear()
             self._q_metadata.clear()
             self.build_timings.clear()

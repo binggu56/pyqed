@@ -972,6 +972,7 @@ def _ac_self_energy_on_imaginary_axis(
     target_k_indices=None,
     q_multiplicities=None,
 ):
+    total_t0 = time.perf_counter()
     ref = space.reference
     nocc = _consistent_closed_shell_nocc(ref)
     ef = _fermi_level_from_gap(ref, energy_table, nocc)
@@ -992,7 +993,9 @@ def _ac_self_energy_on_imaginary_axis(
 
     finite_size = None
     finite_size_method = None
+    finite_size_setup_seconds = 0.0
     if finite_size_correction:
+        t0 = time.perf_counter()
         finite_size = _ac_finite_size_data(
             space,
             energy_table,
@@ -1001,6 +1004,7 @@ def _ac_self_energy_on_imaginary_axis(
             finite_size_head_method,
         )
         finite_size_method = finite_size["method"]
+        finite_size_setup_seconds = time.perf_counter() - t0
 
     q_indices = _normalize_q_indices(space, q_indices)
     if target_k_indices is None:
@@ -1020,55 +1024,147 @@ def _ac_self_energy_on_imaginary_axis(
             raise ValueError("q_multiplicities must be positive finite values.")
     direct_scale = float(direct_scale)
     response_weight = direct_scale * 4.0 / ref.nkpts
+    occupied_positions = np.flatnonzero(orbitals < nocc)
+    virtual_positions = np.flatnonzero(orbitals >= nocc)
+    identity_by_rank = {}
+    factor_cache_attribute = (
+        "_pyscf_gdf_factor_cache"
+        if is_pyscf_gdf_component(coulomb_component)
+        else "_gdf_factor_cache"
+    )
+    initial_factor_cache = getattr(space, factor_cache_attribute, None) or {}
+    initial_factor_keys = frozenset(initial_factor_cache)
+    profile = {
+        "factor_seconds": 0.0,
+        "polarizability_seconds": 0.0,
+        "dielectric_inversion_seconds": 0.0,
+        "self_energy_contraction_seconds": 0.0,
+        "finite_size_seconds": 0.0,
+        "finite_size_setup_seconds": float(finite_size_setup_seconds),
+        "evaluated_qpoints": int(len(q_indices)),
+        "frequencies": int(len(freqs)),
+        "peak_factor_bytes": 0,
+    }
     for q_position, q_index in enumerate(q_indices):
         coupling_weight = (
             direct_scale * float(q_multiplicities[q_position]) / ref.nkpts
         )
+        t0 = time.perf_counter()
         q_index, factors = _factor_backend_for_ac(
             space,
             int(q_index),
             coulomb_component,
             g2_tol,
         )
+        profile["factor_seconds"] += time.perf_counter() - t0
+        factor_arrays = [factors.transition_vectors, *factors.pair_blocks.values()]
+        profile["peak_factor_bytes"] = max(
+            profile["peak_factor_bytes"],
+            sum(
+                np.asarray(array).nbytes
+                for array in factor_arrays
+                if array is not None
+            ),
+        )
         naux = int(factors.transition_vectors.shape[1])
+        identity = identity_by_rank.setdefault(
+            naux,
+            np.eye(naux, dtype=np.complex128),
+        )
+        transition_vectors = np.asarray(
+            factors.transition_vectors,
+            dtype=np.complex128,
+            order="C",
+        )
+        transition_energy = np.fromiter(
+            (
+                energy_table[transition.k_index, transition.occ_band]
+                - energy_table[transition.kq_index, transition.vir_band]
+                for transition in factors.transitions
+            ),
+            dtype=float,
+            count=len(factors.transitions),
+        )
         k_minus_q = {
             int(k_index): ref.find_kpoint_index(
                 ref.kpts[int(k_index)] - space.qpts[q_index]
             )
             for k_index in target_k_indices
         }
+        pair_blocks = {
+            int(k_index): factors.pair_blocks[
+                (int(k_minus_q[int(k_index)]), int(k_index))
+            ]
+            for k_index in target_k_indices
+        }
+        orbital_blocks = {
+            int(k_index): np.asarray(
+                pair_blocks[int(k_index)][:, :, orbitals],
+                dtype=np.complex128,
+                order="C",
+            )
+            for k_index in target_k_indices
+        }
         is_gamma_q = np.linalg.norm(space.qpts[q_index]) <= 1.0e-12
         for iw, freq in enumerate(freqs):
-            pi = np.zeros((naux, naux), dtype=np.complex128)
-            for row, transition in enumerate(factors.transitions):
-                eia = (
-                    energy_table[transition.k_index, transition.occ_band]
-                    - energy_table[transition.kq_index, transition.vir_band]
-                )
-                coeff = eia / (float(freq) ** 2 + eia * eia)
-                vector = factors.transition_vectors[row]
-                pi += response_weight * coeff * np.outer(vector, vector.conj())
-            eps_inv = np.linalg.inv(np.eye(naux, dtype=np.complex128) - pi)
-            wc = eps_inv - np.eye(naux, dtype=np.complex128)
+            t0 = time.perf_counter()
+            coeff = transition_energy / (
+                float(freq) ** 2 + transition_energy * transition_energy
+            )
+            pi = response_weight * (
+                transition_vectors.T @ (coeff[:, None] * transition_vectors.conj())
+            )
+            profile["polarizability_seconds"] += time.perf_counter() - t0
 
-            g0_occ = weights[iw] * emo_occ / (emo_occ**2 + float(freq) ** 2)
-            g0_vir = weights[iw] * emo_vir / (emo_vir**2 + float(freq) ** 2)
+            t0 = time.perf_counter()
+            wc = np.linalg.inv(identity - pi) - identity
+            profile["dielectric_inversion_seconds"] += time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            finite_size_elapsed = 0.0
             for k_index in target_k_indices:
                 k_index = int(k_index)
                 kmq_index = k_minus_q[k_index]
-                block = factors.pair_blocks[(int(kmq_index), int(k_index))]
-                for orbital_pos, orbital in enumerate(orbitals):
-                    branch = g0_occ[kmq_index] if int(orbital) < nocc else g0_vir[kmq_index]
-                    wmn = np.empty(ref.nband, dtype=np.complex128)
-                    for intermediate_band in range(ref.nband):
-                        vector = block[:, intermediate_band, int(orbital)]
-                        wmn[intermediate_band] = (
-                            coupling_weight * (vector.conj() @ wc @ vector)
-                        )
-                    sigma[k_index, orbital_pos] -= wmn @ branch / np.pi
+                block = orbital_blocks[k_index]
+                screened = np.einsum(
+                    "Pmn,PQ->Qmn",
+                    block.conj(),
+                    wc,
+                    optimize=True,
+                )
+                wmn = coupling_weight * np.einsum(
+                    "Qmn,Qmn->mn",
+                    screened,
+                    block,
+                    optimize=True,
+                )
+                if len(occupied_positions):
+                    branch = weights[iw] * emo_occ[kmq_index] / (
+                        emo_occ[kmq_index] ** 2 + float(freq) ** 2
+                    )
+                    sigma[k_index, occupied_positions] -= np.einsum(
+                        "mn,mw->nw",
+                        wmn[:, occupied_positions],
+                        branch,
+                        optimize=True,
+                    ) / np.pi
+                if len(virtual_positions):
+                    branch = weights[iw] * emo_vir[kmq_index] / (
+                        emo_vir[kmq_index] ** 2 + float(freq) ** 2
+                    )
+                    sigma[k_index, virtual_positions] -= np.einsum(
+                        "mn,mw->nw",
+                        wmn[:, virtual_positions],
+                        branch,
+                        optimize=True,
+                    ) / np.pi
 
-                    if finite_size_correction and is_gamma_q:
-                        diagonal_body = block[:, int(orbital), int(orbital)]
+                if finite_size_correction and is_gamma_q:
+                    finite_size_t0 = time.perf_counter()
+                    for orbital_pos, orbital in enumerate(orbitals):
+                        diagonal_body = pair_blocks[k_index][
+                            :, int(orbital), int(orbital)
+                        ]
                         head, wing, _cutoff = _head_wing_delta(
                             factors,
                             finite_size["transitions"],
@@ -1081,11 +1177,39 @@ def _ac_self_energy_on_imaginary_axis(
                             finite_size["q_norm"],
                             response_weight=response_weight,
                         )
+                        branch_source = (
+                            emo_occ[kmq_index]
+                            if int(orbital) < nocc
+                            else emo_vir[kmq_index]
+                        )
+                        branch = weights[iw] * branch_source / (
+                            branch_source**2 + float(freq) ** 2
+                        )
                         sigma[k_index, orbital_pos] -= (
                             (head + wing) * branch[int(orbital)] / np.pi
                         )
+                    elapsed = time.perf_counter() - finite_size_t0
+                    finite_size_elapsed += elapsed
+                    profile["finite_size_seconds"] += elapsed
+            profile["self_energy_contraction_seconds"] += (
+                time.perf_counter() - t0 - finite_size_elapsed
+            )
 
-    return sigma, omega, ef, finite_size_method
+        factor_cache = getattr(space, factor_cache_attribute, None)
+        if factor_cache is not None:
+            for key in tuple(factor_cache):
+                cache_q_index = key[0] if isinstance(key, tuple) else key
+                if (
+                    key not in initial_factor_keys
+                    and int(cache_q_index) == int(q_index)
+                ):
+                    factor_cache.pop(key, None)
+
+    profile["total_seconds"] = float(time.perf_counter() - total_t0)
+    profile["retained_factor_blocks"] = int(
+        len(getattr(space, factor_cache_attribute, {}))
+    )
+    return sigma, omega, ef, finite_size_method, profile
 
 
 def _diagonal_g0w0_ac(
@@ -1155,7 +1279,8 @@ def _diagonal_g0w0_ac(
     else:
         evaluation_q_indices = np.asarray(requested_q_indices, dtype=int)
         q_multiplicities = np.ones(len(evaluation_q_indices), dtype=float)
-    sigma_iw, omega_iw, ef, finite_size_method = _ac_self_energy_on_imaginary_axis(
+    sigma_iw, omega_iw, ef, finite_size_method, ac_profile = (
+        _ac_self_energy_on_imaginary_axis(
         space,
         orbitals,
         freqs,
@@ -1172,6 +1297,7 @@ def _diagonal_g0w0_ac(
         ac_finite_size_head_method,
         target_k_indices=target_k_indices,
         q_multiplicities=q_multiplicities,
+        )
     )
     nocc = _consistent_closed_shell_nocc(ref)
     e_qp = np.asarray(omega_table, dtype=float).copy()
@@ -1242,6 +1368,7 @@ def _diagonal_g0w0_ac(
             "ac_iw_cutoff": None if ac_iw_cutoff is None else float(ac_iw_cutoff),
             "ac_fermi_level": float(ef),
             "ac_orbitals": orbitals.copy(),
+            "ac_profile": ac_profile,
             "linearized": bool(linearized),
             "linearized_step": float(linearized_step),
             "solve_roots": bool(solve_roots),
@@ -1519,7 +1646,12 @@ def diagonal_g0w0(
     and ``solve_roots=True`` solves the scalar quasiparticle equation for each
     band with Newton iteration.  ``frequency_integration="ac"`` uses a
     PySCF-compatible imaginary-axis/two-pole analytic-continuation route for
-    GDF factor backends.
+    GDF factor backends.  The latter is an adaptation of the space-time GW
+    continuation described by H. N. Rojas, R. W. Godby, and R. J. Needs,
+    Phys. Rev. Lett. 74, 1827 (1995), doi:10.1103/PhysRevLett.74.1827, using
+    PySCF's periodic two-pole convention.  It targets quasiparticle roots in
+    closed-shell insulators; it is not a full-frequency satellite solver and
+    does not support metals.
     """
 
     if not isinstance(space, KPointTransitionSpace):

@@ -2076,6 +2076,51 @@ def test_native_ewald_krhf_fractionally_occupies_degenerate_frontier_when_reques
     np.testing.assert_allclose(electron_count, cell.nelectron, atol=1e-12)
 
 
+def test_ewald_krhf_allows_odd_cell_fractional_even_kmesh():
+    cell = Cell(
+        atom="Li 0 0 0",
+        a=np.asarray(
+            [[-3.315, 3.315, 3.315], [3.315, -3.315, 3.315], [3.315, 3.315, -3.315]]
+        ),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+    mf = cell.KRHF(
+        kpts=cell.make_kpts((2, 1, 1)),
+        eta=0.5,
+        occupation_mode="fractional",
+    )
+
+    mf._validate()
+    energies = [np.asarray([-2.0, 0.0]), np.asarray([-2.0, 0.0])]
+    occupations = mf._occupations_from_energies(energies)
+
+    np.testing.assert_allclose(occupations, [[2.0, 1.0], [2.0, 1.0]])
+
+
+def test_ewald_krhf_rejects_odd_cell_without_fractional_even_kmesh():
+    cell = Cell(
+        atom="Li 0 0 0",
+        a=np.diag([6.63, 6.63, 6.63]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+    ).build()
+
+    with pytest.raises(NotImplementedError, match="Odd-electron cells require"):
+        cell.KRHF(kpts=cell.make_kpts((2, 1, 1)), eta=0.5)._validate()
+
+    with pytest.raises(NotImplementedError, match="Odd-electron cells require"):
+        cell.KRHF(
+            kpts=cell.make_kpts((3, 1, 1)),
+            eta=0.5,
+            occupation_mode="fractional",
+        )._validate()
+
+
 def test_native_ewald_krhf_uses_integer_aufbau_for_degenerate_frontier_by_default():
     cell = Cell(
         atom="H 0 0 0; H 1.4 0 0",
@@ -2323,6 +2368,7 @@ def test_native_3d_gdf_krhf_mesh_bands_and_off_mesh_guard(monkeypatch, tmp_path)
         not store.ao_blocks for store in _gdf_mf_cache(mf, "q_ao_store").values()
     )
     direct_j, direct_k = mf.with_df.get_jk(mf.dm)
+    assert not mf.with_df._disk_maps
     legacy_j, legacy_k = legacy_gdf_mo_jk(space, dm=mf.dm)
     for k_index, coeff in enumerate(space.reference.mo_coeff):
         np.testing.assert_allclose(
@@ -2345,6 +2391,30 @@ def test_native_3d_gdf_krhf_mesh_bands_and_off_mesh_guard(monkeypatch, tmp_path)
     assert all(not os.path.exists(path) for path in cache_files)
 
 
+def test_gdf_folded_mesh_handles_wrapped_boundary_and_rejects_shift():
+    from pyqed.pbc.gw.integrals import _gdf_gamma_folded_mesh
+    from pyqed.qchem.pbc.gdf import _KMeshSpace
+
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+        integral_options={"eri_representation": "direct"},
+    ).build()
+    gamma_mf = cell.KRHF(
+        kpts=cell.make_kpts((4, 2, 2), gamma_centered=True),
+    )
+    mesh, indices = _gdf_gamma_folded_mesh(_KMeshSpace(gamma_mf).reference)
+    assert mesh == (4, 2, 2)
+    assert sorted(indices) == list(range(16))
+
+    shifted_mf = cell.KRHF(kpts=cell.make_kpts((4, 2, 2)))
+    assert _gdf_gamma_folded_mesh(_KMeshSpace(shifted_mf).reference) is None
+
+
 def test_native_gdf_stream_pair_batching_preserves_factors():
     from pyqed.pbc.gw.integrals import _gdf_mf_cache
 
@@ -2357,9 +2427,9 @@ def test_native_gdf_stream_pair_batching_preserves_factors():
         spin=0,
         integral_options={"eri_representation": "direct"},
     ).build()
-    kpts = cell.make_kpts((2, 1, 1))
+    kpts = cell.make_kpts((2, 1, 1), gamma_centered=True)
 
-    def build(batch_size, workers=1, batch_mb=128.0):
+    def build(batch_size, workers=1, batch_mb=128.0, storage="memory"):
         mf = cell.KRHF(
             kpts=kpts,
             eta=0.5,
@@ -2369,18 +2439,24 @@ def test_native_gdf_stream_pair_batching_preserves_factors():
         ).density_fit(
             auxbasis="def2-svp-jkfit",
             precision=1.0e-8,
-            storage="memory",
+            storage=storage,
             stream_pairs=True,
             stream_pair_batch_size=batch_size,
             stream_pair_batch_mb=batch_mb,
+            folded_batch_mb=0.001 if workers > 1 else 128.0,
         )
+        if workers > 1:
+            mf.gdf_folded_min_kpts = 1
         mf.with_df.build(workers=workers)
         return mf.with_df
 
     single_pair = build(1)
     bounded_q_local = build("auto", batch_mb=0.03)
-    grouped = build("auto", workers=2)
+    grouped = build("auto", workers=2, storage="disk")
     try:
+        assert grouped.folded_batch_mb == 0.001
+        assert grouped.mf.gdf_folded_batch_mb == 0.001
+        assert grouped.disk_bytes > 0
         assert single_pair.multi_q_build_timings == []
         assert bounded_q_local.multi_q_build_timings == []
         assert sorted(
@@ -2406,63 +2482,295 @@ def test_native_gdf_stream_pair_batching_preserves_factors():
         assert len(grouped.multi_q_build_timings) == 1
         multi_q = grouped.multi_q_build_timings[0]
         assert multi_q["q_indices"] == [0, 1]
-        assert multi_q["prebuilt_pair_blocks"] == 3
-        assert multi_q["short_range_multi_q_pairs"] == 3
-        assert multi_q["short_range_multi_q_self_opposite_pair_reuses"] == 1
-        assert multi_q["three_center_sr_bloch_batch_qpoints"] == 2
-        assert multi_q["three_center_sr_bloch_contiguous"] is True
-        assert multi_q["three_center_sr_shell_task_skips"] >= 0
-        assert len(multi_q["three_center_sr_worker_seconds"]) == multi_q[
-            "three_center_short_range_workers"
-        ]
-        assert len(multi_q["three_center_sr_worker_primitive_retained"]) == multi_q[
-            "three_center_short_range_workers"
-        ]
-        assert multi_q["aux_metric_short_range_qpoints"] == 2
-        assert multi_q["materialize_workers"] == 1
-        assert multi_q["nested_parallelism_avoided"] is True
-        assert multi_q["stream_pair_workspace_within_budget"] is True
+        assert multi_q["consumer"] == "periodic_gdf_bounded_j3c_cderi"
+        assert multi_q["three_center_sr_folded"] is True
+        assert multi_q["three_center_sr_folded_pipeline"] == (
+            "aux_fft_consumer"
+        )
+        assert multi_q["three_center_sr_folded_storage_bytes"] == 0
+        assert multi_q["three_center_sr_folded_batch_count"] > 1
+        assert multi_q["bounded_j3c_storage_bytes"] > 0
         assert (
-            multi_q["stream_pair_workspace_upper_bound_bytes"]
-            <= grouped.stream_pair_batch_mb * 1.0e6
+            0
+            < multi_q["bounded_j3c_q_block_peak_bytes"]
+            < multi_q["bounded_j3c_storage_bytes"]
         )
-        assert multi_q["unconsumed_pair_blocks"] == 0
-        assert multi_q["unconsumed_metric_blocks"] == 0
-        assert sorted(
-            timing["three_center_ao_sr_cache_consumes"]
-            for timing in grouped.build_timings.values()
-        ) == [1, 2]
-        assert all(
-            timing["aux_metric_sr_cache_consumes"] == 1
-            for timing in grouped.build_timings.values()
+        assert multi_q["aux_metric_sr_grouped_seconds"] > 0.0
+        assert multi_q["aux_metric_sr_grouped_batches"] >= 1
+        assert multi_q["aux_metric_sr_grouped_batch_size"] >= 1
+        assert (
+            multi_q["aux_metric_sr_grouped_workspace_upper_bound_bytes"]
+            <= int(grouped.stream_pair_batch_mb * 1.0e6)
         )
-        assert all(
-            timing["pair_ft_stream_raw_cache_hits"] >= 1
+        assert multi_q["three_center_short_range_workers"] <= min(
+            timing["inner_worker_cap"]
             for timing in grouped.build_timings.values()
         )
         assert all(
-            timing["pair_ft_stream_raw_cache_peak_bytes"]
-            <= timing["pair_ft_stream_pair_batch_mb"] * 1.0e6
+            timing["direct_cderi_stream"] is True
+            and timing["direct_cderi_pipeline"]
+            == "aux_fft_bounded_j3c_whiten"
+            for timing in grouped.build_timings.values()
+        )
+        assert any(
+            timing.get("direct_cderi_disk_shard", False)
+            for timing in grouped.build_timings.values()
+        )
+        assert len(grouped.cache_files) < len(grouped._cderi_cache)
+        assert all(
+            timing["direct_cderi_global_budget_bytes"]
+            == int(grouped.stream_pair_batch_mb * 1.0e6)
             for timing in grouped.build_timings.values()
         )
         assert not _gdf_mf_cache(grouped.mf, "three_center_ao_short_range")
         assert not _gdf_mf_cache(grouped.mf, "aux_metric_short_range")
+        assert not _gdf_mf_cache(
+            grouped.mf,
+            "three_center_ao_short_range_folded",
+        )
+        assert all(
+            timing["parallel_policy"] == "bounded_nested"
+            and timing["prebuild_outer_workers"]
+            * timing["inner_worker_cap"]
+            <= (os.cpu_count() or 1)
+            for timing in grouped.build_timings.values()
+        )
+        assert all(
+            timing["aggregate_stream_pair_batch_mb"]
+            == pytest.approx(grouped.stream_pair_batch_mb)
+            and timing["stream_pair_budget_scope"] == "global"
+            for timing in grouped.build_timings.values()
+        )
         for q_index in range(len(grouped.qpts)):
             for k_index, kq_index in grouped.pair_keys(q_index):
-                np.testing.assert_allclose(
-                    grouped.cderi(q_index, k_index, kq_index),
-                    single_pair.cderi(q_index, k_index, kq_index),
-                    atol=1.0e-12,
+                grouped_factor = grouped.cderi(q_index, k_index, kq_index)
+                reference_factor = single_pair.cderi(
+                    q_index, k_index, kq_index
+                )
+                grouped_flat = grouped_factor.reshape(
+                    grouped_factor.shape[0], -1
+                )
+                reference_flat = reference_factor.reshape(
+                    reference_factor.shape[0], -1
                 )
                 np.testing.assert_allclose(
-                    grouped.cderi(q_index, k_index, kq_index),
-                    bounded_q_local.cderi(q_index, k_index, kq_index),
+                    grouped_flat.T @ grouped_flat.conj(),
+                    reference_flat.T @ reference_flat.conj(),
+                    atol=1.0e-12,
+                )
+                bounded_factor = bounded_q_local.cderi(
+                    q_index, k_index, kq_index
+                )
+                bounded_flat = bounded_factor.reshape(
+                    bounded_factor.shape[0], -1
+                )
+                np.testing.assert_allclose(
+                    grouped_flat.T @ grouped_flat.conj(),
+                    bounded_flat.T @ bounded_flat.conj(),
                     atol=1.0e-12,
                 )
     finally:
         single_pair.close()
         bounded_q_local.close()
         grouped.close()
+
+
+def _bounded_folded_gdf(cache_dir, *, storage="disk"):
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+        integral_options={"eri_representation": "direct"},
+    ).build()
+    mf = cell.KRHF(
+        kpts=cell.make_kpts((2, 1, 1), gamma_centered=True),
+        eta=0.5,
+        real_cut=2,
+        pair_cut=2,
+        recip_cut=5,
+    ).density_fit(
+        auxbasis="def2-svp-jkfit",
+        precision=1.0e-8,
+        storage=storage,
+        max_memory_mb=0.0,
+        cache_dir=str(cache_dir),
+        stream_pairs=True,
+        stream_pair_batch_mb=0.03,
+        folded_batch_mb=0.001,
+    )
+    mf.gdf_folded_min_kpts = 1
+    return mf.with_df
+
+
+def test_gdf_build_rolls_back_interruption_and_removes_spools(monkeypatch, tmp_path):
+    import pyqed.pbc.gw.integrals as integrals
+
+    backend = _bounded_folded_gdf(tmp_path)
+    stream = integrals._gdf_stream_three_center_ao_short_range_folded
+
+    def interrupt_stream(
+        space,
+        aux,
+        omega,
+        short_range_cut,
+        consumer,
+        **kwargs,
+    ):
+        def interrupt_after_first_batch(*args):
+            consumer(*args)
+            raise KeyboardInterrupt("test interruption")
+
+        return stream(
+            space,
+            aux,
+            omega,
+            short_range_cut,
+            interrupt_after_first_batch,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(
+        integrals,
+        "_gdf_stream_three_center_ao_short_range_folded",
+        interrupt_stream,
+    )
+    with pytest.raises(KeyboardInterrupt, match="test interruption"):
+        backend.build(workers=2)
+
+    assert backend.memory_bytes == 0
+    assert backend.disk_bytes == 0
+    assert not backend.cache_files
+    assert not backend._cderi_cache
+    assert not backend._q_metadata
+    assert not list(tmp_path.iterdir())
+
+
+def test_gdf_disk_failure_is_atomic_and_rolls_back(monkeypatch, tmp_path):
+    backend = _bounded_folded_gdf(tmp_path)
+    open_memmap = np.lib.format.open_memmap
+
+    def fail_factor_write(filename, *args, **kwargs):
+        path = os.fspath(filename)
+        parent = os.path.basename(os.path.dirname(path))
+        if parent.startswith("pyqed-gdf-") and not parent.startswith(
+            "pyqed-gdf-j3c-"
+        ):
+            with open(path, "wb") as stream:
+                stream.write(b"partial")
+            raise OSError("simulated disk full")
+        return open_memmap(filename, *args, **kwargs)
+
+    monkeypatch.setattr(np.lib.format, "open_memmap", fail_factor_write)
+    with pytest.raises(OSError, match="simulated disk full"):
+        backend.build(workers=2)
+
+    assert backend.memory_bytes == 0
+    assert backend.disk_bytes == 0
+    assert not backend.cache_files
+    assert not backend._cderi_cache
+    assert not list(tmp_path.iterdir())
+
+
+def test_gdf_concurrent_builds_share_one_transaction(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    backend = _bounded_folded_gdf(tmp_path)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        completed = list(executor.map(lambda _index: backend.build(workers=2), range(2)))
+    try:
+        assert completed == [backend, backend]
+        assert backend.memory_bytes == 0
+        assert backend.disk_bytes > 0
+        assert len(backend.cache_files) == len(set(backend.cache_files))
+        assert not any(path.name.startswith(".") for path in tmp_path.rglob("*"))
+        for q_index in range(len(backend.qpts)):
+            for k_index, kq_index in backend.pair_keys(q_index):
+                assert np.all(
+                    np.isfinite(backend.cderi(q_index, k_index, kq_index))
+                )
+    finally:
+        backend.close()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "scaled_kpts",
+    (
+        [[-0.25, 0.0, 0.0], [0.25, 0.0, 0.0]],
+        [
+            [0.0, 0.0, 0.0],
+            [1.0 / 3.0, 1.0 / 3.0, 0.0],
+            [-1.0 / 3.0, -1.0 / 3.0, 0.0],
+        ],
+    ),
+)
+def test_gdf_direct_bloch_fallback_builds_shifted_and_noncommensurate_kpoints(
+    scaled_kpts,
+):
+    from pyqed.pbc.gw.integrals import _gdf_gamma_folded_mesh
+    from pyqed.qchem.pbc.gdf import _KMeshSpace
+
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+        integral_options={"eri_representation": "direct"},
+    ).build()
+    reciprocal = 2.0 * np.pi * np.linalg.inv(cell.lattice_vectors).T
+    kpts = np.asarray(scaled_kpts, dtype=float) @ reciprocal
+    mf = cell.KRHF(
+        kpts=kpts,
+        eta=0.5,
+        real_cut=2,
+        pair_cut=2,
+        recip_cut=5,
+    ).density_fit(
+        auxbasis="def2-svp-jkfit",
+        precision=1.0e-8,
+        storage="memory",
+        stream_pairs=True,
+    )
+    mf.gdf_folded_min_kpts = 1
+    assert _gdf_gamma_folded_mesh(_KMeshSpace(mf).reference) is None
+    backend = mf.with_df.build(workers=2)
+    try:
+        assert all(
+            not row.get("three_center_sr_folded", False)
+            for row in backend.multi_q_build_timings
+        )
+        density = np.asarray([np.eye(cell.nao)] * len(kpts), dtype=complex)
+        direct_j, direct_k = backend.get_jk(density)
+        assert np.all(np.isfinite(direct_j))
+        assert np.all(np.isfinite(direct_k))
+        np.testing.assert_allclose(
+            direct_j,
+            direct_j.conj().transpose(0, 2, 1),
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            direct_k,
+            direct_k.conj().transpose(0, 2, 1),
+            atol=1.0e-12,
+        )
+    finally:
+        backend.close()
+
+
+def test_periodic_cell_rejects_unimplemented_two_dimensional_coulomb():
+    with pytest.raises(NotImplementedError, match="dimension=1 or dimension=3"):
+        Cell(
+            atom="H 0 0 0; H 1.4 0 0",
+            a=np.diag([5.0, 5.0, 15.0]),
+            basis="sto-3g",
+            unit="bohr",
+            dimension=2,
+        ).build()
 
 
 def test_optional_pyscf_3d_hydrogen_gdf_krhf_energy():

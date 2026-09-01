@@ -650,8 +650,15 @@ class EwaldRHF:
             )
         if self.cell.charge != 0:
             raise NotImplementedError("EwaldRHF v1 requires neutral periodic cells.")
-        if self.cell.spin != 0 or int(self.cell.nelectron) % 2:
-            raise NotImplementedError("EwaldRHF v1 supports closed-shell even-electron cells only.")
+        if self.cell.spin != 0:
+            raise NotImplementedError("EwaldRHF v1 supports spin-restricted cells only.")
+        odd_cell = int(self.cell.nelectron) % 2
+        odd_mesh = (int(self.cell.nelectron) * self.nkpts) % 2
+        if odd_cell and (self.occupation_mode != "fractional" or odd_mesh):
+            raise NotImplementedError(
+                "Odd-electron cells require occupation_mode='fractional' and "
+                "an even total electron count over the k-point mesh."
+            )
         if self.eta <= 0.0:
             raise ValueError("eta must be positive for method='ewald'.")
         if not np.isfinite(self.recip_precision) or self.recip_precision <= 0.0:

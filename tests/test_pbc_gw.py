@@ -2332,6 +2332,31 @@ def test_gdf_aux_transform_plan_matches_dense():
     np.testing.assert_allclose(sparse_out, cart_ft @ sparse_transform)
     assert sparse_timings["aux_ft_transform_backend"] == "sparse_pattern"
 
+    three_center = (
+        rng.normal(size=(2, 4, 3, 3))
+        + 1.0j * rng.normal(size=(2, 4, 3, 3))
+    )
+    transformed = integrals._gdf_apply_three_center_aux_transform(
+        three_center,
+        sparse_aux,
+        mf,
+    )
+    reference = np.einsum(
+        "aP,xamn->xPmn",
+        sparse_transform,
+        three_center,
+        optimize=True,
+    )
+    np.testing.assert_allclose(transformed, reference)
+    np.testing.assert_allclose(
+        integrals._gdf_apply_three_center_aux_transform(
+            three_center[0],
+            sparse_aux,
+            mf,
+        ),
+        reference[0],
+    )
+
 
 def test_gdf_auxiliary_shells_use_charge_normalization():
     import math
@@ -3112,6 +3137,25 @@ def test_periodic_gdf_exposes_relative_metric_regularization(gamma_h2_mf):
             gamma_h2_mf,
             auxbasis="sto-3g",
             metric_relative_tol=1.0,
+        )
+
+
+def test_periodic_gdf_exposes_folded_workspace_budget(gamma_h2_mf):
+    from pyqed.qchem.pbc.gdf import PeriodicGDF
+
+    backend = PeriodicGDF(
+        gamma_h2_mf,
+        auxbasis="sto-3g",
+        folded_batch_mb=64.0,
+    )
+
+    assert backend.folded_batch_mb == 64.0
+    assert gamma_h2_mf.gdf_folded_batch_mb == 64.0
+    with pytest.raises(ValueError, match="folded_batch_mb"):
+        PeriodicGDF(
+            gamma_h2_mf,
+            auxbasis="sto-3g",
+            folded_batch_mb=0.0,
         )
 
 
@@ -4692,11 +4736,15 @@ def test_periodic_gw_ac_fixed_target_and_time_reversal_q_reduction(
             )
             pair_blocks[(int(kmq_index), int(k_index))] = block.copy()
         transitions = space.transitions(q_index)
-        return q_index, SimpleNamespace(
+        factors = SimpleNamespace(
             transitions=transitions,
             transition_vectors=np.full((len(transitions), 1), 0.2 + 0.0j),
             pair_blocks=pair_blocks,
         )
+        if not hasattr(space, "_gdf_factor_cache"):
+            space._gdf_factor_cache = {}
+        space._gdf_factor_cache[(q_index, "test")] = factors
+        return q_index, factors
 
     monkeypatch.setattr(self_energy, "_factor_backend_for_ac", fake_factors)
     common = dict(
@@ -4708,6 +4756,8 @@ def test_periodic_gw_ac_fixed_target_and_time_reversal_q_reduction(
     )
     full = diagonal_g0w0(space, qp_bands=[0, 1], **common)
     fixed = diagonal_g0w0(space, qp_bands={0: [0, 1]}, **common)
+    prebuilt_factor = object()
+    space._gdf_factor_cache[(0, "prebuilt")] = prebuilt_factor
     reduced = diagonal_g0w0(
         space,
         qp_bands={0: [0, 1]},
@@ -4717,6 +4767,7 @@ def test_periodic_gw_ac_fixed_target_and_time_reversal_q_reduction(
 
     np.testing.assert_allclose(fixed.e_qp[0], full.e_qp[0], atol=1.0e-12)
     np.testing.assert_allclose(reduced.e_qp[0], fixed.e_qp[0], atol=1.0e-12)
+    assert space._gdf_factor_cache == {(0, "prebuilt"): prebuilt_factor}
     np.testing.assert_array_equal(fixed.info["target_k_indices"], [0])
     assert fixed.info["evaluated_kpoints"] == 1
     assert reduced.info["q_reduction"] == "time_reversal"
