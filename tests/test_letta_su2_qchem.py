@@ -640,6 +640,7 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         graph="nn",
         D=2,
         seed=3,
+        n_threads=2,
     )
     before = state.expectation()
     monkeypatch.setenv("PYQED_VALIDATE_LETTA_PROJECTED_ROUTE", "1")
@@ -657,6 +658,9 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
     assert state.energy < before
     assert cycle["algorithm"] == "projected"
     assert cycle["environment_reuse"]
+    assert state.n_threads == 2
+    threading = cycle["cpp_local_operator_stats"]["threading"]
+    assert threading["n_threads"] == (2 if threading["available"] else 1)
     assert cycle["rejected_updates"] == 0
     assert all(
         update["local_linear_algebra"]
@@ -682,15 +686,29 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         for update in fused
     ) < 1.0e-12
     assert state._projected_route_cache_hits > 0
+    assert state._embedding_basis_cache_hits > 0
+    assert any(
+        update["solver_info"]["davidson"]["recycled_vectors"] > 0
+        for update in cycle["updates"]
+    )
     assert all(
         update["solver_info"]["davidson"]["preconditioner_mode"]
-        == "projected_diagonal_seed_constant_shift"
+        in {
+            "projected_diagonal_seed_constant_shift",
+            "native_constant_shift",
+        }
+        for update in cycle["updates"]
+    )
+    assert any(
+        update["solver_info"]["davidson"].get("native_davidson", False)
         for update in cycle["updates"]
     )
     assert max(
         update["solver_info"]["davidson"]["orthonormality_error"]
         for update in cycle["updates"]
     ) < 1.0e-10
+    assert cycle["energy"] == pytest.approx(state.expectation(), abs=2.0e-10)
+    assert cycle["norm"] == pytest.approx(state.norm(), abs=2.0e-10)
 
 
 def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():

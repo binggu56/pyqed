@@ -1768,6 +1768,8 @@ def _solve_packed_generalized_davidson(
     block_preconditioner=None,
     use_block_preconditioner=True,
     profile=False,
+    initial_vectors=None,
+    return_recycle_space=False,
 ):
     timing = {
         "davidson": 0.0,
@@ -1848,6 +1850,15 @@ def _solve_packed_generalized_davidson(
 
     metric_orthonormal_krylov = bool(has_norm_operator)
     Vp = _build_iterative_guess(h_diag, 1, guess=guess_packed, diag_n=n_diag)
+    if initial_vectors is not None:
+        recycled = np.asarray(initial_vectors, dtype=complex)
+        if recycled.ndim == 1:
+            recycled = recycled[:, None]
+        if recycled.ndim != 2 or recycled.shape[0] != guess_packed.size:
+            raise ValueError(
+                "Recycled Davidson vectors must match the packed dimension."
+            )
+        Vp = np.column_stack((Vp, recycled))
     if metric_orthonormal_krylov:
         t0 = time.perf_counter() if profile else None
         Vp, BVp = _metric_orthonormalize_packed_columns(Vp, N, tol=lindep)
@@ -1856,6 +1867,7 @@ def _solve_packed_generalized_davidson(
         if Vp.shape[1] == 0:
             raise ValueError("Initial generalized Davidson basis is singular in the local metric.")
     else:
+        Vp = _orthonormalize_columns_dense(Vp, tol=lindep)
         BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
     AVp = np.column_stack([np.asarray(H(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
     preconditioner_mode = None
@@ -2134,6 +2146,10 @@ def _solve_packed_generalized_davidson(
         }
         info["matvec_count"] = int(h_matvec_count)
         info["norm_matvec_count"] = int(n_matvec_count)
+    if return_recycle_space:
+        info["_recycle_space"] = np.array(
+            Vp[:, : min(4, Vp.shape[1])], copy=True
+        )
     return float(theta), vec_packed, info
 
 

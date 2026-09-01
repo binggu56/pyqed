@@ -497,6 +497,7 @@ class NonAbelianFrontierLETTA:
         tie="auto",
         max_frontier_states=4096,
         workers=1,
+        n_threads=1,
         we_route_memory=256.0,
     ):
         factors = getattr(mpo, "factors", mpo)
@@ -512,6 +513,17 @@ class NonAbelianFrontierLETTA:
             raise ValueError("D must be a positive reduced multiplet dimension.")
         self.D = int(D)
         self.workers = resolve_workers(workers)
+        if isinstance(n_threads, (bool, np.bool_)) or not isinstance(
+            n_threads, Integral
+        ):
+            raise TypeError("n_threads must be a positive integer.")
+        if int(n_threads) < 1:
+            raise ValueError("n_threads must be positive.")
+        self.n_threads = int(n_threads)
+        if self._su2_moving_environment is not None and hasattr(
+            self._su2_moving_environment, "set_num_threads"
+        ):
+            self._su2_moving_environment.set_num_threads(self.n_threads)
         self.we_route_memory = float(we_route_memory)
         if self.we_route_memory <= 0.0:
             raise ValueError("we_route_memory must be positive in MiB.")
@@ -522,6 +534,13 @@ class NonAbelianFrontierLETTA:
         self._projected_route_cache = {}
         self._projected_route_cache_hits = 0
         self._projected_route_cache_misses = 0
+        self._embedding_basis_cache = {}
+        self._embedding_basis_cache_hits = 0
+        self._embedding_basis_cache_misses = 0
+        self._projected_krylov_cache = {}
+        self._metric_whitener_cache = {}
+        self._metric_whitener_cache_hits = 0
+        self._metric_whitener_cache_misses = 0
         self._solver_executor = (
             ThreadPoolExecutor(
                 max_workers=self.workers,
@@ -1170,13 +1189,34 @@ class NonAbelianFrontierLETTA:
             for block in site.data.values()
         )
         route_bytes = sum(plan.nbytes for plan in self._we_route_cache.values())
+        embedding_bytes = sum(
+            np.asarray(blocks).nbytes
+            for blocks in self._embedding_basis_cache.values()
+        )
+        krylov_bytes = sum(
+            np.asarray(vectors).nbytes
+            for vectors in self._projected_krylov_cache.values()
+        )
+        whitener_bytes = sum(
+            np.asarray(whitener).nbytes + np.asarray(spectrum).nbytes
+            for _revision, whitener, spectrum, _backend
+            in self._metric_whitener_cache.values()
+        )
         reduced_block_bytes = 0
         for core in self.mpo:
             for blocks in getattr(core, "_environment_reduced_block_cache", {}).values():
                 reduced_block_bytes += sum(
                     np.asarray(block).nbytes for block in blocks.values()
                 )
-        return int(tensor_bytes + base_bytes + route_bytes + reduced_block_bytes)
+        return int(
+            tensor_bytes
+            + base_bytes
+            + route_bytes
+            + embedding_bytes
+            + krylov_bytes
+            + whitener_bytes
+            + reduced_block_bytes
+        )
 
     @property
     def convergence_summary(self):
@@ -1230,6 +1270,7 @@ class NonAbelianFrontierLETTA:
             "success": self.success,
             "message": self.message,
             "we_route_memory": self.we_route_memory,
+            "n_threads": self.n_threads,
         }
         temporary = path.with_name(path.name + ".tmp")
         with temporary.open("wb") as handle:
@@ -1267,6 +1308,7 @@ class NonAbelianFrontierLETTA:
             tie=payload.get("tie", "physical"),
             init="mps",
             workers=workers,
+            n_threads=payload.get("n_threads", 1),
             we_route_memory=payload.get("we_route_memory", 256.0),
         )
         state.core_energy = float(payload.get("core_energy", state.ecore))
@@ -1547,6 +1589,64 @@ class NonAbelianFrontierLETTA:
             raise RuntimeError(
                 "Cached Wigner--Eckart basis does not match the local parameter space."
             )
+        if isinstance(layout, _ChannelResolvedPairSpace):
+            embedding = np.zeros(
+                (layout.size, current.size), dtype=dtype
+            )
+            for entry in layout.entries:
+                q_l, q_p1, q_p2, q_r, q_mid = entry.key
+                varied_key = (
+                    (q_l, q_p1, q_mid)
+                    if site == bond
+                    else (q_mid, q_p2, q_r)
+                )
+                cache_key = (int(site), varied_key)
+                varied_blocks = self._embedding_basis_cache.get(cache_key)
+                if varied_blocks is None:
+                    template = (
+                        sites[bond].data.get((q_l, q_p1, q_mid))
+                        if site == bond
+                        else sites[bond + 1].data.get((q_mid, q_p2, q_r))
+                    )
+                    if template is None:
+                        continue
+                    varied_blocks = np.stack(
+                        [
+                            np.asarray(
+                                basis.data.get(
+                                    varied_key, np.zeros_like(template)
+                                ),
+                                dtype=dtype,
+                            )
+                            for basis in routes.basis
+                        ]
+                    )
+                    self._embedding_basis_cache[cache_key] = varied_blocks
+                    self._embedding_basis_cache_misses += 1
+                else:
+                    self._embedding_basis_cache_hits += 1
+                if site == bond:
+                    fixed = sites[bond + 1].data.get((q_mid, q_p2, q_r))
+                    if fixed is None:
+                        continue
+                    pair_blocks = np.tensordot(
+                        varied_blocks, fixed, axes=([3], [0])
+                    )
+                else:
+                    fixed = sites[bond].data.get((q_l, q_p1, q_mid))
+                    if fixed is None:
+                        continue
+                    pair_blocks = np.moveaxis(
+                        np.tensordot(
+                            fixed, varied_blocks, axes=([2], [1])
+                        ),
+                        2,
+                        0,
+                    )
+                embedding[
+                    entry.offset : entry.offset + entry.size
+                ] = pair_blocks.reshape(current.size, -1).T
+            return current, embedding
         columns = []
         for varied in routes.basis:
             if site == bond:
@@ -1671,12 +1771,14 @@ class NonAbelianFrontierLETTA:
         """Install ``E† H_eff E`` in the persistent reduced C++ owner."""
         owner = getattr(parent_action, "su2_moving_environment", None)
         factor_route_key = getattr(parent_action, "factor_route_key", None)
-        operator_embedding = getattr(parent_action, "operator_embedding", None)
+        projection_builder = getattr(
+            parent_action, "operator_projection_blocks", None
+        )
         parent_dimension, dimension = map(int, orthonormal_design.shape)
         if (
             owner is None
             or factor_route_key is None
-            or not callable(operator_embedding)
+            or not callable(projection_builder)
             or not owner.factor_route_installed(
                 factor_route_key, parent_dimension
             )
@@ -1685,34 +1787,58 @@ class NonAbelianFrontierLETTA:
 
         from pyqed.mps.nonabelian import _su2_kernel
 
-        cache_key = (int(site), int(bond), parent_dimension, dimension)
+        projection_blocks = projection_builder(orthonormal_design)
+        if not projection_blocks:
+            return None
+        topology_signature = tuple(
+            (
+                int(row_slice.start),
+                int(row_slice.stop),
+                tuple(map(int, indices)),
+            )
+            for row_slice, indices, _transform in projection_blocks
+        )
+        cache_key = (
+            int(site),
+            int(bond),
+            parent_dimension,
+            dimension,
+            topology_signature,
+        )
         cached = self._projected_route_cache.get(cache_key)
         if cached is None:
-            parent_indices = np.arange(parent_dimension, dtype=np.int64)
             topology_revision = _su2_kernel._cpp_array_revision(
                 np.asarray(
                     [site, bond, parent_dimension, dimension], dtype=np.int64
                 ),
-                parent_indices,
+                *(
+                    value
+                    for row_slice, indices, _transform in projection_blocks
+                    for value in (
+                        np.asarray(
+                            [int(row_slice.start), int(row_slice.stop)],
+                            dtype=np.int64,
+                        ),
+                        indices,
+                    )
+                ),
             )
-            cached = (parent_indices, int(topology_revision))
+            cached = int(topology_revision)
             self._projected_route_cache[cache_key] = cached
             self._projected_route_cache_misses += 1
         else:
             self._projected_route_cache_hits += 1
-        parent_indices, topology_revision = cached
-        transform = operator_embedding(orthonormal_design)
-        numeric_revision = int(_su2_kernel._cpp_array_revision(transform))
+        topology_revision = int(cached)
+        transforms = tuple(block[2] for block in projection_blocks)
+        numeric_revision = int(_su2_kernel._cpp_array_revision(*transforms))
         projection_key = (
             f"letta:{int(site)}:{int(bond)}:{factor_route_key}:"
             f"{topology_revision}"
         )
-        owner.install_factor_route_projection(
+        owner.install_indexed_factor_route_projection(
             projection_key,
             factor_route_key,
-            (parent_indices,),
-            (transform,),
-            (0,),
+            projection_blocks,
             parent_dimension,
             dimension,
             topology_revision,
@@ -1721,7 +1847,7 @@ class NonAbelianFrontierLETTA:
         return {
             "owner": owner,
             "projection_key": projection_key,
-            "transform": transform,
+            "projection_blocks": projection_blocks,
             "topology_revision": topology_revision,
             "numeric_revision": numeric_revision,
         }
@@ -2494,6 +2620,30 @@ class NonAbelianFrontierLETTA:
                     return np.ascontiguousarray(out)
 
                 action.operator_embedding = operator_embedding
+
+                def operator_projection_blocks(columns):
+                    columns = np.asarray(columns)
+                    blocks = []
+                    for _own_index, own_entry, _op_index, op_entry in entry_map:
+                        local = columns[
+                            own_entry.offset : own_entry.offset + own_entry.size
+                        ]
+                        active = np.flatnonzero(np.any(local != 0.0, axis=0))
+                        if active.size == 0:
+                            continue
+                        blocks.append(
+                            (
+                                slice(
+                                    int(op_entry.offset),
+                                    int(op_entry.offset + op_entry.size),
+                                ),
+                                np.asarray(active, dtype=np.int64),
+                                np.ascontiguousarray(local[:, active]),
+                            )
+                        )
+                    return tuple(blocks)
+
+                action.operator_projection_blocks = operator_projection_blocks
                 return action, operator, tuple(entry_map), compiled
 
             h_sweep = n_sweep = None
@@ -3108,9 +3258,41 @@ class NonAbelianFrontierLETTA:
         )
         before = float(np.real(numerator) / denominator) + self.ecore
         if matrix_free:
-            whitener, retained_metric, whitening_backend = self._metric_whitener(
-                projected_metric, rtol=metric_rtol
+            from pyqed.mps.nonabelian import _su2_kernel
+
+            metric_revision = int(
+                _su2_kernel._cpp_array_revision(projected_metric)
             )
+            metric_cache_key = (
+                int(site),
+                int(bond),
+                tuple(map(int, support)),
+            )
+            cached_whitener = self._metric_whitener_cache.get(metric_cache_key)
+            if (
+                cached_whitener is not None
+                and cached_whitener[0] == metric_revision
+            ):
+                (
+                    _revision,
+                    whitener,
+                    retained_metric,
+                    whitening_backend,
+                ) = cached_whitener
+                self._metric_whitener_cache_hits += 1
+            else:
+                whitener, retained_metric, whitening_backend = (
+                    self._metric_whitener(
+                        projected_metric, rtol=metric_rtol
+                    )
+                )
+                self._metric_whitener_cache[metric_cache_key] = (
+                    metric_revision,
+                    whitener,
+                    retained_metric,
+                    whitening_backend,
+                )
+                self._metric_whitener_cache_misses += 1
             whitened_current = (
                 whitener.conj().T @ projected_metric @ current_reduced
             )
@@ -3174,25 +3356,86 @@ class NonAbelianFrontierLETTA:
                 )
                 return residual / safe
 
-            local_energy, whitened_reduced, davidson_info = (
-                _solve_packed_generalized_davidson(
-                    whitened_current,
-                    projected_action,
-                    h_diag=davidson_diagonal,
-                    N=None,
-                    n_diag=None,
-                    tol=float(davidson_tol),
-                    tol_residual=float(davidson_tol),
-                    itermax=int(davidson_maxiter),
-                    max_space=min(
-                        int(davidson_max_space), int(whitener.shape[1])
-                    ),
-                    precond=projected_preconditioner,
+            krylov_key = (int(site), int(bond))
+            cached_krylov = self._projected_krylov_cache.get(krylov_key)
+            recycled_vectors = None
+            if (
+                cached_krylov is not None
+                and cached_krylov.shape[0] == current.size
+            ):
+                recycled_reduced = cached_krylov[support]
+                recycled_vectors = (
+                    whitener.conj().T
+                    @ projected_metric
+                    @ recycled_reduced
                 )
+
+            native_result = None
+            if projected_route is not None and whitener.shape[1] <= 16:
+                trial = owner.factor_route_projected_davidson(
+                    projection_key,
+                    np.full(whitener.shape[1], diagonal_center, dtype=complex),
+                    whitened_current,
+                    float(davidson_tol),
+                    int(davidson_maxiter),
+                    min(int(davidson_max_space), int(whitener.shape[1])),
+                    True,
+                )
+                if (
+                    bool(trial.get("converged", False))
+                    and float(trial.get("residual_norm", np.inf))
+                    <= float(davidson_tol)
+                ):
+                    native_result = trial
+            if native_result is None:
+                local_energy, whitened_reduced, davidson_info = (
+                    _solve_packed_generalized_davidson(
+                        whitened_current,
+                        projected_action,
+                        h_diag=davidson_diagonal,
+                        N=None,
+                        n_diag=None,
+                        tol=float(davidson_tol),
+                        tol_residual=float(davidson_tol),
+                        itermax=int(davidson_maxiter),
+                        max_space=min(
+                            int(davidson_max_space), int(whitener.shape[1])
+                        ),
+                        precond=projected_preconditioner,
+                        initial_vectors=recycled_vectors,
+                        return_recycle_space=True,
+                    )
+                )
+                recycle_space = davidson_info.pop("_recycle_space")
+                davidson_info["native_davidson"] = False
+            else:
+                local_energy = float(native_result["energy"])
+                whitened_reduced = np.asarray(native_result["vector"])
+                recycle_space = whitened_reduced[:, None]
+                davidson_info = {
+                    "metric": float(native_result["residual_norm"]),
+                    "residual": float(native_result["residual_norm"]),
+                    "davidson_iterations": int(native_result["iterations"]),
+                    "davidson_converged": True,
+                    "subspace_dim": int(native_result["basis_size"]),
+                    "restarts": int(native_result["restarts"]),
+                    "packed_dimension": int(whitener.shape[1]),
+                    "native_davidson": True,
+                    "cpp_davidson_kind": str(native_result.get("kind")),
+                }
+            tied_recycle = np.zeros(
+                (current.size, recycle_space.shape[1]), dtype=complex
+            )
+            tied_recycle[support] = whitener @ recycle_space
+            self._projected_krylov_cache[krylov_key] = tied_recycle
+            davidson_info["recycled_vectors"] = int(
+                0 if recycled_vectors is None else recycled_vectors.shape[1]
             )
             davidson_info["fused_cpp_action"] = projected_route is not None
             davidson_info["preconditioner_mode"] = (
-                "projected_diagonal_seed_constant_shift"
+                "native_constant_shift"
+                if native_result is not None
+                else "projected_diagonal_seed_constant_shift"
             )
             reduced = whitener @ whitened_reduced
             candidate_h = projected_action(whitened_reduced)
@@ -3256,6 +3499,7 @@ class NonAbelianFrontierLETTA:
         if not accepted:
             self._set_site_vector(site, current)
             after = before
+        norm_after = float(candidate_norm if accepted and matrix_free else denominator)
         return {
             "site": site,
             "energy_before": float(before),
@@ -3264,6 +3508,8 @@ class NonAbelianFrontierLETTA:
             "support": int(support.size),
             "parameters": int(current.size),
             "accepted": bool(accepted),
+            "norm_before": float(denominator),
+            "norm_after": norm_after,
             "native_su2": True,
             "solver": solver,
             "requested_solver": requested_solver,
@@ -3367,11 +3613,12 @@ class NonAbelianFrontierLETTA:
             # keep the norm recursion in Python even when the Hamiltonian uses
             # the corrected C++ reduced-boundary route batch.
             moving_environment.norm_stack.su2_boundary_environment = None
-        previous = self.expectation()
+        previous = float(self.energy)
         if reset_history:
             self.history = []
         self.converged = False
         streak = 0
+        canonical_center = None
         for sweep in range(nsweeps):
             cycle_started = time.perf_counter()
             updates = []
@@ -3382,13 +3629,19 @@ class NonAbelianFrontierLETTA:
                 ("rl", range(self.nsites - 2, -1, -1)),
             ):
                 bonds = tuple(bonds)
+                recentered = False
                 if conditional_gauge:
                     center = 0 if direction == "lr" else self.nsites - 1
-                    gauge_updates.extend(
-                        self.canonicalize_conditional_center(
+                    if canonical_center != center:
+                        center_updates = self.canonicalize_conditional_center(
                             center, rcond=gauge_rcond
                         )
-                    )
+                        gauge_updates.extend(center_updates)
+                        recentered = any(
+                            bool(item.get("applied", False))
+                            for item in center_updates
+                        )
+                        canonical_center = center
                 materialized = self.materialize()
                 environment_sweeps = None
                 if algorithm in {"two_site", "projected"} and reuse_environments:
@@ -3397,12 +3650,11 @@ class NonAbelianFrontierLETTA:
                         algorithm == "projected"
                         and self._su2_moving_environment is not None
                     ):
-                        self._su2_moving_environment.clear_boundaries()
                         self._su2_moving_environment.clear_factor_routes()
                         moving_environment.hamiltonian_stack.su2_moving_environment = (
                             self._su2_moving_environment
                         )
-                    if conditional_gauge:
+                    if recentered:
                         h_reuse = n_reuse = None
                     else:
                         h_reuse, n_reuse = moving_environment.reuse_sides_for(
@@ -3475,6 +3727,9 @@ class NonAbelianFrontierLETTA:
                                     )
                                 ),
                             }
+                            canonical_center = (
+                                bond + 1 if direction == "lr" else bond
+                            )
                         materialized[bond] = self.materialize_site(bond)
                         materialized[bond + 1] = self.materialize_site(bond + 1)
                         if environment_sweeps is not None:
@@ -3488,7 +3743,7 @@ class NonAbelianFrontierLETTA:
                         site = bond if direction == "lr" else bond + 1
                         h_stack = (
                             None
-                            if moving_environment is None
+                            if moving_environment is None or algorithm == "projected"
                             else moving_environment.hamiltonian_stack
                         )
                         if h_stack is not None:
@@ -3539,6 +3794,9 @@ class NonAbelianFrontierLETTA:
                                     for item in local_gauge_updates
                                 )),
                             }
+                            canonical_center = (
+                                bond + 1 if direction == "lr" else bond
+                            )
                         materialized[site] = self.materialize_site(site)
                         if algorithm == "projected":
                             materialized[bond] = self.materialize_site(bond)
@@ -3556,7 +3814,12 @@ class NonAbelianFrontierLETTA:
                     moving_environment.finish_sweep(direction)
                 if algorithm == "projected" and moving_environment is not None:
                     moving_environment.hamiltonian_stack.su2_moving_environment = None
-            energy = self.expectation()
+            if algorithm == "projected" and updates:
+                energy = float(updates[-1]["energy_after"])
+                cycle_norm = float(updates[-1]["norm_after"])
+            else:
+                energy = self.expectation()
+                cycle_norm = float(self.norm())
             delta = abs(energy - previous)
             residuals = []
             truncation_errors = []
@@ -3599,6 +3862,9 @@ class NonAbelianFrontierLETTA:
                         "memory_bytes",
                     )
                 }
+                cpp_local_stats["threading"] = dict(
+                    self._su2_moving_environment.threading_info
+                )
             record = {
                 "sweep": len(self.history) + 1,
                 "energy": float(energy),
@@ -3612,7 +3878,7 @@ class NonAbelianFrontierLETTA:
                 "complete_cycle": True,
                 "symmetry": "SU2",
                 "algorithm": algorithm,
-                "norm": float(self.norm()),
+                "norm": cycle_norm,
                 "storage_nbytes": int(self.storage_nbytes),
                 "gauge": "conditional" if conditional_gauge else None,
                 "conditional_gauge_supported": bool(

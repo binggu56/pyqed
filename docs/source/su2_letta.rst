@@ -26,6 +26,7 @@ driver:
        mf,
        symmetry="su2",
        D=32,
+       n_threads=4,
    )
 
 For an active-space calculation, additionally pass ``ncas``, ``nelecas``, and
@@ -91,26 +92,33 @@ Rayleigh quotient does not increase.  No magnetic or determinant-space
 projection is used.
 
 On states that retain the compiled SU(2) owner, the projected optimizer
-installs the complete ``E† H_eff E`` action as one fused factor-route projection;
-Davidson vectors therefore remain in the tied orthonormal space without Python
-lift/apply/project callbacks.  ``E† N_eff E`` is contracted directly from the
-factorized reduced metric blocks and touches only active embedding columns.
-Projection topology and one-site Wigner--Eckart routes are cached across
-cycles, while numerical transforms are refreshed after each update.  Norm
-whitening is split into independent connected blocks and uses a direct
-diagonal/identity scaling whenever the conditional gauge permits it.  A
-projected parent-Hamiltonian diagonal controls Davidson seed ordering; the
-correction uses a constant shift because omitted transformed off-diagonal
-terms make that inexpensive diagonal unsafe as a direct denominator.
+installs ``E† H_eff E`` as indexed projections of only the active reduced
+blocks.  Davidson vectors therefore remain in the tied orthonormal space
+without Python lift/apply/project callbacks or dense zero-padded projection
+matrices.  ``E† N_eff E`` is likewise contracted directly from factorized
+reduced metric blocks.  Projection topology, batched one-site
+Wigner--Eckart embedding bases, metric whiteners, and small Davidson/Ritz
+spaces are cached across cycles; numerical transforms are refreshed whenever
+their array revision changes.  Norm whitening is split into independent
+connected blocks and uses direct diagonal/identity scaling whenever the
+conditional gauge permits it.  The compiled Davidson solve is accepted only
+after its true residual passes the requested tolerance; otherwise the solver
+continues with the recycled Python Davidson space.  A projected
+parent-Hamiltonian diagonal controls seed ordering, while a robust constant
+shift is used for correction because omitted transformed off-diagonal terms
+make that inexpensive diagonal unsafe as a direct denominator.
 
 For a physical nearest-neighbor tie chain, ``gauge="conditional"`` applies an
 exact reduced QR gauge independently for every crossing physical SU(2) sector.
 The adjacent tensor absorbs the transfer matrix, so the graph-tied state is
 unchanged.  Projected and two-site sweeps then reuse incrementally advanced
-Hamiltonian and norm environments within each half-sweep.  Recentring the
-conditional gauge changes virtual-bond coordinates, so the opposite boundary
-side is rebuilt at the start of the next half-sweep rather than reused with
-stale coordinates.  General graphs that do not expose one next-site condition
+Hamiltonian and norm environments within and across half-sweeps whenever the
+tracked canonical center already has the required position.  A real gauge
+coordinate change invalidates the affected side and triggers a rebuild.  The
+projected cycle energy and norm are taken from its terminal exact local
+Rayleigh quotient, avoiding redundant full-chain contractions; validation
+tests compare these values to explicit chain contractions.  General graphs
+that do not expose one next-site condition
 per internal frontier skip the conditional gauge; ``gauge=None`` and
 ``reuse_environments=False`` select the rebuild-every-bond reference path.
 
@@ -129,11 +137,21 @@ route path.  Immutable left/right reduced MPO recoupling blocks are cached per
 core and reused by environment construction, local actions, and expectation
 values.
 
-For the pyrazine STO-3G CAS(6,6), ``D=4`` nearest-neighbor validation, these
-optimizations reduce a steady complete LR/RL cycle from about 8.3 seconds to
-about 2.3 seconds on the development machine while retaining the CASCI energy
-to roughly ``1e-13`` Hartree.  This is the fast LETTA path, but its tied metric
-and embedding work still make it slower than an unconstrained SU(2)-DMRG sweep.
+``n_threads`` configures the OpenMP team owned by the compiled reduced engine.
+It parallelizes independent dependency waves and sufficiently large route or
+block batches; small batches deliberately remain serial because thread-launch
+overhead exceeds their work.  This is separate from ``workers``, which controls
+Python-side independent local setup.  Avoid combining large values for both
+with a multithreaded BLAS.
+
+For the pyrazine STO-3G CAS(6,6), ``D=4`` nearest-neighbor benchmark, the first
+cycle takes about 4.9 seconds and steady complete LR/RL cycles take about 2.0
+seconds on the development machine.  The one- and four-thread three-cycle
+totals were 9.22 and 9.15 seconds, respectively: this small ``D`` does not
+contain enough parallel reduced-block work for material OpenMP scaling.  Both
+runs retained the CASCI energy within ``6e-14`` Hartree.  This is the fast
+LETTA path, but its tied metric and embedding work still make it slower than an
+unconstrained SU(2)-DMRG sweep.  Timings are machine-dependent.
 
 Pair updates
 ------------
