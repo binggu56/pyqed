@@ -60,7 +60,7 @@ Restartable run
 
    state.run(
        nsweeps=8,
-       algorithm="two_site",
+       algorithm="projected",
        tol=1e-9,
        residual_tol=1e-8,
        truncation_tol=1e-7,
@@ -79,15 +79,26 @@ For one-site updates, ``solver="auto"`` selects the native reduced
 Wigner--Eckart path.  ``solver="polarization"`` is retained only as an explicit
 small-system reference calculation; it is not selected automatically.
 
+``algorithm="projected"`` is the preferred fixed-D optimizer.  It embeds the
+tied one-site parameters into the adjacent channel-resolved DMRG pair space,
+projects the effective Hamiltonian and norm actions with that embedding, and
+removes null or redundant tied directions by diagonalizing the projected norm.
+The retained basis is norm-orthonormal before ordinary Hermitian Davidson is
+started.  This avoids an ill-conditioned generalized Krylov problem and lets
+the local solve reuse the incrementally advanced reduced DMRG environments.
+An update is committed only when Davidson converges and its recomputed local
+Rayleigh quotient does not increase.  No magnetic or determinant-space
+projection is used.
+
 For a physical nearest-neighbor tie chain, ``gauge="conditional"`` applies an
 exact reduced QR gauge independently for every crossing physical SU(2) sector.
 The adjacent tensor absorbs the transfer matrix, so the graph-tied state is
-unchanged.  Two-site sweeps then reuse incrementally advanced Hamiltonian and
-norm environments within each half-sweep.  Recentring the conditional gauge
-changes virtual-bond coordinates, so the opposite boundary side is rebuilt at
-the start of the next half-sweep rather than reused with stale coordinates.
-General graphs that do not expose one next-site condition per internal
-frontier skip the conditional gauge; ``gauge=None`` and
+unchanged.  Projected and two-site sweeps then reuse incrementally advanced
+Hamiltonian and norm environments within each half-sweep.  Recentring the
+conditional gauge changes virtual-bond coordinates, so the opposite boundary
+side is rebuilt at the start of the next half-sweep rather than reused with
+stale coordinates.  General graphs that do not expose one next-site condition
+per internal frontier skip the conditional gauge; ``gauge=None`` and
 ``reuse_environments=False`` select the rebuild-every-bond reference path.
 
 States constructed by ``SU2LETTA.from_integrals`` retain the transient C++
@@ -123,6 +134,11 @@ and metric-null directions.  Empty contextual operators, which can occur when
 a Hamiltonian vanishes in a target-spin sector, are represented as valid zero
 route tables.  The active path never expands magnetic projections or projects
 the wavefunction into a dense determinant basis.
+
+The older ``algorithm="two_site"`` route optimizes the unrestricted reduced
+pair first and retracts it back to the tied manifold.  It remains useful as a
+reference, but pair-space growth and nonlinear retraction make it less suitable
+than the projected optimizer at larger ``D``.
 
 Checkpoint and restart
 ----------------------

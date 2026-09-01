@@ -8,12 +8,13 @@ the existing rank-coupled quantum-chemistry MPO contractions.
 
 The one-site optimizer contracts native Wigner--Eckart routes throughout.
 Reduced structural routes are cached and packed by compatible tensor block;
-large local problems are solved by a matrix-free generalized Davidson
-iteration.  The two-site optimizer acts in the channel-resolved reduced pair
-space and retracts the result to the tied manifold.  The original polarization
-construction remains available as a small-system reference path.  A bounded
-worker pool can be shared by every exact construction, with threaded BLAS held
-to one thread inside parallel regions.
+large local problems are metric-orthonormalized and solved by a projected
+matrix-free Davidson iteration.  The two-site optimizer acts in the
+channel-resolved reduced pair space and retracts the result to the tied
+manifold.  The original polarization construction remains available as a
+small-system reference path.  A bounded worker pool can be shared by every
+exact construction, with threaded BLAS held to one thread inside parallel
+regions.
 """
 
 from __future__ import annotations
@@ -1757,6 +1758,7 @@ class NonAbelianFrontierLETTA:
         max_parameters=4096,
         executor=None,
         sites=None,
+        environment_sweeps=None,
     ):
         """Project a reusable reduced bond action onto one-site parameters.
 
@@ -1785,7 +1787,11 @@ class NonAbelianFrontierLETTA:
         if embedding.shape[1] != current.size:
             raise RuntimeError("one-site frontier embedding has the wrong size.")
         h_pair, n_pair, pair_diagnostics = self._reduced_pair_transition_actions(
-            bond, sites, merged, layout
+            bond,
+            sites,
+            merged,
+            layout,
+            environment_sweeps=environment_sweeps,
         )
 
         n_columns = self._apply_packed_columns(n_pair, embedding, executor=executor)
@@ -1795,8 +1801,11 @@ class NonAbelianFrontierLETTA:
         if support.size == 0:
             raise np.linalg.LinAlgError("local SU2LETTA parameter support is null.")
         design = np.asarray(embedding[:, support])
-        h_columns = self._apply_packed_columns(h_pair, design, executor=executor)
-        h_diagonal = np.real(np.sum(design.conj() * h_columns, axis=0))
+        projected_metric = design.conj().T @ n_columns[:, support]
+        projected_metric = 0.5 * (projected_metric + projected_metric.conj().T)
+        # A diagonal preconditioner is only a hint to Davidson.  Avoid forming
+        # every H_eff E column here: that setup dominated larger tied spaces.
+        h_diagonal = np.zeros(support.size, dtype=float)
         n_diagonal = n_diagonal[support]
         matvec_counts = {"hamiltonian": 0, "metric": 0}
 
@@ -1825,6 +1834,7 @@ class NonAbelianFrontierLETTA:
                 "frontier_dimension": int(layout.size),
                 "embedding_bytes": int(embedding.nbytes),
                 "matvec_counts": matvec_counts,
+                "_projected_metric": projected_metric,
             }
         )
         return (
@@ -2807,6 +2817,7 @@ class NonAbelianFrontierLETTA:
         sites=None,
         bond=None,
         executor=None,
+        environment_sweeps=None,
     ):
         """Perform one exact reduced local Rayleigh--Ritz update."""
         site = int(site)
@@ -2844,6 +2855,7 @@ class NonAbelianFrontierLETTA:
                     max_parameters=max_matrix_free_parameters,
                     executor=executor,
                     sites=sites,
+                    environment_sweeps=environment_sweeps,
                 )
             else:
                 (
@@ -2874,16 +2886,71 @@ class NonAbelianFrontierLETTA:
         )
         before = float(np.real(numerator) / denominator) + self.ecore
         if matrix_free:
-            local_energy, reduced, davidson_info = _solve_packed_generalized_davidson(
-                current_reduced,
-                h_action,
-                h_diag=h_diag,
-                N=n_action,
-                n_diag=n_diag,
-                tol=float(davidson_tol),
-                tol_residual=float(davidson_tol),
-                itermax=int(davidson_maxiter),
-                max_space=min(int(davidson_max_space), int(support.size)),
+            projected_metric = np.asarray(
+                solver_info.pop("_projected_metric"), dtype=complex
+            )
+            metric_eigenvalues, metric_eigenvectors = np.linalg.eigh(
+                projected_metric
+            )
+            metric_scale = max(
+                float(np.max(np.abs(metric_eigenvalues), initial=0.0)), 1.0
+            )
+            metric_keep = metric_eigenvalues > float(metric_rtol) * metric_scale
+            if not np.any(metric_keep):
+                raise np.linalg.LinAlgError(
+                    "the projected SU2LETTA parameter metric is singular."
+                )
+            whitener = metric_eigenvectors[:, metric_keep] / np.sqrt(
+                metric_eigenvalues[metric_keep]
+            )
+            whitened_current = (
+                whitener.conj().T @ projected_metric @ current_reduced
+            )
+
+            def orthonormal_h_action(vector):
+                return whitener.conj().T @ h_action(whitener @ vector)
+
+            # The metric is now exactly the identity in the retained tied
+            # tangent space, so Davidson never has to invert an ill-conditioned
+            # generalized Krylov metric.
+            local_energy, whitened_reduced, davidson_info = (
+                _solve_packed_generalized_davidson(
+                    whitened_current,
+                    orthonormal_h_action,
+                    h_diag=np.zeros(whitener.shape[1], dtype=float),
+                    N=None,
+                    n_diag=None,
+                    tol=float(davidson_tol),
+                    tol_residual=float(davidson_tol),
+                    itermax=int(davidson_maxiter),
+                    max_space=min(
+                        int(davidson_max_space), int(whitener.shape[1])
+                    ),
+                )
+            )
+            reduced = whitener @ whitened_reduced
+            candidate_h = h_action(reduced)
+            candidate_n = n_action(reduced)
+            candidate_norm = float(np.real(np.vdot(reduced, candidate_n)))
+            if candidate_norm <= 0.0:
+                local_energy = np.inf
+            else:
+                local_energy = float(
+                    np.real(np.vdot(reduced, candidate_h)) / candidate_norm
+                )
+            davidson_info["metric_rank"] = int(whitener.shape[1])
+            davidson_info["metric_nullity"] = int(
+                support.size - whitener.shape[1]
+            )
+            davidson_info["metric_condition"] = float(
+                metric_eigenvalues[metric_keep][-1]
+                / metric_eigenvalues[metric_keep][0]
+            )
+            davidson_info["orthonormality_error"] = float(
+                np.linalg.norm(
+                    whitener.conj().T @ projected_metric @ whitener
+                    - np.eye(whitener.shape[1])
+                )
             )
             if float(davidson_info.get("residual", np.inf)) <= float(davidson_tol):
                 davidson_info["davidson_converged"] = True
@@ -2906,6 +2973,10 @@ class NonAbelianFrontierLETTA:
         self._set_site_vector(site, candidate)
         after = float(local_energy + self.ecore)
         accepted = after <= before + float(accept_tol)
+        if matrix_free:
+            accepted = accepted and bool(
+                davidson_info.get("davidson_converged", False)
+            )
         if not accepted:
             self._set_site_vector(site, current)
             after = before
@@ -2925,7 +2996,7 @@ class NonAbelianFrontierLETTA:
             "fully_wigner_eckart_reduced": solver == "wigner_eckart",
             "matrix_free": bool(matrix_free),
             "local_linear_algebra": (
-                "matrix_free_generalized_davidson"
+                "metric_orthonormal_projected_davidson"
                 if matrix_free
                 else "dense_generalized_eigh"
             ),
@@ -2974,8 +3045,13 @@ class NonAbelianFrontierLETTA:
             algorithm = "one_site"
         if algorithm in {"2site", "pair"}:
             algorithm = "two_site"
-        if algorithm not in {"one_site", "two_site"}:
-            raise ValueError("SU2LETTA algorithm must be 'one_site' or 'two_site'.")
+        if algorithm in {"projected_one_site", "tied_space"}:
+            algorithm = "projected"
+        if algorithm not in {"one_site", "two_site", "projected"}:
+            raise ValueError(
+                "SU2LETTA algorithm must be 'one_site', 'two_site', or "
+                "'projected'."
+            )
         consecutive_cycles = int(consecutive_cycles)
         if consecutive_cycles < 1:
             raise ValueError("consecutive_cycles must be positive.")
@@ -2989,7 +3065,7 @@ class NonAbelianFrontierLETTA:
         if gauge not in {None, "conditional"}:
             raise ValueError("SU2LETTA gauge must be None or 'conditional'.")
         conditional_gauge = bool(
-            algorithm == "two_site"
+            algorithm in {"two_site", "projected"}
             and gauge == "conditional"
             and self.supports_conditional_canonical_gauge
         )
@@ -3002,7 +3078,7 @@ class NonAbelianFrontierLETTA:
         cpp_boundary_environment = (
             self._su2_moving_environment if self.nsites >= 6 else None
         )
-        if algorithm == "two_site" and reuse_environments:
+        if algorithm in {"two_site", "projected"} and reuse_environments:
             moving_environment = MovingEnvironment(
                 self.materialize(),
                 mpo_factors=self.mpo,
@@ -3039,7 +3115,7 @@ class NonAbelianFrontierLETTA:
                     )
                 materialized = self.materialize()
                 environment_sweeps = None
-                if algorithm == "two_site" and reuse_environments:
+                if algorithm in {"two_site", "projected"} and reuse_environments:
                     environment_started = time.perf_counter()
                     if conditional_gauge:
                         h_reuse = n_reuse = None
@@ -3125,20 +3201,70 @@ class NonAbelianFrontierLETTA:
                                 )
                     else:
                         site = bond if direction == "lr" else bond + 1
-                        update = self.optimize_site(
-                            site,
-                            max_local_parameters=max_local_parameters,
-                            max_matrix_free_parameters=max_matrix_free_parameters,
-                            solver=local_solver,
-                            we_dense_dim=we_dense_dim,
-                            sites=materialized,
-                            bond=bond,
-                            executor=self._solver_executor,
-                            **kwargs,
+                        h_stack = (
+                            None
+                            if moving_environment is None
+                            else moving_environment.hamiltonian_stack
                         )
+                        if h_stack is not None:
+                            if self._su2_moving_environment is not None:
+                                self._su2_moving_environment.clear_boundaries()
+                                self._su2_moving_environment.clear_factor_routes()
+                            h_stack.su2_moving_environment = (
+                                self._su2_moving_environment
+                            )
+                        try:
+                            update = self.optimize_site(
+                                site,
+                                max_local_parameters=max_local_parameters,
+                                max_matrix_free_parameters=max_matrix_free_parameters,
+                                solver=local_solver,
+                                we_dense_dim=(
+                                    0 if algorithm == "projected" else we_dense_dim
+                                ),
+                                sites=materialized,
+                                bond=bond,
+                                executor=self._solver_executor,
+                                environment_sweeps=(
+                                    environment_sweeps
+                                    if algorithm == "projected"
+                                    else None
+                                ),
+                                **kwargs,
+                            )
+                        finally:
+                            if h_stack is not None:
+                                h_stack.su2_moving_environment = None
                         update["requested_solver"] = requested_solver
                         update["auto_selected"] = requested_solver == "auto"
+                        if conditional_gauge:
+                            local_gauge_updates = self.canonicalize_conditional_bond(
+                                bond,
+                                direction=direction,
+                                rcond=gauge_rcond,
+                            )
+                            gauge_updates.extend(local_gauge_updates)
+                            update["conditional_gauge"] = {
+                                "applied": int(sum(
+                                    bool(item.get("applied", False))
+                                    for item in local_gauge_updates
+                                )),
+                                "skipped": int(sum(
+                                    not bool(item.get("applied", False))
+                                    for item in local_gauge_updates
+                                )),
+                            }
                         materialized[site] = self.materialize_site(site)
+                        if algorithm == "projected":
+                            materialized[bond] = self.materialize_site(bond)
+                            materialized[bond + 1] = self.materialize_site(bond + 1)
+                            if environment_sweeps is not None:
+                                for environment_sweep in environment_sweeps:
+                                    environment_sweep.advance_after_update(
+                                        bond,
+                                        materialized[bond],
+                                        materialized[bond + 1],
+                                    )
                     update["direction"] = direction
                     updates.append(update)
                 if environment_sweeps is not None:
@@ -3218,7 +3344,7 @@ class NonAbelianFrontierLETTA:
                     )
                 ),
                 "environment_reuse": bool(
-                    algorithm == "two_site" and reuse_environments
+                    algorithm in {"two_site", "projected"} and reuse_environments
                 ),
                 "environment_build_s": float(environment_build_s),
                 "moving_environment_backend": (

@@ -612,9 +612,63 @@ def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():
         atol=2.0e-11,
     )
     assert matrix_free_update["matrix_free"]
-    assert matrix_free_update["local_linear_algebra"] == "matrix_free_generalized_davidson"
+    assert (
+        matrix_free_update["local_linear_algebra"]
+        == "metric_orthonormal_projected_davidson"
+    )
     assert matrix_free_update["solver_info"]["davidson"]["davidson_converged"]
+    assert (
+        matrix_free_update["solver_info"]["davidson"]["orthonormality_error"]
+        < 1.0e-11
+    )
     assert matrix_free_update["solver_info"]["route_backend"] == "block-grouped-gemm"
+
+
+def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2():
+    norb = 4
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    eri = np.zeros((norb, norb, norb, norb))
+    indices = np.arange(norb)
+    eri[indices, indices, indices, indices] = 1.0
+    state = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=3,
+    )
+    before = state.expectation()
+    state.run(
+        nsweeps=1,
+        algorithm="projected",
+        reuse_environments=True,
+        gauge="conditional",
+        solver="wigner_eckart",
+        davidson_tol=1.0e-8,
+    )
+
+    cycle = state.history[-1]
+    assert state.energy < before
+    assert cycle["algorithm"] == "projected"
+    assert cycle["environment_reuse"]
+    assert cycle["rejected_updates"] == 0
+    assert all(
+        update["local_linear_algebra"]
+        == "metric_orthonormal_projected_davidson"
+        for update in cycle["updates"]
+    )
+    assert all(
+        update["solver_info"]["environment_reused"]
+        for update in cycle["updates"]
+    )
+    assert max(
+        update["solver_info"]["davidson"]["orthonormality_error"]
+        for update in cycle["updates"]
+    ) < 1.0e-10
 
 
 def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
