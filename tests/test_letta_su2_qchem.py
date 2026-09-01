@@ -624,7 +624,7 @@ def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():
     assert matrix_free_update["solver_info"]["route_backend"] == "block-grouped-gemm"
 
 
-def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2():
+def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
     norb = 4
     h1e = np.diag(np.linspace(-1.0, 1.0, norb))
     h1e += np.diag(np.full(norb - 1, -0.2), 1)
@@ -642,8 +642,10 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2():
         seed=3,
     )
     before = state.expectation()
+    monkeypatch.setenv("PYQED_VALIDATE_LETTA_PROJECTED_ROUTE", "1")
     state.run(
-        nsweeps=1,
+        nsweeps=2,
+        tol=0.0,
         algorithm="projected",
         reuse_environments=True,
         gauge="conditional",
@@ -663,6 +665,26 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2():
     )
     assert all(
         update["solver_info"]["environment_reused"]
+        for update in cycle["updates"]
+    )
+    assert all(
+        update["solver_info"]["projected_metric_backend"] == "reduced_blocks"
+        for update in cycle["updates"]
+    )
+    fused = [
+        update for row in state.history for update in row["updates"]
+        if update["solver_info"]["projected_action_backend"]
+        == "cpp_fused_factor_routes"
+    ]
+    assert fused
+    assert max(
+        update["solver_info"]["projected_route_validation_error"]
+        for update in fused
+    ) < 1.0e-12
+    assert state._projected_route_cache_hits > 0
+    assert all(
+        update["solver_info"]["davidson"]["preconditioner_mode"]
+        == "projected_diagonal_seed_constant_shift"
         for update in cycle["updates"]
     )
     assert max(
@@ -704,6 +726,14 @@ def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
     np.testing.assert_allclose(
         frontier[3](vector), reference[3](vector), atol=2.0e-12
     )
+    identity = np.eye(frontier[1].size, dtype=complex)
+    explicit_metric = np.column_stack(
+        [frontier[3](identity[:, column]) for column in range(identity.shape[1])]
+    )
+    np.testing.assert_allclose(
+        frontier[-1]["_projected_metric"], explicit_metric, atol=2.0e-12
+    )
+    assert frontier[-1]["projected_metric_backend"] == "reduced_blocks"
     assert frontier[-1]["local_action_backend"] == "frontier_projected_pair"
     assert frontier[-1]["backend"] == "compiled_contextual_channel_resolved"
     state.close()

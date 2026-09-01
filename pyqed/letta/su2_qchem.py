@@ -519,6 +519,9 @@ class NonAbelianFrontierLETTA:
         self._we_route_cache = {}
         self._we_route_cache_hits = 0
         self._we_route_cache_misses = 0
+        self._projected_route_cache = {}
+        self._projected_route_cache_hits = 0
+        self._projected_route_cache_misses = 0
         self._solver_executor = (
             ThreadPoolExecutor(
                 max_workers=self.workers,
@@ -1560,6 +1563,169 @@ class NonAbelianFrontierLETTA:
             return current, np.zeros((0, 0), dtype=dtype)
         return current, np.column_stack(columns)
 
+    @staticmethod
+    def _project_metric_blocks(embedding, metric_blocks):
+        """Contract ``E† N E`` directly from reduced pair-metric blocks."""
+        embedding = np.asarray(embedding)
+        projected = np.zeros(
+            (embedding.shape[1], embedding.shape[1]),
+            dtype=np.result_type(embedding.dtype, complex),
+        )
+        active_designs = {}
+
+        def active_design(entry):
+            key = (int(entry.offset), int(entry.size))
+            cached = active_designs.get(key)
+            if cached is not None:
+                return cached
+            rows = embedding[key[0] : key[0] + key[1]]
+            columns = np.flatnonzero(np.any(rows != 0.0, axis=0))
+            cached = (columns, np.ascontiguousarray(rows[:, columns]))
+            active_designs[key] = cached
+            return cached
+
+        for out_entry, in_entry, block in metric_blocks:
+            out_columns, out_design = active_design(out_entry)
+            in_columns, in_design = active_design(in_entry)
+            if out_columns.size == 0 or in_columns.size == 0:
+                continue
+            contribution = out_design.conj().T @ (
+                np.asarray(block) @ in_design
+            )
+            projected[np.ix_(out_columns, in_columns)] += contribution
+        return 0.5 * (projected + projected.conj().T)
+
+    @staticmethod
+    def _metric_whitener(metric, *, rtol):
+        """Return an exact block-aware whitener for a projected norm."""
+        metric = 0.5 * (np.asarray(metric) + np.asarray(metric).conj().T)
+        dimension = int(metric.shape[0])
+        scale = max(float(np.max(np.abs(metric), initial=0.0)), 1.0)
+        threshold = float(rtol) * scale
+        diagonal = np.real(np.diag(metric))
+        off_diagonal = metric - np.diag(diagonal)
+        off_error = float(np.linalg.norm(off_diagonal))
+        if off_error <= threshold * max(np.sqrt(dimension), 1.0):
+            keep = diagonal > threshold
+            if not np.any(keep):
+                raise np.linalg.LinAlgError(
+                    "the projected SU2LETTA parameter metric is singular."
+                )
+            indices = np.flatnonzero(keep)
+            whitener = np.zeros((dimension, indices.size), dtype=metric.dtype)
+            whitener[indices, np.arange(indices.size)] = 1.0 / np.sqrt(
+                diagonal[indices]
+            )
+            identity_error = float(
+                np.max(np.abs(diagonal[indices] - 1.0), initial=0.0)
+            )
+            backend = "conditional_identity" if identity_error <= threshold else "diagonal"
+            return whitener, diagonal[indices], backend
+
+        adjacency = np.abs(off_diagonal) > threshold
+        unseen = set(range(dimension))
+        components = []
+        while unseen:
+            seed = unseen.pop()
+            component = {seed}
+            frontier = [seed]
+            while frontier:
+                row = frontier.pop()
+                neighbors = set(np.flatnonzero(adjacency[row])) & unseen
+                unseen.difference_update(neighbors)
+                component.update(neighbors)
+                frontier.extend(neighbors)
+            components.append(np.asarray(sorted(component), dtype=np.int64))
+
+        columns = []
+        retained = []
+        for indices in components:
+            block = metric[np.ix_(indices, indices)]
+            values, vectors = np.linalg.eigh(block)
+            keep = values > threshold
+            if not np.any(keep):
+                continue
+            local = vectors[:, keep] / np.sqrt(values[keep])
+            lifted = np.zeros((dimension, local.shape[1]), dtype=metric.dtype)
+            lifted[indices] = local
+            columns.append(lifted)
+            retained.extend(map(float, values[keep]))
+        if not columns:
+            raise np.linalg.LinAlgError(
+                "the projected SU2LETTA parameter metric is singular."
+            )
+        return (
+            np.column_stack(columns),
+            np.asarray(retained),
+            "block_eigh" if len(components) > 1 else "dense_eigh",
+        )
+
+    def _install_projected_factor_route(
+        self,
+        *,
+        site,
+        bond,
+        parent_action,
+        orthonormal_design,
+    ):
+        """Install ``E† H_eff E`` in the persistent reduced C++ owner."""
+        owner = getattr(parent_action, "su2_moving_environment", None)
+        factor_route_key = getattr(parent_action, "factor_route_key", None)
+        operator_embedding = getattr(parent_action, "operator_embedding", None)
+        parent_dimension, dimension = map(int, orthonormal_design.shape)
+        if (
+            owner is None
+            or factor_route_key is None
+            or not callable(operator_embedding)
+            or not owner.factor_route_installed(
+                factor_route_key, parent_dimension
+            )
+        ):
+            return None
+
+        from pyqed.mps.nonabelian import _su2_kernel
+
+        cache_key = (int(site), int(bond), parent_dimension, dimension)
+        cached = self._projected_route_cache.get(cache_key)
+        if cached is None:
+            parent_indices = np.arange(parent_dimension, dtype=np.int64)
+            topology_revision = _su2_kernel._cpp_array_revision(
+                np.asarray(
+                    [site, bond, parent_dimension, dimension], dtype=np.int64
+                ),
+                parent_indices,
+            )
+            cached = (parent_indices, int(topology_revision))
+            self._projected_route_cache[cache_key] = cached
+            self._projected_route_cache_misses += 1
+        else:
+            self._projected_route_cache_hits += 1
+        parent_indices, topology_revision = cached
+        transform = operator_embedding(orthonormal_design)
+        numeric_revision = int(_su2_kernel._cpp_array_revision(transform))
+        projection_key = (
+            f"letta:{int(site)}:{int(bond)}:{factor_route_key}:"
+            f"{topology_revision}"
+        )
+        owner.install_factor_route_projection(
+            projection_key,
+            factor_route_key,
+            (parent_indices,),
+            (transform,),
+            (0,),
+            parent_dimension,
+            dimension,
+            topology_revision,
+            numeric_revision,
+        )
+        return {
+            "owner": owner,
+            "projection_key": projection_key,
+            "transform": transform,
+            "topology_revision": topology_revision,
+            "numeric_revision": numeric_revision,
+        }
+
     def _prepare_wigner_eckart_local_problem(
         self,
         site,
@@ -1794,18 +1960,34 @@ class NonAbelianFrontierLETTA:
             environment_sweeps=environment_sweeps,
         )
 
-        n_columns = self._apply_packed_columns(n_pair, embedding, executor=executor)
-        n_diagonal = np.real(np.sum(embedding.conj() * n_columns, axis=0))
+        metric_blocks = getattr(n_pair, "metric_blocks", None)
+        if metric_blocks is None:
+            n_columns = self._apply_packed_columns(
+                n_pair, embedding, executor=executor
+            )
+            projected_metric_full = embedding.conj().T @ n_columns
+            metric_backend = "operator_columns"
+        else:
+            projected_metric_full = self._project_metric_blocks(
+                embedding, metric_blocks
+            )
+            metric_backend = "reduced_blocks"
+        projected_metric_full = 0.5 * (
+            projected_metric_full + projected_metric_full.conj().T
+        )
+        n_diagonal = np.real(np.diag(projected_metric_full))
         scale = max(float(np.max(np.abs(n_diagonal), initial=0.0)), 1.0)
         support = np.flatnonzero(n_diagonal > float(support_rtol) * scale)
         if support.size == 0:
             raise np.linalg.LinAlgError("local SU2LETTA parameter support is null.")
         design = np.asarray(embedding[:, support])
-        projected_metric = design.conj().T @ n_columns[:, support]
-        projected_metric = 0.5 * (projected_metric + projected_metric.conj().T)
-        # A diagonal preconditioner is only a hint to Davidson.  Avoid forming
-        # every H_eff E column here: that setup dominated larger tied spaces.
-        h_diagonal = np.zeros(support.size, dtype=float)
+        projected_metric = projected_metric_full[np.ix_(support, support)]
+        parent_h_diagonal = np.asarray(
+            getattr(h_pair, "diag", np.zeros(layout.size)), dtype=float
+        )
+        h_diagonal = np.real(
+            np.sum(design.conj() * (parent_h_diagonal[:, None] * design), axis=0)
+        )
         n_diagonal = n_diagonal[support]
         matvec_counts = {"hamiltonian": 0, "metric": 0}
 
@@ -1834,7 +2016,17 @@ class NonAbelianFrontierLETTA:
                 "frontier_dimension": int(layout.size),
                 "embedding_bytes": int(embedding.nbytes),
                 "matvec_counts": matvec_counts,
+                "projected_metric_backend": metric_backend,
                 "_projected_metric": projected_metric,
+                "_projected_design": design,
+                "_parent_h_diagonal": parent_h_diagonal,
+                "_parent_h_action": h_pair,
+                "parent_action_type": type(
+                    getattr(h_pair, "compiled_factorized_terms", None)
+                ).__name__,
+                "parent_factor_route_key": getattr(
+                    h_pair, "factor_route_key", None
+                ),
             }
         )
         return (
@@ -2278,6 +2470,30 @@ class NonAbelianFrontierLETTA:
                 action.backend = str(
                     getattr(packed_apply, "backend", "compiled-packed")
                 )
+                action.compiled_factorized_terms = compiled
+                action.factor_route_key = getattr(
+                    compiled,
+                    "_cpp_factor_route_key",
+                    getattr(compiled, "factor_route_key", None),
+                )
+                action.su2_moving_environment = getattr(
+                    compiled,
+                    "su2_moving_environment",
+                    getattr(compiled, "owner", None),
+                )
+
+                def operator_embedding(columns):
+                    columns = np.asarray(columns)
+                    out = np.zeros_like(columns)
+                    for _own_index, own_entry, _op_index, op_entry in entry_map:
+                        out[
+                            op_entry.offset : op_entry.offset + op_entry.size
+                        ] = columns[
+                            own_entry.offset : own_entry.offset + own_entry.size
+                        ]
+                    return np.ascontiguousarray(out)
+
+                action.operator_embedding = operator_embedding
                 return action, operator, tuple(entry_map), compiled
 
             h_sweep = n_sweep = None
@@ -2323,12 +2539,7 @@ class NonAbelianFrontierLETTA:
                         dtype=np.result_type(left, right, complex),
                     )
                     metric_by_pair[key] = block
-                for column in range(in_entry.size):
-                    source = np.zeros(in_entry.shape, dtype=block.dtype)
-                    source.reshape(-1)[column] = 1.0
-                    source_matrix = source[:, 0, 0, :]
-                    target = np.asarray(left) @ source_matrix @ np.asarray(right).T
-                    block[:, column] += target.reshape(-1)
+                block += np.kron(np.asarray(left), np.asarray(right))
             entry_by_key = {entry.key: entry for entry in layout.entries}
             metric_blocks = tuple(
                 (
@@ -2873,9 +3084,20 @@ class NonAbelianFrontierLETTA:
                 )
         current_reduced = current[support]
         if matrix_free:
+            projected_metric = np.asarray(
+                solver_info.pop("_projected_metric"), dtype=complex
+            )
+            projected_design = np.asarray(
+                solver_info.pop("_projected_design"), dtype=complex
+            )
+            parent_h_diagonal = np.asarray(
+                solver_info.pop("_parent_h_diagonal"), dtype=float
+            )
+            parent_h_action = solver_info.pop("_parent_h_action")
             current_h = h_action(current_reduced)
-            current_n = n_action(current_reduced)
-            denominator = np.real(np.vdot(current_reduced, current_n))
+            denominator = np.real(
+                np.vdot(current_reduced, projected_metric @ current_reduced)
+            )
         else:
             denominator = np.real(np.vdot(current_reduced, metric @ current_reduced))
         if denominator <= 0.0:
@@ -2886,38 +3108,77 @@ class NonAbelianFrontierLETTA:
         )
         before = float(np.real(numerator) / denominator) + self.ecore
         if matrix_free:
-            projected_metric = np.asarray(
-                solver_info.pop("_projected_metric"), dtype=complex
-            )
-            metric_eigenvalues, metric_eigenvectors = np.linalg.eigh(
-                projected_metric
-            )
-            metric_scale = max(
-                float(np.max(np.abs(metric_eigenvalues), initial=0.0)), 1.0
-            )
-            metric_keep = metric_eigenvalues > float(metric_rtol) * metric_scale
-            if not np.any(metric_keep):
-                raise np.linalg.LinAlgError(
-                    "the projected SU2LETTA parameter metric is singular."
-                )
-            whitener = metric_eigenvectors[:, metric_keep] / np.sqrt(
-                metric_eigenvalues[metric_keep]
+            whitener, retained_metric, whitening_backend = self._metric_whitener(
+                projected_metric, rtol=metric_rtol
             )
             whitened_current = (
                 whitener.conj().T @ projected_metric @ current_reduced
+            )
+            orthonormal_design = np.ascontiguousarray(
+                projected_design @ whitener
+            )
+            projected_h_diagonal = np.real(
+                np.sum(
+                    orthonormal_design.conj()
+                    * (parent_h_diagonal[:, None] * orthonormal_design),
+                    axis=0,
+                )
             )
 
             def orthonormal_h_action(vector):
                 return whitener.conj().T @ h_action(whitener @ vector)
 
-            # The metric is now exactly the identity in the retained tied
-            # tangent space, so Davidson never has to invert an ill-conditioned
-            # generalized Krylov metric.
+            projected_route = self._install_projected_factor_route(
+                site=site,
+                bond=bond,
+                parent_action=parent_h_action,
+                orthonormal_design=orthonormal_design,
+            )
+            if projected_route is None:
+                projected_action = orthonormal_h_action
+                solver_info["projected_action_backend"] = "python_composition"
+            else:
+                owner = projected_route["owner"]
+                projection_key = projected_route["projection_key"]
+                projected_action = lambda vector: owner.factor_route_projected_matvec(
+                    projection_key, np.asarray(vector)
+                )
+                if os.environ.get("PYQED_VALIDATE_LETTA_PROJECTED_ROUTE"):
+                    reference_probe = orthonormal_h_action(whitened_current)
+                    compiled_probe = projected_action(whitened_current)
+                    solver_info["projected_route_validation_error"] = float(
+                        np.linalg.norm(compiled_probe - reference_probe)
+                        / max(np.linalg.norm(reference_probe), 1.0)
+                    )
+                solver_info["projected_action_backend"] = "cpp_fused_factor_routes"
+                solver_info["projected_route_topology_revision"] = int(
+                    projected_route["topology_revision"]
+                )
+            # The projected parent diagonal is retained as a structured
+            # preconditioner diagnostic.  Its off-diagonal transform terms are
+            # not available cheaply, so a constant shift is the robust
+            # preconditioner until the exact projected diagonal is installed.
+            diagonal_center = float(np.median(projected_h_diagonal))
+            davidson_diagonal = projected_h_diagonal
+
+            def projected_preconditioner(residual, theta, _vector):
+                denominator = theta - diagonal_center
+                floor = max(
+                    1.0e-10,
+                    1.0e-6 * abs(float(denominator)),
+                )
+                safe = (
+                    denominator
+                    if abs(denominator) > floor
+                    else (floor if denominator >= 0.0 else -floor)
+                )
+                return residual / safe
+
             local_energy, whitened_reduced, davidson_info = (
                 _solve_packed_generalized_davidson(
                     whitened_current,
-                    orthonormal_h_action,
-                    h_diag=np.zeros(whitener.shape[1], dtype=float),
+                    projected_action,
+                    h_diag=davidson_diagonal,
                     N=None,
                     n_diag=None,
                     tol=float(davidson_tol),
@@ -2926,25 +3187,31 @@ class NonAbelianFrontierLETTA:
                     max_space=min(
                         int(davidson_max_space), int(whitener.shape[1])
                     ),
+                    precond=projected_preconditioner,
                 )
             )
+            davidson_info["fused_cpp_action"] = projected_route is not None
+            davidson_info["preconditioner_mode"] = (
+                "projected_diagonal_seed_constant_shift"
+            )
             reduced = whitener @ whitened_reduced
-            candidate_h = h_action(reduced)
-            candidate_n = n_action(reduced)
-            candidate_norm = float(np.real(np.vdot(reduced, candidate_n)))
-            if candidate_norm <= 0.0:
+            candidate_h = projected_action(whitened_reduced)
+            candidate_norm = float(np.real(np.vdot(
+                reduced, projected_metric @ reduced
+            )))
+            if candidate_norm <= 0.0 or not np.all(np.isfinite(candidate_h)):
                 local_energy = np.inf
             else:
                 local_energy = float(
-                    np.real(np.vdot(reduced, candidate_h)) / candidate_norm
+                    np.real(np.vdot(whitened_reduced, candidate_h))
+                    / candidate_norm
                 )
             davidson_info["metric_rank"] = int(whitener.shape[1])
             davidson_info["metric_nullity"] = int(
                 support.size - whitener.shape[1]
             )
             davidson_info["metric_condition"] = float(
-                metric_eigenvalues[metric_keep][-1]
-                / metric_eigenvalues[metric_keep][0]
+                np.max(retained_metric) / np.min(retained_metric)
             )
             davidson_info["orthonormality_error"] = float(
                 np.linalg.norm(
@@ -2952,10 +3219,19 @@ class NonAbelianFrontierLETTA:
                     - np.eye(whitener.shape[1])
                 )
             )
+            davidson_info["metric_whitening_backend"] = whitening_backend
+            davidson_info["projected_diagonal_min"] = float(
+                np.min(projected_h_diagonal, initial=0.0)
+            )
+            davidson_info["projected_diagonal_max"] = float(
+                np.max(projected_h_diagonal, initial=0.0)
+            )
             if float(davidson_info.get("residual", np.inf)) <= float(davidson_tol):
                 davidson_info["davidson_converged"] = True
             solver_info["davidson"] = davidson_info
-            overlap = np.vdot(current_reduced, n_action(reduced))
+            overlap = np.vdot(
+                current_reduced, projected_metric @ reduced
+            )
         else:
             local_energy, reduced = _lowest_generalized_pair(
                 hamiltonian,
@@ -3117,6 +3393,15 @@ class NonAbelianFrontierLETTA:
                 environment_sweeps = None
                 if algorithm in {"two_site", "projected"} and reuse_environments:
                     environment_started = time.perf_counter()
+                    if (
+                        algorithm == "projected"
+                        and self._su2_moving_environment is not None
+                    ):
+                        self._su2_moving_environment.clear_boundaries()
+                        self._su2_moving_environment.clear_factor_routes()
+                        moving_environment.hamiltonian_stack.su2_moving_environment = (
+                            self._su2_moving_environment
+                        )
                     if conditional_gauge:
                         h_reuse = n_reuse = None
                     else:
@@ -3146,7 +3431,7 @@ class NonAbelianFrontierLETTA:
                     if algorithm == "two_site":
                         h_stack = (
                             None
-                            if moving_environment is None
+                            if moving_environment is None or algorithm == "projected"
                             else moving_environment.hamiltonian_stack
                         )
                         if h_stack is not None:
@@ -3269,6 +3554,8 @@ class NonAbelianFrontierLETTA:
                     updates.append(update)
                 if environment_sweeps is not None:
                     moving_environment.finish_sweep(direction)
+                if algorithm == "projected" and moving_environment is not None:
+                    moving_environment.hamiltonian_stack.su2_moving_environment = None
             energy = self.expectation()
             delta = abs(energy - previous)
             residuals = []

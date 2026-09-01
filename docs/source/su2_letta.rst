@@ -90,6 +90,19 @@ An update is committed only when Davidson converges and its recomputed local
 Rayleigh quotient does not increase.  No magnetic or determinant-space
 projection is used.
 
+On states that retain the compiled SU(2) owner, the projected optimizer
+installs the complete ``E† H_eff E`` action as one fused factor-route projection;
+Davidson vectors therefore remain in the tied orthonormal space without Python
+lift/apply/project callbacks.  ``E† N_eff E`` is contracted directly from the
+factorized reduced metric blocks and touches only active embedding columns.
+Projection topology and one-site Wigner--Eckart routes are cached across
+cycles, while numerical transforms are refreshed after each update.  Norm
+whitening is split into independent connected blocks and uses a direct
+diagonal/identity scaling whenever the conditional gauge permits it.  A
+projected parent-Hamiltonian diagonal controls Davidson seed ordering; the
+correction uses a constant shift because omitted transformed off-diagonal
+terms make that inexpensive diagonal unsafe as a direct denominator.
+
 For a physical nearest-neighbor tie chain, ``gauge="conditional"`` applies an
 exact reduced QR gauge independently for every crossing physical SU(2) sector.
 The adjacent tensor absorbs the transfer matrix, so the graph-tied state is
@@ -115,6 +128,12 @@ deep copies drop the non-pickleable owner and use the same exact reduced Python
 route path.  Immutable left/right reduced MPO recoupling blocks are cached per
 core and reused by environment construction, local actions, and expectation
 values.
+
+For the pyrazine STO-3G CAS(6,6), ``D=4`` nearest-neighbor validation, these
+optimizations reduce a steady complete LR/RL cycle from about 8.3 seconds to
+about 2.3 seconds on the development machine while retaining the CASCI energy
+to roughly ``1e-13`` Hartree.  This is the fast LETTA path, but its tied metric
+and embedding work still make it slower than an unconstrained SU(2)-DMRG sweep.
 
 Pair updates
 ------------
