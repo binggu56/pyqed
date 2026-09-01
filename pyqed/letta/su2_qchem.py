@@ -434,14 +434,53 @@ def _lowest_generalized_pair(hamiltonian, metric, *, rtol=1.0e-11):
 class _WignerEckartRoutePlan:
     """Linear map from tied parameters to grouped reduced tensor blocks."""
 
-    def __init__(self, *, template, groups, basis, nparameters, nbytes):
+    def __init__(self, *, template, groups, nparameters, nbytes):
         self.template = template
         self.groups = tuple(groups)
-        self.basis = tuple(basis)
         self.nparameters = int(nparameters)
         self.nbytes = int(nbytes)
         self.route_count = int(sum(indices.size for _, indices, _, _ in self.groups))
         self.backend = "block-grouped-gemm"
+        self._group_by_key = {
+            key: (indices, matrix, shape)
+            for key, indices, matrix, shape in self.groups
+        }
+        self._basis = None
+
+    def block_basis(self, key, *, dtype=complex):
+        """Return all parameter directions for one reduced tensor block."""
+        record = self._group_by_key.get(key)
+        if record is None:
+            shape = np.asarray(self.template.data[key]).shape
+            return np.zeros((self.nparameters,) + shape, dtype=dtype)
+        indices, matrix, shape = record
+        blocks = np.zeros(
+            (self.nparameters,) + tuple(shape),
+            dtype=np.result_type(dtype, matrix.dtype),
+        )
+        blocks[indices] = np.asarray(matrix).reshape((-1,) + tuple(shape))
+        return blocks
+
+    @property
+    def basis(self):
+        """Materialize unit-direction tensors only for reference solvers."""
+        if self._basis is None:
+            basis_data = [dict() for _ in range(self.nparameters)]
+            for key, indices, matrix, shape in self.groups:
+                rows = np.asarray(matrix).reshape((-1,) + tuple(shape))
+                for row, parameter in enumerate(indices):
+                    basis_data[int(parameter)][key] = rows[row]
+            self._basis = tuple(
+                IrrepTensor(
+                    data=data,
+                    qns=[list(values) for values in self.template.qns],
+                    dirs=list(self.template.dirs),
+                    fusion_legs=list(self.template.fusion_legs),
+                    metadata=dict(self.template.metadata),
+                )
+                for data in basis_data
+            )
+        return self._basis
 
     def tensor(self, coefficients):
         coefficients = np.asarray(coefficients).reshape(-1)
@@ -541,6 +580,9 @@ class NonAbelianFrontierLETTA:
         self._metric_whitener_cache = {}
         self._metric_whitener_cache_hits = 0
         self._metric_whitener_cache_misses = 0
+        self._materialized_site_cache = {}
+        self._materialized_site_cache_hits = 0
+        self._materialized_site_cache_misses = 0
         self._solver_executor = (
             ThreadPoolExecutor(
                 max_workers=self.workers,
@@ -1004,6 +1046,8 @@ class NonAbelianFrontierLETTA:
                         "message": "canonicalized",
                     }
                 )
+        if any(bool(update.get("applied", False)) for update in updates):
+            self._invalidate_materialized_sites(bond, bond + 1)
         return tuple(updates)
 
     def canonicalize_conditional_center(self, center, *, rcond=1.0e-12):
@@ -1040,6 +1084,11 @@ class NonAbelianFrontierLETTA:
     def materialize_site(self, site):
         """Materialize one tied tensor as a reduced SU(2) MPS site."""
         site = int(site)
+        cached = self._materialized_site_cache.get(site)
+        if cached is not None:
+            self._materialized_site_cache_hits += 1
+            return cached
+        self._materialized_site_cache_misses += 1
         base = self._base_sites[site]
         left_frontier = self.frontiers[site]
         right_frontier = self.frontiers[site + 1]
@@ -1104,7 +1153,7 @@ class NonAbelianFrontierLETTA:
             for sector, dimension in right_dims.items()
             for _ in range(dimension * len(right_assignments))
         ]
-        return IrrepTensor(
+        materialized = IrrepTensor(
             data=data,
             qns=[left_qns, list(physical_sectors), right_qns],
             dirs=[-1, 1, 1],
@@ -1115,6 +1164,8 @@ class NonAbelianFrontierLETTA:
                 "letta_tie": self.tie,
             },
         )
+        self._materialized_site_cache[site] = materialized
+        return materialized
 
     def materialize(self):
         """Return the exact unfolded reduced SU(2) MPS."""
@@ -1202,6 +1253,11 @@ class NonAbelianFrontierLETTA:
             for _revision, whitener, spectrum, _backend
             in self._metric_whitener_cache.values()
         )
+        materialized_bytes = sum(
+            np.asarray(block).nbytes
+            for tensor in self._materialized_site_cache.values()
+            for block in tensor.data.values()
+        )
         reduced_block_bytes = 0
         for core in self.mpo:
             for blocks in getattr(core, "_environment_reduced_block_cache", {}).values():
@@ -1215,6 +1271,7 @@ class NonAbelianFrontierLETTA:
             + embedding_bytes
             + krylov_bytes
             + whitener_bytes
+            + materialized_bytes
             + reduced_block_bytes
         )
 
@@ -1319,6 +1376,7 @@ class NonAbelianFrontierLETTA:
             {key: np.array(value, copy=True) for key, value in tensor.items()}
             for tensor in payload["tensors"]
         ]
+        state._materialized_site_cache.clear()
         state.history = list(payload.get("history", ()))
         state.energy = float(payload.get("energy", state.expectation()))
         state.converged = bool(payload.get("converged", False))
@@ -1332,6 +1390,10 @@ class NonAbelianFrontierLETTA:
             return np.zeros(0)
         return np.concatenate(arrays)
 
+    def _invalidate_materialized_sites(self, *sites):
+        for site in sites:
+            self._materialized_site_cache.pop(int(site), None)
+
     def _set_site_vector(self, site, vector):
         vector = np.asarray(vector)
         offset = 0
@@ -1344,6 +1406,7 @@ class NonAbelianFrontierLETTA:
         if offset != vector.size:
             raise ValueError("local SU2LETTA parameter vector has the wrong size.")
         self.tensors[site] = updated
+        self._invalidate_materialized_sites(site)
 
     def _quadratic_value(self, sites, site, vector, factors):
         self._set_site_vector(site, vector)
@@ -1432,67 +1495,104 @@ class NonAbelianFrontierLETTA:
             return list(executor.map(function, tasks))
 
     def _compile_wigner_eckart_routes(self, site):
-        """Compile the structural tied-parameter map once for one site."""
+        """Compile the structural tied-parameter scatter map once."""
         site = int(site)
         current = self._pack_site(site)
-        unit = np.zeros(current.size, dtype=np.result_type(current.dtype, float))
-        rows = {}
-        template = None
-        try:
-            for parameter in range(current.size):
-                unit[parameter] = 1.0
-                self._set_site_vector(site, unit)
-                local = self.materialize_site(site)
-                if template is None:
-                    template = local
-                for key, block in local.data.items():
-                    array = np.asarray(block)
-                    if np.any(array):
-                        rows.setdefault(key, []).append(
-                            (int(parameter), np.array(array, copy=True))
-                        )
-                unit[parameter] = 0.0
-        finally:
-            self._set_site_vector(site, current)
-        if template is None:
-            raise np.linalg.LinAlgError("the local Wigner--Eckart route is empty.")
-
+        template = self.materialize_site(site)
+        left_frontier = self.frontiers[site]
+        right_frontier = self.frontiers[site + 1]
+        left_maps = [
+            dict(zip(left_frontier, values))
+            for values in self._assignments[site]
+        ]
+        right_maps = [
+            dict(zip(right_frontier, values))
+            for values in self._assignments[site + 1]
+        ]
+        left_dims = self._bond_sector_dims(site, 0)
+        right_dims = self._bond_sector_dims(site, 2)
+        parameter_offsets = {}
+        offset = 0
+        for key in self._tensor_keys[site]:
+            parameter_offsets[key] = offset
+            offset += int(np.asarray(self.tensors[site][key]).size)
+        if offset != current.size:
+            raise RuntimeError("Tied parameter offsets do not cover the site.")
         groups = []
-        basis_data = [dict() for _ in range(current.size)]
         nbytes = 0
-        for key in template.data:
-            records = rows.get(key, ())
-            if not records:
+        for block_key, target_block in template.data.items():
+            q_left, q_phys, q_right = block_key
+            source_keys = [
+                key
+                for key in self._tensor_keys[site]
+                if key[:3] == block_key
+            ]
+            if not source_keys:
                 continue
-            indices = np.asarray([record[0] for record in records], dtype=np.intp)
-            shape = np.asarray(records[0][1]).shape
-            matrix = np.ascontiguousarray(
-                np.stack([np.asarray(record[1]).reshape(-1) for record in records])
-            )
+            d_left = left_dims[q_left]
+            d_right = right_dims[q_right]
+            endpoint_value = self._tie_index_by_site[site][
+                q_phys if self.tie == "physical" else q_left
+            ]
+            indices = []
+            matrix_rows = []
+            for source_key in source_keys:
+                condition = source_key[3]
+                source_shape = np.asarray(self.tensors[site][source_key]).shape
+                source_offset = parameter_offsets[source_key]
+                for local_index in range(int(np.prod(source_shape))):
+                    i_left, i_phys, i_right = np.unravel_index(
+                        local_index, source_shape
+                    )
+                    row = np.zeros(np.asarray(target_block).size, dtype=float)
+                    for left_index, left_values in enumerate(left_maps):
+                        if (
+                            site in left_values
+                            and left_values[site] != endpoint_value
+                        ):
+                            continue
+                        for right_index, right_values in enumerate(right_maps):
+                            common = set(left_values).intersection(right_values)
+                            if any(
+                                left_values[value] != right_values[value]
+                                for value in common
+                            ):
+                                continue
+                            if tuple(
+                                right_values[parent]
+                                for parent in self.parent_sets[site]
+                            ) != condition:
+                                continue
+                            target_index = np.ravel_multi_index(
+                                (
+                                    left_index * d_left + i_left,
+                                    i_phys,
+                                    right_index * d_right + i_right,
+                                ),
+                                np.asarray(target_block).shape,
+                            )
+                            row[target_index] = 1.0
+                    if np.any(row):
+                        indices.append(source_offset + local_index)
+                        matrix_rows.append(row)
+            if not indices:
+                continue
+            indices = np.asarray(indices, dtype=np.intp)
+            matrix = np.ascontiguousarray(np.stack(matrix_rows))
             nbytes += int(indices.nbytes + matrix.nbytes)
             if nbytes > self._we_route_limit_bytes:
                 raise MemoryError(
                     "packed Wigner--Eckart routes require more than "
                     f"{self.we_route_memory:g} MiB; increase we_route_memory."
                 )
-            groups.append((key, indices, matrix, shape))
-            for row, parameter in enumerate(indices):
-                basis_data[int(parameter)][key] = matrix[row].reshape(shape)
-
-        basis = tuple(
-            IrrepTensor(
-                data=data,
-                qns=[list(values) for values in template.qns],
-                dirs=list(template.dirs),
-                fusion_legs=list(template.fusion_legs),
-                metadata=dict(template.metadata),
+            groups.append(
+                (block_key, indices, matrix, np.asarray(target_block).shape)
             )
-            for data in basis_data
-        )
+        if not groups:
+            raise np.linalg.LinAlgError("the local Wigner--Eckart route is empty.")
         return _WignerEckartRoutePlan(
             template=template,
             groups=groups,
-            basis=basis,
             nparameters=current.size,
             nbytes=nbytes,
         )
@@ -1585,7 +1685,7 @@ class NonAbelianFrontierLETTA:
         current = self._pack_site(site)
         dtype = np.result_type(current.dtype, complex)
         routes = self._wigner_eckart_route_plan(site)
-        if len(routes.basis) != current.size:
+        if routes.nparameters != current.size:
             raise RuntimeError(
                 "Cached Wigner--Eckart basis does not match the local parameter space."
             )
@@ -1610,16 +1710,9 @@ class NonAbelianFrontierLETTA:
                     )
                     if template is None:
                         continue
-                    varied_blocks = np.stack(
-                        [
-                            np.asarray(
-                                basis.data.get(
-                                    varied_key, np.zeros_like(template)
-                                ),
-                                dtype=dtype,
-                            )
-                            for basis in routes.basis
-                        ]
+                    varied_blocks = np.asarray(
+                        routes.block_basis(varied_key, dtype=dtype),
+                        dtype=dtype,
                     )
                     self._embedding_basis_cache[cache_key] = varied_blocks
                     self._embedding_basis_cache_misses += 1

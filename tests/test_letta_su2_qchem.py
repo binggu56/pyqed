@@ -539,12 +539,17 @@ def test_wigner_eckart_local_transition_plan_and_grouped_routes_are_exact():
     ) == cached_blocks
 
     routes = state._wigner_eckart_route_plan(0)
+    assert routes._basis is None
+    cached_site = state.materialize_site(0)
+    assert state.materialize_site(0) is cached_site
+    cache_hits = state._materialized_site_cache_hits
     rng = np.random.default_rng(31)
     vector = rng.normal(size=state._pack_site(0).size)
     current = state._pack_site(0)
     try:
         state._set_site_vector(0, vector)
         reference = state.materialize_site(0)
+        assert reference is not cached_site
     finally:
         state._set_site_vector(0, current)
     routed = routes.tensor(vector)
@@ -576,6 +581,10 @@ def test_wigner_eckart_local_transition_plan_and_grouped_routes_are_exact():
         np.column_stack(reference_columns),
         atol=1.0e-13,
     )
+    assert routes._basis is None
+    state.materialize_site(0)
+    state.materialize_site(0)
+    assert state._materialized_site_cache_hits > cache_hits
 
 
 def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():

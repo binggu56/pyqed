@@ -108,6 +108,16 @@ parent-Hamiltonian diagonal controls seed ordering, while a robust constant
 shift is used for correction because omitted transformed off-diagonal terms
 make that inexpensive diagonal unsafe as a direct denominator.
 
+The tied-to-reduced coordinate map is compiled directly from frontier-sector
+slices and parameter offsets.  It no longer constructs a materialized MPS
+tensor for every unit parameter direction.  Unit-direction ``IrrepTensor``
+objects are generated lazily only for explicit reference solvers.  Numerical
+reduced MPS sites are retained by the state and invalidated precisely when a
+site parameter or crossing conditional gauge changes.  Thus the production
+path carries the tie constraint as a persistent reduced-coordinate scatter
+map while retaining the rank-filtered metric basis required to remove null
+directions.
+
 For a physical nearest-neighbor tie chain, ``gauge="conditional"`` applies an
 exact reduced QR gauge independently for every crossing physical SU(2) sector.
 The adjacent tensor absorbs the transfer matrix, so the graph-tied state is
@@ -145,11 +155,11 @@ Python-side independent local setup.  Avoid combining large values for both
 with a multithreaded BLAS.
 
 For the pyrazine STO-3G CAS(6,6), ``D=4`` nearest-neighbor benchmark, the first
-cycle takes about 4.9 seconds and steady complete LR/RL cycles take about 2.0
-seconds on the development machine.  The one- and four-thread three-cycle
-totals were 9.22 and 9.15 seconds, respectively: this small ``D`` does not
-contain enough parallel reduced-block work for material OpenMP scaling.  Both
-runs retained the CASCI energy within ``6e-14`` Hartree.  This is the fast
+cycle takes about 3.0 seconds and steady complete LR/RL cycles take about
+1.9--2.0 seconds on the development machine.  The one-thread three-cycle total
+is about 7.1 seconds.  This small ``D`` does not contain enough parallel
+reduced-block work for material OpenMP scaling.  The run retained the CASCI
+energy within ``1e-13`` Hartree.  This is the fast
 LETTA path, but its tied metric and embedding work still make it slower than an
 unconstrained SU(2)-DMRG sweep.  Timings are machine-dependent.
 
