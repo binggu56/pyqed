@@ -118,6 +118,27 @@ path carries the tie constraint as a persistent reduced-coordinate scatter
 map while retaining the rank-filtered metric basis required to remove null
 directions.
 
+The moving Hamiltonian and norm sweeps are the sole local boundary owners in
+the projected path; redundant standalone adjacent-pair anchors are not built.
+The norm projection is accumulated directly into connected tied-coordinate
+components.  Their topology is cached, numerical blocks are refreshed
+component-wise, and each component is whitened immediately, so no full
+``E† N_eff E`` temporary is required.  The compiled owner still supplies the
+local factorized norm action.  Its C++-boundary-only metric handle is not used
+for whitening because that handle exposes matvecs and a diagonal but not the
+connected blocks needed to remove LETTA null directions; using raw generalized
+coordinates was tested and was slower for strongly rank-deficient sites.
+
+Accepted parameter changes update cached unfolded MPS blocks through the
+persistent scatter map.  Ritz vectors are transported through the new metric
+whitener on the next visit.  Updates below the metric step tolerance preserve
+their tensor, gauge, and environment revisions.  A complete cycle in which
+every update is stationary is a deterministic fixed point and satisfies the
+requested consecutive-cycle check without executing an identical extra
+cycle.  Physical ``graph="nn"`` states use a dedicated bounded-frontier
+``nearest-neighbor-block-scatter`` constraint plan; general graphs retain the
+generic grouped route representation.
+
 For a physical nearest-neighbor tie chain, ``gauge="conditional"`` applies an
 exact reduced QR gauge independently for every crossing physical SU(2) sector.
 The adjacent tensor absorbs the transfer matrix, so the graph-tied state is
@@ -155,11 +176,12 @@ Python-side independent local setup.  Avoid combining large values for both
 with a multithreaded BLAS.
 
 For the pyrazine STO-3G CAS(6,6), ``D=4`` nearest-neighbor benchmark, the first
-cycle takes about 3.0 seconds and steady complete LR/RL cycles take about
-1.9--2.0 seconds on the development machine.  The one-thread three-cycle total
-is about 7.1 seconds.  This small ``D`` does not contain enough parallel
-reduced-block work for material OpenMP scaling.  The run retained the CASCI
-energy within ``1e-13`` Hartree.  This is the fast
+cycle takes about 2.8 seconds and the stationary complete LR/RL cycle takes
+about 1.5 seconds on the development machine.  The one-thread run reaches its
+stationary fixed point in two cycles and about 4.45 seconds, compared with
+9.22 seconds for the earlier three-cycle projected implementation.  This small
+``D`` does not contain enough parallel reduced-block work for material OpenMP
+scaling.  The run retained the CASCI energy within ``1e-13`` Hartree.  This is the fast
 LETTA path, but its tied metric and embedding work still make it slower than an
 unconstrained SU(2)-DMRG sweep.  Timings are machine-dependent.
 

@@ -254,6 +254,120 @@ class _ChannelResolvedPairSpace:
         )
         return left, right
 
+
+class _ReducedMetricComponents:
+    """Connected projected-norm blocks in tied reduced coordinates."""
+
+    def __init__(self, dimension, components):
+        self.dimension = int(dimension)
+        self.components = tuple(
+            (
+                np.asarray(indices, dtype=np.int64),
+                np.asarray(block, dtype=complex),
+            )
+            for indices, block in components
+        )
+
+    def dense(self):
+        metric = np.zeros((self.dimension, self.dimension), dtype=complex)
+        for indices, block in self.components:
+            metric[np.ix_(indices, indices)] += block
+        return metric
+
+    def __array__(self, dtype=None, copy=None):
+        metric = self.dense()
+        if dtype is not None:
+            metric = metric.astype(dtype, copy=False)
+        return np.array(metric, copy=True) if copy else metric
+
+    @property
+    def diagonal(self):
+        diagonal = np.zeros(self.dimension, dtype=float)
+        for indices, block in self.components:
+            diagonal[indices] += np.real(np.diag(block))
+        return diagonal
+
+    @property
+    def nbytes(self):
+        return int(sum(indices.nbytes + block.nbytes for indices, block in self.components))
+
+    def matvec(self, vector):
+        vector = np.asarray(vector)
+        output = np.zeros_like(vector, dtype=np.result_type(vector, complex))
+        for indices, block in self.components:
+            output[indices] += block @ vector[indices]
+        return output
+
+    def restrict(self, support):
+        support = np.asarray(support, dtype=np.int64)
+        inverse = {int(old): new for new, old in enumerate(support)}
+        components = []
+        for indices, block in self.components:
+            keep = np.asarray(
+                [position for position, index in enumerate(indices) if int(index) in inverse],
+                dtype=np.int64,
+            )
+            if keep.size == 0:
+                continue
+            new_indices = np.asarray(
+                [inverse[int(indices[position])] for position in keep],
+                dtype=np.int64,
+            )
+            components.append((new_indices, block[np.ix_(keep, keep)]))
+        return type(self)(support.size, components)
+
+    def whitener(self, *, rtol):
+        scale = max(
+            (
+                float(np.max(np.abs(block), initial=0.0))
+                for _indices, block in self.components
+            ),
+            default=1.0,
+        )
+        scale = max(scale, 1.0)
+        threshold = float(rtol) * scale
+        columns = []
+        retained = []
+        backends = []
+        for indices, raw_block in self.components:
+            block = 0.5 * (raw_block + raw_block.conj().T)
+            diagonal = np.real(np.diag(block))
+            off_diagonal = block - np.diag(diagonal)
+            if np.linalg.norm(off_diagonal) <= threshold * max(
+                np.sqrt(indices.size), 1.0
+            ):
+                keep = diagonal > threshold
+                if not np.any(keep):
+                    continue
+                local = np.zeros((indices.size, np.count_nonzero(keep)), dtype=complex)
+                local[np.flatnonzero(keep), np.arange(np.count_nonzero(keep))] = (
+                    1.0 / np.sqrt(diagonal[keep])
+                )
+                values = diagonal[keep]
+                backends.append("diagonal")
+            else:
+                values, vectors = np.linalg.eigh(block)
+                keep = values > threshold
+                if not np.any(keep):
+                    continue
+                local = vectors[:, keep] / np.sqrt(values[keep])
+                values = values[keep]
+                backends.append("eigh")
+            lifted = np.zeros((self.dimension, local.shape[1]), dtype=complex)
+            lifted[indices] = local
+            columns.append(lifted)
+            retained.extend(map(float, values))
+        if not columns:
+            raise np.linalg.LinAlgError(
+                "the projected SU2LETTA parameter metric is singular."
+            )
+        backend = (
+            "conditional_identity"
+            if backends and all(value == "diagonal" for value in backends)
+            else "block_eigh"
+        )
+        return np.column_stack(columns), np.asarray(retained), backend
+
     @staticmethod
     def _clean_metadata(metadata):
         cleaned = dict(metadata or {})
@@ -499,6 +613,25 @@ class _WignerEckartRoutePlan:
             metadata=dict(self.template.metadata),
         )
 
+    def apply_delta(self, tensor, coefficients):
+        """Apply a tied parameter delta directly to materialized blocks."""
+        coefficients = np.asarray(coefficients).reshape(-1)
+        if coefficients.size != self.nparameters:
+            raise ValueError("Wigner--Eckart route coefficients have the wrong size.")
+        for key, indices, matrix, shape in self.groups:
+            delta = (coefficients[indices] @ matrix).reshape(shape)
+            tensor.data[key] = np.asarray(tensor.data[key]) + delta
+        return tensor
+
+
+class _NearestNeighborTieRoutePlan(_WignerEckartRoutePlan):
+    """Bounded-frontier reduced scatter plan for physical NN ties."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.backend = "nearest-neighbor-block-scatter"
+        self.conditioned_frontier_width = 1
+
 
 class NonAbelianFrontierLETTA:
     r"""Graph-tied reduced SU(2) frontier LETTA.
@@ -580,9 +713,13 @@ class NonAbelianFrontierLETTA:
         self._metric_whitener_cache = {}
         self._metric_whitener_cache_hits = 0
         self._metric_whitener_cache_misses = 0
+        self._metric_component_topology_cache = {}
+        self._metric_component_cache_hits = 0
+        self._metric_component_cache_misses = 0
         self._materialized_site_cache = {}
         self._materialized_site_cache_hits = 0
         self._materialized_site_cache_misses = 0
+        self._incremental_materialization_enabled = False
         self._solver_executor = (
             ThreadPoolExecutor(
                 max_workers=self.workers,
@@ -1258,6 +1395,11 @@ class NonAbelianFrontierLETTA:
             for tensor in self._materialized_site_cache.values()
             for block in tensor.data.values()
         )
+        metric_topology_bytes = sum(
+            indices.nbytes
+            for groups in self._metric_component_topology_cache.values()
+            for indices in groups
+        )
         reduced_block_bytes = 0
         for core in self.mpo:
             for blocks in getattr(core, "_environment_reduced_block_cache", {}).values():
@@ -1272,6 +1414,7 @@ class NonAbelianFrontierLETTA:
             + krylov_bytes
             + whitener_bytes
             + materialized_bytes
+            + metric_topology_bytes
             + reduced_block_bytes
         )
 
@@ -1396,6 +1539,7 @@ class NonAbelianFrontierLETTA:
 
     def _set_site_vector(self, site, vector):
         vector = np.asarray(vector)
+        previous = self._pack_site(site)
         offset = 0
         updated = {}
         for key in self._tensor_keys[site]:
@@ -1406,7 +1550,16 @@ class NonAbelianFrontierLETTA:
         if offset != vector.size:
             raise ValueError("local SU2LETTA parameter vector has the wrong size.")
         self.tensors[site] = updated
-        self._invalidate_materialized_sites(site)
+        cached = self._materialized_site_cache.get(int(site))
+        route = self._we_route_cache.get(int(site))
+        if (
+            self._incremental_materialization_enabled
+            and cached is not None
+            and route is not None
+        ):
+            route.apply_delta(cached, vector - previous)
+        else:
+            self._invalidate_materialized_sites(site)
 
     def _quadratic_value(self, sites, site, vector, factors):
         self._set_site_vector(site, vector)
@@ -1590,7 +1743,12 @@ class NonAbelianFrontierLETTA:
             )
         if not groups:
             raise np.linalg.LinAlgError("the local Wigner--Eckart route is empty.")
-        return _WignerEckartRoutePlan(
+        plan_type = (
+            _NearestNeighborTieRoutePlan
+            if self.supports_conditional_canonical_gauge
+            else _WignerEckartRoutePlan
+        )
+        return plan_type(
             template=template,
             groups=groups,
             nparameters=current.size,
@@ -1787,6 +1945,120 @@ class NonAbelianFrontierLETTA:
             )
             projected[np.ix_(out_columns, in_columns)] += contribution
         return 0.5 * (projected + projected.conj().T)
+
+    def _project_metric_components(
+        self,
+        embedding,
+        metric_blocks,
+        *,
+        site,
+        bond,
+    ):
+        """Project and assemble only connected tied-metric components."""
+        embedding = np.asarray(embedding)
+        dimension = int(embedding.shape[1])
+        active_designs = {}
+        from pyqed.mps.nonabelian import _su2_kernel
+
+        def active_design(entry):
+            key = (int(entry.offset), int(entry.size))
+            cached = active_designs.get(key)
+            if cached is None:
+                rows = embedding[key[0] : key[0] + key[1]]
+                columns = np.flatnonzero(np.any(rows != 0.0, axis=0))
+                cached = (columns, np.ascontiguousarray(rows[:, columns]))
+                active_designs[key] = cached
+            return cached
+
+        records = []
+        topology_values = []
+        for out_entry, in_entry, block in metric_blocks:
+            out_columns, out_design = active_design(out_entry)
+            in_columns, in_design = active_design(in_entry)
+            if out_columns.size == 0 or in_columns.size == 0:
+                continue
+            contribution = out_design.conj().T @ (
+                np.asarray(block) @ in_design
+            )
+            threshold = 1.0e-15 * max(
+                float(np.max(np.abs(contribution), initial=0.0)), 1.0
+            )
+            pattern = np.ascontiguousarray(
+                np.abs(contribution) > threshold, dtype=np.uint8
+            )
+            records.append((out_columns, in_columns, contribution, pattern))
+            topology_values.append(
+                (
+                    int(out_entry.offset),
+                    int(in_entry.offset),
+                    tuple(map(int, out_columns)),
+                    tuple(map(int, in_columns)),
+                    int(_su2_kernel._cpp_array_revision(pattern)),
+                )
+            )
+        topology_key = (
+            int(site),
+            int(bond),
+            dimension,
+            tuple(topology_values),
+        )
+        groups = self._metric_component_topology_cache.get(topology_key)
+        if groups is None:
+            parent = np.arange(dimension, dtype=np.int64)
+
+            def find(index):
+                index = int(index)
+                while parent[index] != index:
+                    parent[index] = parent[parent[index]]
+                    index = int(parent[index])
+                return index
+
+            def union(left, right):
+                left_root = find(left)
+                right_root = find(right)
+                if left_root != right_root:
+                    parent[right_root] = left_root
+
+            for out_columns, in_columns, _contribution, pattern in records:
+                for out_position, in_position in np.argwhere(pattern):
+                    union(
+                        int(out_columns[out_position]),
+                        int(in_columns[in_position]),
+                    )
+            grouped = {}
+            for index in range(dimension):
+                grouped.setdefault(find(index), []).append(index)
+            groups = tuple(
+                np.asarray(values, dtype=np.int64)
+                for values in grouped.values()
+            )
+            self._metric_component_topology_cache[topology_key] = groups
+            self._metric_component_cache_misses += 1
+        else:
+            self._metric_component_cache_hits += 1
+
+        labels = np.empty(dimension, dtype=np.int64)
+        positions = np.empty(dimension, dtype=np.int64)
+        blocks = []
+        for label, indices in enumerate(groups):
+            labels[indices] = label
+            positions[indices] = np.arange(indices.size)
+            blocks.append(np.zeros((indices.size, indices.size), dtype=complex))
+        for out_columns, in_columns, contribution, _pattern in records:
+            for label in np.intersect1d(
+                labels[out_columns], labels[in_columns], assume_unique=False
+            ):
+                out_keep = np.flatnonzero(labels[out_columns] == label)
+                in_keep = np.flatnonzero(labels[in_columns] == label)
+                blocks[int(label)][
+                    np.ix_(positions[out_columns[out_keep]], positions[in_columns[in_keep]])
+                ] += contribution[np.ix_(out_keep, in_keep)]
+        components = []
+        for indices, block in zip(groups, blocks):
+            block = 0.5 * (block + block.conj().T)
+            if np.max(np.abs(block), initial=0.0) > 1.0e-15:
+                components.append((indices, block))
+        return _ReducedMetricComponents(dimension, components)
 
     @staticmethod
     def _metric_whitener(metric, *, rtol):
@@ -2184,23 +2456,28 @@ class NonAbelianFrontierLETTA:
             n_columns = self._apply_packed_columns(
                 n_pair, embedding, executor=executor
             )
-            projected_metric_full = embedding.conj().T @ n_columns
+            dense_metric = embedding.conj().T @ n_columns
+            dense_metric = 0.5 * (dense_metric + dense_metric.conj().T)
+            projected_metric_full = _ReducedMetricComponents(
+                current.size,
+                ((np.arange(current.size, dtype=np.int64), dense_metric),),
+            )
             metric_backend = "operator_columns"
         else:
-            projected_metric_full = self._project_metric_blocks(
-                embedding, metric_blocks
+            projected_metric_full = self._project_metric_components(
+                embedding,
+                metric_blocks,
+                site=site,
+                bond=bond,
             )
-            metric_backend = "reduced_blocks"
-        projected_metric_full = 0.5 * (
-            projected_metric_full + projected_metric_full.conj().T
-        )
-        n_diagonal = np.real(np.diag(projected_metric_full))
+            metric_backend = "connected_reduced_blocks"
+        n_diagonal = projected_metric_full.diagonal
         scale = max(float(np.max(np.abs(n_diagonal), initial=0.0)), 1.0)
         support = np.flatnonzero(n_diagonal > float(support_rtol) * scale)
         if support.size == 0:
             raise np.linalg.LinAlgError("local SU2LETTA parameter support is null.")
         design = np.asarray(embedding[:, support])
-        projected_metric = projected_metric_full[np.ix_(support, support)]
+        projected_metric = projected_metric_full.restrict(support)
         parent_h_diagonal = np.asarray(
             getattr(h_pair, "diag", np.zeros(layout.size)), dtype=float
         )
@@ -2602,8 +2879,12 @@ class NonAbelianFrontierLETTA:
         """
         dimension = int(getattr(layout, "size", sum(entry.size for entry in layout)))
         identity = _identity_mpo_factors_for_sites_and_mpo(sites, self.mpo)
-        h_plan = AdjacentPairTransitionPlan.build(sites, self.mpo, bond)
-        n_plan = AdjacentPairTransitionPlan.build(sites, identity, bond)
+        h_plan = n_plan = None
+        if environment_sweeps is None or not isinstance(
+            layout, _ChannelResolvedPairSpace
+        ):
+            h_plan = AdjacentPairTransitionPlan.build(sites, self.mpo, bond)
+            n_plan = AdjacentPairTransitionPlan.build(sites, identity, bond)
         if isinstance(layout, _ChannelResolvedPairSpace):
             def compiled_action(factors, sweep=None):
                 if sweep is None:
@@ -2758,6 +3039,10 @@ class NonAbelianFrontierLETTA:
                 raise RuntimeError(
                     "Compiled identity pair action does not expose reduced metric routes."
                 )
+            n_action.factorized_metric_routes = metric_routes
+            n_action.metric_route_owner = getattr(
+                n_compiled, "su2_moving_environment", None
+            )
             own_by_operator_index = {
                 operator_index: own_entry
                 for _own_index, own_entry, operator_index, _operator_entry
@@ -2799,10 +3084,18 @@ class NonAbelianFrontierLETTA:
             diagnostics = {
                 "backend": "compiled_contextual_channel_resolved",
                 "dimension": dimension,
-                "hamiltonian_direction": h_plan.direction,
-                "metric_direction": n_plan.direction,
-                "hamiltonian_cached_sites": h_plan.cached_sites,
-                "metric_cached_sites": n_plan.cached_sites,
+                "hamiltonian_direction": (
+                    h_plan.direction if h_sweep is None else h_sweep.direction
+                ),
+                "metric_direction": (
+                    n_plan.direction if n_sweep is None else n_sweep.direction
+                ),
+                "hamiltonian_cached_sites": (
+                    h_plan.cached_sites if h_sweep is None else self.nsites - 2
+                ),
+                "metric_cached_sites": (
+                    n_plan.cached_sites if n_sweep is None else self.nsites - 2
+                ),
                 "hamiltonian_transitions": h_action.transition_count,
                 "metric_transitions": n_action.transition_count,
                 "metric_blocks": len(metric_blocks),
@@ -2810,6 +3103,11 @@ class NonAbelianFrontierLETTA:
                 "environment_reused": environment_sweeps is not None,
                 "hamiltonian_backend": h_action.backend,
                 "metric_backend": n_action.backend,
+                "metric_route_owner": (
+                    "compiled_reduced_owner"
+                    if n_action.metric_route_owner is not None
+                    else "python_factorized_routes"
+                ),
             }
             return h_action, n_action, diagnostics
 
@@ -3327,9 +3625,13 @@ class NonAbelianFrontierLETTA:
                 )
         current_reduced = current[support]
         if matrix_free:
-            projected_metric = np.asarray(
-                solver_info.pop("_projected_metric"), dtype=complex
-            )
+            projected_metric = solver_info.pop("_projected_metric")
+            if not isinstance(projected_metric, _ReducedMetricComponents):
+                dense_metric = np.asarray(projected_metric, dtype=complex)
+                projected_metric = _ReducedMetricComponents(
+                    dense_metric.shape[0],
+                    ((np.arange(dense_metric.shape[0]), dense_metric),),
+                )
             projected_design = np.asarray(
                 solver_info.pop("_projected_design"), dtype=complex
             )
@@ -3339,7 +3641,7 @@ class NonAbelianFrontierLETTA:
             parent_h_action = solver_info.pop("_parent_h_action")
             current_h = h_action(current_reduced)
             denominator = np.real(
-                np.vdot(current_reduced, projected_metric @ current_reduced)
+                np.vdot(current_reduced, projected_metric.matvec(current_reduced))
             )
         else:
             denominator = np.real(np.vdot(current_reduced, metric @ current_reduced))
@@ -3354,7 +3656,13 @@ class NonAbelianFrontierLETTA:
             from pyqed.mps.nonabelian import _su2_kernel
 
             metric_revision = int(
-                _su2_kernel._cpp_array_revision(projected_metric)
+                _su2_kernel._cpp_array_revision(
+                    *(
+                        value
+                        for indices, block in projected_metric.components
+                        for value in (indices, block)
+                    )
+                )
             )
             metric_cache_key = (
                 int(site),
@@ -3375,9 +3683,7 @@ class NonAbelianFrontierLETTA:
                 self._metric_whitener_cache_hits += 1
             else:
                 whitener, retained_metric, whitening_backend = (
-                    self._metric_whitener(
-                        projected_metric, rtol=metric_rtol
-                    )
+                    projected_metric.whitener(rtol=metric_rtol)
                 )
                 self._metric_whitener_cache[metric_cache_key] = (
                     metric_revision,
@@ -3387,7 +3693,7 @@ class NonAbelianFrontierLETTA:
                 )
                 self._metric_whitener_cache_misses += 1
             whitened_current = (
-                whitener.conj().T @ projected_metric @ current_reduced
+                whitener.conj().T @ projected_metric.matvec(current_reduced)
             )
             orthonormal_design = np.ascontiguousarray(
                 projected_design @ whitener
@@ -3459,8 +3765,7 @@ class NonAbelianFrontierLETTA:
                 recycled_reduced = cached_krylov[support]
                 recycled_vectors = (
                     whitener.conj().T
-                    @ projected_metric
-                    @ recycled_reduced
+                    @ projected_metric.matvec(recycled_reduced)
                 )
 
             native_result = None
@@ -3524,6 +3829,9 @@ class NonAbelianFrontierLETTA:
             davidson_info["recycled_vectors"] = int(
                 0 if recycled_vectors is None else recycled_vectors.shape[1]
             )
+            davidson_info["transported_ritz_vectors"] = int(
+                0 if recycled_vectors is None else recycled_vectors.shape[1]
+            )
             davidson_info["fused_cpp_action"] = projected_route is not None
             davidson_info["preconditioner_mode"] = (
                 "native_constant_shift"
@@ -3533,7 +3841,7 @@ class NonAbelianFrontierLETTA:
             reduced = whitener @ whitened_reduced
             candidate_h = projected_action(whitened_reduced)
             candidate_norm = float(np.real(np.vdot(
-                reduced, projected_metric @ reduced
+                reduced, projected_metric.matvec(reduced)
             )))
             if candidate_norm <= 0.0 or not np.all(np.isfinite(candidate_h)):
                 local_energy = np.inf
@@ -3551,7 +3859,8 @@ class NonAbelianFrontierLETTA:
             )
             davidson_info["orthonormality_error"] = float(
                 np.linalg.norm(
-                    whitener.conj().T @ projected_metric @ whitener
+                    whitener.conj().T
+                    @ projected_metric.matvec(whitener)
                     - np.eye(whitener.shape[1])
                 )
             )
@@ -3566,7 +3875,7 @@ class NonAbelianFrontierLETTA:
                 davidson_info["davidson_converged"] = True
             solver_info["davidson"] = davidson_info
             overlap = np.vdot(
-                current_reduced, projected_metric @ reduced
+                current_reduced, projected_metric.matvec(reduced)
             )
         else:
             local_energy, reduced = _lowest_generalized_pair(
@@ -3582,7 +3891,26 @@ class NonAbelianFrontierLETTA:
         candidate[support] = reduced
         if abs(overlap) > 0.0:
             candidate *= np.conj(overlap) / abs(overlap)
-        self._set_site_vector(site, candidate)
+        if matrix_free:
+            step = candidate[support] - current_reduced
+            stationary_step = float(
+                np.sqrt(
+                    max(
+                        np.real(np.vdot(step, projected_metric.matvec(step)))
+                        / max(float(denominator), np.finfo(float).tiny),
+                        0.0,
+                    )
+                )
+            )
+        else:
+            stationary_step = float(
+                np.linalg.norm(candidate - current)
+                / max(float(np.linalg.norm(current)), np.finfo(float).tiny)
+            )
+        stationary_tolerance = max(1.0e-12, 0.01 * float(davidson_tol))
+        stationary = stationary_step <= stationary_tolerance
+        if not stationary:
+            self._set_site_vector(site, candidate)
         after = float(local_energy + self.ecore)
         accepted = after <= before + float(accept_tol)
         if matrix_free:
@@ -3590,9 +3918,16 @@ class NonAbelianFrontierLETTA:
                 davidson_info.get("davidson_converged", False)
             )
         if not accepted:
-            self._set_site_vector(site, current)
+            if not stationary:
+                self._set_site_vector(site, current)
             after = before
-        norm_after = float(candidate_norm if accepted and matrix_free else denominator)
+        elif stationary:
+            after = before
+        norm_after = float(
+            candidate_norm
+            if accepted and matrix_free and not stationary
+            else denominator
+        )
         return {
             "site": site,
             "energy_before": float(before),
@@ -3601,6 +3936,8 @@ class NonAbelianFrontierLETTA:
             "support": int(support.size),
             "parameters": int(current.size),
             "accepted": bool(accepted),
+            "stationary": bool(stationary),
+            "stationary_step": stationary_step,
             "norm_before": float(denominator),
             "norm_after": norm_after,
             "native_su2": True,
@@ -3702,9 +4039,9 @@ class NonAbelianFrontierLETTA:
                 su2_moving_environment=None,
                 su2_boundary_environment=cpp_boundary_environment,
             )
-            # The LETTA retraction consumes explicit factorized metric blocks;
-            # keep the norm recursion in Python even when the Hamiltonian uses
-            # the corrected C++ reduced-boundary route batch.
+            # Keep explicit factorized norm boundary components available for
+            # connected whitening.  Their local pair action is still owned by
+            # the compiled reduced engine.
             moving_environment.norm_stack.su2_boundary_environment = None
         previous = float(self.energy)
         if reset_history:
@@ -3799,7 +4136,7 @@ class NonAbelianFrontierLETTA:
                         finally:
                             if h_stack is not None:
                                 h_stack.su2_moving_environment = None
-                        if conditional_gauge:
+                        if conditional_gauge and not update.get("stationary", False):
                             local_gauge_updates = self.canonicalize_conditional_bond(
                                 bond,
                                 direction=direction,
@@ -3823,6 +4160,12 @@ class NonAbelianFrontierLETTA:
                             canonical_center = (
                                 bond + 1 if direction == "lr" else bond
                             )
+                        elif conditional_gauge:
+                            update["conditional_gauge"] = {
+                                "applied": 0,
+                                "skipped": 0,
+                                "stationary": True,
+                            }
                         materialized[bond] = self.materialize_site(bond)
                         materialized[bond + 1] = self.materialize_site(bond + 1)
                         if environment_sweeps is not None:
@@ -3847,6 +4190,9 @@ class NonAbelianFrontierLETTA:
                                 self._su2_moving_environment
                             )
                         try:
+                            self._incremental_materialization_enabled = (
+                                algorithm == "projected"
+                            )
                             update = self.optimize_site(
                                 site,
                                 max_local_parameters=max_local_parameters,
@@ -3866,11 +4212,12 @@ class NonAbelianFrontierLETTA:
                                 **kwargs,
                             )
                         finally:
+                            self._incremental_materialization_enabled = False
                             if h_stack is not None:
                                 h_stack.su2_moving_environment = None
                         update["requested_solver"] = requested_solver
                         update["auto_selected"] = requested_solver == "auto"
-                        if conditional_gauge:
+                        if conditional_gauge and not update.get("stationary", False):
                             local_gauge_updates = self.canonicalize_conditional_bond(
                                 bond,
                                 direction=direction,
@@ -3890,6 +4237,12 @@ class NonAbelianFrontierLETTA:
                             canonical_center = (
                                 bond + 1 if direction == "lr" else bond
                             )
+                        elif conditional_gauge:
+                            update["conditional_gauge"] = {
+                                "applied": 0,
+                                "skipped": 0,
+                                "stationary": True,
+                            }
                         materialized[site] = self.materialize_site(site)
                         if algorithm == "projected":
                             materialized[bond] = self.materialize_site(bond)
@@ -3934,7 +4287,19 @@ class NonAbelianFrontierLETTA:
                 cycle_ok = cycle_ok and max_residual <= float(residual_tol)
             if truncation_tol is not None:
                 cycle_ok = cycle_ok and max_truncation <= float(truncation_tol)
-            streak = streak + 1 if cycle_ok else 0
+            stationary_fixed_point = bool(
+                algorithm == "projected"
+                and updates
+                and all(
+                    update.get("stationary", False)
+                    and update.get("accepted", False)
+                    for update in updates
+                )
+            )
+            if cycle_ok and stationary_fixed_point:
+                streak = max(streak + 1, consecutive_cycles)
+            else:
+                streak = streak + 1 if cycle_ok else 0
             cpp_local_stats = None
             if (
                 moving_environment is not None
@@ -3966,6 +4331,10 @@ class NonAbelianFrontierLETTA:
                 "max_truncation_error": float(max_truncation),
                 "rejected_updates": int(rejected),
                 "accepted_updates": int(len(updates) - rejected),
+                "stationary_updates": int(
+                    sum(bool(update.get("stationary", False)) for update in updates)
+                ),
+                "stationary_fixed_point": stationary_fixed_point,
                 "consecutive_cycles": int(streak),
                 "updates": updates,
                 "complete_cycle": True,
@@ -4011,6 +4380,24 @@ class NonAbelianFrontierLETTA:
                     else moving_environment.stats
                 ),
                 "cpp_local_operator_stats": cpp_local_stats,
+                "constraint_cache_stats": {
+                    "embedding_hits": int(self._embedding_basis_cache_hits),
+                    "metric_component_hits": int(
+                        self._metric_component_cache_hits
+                    ),
+                    "metric_component_misses": int(
+                        self._metric_component_cache_misses
+                    ),
+                    "metric_whitener_hits": int(
+                        self._metric_whitener_cache_hits
+                    ),
+                    "projected_route_hits": int(
+                        self._projected_route_cache_hits
+                    ),
+                    "materialized_site_hits": int(
+                        self._materialized_site_cache_hits
+                    ),
+                },
                 "elapsed_s": float(time.perf_counter() - cycle_started),
             }
             self.history.append(record)

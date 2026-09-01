@@ -546,14 +546,16 @@ def test_wigner_eckart_local_transition_plan_and_grouped_routes_are_exact():
     rng = np.random.default_rng(31)
     vector = rng.normal(size=state._pack_site(0).size)
     current = state._pack_site(0)
+    state._incremental_materialization_enabled = True
     try:
         state._set_site_vector(0, vector)
-        reference = state.materialize_site(0)
-        assert reference is not cached_site
+        assert state.materialize_site(0) is cached_site
+        reference = state.materialize_site(0).copy()
     finally:
         state._set_site_vector(0, current)
+        state._incremental_materialization_enabled = False
     routed = routes.tensor(vector)
-    assert routes.backend == "block-grouped-gemm"
+    assert routes.backend == "nearest-neighbor-block-scatter"
     assert routes.nbytes > 0
     for key in reference.data:
         np.testing.assert_allclose(routed.data[key], reference.data[key], atol=1.0e-13)
@@ -630,7 +632,10 @@ def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():
         matrix_free_update["solver_info"]["davidson"]["orthonormality_error"]
         < 1.0e-11
     )
-    assert matrix_free_update["solver_info"]["route_backend"] == "block-grouped-gemm"
+    assert (
+        matrix_free_update["solver_info"]["route_backend"]
+        == "nearest-neighbor-block-scatter"
+    )
 
 
 def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
@@ -681,7 +686,8 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         for update in cycle["updates"]
     )
     assert all(
-        update["solver_info"]["projected_metric_backend"] == "reduced_blocks"
+        update["solver_info"]["projected_metric_backend"]
+        == "connected_reduced_blocks"
         for update in cycle["updates"]
     )
     fused = [
@@ -695,11 +701,22 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         for update in fused
     ) < 1.0e-12
     assert state._projected_route_cache_hits > 0
+    assert state._metric_component_cache_hits > 0
     assert state._embedding_basis_cache_hits > 0
+    assert all(
+        update["solver_info"]["route_backend"]
+        == "nearest-neighbor-block-scatter"
+        for update in cycle["updates"]
+    )
     assert any(
         update["solver_info"]["davidson"]["recycled_vectors"] > 0
         for update in cycle["updates"]
     )
+    assert any(
+        update["solver_info"]["davidson"]["transported_ritz_vectors"] > 0
+        for update in cycle["updates"]
+    )
+    assert all("stationary" in update for update in cycle["updates"])
     assert all(
         update["solver_info"]["davidson"]["preconditioner_mode"]
         in {
@@ -760,7 +777,10 @@ def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
     np.testing.assert_allclose(
         frontier[-1]["_projected_metric"], explicit_metric, atol=2.0e-12
     )
-    assert frontier[-1]["projected_metric_backend"] == "reduced_blocks"
+    assert (
+        frontier[-1]["projected_metric_backend"]
+        == "connected_reduced_blocks"
+    )
     assert frontier[-1]["local_action_backend"] == "frontier_projected_pair"
     assert frontier[-1]["backend"] == "compiled_contextual_channel_resolved"
     state.close()
