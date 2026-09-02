@@ -10,7 +10,7 @@ from pyqed.qchem.mcscf.cocas import _fresh_casci_like, kernel, kernel_state_aver
 from pyqed.qchem.mcscf.orbopt import embed_rdm2
 from pyqed.qchem.mcscf.casci import (
     _get_mf_cholesky_factors,
-    _resolve_use_cholesky_integrals,
+    _resolve_use_cholesky,
     transform_eri_factors_to_mo_pair,
 )
 
@@ -343,7 +343,7 @@ class DMRGSCF(QCDMRG):
         self.tol = float(macro_tol)
         self.dmrg_conv_tol = float(dmrg_conv_tol)
         self.mo_coeff = None
-        self.use_cholesky_integrals = False
+        self.use_cholesky = False
 
         self.weights = None
         self.nstates = 1
@@ -437,8 +437,8 @@ class DMRGSCF(QCDMRG):
         kwargs["require_convergence"] = False
 
         if orbital_driver in {"nonredundant", "second_order"}:
-            orbital_use_cholesky = _resolve_use_cholesky_integrals(mf)
-            self.use_cholesky_integrals = orbital_use_cholesky
+            orbital_use_cholesky = _resolve_use_cholesky(mf)
+            self.use_cholesky = orbital_use_cholesky
             optimizer = orbital_options["optimizer"].upper()
             if optimizer not in {"DIAG", "LBFGS", "AH"}:
                 optimizer = "LBFGS"
@@ -544,8 +544,8 @@ class DMRGSCF(QCDMRG):
         mc.run(nstates=self.nstates, weights=self.weights, mo_coeff=C0, **kwargs)
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo(C0)
-        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(mf)
-        if self.use_cholesky_integrals:
+        self.use_cholesky = _resolve_use_cholesky(mf)
+        if self.use_cholesky:
             eri = transform_eri_factors_to_mo_pair(
                 _get_mf_cholesky_factors(mf),
                 C0,

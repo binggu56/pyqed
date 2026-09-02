@@ -796,8 +796,8 @@ def test_first_order_casscf_cholesky_matches_pyscf():
     ).run()
 
     assert mc.converged
-    assert mc.use_cholesky_integrals
-    assert mc.casci.use_cholesky_integrals
+    assert mc.use_cholesky
+    assert mc.casci.use_cholesky
 
     pmol = pyscf_gto.M(atom=atom, basis=basis, unit='angstrom', verbose=0)
     pmf = pyscf_scf.RHF(pmol)
@@ -926,7 +926,7 @@ def test_first_order_casscf_factorized_evaluate_avoids_dense_mo_eri(monkeypatch)
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     casscf = FirstOrderCASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
-    casscf.use_cholesky_integrals = casscf._resolve_use_cholesky(True)
+    casscf.use_cholesky = casscf._resolve_use_cholesky(True)
 
     def fail_get_eri_mo(*args, **kwargs):
         raise AssertionError("dense MO ERIs should not be built in factorized CASSCF")
@@ -946,7 +946,7 @@ def test_first_order_casscf_reuses_direct_ci_setup_cache(monkeypatch):
 
     mf = mol.RHF().run(cholesky_jk=True, cholesky_tol=1e-10)
     casscf = FirstOrderCASSCF(mf, ncas=4, nelecas=4, max_cycle=20, ci_method='direct_ci')
-    casscf.use_cholesky_integrals = casscf._resolve_use_cholesky(True)
+    casscf.use_cholesky = casscf._resolve_use_cholesky(True)
 
     mc0 = casscf._make_casci(mf.mo_coeff, 1)
     casscf._effective_rdms_occ(mc0, 0)

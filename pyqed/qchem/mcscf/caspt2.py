@@ -28,7 +28,7 @@ from pyqed.qchem.mcscf.casci import (
     _get_veff_for_dm,
     _get_mf_cholesky_factors,
     _is_uhf_reference,
-    _resolve_use_cholesky_integrals,
+    _resolve_use_cholesky,
     assemble_spatial_eri_from_factors,
     mo_pair_factors,
     transform_spatial_eri_to_mo,
@@ -813,7 +813,7 @@ class CASPT2:
     def _use_cholesky(self):
         if self.use_cholesky is not None:
             return self.use_cholesky
-        return _resolve_use_cholesky_integrals(getattr(self.mc, "mf", None), None)
+        return _resolve_use_cholesky(getattr(self.mc, "mf", None), None)
 
     def _eri_mo(self, mo_coeff):
         return np.asarray(

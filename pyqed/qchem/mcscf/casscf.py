@@ -15,7 +15,7 @@ from scipy.linalg import expm
 
 from .casci import (
     _get_mf_cholesky_factors,
-    _resolve_use_cholesky_integrals,
+    _resolve_use_cholesky,
     transform_eri_factors_to_mo_pair,
 )
 from .direct_ci import (
@@ -188,7 +188,7 @@ class FirstOrderCASSCF:
         self.ah_fd_step = float(ah_fd_step)
         self.ah_hessian = str(ah_hessian).lower().replace("-", "_")
         self.ci_method = ci_method
-        self.use_cholesky = use_cholesky
+        self._use_cholesky_requested = use_cholesky
         if self.ah_hessian not in {"analytic", "finite_difference"}:
             raise ValueError(
                 "Unknown ah_hessian '{}'. Use 'analytic' or 'finite_difference'.".format(
@@ -224,7 +224,7 @@ class FirstOrderCASSCF:
         self.spin_purification = False
         self.ss = None
         self.shift = None
-        self.use_cholesky_integrals = False
+        self.use_cholesky = False
         self._casci_binary_cache = None
         self._casci_direct_connectivity_cache = None
         self._casci_spin_string_connectivity_cache = None
@@ -419,7 +419,7 @@ class FirstOrderCASSCF:
             mo_coeff=mo_coeff,
             method=self.ci_method,
             ci0=ci0,
-            use_cholesky=self.use_cholesky_integrals,
+            use_cholesky=self.use_cholesky,
         )
         self._reorder_tracked_ci_root(mc, requested_nstates, ci0)
         self.ncore = mc.ncore
@@ -439,10 +439,10 @@ class FirstOrderCASSCF:
 
     def _resolve_use_cholesky(self, use_cholesky=None):
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky
+            use_cholesky = self._use_cholesky_requested
         if use_cholesky is None:
             use_cholesky = bool(getattr(self.mf, "cholesky_jk", False))
-        return _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        return _resolve_use_cholesky(self.mf, use_cholesky)
 
     def orbital_rotation_pairs(self, ncore=None, ncas=None, nmo=None):
         if ncore is None:
@@ -581,7 +581,7 @@ class FirstOrderCASSCF:
         self._ah_reference_cache = None
 
     def _set_ah_reference_data(self, mo_coeff, mc, dm1, dm2, h1_mo, eri_mo):
-        if self.ah_hessian != "analytic" or self.use_cholesky_integrals:
+        if self.ah_hessian != "analytic" or self.use_cholesky:
             return
         self._ah_reference_cache = {
             "mo_coeff_ref": mo_coeff,
@@ -593,7 +593,7 @@ class FirstOrderCASSCF:
         }
 
     def _get_ah_reference_data(self, mo_coeff, mc):
-        if self.ah_hessian != "analytic" or self.use_cholesky_integrals:
+        if self.ah_hessian != "analytic" or self.use_cholesky:
             return None
 
         cache = self._ah_reference_cache
@@ -619,7 +619,7 @@ class FirstOrderCASSCF:
 
     def _evaluate(self, mo_coeff, nstates, state_id, ci0=None):
         mc = self._make_casci(mo_coeff, nstates=nstates, ci0=ci0)
-        if self.use_cholesky_integrals:
+        if self.use_cholesky:
             dm1_occ, dm2_occ = self._effective_rdms_occ(mc, state_id)
             h1_mo = self._get_hcore_mo(mo_coeff)
             occ_mo = mo_coeff[:, :mc.ncore + mc.ncas]
@@ -767,7 +767,7 @@ class FirstOrderCASSCF:
 
     def _orbital_hessian_action(self, mo_coeff, mc, grad_vec, direction_vec):
         """Approximate the packed orbital Hessian action with a finite-difference gradient."""
-        if self.ah_hessian == "analytic" and not self.use_cholesky_integrals:
+        if self.ah_hessian == "analytic" and not self.use_cholesky:
             reference = self._get_ah_reference_data(mo_coeff, mc)
             direction_kappa = unpack_nonredundant(
                 direction_vec,
@@ -951,7 +951,7 @@ class FirstOrderCASSCF:
         self._casci_sc1_cache = None
         self._casci_sc2_cache = None
         self._ah_trust_radius = self.max_step
-        self.use_cholesky_integrals = self._resolve_use_cholesky(use_cholesky)
+        self.use_cholesky = self._resolve_use_cholesky(use_cholesky)
         self.orbital_diis = (
             OrbitalDIIS(max_space=self.diis_space, start=self.diis_start)
             if self.diis else None
@@ -4845,7 +4845,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             zero_step_recovery_max=self.zero_step_recovery_max,
             micro_ci_mode=self.micro_ci_mode,
             ci_method=self.ci_method,
-            use_cholesky=self.use_cholesky,
+            use_cholesky=self._use_cholesky_requested,
             coupling=self.coupling,
             coupled_fd_step=self.coupled_fd_step,
             coupled_ci_roots=self.coupled_ci_roots,
@@ -4959,8 +4959,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 "micro_ci_mode='keyframe' currently supports coupling='qn' "
                 "or 'uncoupled'."
             )
-        self.use_cholesky_integrals = self._resolve_use_cholesky(use_cholesky)
-        if self.use_cholesky_integrals:
+        self.use_cholesky = self._resolve_use_cholesky(use_cholesky)
+        if self.use_cholesky:
             if self.coupling == "partial":
                 raise NotImplementedError(
                     "Factorized SecondOrderCASSCF currently supports the "
@@ -5029,7 +5029,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self._joint_trial_sigma_cache = {}
             self.mo_coeff_ref = mo_coeff
             h1_ref = self.mf.get_hcore_mo(mo_coeff)
-            if self.use_cholesky_integrals:
+            if self.use_cholesky:
                 pair_ref = transform_eri_factors_to_mo_pair(
                     _get_mf_cholesky_factors(self.mf),
                     mo_coeff,
@@ -5059,7 +5059,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             ci_keyframe_mc = None
 
             for micro in range(1, self.max_micro_cycle + 1):
-                if self.use_cholesky_integrals:
+                if self.use_cholesky:
                     h1_cur, pair_cur = self._transform_frozen_factor_integrals(
                         h1_ref,
                         pair_ref,
@@ -5073,7 +5073,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 if self.coupling == "partial":
                     solve_nstates += max(0, self.coupled_ci_roots)
                 ci_relaxed = self.micro_ci_mode == "full" or micro == 1
-                if self.use_cholesky_integrals:
+                if self.use_cholesky:
                     if ci_relaxed:
                         mc = self._make_factor_integral_casci(
                             h1_cur,
@@ -5108,7 +5108,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 if ci_relaxed:
                     ci_keyframe_mc = mc
                 energy = self._objective_energy(mc, self.state_id)
-                if self.use_cholesky_integrals:
+                if self.use_cholesky:
                     dm1_occ, dm2_occ = self._effective_rdms_occ(mc, self.state_id)
                     nocc_like = mc.ncore + mc.ncas
                     fock = generalized_fock_from_factors(
@@ -5131,7 +5131,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 if (
                     self.nstates == 1
                     and self.exact_state_specific_gradient
-                    and not self.use_cholesky_integrals
+                    and not self.use_cholesky
                 ):
                     grad_vec = self._exact_orbital_gradient_vector(
                         mc,
@@ -5150,7 +5150,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 use_parameterized_hessian = self.ah_hessian == "finite_difference"
                 if use_parameterized_hessian:
                     orbital_hessian_model = "parameterized_finite_difference"
-                elif self.use_cholesky_integrals:
+                elif self.use_cholesky:
                     orbital_hessian_model = "factorized_analytic_integral_response"
                 elif self.orbital_parameterization == "wmk":
                     orbital_hessian_model = "analytic_wmk_second_order"
@@ -5160,7 +5160,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 factor_hessian_cache = {}
 
                 def base_hessian_action(vec):
-                    if self.use_cholesky_integrals and not use_parameterized_hessian:
+                    if self.use_cholesky and not use_parameterized_hessian:
                         return self._pack_orbitals(
                             self._orbital_hessian_action_from_factors(
                                 h1_cur,
@@ -5174,7 +5174,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             mc.ncas,
                             self.nmo,
                         )
-                    if self.use_cholesky_integrals:
+                    if self.use_cholesky:
                         return self._factor_parameterized_orbital_hessian_action(
                             h1_cur,
                             pair_cur,
@@ -5204,7 +5204,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     )
 
                 base_hessian_action_block = None
-                if self.use_cholesky_integrals and not use_parameterized_hessian:
+                if self.use_cholesky and not use_parameterized_hessian:
                     def base_hessian_action_block(vectors):
                         vectors = np.asarray(vectors, dtype=float)
                         kappas = np.stack(
@@ -5240,7 +5240,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                 if self.coupling == "qn" and qn_base_hessian_action is None:
                     h1_qn = np.array(h1_cur, copy=True)
-                    if self.use_cholesky_integrals:
+                    if self.use_cholesky:
                         pair_qn = np.array(pair_cur, copy=True)
                         eri_qn = None
                     else:
@@ -5255,14 +5255,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                     ci_qn = None
                     if not (
-                        self.use_cholesky_integrals
+                        self.use_cholesky
                         and not use_parameterized_hessian
                     ):
                         ci_qn = np.array(mc.ci[self.state_id], copy=True)
                     grad_qn = np.array(grad_vec, copy=True)
 
                     def qn_base_hessian_action(vec):
-                        if self.use_cholesky_integrals and not use_parameterized_hessian:
+                        if self.use_cholesky and not use_parameterized_hessian:
                             return self._pack_orbitals(
                                 self._orbital_hessian_action_from_factors(
                                     h1_qn,
@@ -5276,7 +5276,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 mc.ncas,
                                 self.nmo,
                             )
-                        if self.use_cholesky_integrals:
+                        if self.use_cholesky:
                             return self._factor_parameterized_orbital_hessian_action(
                                 h1_qn,
                                 pair_qn,
@@ -5305,7 +5305,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             vec,
                         )
 
-                    if self.use_cholesky_integrals and not use_parameterized_hessian:
+                    if self.use_cholesky and not use_parameterized_hessian:
                         def qn_base_hessian_action_block(vectors):
                             vectors = np.asarray(vectors, dtype=float)
                             kappas = np.stack(
@@ -5353,7 +5353,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         )
                     )
                 elif self.coupling == "relaxed_fd":
-                    if self.use_cholesky_integrals:
+                    if self.use_cholesky:
                         hessian_action = lambda vec: self._factor_relaxed_ci_hessian_action(
                             h1_ref,
                             pair_ref,
@@ -5528,7 +5528,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         step_vec,
                         step_limit,
                         return_info=True,
-                        pair_factors=pair_cur if self.use_cholesky_integrals else None,
+                        pair_factors=pair_cur if self.use_cholesky else None,
                     )
                 else:
                     ah_guess = self._orbital_pspace_guess(
@@ -5632,7 +5632,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 np.dot(grad_vec, candidate_step)
                                 + 0.5 * np.dot(candidate_step, step_hv)
                             )
-                        if self.use_cholesky_integrals:
+                        if self.use_cholesky:
                             trial_accepted, joint = self._factor_joint_trust_region_micro_search(
                                 h1_ref,
                                 pair_ref,
@@ -5704,7 +5704,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         model_linear = float(np.dot(grad_vec, candidate_step))
                         model_quadratic = float(np.dot(candidate_step, step_hv))
                         predicted = -(model_linear + 0.5 * model_quadratic)
-                        if self.use_cholesky_integrals:
+                        if self.use_cholesky:
                             trial_accepted, trial_U, _, trial_mc, trial_scale = (
                                 self._factor_micro_line_search(
                                     h1_ref,
@@ -5743,7 +5743,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             # after the roots relax. Retry exactly only in this
                             # narrow tail instead of diagonalizing every trial.
                             exact_tail_retry = True
-                            if self.use_cholesky_integrals:
+                            if self.use_cholesky:
                                 trial_accepted, trial_U, _, trial_mc, trial_scale = (
                                     self._factor_micro_line_search(
                                         h1_ref,

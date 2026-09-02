@@ -172,7 +172,7 @@ def main():
         "rdm1_trace": np.trace(rdm1),
         "rdm2_trace": np.einsum("pprr->", rdm2),
         "spatial_rdm_diagnostics": calculation.casci.spatial_rdm_diagnostics,
-        "factorized_orbital_integrals": calculation.use_cholesky_integrals,
+        "factorized_orbital_integrals": calculation.use_cholesky,
         "su2_runtime_reused": active_info.get("su2_runtime_reused"),
         "final_su2_runtime_rebuilt": active_info.get(
             "final_su2_runtime_rebuilt"

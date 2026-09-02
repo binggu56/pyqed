@@ -624,7 +624,7 @@ class RASSCF(FirstOrderCASSCF):
             mo_coeff=mo_coeff,
             method=self.ci_method,
             ci0=ci0,
-            use_cholesky=self.use_cholesky_integrals,
+            use_cholesky=self.use_cholesky,
         )
         self._reorder_tracked_ci_root(mc, requested_nstates, ci0)
         self.ncore = mc.ncore
@@ -703,7 +703,7 @@ class RASSCF(FirstOrderCASSCF):
         return False, (mo_coeff, energy, 0.0, None, np.asarray(step_vec, dtype=float))
 
     def _orbital_hessian_action(self, mo_coeff, mc, grad_vec, direction_vec):
-        if self.ah_hessian == "analytic" and not self.use_cholesky_integrals:
+        if self.ah_hessian == "analytic" and not self.use_cholesky:
             reference = self._get_ah_reference_data(mo_coeff, mc)
             direction_kappa = self._unpack_orbitals(
                 direction_vec,
@@ -795,7 +795,7 @@ class RASSCF(FirstOrderCASSCF):
         self._casci_sc1_cache = None
         self._casci_sc2_cache = None
         self._ah_trust_radius = self.max_step
-        self.use_cholesky_integrals = self._resolve_use_cholesky(use_cholesky)
+        self.use_cholesky = self._resolve_use_cholesky(use_cholesky)
         self.orbital_diis = (
             OrbitalDIIS(max_space=self.diis_space, start=self.diis_start)
             if self.diis else None

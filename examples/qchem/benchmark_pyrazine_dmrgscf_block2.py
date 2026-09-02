@@ -131,7 +131,7 @@ def run_pyqed(args):
         "rdm2_trace": float(np.einsum("pprr->", rdm2)),
         "rdm_diagnostics": calculation.casci.spatial_rdm_diagnostics,
         "factorized_orbital_integrals": bool(
-            calculation.use_cholesky_integrals
+            calculation.use_cholesky
         ),
         "mo_checkpoint": str(checkpoint),
         "final_su2_runtime_rebuilt": active.get(

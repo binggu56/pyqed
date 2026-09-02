@@ -1661,7 +1661,7 @@ def test_casci_auto_uses_cholesky_from_rhf_label():
     mc_auto = CASCI(mf, ncas=4, nelecas=4).run(nstates=2)
     mc_cd = CASCI(mf, ncas=4, nelecas=4).run(nstates=2, use_cholesky=True)
 
-    assert mc_auto.use_cholesky_integrals
+    assert mc_auto.use_cholesky
     np.testing.assert_allclose(mc_auto.e_tot, mc_cd.e_tot, atol=1e-8)
 
 
@@ -1771,7 +1771,7 @@ def test_direct_ci_auto_uses_cholesky_from_rhf_label():
     mc_cd.direct_ci_dense_fallback_ndets = 1
     mc_cd.run(nstates=2, method='direct_ci', use_cholesky=True)
 
-    assert mc_auto.use_cholesky_integrals
+    assert mc_auto.use_cholesky
     np.testing.assert_allclose(mc_auto.e_tot, mc_cd.e_tot, atol=1e-8)
 
 

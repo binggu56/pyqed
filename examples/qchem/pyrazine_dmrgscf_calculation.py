@@ -233,7 +233,7 @@ def main():
         "spin_square": getattr(mc.casci, "s2", None),
         "energy_history_hartree": mc.e_history,
         "macro_diagnostics": mc.macro_diagnostics,
-        "factorized_orbital_integrals": mc.use_cholesky_integrals,
+        "factorized_orbital_integrals": mc.use_cholesky,
         "spatial_rdm2_algorithm": getattr(mc.casci, "spatial_rdm2_algorithm", None),
         "resolved_spatial_rdm2_algorithm": mc.casci._resolve_spatial_rdm2_algorithm(),
         "spatial_rdm_diagnostics": getattr(mc.casci, "spatial_rdm_diagnostics", None),

@@ -215,7 +215,7 @@ class MCSCFZVector:
         response can be added behind the same API later.
         """
 
-        if getattr(driver, "use_cholesky_integrals", False):
+        if getattr(driver, "use_cholesky", False):
             raise NotImplementedError("MCSCFZVector currently expects dense MO integrals.")
         if mo_coeff is None:
             mo_coeff = getattr(driver.mf, "mo_coeff", None)

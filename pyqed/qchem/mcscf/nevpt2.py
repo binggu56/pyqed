@@ -21,7 +21,7 @@ from pyqed.qchem.mcscf.casci import (
     _determinant_bits_from_binary,
     _get_veff_for_dm,
     _is_uhf_reference,
-    _resolve_use_cholesky_integrals,
+    _resolve_use_cholesky,
     transform_spatial_eri_to_mo,
 )
 
@@ -258,7 +258,7 @@ class NEVPT2:
     def _use_cholesky(self):
         if self.use_cholesky is not None:
             return self.use_cholesky
-        return _resolve_use_cholesky_integrals(getattr(self.mc, "mf", None), None)
+        return _resolve_use_cholesky(getattr(self.mc, "mf", None), None)
 
     def _eri_mo(self, mo_left, mo_right, mo_left_2, mo_right_2):
         return transform_spatial_eri_to_mo(

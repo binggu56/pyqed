@@ -13,7 +13,7 @@ from opt_einsum import contract
 from pyqed.qchem.mcscf.direct_ci import CASCI
 from pyqed.qchem.mcscf.casci import (
     _get_mf_cholesky_factors,
-    _resolve_use_cholesky_integrals,
+    _resolve_use_cholesky,
     transform_eri_factors_to_mo_pair,
 )
 # from pyqed.qchem.mcscf.casci import CASCI
@@ -316,7 +316,7 @@ def _fresh_casci_like(source, *, solver_cls=None):
         value = getattr(source, name, None)
         if value is not None:
             setattr(mc, name, value)
-    mc.use_cholesky_integrals = getattr(source, 'use_cholesky_integrals', False)
+    mc.use_cholesky = getattr(source, 'use_cholesky', False)
     mc._su2_runtime = getattr(
         source,
         "_su2_runtime",
@@ -671,8 +671,8 @@ class COCAS(CASCI):
         self.diis_space = diis_space
         self.diis_start = diis_start
         self.ci_method = ci_method
-        self.use_cholesky = use_cholesky
-        self.use_cholesky_integrals = False
+        self._use_cholesky_requested = use_cholesky
+        self.use_cholesky = False
         # Keep a consistent CI backend across macroiterations; switching
         # between dense and direct solvers changes the effective orbital
         # objective enough to confuse convergence comparisons.
@@ -709,10 +709,10 @@ class COCAS(CASCI):
         ncore = self.ncore
 
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky
+            use_cholesky = self._use_cholesky_requested
         if use_cholesky is None:
             use_cholesky = bool(getattr(mf, "cholesky_jk", False))
-        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(mf, use_cholesky)
+        self.use_cholesky = _resolve_use_cholesky(mf, use_cholesky)
 
         mc = _fresh_casci_like(self)
         # spin
@@ -720,13 +720,13 @@ class COCAS(CASCI):
             mc,
             nstates,
             method=self.ci_method,
-            use_cholesky=self.use_cholesky_integrals,
+            use_cholesky=self.use_cholesky,
         )
 
 
         # matrix elements in CMOs
         h1e = mf.get_hcore_mo()
-        if self.use_cholesky_integrals:
+        if self.use_cholesky:
             eri = transform_eri_factors_to_mo_pair(_get_mf_cholesky_factors(mf), C0)
         else:
             eri = mf.get_eri_mo()
@@ -759,7 +759,7 @@ class COCAS(CASCI):
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
                 ci_method=self.ci_method,
-                use_cholesky=self.use_cholesky_integrals,
+                use_cholesky=self.use_cholesky,
             )
 
         elif nstates > 1:
@@ -791,7 +791,7 @@ class COCAS(CASCI):
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
                 ci_method=self.ci_method,
-                use_cholesky=self.use_cholesky_integrals,
+                use_cholesky=self.use_cholesky,
             )
 
         self.mo_coeff = C

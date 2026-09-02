@@ -101,7 +101,7 @@ def test_su2_dmrgscf_keeps_factorized_orbital_integrals(monkeypatch):
         mixer_zero_block_noise_scale=0.0,
     )
 
-    assert mc.use_cholesky_integrals is True
+    assert mc.use_cholesky is True
     assert mc.integral_backend_override is None
     assert mc.integral_mode == "cholesky"
     assert mc.casci.integral_mode == "cholesky"

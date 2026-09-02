@@ -378,7 +378,7 @@ def _get_mf_cholesky_factors(mf):
     return eri_factors
 
 
-def _resolve_use_cholesky_integrals(mf, use_cholesky=None):
+def _resolve_use_cholesky(mf, use_cholesky=None):
     """
     Enable the factor/Cholesky CASCI path automatically for factor-only RHF.
     """
@@ -890,7 +890,7 @@ class CASCI:
         self.binary = None
         self.SC1 = None # SlaterCondon rule 1
         self.eri_so = self.h2e_cas = None # spin-orbital ERI in the active space
-        self.use_cholesky_integrals = False
+        self.use_cholesky = False
         self._property_operator_cache = {}
         self.active_symmetry = None
         self.active_orb_irrep_labels = None
@@ -1279,8 +1279,8 @@ class CASCI:
 
         mf = self.mf
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky_integrals
-        use_cholesky = _resolve_use_cholesky_integrals(mf, use_cholesky)
+            use_cholesky = self.use_cholesky
+        use_cholesky = _resolve_use_cholesky(mf, use_cholesky)
 
         # molecular orbitals
         Ca, Cb = _as_spin_tuple(self.mo_cas)
@@ -1621,7 +1621,7 @@ class CASCI:
                 method = "ci"
 
         self.nstates = nstates
-        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+        self.use_cholesky = _resolve_use_cholesky(self.mf, use_cholesky)
         method_key = str(method).lower().replace("-", "_")
         direct_spin0_methods = {"direct_spin0", "direct_spin0_symm", "spin0", "spin0_symm"}
 
@@ -1657,7 +1657,7 @@ class CASCI:
         )
 
         if solvent_response_model is None and (method_key == 'direct_ci' or method_key in direct_spin0_methods or (
-            method_key == 'ci' and self.use_cholesky_integrals and not self.spin_purification
+            method_key == 'ci' and self.use_cholesky and not self.spin_purification
         )):
             from pyqed.qchem.mcscf.direct_ci import CASCI as DirectCASCI
 
@@ -3890,7 +3890,7 @@ class CASCIScanner:
         scanner_mc.spin_purification = self.template.spin_purification
         scanner_mc.ss = self.template.ss
         scanner_mc.shift = self.template.shift
-        scanner_mc.use_cholesky_integrals = self.template.use_cholesky_integrals
+        scanner_mc.use_cholesky = self.template.use_cholesky
         scanner_mc.spin_string_connectivity = self.template.spin_string_connectivity
         for name in _DIRECT_SOLVER_SETTING_NAMES:
             if hasattr(self.template, name):

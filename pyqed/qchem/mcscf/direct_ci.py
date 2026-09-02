@@ -56,7 +56,7 @@ from pyqed.qchem.mcscf.casci import (
     transform_spatial_eri_to_mo,
     mo_pair_factors,
     _get_mf_cholesky_factors,
-    _resolve_use_cholesky_integrals,
+    _resolve_use_cholesky,
 )
 from pyqed.qchem import mcscf
 
@@ -3385,8 +3385,8 @@ class CASCI(mcscf.casci.CASCI):
 
         mf = self.mf
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky_integrals
-        use_cholesky = _resolve_use_cholesky_integrals(mf, use_cholesky)
+            use_cholesky = self.use_cholesky
+        use_cholesky = _resolve_use_cholesky(mf, use_cholesky)
 
         # molecular orbitals
         Ca, Cb = _as_spin_tuple(self.mo_cas)
@@ -3496,8 +3496,8 @@ class CASCI(mcscf.casci.CASCI):
         avoids paying the AO->MO contraction cost every time.
         """
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky_integrals
-        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+            use_cholesky = self.use_cholesky
+        use_cholesky = _resolve_use_cholesky(self.mf, use_cholesky)
         if (
             self._direct_spatial_h1 is not None
             and self._direct_spatial_eri is not None
@@ -3542,8 +3542,8 @@ class CASCI(mcscf.casci.CASCI):
         Return cached active-space MO-pair factors for the direct-CI backend.
         """
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky_integrals
-        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+            use_cholesky = self.use_cholesky
+        use_cholesky = _resolve_use_cholesky(self.mf, use_cholesky)
         if not use_cholesky:
             return None, None, self.e_core
 
@@ -3595,8 +3595,8 @@ class CASCI(mcscf.casci.CASCI):
         Caching them keeps the direct-CI setup light across repeated runs.
         """
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky_integrals
-        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+            use_cholesky = self.use_cholesky
+        use_cholesky = _resolve_use_cholesky(self.mf, use_cholesky)
         h1, eri_spatial, energy_core = self.get_direct_spatial_integrals(use_cholesky=use_cholesky)
         if (
             self._direct_same_spin_eri is None
@@ -3612,8 +3612,8 @@ class CASCI(mcscf.casci.CASCI):
         Precompute direct-CI Hamiltonian connection values from MO-pair factors.
         """
         if use_cholesky is None:
-            use_cholesky = self.use_cholesky_integrals
-        use_cholesky = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
+            use_cholesky = self.use_cholesky
+        use_cholesky = _resolve_use_cholesky(self.mf, use_cholesky)
         if not use_cholesky:
             return None
 
@@ -4774,8 +4774,8 @@ class CASCI(mcscf.casci.CASCI):
         self.direct_ci_fallback_reason = None
         self.converged = False
         requested_nstates = nstates
-        self.use_cholesky_integrals = _resolve_use_cholesky_integrals(self.mf, use_cholesky)
-        use_cholesky = self.use_cholesky_integrals
+        self.use_cholesky = _resolve_use_cholesky(self.mf, use_cholesky)
+        use_cholesky = self.use_cholesky
         method_key = str(method).lower().replace("-", "_")
         direct_spin0_methods = {"direct_spin0", "direct_spin0_symm", "spin0", "spin0_symm"}
 

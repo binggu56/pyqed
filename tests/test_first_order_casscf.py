@@ -901,9 +901,9 @@ def test_second_order_casscf_factorized_qn_matches_dense_on_lih():
     dense = SecondOrderCASSCF(mf_dense, **common).run(use_cholesky=False)
     factor = SecondOrderCASSCF(mf_factor, **common).run(use_cholesky=True)
 
-    assert not dense.use_cholesky_integrals
-    assert factor.use_cholesky_integrals
-    assert factor.casci.use_cholesky_integrals
+    assert not dense.use_cholesky
+    assert factor.use_cholesky
+    assert factor.casci.use_cholesky
     assert factor.casci.solver_backend in {"ci_dense_fallback", "direct_ci_spin_string"}
     assert factor.casci.direct_connectivity is None
     np.testing.assert_allclose(factor.e_tot[0], dense.e_tot[0], atol=1.0e-6)
@@ -934,8 +934,8 @@ def test_second_order_casscf_factorized_qn_avoids_dense_mo_eri(monkeypatch):
     ).run()
 
     assert np.isfinite(factor.e_tot[0])
-    assert factor.use_cholesky_integrals
-    assert factor.casci.use_cholesky_integrals
+    assert factor.use_cholesky
+    assert factor.casci.use_cholesky
     assert factor.micro_history[0]["orbital_hessian_model"] == "factorized_analytic_integral_response"
 
 
@@ -963,7 +963,7 @@ def test_second_order_casscf_factorized_full_matches_dense_on_lih():
     dense = SecondOrderCASSCF(mf_dense, **common).run(use_cholesky=False)
     factor = SecondOrderCASSCF(mf_factor, **common).run()
 
-    assert factor.use_cholesky_integrals
+    assert factor.use_cholesky
     assert factor.coupling == "full"
     assert factor.casci.solver_backend in {"ci_dense_fallback", "direct_ci_spin_string"}
     assert factor.casci.direct_connectivity is None
@@ -995,8 +995,8 @@ def test_second_order_casscf_factorized_default_avoids_dense_mo_eri(monkeypatch)
 
     assert factor.coupling == "qn"
     assert np.isfinite(factor.e_tot[0])
-    assert factor.use_cholesky_integrals
-    assert factor.casci.use_cholesky_integrals
+    assert factor.use_cholesky
+    assert factor.casci.use_cholesky
 
 
 def test_second_order_casscf_factorized_state_average_matches_dense_on_h4():
@@ -1030,7 +1030,7 @@ def test_second_order_casscf_factorized_state_average_matches_dense_on_h4():
         .run(nstates=2)
     )
 
-    assert factor.use_cholesky_integrals
+    assert factor.use_cholesky
     assert factor.coupling == "qn"
     assert factor.casci.solver_backend in {"ci_dense_fallback", "direct_ci_spin_string"}
     assert factor.casci.direct_connectivity is None
@@ -1290,7 +1290,7 @@ def test_second_order_factorized_fock_gradient_matches_exact_gradient():
     driver = SecondOrderCASSCF(mf, ncas=2, nelecas=2, coupling="qn")
     driver.nstates = 1
     driver.state_id = 0
-    driver.use_cholesky_integrals = True
+    driver.use_cholesky = True
 
     mo_coeff = mf.mo_coeff
     h1_mo = mf.get_hcore_mo(mo_coeff)
@@ -1335,7 +1335,7 @@ def test_second_order_factorized_state_average_gradient_matches_finite_differenc
     driver.state_average([0.5, 0.5])
     driver.nstates = 2
     driver.state_id = 0
-    driver.use_cholesky_integrals = True
+    driver.use_cholesky = True
     driver.mo_coeff_ref = mo_guess
 
     h1_mo = mf.get_hcore_mo(mo_guess)
