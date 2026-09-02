@@ -1584,22 +1584,60 @@ def test_cholesky_active_space_eri_transform_matches_dense():
     np.testing.assert_allclose(eri_cd, eri_dense, atol=1e-8)
 
 
-def test_builtin_s8_dense_eri_transform_unpacks_compressed_cache():
+def test_builtin_s8_dense_eri_transform_avoids_full_ao_unpack(monkeypatch):
+    from pyqed.qchem import basis as basis_module
+
     mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='sto-3g')
     mol.build(aosym='s8', eri='dense')
 
     mf = mol.RHF().run()
     mo_cas = mf.mo_coeff[:, :2]
+    eri_ao = basis_module.unpack_eri_s8(mf.eri_s8, mf.mol.nao)
+    reference = np.einsum(
+        'ijkl,ip,jq,kr,ls->pqrs',
+        eri_ao,
+        mo_cas.conj(),
+        mo_cas,
+        mo_cas.conj(),
+        mo_cas,
+        optimize=True,
+    )
+
+    def fail_unpack(*args, **kwargs):
+        raise AssertionError("packed CASCI should not unpack the full AO ERI tensor")
+
+    monkeypatch.setattr(basis_module, 'unpack_eri_s8', fail_unpack)
 
     assert mf.eri is None
     assert mf.eri_s8 is not None
     eri_active = transform_spatial_eri_to_mo(mf, mo_cas, use_cholesky=False)
 
-    np.testing.assert_allclose(
-        eri_active,
-        mf.get_eri_mo()[0:2, 0:2, 0:2, 0:2],
-        atol=1e-12,
+    np.testing.assert_allclose(eri_active, reference, atol=1e-12)
+
+
+def test_builtin_s8_transform_supports_distinct_mo_spaces():
+    from pyqed.qchem.basis import unpack_eri_s8
+
+    mol = Molecule(atom='H 0 0 0; H 0 0 1.4', unit='bohr', basis='6-31g')
+    mol.build(aosym='s8', eri='dense')
+    mf = mol.RHF().run()
+    rng = np.random.default_rng(9281)
+    coefficient_shapes = (2, 3, 2, 1)
+    coefficients = tuple(rng.normal(size=(mol.nao, nmo)) for nmo in coefficient_shapes)
+    eri_ao = unpack_eri_s8(mf.eri_s8, mol.nao)
+    reference = np.einsum(
+        'ijkl,ip,jq,kr,ls->pqrs',
+        eri_ao,
+        coefficients[0].conj(),
+        coefficients[1],
+        coefficients[2].conj(),
+        coefficients[3],
+        optimize=True,
     )
+
+    transformed = transform_spatial_eri_to_mo(mf, *coefficients, use_cholesky=False)
+
+    np.testing.assert_allclose(transformed, reference, atol=1e-11)
 
 
 def test_casci_use_cholesky_matches_dense_energy():

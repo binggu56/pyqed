@@ -4937,50 +4937,72 @@ def contract_veff_s8(eri_s8, dm, nao, workers=1):
     return None
 
 
-def ao2mo_s8(eri_s8, mo_coeff):
+def ao2mo_s8(eri_s8, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None):
     """
     Transform eight-fold packed AO ERIs to a dense chemist-notation MO tensor.
 
     The packed tensor is first promoted to the AO-pair matrix and transformed as
-    ``P.T @ G @ P``.  This uses NumPy's BLAS-backed matrix products and is much
-    faster than the legacy scalar-loop C++ kernel for repeated CASSCF/NARGSCF
-    AO->MO transformations.
+    ``P_left.T @ G @ P_right``.  This uses NumPy's BLAS-backed matrix products
+    and avoids expanding the packed ERIs to an ``nao**4`` tensor.
     """
     eri_s8 = np.asarray(eri_s8)
-    mo_coeff = np.asarray(mo_coeff)
-    if mo_coeff.ndim != 2:
-        raise ValueError("mo_coeff must be a 2D array.")
-    nao, nmo = mo_coeff.shape
+    mo_left = np.asarray(mo_left)
+    if mo_right is None:
+        mo_right = mo_left
+    if mo_left_2 is None:
+        mo_left_2 = mo_left
+    if mo_right_2 is None:
+        mo_right_2 = mo_right
+    mo_right = np.asarray(mo_right)
+    mo_left_2 = np.asarray(mo_left_2)
+    mo_right_2 = np.asarray(mo_right_2)
+    coefficients = (mo_left, mo_right, mo_left_2, mo_right_2)
+    if any(coeff.ndim != 2 for coeff in coefficients):
+        raise ValueError("MO coefficients must be 2D arrays.")
+    nao = mo_left.shape[0]
+    if any(coeff.shape[0] != nao for coeff in coefficients):
+        raise ValueError("MO coefficients must share the same AO dimension.")
     npair = int(nao) * (int(nao) + 1) // 2
     if eri_s8.shape != ((npair * (npair + 1)) // 2,):
-        raise ValueError("eri_s8 shape is inconsistent with mo_coeff.")
+        raise ValueError("eri_s8 shape is inconsistent with the MO coefficients.")
+    same_coefficients = all(np.array_equal(coeff, mo_left) for coeff in coefficients[1:])
     if (
         _env_flag("PYQED_QCHEM_CPP_AO2MO_SCALAR", default=False)
         and _integrals_cpp is not None
         and hasattr(_integrals_cpp, "ao2mo_s8")
         and not np.iscomplexobj(eri_s8)
-        and not np.iscomplexobj(mo_coeff)
+        and not np.iscomplexobj(mo_left)
+        and same_coefficients
     ):
         try:
             eri_mo = _integrals_cpp.ao2mo_s8(
                 np.ascontiguousarray(eri_s8, dtype=np.float64),
-                np.ascontiguousarray(mo_coeff, dtype=np.float64),
+                np.ascontiguousarray(mo_left, dtype=np.float64),
             )
             return np.asarray(eri_mo, dtype=np.float64)
         except Exception:
             pass
 
     rows, cols = _ao_pair_indices(nao)
-    left = mo_coeff.conj()
-    pair_mo = left[rows, :, None] * mo_coeff[cols, None, :]
-    offdiag = rows != cols
-    if np.any(offdiag):
-        pair_mo[offdiag] += left[cols[offdiag], :, None] * mo_coeff[rows[offdiag], None, :]
-    pair_mo = np.ascontiguousarray(pair_mo.reshape(npair, nmo * nmo))
+
+    def pair_transform(left, right):
+        left = left.conj()
+        transformed = left[rows, :, None] * right[cols, None, :]
+        offdiag = rows != cols
+        transformed[offdiag] += left[cols[offdiag], :, None] * right[rows[offdiag], None, :]
+        return np.ascontiguousarray(transformed.reshape(npair, left.shape[1] * right.shape[1]))
+
+    pair_mo_left = pair_transform(mo_left, mo_right)
+    pair_mo_right = pair_transform(mo_left_2, mo_right_2)
     pair_ids = np.arange(npair, dtype=np.int64)
     eri_s4 = np.asarray(eri_s8)[_packed_pair_pair_indices(pair_ids[:, None], pair_ids[None, :])]
-    eri_mo = pair_mo.T @ (eri_s4 @ pair_mo)
-    return eri_mo.reshape(nmo, nmo, nmo, nmo)
+    eri_mo = pair_mo_left.T @ (eri_s4 @ pair_mo_right)
+    return eri_mo.reshape(
+        mo_left.shape[1],
+        mo_right.shape[1],
+        mo_left_2.shape[1],
+        mo_right_2.shape[1],
+    )
 
 
 def contract_jk_ri(eri_factors, dm, nao):

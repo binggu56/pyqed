@@ -460,21 +460,29 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
         return assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs)
 
     eri_source = getattr(mf, 'eri', None)
+    mol = getattr(mf, 'mol', None)
+    eri_s8_source = None
+    if eri_source is None and getattr(mf, 'eri_s4', None) is None:
+        eri_s8_source = getattr(mf, 'eri_s8', None)
+        if eri_s8_source is None and mol is not None and getattr(mol, 'eri_s4', None) is None:
+            eri_s8_source = getattr(mol, 'eri_s8', None)
+    if eri_s8_source is not None:
+        from pyqed.qchem.basis import ao2mo_s8
+        return ao2mo_s8(
+            eri_s8_source,
+            mo_left,
+            mo_right,
+            mo_left_2,
+            mo_right_2,
+        )
     if eri_source is None and getattr(mf, 'eri_s4', None) is not None:
         from pyqed.qchem.basis import unpack_eri_s4
         eri_source = unpack_eri_s4(mf.eri_s4, mf.mol.nao)
-    if eri_source is None and getattr(mf, 'eri_s8', None) is not None:
-        from pyqed.qchem.basis import unpack_eri_s8
-        eri_source = unpack_eri_s8(mf.eri_s8, mf.mol.nao)
-    mol = getattr(mf, 'mol', None)
     if eri_source is None and mol is not None:
         eri_source = getattr(mol, 'eri', None)
     if eri_source is None and mol is not None and getattr(mol, 'eri_s4', None) is not None:
         from pyqed.qchem.basis import unpack_eri_s4
         eri_source = unpack_eri_s4(mol.eri_s4, mol.nao)
-    if eri_source is None and mol is not None and getattr(mol, 'eri_s8', None) is not None:
-        from pyqed.qchem.basis import unpack_eri_s8
-        eri_source = unpack_eri_s8(mol.eri_s8, mol.nao)
     eri_ndim = None if eri_source is None else np.asarray(eri_source).ndim
     if eri_source is not None and eri_ndim == 4:
         return contract(
