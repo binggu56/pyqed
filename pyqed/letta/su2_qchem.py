@@ -4796,64 +4796,6 @@ class NonAbelianFrontierLETTA:
                         self._su2_moving_environment.begin_bond(bond)
                         self._su2_moving_environment.merge_active_bond()
                     local_environment_sweeps = environment_sweeps
-                    if (
-                        algorithm == "projected"
-                        and self.hamiltonian_representation == "complementary"
-                        and local_environment_sweeps is None
-                    ):
-                        for current_site in materialized:
-                            metadata = getattr(current_site, "metadata", None)
-                            if isinstance(metadata, dict):
-                                metadata.pop("_cpp_split_site", None)
-                        environment_started = time.perf_counter()
-                        local_environment = MovingEnvironment(
-                            materialized,
-                            mpo_factors=self.mpo,
-                            complementary_operator_families=self._complementary_operators,
-                            materialize_complementary_family_operator_tables=False,
-                            su2_moving_environment=None,
-                            su2_boundary_environment=cpp_boundary_environment,
-                        )
-                        local_environment.norm_stack.su2_boundary_environment = None
-                        local_environment.hamiltonian_stack.su2_moving_environment = (
-                            self._su2_moving_environment
-                        )
-                        self._su2_moving_environment.clear_boundaries()
-                        self._su2_moving_environment.clear_factor_routes()
-                        hamiltonian_environment_started = time.perf_counter()
-                        local_h_chain = BlockSparseEnvironmentChain.build(
-                            materialized,
-                            self.mpo,
-                            renormalized_blocks=local_environment.hamiltonian_stack,
-                        )
-                        hamiltonian_environment_build_s += (
-                            time.perf_counter() - hamiltonian_environment_started
-                        )
-                        norm_environment_started = time.perf_counter()
-                        local_n_chain = BlockSparseEnvironmentChain.build(
-                            materialized,
-                            local_environment.identity_mpo_factors,
-                            renormalized_blocks=local_environment.norm_stack,
-                        )
-                        norm_environment_build_s += (
-                            time.perf_counter() - norm_environment_started
-                        )
-                        local_h_sweep = local_h_chain.start_sweep(direction)
-                        local_n_sweep = local_n_chain.start_sweep(direction)
-                        traversed = (
-                            range(bond)
-                            if direction == "lr"
-                            else range(self.nsites - 2, bond, -1)
-                        )
-                        for prior_bond in traversed:
-                            for local_sweep in (local_h_sweep, local_n_sweep):
-                                local_sweep.advance_after_update(
-                                    prior_bond,
-                                    materialized[prior_bond],
-                                    materialized[prior_bond + 1],
-                                )
-                        local_environment_sweeps = (local_h_sweep, local_n_sweep)
-                        environment_build_s += time.perf_counter() - environment_started
                     if algorithm == "two_site":
                         h_stack = (
                             None
