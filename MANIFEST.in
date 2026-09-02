@@ -38,6 +38,7 @@ include pyqed/qchem/_rys_cy.c
 include pyqed/qchem/_rys_cy.pyx
 
 prune pyqed/pyqed.egg-info
+recursive-exclude pyqed.egg-info *Bing*Mac* *gugroup*
 prune tests
 include tests/test_release_smoke.py
 recursive-exclude pyqed *.dylib *.pyc *.so

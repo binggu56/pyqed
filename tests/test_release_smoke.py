@@ -10,7 +10,7 @@ from pyqed.qchem.basis import _basis_path
 
 
 def test_runtime_version_uses_the_release_source():
-    assert pyqed.__version__ == "0.2.0"
+    assert pyqed.__version__ == "0.3.0"
 
 
 def test_required_basis_data_is_packaged():

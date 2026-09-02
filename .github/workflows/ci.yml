@@ -47,10 +47,11 @@ jobs:
           tests/test_integrate.py
 
   native-extensions:
-    name: Optional native extensions
+    name: All extension groups
     runs-on: ubuntu-latest
     env:
       PYQED_BUILD_EXTENSIONS: "1"
+      PYQED_EXTENSION_GROUPS: all
 
     steps:
       - uses: actions/checkout@v7
@@ -141,6 +142,6 @@ jobs:
       - name: Install documentation dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e ".[docs]"
+          PYQED_BUILD_EXTENSIONS=0 python -m pip install -e ".[docs]"
       - name: Build documentation without warnings
         run: sphinx-build -W --keep-going -b html docs/source /tmp/pyqed-docs

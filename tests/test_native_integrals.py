@@ -17,6 +17,7 @@ from pyqed.qchem.basis import (
     _cart2sph_unit_block,
     _compute_cartesian_shell_quartet_block_cython,
     _compute_dense_eri_serial,
+    _compute_dense_eri_with_backend,
     _compute_dense_eri_serial_cpp_cartesian,
     _compute_dense_eri_serial_cpp_ssss,
     _compute_eri_s8_cpp_cartesian,
@@ -429,14 +430,22 @@ def test_cpp_cartesian_helper_supports_high_l_scalar_fallback():
     np.testing.assert_allclose(cpp_eri, ref_eri, atol=1e-8, rtol=1e-8)
 
 
-def test_dense_dispatch_falls_back_beyond_cpp_high_l_limit():
+def test_dense_dispatch_requires_explicit_reference_beyond_compiled_high_l_limit():
     signatures = (
         ((0, 0, 0), (0.0, 0.0, 0.0), (0.8,), (1.0,)),
         ((7, 0, 0), (0.2, -0.1, 0.3), (1.1,), (0.4,)),
     )
     pair_bounds = _compute_pair_bounds(signatures)
 
-    eri, computed, skipped = _compute_dense_eri_serial(signatures, pair_bounds, 0.0)
+    with pytest.raises(RuntimeError, match="explicit slow reference"):
+        _compute_dense_eri_serial(signatures, pair_bounds, 0.0)
+
+    (eri, computed, skipped), builder = _compute_dense_eri_with_backend(
+        signatures,
+        pair_bounds,
+        0.0,
+        backend="python",
+    )
     ref_eri, ref_computed, ref_skipped = _compute_dense_eri_serial_aopairs(
         signatures,
         pair_bounds,
@@ -445,6 +454,7 @@ def test_dense_dispatch_falls_back_beyond_cpp_high_l_limit():
 
     assert computed == ref_computed
     assert skipped == ref_skipped
+    assert builder == "python-shellblocked"
     np.testing.assert_allclose(eri, ref_eri, atol=1e-8, rtol=1e-8)
 
 

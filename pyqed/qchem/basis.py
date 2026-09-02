@@ -749,6 +749,34 @@ def _normalize_eri_backend(requested):
     return requested
 
 
+def _reference_integrals_requested(mol, eri_backend=None):
+    if eri_backend is None:
+        eri_backend = getattr(
+            mol,
+            "builtin_eri_backend",
+            getattr(mol, "native_eri_backend", "auto"),
+        )
+    if _normalize_eri_backend(eri_backend) == "python":
+        return True
+    ri_backend = str(
+        getattr(
+            mol,
+            "builtin_ri_tensor_backend",
+            getattr(mol, "native_ri_tensor_backend", "auto"),
+        )
+    ).strip().lower().replace("_", "-")
+    return ri_backend in {"python", "serial"}
+
+
+def _compiled_integral_error(component):
+    return RuntimeError(
+        f"The compiled {component} accelerator is unavailable. Install a platform "
+        "wheel or build PyQED with a supported C/C++ toolchain. For an explicit "
+        "slow reference calculation, select eri_backend='python' (and "
+        "ri_tensor_backend='python' for RI)."
+    )
+
+
 def _resolve_eri_backend(requested, signatures, operation="dense"):
     requested = _normalize_eri_backend(requested)
     if operation not in {"dense", "direct", "factors"}:
@@ -758,8 +786,16 @@ def _resolve_eri_backend(requested, signatures, operation="dense"):
         if operation == "direct":
             if _cpp_direct_eri_supported(signatures):
                 return "cpp"
-            raise RuntimeError("Direct JK requires the compiled C++ Cartesian ERI kernel.")
-        return "cpp" if _cpp_dense_eri_supported(signatures) else "python"
+            raise _compiled_integral_error("direct J/K")
+        if _cpp_dense_eri_supported(signatures):
+            return "cpp"
+        max_l = _signatures_max_l(signatures)
+        raise RuntimeError(
+            "The compiled ERI accelerator is unavailable or does not support "
+            f"the requested basis (max angular momentum {max_l}; supported "
+            f"maximum {_CPP_CARTESIAN_MAX_L}). Select eri_backend='python' only "
+            "for an explicit slow reference calculation."
+        )
 
     if requested == "cpp":
         supported = (
@@ -782,8 +818,11 @@ def _resolve_eri_backend(requested, signatures, operation="dense"):
                 raise RuntimeError("The compiled Rys direct-J/K kernel is unavailable.")
             return "rys"
         raise ValueError("Direct JK supports eri_backend='auto', 'cpp', or 'rys'.")
-    if requested == "rys" and not _signatures_are_sp_only(signatures):
-        raise RuntimeError("The production Rys ERI backend currently supports only Cartesian s/p bases.")
+    if requested == "rys":
+        if _rys_cy is None or not hasattr(_rys_cy, "compute_dense_eri_blocked_rys"):
+            raise _compiled_integral_error("Rys ERI")
+        if not _signatures_are_sp_only(signatures):
+            raise RuntimeError("The production Rys ERI backend currently supports only Cartesian s/p bases.")
     return requested
 
 
@@ -2009,11 +2048,11 @@ def _compute_dense_eri_spherical_shellblocked(
     ):
         global_transform[cart_start:cart_stop, sph_start:sph_stop] = transform
 
-    if (
-        backend == "cpp"
-        and _integrals_cpp is not None
-        and hasattr(_integrals_cpp, "compute_dense_eri_spherical")
-    ):
+    if backend == "cpp":
+        if _integrals_cpp is None or not hasattr(
+            _integrals_cpp, "compute_dense_eri_spherical"
+        ):
+            raise _compiled_integral_error("spherical ERI")
         shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
         eri, computed, skipped = _integrals_cpp.compute_dense_eri_spherical(
             np.ascontiguousarray(shells, dtype=np.int64),
@@ -2120,7 +2159,7 @@ def _compute_dense_eri_spherical_shellblocked(
                                 s0,
                                 s1,
                             )
-                    if block is None and _basis_cy is not None:
+                    if block is None and backend != "python" and _basis_cy is not None:
                         block = _basis_cy.compute_cartesian_shell_quartet_block(
                             shells,
                             origins,
@@ -2137,6 +2176,8 @@ def _compute_dense_eri_spherical_shellblocked(
                             s1,
                             False,
                         )
+                    if block is None and backend != "python":
+                        raise _compiled_integral_error("spherical shell-quartet")
                     if block is None:
                         block = np.empty((np_, nq_, nr_, ns_), dtype=float)
                         for ip, p in enumerate(range(p0, p1)):
@@ -2183,7 +2224,7 @@ def _compute_dense_eri_spherical_shellblocked(
                     eri[d0:d1, c0:c1, b0:b1, a0:a1] = transformed.transpose(3, 2, 1, 0)
                     computed += unique_count
 
-    source = "rys" if backend == "rys" else "cython"
+    source = "rys" if backend == "rys" else "python"
     return (eri, computed, skipped), f"{source}-spherical-shellblocked"
 
 
@@ -2243,7 +2284,9 @@ def _matrix_free_spherical_cd_factors(
     screen_tol=0.0,
     workers=1,
     rys_cache_mib=64,
+    backend="auto",
 ):
+    backend = _resolve_eri_backend(backend, signatures, operation="factors")
     tol = float(tol)
     if tol <= 0.0:
         raise ValueError("low_rank_tol must be positive for CD builds.")
@@ -2259,7 +2302,7 @@ def _matrix_free_spherical_cd_factors(
         "spherical_direct_jk_plan_stats",
         "direct_j_spherical_plan",
     )
-    if _integrals_cpp is not None and all(
+    if backend in {"cpp", "rys"} and _integrals_cpp is not None and all(
         hasattr(_integrals_cpp, method) for method in native_methods
     ):
         effective_screen_tol = float(screen_tol or 0.0)
@@ -2290,8 +2333,8 @@ def _matrix_free_spherical_cd_factors(
                 max(1, int(workers)),
                 0,
             )
-        except Exception:
-            native_plan = None
+        except Exception as exc:
+            raise RuntimeError("The compiled spherical CD plan failed.") from exc
         if native_plan is not None:
             plan_seconds = time.perf_counter() - plan_started
             diagonal = np.asarray(
@@ -2383,6 +2426,9 @@ def _matrix_free_spherical_cd_factors(
             }
             return factors, info
 
+    if backend == "cpp":
+        raise _compiled_integral_error("spherical Cholesky-decomposition")
+
     max_column_l1 = float(np.max(np.sum(np.abs(primary_transform), axis=0)))
     residual_amplification = max(1.0, max_column_l1 ** 4)
     cartesian_tol = tol / residual_amplification
@@ -2393,18 +2439,23 @@ def _matrix_free_spherical_cd_factors(
     shell_blocks = _contiguous_shell_blocks_from_signatures(signatures)
     shell_starts = np.asarray([start for start, _stop in shell_blocks], dtype=np.int64)
     shell_stops = np.asarray([stop for _start, stop in shell_blocks], dtype=np.int64)
-    cartesian = _pivoted_cholesky_from_integral_oracle_cython_blocked(
-        signatures,
-        pair_bounds,
-        shell_starts,
-        shell_stops,
-        tol=cartesian_tol,
-        max_rank=max_rank,
-        screen_tol=effective_screen_tol,
-        packed=True,
-    )
-    builder = "cython-matrix-free-blocked"
+    cartesian = None
+    builder = "python-matrix-free"
+    if backend != "python":
+        cartesian = _pivoted_cholesky_from_integral_oracle_cython_blocked(
+            signatures,
+            pair_bounds,
+            shell_starts,
+            shell_stops,
+            tol=cartesian_tol,
+            max_rank=max_rank,
+            screen_tol=effective_screen_tol,
+            packed=True,
+        )
+        builder = "cython-matrix-free-blocked"
     if cartesian is None:
+        if backend != "python":
+            raise _compiled_integral_error("spherical Cholesky-decomposition")
         cartesian = _pivoted_cholesky_from_integral_oracle(
             signatures,
             pair_bounds,
@@ -4255,6 +4306,9 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         elif tensor_backend == "cython":
             raise RuntimeError("builtin_ri_tensor_backend='cython' was requested, but no compiled RI tensor kernel is available.")
 
+    if tensors is None and tensor_backend == "auto":
+        raise _compiled_integral_error("RI tensor")
+
     if tensors is None:
         metric = _compute_aux_coulomb_metric(aux_signatures)
         j3_pair, ri_computed, ri_skipped = _compute_three_center_pair_tensor_parallel(
@@ -5168,6 +5222,14 @@ def build_builtin(mol):
     timings["basis_setup"] = time.perf_counter() - t0
     nao_cart = len(basis_cart)
     signatures = tuple(_basis_signature(fn) for fn in basis_cart)
+    requested_eri_backend = _normalize_eri_backend(
+        getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
+    )
+    if (
+        (_basis_cy is None or not hasattr(_basis_cy, "compute_one_electron"))
+        and not _reference_integrals_requested(mol, requested_eri_backend)
+    ):
+        raise _compiled_integral_error("one-electron integral")
 
     t0 = time.perf_counter()
     one_electron_cache_key = _native_one_electron_cache_key(mol, signatures, atcoords, atnums)
@@ -5210,9 +5272,6 @@ def build_builtin(mol):
     )
     if eri_screen_tol < 0.0 or direct_scf_tol < 0.0:
         raise ValueError("eri_screen_tol and direct_scf_tol must be non-negative.")
-    requested_eri_backend = _normalize_eri_backend(
-        getattr(mol, "builtin_eri_backend", getattr(mol, "native_eri_backend", "auto"))
-    )
     eri_representation = getattr(
         mol,
         "builtin_eri_representation",
@@ -5470,6 +5529,7 @@ def build_builtin(mol):
                         )
                     ),
                 ),
+                backend=eri_backend,
             )
             timings["low_rank_factors"] = time.perf_counter() - t0
             factors_are_spherical = True

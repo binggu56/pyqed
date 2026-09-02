@@ -5,6 +5,21 @@ History
 Unreleased
 ----------
 
+0.3.0 (2026-09-02)
+------------------
+
+* Ship compiled qchem wheels for CPython 3.10--3.13 on Linux, macOS, and
+  Windows.
+* Build the production qchem accelerators by default for source installs while
+  retaining an explicit Python reference-kernel mode for debugging.
+* Reject silent fallback from production integral paths to slow Python kernels
+  and add ``python -m pyqed.qchem.check_install`` for installation checks.
+* Build, test, and publish the platform wheels and source distribution through
+  the tagged-release workflow.
+
+0.2.0 (2026-07-11)
+------------------
+
 * Reorganized the documentation around installation, a tested quickstart,
   task-oriented guides, examples, API entry points, benchmarks, citation, and
   development.

@@ -42,21 +42,24 @@ Install a published release from PyPI:
 
    python -m pip install pyqed
 
-For the current development tree:
+For the current ``bg`` development branch:
 
 .. code-block:: bash
 
-   git clone https://github.com/binggu56/pyqed.git
+   git clone --branch bg https://github.com/binggu56/pyqed.git
    cd pyqed
    python -m pip install -e .
 
-Standard installations use the tested pure-Python fallbacks.  To compile the
-optional native accelerators from a source checkout, use a supported C/C++
-toolchain and opt in explicitly:
+Published releases provide platform wheels containing the production qchem
+accelerators. Source installs build the same required accelerators by default
+and therefore need a supported C/C++ toolchain. Verify an installation with:
 
 .. code-block:: bash
 
-   PYQED_BUILD_EXTENSIONS=1 python -m pip install .
+   python -m pyqed.qchem.check_install
+
+The slow pure-Python integral implementation is an explicit reference/debug
+mode; see the installation guide for its source-build and runtime settings.
 
 Use documentation from the same release or commit as the installed code.  See
 the `installation guide <https://docs.pyqed.org/en/latest/installation.html>`_

@@ -6,10 +6,13 @@
 import glob
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 from setuptools import Extension, setup
+from setuptools.archive_util import unpack_archive
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.install_egg_info import install_egg_info as _install_egg_info
 
 
 def _is_sync_conflict_copy(module_path):
@@ -19,6 +22,13 @@ def _is_sync_conflict_copy(module_path):
 
 
 class _CleanBuildPy(_build_py):
+    def run(self):
+        super().run()
+        build_root = Path(self.build_lib)
+        for path in build_root.rglob("*"):
+            if path.is_file() and _is_sync_conflict_copy(path):
+                path.unlink()
+
     def find_package_modules(self, package, package_dir):
         modules = super().find_package_modules(package, package_dir)
         return [
@@ -27,18 +37,47 @@ class _CleanBuildPy(_build_py):
             if not _is_sync_conflict_copy(module[2])
         ]
 
+    def find_data_files(self, package, src_dir):
+        return [
+            path
+            for path in super().find_data_files(package, src_dir)
+            if not _is_sync_conflict_copy(path)
+        ]
+
+
+class _CleanInstallEggInfo(_install_egg_info):
+    def copytree(self):
+        def keep(src, dst):
+            if _is_sync_conflict_copy(src):
+                return None
+            for marker in ".svn/", "CVS/":
+                if src.startswith(marker) or "/" + marker in src:
+                    return None
+            self.outputs.append(dst)
+            return dst
+
+        unpack_archive(self.source, self.target, keep)
+
 
 def _cpp_include_dirs(np):
     include_dirs = [np.get_include()]
     if sys.platform == "darwin":
         sdkroot = os.environ.get("SDKROOT")
+        if not sdkroot:
+            try:
+                sdkroot = subprocess.run(
+                    ["xcrun", "--show-sdk-path"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+            except (OSError, subprocess.CalledProcessError):
+                sdkroot = None
         if sdkroot:
             path = f"{sdkroot}/usr/include/c++/v1"
             if os.path.isdir(path):
                 include_dirs.append(path)
-        # Otherwise let the active compiler select its matching libc++ headers.
-        # Guessing a Command Line Tools or Conda SDK can mix incompatible Xcode
-        # releases, which fails even on standard headers.
+        # xcrun selects the libc++ headers matching the active Xcode toolchain.
         return include_dirs
     for pattern in (
         f"{sys.prefix}/pkgs/libcxx-*/include/c++/v1",
@@ -96,13 +135,17 @@ def _mps_openmp_flags():
     return [], []
 
 
-def _optional_extensions():
-    enabled = os.environ.get("PYQED_BUILD_EXTENSIONS", "0")
-    if enabled.strip().lower() not in {"1", "true", "yes", "on"}:
+def _extensions_to_build():
+    enabled = os.environ.get("PYQED_BUILD_EXTENSIONS", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
         return []
+    if enabled not in {"1", "true", "yes", "on"}:
+        raise ValueError(
+            "PYQED_BUILD_EXTENSIONS must be an explicit true or false value."
+        )
     groups = {
         item.strip().lower()
-        for item in os.environ.get("PYQED_EXTENSION_GROUPS", "all").split(",")
+        for item in os.environ.get("PYQED_EXTENSION_GROUPS", "qchem").split(",")
         if item.strip()
     }
     valid_groups = {"all", "qchem", "heom", "mps", "letta", "ldr"}
@@ -110,12 +153,18 @@ def _optional_extensions():
     if unknown_groups:
         names = ", ".join(sorted(unknown_groups))
         raise ValueError(f"unknown PYQED_EXTENSION_GROUPS entries: {names}")
+    if not groups:
+        raise ValueError("PYQED_EXTENSION_GROUPS must not be empty.")
+    groups.add("qchem")
 
     extensions = []
     try:
         import numpy as np
     except Exception:
         np = None
+
+    if np is None:
+        raise RuntimeError("NumPy is required to build the qchem accelerators.")
 
     if np is not None:
         cpp_include_dirs = _cpp_include_dirs(np)
@@ -159,7 +208,7 @@ def _optional_extensions():
                 language="c++",
                 extra_compile_args=qchem_integral_compile_args,
                 extra_link_args=qchem_integral_link_args,
-                optional=True,
+                optional=False,
             )
         )
         extensions.append(
@@ -172,7 +221,7 @@ def _optional_extensions():
                 extra_link_args=accelerate_link_args,
                 libraries=casscf_libraries,
                 define_macros=casscf_macros,
-                optional=True,
+                optional=False,
             )
         )
         extensions.append(
@@ -182,7 +231,7 @@ def _optional_extensions():
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=cpp_compile_args,
-                optional=True,
+                optional=False,
             )
         )
         extensions.append(
@@ -204,7 +253,7 @@ def _optional_extensions():
                 ["pyqed/qchem/_basis_cy.pyx"],
                 include_dirs=[np.get_include()],
                 extra_compile_args=c_compile_args,
-                optional=True,
+                optional=False,
             )
         )
         extensions.append(
@@ -213,7 +262,7 @@ def _optional_extensions():
                 ["pyqed/qchem/_rys_cy.pyx"],
                 include_dirs=[np.get_include()],
                 extra_compile_args=c_compile_args,
-                optional=True,
+                optional=False,
             )
         )
         extensions.append(
@@ -297,7 +346,7 @@ def _optional_extensions():
     ]
 
 
-extensions = _optional_extensions()
+extensions = _extensions_to_build()
 if any(
     source.endswith(".pyx")
     for extension in extensions
@@ -312,9 +361,12 @@ if any(
     )
 
 
-# Project metadata lives in pyproject.toml.  This small compatibility hook is
-# retained solely for the optional native extensions.
+# Project metadata lives in pyproject.toml. This hook builds the required qchem
+# accelerators plus explicitly requested optional extension groups.
 setup(
-    cmdclass={"build_py": _CleanBuildPy},
+    cmdclass={
+        "build_py": _CleanBuildPy,
+        "install_egg_info": _CleanInstallEggInfo,
+    },
     ext_modules=extensions,
 )

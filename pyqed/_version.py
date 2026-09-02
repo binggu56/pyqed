@@ -3,5 +3,4 @@
 This is the single version source used by both the package and build metadata.
 """
 
-__version__ = "0.2.0"
-
+__version__ = "0.3.0"

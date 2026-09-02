@@ -32,21 +32,49 @@ The PyPI release can lag behind the development branch.  Before following a
 Current development tree
 ------------------------
 
-To work from source:
+To work from the current ``bg`` development branch:
 
 .. code-block:: bash
 
-   git clone https://github.com/binggu56/pyqed.git
+   git clone --branch bg https://github.com/binggu56/pyqed.git
    cd pyqed
    python -m pip install -e .
 
-The default build uses the tested pure-Python fallbacks.  To compile the
-optional native accelerators, install from a source checkout with a supported
-C/C++ toolchain and opt in explicitly:
+The default source build compiles the required qchem accelerators and needs a
+supported C/C++ toolchain. It builds only the qchem extension group, which
+keeps the normal installation focused:
 
 .. code-block:: bash
 
-   PYQED_BUILD_EXTENSIONS=1 python -m pip install .
+   python -m pip install .
+
+Build every extension group for a full development installation with:
+
+.. code-block:: bash
+
+   PYQED_EXTENSION_GROUPS=all python -m pip install .
+
+If you specifically need the slow reference kernels for debugging, disable
+extension compilation explicitly and select the Python integral paths in the
+calculation:
+
+.. code-block:: bash
+
+   PYQED_BUILD_EXTENSIONS=0 python -m pip install .
+
+.. code-block:: python
+
+   from pyqed.qchem import Molecule
+
+   mol = Molecule(
+       atom="H 0 0 0; H 0 0 0.74",
+       unit="angstrom",
+       basis="sto-3g",
+       options={"eri_backend": "python", "ri_tensor_backend": "python"},
+   )
+
+Automatic backend selection does not silently fall back to these reference
+kernels. A missing or unsupported compiled integral kernel is an error.
 
 Native integral extensions use link-time optimization by default. Set
 ``PYQED_LTO=0`` only when diagnosing a toolchain that cannot link LTO objects.
@@ -82,11 +110,18 @@ The second command records whether local modifications were present.
 Verify the native path
 ----------------------
 
-Run this small calculation after installation:
+First verify that every production qchem extension can be imported and exposes
+its required entry point:
 
 .. code-block:: bash
 
-   python -c "from pyqed.qchem import Molecule; m=Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g'); m.build(eri='auto'); x=m.RHF().run(); print(x.converged, x.e_tot)"
+   python -m pyqed.qchem.check_install
+
+Then run a small end-to-end calculation:
+
+.. code-block:: bash
+
+   python -c "from pyqed.qchem import Molecule; m=Molecule(atom='H 0 0 0; H 0 0 0.74', unit='angstrom', basis='sto-3g'); m.build(); x=m.RHF().run(); print(x.converged, x.e_tot)"
 
 The command should finish with a converged flag and a finite total energy.  If
 it fails, include the command and full output in a support request.
@@ -101,7 +136,7 @@ identifies its optional requirements where known.  Common categories include:
 * plotting or visualization packages for figure-generating examples;
 * electronic-structure or molecular-dynamics programs used by comparison
   scripts; and
-* a C/C++ toolchain for optional accelerated extensions when building from
+* a C/C++ toolchain for the required qchem accelerators when building from
   source.
 
 Do not install every optional package merely to run the quickstart.  Select a

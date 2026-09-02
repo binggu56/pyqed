@@ -15,8 +15,38 @@ env:
   NUMEXPR_NUM_THREADS: "1"
 
 jobs:
-  build:
-    name: Build and verify release
+  wheels:
+    name: Wheel / ${{ matrix.os }} / ${{ matrix.arch }}
+    if: github.repository == 'binggu56/pyqed'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: windows-latest
+            arch: AMD64
+          - os: macos-15-intel
+            arch: x86_64
+          - os: macos-14
+            arch: arm64
+
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test wheels
+        uses: pypa/cibuildwheel@v4.2.0
+        env:
+          CIBW_ARCHS: ${{ matrix.arch }}
+      - name: Store wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-package-wheels-${{ matrix.os }}-${{ matrix.arch }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
     if: github.repository == 'binggu56/pyqed'
     runs-on: ubuntu-latest
 
@@ -33,54 +63,42 @@ jobs:
           tag_version = os.environ["GITHUB_REF_NAME"].removeprefix("v");
           assert tag_version == package_version,
           f"tag {tag_version!r} does not match package {package_version!r}"'
-      - name: Install release tools and run acceptance tests
+      - name: Build and inspect the source distribution
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e ".[test]"
-          python -m pytest -q tests/test_release_smoke.py tests/test_superoperator_lindblad.py tests/test_integrate.py
-      - name: Build and inspect the universal wheel and source distribution
-        run: |
-          python -m build
+          python -m pip install --upgrade pip build twine
+          PYQED_BUILD_EXTENSIONS=0 python -m build --sdist
           python -m twine check dist/*
           python - <<'PY'
           from pathlib import Path
           import tarfile
-          from zipfile import ZipFile
 
           def is_conflict_copy(name):
               lowered = name.lower()
               return "gugroup" in lowered or "bing" in lowered and "mac" in lowered
 
-          wheel = next(Path("dist").glob("*.whl"))
-          assert wheel.name.endswith("-py3-none-any.whl")
-          with ZipFile(wheel) as archive:
-              wheel_names = archive.namelist()
-          assert not any(name.endswith((".so", ".pyd", ".dylib")) for name in wheel_names)
-          assert not any(is_conflict_copy(name) for name in wheel_names)
-
           sdist = next(Path("dist").glob("*.tar.gz"))
           with tarfile.open(sdist) as archive:
-              sdist_names = archive.getnames()
-          assert not any(is_conflict_copy(name) for name in sdist_names)
+              names = archive.getnames()
+          assert not any(is_conflict_copy(name) for name in names)
+          required_sources = {
+              "pyqed/qchem/_integrals.cpp",
+              "pyqed/qchem/_casscf_cpp.cpp",
+              "pyqed/qchem/_gdf_cpp.cpp",
+              "pyqed/qchem/_basis_cy.pyx",
+              "pyqed/qchem/_rys_cy.pyx",
+          }
+          assert all(any(name.endswith(source) for name in names) for source in required_sources)
           PY
-      - name: Install the wheel in a clean environment
-        run: |
-          python -m venv /tmp/pyqed-release
-          /tmp/pyqed-release/bin/python -m pip install --upgrade pip
-          /tmp/pyqed-release/bin/python -m pip install dist/*.whl
-          cd /tmp
-          /tmp/pyqed-release/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
-          /tmp/pyqed-release/bin/python -c 'from importlib.metadata import version; import pyqed; assert pyqed.__version__ == version("pyqed")'
-      - name: Store verified distributions
+      - name: Store source distribution
         uses: actions/upload-artifact@v7
         with:
-          name: python-package-distributions
-          path: dist/
+          name: python-package-sdist
+          path: dist/*.tar.gz
           if-no-files-found: error
 
   publish:
     name: Publish to PyPI
-    needs: build
+    needs: [wheels, sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -92,7 +110,8 @@ jobs:
       - name: Retrieve verified distributions
         uses: actions/download-artifact@v8
         with:
-          name: python-package-distributions
+          pattern: python-package-*
           path: dist/
+          merge-multiple: true
       - name: Publish with PyPI Trusted Publishing
         uses: pypa/gh-action-pypi-publish@release/v1
