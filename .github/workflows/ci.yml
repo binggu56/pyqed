@@ -120,7 +120,7 @@ jobs:
           /tmp/pyqed-wheel/bin/python -m pip install dist/*.whl
           cd /tmp
           /tmp/pyqed-wheel/bin/python "$GITHUB_WORKSPACE/examples/quickstart.py"
-          /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from pathlib import Path; import pyqed; from pyqed.qchem import _casscf_cpp; from pyqed.qchem.basis import _basis_path; assert pyqed.__version__ == version("pyqed") == "0.2.0"; assert _casscf_cpp is not None; assert Path(_basis_path("sto-3g")).is_file()'
+          /tmp/pyqed-wheel/bin/python -c 'from importlib.metadata import version; from pathlib import Path; import pyqed; from pyqed.qchem import _casscf_cpp; from pyqed.qchem.basis import _basis_path; assert pyqed.__version__ == version("pyqed"); assert _casscf_cpp is not None; assert Path(_basis_path("sto-3g")).is_file()'
       - name: Install and test the source distribution in isolation
         run: |
           python -m venv /tmp/pyqed-sdist
