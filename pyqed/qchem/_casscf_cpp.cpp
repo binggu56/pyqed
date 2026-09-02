@@ -278,12 +278,30 @@ inline std::uint64_t orbital_mask(npy_intp orbital) {
     return std::uint64_t{1} << static_cast<unsigned>(orbital);
 }
 
+inline int bit_popcount64(std::uint64_t bits) {
+#ifdef _MSC_VER
+    return static_cast<int>(__popcnt64(bits));
+#else
+    return __builtin_popcountll(bits);
+#endif
+}
+
+inline int bit_trailing_zeros64(std::uint64_t bits) {
+#ifdef _MSC_VER
+    unsigned long index = 0;
+    _BitScanForward64(&index, bits);
+    return static_cast<int>(index);
+#else
+    return __builtin_ctzll(bits);
+#endif
+}
+
 inline npy_int8 orbital_phase(std::uint64_t bits, npy_intp orbital) {
     if (orbital <= 0) {
         return 1;
     }
     const std::uint64_t mask = orbital_mask(orbital) - 1;
-    return (__builtin_popcountll(bits & mask) & 1) ? -1 : 1;
+    return (bit_popcount64(bits & mask) & 1) ? -1 : 1;
 }
 
 std::uint64_t row_to_bits(const npy_int8* strings, npy_intp n_mo, npy_intp row) {
@@ -6094,11 +6112,7 @@ inline bool bit_is_set(std::uint64_t bits, npy_intp idx) {
 }
 
 inline int popcount_u64(std::uint64_t bits) {
-#ifdef _MSC_VER
-    return static_cast<int>(__popcnt64(bits));
-#else
-    return __builtin_popcountll(bits);
-#endif
+    return bit_popcount64(bits);
 }
 
 inline int fermion_phase(std::uint64_t bits, npy_intp idx) {
@@ -6127,13 +6141,7 @@ bool create_bit(std::uint64_t bits, npy_intp idx, std::uint64_t& out_bits, int& 
 }
 
 inline npy_intp single_bit_index(std::uint64_t bits) {
-#ifdef _MSC_VER
-    unsigned long idx = 0;
-    _BitScanForward64(&idx, bits);
-    return static_cast<npy_intp>(idx);
-#else
-    return static_cast<npy_intp>(__builtin_ctzll(bits));
-#endif
+    return static_cast<npy_intp>(bit_trailing_zeros64(bits));
 }
 
 inline double spin_orbital_energy(const double* mo_energy, npy_intp nmo, npy_intp spin_orbital) {
@@ -6195,9 +6203,9 @@ struct CASPT2Words {
 };
 
 inline int caspt2_word_popcount(const CASPT2Words& bits) {
-    return __builtin_popcountll(bits.word[0]) +
-           __builtin_popcountll(bits.word[1]) +
-           __builtin_popcountll(bits.word[2]);
+    return bit_popcount64(bits.word[0]) +
+           bit_popcount64(bits.word[1]) +
+           bit_popcount64(bits.word[2]);
 }
 
 inline bool caspt2_word_test(const CASPT2Words& bits, int index) {
@@ -6208,11 +6216,11 @@ inline int caspt2_word_phase_below(const CASPT2Words& bits, int index) {
     int count = 0;
     const int target_word = index / 64;
     for (int word = 0; word < target_word; ++word) {
-        count += __builtin_popcountll(bits.word[word]);
+        count += bit_popcount64(bits.word[word]);
     }
     const int offset = index % 64;
     if (offset) {
-        count += __builtin_popcountll(
+        count += bit_popcount64(
             bits.word[target_word] & ((1ULL << static_cast<unsigned>(offset)) - 1ULL)
         );
     }
@@ -6290,13 +6298,13 @@ double caspt2_connected_element_words(
     for (int word = 0; word < 3; ++word) {
         std::uint64_t hole_word = holes.word[word];
         while (hole_word) {
-            hole_indices[nholes++] = 64 * word + __builtin_ctzll(hole_word);
+            hole_indices[nholes++] = 64 * word + bit_trailing_zeros64(hole_word);
             hole_word &= hole_word - 1;
         }
         std::uint64_t particle_word = particles.word[word];
         while (particle_word) {
             particle_indices[nparticles++] =
-                64 * word + __builtin_ctzll(particle_word);
+                64 * word + bit_trailing_zeros64(particle_word);
             particle_word &= particle_word - 1;
         }
     }
@@ -6370,7 +6378,7 @@ double caspt2_connected_element_words(
         for (int word = 0; word < 3; ++word) {
             std::uint64_t common_word = common.word[word];
             while (common_word) {
-                const int s = 64 * word + __builtin_ctzll(common_word);
+                const int s = 64 * word + bit_trailing_zeros64(common_word);
                 accumulate_pair(q, s, p, s);
                 accumulate_pair(s, q, p, s);
                 common_word &= common_word - 1;
@@ -6654,7 +6662,7 @@ PyObject* caspt2_direct_fock_words(PyObject*, PyObject* args) {
         for (int word = 0; word < 3; ++word) {
             std::uint64_t occupied = ket.word[word];
             while (occupied) {
-                const int spinorb = 64 * word + __builtin_ctzll(occupied);
+                const int spinorb = 64 * word + bit_trailing_zeros64(occupied);
                 if (spinorb < 2 * nmo) {
                     diagonal += fock_data[(spinorb % nmo) * nmo + spinorb % nmo];
                 }
