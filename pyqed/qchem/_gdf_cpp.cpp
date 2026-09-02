@@ -47,7 +47,7 @@ inline void complex_mul(
 }
 
 inline void sincos_values(double value, double& sin_value, double& cos_value) {
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__GNUC__) && !defined(__clang__)
     __builtin_sincos(value, &sin_value, &cos_value);
 #else
     sin_value = std::sin(value);

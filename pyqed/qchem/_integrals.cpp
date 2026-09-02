@@ -3822,7 +3822,7 @@ inline std::size_t os_vrr_idx(
     int mdim
 ) {
     (void)adim;
-    constexpr int lut_dim = OS_VRR_PAIR_MAX_L + 1;
+    static constexpr int lut_dim = OS_VRR_PAIR_MAX_L + 1;
     static const std::array<unsigned char, lut_dim * lut_dim * lut_dim> cart_index = [] {
         std::array<unsigned char, lut_dim * lut_dim * lut_dim> result{};
         for (int x = 0; x < lut_dim; ++x) {
