@@ -9,7 +9,6 @@ from time import perf_counter
 from jax import numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.optimize import minimize_scalar
 from scipy.special import ndtri
 from scipy.sparse.csgraph import minimum_spanning_tree
 from scipy.spatial.distance import cdist
@@ -37,101 +36,39 @@ bounds = ((-0.60, 0.60), (-0.70, 0.70), (-0.70, 0.70))
 tmax_fs = 5.0
 dt_fs = 0.02
 nout = 5
+distortion_limit = 0.65
 
 
 def geometry(q):
+    """Map symmetry coordinates through a non-folding exponential strain.
+
+    The Jacobian at the origin is the conventional linear H3+ normal-mode
+    map.  Saturating only the traceless strain keeps an expanded rectangular
+    coordinate chart away from artificial H-H collisions while preserving
+    the S3 action on ``(Qx, Qy)``.
+    """
     root3 = jnp.sqrt(3.0)
     triangle = jnp.asarray(
         ((-0.5, -0.5 / root3, 0.0),
          (0.5, -0.5 / root3, 0.0),
          (0.0, 1.0 / root3, 0.0))
     )
-    stretch = triangle.at[:, :2].set(
-        triangle[:, :2] @ jnp.diag(jnp.asarray((1.0, -1.0)))
-    )
-    shear = triangle.at[:, :2].set(
-        triangle[:, :2] @ jnp.asarray(((0.0, 1.0), (1.0, 0.0)))
-    )
     qs, qx, qy = q
-    return (equilibrium + qs) * triangle + qx * stretch + qy * shear
+    radius = jnp.sqrt(qx**2 + qy**2 + 1.0e-16)
+    amplitude = distortion_limit * jnp.tanh(radius / distortion_limit)
+    traceless = jnp.asarray(((qx, qy), (qy, -qx)))
+    strain = (
+        jnp.cosh(amplitude / equilibrium) * jnp.eye(2)
+        + jnp.sinh(amplitude / equilibrium) / radius * traceless
+    )
+    transform = jnp.exp(qs / equilibrium) * strain
+    return triangle.at[:, :2].set(
+        equilibrium * triangle[:, :2] @ transform
+    )
 
 
 def mace_geometry(q):
     return np.asarray(geometry(np.asarray(q, dtype=float)), dtype=float)
-
-
-def group_coordinates():
-    angle = 2.0 * np.pi / 3.0
-    rotation = np.eye(3)
-    rotation[1:, 1:] = (
-        (np.cos(angle), -np.sin(angle)),
-        (np.sin(angle), np.cos(angle)),
-    )
-    reflection = np.diag((1.0, 1.0, -1.0))
-    return np.asarray(
-        [np.linalg.matrix_power(rotation, power) for power in range(3)]
-        + [
-            reflection @ np.linalg.matrix_power(rotation, power)
-            for power in range(3)
-        ]
-    )
-
-
-def infer_s3(orbit_hamiltonians, feature_rank=16):
-    identity = np.eye(2)
-
-    def traceless(value):
-        return value - 0.5 * np.trace(value) * identity
-
-    base, rotated, reflected = (
-        orbit_hamiltonians[0], orbit_hamiltonians[1], orbit_hamiltonians[3]
-    )
-
-    def objective(angle):
-        cosine, sine = np.cos(2.0 * angle), np.sin(2.0 * angle)
-        representation = np.asarray(((cosine, sine), (sine, -cosine)))
-        return np.linalg.norm(
-            representation @ traceless(base) @ representation - traceless(reflected)
-        )
-
-    angles = np.linspace(0.0, np.pi, 2048, endpoint=False)
-    center = angles[int(np.argmin([objective(value) for value in angles]))]
-    spacing = np.pi / len(angles)
-    result = minimize_scalar(
-        objective,
-        bounds=(center - spacing, center + spacing),
-        method="bounded",
-    )
-    cosine, sine = np.cos(2.0 * result.x), np.sin(2.0 * result.x)
-    electronic_reflection = np.asarray(((cosine, sine), (sine, -cosine)))
-    angle = 2.0 * np.pi / 3.0
-    candidates = []
-    for sign in (1.0, -1.0):
-        value = sign * angle
-        representation = np.asarray(
-            ((np.cos(value), -np.sin(value)),
-             (np.sin(value), np.cos(value)))
-        )
-        candidates.append(
-            (np.linalg.norm(representation @ base @ representation.T - rotated),
-             representation)
-        )
-    electronic_rotation = min(candidates, key=lambda item: item[0])[1]
-    electronic = np.asarray(
-        [np.linalg.matrix_power(electronic_rotation, power) for power in range(3)]
-        + [
-            electronic_reflection @ np.linalg.matrix_power(electronic_rotation, power)
-            for power in range(3)
-        ]
-    )
-    return {
-        "coordinate_representations": group_coordinates(),
-        "electronic_representations": electronic,
-        "ambient_representations": np.asarray(
-            [np.kron(np.eye(feature_rank // 2), value) for value in electronic]
-        ),
-        "tolerance": 2.0e-7,
-    }
 
 
 def graph_pairs(coordinates, neighbors=3):
@@ -218,6 +155,7 @@ def train_mace(
     epochs=None,
     expanded=False,
 ):
+    coordinates = sampler.reduce_coordinates(coordinates)
     pairs = graph_pairs(coordinates)
     fields = sampler.continuous_fields(coordinates, pairs)
     fit = MACE(
@@ -228,26 +166,27 @@ def train_mace(
         chart_features=True,
         chart_bounds=bounds,
         geometry_units="bohr",
-        channels=32 if expanded else 16,
+        channels=20 if expanded else 16,
         max_ell=2,
-        interactions=3 if expanded else 2,
-        correlation=3 if expanded else 2,
+        interactions=2,
+        correlation=2,
         radial_basis=10 if expanded else 8,
-        radial_mlp=(128, 128) if expanded else (64, 64),
+        radial_mlp=(96, 96) if expanded else (64, 64),
         cutoff=4.5,
     ).fit_y(
         (coordinates, fields["hamiltonians"]),
         coordinates,
         pairs,
         fields["links"],
-        feature_rank=32 if expanded else 16,
+        feature_rank=20 if expanded else 16,
         feature_objective="links-only",
         ambient_representation="full",
         energy_representation="direct",
+        energy_objective="trace-traceless",
         finite_group=finite_group,
-        hidden=(128, 128) if expanded else (64, 64),
+        hidden=(96, 96) if expanded else (64, 64),
         epochs=(
-            (900 if previous is None else 220)
+            (450 if previous is None else 160)
             if expanded
             else (650 if previous is None else 320)
         ) if epochs is None else epochs,
@@ -316,32 +255,221 @@ def subspace_diagnostics(fields, max_distance=0.15):
     }
 
 
+def state_gap_diagnostics(sampler, coordinates):
+    """Measure separation of the selected manifold from excluded singlet roots."""
+
+    roots = []
+    for coordinate in np.asarray(coordinates, dtype=float):
+        record = sampler.database.get(
+            {
+                "geometry": sampler.coord.cartesian(tuple(coordinate)),
+                "protocol": sampler.protocol,
+            }
+        )
+        if record is None:
+            raise RuntimeError("state-gap diagnostic requires sampled coordinates")
+        values = record[1] if isinstance(record, tuple) else record["energies"]
+        roots.append(np.asarray(values, dtype=float))
+    roots = np.asarray(roots)
+    first, last = min(sampler.states), max(sampler.states)
+    if tuple(sampler.states) != tuple(range(first, last + 1)):
+        raise ValueError("state-gap diagnostics require a contiguous state manifold")
+    gaps = []
+    labels = []
+    if first > 0:
+        gaps.append(roots[:, first] - roots[:, first - 1])
+        labels.append(f"E{first}-E{first - 1}")
+    if last + 1 < roots.shape[1]:
+        gaps.append(roots[:, last + 1] - roots[:, last])
+        labels.append(f"E{last + 1}-E{last}")
+    if not gaps:
+        raise ValueError("no excluded root brackets the selected manifold")
+    gaps = np.column_stack(gaps)
+    nearest = np.min(gaps, axis=1)
+    return {
+        "excluded_gap_labels": labels,
+        "minimum_excluded_root_gap_hartree": float(np.min(nearest)),
+        "one_percent_excluded_root_gap_hartree": float(
+            np.quantile(nearest, 0.01)
+        ),
+        "median_excluded_root_gap_hartree": float(np.median(nearest)),
+        "coordinates": np.asarray(coordinates, dtype=float),
+        "excluded_root_gaps": gaps,
+        "nearest_excluded_root_gap": nearest,
+    }
+
+
+def plot_state_leakage(fields, gap_diagnostics, suffix=""):
+    """Plot selected-subspace retention and separation from excluded roots."""
+
+    coordinates = np.asarray(fields["coordinates"], dtype=float)
+    pairs = np.asarray(fields["pairs"], dtype=int)
+    distances = np.linalg.norm(
+        coordinates[pairs[:, 1]] - coordinates[pairs[:, 0]], axis=1
+    )
+    singular_values = np.linalg.svd(fields["links"], compute_uv=False)[:, -1]
+    gap_coordinates = gap_diagnostics["coordinates"]
+    normalized_radius = np.linalg.norm(gap_coordinates / packet_widths, axis=1)
+    gap_ev = gap_diagnostics["nearest_excluded_root_gap"] * au2ev
+
+    plt.rcParams.update(
+        {
+            "font.size": 9,
+            "axes.labelsize": 9,
+            "axes.titlesize": 9.5,
+            "legend.fontsize": 8,
+            "pdf.fonttype": 42,
+            "ps.fonttype": 42,
+        }
+    )
+    figure, panels = plt.subplots(
+        1, 2, figsize=(7.2, 2.8), constrained_layout=True
+    )
+    ordered_singular_values = np.sort(singular_values)
+    percentile = 100.0 * (
+        np.arange(len(ordered_singular_values)) + 0.5
+    ) / len(ordered_singular_values)
+    panels[0].plot(
+        percentile,
+        ordered_singular_values,
+        color="#0072B2",
+        linewidth=1.3,
+        marker="o",
+        markerfacecolor="white",
+        markersize=3.5,
+    )
+    panels[0].axhline(0.9, color="#D55E00", linestyle="--", linewidth=1.0)
+    panels[0].set(
+        xlabel="link percentile",
+        ylabel="minimum link singular value",
+        title=rf"(a) Subspace retention, $|\Delta q|={np.median(distances):.2f}$ bohr",
+        ylim=(min(0.895, float(np.min(singular_values)) - 0.002), 1.001),
+    )
+    panels[1].scatter(
+        normalized_radius,
+        gap_ev,
+        s=22,
+        facecolor="white",
+        edgecolor="#009E73",
+        linewidth=0.9,
+    )
+    panels[1].set(
+        xlabel=r"packet-scaled radius $|q/\sigma|$",
+        ylabel="nearest excluded-root gap (eV)",
+        title="(b) Separation from other singlets",
+    )
+    for panel in panels:
+        panel.spines[["top", "right"]].set_visible(False)
+        panel.tick_params(direction="out")
+    path = output / f"h3plus_fci_state_leakage{suffix}"
+    figure.savefig(path.with_suffix(".pdf"))
+    figure.savefig(path.with_suffix(".png"), dpi=360)
+    plt.close(figure)
+    np.savez(
+        path.with_suffix(".npz"),
+        pair_distance=distances,
+        minimum_link_singular_value=singular_values,
+        gap_coordinates=gap_coordinates,
+        nearest_excluded_root_gap_hartree=gap_diagnostics[
+            "nearest_excluded_root_gap"
+        ],
+    )
+    return path
+
+
+def plot_production_validation(fit):
+    """Plot independent neural errors against the production gates."""
+    h_error = np.sort(
+        np.asarray(fit.validation["independent_hamiltonian_errors"]) * au2ev
+        * 1000.0
+    )
+    link_error = np.sort(
+        np.asarray(fit.validation["independent_link_errors"])
+    )
+    figure, panels = plt.subplots(1, 2, figsize=(7.2, 2.8), constrained_layout=True)
+    panels[0].plot(h_error, color="#0072B2")
+    panels[0].axhline(
+        fit.acceptance["hamiltonian_atol"] * au2ev * 1000.0,
+        color="#D55E00",
+        linestyle="--",
+        label="maximum-error gate",
+    )
+    panels[0].set(
+        xlabel="sorted validation point",
+        ylabel=r"$||\Delta \bar H||_F$ (meV)",
+        title="(a) Gauged Hamiltonian",
+    )
+    panels[1].plot(link_error, color="#009E73")
+    panels[1].axhline(
+        fit.acceptance["link_rtol"],
+        color="#D55E00",
+        linestyle="--",
+        label="relative-error gate",
+    )
+    panels[1].set(
+        xlabel="sorted validation link",
+        ylabel="relative raw-link error",
+        title="(b) Endpoint links",
+    )
+    for panel in panels:
+        panel.legend(frameon=False)
+        panel.spines[["top", "right"]].set_visible(False)
+        panel.tick_params(direction="out")
+    path = output / "h3plus_fci_production_validation_rejected"
+    figure.savefig(path.with_suffix(".pdf"))
+    figure.savefig(path.with_suffix(".png"), dpi=360)
+    plt.close(figure)
+    np.savez(
+        path.with_suffix(".npz"),
+        hamiltonian_error_hartree=h_error / (au2ev * 1000.0),
+        relative_link_error=link_error,
+    )
+    return path
+
+
 def plot_pes_cuts(sampler, fit, validation_metrics, suffix=""):
-    """Plot independent FCI points against continuous MACE and distilled FTT."""
+    """Plot symmetry-inequivalent FCI cuts against MACE and distilled FTT."""
     expanded = max(abs(value) for bound in bounds for value in bound) > 0.75
+    angle15 = np.deg2rad(15.0)
+    angle30 = np.deg2rad(30.0)
+    mixed = np.asarray((1.0, 0.8 * np.cos(angle15), 0.8 * np.sin(angle15)))
+    mixed /= np.linalg.norm(mixed)
     directions = (
+        ("breathing", r"breathing $Q_s$", (1.0, 0.0, 0.0), 0.72, 23),
+        ("branching", r"branching $\theta=0^\circ$", (0.0, 1.0, 0.0), 0.88, 23),
         (
-            r"breathing $Q_s$",
-            np.asarray((1.0, 0.0, 0.0)),
-            0.72 if expanded else 0.55,
+            "theta15",
+            r"branching $\theta=15^\circ$",
+            (0.0, np.cos(angle15), np.sin(angle15)),
+            0.88,
+            15,
         ),
         (
-            r"branching $Q_x$",
-            np.asarray((0.0, 1.0, 0.0)),
-            0.88 if expanded else 0.62,
+            "theta30",
+            r"branching $\theta=30^\circ$",
+            (0.0, np.cos(angle30), np.sin(angle30)),
+            0.88,
+            15,
         ),
         (
+            "diagonal",
             r"diagonal $Q_x=Q_y$",
             np.asarray((0.0, 1.0, 1.0)) / np.sqrt(2.0),
-            0.88 if expanded else 0.62,
+            0.88,
+            23,
         ),
+        ("mixed", r"mixed $Q_s+Q_{15^\circ}$", mixed, 0.92, 15),
     )
-    raw_abscissa = []
-    raw_coordinates = []
-    dense_abscissa = []
-    dense_coordinates = []
-    for _name, direction, extent in directions:
-        raw_axis = np.linspace(-extent, extent, 23)
+    if not expanded:
+        directions = tuple(
+            (key, name, direction, min(extent, 0.62), points)
+            for key, name, direction, extent, points in directions
+        )
+    raw_abscissa, raw_coordinates = [], []
+    dense_abscissa, dense_coordinates = [], []
+    for _key, _name, direction, extent, points in directions:
+        direction = np.asarray(direction, dtype=float)
+        raw_axis = np.linspace(-extent, extent, points)
         dense_axis = np.linspace(-extent, extent, 401)
         raw_abscissa.append(raw_axis)
         raw_coordinates.append(raw_axis[:, None] * direction[None, :])
@@ -357,6 +485,7 @@ def plot_pes_cuts(sampler, fit, validation_metrics, suffix=""):
         np.linalg.eigvalsh(fit.neural_energy.predict(coordinates))
         for coordinates in raw_coordinates
     ]
+
     def ftt_levels(coordinates):
         fitted_bounds = np.asarray(fit.energy.bounds_, dtype=float)
         inside = np.all(
@@ -387,32 +516,34 @@ def plot_pes_cuts(sampler, fit, validation_metrics, suffix=""):
     )
     colors = ("#0072B2", "#D55E00")
     figure, panels = plt.subplots(
-        2,
+        4,
         3,
-        figsize=(9.0, 5.1),
+        figsize=(9.0, 8.8),
         constrained_layout=True,
-        gridspec_kw={"height_ratios": (2.1, 1.0)},
-        sharex="col",
+        gridspec_kw={"height_ratios": (2.0, 0.9, 2.0, 0.9)},
     )
-    for column, (name, _direction, _extent) in enumerate(directions):
-        origin = float(np.min(raw_levels[column]))
+    for index, (_key, name, _direction, _extent, _points) in enumerate(directions):
+        block, column = divmod(index, 3)
+        energy_panel = panels[2 * block, column]
+        residual_panel = panels[2 * block + 1, column]
+        origin = float(np.min(raw_levels[index]))
         for state, color in enumerate(colors):
-            panels[0, column].plot(
-                dense_abscissa[column],
-                (mace_dense_levels[column][:, state] - origin) * au2ev,
+            energy_panel.plot(
+                dense_abscissa[index],
+                (mace_dense_levels[index][:, state] - origin) * au2ev,
                 color=color,
                 label=fr"MACE $S_{state + 1}$",
             )
-            panels[0, column].plot(
-                dense_abscissa[column],
-                (ftt_dense_levels[column][:, state] - origin) * au2ev,
+            energy_panel.plot(
+                dense_abscissa[index],
+                (ftt_dense_levels[index][:, state] - origin) * au2ev,
                 "--",
                 color=color,
                 label=fr"FTT $S_{state + 1}$",
             )
-            panels[0, column].scatter(
-                raw_abscissa[column],
-                (raw_levels[column][:, state] - origin) * au2ev,
+            energy_panel.scatter(
+                raw_abscissa[index],
+                (raw_levels[index][:, state] - origin) * au2ev,
                 s=17,
                 facecolor="white",
                 edgecolor=color,
@@ -420,39 +551,41 @@ def plot_pes_cuts(sampler, fit, validation_metrics, suffix=""):
                 zorder=3,
                 label=fr"FCI $S_{state + 1}$",
             )
-            panels[1, column].plot(
-                raw_abscissa[column],
-                (mace_raw_levels[column][:, state] - raw_levels[column][:, state])
+            residual_panel.plot(
+                raw_abscissa[index],
+                (mace_raw_levels[index][:, state] - raw_levels[index][:, state])
                 * au2ev
                 * 1000.0,
                 color=color,
                 marker="o",
                 markersize=2.5,
             )
-            panels[1, column].plot(
-                raw_abscissa[column],
-                (ftt_raw_levels[column][:, state] - raw_levels[column][:, state])
+            residual_panel.plot(
+                raw_abscissa[index],
+                (ftt_raw_levels[index][:, state] - raw_levels[index][:, state])
                 * au2ev
                 * 1000.0,
                 "--",
                 color=color,
             )
-        panels[0, column].set_title(fr"({chr(97 + column)}) {name}")
-        panels[1, column].axhline(0.0, color="0.6", linewidth=0.7)
-        panels[1, column].set_xlabel(r"cut coordinate (bohr)")
-        panels[1, column].set_title(fr"({chr(100 + column)}) level residual")
-        for panel in panels[:, column]:
+        energy_panel.set_title(fr"({chr(97 + index)}) {name}")
+        residual_panel.axhspan(-20.0, 20.0, color="0.92", zorder=-2)
+        residual_panel.axhline(0.0, color="0.55", linewidth=0.7)
+        residual_panel.set_xlabel(r"cut coordinate (bohr)")
+        for panel in (energy_panel, residual_panel):
             panel.spines[["top", "right"]].set_visible(False)
             panel.tick_params(direction="out")
-    panels[0, 0].set_ylabel("energy relative to cut minimum (eV)")
-    panels[1, 0].set_ylabel("fit - FCI (meV)")
-    panels[0, 0].legend(frameon=False, ncol=2)
+    for row in (0, 2):
+        panels[row, 0].set_ylabel("energy relative to cut minimum (eV)")
+    for row in (1, 3):
+        panels[row, 0].set_ylabel("fit - FCI (meV)")
+    handles, labels = panels[0, 0].get_legend_handles_labels()
+    figure.legend(handles, labels, frameon=False, ncol=6, loc="outside lower center")
     figure.suptitle(
         "H$_3^+$ spin-pure singlet full CI/aug-cc-pVDZ\n"
-        + rf"validation max $||\Delta \bar H||_F$="
+        + r"validation max $||\Delta \bar H||_F$="
         + f"{validation_metrics['maximum_hamiltonian_error_hartree'] * au2ev:.3f} eV, "
-        + rf"relative link error={validation_metrics['relative_link_error']:.3f}; "
-        + f"rejected above {7.5e-4 * au2ev:.3f} eV"
+        + rf"relative link error={validation_metrics['relative_link_error']:.3f}"
     )
     cut_path = output / f"h3plus_fci_physical_fitted_pes_cuts{suffix}"
     figure.savefig(cut_path.with_suffix(".pdf"))
@@ -460,16 +593,15 @@ def plot_pes_cuts(sampler, fit, validation_metrics, suffix=""):
     plt.close(figure)
 
     arrays = {}
-    for column, _direction in enumerate(directions):
-        key = ("breathing", "branching", "diagonal")[column]
-        arrays[f"{key}_raw_coordinate"] = raw_abscissa[column]
-        arrays[f"{key}_raw_fci_hamiltonian"] = raw_hamiltonians[column]
-        arrays[f"{key}_raw_fci_levels"] = raw_levels[column]
-        arrays[f"{key}_raw_mace_levels"] = mace_raw_levels[column]
-        arrays[f"{key}_raw_ftt_levels"] = ftt_raw_levels[column]
-        arrays[f"{key}_dense_coordinate"] = dense_abscissa[column]
-        arrays[f"{key}_dense_mace_levels"] = mace_dense_levels[column]
-        arrays[f"{key}_dense_ftt_levels"] = ftt_dense_levels[column]
+    for index, (key, _name, _direction, _extent, _points) in enumerate(directions):
+        arrays[f"{key}_raw_coordinate"] = raw_abscissa[index]
+        arrays[f"{key}_raw_fci_hamiltonian"] = raw_hamiltonians[index]
+        arrays[f"{key}_raw_fci_levels"] = raw_levels[index]
+        arrays[f"{key}_raw_mace_levels"] = mace_raw_levels[index]
+        arrays[f"{key}_raw_ftt_levels"] = ftt_raw_levels[index]
+        arrays[f"{key}_dense_coordinate"] = dense_abscissa[index]
+        arrays[f"{key}_dense_mace_levels"] = mace_dense_levels[index]
+        arrays[f"{key}_dense_ftt_levels"] = ftt_dense_levels[index]
     np.savez(cut_path.with_suffix(".npz"), **arrays)
     return cut_path
 
@@ -554,6 +686,22 @@ def main():
         action="store_true",
         help="qualify an adaptive ab initio fit on the expanded 21^3 chart",
     )
+    parser.add_argument(
+        "--refine-h-fit",
+        action="store_true",
+        help="continue an existing fit with the balanced trace/traceless objective",
+    )
+    parser.add_argument("--refine-epochs", type=int, default=1500)
+    parser.add_argument(
+        "--production-build",
+        action="store_true",
+        help="use the native adaptive ensemble-MACE/FTT acceptance pipeline",
+    )
+    parser.add_argument(
+        "--database-audit",
+        action="store_true",
+        help="report reusable symmetry-reduced records and stop",
+    )
     args = parser.parse_args()
     if args.expanded_fit:
         bounds = ((-0.80, 0.80), (-1.00, 1.00), (-1.00, 1.00))
@@ -587,44 +735,199 @@ def main():
     root_s2 = np.asarray([mc.spin_square(root) for root in range(6)])
     if np.max(np.abs(root_s2)) > 1.0e-7:
         raise RuntimeError(f"non-singlet CASCI root detected: S^2={root_s2}")
+    fit_options = (
+        {
+            "model": "mace",
+            "cache_only": True,
+            "initial": 320,
+            "batch": 24,
+            "maximum": 320,
+            "rounds": 1,
+            "calibration": 64,
+            "validation": 96,
+            "ensemble": 3,
+            "epochs": 300,
+            "refinement_epochs": 240,
+            "sync_steps": 600,
+            "feature_rank": 20,
+            "hidden": (128, 128),
+            "encoder": {
+                "channels": 24,
+                "max_ell": 2,
+                "interactions": 2,
+                "correlation": 2,
+                "radial_basis": 10,
+                "radial_mlp": (96, 96),
+                "cutoff": 5.0,
+            },
+            "degrees": 12,
+            "rank": 64,
+            "verbose": True,
+            "strict": False,
+        }
+        if args.production_build
+        else {"degrees": (8, 10, 10), "rank": 64}
+    )
     sampler = AbInitioFit(
         mc,
         coord=coord,
         states=(1, 2),
         nroots=6,
-        fit_options={"degrees": (8, 10, 10), "rank": 64},
+        fit_options=fit_options,
         database=database,
         workers=6,
         progress=False,
     )
+    if args.database_audit:
+        reusable = sampler._database_coordinates()
+        print(
+            json.dumps(
+                {
+                    "database": str(database),
+                    "records": sampler.database.stats["records"],
+                    "protocol_matched_symmetry_representatives": len(reusable),
+                    "group": sampler.group,
+                    "coord_irreps": sampler.coord_irreps,
+                    "bounds": bounds,
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
+        sampler.close()
+        return
+    if args.production_build:
+        fit = sampler.build()
+        if not fit.success:
+            checkpoint = fit.mace.save(output / "production_mace_rejected.pt")
+            validation_path = plot_production_validation(fit)
+            report = {
+                "accepted": False,
+                "model": fit.model,
+                "group": fit.group,
+                "coord_irreps": fit.coord_irreps,
+                "state_validation": fit.state_validation,
+                "validation": fit.validation,
+                "acceptance": fit.acceptance,
+                "database": str(database),
+                "database_writes": fit.stats["database"]["writes"],
+                "checkpoint": str(checkpoint),
+                "validation_figure": str(validation_path.with_suffix(".png")),
+            }
 
-    group = group_coordinates()
-    feature_rank = 32 if args.expanded_fit else 16
+            def json_default(value):
+                if isinstance(value, np.ndarray):
+                    return value.tolist()
+                if isinstance(value, np.generic):
+                    return value.item()
+                raise TypeError(type(value).__name__)
+
+            report_path = output / "production_fit_rejected.json"
+            report_path.write_text(
+                json.dumps(report, indent=2, default=json_default) + "\n"
+            )
+            print(json.dumps(report, indent=2, default=json_default), flush=True)
+            print(validation_path.with_suffix(".png"), flush=True)
+            return
+        fit_directory = output / "production_fit"
+        fit.save(fit_directory, labels=("Qs", "Qx", "Qy"))
+        independent = fit.validation["independent"]
+        metrics = {
+            "maximum_hamiltonian_error_hartree": independent[
+                "maximum_hamiltonian_error"
+            ],
+            "rms_hamiltonian_error_hartree": independent[
+                "rms_hamiltonian_error"
+            ],
+            "maximum_relative_link_error": independent[
+                "maximum_relative_link_error"
+            ],
+            "relative_link_error": independent["relative_link_error"],
+        }
+        cut_path = plot_pes_cuts(
+            sampler, fit.mace, metrics, suffix="_production_accepted"
+        )
+        report = {
+            "accepted": fit.acceptance["accepted"],
+            "model": fit.model,
+            "group": fit.group,
+            "coord_irreps": fit.coord_irreps,
+            "state_validation": fit.state_validation,
+            "validation": fit.validation,
+            "acceptance": fit.acceptance,
+            "database": str(database),
+            "database_writes": fit.stats["database"]["writes"],
+            "fit_directory": str(fit_directory),
+            "pes_cuts": str(cut_path.with_suffix(".png")),
+        }
+        (output / "production_fit_report.json").write_text(
+            json.dumps(report, indent=2) + "\n"
+        )
+        print(json.dumps(report, indent=2), flush=True)
+        print(cut_path.with_suffix(".png"), flush=True)
+        return
+
+    feature_rank = 20 if args.expanded_fit else 16
     calibration_base = np.asarray((0.0, 0.065, 0.027))
-    calibration = calibration_base @ group.transpose(0, 2, 1)
-    finite_group = infer_s3(
-        sampler.continuous_fields(calibration)["hamiltonians"],
-        feature_rank=feature_rank,
+    calibration = sampler.orbit(calibration_base)
+    finite_group = sampler.mace_group(feature_rank, tolerance=2.0e-7)
+    orbit_budget = sampler.reduced_size
+    full_domain_initial_budget = (
+        1
+        + 6
+        + (384 if args.expanded_fit else 192)
+        + (96 if args.expanded_fit else 48)
+        + (256 if args.expanded_fit else 0)
     )
     training_parts = [
         np.zeros((1, 3)),
         calibration,
-        physical_coordinates(19, 384 if args.expanded_fit else 192, radius=5.0 if args.expanded_fit else 3.5),
-        physical_shell(29, 96 if args.expanded_fit else 48, radius=4.5 if args.expanded_fit else 3.6),
+        physical_coordinates(
+            19,
+            orbit_budget(384 if args.expanded_fit else 192),
+            radius=5.0 if args.expanded_fit else 3.5,
+        ),
+        physical_shell(
+            29,
+            orbit_budget(96 if args.expanded_fit else 48),
+            radius=4.5 if args.expanded_fit else 3.6,
+        ),
     ]
     if args.expanded_fit:
-        training_parts.append(uniform_coordinates(39, 256))
-    training = np.unique(np.vstack(training_parts), axis=0)
+        training_parts.append(uniform_coordinates(39, orbit_budget(256)))
+    requested_training_points = len(np.unique(np.vstack(training_parts), axis=0))
+    training = sampler.reduce_coordinates(np.vstack(training_parts))
+    reduced_initial_training_points = len(training)
     if args.expanded_fit:
-        validation, validation_pairs = paired_coordinates(119, 256)
+        validation, validation_pairs = paired_coordinates(119, orbit_budget(256))
+        requested_validation_pairs = len(validation_pairs)
+        validation, validation_pairs = sampler.reduce_pairs(
+            validation, validation_pairs
+        )
     else:
-        validation = physical_coordinates(119, 128)
+        validation = physical_coordinates(119, orbit_budget(128))
+        requested_validation_pairs = None
+        validation = sampler.reduce_coordinates(validation)
         validation_pairs = graph_pairs(validation)
     validation_fields = sampler.continuous_fields(
         validation, validation_pairs
     )
     subspace = subspace_diagnostics(validation_fields)
-    print(f"singlet subspace: {subspace}", flush=True)
+    state_gaps = state_gap_diagnostics(sampler, validation)
+    state_gap_summary = {
+        key: value
+        for key, value in state_gaps.items()
+        if key
+        not in {
+            "coordinates",
+            "excluded_root_gaps",
+            "nearest_excluded_root_gap",
+        }
+    }
+    print(
+        f"singlet subspace: {subspace}; excluded-root gaps: {state_gap_summary}",
+        flush=True,
+    )
     if subspace["minimum_link_singular_value"] < 0.9:
         raise RuntimeError(
             "refusing fit: the selected singlet pair leaks from the local "
@@ -632,14 +935,20 @@ def main():
         )
     diagnostic_suffix = "_diagnostic" if args.diagnostic_cuts else ""
     if args.expanded_fit:
-        diagnostic_suffix += "_expanded_abinitio"
-    checkpoint = output / f"physical_s3_mace_y{diagnostic_suffix}.pt"
-    history_path = output / f"physical_adaptive_history{diagnostic_suffix}.json"
-    training_path = output / f"physical_adaptive_training{diagnostic_suffix}.npy"
+        diagnostic_suffix += "_curvilinear_expanded_abinitio"
+    fit_suffix = "_curvilinear_expanded_abinitio" if args.expanded_fit else ""
+    checkpoint = output / f"physical_s3_quotient_mace_y{fit_suffix}.pt"
+    history_path = output / f"physical_s3_quotient_history{fit_suffix}.json"
+    training_path = output / f"physical_s3_quotient_training{fit_suffix}.npy"
     started = perf_counter()
     if checkpoint.is_file() and history_path.is_file():
         fit = MACE.load(checkpoint, mace_geometry, distill=False)
         history = json.loads(history_path.read_text())
+        history = [
+            item
+            for item in history
+            if item.get("stage") != "symmetry-adapted polynomial Hamiltonian head"
+        ]
         if training_path.is_file():
             training = np.load(training_path)
     else:
@@ -657,6 +966,32 @@ def main():
         history_path.write_text(json.dumps(history, indent=2) + "\n")
         np.save(training_path, training)
 
+    if args.refine_h_fit:
+        refinement_pairs = graph_pairs(training)
+        refinement_fields = sampler.continuous_fields(
+            training, refinement_pairs
+        )
+        fit.refine_hamiltonian(
+            training,
+            refinement_fields["hamiltonians"],
+            epochs=args.refine_epochs,
+            learning_rate=1.0e-3,
+            objective="trace-traceless",
+            seed=19,
+        )
+        history.append(
+            {
+                "round": int(history[-1]["round"]) + 1,
+                "stage": "frozen-encoder S3-projected MACE H refinement",
+                **subspace,
+                **state_gap_summary,
+                **assess(fit, validation_fields),
+            }
+        )
+        print(f"Hamiltonian refinement: {history[-1]}", flush=True)
+        fit.save(checkpoint)
+        history_path.write_text(json.dumps(history, indent=2) + "\n")
+
     for adaptive_round in range(
         int(history[-1]["round"]) + 1,
         1 if args.diagnostic_cuts else (9 if args.expanded_fit else 5),
@@ -669,21 +1004,29 @@ def main():
         if args.expanded_fit:
             candidates, candidate_pairs = paired_coordinates(
                 200 + adaptive_round,
-                128,
+                orbit_budget(128),
                 physical_fraction=0.35,
             )
+            candidates, candidate_pairs = sampler.reduce_pairs(
+                candidates, candidate_pairs
+            )
         else:
-            candidates = physical_coordinates(200 + adaptive_round, 128)
+            candidates = physical_coordinates(
+                200 + adaptive_round, orbit_budget(128)
+            )
+            candidates = sampler.reduce_coordinates(candidates)
             candidate_pairs = graph_pairs(candidates)
         candidate_fields = sampler.continuous_fields(
             candidates, candidate_pairs
         )
         candidate_h_error = np.linalg.norm(
-            fit.neural_energy.predict(candidates)
+            fit.neural_energy.predict(candidate_fields["coordinates"])
             - candidate_fields["hamiltonians"],
             axis=(-2, -1),
         )
-        candidate_feature = fit.neural_feature.predict(candidates)
+        candidate_feature = fit.neural_feature.predict(
+            candidate_fields["coordinates"]
+        )
         predicted_candidate_links = (
             candidate_feature[candidate_pairs[:, 0]].conj().swapaxes(-1, -2)
             @ candidate_feature[candidate_pairs[:, 1]]
@@ -704,12 +1047,20 @@ def main():
             candidate_link_error / 2.0e-2,
         )
         acquired_pairs = candidate_pairs[
-            np.argsort(acquisition_score)[-(48 if args.expanded_fit else 16):]
+            np.argsort(acquisition_score)[
+                -orbit_budget(48 if args.expanded_fit else 16):
+            ]
         ]
         training = np.unique(
-            np.vstack((training, candidates[np.unique(acquired_pairs)])),
+            np.vstack(
+                (
+                    training,
+                    candidate_fields["coordinates"][np.unique(acquired_pairs)],
+                )
+            ),
             axis=0,
         )
+        training = sampler.reduce_coordinates(training)
         fit = train_mace(
             sampler,
             grid,
@@ -738,9 +1089,12 @@ def main():
         np.save(training_path, training)
     fit_seconds = perf_counter() - started
 
+    history[-1].update(assess(fit, validation_fields))
+    history_path.write_text(json.dumps(history, indent=2) + "\n")
+
     if args.diagnostic_cuts or args.plot_cuts:
         if fit.energy is fit.neural_energy:
-            fit.distill_y(rank=64, degree=10, method="grid", seed=19)
+            fit.distill_y(rank=64, degree=12, method="grid", seed=19)
             fit.save(checkpoint)
         accepted = (
             history[-1]["maximum_hamiltonian_error_hartree"] <= 7.5e-4
@@ -753,11 +1107,17 @@ def main():
             suffix=(
                 ("_diagnostic_" if args.diagnostic_cuts else "_adaptive_")
                 + ("accepted" if accepted else "rejected")
-                + ("_expanded_abinitio" if args.expanded_fit else "")
+                + ("_curvilinear_expanded_abinitio" if args.expanded_fit else "")
             ),
+        )
+        leakage_path = plot_state_leakage(
+            validation_fields,
+            state_gaps,
+            suffix=("_curvilinear_expanded" if args.expanded_fit else ""),
         )
         print(json.dumps(history[-1], indent=2), flush=True)
         print(cut_path.with_suffix(".png"), flush=True)
+        print(leakage_path.with_suffix(".png"), flush=True)
         return
 
     converged = (
@@ -776,7 +1136,7 @@ def main():
         or fit.energy is fit.neural_energy
         or fit.feature is fit.neural_feature
     ):
-        fit.distill_y(rank=64, degree=10, method="grid", seed=19)
+        fit.distill_y(rank=64, degree=12, method="grid", seed=19)
         fit.save(checkpoint)
     distilled_validation = assess_models(fit.energy, fit.feature, validation_fields)
     if (
@@ -908,8 +1268,22 @@ def main():
         "gauge": "anchor-Procrustes",
         "fit": "S3-equivariant MACE (H,Y) distilled to FTT",
         "sampling_measure": (
-            "independent harmonic/CAP-accessible ellipsoid plus outer shell"
+            "one canonical S3 representative per harmonic/CAP-accessible orbit "
+            "plus outer shell"
         ),
+        "sampling_symmetry": {
+            "group": sampler.group,
+            "coord_repr": sampler.coord_repr.tolist(),
+            "state_repr": sampler.state_repr.tolist(),
+            "validation": sampler.symmetry_validation,
+            "state_validation": sampler.state_validation,
+        },
+        "full_domain_initial_sample_budget": int(full_domain_initial_budget),
+        "requested_initial_training_points": int(requested_training_points),
+        "symmetry_reduced_initial_training_points": int(
+            reduced_initial_training_points
+        ),
+        "requested_validation_pairs": requested_validation_pairs,
         "unitarize_links": False,
         "training_points": int(fit.info["energy_samples"]),
         "adaptive_history": history,

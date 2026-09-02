@@ -119,6 +119,7 @@ def _validate_finite_group(
     ndim,
     nstates,
     feature_rank,
+    origin=None,
     tolerance=1.0e-8,
 ):
     r"""Validate aligned coordinate, electronic, and ambient group representations."""
@@ -127,6 +128,9 @@ def _validate_finite_group(
     electronic = np.asarray(electronic_representations, dtype=complex)
     ambient = np.asarray(ambient_representations, dtype=complex)
     order = len(coordinate)
+    origin = np.zeros(int(ndim)) if origin is None else np.asarray(origin, dtype=float)
+    if origin.shape != (int(ndim),):
+        raise ValueError("finite-group origin has an incompatible shape")
     if coordinate.shape != (order, int(ndim), int(ndim)):
         raise ValueError("coordinate representations have an incompatible shape")
     if electronic.shape != (order, int(nstates), int(nstates)):
@@ -173,6 +177,7 @@ def _validate_finite_group(
         "electronic_representations": electronic,
         "ambient_representations": ambient,
         "multiplication_table": multiplication,
+        "origin": origin,
         "tolerance": float(tolerance),
     }
 
@@ -960,6 +965,14 @@ class MACE:
     After neural training the fields are evaluated on the requested DVR grid
     and distilled to :class:`~pyqed.mps.functional.FunctionalTT`, making this
     object directly consumable by ``TTLDR.from_fit``.
+
+    This is a molecule-specific adaptation of I. Batatia et al., *Advances in
+    Neural Information Processing Systems* **35**, 11423 (2022),
+    https://arxiv.org/abs/2206.07697.  PyQED uses a MACE invariant encoder with
+    matrix-valued chart heads, Procrustes-gauged Hamiltonian/link targets,
+    optional finite-group Reynolds projection, and no force training; it is
+    not an exact reproduction of the interatomic-potential architecture or
+    its reference accuracy guarantees.
     """
 
     def __init__(
@@ -971,6 +984,7 @@ class MACE:
         *,
         chart_features=False,
         chart_bounds=None,
+        periodic_axes=(),
         geometry_units="angstrom",
         **encoder_options,
     ) -> None:
@@ -1002,14 +1016,23 @@ class MACE:
         ):
             raise ValueError("chart_bounds must contain one increasing pair per grid")
         self.chart_bounds = tuple(tuple(map(float, bound)) for bound in chart_bounds)
+        self.periodic_axes = tuple(
+            sorted(set(int(axis) for axis in periodic_axes))
+        )
+        if any(
+            axis < 0 or axis >= len(self.grids)
+            for axis in self.periodic_axes
+        ):
+            raise ValueError("periodic_axes contains an invalid coordinate")
         self._chart_center = np.mean(chart_bounds, axis=1)
         self._chart_scale = 0.5 * np.ptp(chart_bounds, axis=1)
         self.encoder_options = dict(encoder_options)
         self.encoder = MACEEncoder(
             species, geometry_units=self.geometry_units, **encoder_options
         )
+        chart_size = len(self.grids) + len(self.periodic_axes)
         self.feature_size = self.encoder.output_size + (
-            len(self.grids) if self.chart_features else 0
+            chart_size if self.chart_features else 0
         )
         self.energy = None
         self.links = None
@@ -1047,7 +1070,22 @@ class MACE:
         latent = self.encoder.forward(batch)
         if not self.chart_features:
             return latent
-        chart = (np.asarray(coordinates) - self._chart_center) / self._chart_scale
+        coordinates = np.asarray(coordinates, dtype=float)
+        chart_columns = []
+        periodic = frozenset(self.periodic_axes)
+        for axis in range(len(self.grids)):
+            if axis in periodic:
+                lower, upper = self.chart_bounds[axis]
+                phase = 2.0 * np.pi * (
+                    coordinates[:, axis] - lower
+                ) / (upper - lower)
+                chart_columns.extend((np.cos(phase), np.sin(phase)))
+            else:
+                chart_columns.append(
+                    (coordinates[:, axis] - self._chart_center[axis])
+                    / self._chart_scale[axis]
+                )
+        chart = np.column_stack(chart_columns)
         chart = self.encoder.torch.as_tensor(
             chart, device=self.encoder.device, dtype=self.encoder.dtype
         )
@@ -1107,7 +1145,10 @@ class MACE:
     def _finite_group_coordinates(self, coordinates):
         values = np.asarray(coordinates, dtype=float)
         representation = self.finite_group_["coordinate_representations"]
-        orbit = np.einsum("gij,nj->gni", representation, values, optimize=True)
+        origin = self.finite_group_["origin"]
+        orbit = origin + np.einsum(
+            "gij,nj->gni", representation, values - origin, optimize=True
+        )
         return orbit.reshape(-1, values.shape[1])
 
     def _finite_group_tensors(self, dtype):
@@ -1763,6 +1804,7 @@ class MACE:
         sync_tol=1.0e-8,
         ambient_representation="full",
         energy_representation="coupled",
+        energy_objective="matrix",
         coordinate_exchange=None,
         fixed_symmetry_representations=(),
         coordinate_exchange_axes=(0, 1),
@@ -1827,6 +1869,12 @@ class MACE:
         if energy_representation not in {"coupled", "direct"}:
             raise ValueError("energy_representation must be 'coupled' or 'direct'")
         self.energy_representation_ = energy_representation
+        energy_objective = str(energy_objective).lower().replace("_", "-")
+        if energy_objective not in {"matrix", "trace-traceless"}:
+            raise ValueError(
+                "energy_objective must be 'matrix' or 'trace-traceless'"
+            )
+        self.energy_objective_ = energy_objective
         frame_fraction = float(frame_fraction)
         ambient_fraction = float(ambient_fraction)
         energy_frame_gradient = float(energy_frame_gradient)
@@ -1875,6 +1923,7 @@ class MACE:
                 ndim=len(self.grids),
                 nstates=self.nstates,
                 feature_rank=self.feature_rank,
+                origin=finite_group.get("origin"),
                 tolerance=finite_group.get("tolerance", 1.0e-8),
             )
         self.ambient_representation_ = ambient_representation
@@ -1892,10 +1941,11 @@ class MACE:
             raise IndexError("feature anchor is outside the coordinate samples")
         if self.finite_group_ is not None:
             anchor_coordinate = coordinates[anchor]
-            anchor_orbit = np.einsum(
+            origin = self.finite_group_["origin"]
+            anchor_orbit = origin + np.einsum(
                 "gij,j->gi",
                 self.finite_group_["coordinate_representations"],
-                anchor_coordinate,
+                anchor_coordinate - origin,
                 optimize=True,
             )
             tolerance = self.finite_group_["tolerance"]
@@ -2356,6 +2406,14 @@ class MACE:
 
         link_scale = fixed_loss_scale("link", target_links)
         energy_scale = fixed_loss_scale("energy", target_energy)
+        target_scalar = torch.diagonal(
+            target_energy, dim1=-2, dim2=-1
+        ).sum(-1) / self.nstates
+        target_traceless = target_energy - target_scalar[:, None, None] * identity
+        scalar_scale = fixed_loss_scale(
+            "energy_scalar", target_scalar - torch.mean(target_scalar)
+        )
+        traceless_scale = fixed_loss_scale("energy_traceless", target_traceless)
         feature_scale = fixed_loss_scale("feature", target_features)
         self.encoder.model.train()
         self.history = []
@@ -2450,9 +2508,25 @@ class MACE:
                         0.5 * (predicted_energy + exchanged_energy),
                         predicted_energy,
                     )
-            energy_loss = torch.mean(
-                torch.abs(predicted_energy - target_energy) ** 2
-            ) / energy_scale
+            if energy_objective == "trace-traceless":
+                predicted_scalar = torch.diagonal(
+                    predicted_energy, dim1=-2, dim2=-1
+                ).sum(-1) / self.nstates
+                predicted_traceless = (
+                    predicted_energy
+                    - predicted_scalar[:, None, None] * identity
+                )
+                scalar_loss = torch.mean(
+                    torch.abs(predicted_scalar - target_scalar) ** 2
+                ) / scalar_scale
+                traceless_loss = torch.mean(
+                    torch.abs(predicted_traceless - target_traceless) ** 2
+                ) / traceless_scale
+                energy_loss = 0.5 * (scalar_loss + traceless_loss)
+            else:
+                energy_loss = torch.mean(
+                    torch.abs(predicted_energy - target_energy) ** 2
+                ) / energy_scale
             if feature_objective == "fixed":
                 feature_loss = torch.mean(torch.abs(features - target_features) ** 2)
                 feature_loss = feature_loss / feature_scale
@@ -2503,6 +2577,7 @@ class MACE:
             self.losses.append(parts)
 
         self.neural_energy = _NeuralField(self, "energy")
+        self.mace_energy = self.neural_energy
         self.neural_feature = _NeuralField(self, "feature")
         self.neural_links = None
         self.success = bool(np.isfinite(self.history[-1])) if self.history else False
@@ -2521,6 +2596,7 @@ class MACE:
             "energy_representation": (
                 "direct-H" if energy_representation == "direct" else "Y.H @ A @ Y"
             ),
+            "energy_objective": energy_objective,
             "ambient_representation": ambient_representation,
             "training_stages": {
                 "frame_epochs": frame_epochs,
@@ -2536,6 +2612,8 @@ class MACE:
             "warm_started": initial_fit is not None,
             "loss_scales": {
                 "energy": float(energy_scale.detach().cpu()),
+                "energy_scalar": float(scalar_scale.detach().cpu()),
+                "energy_traceless": float(traceless_scale.detach().cpu()),
                 "link": float(link_scale.detach().cpu()),
                 "feature": float(feature_scale.detach().cpu()),
             },
@@ -2573,6 +2651,7 @@ class MACE:
                 "electronic_representations_imag": self.finite_group_[
                     "electronic_representations"
                 ].imag.tolist(),
+                "origin": self.finite_group_["origin"].tolist(),
             }
         if distill:
             self.distill_y(rank=tt_rank, degree=tt_degree)
@@ -2580,6 +2659,146 @@ class MACE:
             self.energy = self.neural_energy
             self.feature = self.neural_feature
             self.links = None
+        return self
+
+    def refine_hamiltonian(
+        self,
+        coordinates,
+        hamiltonians,
+        *,
+        epochs=2000,
+        learning_rate=1.0e-3,
+        weight_decay=1.0e-8,
+        lbfgs_steps=100,
+        objective="trace-traceless",
+        seed=0,
+    ):
+        r"""Refine only the symmetry-projected MACE Hamiltonian head.
+
+        The atomistic encoder and endpoint field $Y$ remain frozen, so raw-link
+        predictions are unchanged.  If a finite group is attached, the loss is
+        evaluated after the same Reynolds projection used at inference.
+        """
+
+        if self._fit_mode != "features":
+            raise RuntimeError("Hamiltonian refinement requires a fitted MACE-Y model")
+        if getattr(self, "energy_representation_", "coupled") != "direct":
+            raise RuntimeError("Hamiltonian-only refinement requires direct-H output")
+        objective = str(objective).lower().replace("_", "-")
+        if objective not in {"matrix", "trace-traceless"}:
+            raise ValueError("objective must be 'matrix' or 'trace-traceless'")
+        coordinates = np.asarray(coordinates, dtype=float)
+        hamiltonians = np.asarray(hamiltonians, dtype=complex)
+        expected = (len(coordinates), self.nstates, self.nstates)
+        if hamiltonians.shape != expected:
+            raise ValueError(f"hamiltonians must have shape {expected}")
+
+        torch = self.encoder.torch
+        torch.manual_seed(int(seed))
+        complex_dtype = (
+            torch.complex64 if self.encoder.dtype == torch.float32 else torch.complex128
+        )
+        if self.finite_group_ is None:
+            model_coordinates = coordinates
+            electronic = None
+        else:
+            model_coordinates = self._finite_group_coordinates(coordinates)
+            electronic, _ambient = self._finite_group_tensors(complex_dtype)
+        batch = self.encoder.batch(self._geometries(model_coordinates))
+        self.encoder.model.eval()
+        with torch.no_grad():
+            latent = self._latent(batch, model_coordinates).detach()
+        target = torch.as_tensor(
+            hamiltonians, device=self.encoder.device, dtype=complex_dtype
+        )
+        identity = torch.eye(
+            self.nstates, device=self.encoder.device, dtype=complex_dtype
+        )
+        target_scalar = torch.diagonal(target, dim1=-2, dim2=-1).sum(-1) / self.nstates
+        target_traceless = target - target_scalar[:, None, None] * identity
+        scalar_scale = torch.mean(
+            torch.abs(target_scalar - torch.mean(target_scalar)) ** 2
+        ).clamp_min(1.0e-12)
+        traceless_scale = torch.mean(torch.abs(target_traceless) ** 2).clamp_min(
+            1.0e-12
+        )
+        matrix_scale = torch.mean(torch.abs(target) ** 2).clamp_min(1.0e-12)
+
+        def loss_value():
+            output = self._head_values(self._energy_head, latent)
+            predicted = self._matrix(output, hermitian=True)
+            if electronic is not None:
+                predicted = self._project_finite_group_energy(predicted, electronic)
+            if objective == "matrix":
+                return torch.mean(torch.abs(predicted - target) ** 2) / matrix_scale
+            scalar = (
+                torch.diagonal(predicted, dim1=-2, dim2=-1).sum(-1)
+                / self.nstates
+            )
+            traceless = predicted - scalar[:, None, None] * identity
+            return 0.5 * (
+                torch.mean(torch.abs(scalar - target_scalar) ** 2) / scalar_scale
+                + torch.mean(torch.abs(traceless - target_traceless) ** 2)
+                / traceless_scale
+            )
+
+        optimizer = torch.optim.Adam(
+            self._energy_head.parameters(),
+            lr=float(learning_rate),
+            weight_decay=float(weight_decay),
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(int(epochs), 1),
+            eta_min=0.02 * float(learning_rate),
+        )
+        losses = []
+        self._energy_head.module.train()
+        for _epoch in range(int(epochs)):
+            optimizer.zero_grad()
+            loss = loss_value()
+            loss.backward()
+            optimizer.step()
+            scheduler.step()
+            losses.append(float(loss.detach().cpu()))
+        lbfgs_steps = int(lbfgs_steps)
+        if lbfgs_steps > 0:
+            optimizer = torch.optim.LBFGS(
+                list(self._energy_head.parameters()),
+                lr=0.5,
+                max_iter=lbfgs_steps,
+                history_size=min(lbfgs_steps, 50),
+                line_search_fn="strong_wolfe",
+            )
+
+            def closure():
+                optimizer.zero_grad()
+                value = loss_value()
+                value.backward()
+                return value
+
+            optimizer.step(closure)
+            losses.append(float(loss_value().detach().cpu()))
+
+        self._energy_head.module.eval()
+        self.neural_energy = _NeuralField(self, "energy")
+        self.mace_energy = self.neural_energy
+        self.energy = self.neural_energy
+        self.energy_objective_ = objective
+        self.success = bool(losses and np.isfinite(losses[-1]))
+        self.message = "Hamiltonian head refined" if self.success else "non-finite loss"
+        self.info["hamiltonian_refinement"] = {
+            "model": "MACE direct-H head",
+            "encoder": "frozen",
+            "endpoint_field": "frozen",
+            "finite_group_projection": self.finite_group_ is not None,
+            "objective": objective,
+            "epochs": int(epochs),
+            "lbfgs_steps": lbfgs_steps,
+            "initial_loss": losses[0] if losses else np.nan,
+            "final_loss": losses[-1] if losses else np.nan,
+            "samples": len(coordinates),
+        }
         return self
 
     def set_coordinate_exchange_symmetry(
@@ -2967,6 +3186,7 @@ class MACE:
         *,
         rank=16,
         degree=6,
+        bases="chebyshev",
         method="grid",
         prediction_batch_size=1024,
         cross_points=None,
@@ -3001,8 +3221,23 @@ class MACE:
                 axis=0,
             )
 
+        bases = (
+            (str(bases),) * len(self.grids)
+            if isinstance(bases, str)
+            else tuple(str(value) for value in bases)
+        )
+        if len(bases) != len(self.grids):
+            raise ValueError("bases must contain one entry per coordinate")
         if method == "grid":
-            degrees = tuple(min(degree, len(grid) - 1) for grid in self.grids)
+            degrees = tuple(
+                min(
+                    degree,
+                    (len(grid) - 1) // 2
+                    if basis.lower() == "fourier"
+                    else len(grid) - 1,
+                )
+                for grid, basis in zip(self.grids, bases)
+            )
             sampling_grids = self.grids
         else:
             points = degree + 1 if cross_points is None else int(cross_points)
@@ -3021,11 +3256,10 @@ class MACE:
             sampling_grids = tuple(chebyshev_lobatto(grid) for grid in self.grids)
             degrees = (degree,) * len(self.grids)
         common = {
+            "bases": bases,
             "degrees": degrees,
             "rank": int(rank),
-            "bounds": tuple(
-                (float(grid[0]), float(grid[-1])) for grid in self.grids
-            ),
+            "bounds": tuple(self.chart_bounds),
             "normalization": "frobenius",
         }
         cross_info = None
@@ -3175,6 +3409,7 @@ class MACE:
             "feature_maximum_isometry_defect": float(np.max(isometry_defect)),
             "rank": int(rank),
             "degree": int(degree),
+            "bases": bases,
             "method": method,
             "prediction_batch_size": prediction_batch_size,
             "validation_points": int(len(validation_coordinates)),
@@ -3413,6 +3648,7 @@ class MACE:
                 "nstates": self.nstates,
                 "chart_features": self.chart_features,
                 "chart_bounds": self.chart_bounds,
+                "periodic_axes": self.periodic_axes,
                 "geometry_units": self.geometry_units,
                 "encoder_options": self.encoder_options,
                 "hidden": self._hidden,
@@ -3424,6 +3660,7 @@ class MACE:
                 "energy_representation": getattr(
                     self, "energy_representation_", "coupled"
                 ),
+                "energy_objective": getattr(self, "energy_objective_", "matrix"),
             },
             "encoder": self.encoder.model.state_dict(),
             "heads": heads,
@@ -3457,11 +3694,13 @@ class MACE:
         feature_rank = config.pop("feature_rank")
         ambient_representation = config.pop("ambient_representation")
         energy_representation = config.pop("energy_representation", "coupled")
+        energy_objective = config.pop("energy_objective", "matrix")
         encoder_options = dict(config.pop("encoder_options"))
         encoder_options["device"] = device
         fit = cls(geometry=geometry, **config, **encoder_options)
         fit.ambient_representation_ = ambient_representation
         fit.energy_representation_ = energy_representation
+        fit.energy_objective_ = energy_objective
         fit.encoder.model.load_state_dict(payload["encoder"])
         energy_basis = payload.get("energy_basis")
         fit.energy_basis_ = (
@@ -3501,6 +3740,7 @@ class MACE:
             ndim=len(fit.grids),
             nstates=fit.nstates,
             feature_rank=fit.feature_rank,
+            origin=finite_group.get("origin"),
             tolerance=finite_group.get("tolerance", 1.0e-8),
         )
         if fit.coordinate_exchange_ is not None:
@@ -3538,6 +3778,7 @@ class MACE:
                 "tolerance": float(fit.coordinate_exchange_["tolerance"]),
             }
         fit.neural_energy = _NeuralField(fit, "energy")
+        fit.mace_energy = fit.neural_energy
         if fit_mode == "features":
             feature_size = 2 * fit.feature_rank * fit.nstates
             fit._feature_head = _Head(
@@ -3593,6 +3834,7 @@ class MACE:
                 fit.distill_y(
                     rank=rank,
                     degree=degree,
+                    bases=distillation.get("bases", "chebyshev"),
                     method=distillation.get("method", "grid"),
                     cross_points=cross_options.get(
                         "points", None if sampling is None else int(sampling[0])

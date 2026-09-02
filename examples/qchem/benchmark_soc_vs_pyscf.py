@@ -15,12 +15,28 @@ from pyscf import ao2mo, fci, gto, mcscf, scf
 from pyqed.qchem import Molecule, st_soc
 from pyqed.qchem.soc import (
     soc_1e_prefactor,
-    spatial_soc_to_spin_orbital,
 )
 from pyqed.units import au2wavenumber
 
 
 AU2CM = au2wavenumber
+
+
+def reference_spatial_soc_to_grouped_spin_orbital(hso_xyz):
+    """Independent spin-first Kronecker construction for the benchmark."""
+
+    pauli = np.asarray(
+        (
+            ((0.0, 1.0), (1.0, 0.0)),
+            ((0.0, -1.0j), (1.0j, 0.0)),
+            ((1.0, 0.0), (0.0, -1.0)),
+        ),
+        dtype=complex,
+    )
+    return sum(
+        np.kron(1.0j * pauli[component], hso_xyz[component])
+        for component in range(3)
+    )
 
 
 @dataclass(frozen=True)
@@ -240,7 +256,7 @@ def pyscf_reference(case, soc_model="1e"):
     else:
         raise ValueError("soc_model must be '1e' or 'somf'.")
 
-    hso = spatial_soc_to_spin_orbital(hso_spatial, order="grouped")
+    hso = reference_spatial_soc_to_grouped_spin_orbital(hso_spatial)
     singlet_state = ci_to_state(c_s, case.ncas, na, nb)
     components = {
         ms: one_body_me(

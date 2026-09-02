@@ -561,6 +561,15 @@ class ElectronicDatabase:
         self.connection.commit()
         return cursor.rowcount == 1
 
+    def release_claims(self, owner):
+        """Release every unfinished calculation claim owned by one run."""
+
+        cursor = self.connection.execute(
+            "DELETE FROM claims WHERE owner = ?", (str(owner),)
+        )
+        self.connection.commit()
+        return int(cursor.rowcount)
+
     def active_claims(self):
         self.connection.execute("DELETE FROM claims WHERE expires_at <= ?", (time.time(),))
         self.connection.commit()

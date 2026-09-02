@@ -72,7 +72,10 @@ def dress(kinetic, overlap, *, nstates=None, threshold=0.0, symmetrize=False):
     return result
 
 
-def block(i, j, bra, ket, links, *, nstates, average_paths=False):
+def block(
+    i, j, bra, ket, links, *, nstates, average_paths=False,
+    shape=None, periodic_axes=(),
+):
     """Return one linked overlap block in dense-overlap orientation."""
 
     if i == j:
@@ -86,6 +89,8 @@ def block(i, j, bra, ket, links, *, nstates, average_paths=False):
             links,
             nstates=nstates,
             average_paths=average_paths,
+            shape=shape,
+            periodic_axes=periodic_axes,
         )
     value = overlap_tools.between(
         ket,
@@ -93,6 +98,8 @@ def block(i, j, bra, ket, links, *, nstates, average_paths=False):
         links,
         nstates=nstates,
         average_paths=average_paths,
+        shape=shape,
+        periodic_axes=periodic_axes,
     )
     return value.conjugate() if nstates is None else value.conj().T
 
@@ -106,6 +113,7 @@ def linked(
     threshold=0.0,
     symmetrize=True,
     average_paths=False,
+    periodic_axes=(),
 ):
     """Return a sparse kinetic matrix dressed by linked-product overlaps."""
 
@@ -124,6 +132,8 @@ def linked(
             links,
             nstates=nstates,
             average_paths=average_paths,
+            shape=shape,
+            periodic_axes=periodic_axes,
         ),
         nstates=nstates,
         threshold=threshold,
@@ -745,6 +755,7 @@ def matrix(
     nrot=1,
     threshold=0.0,
     average_paths=False,
+    periodic_axes=(),
     symmetrize=True,
 ):
     """Materialize an overlap-dressed kinetic matrix."""
@@ -759,7 +770,9 @@ def matrix(
         nrot,
     )
     if overlap_array is None and links is not None and nrot == 1:
-        overlap_array = overlap_tools.dense(shape, links, nstates=nstates)
+        overlap_array = overlap_tools.dense(
+            shape, links, nstates=nstates, periodic_axes=periodic_axes
+        )
 
     nuclear = kinetic.toarray() if sp.issparse(kinetic) else np.asarray(kinetic)
     state_eye = np.eye(nstates, dtype=complex)
@@ -799,6 +812,8 @@ def matrix(
                     links,
                     nstates=nstates,
                     average_paths=average_paths,
+                    shape=shape,
+                    periodic_axes=periodic_axes,
                 )
         result = result.reshape(ngrid * nstates, ngrid * nstates)
     else:
@@ -820,6 +835,8 @@ def matrix(
                     links,
                     nstates=nstates,
                     average_paths=average_paths,
+                    shape=shape,
+                    periodic_axes=periodic_axes,
                 )
                 result[i, :, :, j, :, :] = (
                     tij[:, None, :, None] * aij[None, :, None, :]
@@ -842,6 +859,7 @@ def operator(
     nrot=1,
     threshold=0.0,
     average_paths=False,
+    periodic_axes=(),
 ):
     """Return a matrix-free overlap-dressed kinetic operator."""
 
@@ -870,6 +888,8 @@ def operator(
                 links,
                 nstates=nstates,
                 average_paths=average_paths,
+                shape=shape,
+                periodic_axes=periodic_axes,
             )
             linked_cache[key] = value
         return value

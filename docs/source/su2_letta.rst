@@ -10,10 +10,11 @@ Construction
 
 By default, SU(2)-LETTA ties only nearest-neighbor orbitals in their current
 order.  This keeps the frontier width bounded even though the quantum-chemistry
-Hamiltonian MPO retains every one- and two-electron coupling.  Pass ``graph``
-explicitly to use a different variational tie graph; the graph does not screen
-or modify the Hamiltonian.  ``graph="nn"`` (or ``"nearest_neighbor"``) selects
-the default chain explicitly.
+Hamiltonian retains every one- and two-electron coupling.  The production
+optimizer currently materializes the fully reduced Hamiltonian MPO.  Pass
+``graph`` explicitly to use a different variational tie graph; the graph does
+not screen or modify the Hamiltonian.
+``graph="nn"`` (or ``"nearest_neighbor"``) selects the default chain explicitly.
 
 Build directly from a completed mean-field calculation through the qchem
 driver:
@@ -33,6 +34,20 @@ For an active-space calculation, additionally pass ``ncas``, ``nelecas``, and
 optionally ``ncore`` or ``mo_coeff``.  ``LETTA.from_integrals`` remains
 available for model Hamiltonians with precomputed spatial-orbital integrals.
 The generic tensor ansatz remains ``pyqed.letta.LETTA``.
+
+``hamiltonian_representation="complementary"`` is the default for
+``from_integrals`` and the qchem driver.  It carries the reduced
+$S/R/A/P/B/Q$ operators directly and does not store a Hamiltonian MPO.
+``hamiltonian_representation="mpo"`` remains available as an explicit
+reference.  Projected direct optimization automatically uses the conditional
+canonical gauge.  After each accepted coordinate update it exactly
+rematerializes the active pair, invalidates the corresponding reduced boundary,
+and advances the retained half-sweep environments.  The D>1 direct action and
+post-update energy are tested against the explicit reduced MPO.  Checkpoints
+store the active-space integrals and rebuild the selected representation on
+restart.
+Two-orbital models use the explicit reduced MPO automatically because there is
+no interior complementary-operator cut to amortize.
 
 For a pre-existing fully reduced spatial-orbital MPS, use the native class:
 
@@ -81,17 +96,21 @@ The convergence decision is made only after complete LR/RL cycles.  Inspect
 maximum pair-retraction error, rejected updates, memory owned by the state,
 and the number of consecutive qualifying cycles.
 
-For one-site updates, ``solver="auto"`` selects the native reduced
-Wigner--Eckart path.  ``solver="polarization"`` is retained only as an explicit
-small-system reference calculation; it is not selected automatically.
+For explicit-MPO one-site updates, ``solver="auto"`` selects the native
+reduced Wigner--Eckart path.  ``solver="polarization"`` is retained only as an
+explicit small-system reference calculation; it is not selected automatically.
 
 ``algorithm="projected"`` is the preferred fixed-D optimizer.  It embeds the
 tied one-site parameters into the adjacent channel-resolved DMRG pair space,
 projects the effective Hamiltonian and norm actions with that embedding, and
 removes null or redundant tied directions by diagonalizing the projected norm.
 The retained basis is norm-orthonormal before ordinary Hermitian Davidson is
-started.  This avoids an ill-conditioned generalized Krylov problem and lets
-the local solve reuse the incrementally advanced reduced DMRG environments.
+started.  This avoids an ill-conditioned generalized Krylov problem.
+Both explicit-MPO and direct complementary optimization incrementally advance
+DMRG-style environments.  The direct path discards the incremental
+materialization delta for the changed active pair and rematerializes that pair
+exactly before advancing its reduced boundary; the untouched side remains
+cached for the rest of the half sweep.
 An update is committed only when Davidson converges and its recomputed local
 Rayleigh quotient does not increase.  No magnetic or determinant-space
 projection is used.
@@ -122,6 +141,22 @@ site parameter or crossing conditional gauge changes.  Thus the production
 path carries the tie constraint as a persistent reduced-coordinate scatter
 map while retaining the rank-filtered metric basis required to remove null
 directions.
+
+At fixed ``D``, the adjacent channel-resolved pair topology and the
+parameter-to-pair contraction plan are invariant.  The projected optimizer
+therefore compiles them once per bond.  On later visits it compares the fixed
+neighbor blocks, reuses unchanged contractions, and applies only their numeric
+deltas to a block-scatter embedding.  The global pair-by-parameter matrix
+``E`` and whitened matrix ``E W`` are never materialized in the production
+path.  Forward and adjoint actions, support restriction, projected diagonals,
+metric contractions, and compiled factor-route projections consume the same
+reduced blocks directly.  Connected norm-component topology is derived from
+the structural parameter incidence, so its union-find decomposition is also
+reused while the component values remain freshly contracted.  The
+``constraint_cache_stats`` cycle diagnostic reports pair-coordinate hits,
+numeric embedding hits and delta updates, reused/updated embedding blocks, and
+metric-component topology hits.  These caches never reuse Hamiltonian or norm
+values across a tensor change.
 
 The moving Hamiltonian and norm sweeps are the sole local boundary owners in
 the projected path; redundant standalone adjacent-pair anchors are not built.
@@ -198,6 +233,15 @@ implementation.  This small
 scaling.  The run retained the CASCI energy within ``1e-13`` Hartree.  This is the fast
 LETTA path, but its tied metric and embedding work still make it slower than an
 unconstrained SU(2)-DMRG sweep.  Timings are machine-dependent.
+
+For a fixed-canonical-RHF pyrazine/6-31G CAS(10,10), ``D=4`` benchmark, the
+direct block-scatter coordinates and incremental caches reduced warm projected
+cycles from roughly 24 seconds to 5.7--5.9 seconds on the same development
+machine.  After cache population, pair topology and norm-component
+connectivity are reused across complete LR/RL cycles; numeric embedding blocks
+are still updated whenever the fixed neighboring tensor changes.  This is an
+architectural reduction in setup work, not a change to the variational
+manifold or convergence criterion.
 
 Pair updates
 ------------

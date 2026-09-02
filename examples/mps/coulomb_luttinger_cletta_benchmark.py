@@ -524,10 +524,10 @@ def _plot(args, results):
     )
     axes[0].format(
         xlabel=r"momentum $ka$",
-        ylabel=r"$K(k)$",
+        ylabel=r"$K_{\mathrm{LL}}(k)$",
         xlim=(args.momentum_min, args.momentum_max),
         ylim=(0.0, 1.04),
-        title=r"$K(k)$: matched 22 parameters",
+        title=r"$K_{\mathrm{LL}}(k)$: matched 22 parameters",
         grid=False,
     )
     axes[0].legend(loc="ul", frame=False)
@@ -703,7 +703,7 @@ def _plot_modes(args, results):
         )
     axes[0].format(
         xlabel=r"momentum $ka$",
-        ylabel=r"$K(k)$",
+        ylabel=r"$K_{\mathrm{LL}}(k)$",
         xlim=(args.momentum_min, args.momentum_max),
         ylim=(0.0, 1.04),
         title="Memory-channel resolution",

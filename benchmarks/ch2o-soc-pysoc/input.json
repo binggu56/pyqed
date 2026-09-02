@@ -1,0 +1,28 @@
+{
+  "system": {
+    "name": "formaldehyde",
+    "atoms": [
+      {"element": "C", "coordinates": [-0.13183, 0.0, -0.00029]},
+      {"element": "O", "coordinates": [1.06529, 0.0, 0.00009]},
+      {"element": "H", "coordinates": [-0.71844, 0.93971, 0.00010]},
+      {"element": "H", "coordinates": [-0.71844, -0.93971, 0.00014]}
+    ],
+    "unit": "angstrom",
+    "charge": 0,
+    "spin": 0
+  },
+  "method": {
+    "name": "full multicenter one-electron Breit-Pauli pVxp AO operator",
+    "basis": "PySOC mio-1-1 fitted Gaussian basis",
+    "pyqed_one_center": false,
+    "pysoc_calculation": "ONE",
+    "component_order": ["x", "y", "z"],
+    "sign_alignment": -1.0,
+    "reference_magnitude_floor": 1e-6
+  },
+  "validation": {
+    "quantity": "relative Frobenius norm of the AO pVxp residual",
+    "unit": "dimensionless",
+    "absolute_tolerance": 0.0002
+  }
+}

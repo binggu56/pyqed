@@ -3,7 +3,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from pyqed.units import au2ev
+from pyqed.units import amu_to_au, au2ev
+from pyqed.pbc import PeriodicPhononMode
 from pyqed.pbc.gw import (
     FULL_EWALD,
     ExcitonPhononChannel,
@@ -59,6 +60,7 @@ from pyqed.pbc.gw import (
     periodic_tda_operator,
     periodic_tda_spectrum,
     periodic_transition_velocity_matrix_elements,
+    phonon_tda_electron_phonon_coupling,
     prebuild_gdf_q_ao_stores,
     pyscf_gdf_orbital_pair_coupling,
     pyscf_gdf_transition_factors,
@@ -75,6 +77,7 @@ from pyqed.pbc.gw.self_energy import (
 from pyqed.pbc.gw.integrals import (
     _gdf_gaussian_ft_batch,
     _gdf_image_keys,
+    _gdf_is_reciprocal_zero,
     _gdf_metric_invsqrt,
     _pyscf_cell_from_reference,
 )
@@ -4391,6 +4394,17 @@ def test_gdf_range_separated_q0_applies_g0_compensation(two_k_h2_reference):
     assert factors.build_timings["three_center_short_range_g0_corrections"] >= 1
 
 
+def test_gdf_reciprocal_zero_recognizes_lattice_equivalent_momenta():
+    reference = SimpleNamespace(
+        cartesian_to_scaled=lambda vector: np.asarray(vector, dtype=float)
+    )
+
+    assert _gdf_is_reciprocal_zero(reference, [0.0, 0.0, 0.0])
+    assert _gdf_is_reciprocal_zero(reference, [1.0, -2.0, 3.0])
+    assert _gdf_is_reciprocal_zero(reference, [1.0 + 5.0e-11, 0.0, 0.0])
+    assert not _gdf_is_reciprocal_zero(reference, [0.5, 0.0, 0.0])
+
+
 def test_gdf_matches_pyscf_gdf_transition_metrics(two_k_h2_reference):
     pytest.importorskip("pyscf")
     two_k_h2_reference.pair_cut = 2
@@ -5919,6 +5933,94 @@ def test_diagonal_g0w0_prebuild_reuses_persistent_scf_gdf(two_k_h2_reference):
         mf.with_df.close()
 
 
+def test_gdf_g0w0_band_path_matches_mesh_and_reciprocal_periodicity():
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+        integral_options={"eri_representation": "direct"},
+    ).build()
+    kpts = cell.make_kpts((2, 1, 1))
+    mf = cell.KRHF(
+        kpts=kpts,
+        eta=0.5,
+        real_cut=2,
+        pair_cut=2,
+        recip_cut=5,
+    ).density_fit(
+        auxbasis="def2-svp-jkfit",
+        precision=1.0e-8,
+        storage="memory",
+        stream_pairs=True,
+    )
+    try:
+        mf.with_df.build(workers=2)
+        mf.run(max_cycle=40, conv_tol=1.0e-10, conv_tol_dm=1.0e-8)
+        assert mf.converged
+        gw = KGW(mf, eta=1.0e-3).g0w0(
+            backend="periodic",
+            coulomb_component="gdf",
+            direct_scale=1.0,
+            qp_bands=[0, 1],
+            intermediate_bands=[0, 1],
+            prebuild_screening=True,
+        )
+        cache_snapshot = {
+            name: set(value)
+            for name, value in vars(mf).items()
+            if name.startswith("_pbc_gdf_") and isinstance(value, dict)
+        }
+
+        mesh = gw.band_structure(
+            kpts=mf.kpts,
+            qp_bands=[0, 1],
+            intermediate_bands=[0, 1],
+            reference="none",
+            pair_workers=2,
+        )
+        np.testing.assert_allclose(mesh["mo_energy"], mf.mo_energy, atol=1.0e-12)
+        np.testing.assert_allclose(mesh["qp_energy"], gw.e_qp, atol=1.0e-12)
+        np.testing.assert_allclose(
+            mesh["sigma_c"],
+            gw.g0w0_result.sigma_c,
+            atol=1.0e-12,
+        )
+
+        off_mesh = gw.band_structure(
+            scaled_kpts=np.asarray([[0.125, 0.0, 0.0], [1.125, 0.0, 0.0]]),
+            qp_bands=[0, 1],
+            intermediate_bands=[0, 1],
+            reference="none",
+            pair_workers=2,
+        )
+        np.testing.assert_allclose(
+            off_mesh["mo_energy"][0],
+            off_mesh["mo_energy"][1],
+            atol=1.0e-12,
+        )
+        np.testing.assert_allclose(
+            off_mesh["qp_energy"][0],
+            off_mesh["qp_energy"][1],
+            atol=1.0e-12,
+        )
+        assert np.all(np.isfinite(off_mesh["qp_energy"]))
+        assert off_mesh["info"]["closure_kpoints"] == 4
+        assert off_mesh["info"]["requested_pairs"] == 4
+        assert off_mesh["info"]["gdf_pair_build"]["qpoints"] == 2
+        assert not off_mesh["interpolated"]
+        assert {
+            name: set(value)
+            for name, value in vars(mf).items()
+            if name.startswith("_pbc_gdf_") and isinstance(value, dict)
+        } == cache_snapshot
+        assert not mf.with_df._disk_maps
+    finally:
+        mf.with_df.close()
+
+
 def test_diagonal_g0w0_gdf_prebuild_can_use_workers(two_k_h2_reference):
     mf = two_k_h2_reference
     mf.gdf_auxbasis = "sto-3g"
@@ -7269,14 +7371,15 @@ def test_commensurate_tda_electron_phonon_driver_uses_folded_q_blocks(
         "bare": 0.4 * kernel1,
         "screened": 0.6 * kernel1,
     }
+    def fake_screened_derivative(source_operator, q_derivative):
+        q_derivative.gdf_screened_interaction_derivative = screened_response
+        q_derivative.gdf_screened_kernel_derivative_components = screened_components
+        return kernel1
+
     monkeypatch.setattr(
         "pyqed.pbc.gw.electron_phonon."
-        "_commensurate_gdf_screened_tda_kernel_derivative",
-        lambda source_operator, q_derivative: (
-            kernel1,
-            screened_response,
-            screened_components,
-        ),
+        "commensurate_gdf_screened_tda_kernel_derivative",
+        fake_screened_derivative,
     )
     screened = commensurate_tda_electron_phonon_coupling(
         operator,
@@ -7295,6 +7398,131 @@ def test_commensurate_tda_electron_phonon_driver_uses_folded_q_blocks(
         "bare_plus_static_screened_gdf"
     )
 
+
+def test_native_phonon_mode_dispatches_to_finite_q_coupling(
+    four_band_two_k_reference,
+    monkeypatch,
+):
+    space = KPointTransitionSpace(four_band_two_k_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    phonon_index = next(index for index in range(space.nqpts) if index != zero_index)
+    operator = periodic_tda_operator(
+        space,
+        q_index=zero_index,
+        direct_scale=0.0,
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+    )
+    scaled_qpoint = space.reference.cartesian_to_scaled(space.qpts[phonon_index])
+    masses = (
+        np.asarray(
+            four_band_two_k_reference.cell.unit_molecule.atom_mass_list(),
+            dtype=float,
+        )
+        * amu_to_au
+    )
+    eigenvector = np.asarray(
+        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+        dtype=float,
+    )
+
+    class FakePhonons:
+        def mode(self, qpoint, branch):
+            np.testing.assert_allclose(qpoint, scaled_qpoint)
+            return PeriodicPhononMode(
+                qpoint=qpoint,
+                branch=branch,
+                frequency=0.015,
+                eigenvector=eigenvector,
+                masses=masses,
+                source="test_phonons",
+            )
+
+    class FakeCoupling:
+        def __init__(self):
+            self.info = {}
+
+        def validate_momentum(self, candidate):
+            assert candidate is space
+            return self
+
+    expected = FakeCoupling()
+
+    def fake_coupling(
+        candidate_operator,
+        candidate_q_index,
+        mode_vector,
+        frequency,
+        **kwargs,
+    ):
+        assert candidate_operator is operator
+        assert candidate_q_index == phonon_index
+        np.testing.assert_allclose(mode_vector, eigenvector / np.sqrt(2.0))
+        assert frequency == pytest.approx(0.015)
+        assert kwargs["branch"] == 4
+        assert kwargs["kernel_derivative"] == "screened_gdf"
+        assert kwargs["supercell_mesh"] == (2, 1, 1)
+        return expected
+
+    monkeypatch.setattr(
+        "pyqed.pbc.gw.electron_phonon."
+        "commensurate_tda_electron_phonon_coupling",
+        fake_coupling,
+    )
+    actual = phonon_tda_electron_phonon_coupling(
+        operator,
+        FakePhonons(),
+        phonon_index,
+        branch=4,
+        supercell_mesh=(2, 1, 1),
+    )
+
+    assert actual is expected
+    assert actual.phonon_mode.branch == 4
+    assert actual.info["phonon_source"] == "test_phonons"
+    np.testing.assert_allclose(
+        actual.info["phonon_qpoint_fractional"],
+        scaled_qpoint,
+    )
+
+
+def test_native_phonon_mode_rejects_unstable_frequency(
+    four_band_two_k_reference,
+):
+    space = KPointTransitionSpace(four_band_two_k_reference, qpts="mesh")
+    zero_index = space.find_qpoint_index(np.zeros(3))
+    operator = periodic_tda_operator(
+        space,
+        q_index=zero_index,
+        direct_scale=0.0,
+        exchange_scale=0.0,
+        screened_exchange_scale=0.0,
+    )
+    masses = (
+        np.asarray(
+            four_band_two_k_reference.cell.unit_molecule.atom_mass_list(),
+            dtype=float,
+        )
+        * amu_to_au
+    )
+
+    class UnstablePhonons:
+        def mode(self, qpoint, branch):
+            return PeriodicPhononMode(
+                qpoint=qpoint,
+                branch=branch,
+                frequency=-0.002,
+                eigenvector=[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+                masses=masses,
+            )
+
+    with pytest.raises(ValueError, match="unstable"):
+        phonon_tda_electron_phonon_coupling(
+            operator,
+            UnstablePhonons(),
+            zero_index,
+            branch=0,
+        )
 
 def test_gamma_one_body_tda_electron_phonon_derivative_is_hermitian(
     four_band_two_k_reference,

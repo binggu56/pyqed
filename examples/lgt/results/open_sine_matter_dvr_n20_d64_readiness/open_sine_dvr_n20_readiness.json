@@ -1,0 +1,104 @@
+{
+  "method": "open paired DCT-IV/DST-IV matter-only DVR DMRG plus TDVP",
+  "fidelity": "open-boundary spectral adaptation with links eliminated by the exact interval Gauss law; single finite-volume point",
+  "links_eliminated": true,
+  "npts": 20,
+  "fermion_modes": 40,
+  "chain_length": 20,
+  "bond_dim": 64,
+  "length": 20.0,
+  "gL": 20.0,
+  "coupling": 1.0,
+  "flux_cutoff": null,
+  "mass_over_g": 0.0,
+  "dt": 0.1,
+  "ground_half_sweeps": 5,
+  "ground_energy": -28.01657051422173,
+  "raw_hamiltonian_mpo_bond": 79,
+  "compressed_hamiltonian_mpo_bond": 35,
+  "hamiltonian_mpo_bonds": [
+    7,
+    11,
+    15,
+    19,
+    23,
+    27,
+    31,
+    33,
+    33,
+    35,
+    33,
+    33,
+    31,
+    27,
+    23,
+    19,
+    15,
+    11,
+    6,
+    1
+  ],
+  "gauss_law": "solved exactly as L_n=L_left-sum_{j<=n} q_j; fixed total charge",
+  "setup_seconds": 0.06445395899936557,
+  "ground_seconds": 263.2946480831597,
+  "ground_history": [
+    {
+      "half_sweep": 1,
+      "direction": "lr",
+      "energy": -28.01657051422179,
+      "local_energy": -28.00620752823243,
+      "truncation": 0.0,
+      "states_kept": 16
+    },
+    {
+      "half_sweep": 2,
+      "direction": "rl",
+      "energy": -28.01657051422179,
+      "local_energy": -28.01657132495301,
+      "truncation": 0.0,
+      "states_kept": 16
+    },
+    {
+      "half_sweep": 3,
+      "direction": "lr",
+      "energy": -28.01657051422179,
+      "local_energy": -28.01657253541634,
+      "truncation": 0.0,
+      "states_kept": 16
+    },
+    {
+      "half_sweep": 4,
+      "direction": "rl",
+      "energy": -28.01657051422179,
+      "local_energy": -27.984824263217103,
+      "truncation": -2.220446049250313e-16,
+      "states_kept": 16
+    },
+    {
+      "half_sweep": 5,
+      "direction": "lr",
+      "energy": -28.01657051422179,
+      "local_energy": -28.016572448761117,
+      "truncation": 1.1102230246251565e-16,
+      "states_kept": 16
+    },
+    {
+      "half_sweep": 6,
+      "direction": "recenter-left",
+      "energy": -28.01657051422173,
+      "local_energy": -28.016576890502183,
+      "truncation": 5.665561266798846e-07,
+      "states_kept": 64
+    }
+  ],
+  "references": [
+    "https://doi.org/10.1103/PhysRevD.11.395",
+    "https://doi.org/10.1103/PhysRevD.13.1043",
+    "https://doi.org/10.1016/j.aop.2011.09.001",
+    "https://doi.org/10.1007/JHEP11(2013)158",
+    "https://doi.org/10.1103/PhysRevD.107.054506"
+  ],
+  "readiness_only": true,
+  "tdvp_attempted": false,
+  "tdvp_note": "Use the production mode for channel construction and checkpointed TDVP; readiness mode is intentionally bounded."
+}

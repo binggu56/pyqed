@@ -92,8 +92,8 @@ def resolve_workers(workers, *, maximum=4):
     return workers
 
 
-def _materialized_rank_coupled_factors(factors):
-    """Return reduced-term MPO cores when given a lightweight NC carrier."""
+def _rank_coupled_hamiltonian_factors(factors, *, materialize=False):
+    """Prepare either direct complementary or explicit reduced MPO cores."""
     factors = tuple(factors)
     if not factors:
         return factors
@@ -104,9 +104,17 @@ def _materialized_rank_coupled_factors(factors):
         for factor in factors
     ):
         return factors
-    from pyqed.qchem.dmrg.backends.reduced import (
-        build_su2_normal_complementary_mpo,
-    )
+    if not materialize:
+        for factor in factors:
+            object.__setattr__(factor, "normal_complementary_right_dual", True)
+            object.__setattr__(
+                factor,
+                "normal_complementary_force_contextual_routes",
+                False,
+            )
+        return factors
+
+    from pyqed.qchem.dmrg.backends.reduced import build_su2_normal_complementary_mpo
 
     materialized = tuple(
         build_su2_normal_complementary_mpo(
@@ -633,6 +641,125 @@ class _NearestNeighborTieRoutePlan(_WignerEckartRoutePlan):
         self.conditioned_frontier_width = 1
 
 
+class _StructuredPairEmbedding:
+    """Block-scatter tied coordinates without a dense pair-by-parameter map."""
+
+    def __init__(self, pair_dimension, parameter_dimension, records=()):
+        self.pair_dimension = int(pair_dimension)
+        self.parameter_dimension = int(parameter_dimension)
+        self._records = {
+            (int(offset), int(size)): (
+                np.asarray(columns, dtype=np.int64),
+                np.asarray(design, dtype=complex),
+            )
+            for offset, size, columns, design in records
+        }
+
+    @property
+    def shape(self):
+        return self.pair_dimension, self.parameter_dimension
+
+    @property
+    def nbytes(self):
+        return int(sum(
+            columns.nbytes + design.nbytes
+            for columns, design in self._records.values()
+        ))
+
+    def block_design(self, offset, size):
+        record = self._records.get((int(offset), int(size)))
+        if record is None:
+            return np.zeros(0, dtype=np.int64), np.zeros(
+                (int(size), 0), dtype=complex
+            )
+        return record
+
+    def add_block(self, offset, size, columns, contribution):
+        key = (int(offset), int(size))
+        columns = np.asarray(columns, dtype=np.int64)
+        contribution = np.asarray(contribution, dtype=complex)
+        cached = self._records.get(key)
+        if cached is None:
+            self._records[key] = (columns, np.array(contribution, copy=True))
+            return
+        cached_columns, design = cached
+        if not np.array_equal(cached_columns, columns):
+            raise RuntimeError("Tied pair-embedding topology changed unexpectedly.")
+        design += contribution
+
+    def dense(self):
+        result = np.zeros(self.shape, dtype=complex)
+        for (offset, size), (columns, design) in self._records.items():
+            result[offset : offset + size, columns] = design
+        return result
+
+    def __array__(self, dtype=None, copy=None):
+        result = self.dense()
+        if dtype is not None:
+            result = result.astype(dtype, copy=False)
+        return np.array(result, copy=True) if copy else result
+
+    def __getitem__(self, key):
+        return self.dense()[key]
+
+    def matvec(self, vector):
+        vector = np.asarray(vector)
+        if vector.size != self.parameter_dimension:
+            raise ValueError("Tied coordinate vector has the wrong size.")
+        result = np.zeros(
+            self.pair_dimension, dtype=np.result_type(vector.dtype, complex)
+        )
+        for (offset, size), (columns, design) in self._records.items():
+            result[offset : offset + size] = design @ vector[columns]
+        return result
+
+    def rmatvec(self, vector):
+        vector = np.asarray(vector)
+        if vector.size != self.pair_dimension:
+            raise ValueError("Reduced pair vector has the wrong size.")
+        result = np.zeros(
+            self.parameter_dimension, dtype=np.result_type(vector.dtype, complex)
+        )
+        for (offset, size), (columns, design) in self._records.items():
+            result[columns] += design.conj().T @ vector[offset : offset + size]
+        return result
+
+    def restrict(self, support):
+        support = np.asarray(support, dtype=np.int64)
+        inverse = np.full(self.parameter_dimension, -1, dtype=np.int64)
+        inverse[support] = np.arange(support.size, dtype=np.int64)
+        records = []
+        for (offset, size), (columns, design) in self._records.items():
+            keep = inverse[columns] >= 0
+            if np.any(keep):
+                records.append((offset, size, inverse[columns[keep]], design[:, keep]))
+        return type(self)(self.pair_dimension, support.size, records)
+
+    def compose(self, transform):
+        transform = np.asarray(transform)
+        if transform.shape[0] != self.parameter_dimension:
+            raise ValueError("Tied-coordinate transform has the wrong row dimension.")
+        records = []
+        output_dimension = int(transform.shape[1])
+        for (offset, size), (columns, design) in self._records.items():
+            local = design @ transform[columns]
+            active = np.flatnonzero(np.any(local != 0.0, axis=0))
+            if active.size:
+                records.append((offset, size, active, local[:, active]))
+        return type(self)(self.pair_dimension, output_dimension, records)
+
+    def projected_diagonal(self, parent_diagonal):
+        parent_diagonal = np.asarray(parent_diagonal)
+        diagonal = np.zeros(self.parameter_dimension, dtype=float)
+        for (offset, size), (columns, design) in self._records.items():
+            diagonal[columns] += np.real(np.sum(
+                design.conj()
+                * (parent_diagonal[offset : offset + size, None] * design),
+                axis=0,
+            ))
+        return diagonal
+
+
 class NonAbelianFrontierLETTA:
     r"""Graph-tied reduced SU(2) frontier LETTA.
 
@@ -677,7 +804,15 @@ class NonAbelianFrontierLETTA:
         self._complementary_operators = getattr(
             mpo, "complementary_operators", None
         )
-        self.mpo = _materialized_rank_coupled_factors(factors)
+        self.mpo = _rank_coupled_hamiltonian_factors(factors)
+        self.hamiltonian_representation = (
+            "complementary"
+            if self.mpo
+            and getattr(self.mpo[0], "normal_complementary_owner", None) is not None
+            and not tuple(getattr(self.mpo[0], "reduced_terms", ()))
+            else "mpo"
+        )
+        self._hamiltonian_spec = None
         self.nsites = len(self.mpo)
         if self.nsites < 2:
             raise ValueError("NonAbelianFrontierLETTA requires at least two sites.")
@@ -709,6 +844,16 @@ class NonAbelianFrontierLETTA:
         self._embedding_basis_cache = {}
         self._embedding_basis_cache_hits = 0
         self._embedding_basis_cache_misses = 0
+        self._pair_coordinate_cache = {}
+        self._pair_coordinate_cache_hits = 0
+        self._pair_coordinate_cache_misses = 0
+        self._embedding_plan_cache = {}
+        self._embedding_numeric_cache = {}
+        self._embedding_numeric_cache_hits = 0
+        self._embedding_incremental_updates = 0
+        self._embedding_reused_blocks = 0
+        self._embedding_updated_blocks = 0
+        self._embedding_active_columns_cache = {}
         self._projected_krylov_cache = {}
         self._metric_whitener_cache = {}
         self._metric_whitener_cache_hits = 0
@@ -842,14 +987,17 @@ class NonAbelianFrontierLETTA:
         D=1,
         ecore=0.0,
         cutoff=1.0e-10,
+        hamiltonian_representation="complementary",
         **kwargs,
     ):
-        """Build the fully reduced qchem MPO and its SU(2)-LETTA state.
+        """Build a reduced qchem Hamiltonian and its SU(2)-LETTA state.
 
         The default LETTA tie graph is the nearest-neighbor orbital chain;
         ``graph="nn"`` selects it explicitly. Hamiltonian couplings remain
-        complete in the reduced MPO; ``graph`` controls only variational
-        tensor ties and may be supplied explicitly.
+        complete in either representation; ``graph`` controls only variational
+        tensor ties. The default direct complementary representation carries
+        the reduced $S/R/A/P/B/Q$ operators without storing a Hamiltonian MPO;
+        ``"mpo"`` remains an explicit reference option.
         """
         from pyqed.qchem.dmrg.backends.reduced import (
             build_spatial_reduced_hamiltonian_mpo,
@@ -867,6 +1015,24 @@ class NonAbelianFrontierLETTA:
             spin=spin,
             ecore=ecore,
         )
+        representation = str(hamiltonian_representation).lower().replace("-", "_")
+        if representation in {"direct", "normal_complementary", "nc"}:
+            representation = "complementary"
+        if representation not in {"complementary", "mpo"}:
+            raise ValueError(
+                "hamiltonian_representation must be 'complementary' or 'mpo'."
+            )
+        if representation == "complementary" and np.asarray(h1e).shape[-1] <= 2:
+            representation = "mpo"
+        if representation == "mpo":
+            factors = _rank_coupled_hamiltonian_factors(
+                hamiltonian.factors,
+                materialize=True,
+            )
+            hamiltonian = replace(
+                hamiltonian,
+                factors=list(factors),
+            )
         if graph is None:
             graph = _nearest_neighbor_graph(np.asarray(h1e).shape[-1])
         state = cls(
@@ -881,9 +1047,26 @@ class NonAbelianFrontierLETTA:
         state.hamiltonian = replace(
             hamiltonian,
             factors=list(state.mpo),
-            complementary_operators=None,
-            moving_environment=None,
+            complementary_operators=(
+                state._complementary_operators
+                if representation == "complementary"
+                else None
+            ),
+            moving_environment=(
+                state._su2_moving_environment
+                if representation == "complementary"
+                else None
+            ),
         )
+        state._hamiltonian_spec = {
+            "h1e": np.array(h1e, copy=True),
+            "eri": None if eri is None else np.array(eri, copy=True),
+            "nelec": int(nelec),
+            "spin": int(spin),
+            "ecore": float(ecore),
+            "cutoff": float(cutoff),
+            "hamiltonian_representation": representation,
+        }
         return state
 
     @classmethod
@@ -1327,6 +1510,33 @@ class NonAbelianFrontierLETTA:
 
     def __deepcopy__(self, memo):
         """Copy variational state while dropping transient compiled owners."""
+        if self._hamiltonian_spec is not None:
+            options = copy.deepcopy(self._hamiltonian_spec, memo)
+            clone = type(self).from_integrals(
+                **options,
+                graph=self.graph,
+                D=self.D,
+                base_sites=copy.deepcopy(self._base_sites, memo),
+                tie=self.tie,
+                init="mps",
+                workers=self.workers,
+                n_threads=self.n_threads,
+                we_route_memory=self.we_route_memory,
+            )
+            memo[id(self)] = clone
+            runtime_names = {
+                "mpo",
+                "hamiltonian",
+                "_hamiltonian_spec",
+                "_su2_moving_environment",
+                "_complementary_operators",
+                "_solver_executor",
+            }
+            for name, value in self.__dict__.items():
+                if name not in runtime_names:
+                    setattr(clone, name, copy.deepcopy(value, memo))
+            clone._hamiltonian_spec = options
+            return clone
         clone = type(self).__new__(type(self))
         memo[id(self)] = clone
         for name, value in self.__dict__.items():
@@ -1354,14 +1564,75 @@ class NonAbelianFrontierLETTA:
         identity = _identity_mpo_factors_for_sites_and_mpo(sites, self.mpo)
         return _real_scalar(contract_chain_expectation(sites, identity))
 
+    def _complementary_rayleigh_quotient(self, sites):
+        """Evaluate the state through one exact direct-complementary bond action."""
+        for site in sites:
+            metadata = getattr(site, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata.pop("_cpp_split_site", None)
+        local_environment = MovingEnvironment(
+            sites,
+            mpo_factors=self.mpo,
+            complementary_operator_families=self._complementary_operators,
+            materialize_complementary_family_operator_tables=False,
+            su2_moving_environment=None,
+            su2_boundary_environment=(
+                self._su2_moving_environment if self.nsites >= 6 else None
+            ),
+        )
+        local_environment.norm_stack.su2_boundary_environment = None
+        local_environment.hamiltonian_stack.su2_moving_environment = (
+            self._su2_moving_environment
+        )
+        self._su2_moving_environment.clear_boundaries()
+        self._su2_moving_environment.clear_factor_routes()
+        h_chain = BlockSparseEnvironmentChain.build(
+            sites,
+            self.mpo,
+            renormalized_blocks=local_environment.hamiltonian_stack,
+        )
+        n_chain = BlockSparseEnvironmentChain.build(
+            sites,
+            local_environment.identity_mpo_factors,
+            renormalized_blocks=local_environment.norm_stack,
+        )
+        merged = merge_mps_sites(sites[0], sites[1])
+        layout = _ChannelResolvedPairSpace(sites[0], sites[1])
+        h_action, n_action, _diagnostics = self._reduced_pair_transition_actions(
+            0,
+            sites,
+            merged,
+            layout,
+            environment_sweeps=(
+                h_chain.start_sweep("lr"),
+                n_chain.start_sweep("lr"),
+            ),
+        )
+        vector = layout.pack_sites(sites[0], sites[1])
+        metric_vector = np.asarray(n_action(vector))
+        denominator = float(np.real(np.vdot(vector, metric_vector)))
+        if denominator <= 0.0:
+            raise FloatingPointError("SU2LETTA norm is non-positive.")
+        return float(np.real(np.vdot(vector, h_action(vector))) / denominator)
+
     def expectation(self, mpo=None):
         factors = self.mpo if mpo is None else tuple(getattr(mpo, "factors", mpo))
+        if mpo is None and self.hamiltonian_representation == "complementary":
+            self._materialized_site_cache.clear()
         sites = self.materialize()
+        if mpo is None and self.hamiltonian_representation == "complementary":
+            return self._complementary_rayleigh_quotient(sites) + self.ecore
         identity = _identity_mpo_factors_for_sites_and_mpo(sites, factors)
         denominator = _real_scalar(contract_chain_expectation(sites, identity))
         if denominator <= 0.0:
             raise FloatingPointError("SU2LETTA norm is non-positive.")
-        numerator = _real_scalar(contract_chain_expectation(sites, factors))
+        numerator = _real_scalar(
+            contract_chain_expectation(
+                sites,
+                factors,
+                moving_environment=getattr(mpo, "moving_environment", None),
+            )
+        )
         shift = self.ecore if mpo is None else float(getattr(mpo, "ecore", 0.0))
         return numerator / denominator + shift
 
@@ -1384,6 +1655,11 @@ class NonAbelianFrontierLETTA:
         embedding_bytes = sum(
             np.asarray(blocks).nbytes
             for blocks in self._embedding_basis_cache.values()
+        )
+        embedding_bytes += sum(
+            int(record["embedding"].nbytes)
+            + sum(np.asarray(block).nbytes for block in record["fixed"].values())
+            for record in self._embedding_numeric_cache.values()
         )
         krylov_bytes = sum(
             np.asarray(vectors).nbytes
@@ -1443,20 +1719,23 @@ class NonAbelianFrontierLETTA:
         """Atomically save a restartable SU(2)-LETTA checkpoint."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint_mpo = copy.deepcopy(self.mpo)
-        for core in checkpoint_mpo:
-            for name in (
-                "_reduced_block_cache",
-                "_environment_reduced_block_cache",
-                "_block_cache",
-            ):
-                cache = getattr(core, name, None)
-                if cache is not None:
-                    cache.clear()
+        checkpoint_mpo = None
+        if self._hamiltonian_spec is None:
+            checkpoint_mpo = copy.deepcopy(self.mpo)
+            for core in checkpoint_mpo:
+                for name in (
+                    "_reduced_block_cache",
+                    "_environment_reduced_block_cache",
+                    "_block_cache",
+                ):
+                    cache = getattr(core, name, None)
+                    if cache is not None:
+                        cache.clear()
         payload = {
             "format": "pyqed-nonabelian-frontier-letta",
-            "version": 2,
+            "version": 3,
             "mpo": checkpoint_mpo,
+            "hamiltonian_spec": self._hamiltonian_spec,
             "nelec": self.nelec,
             "spin": self.spin,
             "target_sector": self.target_sector,
@@ -1496,25 +1775,32 @@ class NonAbelianFrontierLETTA:
         )
         current = (
             payload.get("format") == "pyqed-nonabelian-frontier-letta"
-            and payload.get("version") == 2
+            and payload.get("version") in {2, 3}
         )
         if not (legacy or current):
             raise ValueError("unsupported SU(2)-LETTA checkpoint format.")
-        state = cls(
-            payload["mpo"],
-            nelec=payload["nelec"],
-            spin=payload["spin"],
-            target_sector=payload.get("target_sector"),
-            graph=payload["graph"],
-            D=payload["D"],
-            ecore=payload["ecore"],
-            base_sites=payload["base_sites"],
-            tie=payload.get("tie", "physical"),
-            init="mps",
-            workers=workers,
-            n_threads=payload.get("n_threads", 1),
-            we_route_memory=payload.get("we_route_memory", 256.0),
-        )
+        hamiltonian_spec = payload.get("hamiltonian_spec")
+        common = {
+            "graph": payload["graph"],
+            "D": payload["D"],
+            "base_sites": payload["base_sites"],
+            "tie": payload.get("tie", "physical"),
+            "init": "mps",
+            "workers": workers,
+            "n_threads": payload.get("n_threads", 1),
+            "we_route_memory": payload.get("we_route_memory", 256.0),
+        }
+        if hamiltonian_spec is not None:
+            state = cls.from_integrals(**hamiltonian_spec, **common)
+        else:
+            state = cls(
+                payload["mpo"],
+                nelec=payload["nelec"],
+                spin=payload["spin"],
+                target_sector=payload.get("target_sector"),
+                ecore=payload["ecore"],
+                **common,
+            )
         state.core_energy = float(payload.get("core_energy", state.ecore))
         state.mpo_includes_core_energy = bool(
             payload.get("mpo_includes_core_energy", False)
@@ -1525,7 +1811,9 @@ class NonAbelianFrontierLETTA:
         ]
         state._materialized_site_cache.clear()
         state.history = list(payload.get("history", ()))
-        state.energy = float(payload.get("energy", state.expectation()))
+        state.energy = float(
+            payload["energy"] if "energy" in payload else state.expectation()
+        )
         state.converged = bool(payload.get("converged", False))
         state.success = payload.get("success")
         state.message = str(payload.get("message", "restored SU(2)-LETTA checkpoint"))
@@ -1571,7 +1859,19 @@ class NonAbelianFrontierLETTA:
         self._set_site_vector(site, vector)
         varied = list(sites)
         varied[site] = self.materialize_site(site)
-        return _real_scalar(contract_chain_expectation(varied, factors))
+        owner = (
+            self._su2_moving_environment
+            if factors is self.mpo
+            and self.hamiltonian_representation == "complementary"
+            else None
+        )
+        return _real_scalar(
+            contract_chain_expectation(
+                varied,
+                factors,
+                moving_environment=owner,
+            )
+        )
 
     def _local_quadratic_matrices(
         self,
@@ -1844,6 +2144,37 @@ class NonAbelianFrontierLETTA:
             self._map_tasks(executor, apply_chunk, chunks), axis=1
         )
 
+    @staticmethod
+    def _site_topology_signature(site):
+        return tuple(
+            (key, tuple(map(int, np.asarray(block).shape)))
+            for key, block in sorted(site.data.items())
+        )
+
+    def _pair_coordinate_space(self, bond, sites):
+        """Return the fixed-D pair topology shared by successive local solves."""
+        bond = int(bond)
+        signature = (
+            self._site_topology_signature(sites[bond]),
+            self._site_topology_signature(sites[bond + 1]),
+        )
+        cached = self._pair_coordinate_cache.get(bond)
+        if cached is not None and cached[0] == signature:
+            self._pair_coordinate_cache_hits += 1
+            return cached[1], cached[2]
+        merged = merge_mps_sites(sites[bond], sites[bond + 1])
+        layout = _ChannelResolvedPairSpace(sites[bond], sites[bond + 1])
+        self._pair_coordinate_cache[bond] = (signature, merged, layout)
+        self._pair_coordinate_cache_misses += 1
+        return merged, layout
+
+    @staticmethod
+    def _embedding_fixed_block(site, key, shape, dtype):
+        block = site.data.get(key)
+        if block is None:
+            return np.zeros(shape, dtype=dtype)
+        return np.asarray(block, dtype=dtype)
+
     def _local_pair_embedding(self, site, sites, bond, layout):
         """Embed tied one-site parameters into a packed two-site tensor."""
         current = self._pack_site(site)
@@ -1854,55 +2185,136 @@ class NonAbelianFrontierLETTA:
                 "Cached Wigner--Eckart basis does not match the local parameter space."
             )
         if isinstance(layout, _ChannelResolvedPairSpace):
-            embedding = np.zeros(
-                (layout.size, current.size), dtype=dtype
+            layout_signature = tuple(
+                (entry.key, entry.shape, int(entry.offset), int(entry.size))
+                for entry in layout.entries
             )
-            for entry in layout.entries:
-                q_l, q_p1, q_p2, q_r, q_mid = entry.key
-                varied_key = (
-                    (q_l, q_p1, q_mid)
-                    if site == bond
-                    else (q_mid, q_p2, q_r)
-                )
-                cache_key = (int(site), varied_key)
-                varied_blocks = self._embedding_basis_cache.get(cache_key)
-                if varied_blocks is None:
-                    template = (
-                        sites[bond].data.get((q_l, q_p1, q_mid))
+            plan_key = (int(site), int(bond), layout_signature, np.dtype(dtype).str)
+            plan = self._embedding_plan_cache.get(plan_key)
+            if plan is None:
+                records = []
+                for entry in layout.entries:
+                    q_l, q_p1, q_p2, q_r, q_mid = entry.key
+                    varied_key = (
+                        (q_l, q_p1, q_mid)
                         if site == bond
-                        else sites[bond + 1].data.get((q_mid, q_p2, q_r))
+                        else (q_mid, q_p2, q_r)
+                    )
+                    fixed_key = (
+                        (q_mid, q_p2, q_r)
+                        if site == bond
+                        else (q_l, q_p1, q_mid)
+                    )
+                    cache_key = (int(site), varied_key)
+                    varied_blocks = self._embedding_basis_cache.get(cache_key)
+                    if varied_blocks is None:
+                        varied_blocks = np.asarray(
+                            routes.block_basis(varied_key, dtype=dtype),
+                            dtype=dtype,
+                        )
+                        self._embedding_basis_cache[cache_key] = varied_blocks
+                        self._embedding_basis_cache_misses += 1
+                    else:
+                        self._embedding_basis_cache_hits += 1
+                    active = np.flatnonzero(
+                        np.any(
+                            varied_blocks != 0.0,
+                            axis=tuple(range(1, varied_blocks.ndim)),
+                        )
+                    )
+                    active_key = (
+                        int(site), int(bond), int(entry.offset), int(entry.size)
+                    )
+                    self._embedding_active_columns_cache[active_key] = np.asarray(
+                        active, dtype=np.int64
+                    )
+                    template = (
+                        sites[bond + 1].data.get(fixed_key)
+                        if site == bond
+                        else sites[bond].data.get(fixed_key)
                     )
                     if template is None:
                         continue
-                    varied_blocks = np.asarray(
-                        routes.block_basis(varied_key, dtype=dtype),
-                        dtype=dtype,
+                    records.append(
+                        (
+                            entry,
+                            fixed_key,
+                            tuple(np.asarray(template).shape),
+                            varied_blocks,
+                            np.asarray(active, dtype=np.int64),
+                        )
                     )
-                    self._embedding_basis_cache[cache_key] = varied_blocks
-                    self._embedding_basis_cache_misses += 1
-                else:
-                    self._embedding_basis_cache_hits += 1
+                plan = tuple(records)
+                self._embedding_plan_cache[plan_key] = plan
+            fixed_site = sites[bond + 1] if site == bond else sites[bond]
+            cached = self._embedding_numeric_cache.get(plan_key)
+            if cached is None:
+                embedding = _StructuredPairEmbedding(layout.size, current.size)
+                fixed_blocks = {}
+                changed = None
+            else:
+                embedding = cached["embedding"]
+                fixed_blocks = cached["fixed"]
+                changed = set()
+                for _entry, fixed_key, fixed_shape, _varied_blocks, _active in plan:
+                    if fixed_key in changed:
+                        continue
+                    fixed = self._embedding_fixed_block(
+                        fixed_site, fixed_key, fixed_shape, dtype
+                    )
+                    previous = fixed_blocks.get(fixed_key)
+                    if previous is None or not np.array_equal(fixed, previous):
+                        changed.add(fixed_key)
+                if not changed:
+                    self._embedding_numeric_cache_hits += 1
+                    self._embedding_reused_blocks += len(plan)
+                    return current, embedding
+                self._embedding_incremental_updates += 1
+            fixed_values = {}
+            deltas = {}
+            for _entry, fixed_key, fixed_shape, _varied_blocks, _active in plan:
+                if fixed_key in fixed_values:
+                    continue
+                fixed = self._embedding_fixed_block(
+                    fixed_site, fixed_key, fixed_shape, dtype
+                )
+                previous = fixed_blocks.get(fixed_key)
+                fixed_values[fixed_key] = fixed
+                deltas[fixed_key] = fixed if previous is None else fixed - previous
+            for entry, fixed_key, fixed_shape, varied_blocks, active in plan:
+                if changed is not None and fixed_key not in changed:
+                    self._embedding_reused_blocks += 1
+                    continue
+                delta = deltas[fixed_key]
+                q_l, q_p1, q_p2, q_r, q_mid = entry.key
                 if site == bond:
-                    fixed = sites[bond + 1].data.get((q_mid, q_p2, q_r))
-                    if fixed is None:
-                        continue
                     pair_blocks = np.tensordot(
-                        varied_blocks, fixed, axes=([3], [0])
+                        varied_blocks, delta, axes=([3], [0])
                     )
                 else:
-                    fixed = sites[bond].data.get((q_l, q_p1, q_mid))
-                    if fixed is None:
-                        continue
                     pair_blocks = np.moveaxis(
                         np.tensordot(
-                            fixed, varied_blocks, axes=([2], [1])
+                            delta, varied_blocks, axes=([2], [1])
                         ),
                         2,
                         0,
                     )
-                embedding[
-                    entry.offset : entry.offset + entry.size
-                ] = pair_blocks.reshape(current.size, -1).T
+                if active.size == 0:
+                    continue
+                contribution = pair_blocks[active].reshape(active.size, -1).T
+                embedding.add_block(
+                    entry.offset,
+                    entry.size,
+                    active,
+                    contribution,
+                )
+                self._embedding_updated_blocks += 1
+            for fixed_key, fixed in fixed_values.items():
+                fixed_blocks[fixed_key] = np.array(fixed, copy=True)
+            self._embedding_numeric_cache[plan_key] = {
+                "embedding": embedding,
+                "fixed": fixed_blocks,
+            }
             return current, embedding
         columns = []
         for varied in routes.basis:
@@ -1961,18 +2373,27 @@ class NonAbelianFrontierLETTA:
         bond,
     ):
         """Project and assemble only connected tied-metric components."""
-        embedding = np.asarray(embedding)
+        structured = isinstance(embedding, _StructuredPairEmbedding)
+        if not structured:
+            embedding = np.asarray(embedding)
         dimension = int(embedding.shape[1])
         active_designs = {}
-        from pyqed.mps.nonabelian import _su2_kernel
 
         def active_design(entry):
             key = (int(entry.offset), int(entry.size))
             cached = active_designs.get(key)
             if cached is None:
-                rows = embedding[key[0] : key[0] + key[1]]
-                columns = np.flatnonzero(np.any(rows != 0.0, axis=0))
-                cached = (columns, np.ascontiguousarray(rows[:, columns]))
+                if structured:
+                    columns, rows = embedding.block_design(*key)
+                    cached = (columns, np.ascontiguousarray(rows))
+                else:
+                    rows = embedding[key[0] : key[0] + key[1]]
+                    columns = self._embedding_active_columns_cache.get(
+                        (int(site), int(bond), key[0], key[1])
+                    )
+                    if columns is None:
+                        columns = np.flatnonzero(np.any(rows != 0.0, axis=0))
+                    cached = (columns, np.ascontiguousarray(rows[:, columns]))
                 active_designs[key] = cached
             return cached
 
@@ -1986,20 +2407,13 @@ class NonAbelianFrontierLETTA:
             contribution = out_design.conj().T @ (
                 np.asarray(block) @ in_design
             )
-            threshold = 1.0e-15 * max(
-                float(np.max(np.abs(contribution), initial=0.0)), 1.0
-            )
-            pattern = np.ascontiguousarray(
-                np.abs(contribution) > threshold, dtype=np.uint8
-            )
-            records.append((out_columns, in_columns, contribution, pattern))
+            records.append((out_columns, in_columns, contribution))
             topology_values.append(
                 (
                     int(out_entry.offset),
                     int(in_entry.offset),
                     tuple(map(int, out_columns)),
                     tuple(map(int, in_columns)),
-                    int(_su2_kernel._cpp_array_revision(pattern)),
                 )
             )
         topology_key = (
@@ -2025,12 +2439,14 @@ class NonAbelianFrontierLETTA:
                 if left_root != right_root:
                     parent[right_root] = left_root
 
-            for out_columns, in_columns, _contribution, pattern in records:
-                for out_position, in_position in np.argwhere(pattern):
-                    union(
-                        int(out_columns[out_position]),
-                        int(in_columns[in_position]),
-                    )
+            for out_columns, in_columns, _contribution in records:
+                if out_columns.size == 0 or in_columns.size == 0:
+                    continue
+                anchor = int(out_columns[0])
+                for index in out_columns[1:]:
+                    union(anchor, int(index))
+                for index in in_columns:
+                    union(anchor, int(index))
             grouped = {}
             for index in range(dimension):
                 grouped.setdefault(find(index), []).append(index)
@@ -2050,7 +2466,7 @@ class NonAbelianFrontierLETTA:
             labels[indices] = label
             positions[indices] = np.arange(indices.size)
             blocks.append(np.zeros((indices.size, indices.size), dtype=complex))
-        for out_columns, in_columns, contribution, _pattern in records:
+        for out_columns, in_columns, contribution in records:
             for label in np.intersect1d(
                 labels[out_columns], labels[in_columns], assume_unique=False
             ):
@@ -2130,6 +2546,7 @@ class NonAbelianFrontierLETTA:
             np.asarray(retained),
             "block_eigh" if len(components) > 1 else "dense_eigh",
         )
+
 
     def _install_projected_factor_route(
         self,
@@ -2442,8 +2859,7 @@ class NonAbelianFrontierLETTA:
                 f"{int(max_parameters)}."
             )
         sites = self.materialize() if sites is None else list(sites)
-        merged = merge_mps_sites(sites[bond], sites[bond + 1])
-        layout = _ChannelResolvedPairSpace(sites[bond], sites[bond + 1])
+        merged, layout = self._pair_coordinate_space(bond, sites)
         _embedded_current, embedding = self._local_pair_embedding(
             site, sites, bond, layout
         )
@@ -2459,10 +2875,11 @@ class NonAbelianFrontierLETTA:
 
         metric_blocks = getattr(n_pair, "metric_blocks", None)
         if metric_blocks is None:
+            dense_embedding = np.asarray(embedding)
             n_columns = self._apply_packed_columns(
-                n_pair, embedding, executor=executor
+                n_pair, dense_embedding, executor=executor
             )
-            dense_metric = embedding.conj().T @ n_columns
+            dense_metric = dense_embedding.conj().T @ n_columns
             dense_metric = 0.5 * (dense_metric + dense_metric.conj().T)
             projected_metric_full = _ReducedMetricComponents(
                 current.size,
@@ -2482,13 +2899,25 @@ class NonAbelianFrontierLETTA:
         support = np.flatnonzero(n_diagonal > float(support_rtol) * scale)
         if support.size == 0:
             raise np.linalg.LinAlgError("local SU2LETTA parameter support is null.")
-        design = np.asarray(embedding[:, support])
+        design = (
+            embedding.restrict(support)
+            if isinstance(embedding, _StructuredPairEmbedding)
+            else np.asarray(embedding[:, support])
+        )
         projected_metric = projected_metric_full.restrict(support)
         parent_h_diagonal = np.asarray(
             getattr(h_pair, "diag", np.zeros(layout.size)), dtype=float
         )
-        h_diagonal = np.real(
-            np.sum(design.conj() * (parent_h_diagonal[:, None] * design), axis=0)
+        h_diagonal = (
+            design.projected_diagonal(parent_h_diagonal)
+            if isinstance(design, _StructuredPairEmbedding)
+            else np.real(
+                np.sum(
+                    design.conj()
+                    * (parent_h_diagonal[:, None] * design),
+                    axis=0,
+                )
+            )
         )
         n_diagonal = n_diagonal[support]
         matvec_counts = {"hamiltonian": 0, "metric": 0}
@@ -2498,6 +2927,8 @@ class NonAbelianFrontierLETTA:
             if vector.size != support.size:
                 raise ValueError("frontier Wigner--Eckart vector has the wrong size.")
             matvec_counts["hamiltonian"] += 1
+            if isinstance(design, _StructuredPairEmbedding):
+                return design.rmatvec(h_pair(design.matvec(vector)))
             return design.conj().T @ h_pair(design @ vector)
 
         def n_action(vector):
@@ -2505,6 +2936,8 @@ class NonAbelianFrontierLETTA:
             if vector.size != support.size:
                 raise ValueError("frontier Wigner--Eckart vector has the wrong size.")
             matvec_counts["metric"] += 1
+            if isinstance(design, _StructuredPairEmbedding):
+                return design.rmatvec(n_pair(design.matvec(vector)))
             return design.conj().T @ n_pair(design @ vector)
 
         routes = self._wigner_eckart_route_plan(site)
@@ -2517,6 +2950,11 @@ class NonAbelianFrontierLETTA:
                 "local_action_backend": "frontier_projected_pair",
                 "frontier_dimension": int(layout.size),
                 "embedding_bytes": int(embedding.nbytes),
+                "embedding_representation": (
+                    "block_scatter"
+                    if isinstance(embedding, _StructuredPairEmbedding)
+                    else "dense"
+                ),
                 "matvec_counts": matvec_counts,
                 "projected_metric_backend": metric_backend,
                 "_projected_metric": projected_metric,
@@ -3002,13 +3440,20 @@ class NonAbelianFrontierLETTA:
                 action.operator_embedding = operator_embedding
 
                 def operator_projection_blocks(columns):
-                    columns = np.asarray(columns)
                     blocks = []
                     for _own_index, own_entry, _op_index, op_entry in entry_map:
-                        local = columns[
-                            own_entry.offset : own_entry.offset + own_entry.size
-                        ]
-                        active = np.flatnonzero(np.any(local != 0.0, axis=0))
+                        if isinstance(columns, _StructuredPairEmbedding):
+                            active, local = columns.block_design(
+                                own_entry.offset, own_entry.size
+                            )
+                        else:
+                            dense_columns = np.asarray(columns)
+                            local = dense_columns[
+                                own_entry.offset : own_entry.offset + own_entry.size
+                            ]
+                            active = np.flatnonzero(
+                                np.any(local != 0.0, axis=0)
+                            )
                         if active.size == 0:
                             continue
                         blocks.append(
@@ -3018,7 +3463,11 @@ class NonAbelianFrontierLETTA:
                                     int(op_entry.offset + op_entry.size),
                                 ),
                                 np.asarray(active, dtype=np.int64),
-                                np.ascontiguousarray(local[:, active]),
+                                np.ascontiguousarray(
+                                    local
+                                    if isinstance(columns, _StructuredPairEmbedding)
+                                    else local[:, active]
+                                ),
                             )
                         )
                     return tuple(blocks)
@@ -3091,10 +3540,14 @@ class NonAbelianFrontierLETTA:
                 "backend": "compiled_contextual_channel_resolved",
                 "dimension": dimension,
                 "hamiltonian_direction": (
-                    h_plan.direction if h_sweep is None else h_sweep.direction
+                    h_plan.direction
+                    if h_sweep is None
+                    else getattr(h_sweep, "direction", "full")
                 ),
                 "metric_direction": (
-                    n_plan.direction if n_sweep is None else n_sweep.direction
+                    n_plan.direction
+                    if n_sweep is None
+                    else getattr(n_sweep, "direction", "full")
                 ),
                 "hamiltonian_cached_sites": (
                     h_plan.cached_sites if h_sweep is None else self.nsites - 2
@@ -3660,9 +4113,9 @@ class NonAbelianFrontierLETTA:
                     dense_metric.shape[0],
                     ((np.arange(dense_metric.shape[0]), dense_metric),),
                 )
-            projected_design = np.asarray(
-                solver_info.pop("_projected_design"), dtype=complex
-            )
+            projected_design = solver_info.pop("_projected_design")
+            if not isinstance(projected_design, _StructuredPairEmbedding):
+                projected_design = np.asarray(projected_design, dtype=complex)
             parent_h_diagonal = np.asarray(
                 solver_info.pop("_parent_h_diagonal"), dtype=float
             )
@@ -3835,16 +4288,22 @@ class NonAbelianFrontierLETTA:
                     int(bond),
                 )
                 return update
-            orthonormal_design = np.ascontiguousarray(
-                projected_design @ whitener
-            )
-            projected_h_diagonal = np.real(
-                np.sum(
-                    orthonormal_design.conj()
-                    * (parent_h_diagonal[:, None] * orthonormal_design),
-                    axis=0,
+            if isinstance(projected_design, _StructuredPairEmbedding):
+                orthonormal_design = projected_design.compose(whitener)
+                projected_h_diagonal = orthonormal_design.projected_diagonal(
+                    parent_h_diagonal
                 )
-            )
+            else:
+                orthonormal_design = np.ascontiguousarray(
+                    projected_design @ whitener
+                )
+                projected_h_diagonal = np.real(
+                    np.sum(
+                        orthonormal_design.conj()
+                        * (parent_h_diagonal[:, None] * orthonormal_design),
+                        axis=0,
+                    )
+                )
 
             def orthonormal_h_action(vector):
                 return whitener.conj().T @ h_action(whitener @ vector)
@@ -4163,6 +4622,11 @@ class NonAbelianFrontierLETTA:
         local_solver = self._select_local_solver(requested_solver)
         if gauge is not None:
             gauge = str(gauge).lower().replace("-", "_")
+        elif (
+            algorithm == "projected"
+            and self.hamiltonian_representation == "complementary"
+        ):
+            gauge = "conditional"
         if gauge not in {None, "conditional"}:
             raise ValueError("SU2LETTA gauge must be None or 'conditional'.")
         conditional_gauge = bool(
@@ -4171,6 +4635,8 @@ class NonAbelianFrontierLETTA:
             and self.supports_conditional_canonical_gauge
         )
         reuse_environments = bool(reuse_environments)
+        if self.hamiltonian_representation == "complementary":
+            reuse_environments = True
         moving_environment = None
         # The C++ reduced-boundary route batch has a fixed packing/install
         # cost.  Four- and five-site active spaces have too little interior
@@ -4200,6 +4666,21 @@ class NonAbelianFrontierLETTA:
         canonical_center = None
         h_chain = n_chain = None
         for sweep in range(nsweeps):
+            if (
+                sweep
+                and moving_environment is not None
+                and self.hamiltonian_representation == "complementary"
+            ):
+                moving_environment = MovingEnvironment(
+                    self.materialize(),
+                    mpo_factors=self.mpo,
+                    complementary_operator_families=self._complementary_operators,
+                    materialize_complementary_family_operator_tables=False,
+                    su2_moving_environment=None,
+                    su2_boundary_environment=cpp_boundary_environment,
+                )
+                moving_environment.norm_stack.su2_boundary_environment = None
+                h_chain = n_chain = None
             cycle_started = time.perf_counter()
             updates = []
             gauge_updates = []
@@ -4239,13 +4720,28 @@ class NonAbelianFrontierLETTA:
                         )
                         canonical_center = center
                 materialized = self.materialize()
+                direct_half_sweep = bool(
+                    algorithm == "projected"
+                    and self.hamiltonian_representation == "complementary"
+                )
+                if direct_half_sweep:
+                    self._su2_moving_environment.install_mps(materialized)
+                    self._su2_moving_environment.begin_half_sweep(
+                        direction,
+                        self.nsites,
+                    )
                 environment_sweeps = None
-                if algorithm in {"two_site", "projected"} and reuse_environments:
+                if (
+                    algorithm in {"two_site", "projected"}
+                    and reuse_environments
+                ):
                     environment_started = time.perf_counter()
                     if (
                         algorithm == "projected"
                         and self._su2_moving_environment is not None
                     ):
+                        if self.hamiltonian_representation == "complementary":
+                            self._su2_moving_environment.clear_boundaries()
                         self._su2_moving_environment.clear_factor_routes()
                         moving_environment.hamiltonian_stack.su2_moving_environment = (
                             self._su2_moving_environment
@@ -4256,6 +4752,8 @@ class NonAbelianFrontierLETTA:
                         h_reuse, n_reuse = moving_environment.reuse_sides_for(
                             direction
                         )
+                        if self.hamiltonian_representation == "complementary":
+                            h_reuse = None
                     if h_chain is not None and h_reuse is not None:
                         h_chain.sites = list(materialized)
                         environment_chain_reuses += 1
@@ -4294,6 +4792,68 @@ class NonAbelianFrontierLETTA:
                     )
                     environment_build_s += time.perf_counter() - environment_started
                 for bond in bonds:
+                    if direct_half_sweep:
+                        self._su2_moving_environment.begin_bond(bond)
+                        self._su2_moving_environment.merge_active_bond()
+                    local_environment_sweeps = environment_sweeps
+                    if (
+                        algorithm == "projected"
+                        and self.hamiltonian_representation == "complementary"
+                        and local_environment_sweeps is None
+                    ):
+                        for current_site in materialized:
+                            metadata = getattr(current_site, "metadata", None)
+                            if isinstance(metadata, dict):
+                                metadata.pop("_cpp_split_site", None)
+                        environment_started = time.perf_counter()
+                        local_environment = MovingEnvironment(
+                            materialized,
+                            mpo_factors=self.mpo,
+                            complementary_operator_families=self._complementary_operators,
+                            materialize_complementary_family_operator_tables=False,
+                            su2_moving_environment=None,
+                            su2_boundary_environment=cpp_boundary_environment,
+                        )
+                        local_environment.norm_stack.su2_boundary_environment = None
+                        local_environment.hamiltonian_stack.su2_moving_environment = (
+                            self._su2_moving_environment
+                        )
+                        self._su2_moving_environment.clear_boundaries()
+                        self._su2_moving_environment.clear_factor_routes()
+                        hamiltonian_environment_started = time.perf_counter()
+                        local_h_chain = BlockSparseEnvironmentChain.build(
+                            materialized,
+                            self.mpo,
+                            renormalized_blocks=local_environment.hamiltonian_stack,
+                        )
+                        hamiltonian_environment_build_s += (
+                            time.perf_counter() - hamiltonian_environment_started
+                        )
+                        norm_environment_started = time.perf_counter()
+                        local_n_chain = BlockSparseEnvironmentChain.build(
+                            materialized,
+                            local_environment.identity_mpo_factors,
+                            renormalized_blocks=local_environment.norm_stack,
+                        )
+                        norm_environment_build_s += (
+                            time.perf_counter() - norm_environment_started
+                        )
+                        local_h_sweep = local_h_chain.start_sweep(direction)
+                        local_n_sweep = local_n_chain.start_sweep(direction)
+                        traversed = (
+                            range(bond)
+                            if direction == "lr"
+                            else range(self.nsites - 2, bond, -1)
+                        )
+                        for prior_bond in traversed:
+                            for local_sweep in (local_h_sweep, local_n_sweep):
+                                local_sweep.advance_after_update(
+                                    prior_bond,
+                                    materialized[prior_bond],
+                                    materialized[prior_bond + 1],
+                                )
+                        local_environment_sweeps = (local_h_sweep, local_n_sweep)
+                        environment_build_s += time.perf_counter() - environment_started
                     if algorithm == "two_site":
                         h_stack = (
                             None
@@ -4314,7 +4874,7 @@ class NonAbelianFrontierLETTA:
                                 retraction_maxiter=retraction_maxiter,
                                 max_retraction_parameters=max_retraction_parameters,
                                 sites=materialized,
-                                environment_sweeps=environment_sweeps,
+                                environment_sweeps=local_environment_sweeps,
                                 **kwargs,
                             )
                         finally:
@@ -4389,7 +4949,7 @@ class NonAbelianFrontierLETTA:
                                 bond=bond,
                                 executor=self._solver_executor,
                                 environment_sweeps=(
-                                    environment_sweeps
+                                    local_environment_sweeps
                                     if algorithm == "projected"
                                     else None
                                 ),
@@ -4429,6 +4989,7 @@ class NonAbelianFrontierLETTA:
                             }
                         materialized[site] = self.materialize_site(site)
                         if algorithm == "projected":
+                            self._invalidate_materialized_sites(bond, bond + 1)
                             materialized[bond] = self.materialize_site(bond)
                             materialized[bond + 1] = self.materialize_site(bond + 1)
                             if environment_sweeps is not None:
@@ -4440,11 +5001,24 @@ class NonAbelianFrontierLETTA:
                                     )
                     update["direction"] = direction
                     updates.append(update)
+                    if direct_half_sweep:
+                        self._su2_moving_environment.stage_bond_update(
+                            materialized[bond],
+                            materialized[bond + 1],
+                        )
+                        self._su2_moving_environment.commit_bond_update(
+                            energy=update.get("energy_after")
+                        )
                 if environment_sweeps is not None:
                     moving_environment.finish_sweep(direction)
+                if direct_half_sweep:
+                    self._su2_moving_environment.finish_half_sweep()
                 if algorithm == "projected" and moving_environment is not None:
                     moving_environment.hamiltonian_stack.su2_moving_environment = None
-            if algorithm == "projected" and updates:
+            if self.hamiltonian_representation == "complementary":
+                energy = self.expectation()
+                cycle_norm = float(self.norm())
+            elif algorithm == "projected" and updates:
                 energy = float(updates[-1]["energy_after"])
                 cycle_norm = float(updates[-1]["norm_after"])
             else:
@@ -4570,7 +5144,25 @@ class NonAbelianFrontierLETTA:
                 ),
                 "cpp_local_operator_stats": cpp_local_stats,
                 "constraint_cache_stats": {
+                    "pair_coordinate_hits": int(
+                        self._pair_coordinate_cache_hits
+                    ),
+                    "pair_coordinate_misses": int(
+                        self._pair_coordinate_cache_misses
+                    ),
                     "embedding_hits": int(self._embedding_basis_cache_hits),
+                    "embedding_numeric_hits": int(
+                        self._embedding_numeric_cache_hits
+                    ),
+                    "embedding_incremental_updates": int(
+                        self._embedding_incremental_updates
+                    ),
+                    "embedding_reused_blocks": int(
+                        self._embedding_reused_blocks
+                    ),
+                    "embedding_updated_blocks": int(
+                        self._embedding_updated_blocks
+                    ),
                     "metric_component_hits": int(
                         self._metric_component_cache_hits
                     ),

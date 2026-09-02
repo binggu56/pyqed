@@ -5,6 +5,7 @@ from .quantum_schwinger_dvr import QuantumSchwingerDVR
 from .kogut_susskind import KogutSusskindED, KogutSusskindMPO
 from .wilson_dvr_mpo import (
     AlternatingWilsonDVRMPO,
+    OpenSineMatterDVRMPO,
     OpenSineWilsonDVRMPO,
     WilsonDVRMPO,
 )
@@ -13,6 +14,7 @@ __all__ = [
     "AlternatingWilsonDVRMPO",
     "KogutSusskindED",
     "KogutSusskindMPO",
+    "OpenSineMatterDVRMPO",
     "OpenSineWilsonDVRMPO",
     "QuantumSchwingerDVR",
     "WilsonDVRMPO",

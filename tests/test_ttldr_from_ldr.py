@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from pyqed.dvr import DVR, SineDVR
+from pyqed.dvr import DVR, ExponentialDVR, SineDVR
 from pyqed.ldr import AbInitioFit, Coord, LDR
 from pyqed.ldr import keo as keo_tools
 from pyqed.ldr.kinetic import linked
@@ -106,6 +106,13 @@ def test_tnldr_from_ldr_uses_raw_links_without_polar_projection(monkeypatch):
     with pytest.raises(ValueError, match="preserves raw links"):
         TNLDR.from_ldr(ldr, gauge_sync=True)
 
+    packet = np.zeros(driver.dims, dtype=complex)
+    packet[1, 1, 0] = 1.0
+    driver.validate(ldr, packet, dt=0.05, steps=3)
+    assert driver.direct_validation["accepted"]
+    assert driver.direct_validation["hamiltonian_relative_error"] < 1.0e-13
+    assert driver.direct_validation["maximum_population_error"] < 1.0e-13
+
 
 def test_tnldr_from_ldr_accepts_curvilinear_metric_and_pseudopotential():
     axes, grid, links = _grid_and_links()
@@ -150,6 +157,27 @@ def test_tnldr_from_ldr_accepts_curvilinear_metric_and_pseudopotential():
         progress=False,
     )
     np.testing.assert_allclose(driver.norms, 1.0, atol=1.0e-11)
+
+
+def test_tnldr_from_ldr_preserves_periodic_seam_transport():
+    axis = ExponentialDVR(npts=5, L=2.0 * np.pi)
+    grid = DVR.from_axes((axis,))
+    links = {
+        (0, (index,)): np.diag(
+            (np.exp(0.07j * (index + 1)), np.exp(-0.04j * (index + 1)))
+        )
+        for index in range(grid.shape[0])
+    }
+    energies = np.zeros((*grid.shape, 2))
+    ldr = LDR(grid, 2, energies=energies, links=links)
+    driver = TNLDR.from_ldr(ldr)
+    expected = linked(
+        axis.t(), grid.shape, links, nstates=2,
+        periodic_axes=(0,), symmetrize=True,
+    ).toarray()
+
+    assert ldr.periodic_axes == (0,)
+    np.testing.assert_allclose(driver.hamiltonian.to_dense(), expected, atol=1.0e-11)
 
 
 def test_tnldr_builds_mpos_directly_from_an_independent_sampling_grid(

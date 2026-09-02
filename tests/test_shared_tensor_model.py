@@ -1,3 +1,5 @@
+import pickle
+
 import numpy as np
 
 from pyqed.symmetry import Irrep, IrrepTensor, Leg, U1Symmetry
@@ -85,6 +87,20 @@ def test_dense_finite_mps_and_mpo_store_shared_tensors():
     assert all(core.is_dense for core in state.factors)
     assert all(isinstance(core, IrrepTensor) for core in operator.factors)
     assert all(core.is_dense for core in operator.factors)
+
+
+def test_finite_tensor_core_lists_round_trip_through_pickle():
+    state = MPS([np.arange(2.0).reshape(1, 2, 1)])
+    operator = MPO([np.eye(2).reshape(1, 1, 2, 2)])
+
+    restored_state, restored_operator = pickle.loads(
+        pickle.dumps((state, operator), protocol=pickle.HIGHEST_PROTOCOL)
+    )
+
+    np.testing.assert_array_equal(restored_state.factors[0], state.factors[0])
+    np.testing.assert_array_equal(restored_operator.factors[0], operator.factors[0])
+    restored_state.factors.append(np.ones((1, 2, 1)))
+    assert isinstance(restored_state.factors[-1], IrrepTensor)
 
 
 def test_uniform_mps_unit_cell_uses_shared_tensor_storage():

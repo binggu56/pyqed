@@ -17,6 +17,16 @@
       "claim_scope": "Total native PyQED RHF energy for H2 at 1.4 bohr in STO-3G compared with PySCF 2.12.1; no performance or broader accuracy claim."
     },
     {
+      "id": "ch2o-soc-pysoc",
+      "kind": ["external_validation"],
+      "status": "reviewed",
+      "source": "benchmarks/ch2o-soc-pysoc/run.py",
+      "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 MPLCONFIGDIR=/private/tmp/matplotlib-codex PYTHONPATH=. python benchmarks/ch2o-soc-pysoc/run.py --input benchmarks/ch2o-soc-pysoc/input.json --reference benchmarks/ch2o-soc-pysoc/pysoc-reference.json --output benchmarks/ch2o-soc-pysoc/raw-output.json --figure-prefix benchmarks/ch2o-soc-pysoc/soc-integral-comparison",
+      "optional_dependencies": ["pyscf", "ultraplot"],
+      "manifest": "benchmarks/ch2o-soc-pysoc/manifest.json",
+      "claim_scope": "Full multicenter one-electron Breit-Pauli pVxp AO operator for PySOC's bundled formaldehyde geometry and mio-1-1 fitted Gaussian basis compared with PySOC 2.3.0 / MolSOC 0.1; no excited-state or performance claim."
+    },
+    {
       "id": "native-h4-casscf-representations",
       "kind": ["independent_internal_validation", "performance"],
       "status": "candidate",

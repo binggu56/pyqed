@@ -1,0 +1,132 @@
+{
+  "schema_version": "1.0",
+  "benchmark_id": "ch2o-soc-pysoc",
+  "generated_at": "2026-09-02T00:03:09Z",
+  "software": {
+    "pyqed_version": "0.2.0",
+    "git_commit": "38eb0f639294ba5f05a839808e916590e756126a",
+    "git_dirty": true,
+    "python_version": "3.13.5",
+    "dependencies": {
+      "numpy": "2.1.3",
+      "scipy": "1.15.3",
+      "pyscf": "2.12.1",
+      "matplotlib": "3.10.0",
+      "ultraplot": "1.65.1",
+      "pysoc_reference": "2.3.0",
+      "molsoc_reference": "0.1"
+    }
+  },
+  "environment": {
+    "os": "macOS 26.2 / Darwin 25.2.0",
+    "architecture": "arm64",
+    "cpu": "Apple M2 Pro",
+    "logical_cores": 12,
+    "memory_bytes": 34359738368,
+    "blas": "OpenBLAS 0.3.30 (NumPy build configuration)",
+    "threads": {
+      "OPENBLAS_NUM_THREADS": 1,
+      "OMP_NUM_THREADS": 1,
+      "VECLIB_MAXIMUM_THREADS": 1,
+      "NUMEXPR_NUM_THREADS": 1
+    }
+  },
+  "workload": {
+    "description": "PyQED full multicenter one-electron Breit-Pauli pVxp AO tensor for formaldehyde compared with PySOC 2.3.0 / MolSOC 0.1.",
+    "method": "Unscreened one-electron nuclear SOC operator; PySOC MolSOC ONE model",
+    "system": "CH2O at the geometry bundled in PySOC examples/ch2o_tddftb; charge 0; spin 0; PySOC mio-1-1 fitted Gaussian basis; 10 spherical AOs",
+    "parameters": {
+      "pyqed_one_center": false,
+      "pysoc_calculation": "ONE",
+      "component_order": ["x", "y", "z"],
+      "compared_tensor_elements": 300,
+      "sign_alignment": -1.0,
+      "basis_mapping": "PySOC unnormalized fitted primitives mapped to normalized libcint AOs and transformed back to the raw PySOC AO convention",
+      "reference_magnitude_floor": 1e-6,
+      "relative_frobenius_tolerance": 0.0002
+    }
+  },
+  "execution": {
+    "command": "OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 MPLCONFIGDIR=/private/tmp/matplotlib-codex PYTHONPATH=. python benchmarks/ch2o-soc-pysoc/run.py --input benchmarks/ch2o-soc-pysoc/input.json --reference benchmarks/ch2o-soc-pysoc/pysoc-reference.json --output benchmarks/ch2o-soc-pysoc/raw-output.json --figure-prefix benchmarks/ch2o-soc-pysoc/soc-integral-comparison",
+    "working_directory": "PyQED repository root",
+    "warmups": 0,
+    "repeats": 1
+  },
+  "metrics": [
+    {
+      "name": "maximum_reference_integral_magnitude",
+      "value": 207.215256463,
+      "unit": "PySOC raw AO pVxp units",
+      "statistic": "maximum_absolute_value"
+    },
+    {
+      "name": "maximum_absolute_residual",
+      "value": 0.03089442505013551,
+      "unit": "PySOC raw AO pVxp units",
+      "statistic": "maximum_absolute_difference"
+    },
+    {
+      "name": "rms_absolute_residual",
+      "value": 0.004503178061914887,
+      "unit": "PySOC raw AO pVxp units",
+      "statistic": "root_mean_square_difference"
+    },
+    {
+      "name": "relative_frobenius_residual",
+      "value": 0.0001471071451240257,
+      "unit": "dimensionless",
+      "statistic": "frobenius_norm_ratio"
+    },
+    {
+      "name": "normalized_overlap_mapping_error",
+      "value": 5.888068049797468e-8,
+      "unit": "dimensionless",
+      "statistic": "maximum_absolute_difference"
+    }
+  ],
+  "validation": {
+    "reference": "PySOC 2.3.0 / MolSOC 0.1 commit 1a520c682f4851a8ec6e551a04ec5cc89ebc2894, bundled examples/ch2o_tddftb, MolSOC ONE AO integrals",
+    "quantity": "relative Frobenius norm of the AO pVxp residual",
+    "tolerance": 0.0002,
+    "observed_difference": 0.0001471071451240257,
+    "passed": true
+  },
+  "artifacts": [
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/input.json",
+      "sha256": "07d1f9d77beaabb5f75f5712530677be0d3330d34bd38c3d0401290df74096d0",
+      "role": "input"
+    },
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/pysoc-reference.json",
+      "sha256": "cc0fa81dc340e2a6f8e79d6546705831ef93695a4d21c32cc96bfb81596b9ea2",
+      "role": "input"
+    },
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/run.py",
+      "sha256": "0a1bacd5b6b65dc5c293deef85fb3ccf25cf4418ae31501cb7ce9ecf16c2b767",
+      "role": "input"
+    },
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/raw-output.json",
+      "sha256": "c137bb49fca3850c8ad80f21f796613a5b93d792dbdae412eb6b0216d4cab500",
+      "role": "raw_output"
+    },
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/RESULT.md",
+      "sha256": "9cd993ace801442820ad5a9670723c9935f7ebcadf771cc02ce1d58cf908a8fc",
+      "role": "processed_output"
+    },
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/soc-integral-comparison.pdf",
+      "sha256": "e653a7db9e984847113ea8ff1480e45f94f35ff8eba54493d98bfb4571f17d95",
+      "role": "figure"
+    },
+    {
+      "path": "benchmarks/ch2o-soc-pysoc/soc-integral-comparison.png",
+      "sha256": "cf6bbdb5f4160c3a796a844d7ee253e8b82259bbdb656be13e42e0cc2abe4754",
+      "role": "figure"
+    }
+  ],
+  "notes": "Correctness validation only; no timing was measured. The source tree was dirty, so this is a development-snapshot record. The official Gaussian path requires proprietary rwfdump and was not used. The open-source MolSOC AO stage completed normally; a later optional soc_td transition-dipole stage segfault is unrelated and its output is excluded. The claim does not extend to PySOC LR-TDDFT/TD-DFTB state couplings or PyQED CASCI state couplings."
+}

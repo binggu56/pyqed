@@ -611,6 +611,12 @@ def _pyscf_gdf_mean_field(space):
 
 
 def _pair_keys_for_q(space, q_index):
+    requested = getattr(space, "requested_pair_keys", None)
+    if requested is not None:
+        return tuple(
+            (int(k_index), int(kq_index))
+            for k_index, kq_index in requested(q_index)
+        )
     ref = space.reference
     qvec = np.asarray(space.qpts[q_index], dtype=float)
     keys = []
@@ -4221,6 +4227,13 @@ def _gdf_is_zero_vector(vec, tol=1.0e-12):
     return float(np.linalg.norm(np.asarray(vec, dtype=float))) <= float(tol)
 
 
+def _gdf_is_reciprocal_zero(ref, vec, tol=1.0e-10):
+    """Return whether a momentum is zero modulo a reciprocal vector."""
+
+    scaled = np.asarray(ref.cartesian_to_scaled(vec), dtype=float)
+    return float(np.max(np.abs(scaled - np.rint(scaled)))) <= float(tol)
+
+
 def _gdf_auxiliary_charge(space, aux, timings=None):
     charge = _gdf_auxiliary_ft(
         space,
@@ -6645,7 +6658,7 @@ def _periodic_gdf_aux_metric(
                 cache_results=False,
                 consume_cached_results=True,
             )
-        if has_compact_aux and _gdf_is_zero_vector(qvec):
+        if has_compact_aux and _gdf_is_reciprocal_zero(ref, qvec):
             qaux = _gdf_auxiliary_charge(space, aux, timings=timings)
             if rs_aux_engine is not None:
                 qaux = qaux * rs_aux_engine.compact_aux_mask
@@ -7232,7 +7245,11 @@ def _periodic_gdf_three_center_ao(
                     allowed_pair_mask=compact_pair_mask,
                 )
             ao_tensor += short_range_ao
-        if has_compact_pairs and has_compact_aux and _gdf_is_zero_vector(qvec):
+        if (
+            has_compact_pairs
+            and has_compact_aux
+            and _gdf_is_reciprocal_zero(ref, qvec)
+        ):
             qaux = _gdf_auxiliary_charge(space, aux, timings=timings)
             if compact_aux_mask is not None:
                 qaux = qaux * compact_aux_mask
@@ -7513,7 +7530,7 @@ def _periodic_gdf_stream_reciprocal_ao_many(
                 cache_results=False,
                 consume_cached_results=True,
             )
-            if _gdf_is_zero_vector(qvec):
+            if _gdf_is_reciprocal_zero(ref, qvec):
                 qaux = _gdf_auxiliary_charge(space, aux, timings=timings)
                 if compact_aux_mask is not None:
                     qaux = qaux * compact_aux_mask
@@ -8205,6 +8222,8 @@ def _gdf_self_opposite_pair_sources(space, q_index, pair_keys):
 
 
 def _gdf_should_use_opposite_q(space, q_index):
+    if getattr(space, "disable_opposite_q_reuse", False):
+        return None
     opposite = _gdf_opposite_q_index(space, q_index)
     if opposite is None or opposite == int(q_index):
         return None

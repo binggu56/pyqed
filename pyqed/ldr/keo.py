@@ -373,9 +373,15 @@ class Podolsky:
     metric: np.ndarray | None = None
     pseudopotential: np.ndarray | bool | None = True
     boundary_complete: bool = False
+    max_metric_condition: float | None = None
     options: tuple[tuple[str, object], ...] = ()
 
     def __post_init__(self):
+        if self.max_metric_condition is not None:
+            maximum = float(self.max_metric_condition)
+            if not np.isfinite(maximum) or maximum < 1.0:
+                raise ValueError("max_metric_condition must be finite and at least 1")
+            object.__setattr__(self, "max_metric_condition", maximum)
         pseudopotential = self.pseudopotential
         if isinstance(pseudopotential, (bool, np.bool_)):
             pseudopotential = bool(pseudopotential)
@@ -464,7 +470,7 @@ class Podolsky:
         return metric, pseudopotential
 
     @staticmethod
-    def _validated_metric(metric):
+    def _validated_metric(metric, max_condition=None):
         metric = np.asarray(metric)
         if not np.all(np.isfinite(metric)):
             raise ValueError("Podolsky metric contains non-finite values")
@@ -476,6 +482,20 @@ class Podolsky:
             raise ValueError(
                 f"Podolsky metric is singular or indefinite at grid index {index}"
             )
+        if max_condition is not None:
+            condition = eigenvalues[..., -1] / eigenvalues[..., 0]
+            flat_index = int(np.argmax(condition))
+            maximum = float(condition.flat[flat_index])
+            if maximum > float(max_condition):
+                index = tuple(int(value) for value in np.unravel_index(
+                    flat_index, condition.shape
+                ))
+                raise ValueError(
+                    "Podolsky metric condition number "
+                    f"{maximum:.6g} exceeds max_metric_condition="
+                    f"{float(max_condition):.6g} at grid index {index}; "
+                    "restrict or replace the coordinate chart"
+                )
         return metric
 
     def bind(self, coord, *, grid=None, molecule=None):
@@ -499,7 +519,7 @@ class Podolsky:
                 metric,
                 pseudopotential,
             )
-        metric = self._validated_metric(metric)
+        metric = self._validated_metric(metric, self.max_metric_condition)
         if metric.shape != (*grid.shape, coord.ndim, coord.ndim):
             raise ValueError("Podolsky metric grid does not match the LDR grid")
         if pseudopotential is not None:
@@ -579,6 +599,7 @@ def podolsky(
     pseudopotential=True,
     *,
     boundary_complete=False,
+    max_metric_condition=None,
     **options,
 ):
     r"""Return a curvilinear Podolsky KEO specification for :class:`LDR`.
@@ -589,12 +610,15 @@ def podolsky(
     discretization is
     $\frac12 p_\mu^\dagger G^{\mu\nu}p_\nu+V_\mathrm{ps}$ and is delegated to
     :func:`pyqed.namd.polyspherical.metric_keo_mpo` when attached to an LDR
-    grid. No global nuclear matrix is formed.
+    grid. No global nuclear matrix is formed. ``max_metric_condition`` can be
+    used to reject a coordinate chart whose sampled inverse metric becomes
+    too ill-conditioned for the intended discretization.
     """
     return Podolsky(
         metric,
         pseudopotential,
         boundary_complete=bool(boundary_complete),
+        max_metric_condition=max_metric_condition,
         options=tuple(options.items()),
     )
 

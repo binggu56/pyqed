@@ -15,12 +15,14 @@ class Coord:
     """A grid-independent nuclear-coordinate chart.
 
     ``to_cartesian(q)`` maps one nuclear coordinate vector to an ``(N, 3)``
-    Cartesian geometry. ``bounds`` defines the fitting domain. Electronic
-    sampling and nuclear dynamics discretize this chart independently.
+    Cartesian geometry. ``bounds`` defines the fitting domain and
+    ``periodic_axes`` identifies coordinates whose endpoints are equivalent.
+    Electronic sampling and nuclear dynamics discretize this chart independently.
     """
 
     to_cartesian: Callable | None = None
     bounds: tuple | None = None
+    periodic_axes: tuple = ()
 
     def __post_init__(self):
         if self.to_cartesian is not None and not callable(self.to_cartesian):
@@ -39,6 +41,12 @@ class Coord:
         ):
             raise ValueError("coordinate bounds must be finite and increasing")
         object.__setattr__(self, "bounds", bounds)
+        periodic_axes = tuple(
+            sorted(set(int(axis) for axis in self.periodic_axes))
+        )
+        if any(axis < 0 or axis >= len(bounds) for axis in periodic_axes):
+            raise ValueError("periodic_axes contains an invalid coordinate")
+        object.__setattr__(self, "periodic_axes", periodic_axes)
 
     def validate_grid(self, grid):
         """Validate a dynamics grid against this chart and return it."""

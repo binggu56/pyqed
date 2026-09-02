@@ -1400,6 +1400,373 @@ def _diagonal_g0w0_ac(
     )
 
 
+def _diagonal_g0w0_bands(
+    space,
+    kpts,
+    *,
+    qp_bands=None,
+    eta=1.0e-2,
+    q_indices=None,
+    direct_scale=2.0,
+    coulomb_component=GDF,
+    g2_tol=1.0e-16,
+    thresh=1.0e-10,
+    linearized=False,
+    linearized_step=1.0e-6,
+    solve_roots=False,
+    maxiter=50,
+    tol=1.0e-6,
+    cache=None,
+    intermediate_bands=None,
+    pair_workers=None,
+    reference="fermi",
+):
+    r"""Evaluate diagonal G0W0 quasiparticle energies off the SCF k mesh.
+
+    For every target :math:`\mathbf k_b`, the intermediate-state closure is
+    :math:`\{\mathbf k_b-\mathbf q\}` over the SCF screening mesh.  The
+    screened interaction remains the mesh direct-RPA solution, while explicit
+    GDF factors are built only for
+    :math:`(\mathbf k_b-\mathbf q,\mathbf k_b)`.
+
+    This is an off-mesh adaptation of the diagonal pole G0W0 implementation,
+    not an interpolation.  It follows L. Hedin, Phys. Rev. 139, A796 (1965),
+    doi:10.1103/PhysRev.139.A796, with the same Hartree--Fock-reference
+    cancellation and direct-RPA screening conventions as
+    :func:`diagonal_g0w0`.  Finite-size head/wing terms, analytic continuation,
+    eigenvalue-only self-consistency, metals, and non-GDF factors are omitted.
+    """
+
+    if not isinstance(space, KPointTransitionSpace):
+        space = KPointTransitionSpace(space)
+    component = normalize_coulomb_component(coulomb_component)
+    if component != GDF:
+        raise NotImplementedError(
+            "Off-mesh G0W0 bands currently require coulomb_component='gdf'."
+        )
+    if cache is None:
+        cache = DiagonalSelfEnergyCache()
+    if linearized and solve_roots:
+        raise ValueError("linearized=True cannot be combined with solve_roots=True.")
+    if linearized:
+        linearized_step = float(linearized_step)
+        if linearized_step <= 0.0:
+            raise ValueError("linearized_step must be positive.")
+    if solve_roots:
+        maxiter = _normalize_positive_integer(maxiter, "maxiter")
+
+    requested_kpts = np.asarray(kpts, dtype=float)
+    if requested_kpts.ndim == 1:
+        requested_kpts = requested_kpts.reshape(1, 3)
+    if (
+        requested_kpts.ndim != 2
+        or requested_kpts.shape[1] != 3
+        or len(requested_kpts) == 0
+    ):
+        raise ValueError("kpts must have shape (nkpts, 3) with at least one row.")
+    if not np.all(np.isfinite(requested_kpts)):
+        raise ValueError("kpts must contain finite values.")
+
+    ref = space.reference
+    mf = ref._pbc_mf
+    backend = getattr(mf, "with_df", None)
+    if getattr(mf, "jk_builder", None) != "gdf" or backend is None:
+        raise NotImplementedError(
+            "Off-mesh G0W0 bands require a converged GDF-KRHF reference."
+        )
+    if not hasattr(mf, "band_structure") or not hasattr(
+        backend,
+        "get_pair_factors",
+    ):
+        raise NotImplementedError(
+            "The GDF-KRHF reference does not provide arbitrary-k pair factors."
+        )
+
+    q_indices = _normalize_q_indices(space, q_indices)
+    if len(q_indices) == 0:
+        raise ValueError("q_indices must select at least one screening momentum.")
+    if qp_bands is None:
+        target_bands = tuple(range(ref.nband))
+    else:
+        target_bands = _normalize_band_indices(ref, qp_bands, "qp_bands")
+    if not target_bands:
+        raise ValueError("qp_bands must select at least one band.")
+    normalized_intermediate = _normalize_intermediate_bands(
+        ref,
+        intermediate_bands,
+    )
+    if isinstance(normalized_intermediate, dict):
+        raise NotImplementedError(
+            "Off-mesh G0W0 bands use one common intermediate_bands list."
+        )
+    intermediate = _intermediate_bands_for_k(
+        ref,
+        0,
+        normalized_intermediate,
+    )
+    if len(intermediate) == 0:
+        raise ValueError("intermediate_bands must select at least one band.")
+    nocc = _consistent_closed_shell_nocc(ref)
+
+    total_started = time.perf_counter()
+    closure = []
+
+    def closure_index(kvec):
+        value = np.asarray(kvec, dtype=float)
+        for index, existing in enumerate(closure):
+            if np.max(np.abs(existing - value)) <= 1.0e-10:
+                return int(index)
+        closure.append(value.copy())
+        return len(closure) - 1
+
+    target_indices = [closure_index(kvec) for kvec in requested_kpts]
+    mesh_target_indices = []
+    for kvec in requested_kpts:
+        distances = np.max(np.abs(np.asarray(ref.kpts) - kvec), axis=1)
+        match = int(np.argmin(distances))
+        mesh_target_indices.append(match if distances[match] <= 1.0e-10 else None)
+    intermediate_indices = np.empty(
+        (len(requested_kpts), len(q_indices)),
+        dtype=np.int64,
+    )
+    requested_pairs = []
+    for target_row, (target_index, kvec) in enumerate(
+        zip(target_indices, requested_kpts)
+    ):
+        for q_position, q_index in enumerate(q_indices):
+            left = closure_index(kvec - space.qpts[int(q_index)])
+            intermediate_indices[target_row, q_position] = left
+            pair = (int(left), int(target_index))
+            if pair not in requested_pairs:
+                requested_pairs.append(pair)
+
+    closure_kpts = np.asarray(closure, dtype=float)
+    band_started = time.perf_counter()
+    band_data = mf.band_structure(
+        kpts=closure_kpts,
+        exchange="finite_q",
+        reference="none",
+        sort_bands="energy",
+    )
+    band_seconds = time.perf_counter() - band_started
+    closure_energy = np.asarray(band_data["mo_energy"], dtype=float)
+    closure_coeff = np.asarray(band_data["mo_coeff"], dtype=np.complex128)
+    if closure_energy.shape != (len(closure_kpts), ref.nband):
+        raise RuntimeError("The GDF-KRHF closure returned an inconsistent band table.")
+
+    pair_started = time.perf_counter()
+    pair_blocks = backend.get_pair_factors(
+        closure_kpts,
+        requested_pairs,
+        closure_coeff,
+        workers=pair_workers,
+    )
+    pair_seconds = time.perf_counter() - pair_started
+    pair_by_indices = dict(zip(requested_pairs, pair_blocks))
+
+    intermediate_energy = np.empty(
+        (len(requested_kpts), len(q_indices), len(intermediate)),
+        dtype=float,
+    )
+    for target_row, mesh_index in enumerate(mesh_target_indices):
+        for q_position, q_index in enumerate(q_indices):
+            if mesh_index is None:
+                left = int(intermediate_indices[target_row, q_position])
+                intermediate_energy[target_row, q_position] = closure_energy[
+                    left,
+                    intermediate,
+                ]
+            else:
+                kmq_index = ref.find_kpoint_index(
+                    ref.kpts[int(mesh_index)] - space.qpts[int(q_index)]
+                )
+                intermediate_energy[target_row, q_position] = np.asarray(
+                    ref.mo_energy[kmq_index, intermediate],
+                    dtype=float,
+                )
+
+    coupling_started = time.perf_counter()
+    coupling_data = {}
+    for q_position, q_index in enumerate(q_indices):
+        q_index = int(q_index)
+        poles = _cached_screened_interaction(
+            cache,
+            space,
+            q_index,
+            direct_scale,
+            component,
+            g2_tol,
+            thresh,
+        )
+        if poles.nmodes == 0:
+            continue
+        transition_factors = _cached_transition_factors(
+            cache,
+            space,
+            q_index,
+            g2_tol,
+            component,
+        )
+        transition_vectors = np.asarray(
+            transition_factors.transition_vectors,
+            dtype=np.complex128,
+        )
+        sqrt_weights = np.sqrt(np.asarray(poles.transition_weights, dtype=float))
+        for target_row, target_index in enumerate(target_indices):
+            left = int(intermediate_indices[target_row, q_position])
+            key = (left, int(target_index))
+            block = np.asarray(pair_by_indices[key], dtype=np.complex128)
+            if block.shape[0] != transition_vectors.shape[1]:
+                raise RuntimeError(
+                    "Off-mesh and screening GDF factors use different auxiliary ranks."
+                )
+            selected = block[:, intermediate, :][:, :, target_bands]
+            bare = np.einsum(
+                "tP,Pmn->tmn",
+                transition_vectors,
+                selected.conj(),
+                optimize=True,
+            )
+            kernel = (
+                float(poles.direct_scale)
+                * sqrt_weights[:, None, None]
+                * bare
+            )
+            mode_coupling = np.einsum(
+                "tmn,tL->mnL",
+                kernel.conj(),
+                poles.mode_projector,
+                optimize=True,
+            )
+            coupling_data[(target_row, q_position)] = (
+                np.asarray(poles.omega, dtype=float),
+                np.asarray(np.abs(mode_coupling) ** 2, dtype=float),
+            )
+    coupling_seconds = time.perf_counter() - coupling_started
+
+    occupied_flags = np.asarray(intermediate < nocc, dtype=np.bool_)
+    q_weight = 1.0 / len(q_indices)
+
+    def sigma_at(target_row, band_position, omega):
+        sigma = 0.0 + 0.0j
+        for q_position in range(len(q_indices)):
+            data = coupling_data.get((target_row, q_position))
+            if data is None:
+                continue
+            pole_omega, weights = data
+            contribution = _accumulate_pole_self_energy(
+                np.asarray([float(omega)], dtype=float),
+                pole_omega,
+                weights[:, band_position, :],
+                intermediate_energy[target_row, q_position],
+                occupied_flags,
+                float(eta),
+            )[0]
+            sigma += q_weight * contribution
+        return sigma
+
+    target_energy = closure_energy[np.asarray(target_indices, dtype=int)]
+    for target_row, mesh_index in enumerate(mesh_target_indices):
+        if mesh_index is not None:
+            target_energy[target_row] = ref.mo_energy[int(mesh_index)]
+    e_qp = np.array(target_energy, copy=True)
+    sigma_on_shell = np.full(e_qp.shape, np.nan, dtype=np.complex128)
+    converged = np.zeros(e_qp.shape, dtype=bool)
+    qp_started = time.perf_counter()
+    for target_row in range(len(requested_kpts)):
+        for band_position, band_index in enumerate(target_bands):
+            eps = float(target_energy[target_row, band_index])
+            sigma_eps = sigma_at(target_row, band_position, eps)
+            sigma_on_shell[target_row, band_index] = sigma_eps
+            if linearized:
+                shifted = sigma_at(
+                    target_row,
+                    band_position,
+                    eps + linearized_step,
+                )
+                derivative = (shifted.real - sigma_eps.real) / linearized_step
+                e_qp[target_row, band_index] = (
+                    eps + sigma_eps.real / (1.0 - derivative)
+                )
+                converged[target_row, band_index] = True
+            elif not solve_roots:
+                e_qp[target_row, band_index] = eps + sigma_eps.real
+                converged[target_row, band_index] = True
+            else:
+
+                def quasiparticle(omega):
+                    return (
+                        omega
+                        - eps
+                        - sigma_at(target_row, band_position, omega).real
+                    )
+
+                try:
+                    e_qp[target_row, band_index] = newton(
+                        quasiparticle,
+                        eps + sigma_eps.real,
+                        tol=tol,
+                        maxiter=maxiter,
+                    )
+                    converged[target_row, band_index] = True
+                except RuntimeError:
+                    e_qp[target_row, band_index] = eps + sigma_eps.real
+    qp_seconds = time.perf_counter() - qp_started
+
+    occupied_mesh = np.asarray(ref.mo_energy)[
+        np.asarray(ref.mo_occ) > ref.occupation_tol
+    ]
+    e_fermi = float(np.max(occupied_mesh)) if occupied_mesh.size else None
+    reference_key = str(reference).strip().lower()
+    if reference_key in ("fermi", "homo") and e_fermi is not None:
+        e_mf_reference = target_energy - e_fermi
+        e_qp_reference = e_qp - e_fermi
+    elif reference_key in ("none", "absolute"):
+        e_mf_reference = target_energy.copy()
+        e_qp_reference = e_qp.copy()
+    else:
+        raise ValueError("reference must be 'fermi' or 'none'.")
+
+    target_coeff = np.asarray(
+        [closure_coeff[index] for index in target_indices],
+        dtype=np.complex128,
+    )
+    target_converged = converged[:, np.asarray(target_bands, dtype=int)]
+    return {
+        "kpts": requested_kpts.copy(),
+        "mo_energy": target_energy,
+        "qp_energy": e_qp,
+        "mo_energy_reference": e_mf_reference,
+        "qp_energy_reference": e_qp_reference,
+        "sigma_c": sigma_on_shell,
+        "converged": converged,
+        "mo_coeff": target_coeff,
+        "e_fermi": e_fermi,
+        "qp_bands": target_bands,
+        "q_indices": np.asarray(q_indices, dtype=int).copy(),
+        "intermediate_bands": np.asarray(intermediate, dtype=int).copy(),
+        "interpolated": False,
+        "info": {
+            "backend": "off_mesh_gdf_diagonal_g0w0",
+            "closure_kpoints": int(len(closure_kpts)),
+            "requested_pairs": int(len(requested_pairs)),
+            "screening_qpoints": int(len(q_indices)),
+            "linearized": bool(linearized),
+            "solve_roots": bool(solve_roots),
+            "all_converged": bool(np.all(target_converged)),
+            "coulomb_component": component,
+            "band_seconds": float(band_seconds),
+            "pair_seconds": float(pair_seconds),
+            "coupling_seconds": float(coupling_seconds),
+            "qp_seconds": float(qp_seconds),
+            "krhf_band_build": dict(backend.band_build_timings),
+            "gdf_pair_build": dict(backend.pair_build_timings),
+            "cache_sizes": cache.sizes(),
+            "total_seconds": float(time.perf_counter() - total_started),
+        },
+    }
+
+
 def diagonal_correlation_self_energy(
     space,
     k_index,

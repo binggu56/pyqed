@@ -199,6 +199,18 @@ def test_calculation_claim_prevents_duplicate_work(tmp_path):
         assert second.active_claims() == []
 
 
+def test_release_claims_cleans_up_an_interrupted_owner(tmp_path):
+    path = tmp_path / "electronic.sqlite"
+    with ElectronicDatabase(path) as database:
+        for coordinate in (0.0, 1.0, 2.0):
+            assert database.claim(
+                {"geometry": [coordinate], "protocol": {"method": "FCI"}},
+                "interrupted-run",
+            ) == "acquired"
+        assert database.release_claims("interrupted-run") == 3
+        assert database.active_claims() == []
+
+
 def test_successful_points_survive_a_later_builder_failure(tmp_path):
     path = tmp_path / "electronic.sqlite"
     protocol = {"method": "SA-CASSCF"}

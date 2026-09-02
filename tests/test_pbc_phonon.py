@@ -4,6 +4,7 @@ import pytest
 from pyqed.pbc import (
     FiniteDisplacementPhonon,
     KRHFForceCalculator,
+    PeriodicPhononMode,
     interpolate_q_path,
 )
 from pyqed.qchem.pbc import Cell
@@ -85,6 +86,32 @@ def test_phonon_band_structure_interpolates_fractional_q_path():
     assert np.all(np.diff(bands["distances"]) > 0.0)
     np.testing.assert_allclose(bands["frequencies"][0], 0.0, atol=1.0e-5)
     np.testing.assert_allclose(bands["frequencies"][-1], 0.0, atol=1.0e-5)
+
+
+def test_finite_displacement_phonon_returns_mass_weighted_mode():
+    spring_constant = 0.3
+    phonon = FiniteDisplacementPhonon(
+        _helium_chain_cell(),
+        _PeriodicChainForces(2.0, 3, spring_constant),
+        supercell=(3, 1, 1),
+        displacement=1.0e-3,
+        masses=[1.0],
+    ).run()
+
+    mode = phonon.mode([0.25, 0.0, 0.0], branch=1)
+    expected_frequency = np.sqrt(2.0 * spring_constant / amu_to_au)
+
+    assert isinstance(mode, PeriodicPhononMode)
+    assert mode.branch == 1
+    assert mode.stable
+    assert mode.source == "FiniteDisplacementPhonon"
+    np.testing.assert_allclose(mode.qpoint, [0.25, 0.0, 0.0])
+    np.testing.assert_allclose(mode.frequency, expected_frequency, atol=1.0e-12)
+    np.testing.assert_allclose(np.linalg.norm(mode.eigenvector), 1.0)
+    np.testing.assert_allclose(
+        mode.cartesian_displacement,
+        mode.eigenvector / np.sqrt(amu_to_au),
+    )
 
 
 def test_interpolate_q_path_validates_shape_and_resolution():

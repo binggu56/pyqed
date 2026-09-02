@@ -141,6 +141,8 @@ def kinetic(x, mass=1, dvr='sinc'):
 
 class _DVR1D:
 
+    periodic = False
+
 
     def v(self, V):
         """
@@ -449,6 +451,7 @@ class ExponentialDVR(SincDVR):
         M.H. Beck et al. Physics Reports 324 (2000) 1-105, P94
 
     """
+    periodic = True
     def __init__(self, n=None, L=1, x0=0, mass=1.0, *, npts=None):
         # Small shift here for consistent abscissa
         # SincDVR.__init__(self, *v, **kw)

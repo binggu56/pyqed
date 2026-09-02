@@ -65,6 +65,10 @@ _LAZY_IMPORTS = {
         "pyqed.pbc.gw.electron_phonon",
         "commensurate_tda_electron_phonon_coupling",
     ),
+    "phonon_tda_electron_phonon_coupling": (
+        "pyqed.pbc.gw.electron_phonon",
+        "phonon_tda_electron_phonon_coupling",
+    ),
     "commensurate_gdf_bare_tda_kernel_derivative": (
         "pyqed.pbc.gw.electron_phonon",
         "commensurate_gdf_bare_tda_kernel_derivative",

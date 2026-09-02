@@ -10,22 +10,35 @@ import numpy as np
 from . import _kernels as kernels
 
 
-def layout(shape):
-    """Return product-grid indices, flat lookup, and forward edges."""
+def _periodic_axes(periodic_axes, ndim):
+    axes = tuple(sorted(set(int(axis) for axis in periodic_axes)))
+    if any(axis < 0 or axis >= int(ndim) for axis in axes):
+        raise ValueError("periodic axis is outside the product grid")
+    return axes
+
+
+def layout(shape, *, periodic_axes=()):
+    """Return product-grid indices, flat lookup, and oriented grid edges.
+
+    Periodic axes include one closing edge from the final node to node zero.
+    The closing link retains the Wilson-loop holonomy rather than identifying
+    the endpoint electronic frames.
+    """
 
     shape = tuple(int(n) for n in shape)
     if not shape or any(n <= 0 for n in shape):
         raise ValueError("shape entries must be positive")
+    periodic_axes = frozenset(_periodic_axes(periodic_axes, len(shape)))
 
     indices = tuple(np.ndindex(shape))
     flat = {idx: i for i, idx in enumerate(indices)}
     edges = []
     for idx in indices:
         for axis in range(len(shape)):
-            if idx[axis] + 1 >= shape[axis]:
+            if idx[axis] + 1 >= shape[axis] and axis not in periodic_axes:
                 continue
             nxt = list(idx)
-            nxt[axis] += 1
+            nxt[axis] = (nxt[axis] + 1) % shape[axis]
             nxt = tuple(nxt)
             edges.append((axis, idx, flat[idx], flat[nxt]))
     return np.asarray(indices, dtype=int), flat, tuple(edges)
@@ -107,10 +120,10 @@ def procrustes(value):
     return rotation, positive, singular_values
 
 
-def nearest(shape, overlap, *, unitarize=False):
-    """Evaluate ``overlap(index, neighbor)`` on all forward grid edges."""
+def nearest(shape, overlap, *, unitarize=False, periodic_axes=()):
+    """Evaluate ``overlap(index, neighbor)`` on all oriented grid edges."""
 
-    indices, _, edges = layout(shape)
+    indices, _, edges = layout(shape, periodic_axes=periodic_axes)
     links = {}
     for axis, idx, _, neighbor_flat in edges:
         neighbor = tuple(indices[neighbor_flat])
@@ -119,13 +132,30 @@ def nearest(shape, overlap, *, unitarize=False):
     return links
 
 
-def follow(bra, ket, links, *, nstates=None, axes=None):
-    """Compose links along one axis-ordered path between two grid points."""
+def follow(
+    bra,
+    ket,
+    links,
+    *,
+    nstates=None,
+    axes=None,
+    shape=None,
+    periodic_axes=(),
+):
+    """Compose links along one axis-ordered, shortest wrapped path."""
 
     bra = tuple(int(i) for i in bra)
     ket = tuple(int(i) for i in ket)
     if len(bra) != len(ket):
         raise ValueError("bra and ket indices must have the same dimension")
+    if shape is None:
+        if periodic_axes:
+            raise ValueError("shape is required for periodic linked transport")
+        shape = tuple(max(left, right) + 1 for left, right in zip(bra, ket))
+    shape = tuple(int(size) for size in shape)
+    if len(shape) != len(bra) or any(size <= 0 for size in shape):
+        raise ValueError("shape is incompatible with linked-transport indices")
+    periodic_axes = frozenset(_periodic_axes(periodic_axes, len(shape)))
     if axes is None:
         axes = range(len(bra))
     current = list(bra)
@@ -133,12 +163,19 @@ def follow(bra, ket, links, *, nstates=None, axes=None):
 
     for axis in axes:
         axis = int(axis)
-        while current[axis] < ket[axis]:
+        delta = ket[axis] - current[axis]
+        if axis in periodic_axes:
+            forward = delta % shape[axis]
+            backward = (-delta) % shape[axis]
+            steps = int(forward if forward <= backward else -backward)
+        else:
+            steps = int(delta)
+        for _ in range(max(steps, 0)):
             link = as_block(links[(axis, tuple(current))], nstates)
             value = value * link if nstates is None else value @ link
-            current[axis] += 1
-        while current[axis] > ket[axis]:
-            current[axis] -= 1
+            current[axis] = (current[axis] + 1) % shape[axis]
+        for _ in range(max(-steps, 0)):
+            current[axis] = (current[axis] - 1) % shape[axis]
             link = as_block(links[(axis, tuple(current))], nstates)
             link = link.conjugate() if nstates is None else link.conj().T
             value = value * link if nstates is None else value @ link
@@ -148,21 +185,42 @@ def follow(bra, ket, links, *, nstates=None, axes=None):
     return value
 
 
-def between(bra, ket, links, *, nstates=None, average_paths=False):
+def between(
+    bra,
+    ket,
+    links,
+    *,
+    nstates=None,
+    average_paths=False,
+    shape=None,
+    periodic_axes=(),
+):
     """Return linked overlap, optionally averaged over active-axis orderings."""
 
     bra = tuple(int(i) for i in bra)
     ket = tuple(int(i) for i in ket)
     active = tuple(i for i, (left, right) in enumerate(zip(bra, ket)) if left != right)
     if not average_paths or len(active) <= 1:
-        return follow(bra, ket, links, nstates=nstates)
+        return follow(
+            bra, ket, links, nstates=nstates, shape=shape,
+            periodic_axes=periodic_axes,
+        )
 
     paths = tuple(itertools.permutations(active))
     if nstates is None:
-        return sum(follow(bra, ket, links, axes=path) for path in paths) / len(paths)
+        return sum(
+            follow(
+                bra, ket, links, axes=path, shape=shape,
+                periodic_axes=periodic_axes,
+            )
+            for path in paths
+        ) / len(paths)
     value = np.zeros((int(nstates), int(nstates)), dtype=complex)
     for path in paths:
-        value += follow(bra, ket, links, nstates=nstates, axes=path)
+        value += follow(
+            bra, ket, links, nstates=nstates, axes=path, shape=shape,
+            periodic_axes=periodic_axes,
+        )
     return value / len(paths)
 
 
@@ -293,7 +351,9 @@ def phase_gauge(
     return values
 
 
-def dense(shape, links, *, nstates=None, average_paths=False):
+def dense(
+    shape, links, *, nstates=None, average_paths=False, periodic_axes=()
+):
     """Materialize the global linked overlap matrix or block tensor."""
 
     indices, _, _ = layout(shape)
@@ -308,6 +368,8 @@ def dense(shape, links, *, nstates=None, average_paths=False):
                     tuple(indices[j]),
                     links,
                     average_paths=average_paths,
+                    shape=shape,
+                    periodic_axes=periodic_axes,
                 )
                 result[i, j] = value
                 result[j, i] = value.conjugate()
@@ -315,7 +377,7 @@ def dense(shape, links, *, nstates=None, average_paths=False):
 
     nstates = int(nstates)
     result = np.zeros((ngrid, nstates, ngrid, nstates), dtype=complex)
-    if nstates is not None and not average_paths:
+    if nstates is not None and not average_paths and not periodic_axes:
         fast = kernels.linked_overlap_dense(shape, links, nstates=nstates, average_paths=False)
         if fast is not None:
             return fast
@@ -328,6 +390,8 @@ def dense(shape, links, *, nstates=None, average_paths=False):
                 links,
                 nstates=nstates,
                 average_paths=average_paths,
+                shape=shape,
+                periodic_axes=periodic_axes,
             )
             result[i, :, j, :] = value
             result[j, :, i, :] = value.conj().T

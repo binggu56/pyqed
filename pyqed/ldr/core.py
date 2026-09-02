@@ -217,6 +217,8 @@ class LDR:
 
         self.shape = dvr.shape
         self.ndim = dvr.ndim
+        self.grid_periodic_axes = tuple(getattr(dvr, "periodic_axes", ()))
+        self.periodic_axes = ()
         self.x = dvr.x
         self.points = dvr.points
         self.ngrid = dvr.size
@@ -561,6 +563,7 @@ class LDR:
         links = overlap_tools.nearest(
             self.shape,
             selected_overlap,
+            periodic_axes=self.grid_periodic_axes,
         )
         self.set_overlaps(links=links)
         return self
@@ -623,6 +626,16 @@ class LDR:
             )
         self.overlaps = overlaps
         self.links = links
+        self.periodic_axes = tuple(
+            axis
+            for axis in self.grid_periodic_axes
+            if links is not None
+            and all(
+                (axis, index) in links
+                for index in np.ndindex(self.shape)
+                if index[axis] == self.shape[axis] - 1
+            )
+        )
         self._kinetic_operators.clear()
         self._kinetic_operator_info.clear()
         self.kinetic_info = {"backend": "unbuilt"}
@@ -649,6 +662,7 @@ class LDR:
                         frames[left].conj().T @ frames[right]
                     ),
                     unitarize=unitarize,
+                    periodic_axes=self.grid_periodic_axes,
                 )
             )
         else:
@@ -716,6 +730,7 @@ class LDR:
                     self.links,
                     nstates=self.nstates,
                     average_paths=self.average_paths,
+                    periodic_axes=self.periodic_axes,
                 )
             return sp.kron(
                 sp.csr_matrix(nuclear),
@@ -730,6 +745,7 @@ class LDR:
             overlaps=self.overlaps,
             links=self.links,
             average_paths=self.average_paths,
+            periodic_axes=self.periodic_axes,
         )
 
     def kinetic_operator(self, *, backend=None):
@@ -752,6 +768,7 @@ class LDR:
             self.links is not None
             and self.overlaps is None
             and not self.average_paths
+            and not self.periodic_axes
         )
         eligible_1d = (
             linked
@@ -798,6 +815,7 @@ class LDR:
             overlaps=self.overlaps,
             links=self.links,
             average_paths=self.average_paths,
+            periodic_axes=self.periodic_axes,
         )
         self.kinetic_info = {"backend": "generic"}
         self._kinetic_operators[backend] = operator

@@ -716,9 +716,113 @@ The current multi-k implementation is intentionally direct and dense:
 * Native ``Cell.KRHF(..., jk_builder="gdf")`` uses the density-driven GDF J/K
   contraction and applies the periodic Madelung exchange correction in the SCF
   layer.  Self-consistent mesh orbital energies are available with
-  ``band_structure(exchange="mesh")``; off-mesh plots use
-  ``exchange="mesh_interpolate"`` until direct finite-q GDF Fock builds are
-  implemented.
+  ``band_structure(exchange="mesh")``.  Arbitrary band points use the direct
+  selected-pair build through ``exchange="finite_q"``, which is the default.
+  For a target :math:`\mathbf k_b`, the implementation evaluates
+
+  .. math::
+
+     \rho_P = \frac{1}{N_k}\sum_{\mathbf k}\sum_{\lambda\sigma}
+     L^P_{\lambda\sigma}(\mathbf k,\mathbf k)
+     D_{\sigma\lambda}(\mathbf k),
+
+  .. math::
+
+     J_{\mu\nu}(\mathbf k_b)
+     = \sum_P L^P_{\mu\nu}(\mathbf k_b,\mathbf k_b)\rho_P^*,
+
+  and
+
+  .. math::
+
+     K_{\mu\nu}(\mathbf k_b)
+     = \frac{1}{N_k}\sum_{\mathbf k,P,\lambda\sigma}
+       L^P_{\mu\lambda}(\mathbf k_b,\mathbf k)
+       D_{\lambda\sigma}(\mathbf k)
+       [L^P_{\nu\sigma}(\mathbf k_b,\mathbf k)]^*.
+
+  Only the diagonal Coulomb block and the target-to-mesh exchange blocks are
+  built.  Their metrics and cderi factors are released after the complete band
+  path is contracted.  The Ewald exchange-divergence correction is added only
+  when :math:`\mathbf k_b` coincides with an SCF mesh point.  The optional
+  ``mesh_interpolate`` mode remains a one-dimensional plotting diagnostic.
+
+  The direct diamond path benchmark is reproducible with
+
+  .. code-block:: console
+
+     PYTHONPATH=. python examples/pbc_gdf_band_structure.py \
+         --kmesh 2,2,2 --gamma-centered --points-per-segment 2 \
+         --output /private/tmp/pbc_diamond_gdf_band_structure
+
+  For the STO-3G/def2-SVP-JKFIT :math:`\Gamma-X-W-K-\Gamma-L` run at
+  ``precision=1e-8``, PyQED built 69 requested momentum blocks and retained
+  17.65 MB of selected factors.  Against the representation-matched PySCF GDF
+  calculation, the maximum difference in the :math:`[-20,20]` eV plotting
+  window was 0.176 meV; the all-band maximum was 0.671 meV.  The corresponding
+  native GDF, SCF, and 11-point band stages took 17.50, 3.61, and 64.85 s on
+  the reference development machine.  Timings are hardware dependent; the
+  numerical comparison is the portable validation target.
+* After a native GDF pole-frequency ``KGW(...).g0w0(...)`` calculation,
+  ``gw.band_structure(kpts=...)`` evaluates diagonal quasiparticle energies
+  directly at arbitrary target momenta.  For every target
+  :math:`\mathbf k_b`, the required intermediate-state closure is
+
+  .. math::
+
+     \mathcal K_{\rm closure}(\mathbf k_b)
+     = \{\mathbf k_b\}\cup
+       \{\mathbf k_b-\mathbf q:\mathbf q\in\mathcal Q_{\rm SCF}\}.
+
+  The mesh RPA poles are reused, while the GDF builder constructs only the
+  requested :math:`(\mathbf k_b-\mathbf q,\mathbf k_b)` factors,
+
+  .. math::
+
+     L^P_{mn}(\mathbf k_b-\mathbf q,\mathbf k_b)
+     = \sum_{\mu\nu}
+       C^*_{\mu m}(\mathbf k_b-\mathbf q)
+       L^P_{\mu\nu}(\mathbf k_b-\mathbf q,\mathbf k_b)
+       C_{\nu n}(\mathbf k_b).
+
+  The diagonal pole self-energy is then
+
+  .. math::
+
+     \Sigma^c_{n\mathbf k_b}(\omega)
+     = \frac{1}{N_q}\sum_{\mathbf q,m,L}
+       \frac{|M^L_{mn}(\mathbf k_b,\mathbf q)|^2}
+       {\omega-\epsilon_{m,\mathbf k_b-\mathbf q}
+        +s_m\Omega_{L\mathbf q}-i s_m\eta},
+
+  where :math:`s_m=+1` for occupied intermediates and :math:`s_m=-1` for
+  virtual intermediates.  This is the same diagonal Hedin G0W0 pole equation
+  as the mesh solver, extended by direct selected-pair factors rather than
+  interpolation.  The current path supports closed-shell insulating native
+  GDF references with fixed mean-field RPA screening.  Analytic continuation,
+  evGW/GnW0, metallic occupations, and the off-mesh finite-size head/wing term
+  are not included.
+
+  A runnable KRHF/G0W0 comparison is
+
+  .. code-block:: console
+
+     PYTHONPATH=. python examples/pbc_gdf_gw_band_structure.py \
+         --kmesh 2,2,2 --path-points 10 --workers 4
+
+  The minimal H2 benchmark closes the ten-point :math:`\Gamma-X` path to 76
+  k points, builds 80 selected orbital pairs in eight q blocks, and takes
+  18.62 s for the complete off-mesh band stage on the reference development
+  machine.  Re-evaluation on the SCF mesh agrees with the ordinary mesh G0W0
+  result to :math:`1.11\times10^{-16}` Ha.  The path gap changes from 21.68 eV
+  at KRHF to 22.16 eV at G0W0 in this deliberately minimal model.
+
+  Direct exact-exchange bands retain the integrable Coulomb singular sampled
+  by the finite k quadrature.  A sparse line mesh such as ``2,1,1`` is not a
+  valid three-dimensional quadrature and can produce poles when a path point
+  approaches a sampled k point.  Use a converged three-dimensional shifted
+  mesh, check the k-mesh ladder explicitly, and avoid interpreting sparse-mesh
+  off-grid bands as a converged spectrum.
 * Periodic diagonal GW supports a PySCF-style small-sphere q->0 finite-size
   head/wing correction for ``coulomb_component="reciprocal_ewald_lr"`` and
   the vector-basis components ``"gdf"`` and ``"pyscf_gdf"`` via
@@ -1110,6 +1214,24 @@ coupling
    V^{q\nu}_{S,t}
    = \left\langle A^P_{S,K}\middle|M_{q\nu}^\dagger
      \middle|t,K+q\right\rangle .
+
+``phonon_tda_electron_phonon_coupling`` connects a native periodic phonon
+calculation directly to this derivative.  It accepts either a
+``FiniteDisplacementPhonon`` result at arbitrary commensurate :math:`q` or a
+``KRHFHessian`` result at Gamma, converts the electronic Cartesian momentum to
+the phonon object's fractional reciprocal convention, and checks the primitive
+lattice, atom ordering, masses, branch, and frequency.  It then dispatches to
+the analytic GDF/CPHF derivative and, by default, includes the bare plus static
+direct-RPA screened BSE-kernel derivative.  Unstable and translational modes
+are rejected because
+
+.. math::
+
+   \left\langle Q_{q\nu}^{2}\right\rangle_0
+   =\frac{1}{2\omega_{q\nu}}
+
+is not a finite harmonic zero-point amplitude for
+:math:`\omega_{q\nu}\leq0`.
 
 Analytic one-body vertex
 ~~~~~~~~~~~~~~~~~~~~~~~~
@@ -1845,6 +1967,21 @@ real-space cost.  The phonon eigenvector and frequency are supplied benchmark
 inputs, so this example does not claim an ab initio phonon calculation.  A
 one-dimensional k-line also measures an engine trend rather than a converged
 three-dimensional Brillouin-zone integral.
+
+With ``--native-phonons``, the same script first builds a
+:math:`2\times1\times1` finite-displacement LiH force-constant supercell,
+selects the highest stable zone-boundary branch unless ``--phonon-branch`` is
+specified, and passes its frequency and mass-weighted eigenvector through
+``phonon_tda_electron_phonon_coupling``.  The force constants are reused for
+all requested electronic meshes.  The current reproducible end-to-end run uses
+``--structure molecular --lattice-constant 7.0``.  Tested rocksalt KRHF
+references at :math:`a=7.72\,a_0` are mechanically unstable and correctly fail
+the positive-frequency gate.  The molecular-cell calculation selects a stable
+internal branch, although its compact low-frequency branches are not all
+stable.  It removes the
+supplied phonon input from the engine qualification, but it is not a rocksalt
+material prediction; that requires a stable periodic DFT force/DFPT provider
+and converged three-dimensional k and q meshes.
 
 .. code-block:: console
 

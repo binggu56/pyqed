@@ -105,6 +105,7 @@ class WilsonDVRMPO:
         self.terms = self._hamiltonian_terms()
         self.gauss_terms = self._gauss_squared_terms()
         self.mpo = None
+        self.factorized_mpos = None
         self.gauss_mpo = None
 
     def _cell(self, matter=None, link=None):
@@ -605,7 +606,8 @@ class AlternatingWilsonDVRMPO:
         bond_dim = int(bond_dim)
         if bond_dim < 1:
             raise ValueError("bond_dim must be positive")
-        zero = QN(*([0] * self.npts))
+        symmetry_rank = len(target)
+        zero = QN(*([0] * symmetry_rank))
         future_support = [set() for _ in range(self.nsites + 1)]
         for site in range(self.nsites - 1, -1, -1):
             support = set(future_support[site + 1])
@@ -628,7 +630,7 @@ class AlternatingWilsonDVRMPO:
                     right = left + physical
                     if any(
                         right[index] != target[index]
-                        for index in range(self.npts)
+                        for index in range(symmetry_rank)
                         if index not in remaining
                     ):
                         continue
@@ -1034,6 +1036,102 @@ class OpenSineWilsonDVRMPO(AlternatingWilsonDVRMPO):
         self.mpo = MPO(factors)
         return self.mpo if max_bond is None else self.mpo.compress(max_bond)
 
+    def build_factorized_mpos(self):
+        r"""Build an exact compact-MPO sum from the DCT-IV/DST-IV modes.
+
+        The spectral derivative is kept in the separable form
+
+        .. math::
+
+            K_{ij}=-i\sum_n C_{in}k_nS_{jn}.
+
+        Each mode is a bond-six Wilson-string automaton with four fermionic
+        hopping channels.  A final bond-two component contains the electric
+        and mass terms.  The sum is algebraically identical to
+        :meth:`build_mpo`; it is intended for TDVP implementations that can
+        contract a sum of compact MPO components directly.
+        """
+        starts = (
+            self.matter["cdag"][0] @ self.matter["P"],
+            self.matter["P"] @ self.matter["c"][0],
+            self.matter["P"] @ self.matter["c"][1],
+            self.matter["cdag"][1] @ self.matter["P"],
+        )
+        closes = (
+            self.matter["c"][1],
+            self.matter["cdag"][1],
+            self.matter["cdag"][0],
+            self.matter["c"][0],
+        )
+        link_propagators = (
+            self.link["U"],
+            self.link["Udag"],
+            self.link["Udag"],
+            self.link["U"],
+        )
+        components = []
+        rank = 6
+        done = rank - 1
+        for mode, momentum in enumerate(self.momenta):
+            cosine = self.cosine_transform[:, mode]
+            sine = self.sine_transform[:, mode]
+            start_coefficients = (cosine, cosine, sine, sine)
+            close_coefficients = (
+                -1j * momentum * sine,
+                1j * momentum * sine,
+                -1j * momentum * cosine,
+                1j * momentum * cosine,
+            )
+            factors = []
+            for chain_site, dimension in enumerate(self.dims):
+                core = np.zeros((rank, rank, dimension, dimension), dtype=complex)
+                identity = np.eye(dimension, dtype=complex)
+                core[0, 0] = identity
+                core[done, done] = identity
+                if chain_site % 2 == 0:
+                    site = chain_site // 2
+                    onsite_kinetic = -1j * momentum * cosine[site] * sine[site]
+                    core[0, done] += (
+                        onsite_kinetic
+                        * self.matter["cdag"][0]
+                        @ self.matter["c"][1]
+                        + onsite_kinetic.conjugate()
+                        * self.matter["cdag"][1]
+                        @ self.matter["c"][0]
+                    )
+                    if site < self.nlinks:
+                        for family in range(4):
+                            core[0, 1 + family] = (
+                                start_coefficients[family][site] * starts[family]
+                            )
+                    for family in range(4):
+                        active = 1 + family
+                        core[active, active] = self.matter["P"]
+                        core[active, done] += (
+                            close_coefficients[family][site] * closes[family]
+                        )
+                else:
+                    for family in range(4):
+                        active = 1 + family
+                        core[active, active] = link_propagators[family]
+                if chain_site == 0:
+                    core = core[0:1]
+                if chain_site == self.nsites - 1:
+                    core = core[:, done : done + 1]
+                factors.append(core)
+            components.append(MPO(factors))
+
+        electric = 0.5 * self.coupling**2 * self.spacing
+        local_terms = []
+        for chain_site, dimension in enumerate(self.dims):
+            if chain_site % 2 == 0:
+                local_terms.append(self.mass * self.matter["mass"])
+            else:
+                local_terms.append(electric * self.link["L2"])
+        components.append(self._additive_mpo(self.dims, local_terms))
+        self.factorized_mpos = tuple(components)
+        return self.factorized_mpos
+
     def _open_gauss_squared_terms(self):
         terms = []
         for site in range(self.npts):
@@ -1174,8 +1272,193 @@ class OpenSineWilsonDVRMPO(AlternatingWilsonDVRMPO):
         return maps, target, manager
 
 
+class OpenSineMatterDVRMPO(OpenSineWilsonDVRMPO):
+    r"""Matter-only open sine--cosine DVR obtained by solving Gauss's law.
+
+    For fixed boundary fluxes, the internal electric fields are
+
+    .. math::
+
+        L_n=L_{\mathrm{left}}-\sum_{j=0}^{n}q_j,
+
+    and the open Wilson links are fixed to one after dressing the matter fields
+    by their boundary Wilson lines.  The resulting Hamiltonian has ``N``
+    four-state matter sites, a dense spectral fermion hopping term, and a
+    bond-three cumulative-charge MPO for the electric energy.  No gauge-link
+    site remains.
+
+    Eliminating gauge fields on an interval follows the standard Schwinger
+    model reduction used by M. C. Bañuls et al., JHEP 11, 158 (2013), DOI:
+    10.1007/JHEP11(2013)158, and reviewed with boundary-condition details by
+    T. Okuda, Phys. Rev. D 107, 054506 (2023), DOI:
+    10.1103/PhysRevD.107.054506.  This class applies that established reduction
+    to the paired DCT-IV/DST-IV spectral regulator; that regulator combination
+    is an adaptation rather than a reproduction of those staggered-fermion
+    calculations.
+
+    The independent-link flux cutoff of :class:`OpenSineWilsonDVRMPO` is not
+    retained.  Electric flux is instead bounded only by the finite matter
+    Hilbert space and penalized dynamically by the exact electric energy.
+    """
+
+    def __init__(
+        self,
+        npts: int,
+        length: float,
+        *,
+        coupling: float = 1.0,
+        mass: float = 0.0,
+        left_flux: int = 0,
+        right_flux: int = 0,
+    ):
+        auxiliary_cutoff = max(1, abs(int(left_flux)), abs(int(right_flux)))
+        super().__init__(
+            npts,
+            length,
+            coupling=coupling,
+            mass=mass,
+            flux_cutoff=auxiliary_cutoff,
+            left_flux=left_flux,
+            right_flux=right_flux,
+        )
+        self.nsites = self.npts
+        self.dims = (4,) * self.npts
+        self.flux_cutoff = None
+        self.gauss_terms = None
+        self.mpo = None
+        self.factorized_mpos = None
+        self.gauss_mpo = None
+        self.vector_mpo = None
+        self.scalar_mpo = None
+
+    def build_mpo(self, *, max_bond=None):
+        """Build the exact matter-only Hamiltonian MPO."""
+        nchannels = 4 * self.nlinks
+        charge_channel = nchannels + 1
+        rank = nchannels + 3
+        done = rank - 1
+
+        def channel(family, left):
+            return 1 + int(family) * self.nlinks + int(left)
+
+        starts = (
+            self.matter["cdag"][0] @ self.matter["P"],
+            self.matter["P"] @ self.matter["c"][0],
+            self.matter["P"] @ self.matter["c"][1],
+            self.matter["cdag"][1] @ self.matter["P"],
+        )
+        closes = (
+            self.matter["c"][1],
+            self.matter["cdag"][1],
+            self.matter["cdag"][0],
+            self.matter["c"][0],
+        )
+        electric = 0.5 * self.coupling**2 * self.spacing
+        charge = self.matter["q"]
+        factors = []
+        for site in range(self.npts):
+            core = np.zeros((rank, rank, 4, 4), dtype=complex)
+            identity = self.matter["I"]
+            core[0, 0] = identity
+            core[done, done] = identity
+            onsite = (
+                self.kinetic[site, site]
+                * self.matter["cdag"][0]
+                @ self.matter["c"][1]
+                + self.kinetic[site, site].conjugate()
+                * self.matter["cdag"][1]
+                @ self.matter["c"][0]
+                + self.mass * self.matter["mass"]
+            )
+            weight = self.nlinks - site
+            if weight > 0:
+                onsite += electric * weight * (
+                    charge @ charge - 2.0 * self.left_flux * charge
+                )
+                core[0, charge_channel] = charge
+                core[charge_channel, done] = 2.0 * electric * weight * charge
+            if site == 0 and self.left_flux:
+                onsite += (
+                    electric * self.nlinks * self.left_flux**2 * identity
+                )
+            core[0, done] += onsite
+
+            if site < self.nlinks:
+                for family in range(4):
+                    core[0, channel(family, site)] = starts[family]
+            for left in range(site):
+                coefficients = (
+                    self.kinetic[left, site],
+                    self.kinetic[left, site].conjugate(),
+                    self.kinetic[site, left],
+                    self.kinetic[site, left].conjugate(),
+                )
+                for family, coefficient in enumerate(coefficients):
+                    active = channel(family, left)
+                    core[active, active] = self.matter["P"]
+                    core[active, done] += coefficient * closes[family]
+            if site > 0:
+                core[charge_channel, charge_channel] = identity
+            if site == 0:
+                core = core[0:1]
+            if site == self.npts - 1:
+                core = core[:, done : done + 1]
+            factors.append(core)
+        self.mpo = MPO(factors)
+        return self.mpo if max_bond is None else self.mpo.compress(max_bond)
+
+    def build_vector_mpo(self):
+        """Build the eliminated-link electric-field zero mode."""
+        norm = np.sqrt(self.nlinks)
+        operators = []
+        for site in range(self.npts):
+            weight = self.nlinks - site
+            operator = -weight * self.matter["q"] / norm
+            if site == 0 and self.left_flux:
+                operator = operator + self.nlinks * self.left_flux * self.matter["I"] / norm
+            operators.append(operator)
+        self.vector_mpo = self._additive_mpo(self.dims, operators)
+        return self.vector_mpo
+
+    def build_scalar_mpo(self):
+        r"""Build ``sum_j bar(psi_j) psi_j / sqrt(N)`` on matter sites."""
+        operators = [self.matter["mass"] / np.sqrt(self.npts)] * self.npts
+        self.scalar_mpo = self._additive_mpo(self.dims, operators)
+        return self.scalar_mpo
+
+    def product_mps(self, matter_bits=None):
+        if matter_bits is None:
+            matter_bits = [1 if site % 2 == 0 else 2 for site in range(self.npts)]
+        if len(matter_bits) != self.npts:
+            raise ValueError("expected one matter value per DVR cell")
+        factors = []
+        for bits in matter_bits:
+            tensor = np.zeros((1, 4, 1), dtype=complex)
+            tensor[0, int(bits), 0] = 1.0
+            factors.append(tensor)
+        return MPS(factors)
+
+    def gauss_qn_maps(self):
+        matter_charge = np.real(np.diag(self.matter["q"])).astype(int)
+        return [
+            {state: QN(int(charge)) for state, charge in enumerate(matter_charge)}
+            for _site in range(self.npts)
+        ]
+
+    def gauss_symmetry(self):
+        maps = self.gauss_qn_maps()
+        target = QN(self.left_flux - self.right_flux)
+        manager = SymmetryManager(
+            list(maps[0].values()),
+            target,
+            sym_types=["matter_charge"],
+        )
+        return maps, target, manager
+
+
 __all__ = [
     "AlternatingWilsonDVRMPO",
+    "OpenSineMatterDVRMPO",
     "OpenSineWilsonDVRMPO",
     "WilsonDVRMPO",
 ]

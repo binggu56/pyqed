@@ -1421,14 +1421,12 @@ def commensurate_tda_electron_phonon_coupling(
             q_derivative,
         )
     elif automatic_kernel == "screened_gdf":
-        (
-            kernel_derivative,
-            screened_response,
-            kernel_components,
-        ) = _commensurate_gdf_screened_tda_kernel_derivative(
+        kernel_derivative = commensurate_gdf_screened_tda_kernel_derivative(
             source_operator,
             q_derivative,
         )
+        screened_response = q_derivative.gdf_screened_interaction_derivative
+        kernel_components = q_derivative.gdf_screened_kernel_derivative_components
     coupling = analytic_tda_electron_phonon_coupling(
         space,
         source_operator.q_index,
@@ -1481,6 +1479,126 @@ def commensurate_tda_electron_phonon_coupling(
         }
     )
     return coupling
+
+
+def phonon_tda_electron_phonon_coupling(
+    source_operator,
+    phonons,
+    phonon_q_index,
+    branch,
+    *,
+    kernel_derivative="screened_gdf",
+    minimum_frequency=1.0e-10,
+    supercell_mesh=None,
+    cphf_tol=1.0e-9,
+    cphf_max_cycle=80,
+):
+    r"""Build a TDA coupling directly from a native periodic phonon mode.
+
+    ``phonons`` may be a :class:`~pyqed.pbc.FiniteDisplacementPhonon` or an
+    analytic :class:`~pyqed.qchem.pbc.KRHFHessian`.  Its mass-weighted
+    eigenvector and atomic-unit frequency are passed to the analytic periodic
+    GDF/CPHF electron--phonon derivative.  The formulation follows the
+    electron--phonon convention reviewed by F. Giustino, Rev. Mod. Phys. 89,
+    015003 (2017), DOI: 10.1103/RevModPhys.89.015003, adapted to PyQED's
+    finite-momentum TDA basis and static screened GDF kernel derivative.
+
+    Translational, zero-frequency, and unstable modes are rejected because
+    their harmonic zero-point amplitude is undefined.  This driver includes
+    the one-phonon Fan vertex; it does not add Debye--Waller or multiphonon
+    terms.
+    """
+
+    if not hasattr(source_operator, "space") or not hasattr(
+        source_operator,
+        "q_index",
+    ):
+        raise TypeError("source_operator must be a PeriodicTDAOperator")
+    if not hasattr(phonons, "mode"):
+        raise TypeError("phonons must provide mode(qpoint, branch).")
+    minimum_frequency = float(minimum_frequency)
+    if not np.isfinite(minimum_frequency) or minimum_frequency < 0.0:
+        raise ValueError("minimum_frequency must be finite and nonnegative.")
+
+    space = source_operator.space
+    phonon_q_index = space.normalize_q_index(phonon_q_index)
+    reference = space.reference
+    qpoint_cartesian = np.asarray(space.qpts[phonon_q_index], dtype=float)
+    qpoint_fractional = np.asarray(
+        reference.cartesian_to_scaled(qpoint_cartesian),
+        dtype=float,
+    )
+    mode = phonons.mode(qpoint_fractional, branch)
+    mode_delta = np.asarray(mode.qpoint, dtype=float) - qpoint_fractional
+    mode_delta -= np.rint(mode_delta)
+    if np.max(np.abs(mode_delta), initial=0.0) > 1.0e-8:
+        raise ValueError("phonon mode q point does not match phonon_q_index.")
+
+    mean_field = reference._pbc_mf
+    natom = len(mean_field.cell._atom_coords)
+    if np.asarray(mode.eigenvector).shape != (natom, 3):
+        raise ValueError("phonon mode and electronic cell have different atom counts.")
+    electronic_masses = np.asarray(
+        mean_field.cell.unit_molecule.atom_mass_list(),
+        dtype=float,
+    ) * amu_to_au
+    if not np.allclose(mode.masses, electronic_masses, rtol=1.0e-10, atol=1.0e-8):
+        raise ValueError("phonon mode masses do not match the electronic cell masses.")
+    phonon_cell = getattr(phonons, "cell", None)
+    if phonon_cell is not None:
+        electronic_lattice = np.asarray(mean_field.cell.lattice_vectors, dtype=float)
+        phonon_lattice = np.asarray(phonon_cell.lattice_vectors, dtype=float)
+        if not np.allclose(phonon_lattice, electronic_lattice, atol=1.0e-10, rtol=0.0):
+            raise ValueError("phonon and electronic primitive lattices do not match.")
+        electronic_symbols = tuple(str(value) for value in mean_field.cell._atom_symbols)
+        phonon_symbols = tuple(str(value) for value in phonon_cell._atom_symbols)
+        if phonon_symbols != electronic_symbols:
+            raise ValueError("phonon and electronic primitive atoms do not match.")
+    frequency = float(mode.frequency)
+    if frequency < 0.0:
+        raise ValueError(
+            f"phonon branch {mode.branch} is unstable with frequency {frequency:.6e} Ha."
+        )
+    if frequency <= minimum_frequency:
+        raise ValueError(
+            f"phonon branch {mode.branch} is translational or below the "
+            f"minimum frequency {minimum_frequency:.6e} Ha."
+        )
+    mode_vector = np.array(mode.eigenvector, dtype=np.complex128, copy=True)
+
+    if reference.is_gamma and np.linalg.norm(qpoint_cartesian) <= 1.0e-12:
+        coupling = gamma_tda_electron_phonon_coupling(
+            source_operator,
+            mode_vector,
+            frequency,
+            branch=mode.branch,
+            kernel_derivative=kernel_derivative,
+            cphf_tol=cphf_tol,
+            cphf_max_cycle=cphf_max_cycle,
+        )
+    else:
+        coupling = commensurate_tda_electron_phonon_coupling(
+            source_operator,
+            phonon_q_index,
+            mode_vector,
+            frequency,
+            kernel_derivative=kernel_derivative,
+            branch=mode.branch,
+            supercell_mesh=supercell_mesh,
+            cphf_tol=cphf_tol,
+            cphf_max_cycle=cphf_max_cycle,
+        )
+    coupling.phonon_mode = mode
+    coupling.info.update(
+        {
+            "phonon_source": mode.source,
+            "phonon_qpoint_fractional": np.asarray(mode.qpoint).tolist(),
+            "phonon_branch": int(mode.branch),
+            "phonon_frequency_au": frequency,
+            "phonon_mode_normalization": "mass_weighted_unit_norm",
+        }
+    )
+    return coupling.validate_momentum(space)
 
 
 @dataclass
@@ -2314,4 +2432,5 @@ __all__ = [
     "gamma_gdf_screened_tda_kernel_derivative",
     "gamma_tda_electron_phonon_coupling",
     "gdf_q_derivative_factors",
+    "phonon_tda_electron_phonon_coupling",
 ]

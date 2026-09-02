@@ -1,7 +1,11 @@
+import itertools
+
 import numpy as np
+import pytest
 
 from pyqed.lgt import (
     AlternatingWilsonDVRMPO,
+    OpenSineMatterDVRMPO,
     OpenSineWilsonDVRMPO,
     QuantumSchwingerDVR,
     WilsonDVRMPO,
@@ -10,6 +14,7 @@ from pyqed.mps import (
     DMRG,
     MPO,
     MPS,
+    QN,
     TDMPS,
     compress_symmetric_mps,
     compress_symmetric_mpo,
@@ -251,6 +256,91 @@ def test_open_sine_wilson_automaton_matches_reference_mpo():
     assert max(builder.mpo.bond_orders()) == 4 * (builder.npts - 1) + 2
     assert max(builder.build_vector_mpo().bond_orders()) == 2
     assert max(builder.build_scalar_mpo().bond_orders()) == 2
+
+
+def test_open_sine_factorized_mpo_sum_matches_automaton():
+    builder = OpenSineWilsonDVRMPO(
+        2,
+        5.0,
+        mass=0.2,
+        flux_cutoff=1,
+    )
+    reference = builder.build_mpo().to_dense()
+    components = builder.build_factorized_mpos()
+    factorized = sum((component.to_dense() for component in components))
+
+    assert len(components) == builder.npts + 1
+    assert max(max(component.bond_orders()) for component in components) == 6
+    np.testing.assert_allclose(factorized, reference, atol=3.0e-14)
+
+
+@pytest.mark.parametrize(("left_flux", "right_flux"), ((0, 0), (1, 0)))
+def test_open_sine_matter_only_matches_explicit_links_in_physical_sector(
+    left_flux,
+    right_flux,
+):
+    explicit = OpenSineWilsonDVRMPO(
+        2,
+        5.0,
+        mass=0.2,
+        flux_cutoff=2,
+        left_flux=left_flux,
+        right_flux=right_flux,
+    )
+    reduced = OpenSineMatterDVRMPO(
+        2,
+        5.0,
+        mass=0.2,
+        left_flux=left_flux,
+        right_flux=right_flux,
+    )
+    charges = np.real(np.diag(explicit.matter["q"])).astype(int)
+    matter_indices = []
+    explicit_indices = []
+    for states in itertools.product(range(4), repeat=explicit.npts):
+        flux = explicit.left_flux
+        internal_fluxes = []
+        for state in states[:-1]:
+            flux -= int(charges[state])
+            internal_fluxes.append(flux)
+        flux -= int(charges[states[-1]])
+        if flux != explicit.right_flux:
+            continue
+        full_state = []
+        for site, state in enumerate(states):
+            full_state.append(state)
+            if site < explicit.nlinks:
+                full_state.append(internal_fluxes[site] + explicit.flux_cutoff)
+        matter_indices.append(np.ravel_multi_index(states, reduced.dims))
+        explicit_indices.append(np.ravel_multi_index(full_state, explicit.dims))
+
+    full_hamiltonian = explicit.build_mpo().to_dense()
+    reduced_hamiltonian = reduced.build_mpo().to_dense()
+    np.testing.assert_allclose(
+        reduced_hamiltonian[np.ix_(matter_indices, matter_indices)],
+        full_hamiltonian[np.ix_(explicit_indices, explicit_indices)],
+        atol=3.0e-14,
+    )
+    for full_operator, reduced_operator in (
+        (explicit.build_vector_mpo(), reduced.build_vector_mpo()),
+        (explicit.build_scalar_mpo(), reduced.build_scalar_mpo()),
+    ):
+        np.testing.assert_allclose(
+            reduced_operator.to_dense()[np.ix_(matter_indices, matter_indices)],
+            full_operator.to_dense()[np.ix_(explicit_indices, explicit_indices)],
+            atol=3.0e-14,
+        )
+
+    maps, target, manager = reduced.gauss_symmetry()
+    seed = reduced.gauss_seed_mps(
+        bond_dim=4,
+        seed=3,
+        native_site_storage=False,
+    )
+    assert target == QN(left_flux - right_flux)
+    assert manager.target_qn == target
+    assert tuple(seed.dims) == reduced.dims
+    np.testing.assert_allclose(seed.norm_squared(), 1.0, atol=2.0e-14)
 
 
 def test_open_sine_wilson_exact_gauss_mpo_and_seed():

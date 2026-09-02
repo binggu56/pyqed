@@ -31,16 +31,17 @@ import numpy as np
 from kogut_susskind_n80_mv_ms import (
     _channel_source,
     _correlation,
-    _dominant_pole_audit,
     _history_rows,
+    _matrix_pencil,
     _symmetric_mpo,
 )
-from pyqed.lgt import OpenSineWilsonDVRMPO
+from pyqed.lgt import OpenSineMatterDVRMPO, OpenSineWilsonDVRMPO
 from pyqed.mps import DMRG, MPS
 
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_OUTPUT = HERE / "results" / "open_sine_dvr_n40_d128_mv_ms"
+DEFAULT_MATTER_OUTPUT = HERE / "results" / "open_sine_matter_dvr_n40_d128_mv_ms"
 KS_DATA = (
     HERE
     / "results"
@@ -49,25 +50,66 @@ KS_DATA = (
 )
 
 
+def _pole_audit(values, dt, *, minimum, maximum):
+    audit = []
+    for rank in range(6, 25, 2):
+        frequencies, roots, amplitudes, _singular = _matrix_pencil(values, dt, rank)
+        candidates = [
+            (float(frequency), float(abs(amplitude)), float(abs(root)))
+            for frequency, root, amplitude in zip(frequencies, roots, amplitudes)
+            if minimum < frequency < maximum and abs(abs(root) - 1.0) < 0.1
+        ]
+        selected = max(candidates, key=lambda row: row[1]) if candidates else None
+        audit.append(
+            {
+                "rank": rank,
+                "candidates": [
+                    {
+                        "frequency": row[0],
+                        "amplitude": row[1],
+                        "root_modulus": row[2],
+                    }
+                    for row in candidates
+                ],
+                "dominant": None if selected is None else selected[0],
+            }
+        )
+    selected = np.asarray(
+        [row["dominant"] for row in audit if row["dominant"] is not None],
+        dtype=float,
+    )
+    if selected.size < 3:
+        return None, None, audit, "fewer than three matrix-pencil ranks support a pole"
+    pole = float(np.median(selected))
+    spread = float(np.median(np.abs(selected - pole)))
+    return pole, spread, audit, None
+
+
 def _plot_readiness(data, output):
     history = data["ground_history"]
     local = np.asarray([row["local_energy"] for row in history], dtype=float)
+    directions = [row["direction"] for row in history]
     fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.0), constrained_layout=True)
-    axes[0].plot(np.arange(1, len(local) + 1), local, "o-")
-    axes[0].set(xlabel="half-sweep", ylabel=r"local $E_0/g$", title="DVR vacuum pilot")
-    labels = ["setup", "ground", "vector\nstep", "scalar\nstep"]
-    values = [
-        data["setup_seconds"],
-        data["ground_seconds"],
-        data["vector_seconds"],
-        data["scalar_seconds"],
-    ]
-    axes[1].bar(labels, values, color=["0.5", "C2", "C0", "C1"])
-    axes[1].set(ylabel="wall time (s)", title="Readiness timing")
+    sweep_index = np.arange(1, len(local) + 1)
+    axes[0].plot(sweep_index, local, "o-")
+    axes[0].set(
+        xlabel="sweep direction",
+        ylabel=r"local $E_0/g$",
+        title="DVR vacuum readiness (not converged)",
+        xticks=sweep_index,
+        xticklabels=directions,
+    )
+    labels = ["setup", "ground"]
+    values = [data["setup_seconds"], data["ground_seconds"]]
+    axes[1].bar(labels, values, color=["0.5", "C2"])
+    axes[1].set_yscale("log")
+    axes[1].set(ylabel="wall time (s, log scale)", title="Readiness timing")
+    for index, value in enumerate(values):
+        axes[1].text(index, value * 1.12, f"{value:.1f}", ha="center", va="bottom")
     for axis in axes:
         axis.grid(True, alpha=0.22, linewidth=0.7)
         axis.tick_params(direction="in")
-    path = output / "33_open_sine_dvr_n40_readiness.png"
+    path = output / f"33_open_sine_dvr_n{data['npts']}_readiness.png"
     fig.savefig(path, dpi=190)
     plt.close(fig)
     return path
@@ -106,8 +148,10 @@ def _plot_result(data, vector_corr, scalar_corr, output):
         ranks = [row["rank"] for row in audit if row["dominant"] is not None]
         poles = [row["dominant"] for row in audit if row["dominant"] is not None]
         axes[1, 0].plot(ranks, poles, "o-", color=color, label=label)
-    axes[1, 0].axhline(data["M_V_over_g"], color="C0", linestyle="--")
-    axes[1, 0].axhline(data["M_S_over_g"], color="C1", linestyle="--")
+    if data["M_V_over_g"] is not None:
+        axes[1, 0].axhline(data["M_V_over_g"], color="C0", linestyle="--")
+    if data["M_S_over_g"] is not None:
+        axes[1, 0].axhline(data["M_S_over_g"], color="C1", linestyle="--")
     axes[1, 0].set(
         xlabel="matrix-pencil rank",
         ylabel=r"dominant pole $\omega/g$",
@@ -117,8 +161,14 @@ def _plot_result(data, vector_corr, scalar_corr, output):
 
     positions = np.arange(2)
     width = 0.25
-    dvr_values = [data["M_V_over_g"], data["M_S_over_g"]]
-    dvr_error = [data["M_V_pole_rank_mad"], data["M_S_pole_rank_mad"]]
+    dvr_values = [
+        np.nan if data["M_V_over_g"] is None else data["M_V_over_g"],
+        np.nan if data["M_S_over_g"] is None else data["M_S_over_g"],
+    ]
+    dvr_error = [
+        0.0 if data["M_V_pole_rank_mad"] is None else data["M_V_pole_rank_mad"],
+        0.0 if data["M_S_pole_rank_mad"] is None else data["M_S_pole_rank_mad"],
+    ]
     ks_values = [ks["M_V_over_g"], ks["M_S_over_g"]]
     ks_error = [ks["M_V_pole_rank_mad"], ks["M_S_pole_rank_mad"]]
     exact = [data["continuum_M_V_over_g"], data["continuum_M_S_over_g"]]
@@ -128,7 +178,7 @@ def _plot_result(data, vector_corr, scalar_corr, output):
         width,
         yerr=dvr_error,
         capsize=3,
-        label=r"sine--cosine DVR $(40\times2)$",
+        label=rf"sine--cosine DVR $({data['npts']}\times2)$",
     )
     axes[1, 1].bar(
         positions,
@@ -136,20 +186,41 @@ def _plot_result(data, vector_corr, scalar_corr, output):
         width,
         yerr=ks_error,
         capsize=3,
-        label="staggered KS (80)",
+        label=f"staggered KS ({ks['nsites']})",
     )
     axes[1, 1].bar(positions + width, exact, width, label="continuum")
     axes[1, 1].set(
         xticks=positions,
         xticklabels=[r"$M_V/g$", r"$M_S/g$"],
         ylabel="mass gap",
-        title=rf"matched 80 matter modes, $gL={data['gL']:.0f}$",
+        title=(
+            rf"DVR {data['fermion_modes']} vs KS {ks['nsites']} matter modes, "
+            rf"$gL={data['gL']:.0f}$"
+        ),
     )
     axes[1, 1].legend(frameon=False, fontsize=8)
+    failed = [
+        label
+        for label, value in ((r"$M_V$", data["M_V_over_g"]), (r"$M_S$", data["M_S_over_g"]))
+        if value is None
+    ]
+    if failed:
+        axes[1, 1].text(
+            0.02,
+            0.05,
+            "no stable DVR pole: " + ", ".join(failed),
+            transform=axes[1, 1].transAxes,
+            va="bottom",
+            color="C3",
+            fontsize=8,
+        )
     for axis in axes.flat:
         axis.grid(True, alpha=0.22, linewidth=0.7)
         axis.tick_params(direction="in")
-    path = output / "34_open_sine_dvr_vs_kogut_susskind_mv_ms.png"
+    path = output / (
+        f"34_open_sine_dvr_n{data['npts']}_d{data['bond_dim']}_vs_"
+        "kogut_susskind_mv_ms.png"
+    )
     fig.savefig(path, dpi=190)
     plt.close(fig)
     return path
@@ -166,18 +237,19 @@ def run(
     length=20.0,
     coupling=1.0,
     flux_cutoff=3,
-    output=DEFAULT_OUTPUT,
+    output=None,
     readiness_only=False,
+    eliminate_links=False,
 ):
+    if output is None:
+        output = DEFAULT_MATTER_OUTPUT if eliminate_links else DEFAULT_OUTPUT
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
-    builder = OpenSineWilsonDVRMPO(
-        npts,
-        length,
-        coupling=coupling,
-        mass=0.0,
-        flux_cutoff=flux_cutoff,
-    )
+    builder_class = OpenSineMatterDVRMPO if eliminate_links else OpenSineWilsonDVRMPO
+    builder_options = {"coupling": coupling, "mass": 0.0}
+    if not eliminate_links:
+        builder_options["flux_cutoff"] = flux_cutoff
+    builder = builder_class(npts, length, **builder_options)
     maps, target, manager = builder.gauss_symmetry()
     sectors = [[site_map[state] for state in sorted(site_map)] for site_map in maps]
     setup_started = perf_counter()
@@ -210,7 +282,9 @@ def run(
         )
 
         def progress(**info):
-            value = float(np.asarray(info.get("energy"), dtype=float).reshape(-1)[0])
+            value = float(
+                np.real(np.asarray(info.get("energy"), dtype=complex).reshape(-1)[0])
+            )
             print(
                 f"[ground] half-sweep {int(info.get('sweep', -1))+1}/"
                 f"{ground_half_sweeps} ({info.get('direction')}): E={value:.12f}",
@@ -245,6 +319,69 @@ def run(
     if saved is not None and saved.get("final") and checkpoint_ground_seconds:
         ground_seconds = checkpoint_ground_seconds
 
+    base = {
+        "method": (
+            "open paired DCT-IV/DST-IV matter-only DVR DMRG plus TDVP"
+            if eliminate_links
+            else "open paired DCT-IV/DST-IV gauge-DVR DMRG plus TDVP"
+        ),
+        "fidelity": (
+            "open-boundary spectral adaptation with links eliminated by the "
+            "exact interval Gauss law; single finite-volume point"
+            if eliminate_links
+            else "open-boundary spectral adaptation with exact Wilson lines and "
+            "Gauss sectors; single finite-volume/cutoff point"
+        ),
+        "links_eliminated": bool(eliminate_links),
+        "npts": int(npts),
+        "fermion_modes": int(2 * npts),
+        "chain_length": int(builder.nsites),
+        "bond_dim": int(bond_dim),
+        "length": float(length),
+        "gL": float(coupling * length),
+        "coupling": float(coupling),
+        "flux_cutoff": None if eliminate_links else int(flux_cutoff),
+        "mass_over_g": 0.0,
+        "dt": float(dt),
+        "ground_half_sweeps": int(ground_half_sweeps),
+        "ground_energy": ground_energy,
+        "raw_hamiltonian_mpo_bond": int(raw_bond),
+        "compressed_hamiltonian_mpo_bond": int(compressed_bond),
+        "hamiltonian_mpo_bonds": hamiltonian.bond_orders(),
+        "gauss_law": (
+            "solved exactly as L_n=L_left-sum_{j<=n} q_j; fixed total charge"
+            if eliminate_links
+            else "exact site-by-site target-QN block structure"
+        ),
+        "setup_seconds": setup_seconds,
+        "ground_seconds": ground_seconds,
+        "ground_history": _history_rows(ground_history),
+        "references": [
+            "https://doi.org/10.1103/PhysRevD.11.395",
+            "https://doi.org/10.1103/PhysRevD.13.1043",
+            "https://doi.org/10.1016/j.aop.2011.09.001",
+            "https://doi.org/10.1007/JHEP11(2013)158",
+            "https://doi.org/10.1103/PhysRevD.107.054506",
+        ],
+    }
+    if readiness_only:
+        base.update(
+            {
+                "readiness_only": True,
+                "tdvp_attempted": False,
+                "tdvp_note": (
+                    "Use the production mode for channel construction and "
+                    "checkpointed TDVP; readiness mode is intentionally bounded."
+                ),
+            }
+        )
+        data_path = output / f"open_sine_dvr_n{npts}_readiness.json"
+        data_path.write_text(json.dumps(base, indent=2) + "\n")
+        figure_path = _plot_readiness(base, output)
+        print(f"[readiness] JSON: {data_path}", flush=True)
+        print(f"[readiness] figure: {figure_path}", flush=True)
+        return base, figure_path
+
     vector_raw = builder.build_vector_mpo()
     scalar_raw = builder.build_scalar_mpo()
     scalar_mean = float(np.real(vacuum.expectation(_symmetric_mpo(scalar_raw, maps))))
@@ -256,8 +393,6 @@ def run(
         f"[channels] <O_S>={scalar_mean:.8e}; exact target-Gauss sources",
         flush=True,
     )
-    actual_vector_steps = 1 if readiness_only else int(vector_steps)
-    actual_scalar_steps = 1 if readiness_only else int(scalar_steps)
     vector_corr, vector_seconds = _correlation(
         hamiltonian,
         vector_source,
@@ -265,11 +400,11 @@ def run(
         target,
         ground_energy,
         dt=dt,
-        steps=actual_vector_steps,
+        steps=int(vector_steps),
         bond_dim=bond_dim,
         checkpoint=output / "vector_tdvp_checkpoint.pkl",
         label="vector",
-        checkpoint_interval=1 if readiness_only else 10,
+        checkpoint_interval=10,
     )
     scalar_corr, scalar_seconds = _correlation(
         hamiltonian,
@@ -278,59 +413,24 @@ def run(
         target,
         ground_energy,
         dt=dt,
-        steps=actual_scalar_steps,
+        steps=int(scalar_steps),
         bond_dim=bond_dim,
         checkpoint=output / "scalar_tdvp_checkpoint.pkl",
         label="scalar",
-        checkpoint_interval=1 if readiness_only else 10,
+        checkpoint_interval=10,
     )
-    base = {
-        "method": "open paired DCT-IV/DST-IV gauge-DVR DMRG plus TDVP",
-        "fidelity": (
-            "open-boundary spectral adaptation with exact Wilson lines and "
-            "Gauss sectors; single finite-volume/cutoff point"
-        ),
-        "npts": int(npts),
-        "fermion_modes": int(2 * npts),
-        "chain_length": int(builder.nsites),
-        "bond_dim": int(bond_dim),
-        "length": float(length),
-        "gL": float(coupling * length),
-        "coupling": float(coupling),
-        "flux_cutoff": int(flux_cutoff),
-        "mass_over_g": 0.0,
-        "dt": float(dt),
-        "ground_half_sweeps": int(ground_half_sweeps),
-        "ground_energy": ground_energy,
-        "scalar_elastic_mean": scalar_mean,
-        "raw_hamiltonian_mpo_bond": int(raw_bond),
-        "compressed_hamiltonian_mpo_bond": int(compressed_bond),
-        "hamiltonian_mpo_bonds": hamiltonian.bond_orders(),
-        "gauss_law": "exact site-by-site target-QN block structure",
-        "setup_seconds": setup_seconds,
-        "ground_seconds": ground_seconds,
-        "vector_seconds": vector_seconds,
-        "scalar_seconds": scalar_seconds,
-        "ground_history": _history_rows(ground_history),
-        "references": [
-            "https://doi.org/10.1103/PhysRevD.11.395",
-            "https://doi.org/10.1103/PhysRevD.13.1043",
-            "https://doi.org/10.1016/j.aop.2011.09.001",
-        ],
-    }
-    if readiness_only:
-        base["readiness_only"] = True
-        data_path = output / "open_sine_dvr_n40_readiness.json"
-        data_path.write_text(json.dumps(base, indent=2) + "\n")
-        figure_path = _plot_readiness(base, output)
-        print(f"[readiness] JSON: {data_path}", flush=True)
-        print(f"[readiness] figure: {figure_path}", flush=True)
-        return base, figure_path
+    base.update(
+        {
+            "scalar_elastic_mean": scalar_mean,
+            "vector_seconds": vector_seconds,
+            "scalar_seconds": scalar_seconds,
+        }
+    )
 
-    vector_mass, vector_spread, vector_audit = _dominant_pole_audit(
+    vector_mass, vector_spread, vector_audit, vector_error = _pole_audit(
         vector_corr, dt, minimum=0.2, maximum=0.9
     )
-    scalar_mass, scalar_spread, scalar_audit = _dominant_pole_audit(
+    scalar_mass, scalar_spread, scalar_audit, scalar_error = _pole_audit(
         scalar_corr, dt, minimum=0.8, maximum=1.6
     )
     continuum_vector = float(1.0 / np.sqrt(np.pi))
@@ -345,10 +445,17 @@ def run(
             "M_S_over_g": scalar_mass,
             "M_V_pole_rank_mad": vector_spread,
             "M_S_pole_rank_mad": scalar_spread,
+            "M_V_extraction_error": vector_error,
+            "M_S_extraction_error": scalar_error,
+            "mass_extraction_success": vector_error is None and scalar_error is None,
             "continuum_M_V_over_g": continuum_vector,
             "continuum_M_S_over_g": continuum_scalar,
-            "M_V_relative_error": float(vector_mass / continuum_vector - 1.0),
-            "M_S_relative_error": float(scalar_mass / continuum_scalar - 1.0),
+            "M_V_relative_error": (
+                None if vector_mass is None else float(vector_mass / continuum_vector - 1.0)
+            ),
+            "M_S_relative_error": (
+                None if scalar_mass is None else float(scalar_mass / continuum_scalar - 1.0)
+            ),
             "vector_pole_audit": vector_audit,
             "scalar_pole_audit": scalar_audit,
             "kogut_susskind_reference": {
@@ -366,17 +473,24 @@ def run(
         }
     )
     np.savez(
-        output / "open_sine_dvr_n40_d128_correlations.npz",
+        output / f"open_sine_dvr_n{npts}_d{bond_dim}_correlations.npz",
         dt=dt,
         vector=vector_corr,
         scalar=scalar_corr,
     )
-    data_path = output / "open_sine_dvr_n40_d128_mv_ms.json"
+    data_path = output / f"open_sine_dvr_n{npts}_d{bond_dim}_mv_ms.json"
     data_path.write_text(json.dumps(base, indent=2) + "\n")
     figure_path = _plot_result(base, vector_corr, scalar_corr, output)
+    def summary(label, mass, spread, error):
+        if error is not None:
+            return f"{label}: rejected ({error})"
+        return f"{label}/g={mass:.9f} (rank MAD={spread:.2e})"
+
     print(
-        f"[result] M_V/g={vector_mass:.9f} (rank MAD={vector_spread:.2e}); "
-        f"M_S/g={scalar_mass:.9f} (rank MAD={scalar_spread:.2e})",
+        "[result] "
+        + summary("M_V", vector_mass, vector_spread, vector_error)
+        + "; "
+        + summary("M_S", scalar_mass, scalar_spread, scalar_error),
         flush=True,
     )
     print(f"[result] JSON: {data_path}", flush=True)
@@ -394,8 +508,13 @@ def main():
     parser.add_argument("--dt", type=float, default=0.1)
     parser.add_argument("--length", type=float, default=20.0)
     parser.add_argument("--flux-cutoff", type=int, default=3)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--readiness-only", action="store_true")
+    parser.add_argument(
+        "--eliminate-links",
+        action="store_true",
+        help="solve the open-boundary Gauss law and retain matter sites only",
+    )
     args = parser.parse_args()
     run(
         npts=args.npts,
@@ -408,6 +527,7 @@ def main():
         flux_cutoff=args.flux_cutoff,
         output=args.output,
         readiness_only=args.readiness_only,
+        eliminate_links=args.eliminate_links,
     )
 
 

@@ -779,13 +779,12 @@ nuclear dynamics DVR:
 
 ``coord`` supplies the shared generalized-coordinate convention, Cartesian
 map, and fitting domain. ``dynamics_grid`` supplies only the nuclear basis and
-KEO discretization. ``AbInitioFit`` always samples adaptively. It constructs a
-Chebyshev candidate grid over the coordinate intervals, starts from
-one-dimensional coordinate fibers through the anchor geometry, and adds
-geometries selected by the current synchronized-feature defect and their
-distance from previous samples. The candidate pool is bounded and the maximum
-number of electronic-structure calls grows only linearly with the coordinate
-dimension. The completed fit can be reused with multiple dynamics grids.
+KEO discretization. ``AbInitioFit`` always samples adaptively. For a native
+molecular driver it uses a symmetry-reduced MACE ensemble, calibrates its
+uncertainty on continuous-coordinate points, validates on an independent set,
+and distills only an accepted model to FunctionalTT. The completed fit can be
+reused with multiple dynamics grids. Set ``fit_options={"model": "ftt"}`` to
+request the direct FunctionalTT sampler explicitly.
 
 Links for the dynamics DVR are formed from continuous feature cores at
 neighboring endpoints, so the electronic sampling nodes need not equal the

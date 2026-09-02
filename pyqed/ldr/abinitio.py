@@ -24,7 +24,7 @@ def _jsonable(value):
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _jsonable(value.tolist())
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, complex):
@@ -278,6 +278,14 @@ class AbInitioFit:
     Electronic Hamiltonians are always transformed into the Procrustes gauge
     before interpolation. Raw, nonunitary overlaps are retained as the link
     targets; their polar factors define the gauge but never replace the links.
+    For native electronic drivers, molecular permutation symmetry is detected
+    on the supplied coordinate chart.  The resulting group, coordinate
+    representation, and selected-state representation are owned by the fit.
+    Native molecular builds use an uncertainty-calibrated MACE ensemble and
+    distill the accepted matrix/endpoint fields to FunctionalTT.  This is an
+    adaptation of the MACE architecture of Batatia et al., NeurIPS 35, 11423
+    (2022), https://arxiv.org/abs/2206.07697; it adds chart-dependent matrix
+    heads and does not inherit interatomic-potential force or accuracy claims.
     """
 
     def __init__(
@@ -300,7 +308,7 @@ class AbInitioFit:
         database=None,
         protocol=None,
         geometry=None,
-        symmetry=None,
+        symmetry="auto",
         run_id=None,
         run_metadata=None,
         claim_ttl=7 * 24 * 60 * 60,
@@ -310,6 +318,12 @@ class AbInitioFit:
     ):
         native_driver = None
         native_states = None
+        symmetry_validation = None
+        automatic_symmetry = isinstance(symmetry, str) and symmetry == "auto"
+        if isinstance(symmetry, str) and not automatic_symmetry:
+            raise ValueError("symmetry must be 'auto', False, or a group action")
+        if symmetry is False:
+            symmetry = None
         if coord is not None:
             if nstates is not None or builder is not None:
                 raise TypeError(
@@ -326,6 +340,12 @@ class AbInitioFit:
                 )
             native_driver = source
             native_states = tuple(int(state) for state in states)
+            if automatic_symmetry:
+                from .sampling_symmetry import detect_symmetry
+
+                symmetry, symmetry_validation = detect_symmetry(
+                    getattr(native_driver, "mol", None), coord
+                )
             if (
                 not native_states
                 or min(native_states) < 0
@@ -423,7 +443,67 @@ class AbInitioFit:
             raise ValueError("a calculation protocol is required with a database")
         self.protocol = protocol
         self.geometry_of = geometry
-        self.symmetry = symmetry
+        if automatic_symmetry and native_driver is None:
+            symmetry = None
+        self._symmetry = symmetry
+        self.symmetry_validation = (
+            symmetry_validation
+            if symmetry_validation is not None
+            else {
+                "detected": False,
+                "group": "C1" if symmetry is None else str(symmetry.name),
+                "order": 1 if symmetry is None else int(getattr(symmetry, "order", 1)),
+                "reason": "disabled" if symmetry is None else "provided explicitly",
+            }
+        )
+        self.group = "C1" if symmetry is None else str(symmetry.name)
+        coordinate_representations = getattr(
+            symmetry, "coordinate_representations", None
+        )
+        self.coord_repr = (
+            np.eye(len(self.grids))[None, ...]
+            if symmetry is None
+            else None
+            if coordinate_representations is None
+            else np.array(coordinate_representations, copy=True)
+        )
+        if symmetry is None:
+            self.coord_irreps = ("A",)
+            self.coord_blocks = (tuple(range(len(self.grids))),)
+            self.coord_basis = np.eye(len(self.grids))
+            self.irrep_validation = {
+                "labels": self.coord_irreps,
+                "dimensions": (len(self.grids),),
+                "coordinate_blocks": self.coord_blocks,
+                "input_basis_is_adapted": True,
+                "off_block_error": 0.0,
+            }
+        elif self.coord_repr is None:
+            self.coord_irreps = None
+            self.coord_blocks = None
+            self.coord_basis = None
+            self.irrep_validation = None
+        else:
+            from .sampling_symmetry import coord_irreps
+
+            (
+                self.coord_irreps,
+                self.coord_blocks,
+                self.coord_basis,
+                self.irrep_validation,
+            ) = coord_irreps(self.coord_repr, self.group)
+        self.state_repr = (
+            np.eye(self.nstates, dtype=complex)[None, ...]
+            if symmetry is None
+            else None
+        )
+        self.state_validation = None
+        self._record_symmetry = (
+            symmetry
+            if symmetry is not None
+            and bool(getattr(symmetry, "supports_record_transport", True))
+            else None
+        )
         self._symmetry_images = {}
         if symmetry is not None:
             required = ("resolve", "transform_record", "view_key", "metadata")
@@ -471,8 +551,8 @@ class AbInitioFit:
                 "protocol": self.protocol,
                 "sampling_symmetry": (
                     None
-                    if self.symmetry is None
-                    else self.symmetry.metadata()
+                    if self._symmetry is None
+                    else self._symmetry.metadata()
                 ),
                 **self.run_metadata,
             }
@@ -496,17 +576,17 @@ class AbInitioFit:
             progress=progress,
             representative=(
                 None
-                if self.symmetry is None
+                if self._record_symmetry is None
                 else self._representative_index
             ),
             transform=(
                 None
-                if self.symmetry is None
+                if self._record_symmetry is None
                 else self._transform_symmetry_record
             ),
             view_key=(
                 None
-                if self.symmetry is None
+                if self._record_symmetry is None
                 else self._symmetry_view_key
             ),
         )
@@ -636,6 +716,630 @@ class AbInitioFit:
             **fit_options,
         )
 
+    def _mace_inputs(self):
+        molecule = getattr(self.electronic_driver, "mol", None)
+        if molecule is None:
+            return None
+        natom = int(getattr(molecule, "natom", 0))
+        if natom < 2:
+            return None
+        symbol = getattr(molecule, "atom_symbol", None)
+        if callable(symbol):
+            species = tuple(str(symbol(index)) for index in range(natom))
+        else:
+            symbols = getattr(molecule, "atom_symbols", None)
+            species = tuple(symbols()) if callable(symbols) else ()
+        if len(species) != natom:
+            charges = getattr(molecule, "atom_charges", None)
+            species = tuple(map(int, charges())) if callable(charges) else ()
+        if len(species) != natom:
+            return None
+        center = np.mean(np.asarray(self.coord.bounds, dtype=float), axis=1)
+        try:
+            geometry = np.asarray(self.coord.cartesian(center), dtype=float)
+        except Exception:
+            return None
+        return species if geometry.shape == (natom, 3) else None
+
+    def _design(self, count, seed, *, reduce=True):
+        from scipy.stats import qmc
+
+        count = int(count)
+        if count < 1:
+            raise ValueError("sample count must be positive")
+        bounds = np.asarray(self.coord.bounds, dtype=float)
+        power = int(np.ceil(np.log2(max(2, count))))
+        unit = qmc.Sobol(len(bounds), scramble=True, seed=int(seed)).random_base2(power)
+        coordinates = qmc.scale(unit[:count], bounds[:, 0], bounds[:, 1])
+        return self.reduce_coordinates(coordinates) if reduce else coordinates
+
+    def _database_coordinates(self, *, canonical=True):
+        """Return reusable coordinates for the exact current protocol."""
+
+        if self.database is None:
+            return np.empty((0, len(self.grids)), dtype=float)
+        cached = getattr(self, "_database_coordinate_cache", None)
+        if cached is not None:
+            coordinates = cached
+            if not canonical or self._symmetry is None:
+                return np.array(coordinates, copy=True)
+            representatives, _operations = self._symmetry.canonicalize_many(
+                coordinates, unique=False
+            )
+            fixed = np.max(np.abs(representatives - coordinates), axis=1) <= max(
+                10.0 * self._symmetry.tolerance, 1.0e-10
+            )
+            return np.unique(coordinates[fixed], axis=0)
+        database = self.database
+        temporary = getattr(database, "connection", None) is None
+        if temporary:
+            database = ElectronicDatabase(database.path)
+        protocol = canonical_json(self.protocol)
+        bounds = np.asarray(self.coord.bounds, dtype=float)
+        coordinates = []
+        geometry_keys = set()
+        try:
+            for entry in database.entries():
+                specification = entry.get("specification", {})
+                if canonical_json(specification.get("protocol")) != protocol:
+                    continue
+                value = entry.get("metadata", {}).get("coordinates")
+                if value is None:
+                    continue
+                value = np.asarray(value, dtype=float)
+                if (
+                    value.shape == (len(self.grids),)
+                    and np.all(value >= bounds[:, 0] - 1.0e-12)
+                    and np.all(value <= bounds[:, 1] + 1.0e-12)
+                    and canonical_json(specification.get("geometry"))
+                    == canonical_json(self.coord.cartesian(value))
+                ):
+                    coordinates.append(value)
+                    geometry_keys.add(canonical_json(specification.get("geometry")))
+        finally:
+            if temporary:
+                database.close()
+        if not coordinates:
+            return np.empty((0, len(self.grids)), dtype=float)
+        coordinates = np.unique(np.asarray(coordinates), axis=0)
+        self._database_coordinate_cache = coordinates
+        self._database_geometry_cache = frozenset(geometry_keys)
+        if not canonical or self._symmetry is None:
+            return np.array(coordinates, copy=True)
+        representatives, _operations = self._symmetry.canonicalize_many(
+            coordinates, unique=False
+        )
+        fixed = np.max(np.abs(representatives - coordinates), axis=1) <= max(
+            10.0 * self._symmetry.tolerance, 1.0e-10
+        )
+        return np.unique(coordinates[fixed], axis=0)
+
+    @staticmethod
+    def _graph_pairs(coordinates, neighbors=4):
+        from scipy.sparse.csgraph import minimum_spanning_tree
+        from scipy.spatial.distance import cdist
+
+        coordinates = np.asarray(coordinates, dtype=float)
+        if len(coordinates) < 2:
+            raise ValueError("at least two coordinates are required for links")
+        scale = np.ptp(coordinates, axis=0)
+        scale[scale < 1.0e-12] = 1.0
+        distances = cdist(coordinates / scale, coordinates / scale)
+        tree = minimum_spanning_tree(distances).tocoo()
+        pairs = {
+            tuple(sorted((int(left), int(right))))
+            for left, right in zip(tree.row, tree.col)
+        }
+        np.fill_diagonal(distances, np.inf)
+        count = min(int(neighbors), len(coordinates) - 1)
+        for left in range(len(coordinates)):
+            nearest = np.argpartition(distances[left], count - 1)[:count]
+            pairs.update(tuple(sorted((left, int(right)))) for right in nearest)
+        return np.asarray(sorted(pairs), dtype=int)
+
+    @staticmethod
+    def _mace_predictions(model, coordinates, pairs):
+        hamiltonians = np.asarray(model.neural_energy.predict(coordinates))
+        features = np.asarray(model.neural_feature.predict(coordinates))
+        links = (
+            features[pairs[:, 0]].conj().swapaxes(-1, -2)
+            @ features[pairs[:, 1]]
+        )
+        return hamiltonians, links
+
+    @staticmethod
+    def _distilled_predictions(model, coordinates, pairs):
+        hamiltonians = np.asarray(model.energy.predict(coordinates))
+        features = np.asarray(model.feature.predict(coordinates))
+        links = (
+            features[pairs[:, 0]].conj().swapaxes(-1, -2)
+            @ features[pairs[:, 1]]
+        )
+        return hamiltonians, links
+
+    @staticmethod
+    def _prediction_metrics(hamiltonians, links, fields):
+        h_error = np.linalg.norm(
+            hamiltonians - fields["hamiltonians"], axis=(-2, -1)
+        )
+        l_error = np.linalg.norm(links - fields["links"], axis=(-2, -1))
+        l_scale = np.maximum(
+            np.linalg.norm(fields["links"], axis=(-2, -1)),
+            np.finfo(float).tiny,
+        )
+        return {
+            "maximum_hamiltonian_error": float(np.max(h_error)),
+            "rms_hamiltonian_error": float(np.sqrt(np.mean(h_error**2))),
+            "relative_link_error": float(
+                np.linalg.norm(l_error) / np.linalg.norm(l_scale)
+            ),
+            "maximum_relative_link_error": float(np.max(l_error / l_scale)),
+            "hamiltonian_errors": h_error,
+            "link_errors": l_error / l_scale,
+        }
+
+    @staticmethod
+    def _passes_accuracy(metrics, *, h_atol, h_rms, link_rtol):
+        return bool(
+            metrics["maximum_hamiltonian_error"] <= h_atol
+            and metrics["rms_hamiltonian_error"] <= h_rms
+            and metrics["relative_link_error"] <= link_rtol
+        )
+
+    def _mace_metrics(self, models, fields):
+        coordinates = np.asarray(fields["coordinates"], dtype=float)
+        pairs = np.asarray(fields["pairs"], dtype=int)
+        predictions = [
+            self._mace_predictions(model, coordinates, pairs) for model in models
+        ]
+        h_values = np.asarray([value[0] for value in predictions])
+        l_values = np.asarray([value[1] for value in predictions])
+        h_mean = np.mean(h_values, axis=0)
+        l_mean = np.mean(l_values, axis=0)
+        metrics = self._prediction_metrics(h_mean, l_mean, fields)
+        h_spread = np.sqrt(
+            np.mean(np.linalg.norm(h_values - h_mean, axis=(-2, -1)) ** 2, axis=0)
+        )
+        l_spread = np.sqrt(
+            np.mean(np.linalg.norm(l_values - l_mean, axis=(-2, -1)) ** 2, axis=0)
+        )
+        metrics.update({
+            "hamiltonian_spread": h_spread,
+            "link_spread": l_spread / np.maximum(
+                np.linalg.norm(fields["links"], axis=(-2, -1)),
+                np.finfo(float).tiny,
+            ),
+        })
+        return metrics
+
+    @staticmethod
+    def _calibrate_uncertainty(metrics, quantile=0.95):
+        floor = np.finfo(float).eps
+        h_factor = float(
+            np.quantile(
+                metrics["hamiltonian_errors"]
+                / np.maximum(metrics["hamiltonian_spread"], floor),
+                quantile,
+                method="higher",
+            )
+        )
+        l_factor = float(
+            np.quantile(
+                metrics["link_errors"]
+                / np.maximum(metrics["link_spread"], floor),
+                quantile,
+                method="higher",
+            )
+        )
+        return {
+            "quantile": float(quantile),
+            "hamiltonian_factor": h_factor,
+            "link_factor": l_factor,
+            "hamiltonian_coverage": float(
+                np.mean(
+                    metrics["hamiltonian_errors"]
+                    <= h_factor * np.maximum(metrics["hamiltonian_spread"], floor)
+                )
+            ),
+            "link_coverage": float(
+                np.mean(
+                    metrics["link_errors"]
+                    <= l_factor * np.maximum(metrics["link_spread"], floor)
+                )
+            ),
+        }
+
+    @staticmethod
+    def _uncertainty_coverage(metrics, calibration):
+        floor = np.finfo(float).eps
+        h_limit = calibration["hamiltonian_factor"] * np.maximum(
+            metrics["hamiltonian_spread"], floor
+        )
+        l_limit = calibration["link_factor"] * np.maximum(
+            metrics["link_spread"], floor
+        )
+        return {
+            "hamiltonian_coverage": float(
+                np.mean(metrics["hamiltonian_errors"] <= h_limit)
+            ),
+            "link_coverage": float(np.mean(metrics["link_errors"] <= l_limit)),
+            "maximum_hamiltonian_bound": float(np.max(h_limit)),
+            "maximum_link_bound": float(np.max(l_limit)),
+        }
+
+    def _fit_mace_ensemble(
+        self,
+        fields,
+        *,
+        species,
+        finite_group,
+        feature_rank,
+        ensemble,
+        epochs,
+        seed,
+        previous=(),
+        encoder_options=None,
+        hidden=(96, 96),
+        sync_steps=300,
+    ):
+        from pyqed.ml import MACE
+
+        options = {
+            "channels": 20,
+            "max_ell": 2,
+            "interactions": 2,
+            "correlation": 2,
+            "radial_basis": 8,
+            "radial_mlp": (64, 64),
+            "cutoff": 5.0,
+            "dtype": "float64",
+        }
+        options.update({} if encoder_options is None else encoder_options)
+        models = []
+        synchronized_targets = None
+        coordinates = np.asarray(fields["coordinates"], dtype=float)
+        anchor_coordinate = np.mean(np.asarray(self.coord.bounds, dtype=float), axis=1)
+        anchor = int(np.argmin(np.linalg.norm(coordinates - anchor_coordinate, axis=1)))
+        for member in range(int(ensemble)):
+            model = MACE(
+                self.grids,
+                species,
+                self.coord.cartesian,
+                self.nstates,
+                chart_features=True,
+                chart_bounds=self.coord.bounds,
+                periodic_axes=self.coord.periodic_axes,
+                geometry_units="bohr",
+                **options,
+            ).fit_y(
+                (coordinates, fields["hamiltonians"]),
+                coordinates,
+                fields["pairs"],
+                fields["links"],
+                feature_targets=synchronized_targets,
+                feature_rank=int(feature_rank),
+                anchor=anchor,
+                feature_objective="links-only",
+                ambient_representation="full",
+                energy_representation="direct",
+                energy_objective="trace-traceless",
+                finite_group=finite_group,
+                hidden=tuple(int(value) for value in hidden),
+                epochs=int(epochs),
+                sync_steps=int(sync_steps),
+                initial_fit=(previous[member] if member < len(previous) else None),
+                seed=int(seed) + 97 * member,
+                distill=False,
+            )
+            if not model.success:
+                raise RuntimeError(f"MACE ensemble member {member} failed: {model.message}")
+            models.append(model)
+            synchronized_targets = np.asarray(model.feature_targets_)
+        return tuple(models)
+
+    def _build_mace(self, options):
+        species = self._mace_inputs()
+        if species is None:
+            raise RuntimeError("MACE requires a molecular Cartesian coordinate chart")
+        initial = int(options.pop("initial", max(48, 12 * len(self.grids))))
+        batch = int(options.pop("batch", max(12, 4 * len(self.grids))))
+        maximum = int(options.pop("maximum", max(initial + 3 * batch, 128)))
+        calibration_count = int(options.pop("calibration", 32))
+        validation_count = int(options.pop("validation", 64))
+        ensemble_count = int(options.pop("ensemble", 3))
+        epochs = int(options.pop("epochs", 450))
+        refinement_epochs = int(options.pop("refinement_epochs", 180))
+        maximum_rounds = options.pop("rounds", None)
+        maximum_rounds = None if maximum_rounds is None else int(maximum_rounds)
+        if maximum_rounds is not None and maximum_rounds < 1:
+            raise ValueError("rounds must be positive")
+        feature_rank = int(options.pop("feature_rank", 8 * self.nstates))
+        feature_rank = int(np.ceil(feature_rank / self.nstates) * self.nstates)
+        h_atol = float(options.pop("hamiltonian_atol", 1.5e-3))
+        h_rms = float(options.pop("hamiltonian_rms", 5.0e-4))
+        link_rtol = float(options.pop("link_rtol", 5.0e-3))
+        distill_rtol = float(options.pop("distill_rtol", 2.0e-3))
+        coverage_atol = float(options.pop("coverage", 0.90))
+        if not 0.0 <= coverage_atol <= 1.0:
+            raise ValueError("coverage must lie between zero and one")
+        tt_rank = int(options.pop("rank", 64))
+        tt_degree = options.pop("degrees", 10)
+        tt_degree = int(tt_degree if np.isscalar(tt_degree) else max(tt_degree))
+        seed = int(options.pop("seed", 0))
+        strict = bool(options.pop("strict", True))
+        reuse_database = bool(options.pop("reuse_database", True))
+        cache_only = bool(options.pop("cache_only", False))
+        verbose = bool(options.pop("verbose", False))
+        self._cache_only = cache_only
+        if cache_only:
+            self.frames.builder = None
+        encoder_options = options.pop("encoder", None)
+        hidden = options.pop("hidden", (96, 96))
+        sync_steps = int(options.pop("sync_steps", 300))
+        if options:
+            raise TypeError("unknown MACE fit options: " + ", ".join(sorted(options)))
+
+        origin = np.mean(np.asarray(self.coord.bounds, dtype=float), axis=1)
+        database_pool = (
+            self._database_coordinates()
+            if reuse_database
+            else np.empty((0, len(self.grids)), dtype=float)
+        )
+        database_candidates = int(len(database_pool))
+        if len(database_pool):
+            keep = np.linalg.norm(database_pool - origin, axis=1) > 1.0e-12
+            database_pool = database_pool[keep]
+            database_pool = database_pool[
+                np.random.default_rng(seed + 7).permutation(len(database_pool))
+            ]
+
+        def take(count, fallback_seed):
+            nonlocal database_pool
+            count = int(count)
+            selected = database_pool[:count]
+            database_pool = database_pool[len(selected):]
+            attempts = 0
+            while len(selected) < count:
+                if cache_only:
+                    raise RuntimeError(
+                        "the electronic database does not contain enough disjoint "
+                        "coordinates for the requested cache-only design"
+                    )
+                generated = self._design(
+                    max(2 * (count - len(selected)), count),
+                    fallback_seed + attempts,
+                )
+                selected = np.unique(np.vstack((selected, generated)), axis=0)
+                attempts += 1
+            return selected[:count]
+
+        calibration = take(calibration_count, seed + 11)
+        validation = take(validation_count, seed + 23)
+        training = self.reduce_coordinates(
+            np.vstack((origin, take(max(initial - 1, 1), seed + 1)))
+        )
+        calibration_pairs = self._graph_pairs(calibration)
+        validation_pairs = self._graph_pairs(validation)
+        calibration_fields = self.continuous_fields(calibration, calibration_pairs)
+        validation_fields = self.continuous_fields(validation, validation_pairs)
+        finite_group = self.mace_group(feature_rank) if self._symmetry is not None else None
+        models = ()
+        history = []
+        round_index = 0
+        while True:
+            pairs = self._graph_pairs(training)
+            training_fields = self.continuous_fields(training, pairs)
+            models = self._fit_mace_ensemble(
+                training_fields,
+                species=species,
+                finite_group=finite_group,
+                feature_rank=feature_rank,
+                ensemble=ensemble_count,
+                epochs=epochs if not models else refinement_epochs,
+                seed=seed + 1000 * round_index,
+                previous=models,
+                encoder_options=encoder_options,
+                hidden=hidden,
+                sync_steps=sync_steps,
+            )
+            calibration_metrics = self._mace_metrics(models, calibration_fields)
+            validation_metrics = self._mace_metrics(models, validation_fields)
+            uncertainty = self._calibrate_uncertainty(calibration_metrics)
+            validation_coverage = self._uncertainty_coverage(
+                validation_metrics, uncertainty
+            )
+            accepted = (
+                validation_metrics["maximum_hamiltonian_error"] <= h_atol
+                and validation_metrics["rms_hamiltonian_error"] <= h_rms
+                and validation_metrics["relative_link_error"] <= link_rtol
+                and validation_coverage["hamiltonian_coverage"] >= coverage_atol
+                and validation_coverage["link_coverage"] >= coverage_atol
+            )
+            history.append(
+                {
+                    "round": round_index,
+                    "training_points": int(len(training)),
+                    "validation": {
+                        key: value
+                        for key, value in validation_metrics.items()
+                        if np.isscalar(value)
+                    },
+                    "uncertainty": uncertainty,
+                    "validation_coverage": validation_coverage,
+                    "accepted": bool(accepted),
+                }
+            )
+            if verbose:
+                print(f"MACE adaptive round {round_index}: {history[-1]}", flush=True)
+            if (
+                accepted
+                or len(training) >= maximum
+                or maximum_rounds is not None
+                and round_index + 1 >= maximum_rounds
+            ):
+                break
+            pool_count = max(8 * batch, 128)
+            if len(database_pool):
+                pool = database_pool[:pool_count]
+                database_pool = database_pool[len(pool):]
+            else:
+                if cache_only:
+                    raise RuntimeError(
+                        "cache-only adaptive sampling exhausted reusable database points"
+                    )
+                pool = self._design(pool_count, seed + 100 + round_index)
+            bounds = np.asarray(self.coord.bounds, dtype=float)
+            scale = np.ptp(bounds, axis=1)
+            distance = np.linalg.norm(
+                (pool[:, None, :] - training[None, :, :]) / scale,
+                axis=-1,
+            ).min(axis=1)
+            h_values = np.asarray(
+                [model.neural_energy.predict(pool) for model in models]
+            )
+            h_mean = np.mean(h_values, axis=0)
+            spread = np.sqrt(
+                np.mean(
+                    np.linalg.norm(h_values - h_mean, axis=(-2, -1)) ** 2,
+                    axis=0,
+                )
+            )
+            score = uncertainty["hamiltonian_factor"] * spread + h_atol * distance
+            acquired = pool[np.argsort(score)[-batch:]]
+            training = self.reduce_coordinates(np.vstack((training, acquired)))
+            round_index += 1
+
+        member_metrics = [
+            self._mace_metrics((candidate,), validation_fields)
+            for candidate in models
+        ]
+        member_scores = [
+            max(
+                metrics["maximum_hamiltonian_error"]
+                / max(h_atol, np.finfo(float).tiny),
+                metrics["rms_hamiltonian_error"]
+                / max(h_rms, np.finfo(float).tiny),
+                metrics["relative_link_error"]
+                / max(link_rtol, np.finfo(float).tiny),
+            )
+            for metrics in member_metrics
+        ]
+        best = int(np.argmin(member_scores))
+        model = models[best]
+        selected_metrics = member_metrics[best]
+        selected_accepted = self._passes_accuracy(
+            selected_metrics,
+            h_atol=h_atol,
+            h_rms=h_rms,
+            link_rtol=link_rtol,
+        )
+        self.mace = model
+        self.ensemble = models
+        self.energy = None
+        self.feature = None
+        self.links = None
+        self.info = dict(model.info)
+        self.info["adaptive"] = history
+        self.validation = {
+            "calibration": history[-1]["uncertainty"],
+            "uncertainty_coverage": history[-1]["validation_coverage"],
+            "independent": history[-1]["validation"],
+            "independent_hamiltonian_errors": validation_metrics[
+                "hamiltonian_errors"
+            ],
+            "independent_link_errors": validation_metrics["link_errors"],
+            "selected_member": {
+                key: value
+                for key, value in selected_metrics.items()
+                if np.isscalar(value)
+            },
+            "state_symmetry": self.state_validation,
+        }
+        self.acceptance = {
+            "accepted": False,
+            "stage": "neural",
+            "hamiltonian_atol": h_atol,
+            "hamiltonian_rms": h_rms,
+            "link_rtol": link_rtol,
+            "distill_rtol": distill_rtol,
+            "coverage": coverage_atol,
+        }
+        self.model = "mace"
+        self.success = False
+        self.message = "neural production acceptance gates failed"
+        self.config = {
+            "gauge": "anchor-procrustes",
+            "unitarize_links": False,
+            "model": self.model,
+            "feature_rank": feature_rank,
+            "ensemble": ensemble_count,
+            "training_points": int(len(training)),
+            "maximum_points": maximum,
+            "maximum_rounds": maximum_rounds,
+            "seed": seed,
+            "database_reuse": reuse_database,
+            "cache_only": cache_only,
+            "database_candidates": database_candidates,
+        }
+        if not history[-1]["accepted"] or not selected_accepted:
+            self.acceptance["stage"] = (
+                "ensemble" if not history[-1]["accepted"] else "selected-member"
+            )
+            if strict:
+                raise RuntimeError(
+                    "MACE fit failed neural production acceptance gates: "
+                    f"{self.validation}"
+                )
+            return self
+
+        model.distill_y(
+            rank=tt_rank,
+            degree=tt_degree,
+            method="cross",
+            validation_points=max(128, validation_count),
+            seed=seed + 5000,
+        )
+        distillation = model.info["distillation"]
+        final_hamiltonians, final_links = self._distilled_predictions(
+            model,
+            np.asarray(validation_fields["coordinates"], dtype=float),
+            np.asarray(validation_fields["pairs"], dtype=int),
+        )
+        final_metrics = self._prediction_metrics(
+            final_hamiltonians, final_links, validation_fields
+        )
+        accepted = bool(
+            distillation["energy_relative_error"] <= distill_rtol
+            and distillation["feature_relative_error"] <= distill_rtol
+            and self._passes_accuracy(
+                final_metrics,
+                h_atol=h_atol,
+                h_rms=h_rms,
+                link_rtol=link_rtol,
+            )
+        )
+        self.energy = model.energy
+        self.feature = model.feature
+        self.info = dict(model.info)
+        self.info["adaptive"] = history
+        self.validation["distillation"] = distillation
+        self.validation["final"] = {
+            key: value
+            for key, value in final_metrics.items()
+            if np.isscalar(value)
+        }
+        self.acceptance.update(accepted=accepted, stage="distillation")
+        self.model = "mace-ftt"
+        self.config["model"] = self.model
+        self.success = accepted
+        self.message = "accepted" if accepted else "production acceptance gates failed"
+        if strict and not accepted:
+            raise RuntimeError(
+                "MACE fit failed production acceptance gates: "
+                f"{self.validation}"
+            )
+        return self
+
     def build(self):
         """Run the native adaptive electronic fit."""
         if self.success:
@@ -643,6 +1347,32 @@ class AbInitioFit:
         if not self._native:
             raise RuntimeError("callback-based fits use run() with an explicit design")
         options = dict(self.fit_options)
+        requested_model = str(options.pop("model", "auto")).lower()
+        if requested_model not in {"auto", "mace", "ftt"}:
+            raise ValueError("model must be 'auto', 'mace', or 'ftt'")
+        use_mace = requested_model == "mace" or (
+            requested_model == "auto" and self._mace_inputs() is not None
+        )
+        if use_mace:
+            started = time.perf_counter()
+            with self:
+                if self.database is not None:
+                    self.database.update_run(self.run_id, "fitting")
+                try:
+                    result = self._build_mace(options)
+                except Exception as error:
+                    self.message = str(error)
+                    if self.database is not None:
+                        self.database.update_run(self.run_id, "failed")
+                    raise
+                else:
+                    if self.database is not None:
+                        self.database.update_run(
+                            self.run_id, "fitted" if self.success else "rejected"
+                        )
+                finally:
+                    self.seconds = time.perf_counter() - started
+            return result
         options.setdefault("degrees", min(6, *(len(axis) - 1 for axis in self.grids)))
         plan = self.adaptive_plan(degrees=options["degrees"])
         progress = self.frames.progress
@@ -656,6 +1386,7 @@ class AbInitioFit:
                 progress = None
         self.frames.progress = progress
         with self:
+            self._ensure_state_repr(strict=False)
             self.run_adaptive(**options)
         return self
 
@@ -684,6 +1415,9 @@ class AbInitioFit:
             nroots=self.protocol["nroots"],
         )
         energy_shift = self.energy_shift if energy_shift is None else float(energy_shift)
+        database = self.database
+        if database is not None and getattr(database, "connection", None) is None:
+            database = database.path
         reference = type(self)(
             grid.x,
             len(self.states),
@@ -693,7 +1427,7 @@ class AbInitioFit:
             overlap=_overlap_view(self.states),
             overlap_protocol=self.overlap_protocol,
             geometry=self.coord.cartesian,
-            database=self.database_path,
+            database=database,
             protocol=self.protocol,
             workers=workers,
             progress=None,
@@ -710,12 +1444,13 @@ class AbInitioFit:
             )
         pairs = []
         pair_keys = []
+        periodic_axes = frozenset(getattr(grid, "periodic_axes", ()))
         for left in points:
             for axis, size in enumerate(grid.shape):
-                if left[axis] + 1 >= size:
+                if left[axis] + 1 >= size and axis not in periodic_axes:
                     continue
                 right = list(left)
-                right[axis] += 1
+                right[axis] = (right[axis] + 1) % size
                 right = tuple(right)
                 pairs.append((left, right))
                 pair_keys.append((axis, left))
@@ -910,17 +1645,20 @@ class AbInitioFit:
             self.electronic_driver,
             nroots=self.protocol["nroots"],
         )
+        database = self.database
+        if database is not None and getattr(database, "connection", None) is None:
+            database = database.path
         reference = type(self)(
             source,
             self.nstates,
-            builder,
+            None if bool(getattr(self, "_cache_only", False)) else builder,
             anchor=(0,) * len(self.grids),
             frame=_electronic_frame_record,
             energies=_energy_view(self.states),
             overlap=_overlap_view(self.states),
             overlap_protocol=self.overlap_protocol,
             geometry=self.coord.cartesian,
-            database=self.database,
+            database=database,
             protocol=self.protocol,
             workers=self.frames.workers,
             progress=None,
@@ -948,6 +1686,222 @@ class AbInitioFit:
             "stats": dict(reference.frames.stats),
         }
 
+    def reduce_coordinates(self, coordinates):
+        """Return unique coordinate-orbit representatives for fitting."""
+
+        coordinates = np.asarray(coordinates, dtype=float)
+        if coordinates.ndim != 2 or coordinates.shape[1] != len(self.grids):
+            raise ValueError("coordinates have the wrong dimension")
+        if self._symmetry is None:
+            return np.unique(coordinates, axis=0)
+        reduce = getattr(self._symmetry, "canonicalize_many", None)
+        if not callable(reduce):
+            raise TypeError(
+                "the configured symmetry does not reduce scattered coordinates"
+            )
+        representatives, _inverse, _operations = reduce(coordinates, unique=True)
+        return representatives
+
+    def reduce_pairs(self, coordinates, pairs):
+        """Jointly reduce pairs while preserving their physical link geometry."""
+
+        coordinates = np.asarray(coordinates, dtype=float)
+        pairs = np.asarray(pairs, dtype=int)
+        if self._symmetry is None:
+            return coordinates, pairs
+        reduce = getattr(self._symmetry, "canonicalize_pairs", None)
+        if not callable(reduce):
+            raise TypeError("the configured symmetry does not reduce scattered pairs")
+        representatives, representative_pairs, _operations = reduce(
+            coordinates, pairs
+        )
+        return representatives, representative_pairs
+
+    def orbit(self, coordinates):
+        """Return the symmetry orbit of one coordinate vector."""
+
+        coordinates = np.asarray(coordinates, dtype=float)
+        if coordinates.shape != (len(self.grids),):
+            raise ValueError("coordinates have the wrong dimension")
+        if self._symmetry is None:
+            return coordinates[None, :]
+        return np.asarray(self._symmetry.images(coordinates), dtype=float)
+
+    def reduced_size(self, full_size):
+        """Return the quotient-domain budget for a full-domain budget."""
+
+        if self._symmetry is None:
+            return int(full_size)
+        count = getattr(self._symmetry, "representative_count", None)
+        return int(full_size) if not callable(count) else int(count(full_size))
+
+    def _state_calibration_coordinates(self, count=2, *, offset=0):
+        origin = np.asarray(self._symmetry.origin, dtype=float)
+        database = self._database_coordinates(canonical=False)
+        representatives = self._database_coordinates(canonical=True)
+        if len(database) and len(representatives):
+            tolerance = max(float(self._symmetry.tolerance), 1.0e-10)
+
+            def key(value):
+                return tuple(np.rint(np.asarray(value) / tolerance).astype(np.int64))
+
+            stored = {key(value) for value in database}
+            stored_geometries = getattr(self, "_database_geometry_cache", frozenset())
+            complete = []
+            scale = np.ptp(np.asarray(self.coord.bounds, dtype=float), axis=1)
+            for base in representatives:
+                orbit = origin + np.einsum(
+                    "gij,j->gi",
+                    self.coord_repr,
+                    np.asarray(base) - origin,
+                    optimize=True,
+                )
+                orbit_keys = {key(value) for value in orbit}
+                if len(orbit_keys) != len(self.coord_repr):
+                    continue
+                exact_orbit = all(
+                    canonical_json(self.coord.cartesian(value)) in stored_geometries
+                    for value in orbit
+                )
+                if orbit_keys.issubset(stored) and exact_orbit:
+                    radius = float(np.linalg.norm((base - origin) / scale))
+                    if radius > 1.0e-4:
+                        complete.append((radius, orbit))
+            complete.sort(key=lambda item: item[0])
+            selected = (
+                complete[: int(count)]
+                if int(offset) == 0
+                else complete[-int(count):]
+                if len(complete) >= int(count) + 2
+                else []
+            )
+            if len(selected) == int(count):
+                return np.asarray([orbit for _radius, orbit in selected])
+        if bool(getattr(self, "_cache_only", False)):
+            raise RuntimeError(
+                "the electronic database does not contain enough complete symmetry "
+                "orbits for cache-only state-representation validation"
+            )
+        spans = np.ptp(np.asarray(self.coord.bounds, dtype=float), axis=1)
+        axes = np.arange(1, len(spans) + 1, dtype=float)
+        orbits = []
+        for local_number in range(int(count)):
+            number = int(offset) + local_number
+            direction = np.sin((number + 1.37) * axes) + 0.4 * np.cos(
+                (number + 0.73) * axes
+            )
+            direction /= max(float(np.max(np.abs(direction))), 1.0)
+            amplitude = 0.12 + 0.06 * (local_number % 5)
+            base = origin + amplitude * spans * direction
+            orbit = origin + np.einsum(
+                "gij,j->gi",
+                self.coord_repr,
+                base - origin,
+                optimize=True,
+            )
+            orbits.append(orbit)
+        return np.asarray(orbits)
+
+    def _validate_state_repr(self, count=4):
+        validation = self._state_calibration_coordinates(count, offset=11)
+        order = validation.shape[1]
+        coordinates = validation.reshape(-1, validation.shape[-1])
+        pairs = np.asarray(
+            [
+                (orbit * order, orbit * order + operation)
+                for orbit in range(len(validation))
+                for operation in range(1, order)
+            ],
+            dtype=int,
+        )
+        fields = self.continuous_fields(coordinates, pairs)
+        hamiltonians = fields["hamiltonians"].reshape(
+            len(validation), order, self.nstates, self.nstates
+        )
+        errors = []
+        for orbit in hamiltonians:
+            source = orbit[0] - np.trace(orbit[0]) / self.nstates * np.eye(
+                self.nstates
+            )
+            scale = max(float(np.linalg.norm(source)), np.finfo(float).tiny)
+            for operation, expected in zip(self.state_repr, orbit):
+                expected = expected - np.trace(expected) / self.nstates * np.eye(
+                    self.nstates
+                )
+                predicted = operation @ source @ operation.conj().T
+                errors.append(float(np.linalg.norm(predicted - expected) / scale))
+        singular = np.linalg.svd(fields["links"], compute_uv=False)
+        return {
+            "independent_orbits": int(len(validation)),
+            "independent_maximum_covariance_error": max(errors, default=0.0),
+            "independent_rms_covariance_error": float(
+                np.sqrt(np.mean(np.square(errors))) if errors else 0.0
+            ),
+            "minimum_manifold_singular_value": float(np.min(singular)),
+            "one_percent_manifold_singular_value": float(
+                np.quantile(singular, 0.01)
+            ),
+        }
+
+    def _ensure_state_repr(self, *, strict=True):
+        if self.state_repr is not None:
+            return self.state_repr
+        if self._symmetry is None or self.coord_repr is None:
+            return None
+        if self.nstates == 1:
+            self.state_repr = np.ones((len(self.coord_repr), 1, 1), dtype=complex)
+            self.state_validation = {
+                "maximum_covariance_error": 0.0,
+                "closure_error": 0.0,
+                "maximum_null_ratio": 0.0,
+                "calibration_orbits": 0,
+            }
+            return self.state_repr
+        calibration = self._state_calibration_coordinates()
+        try:
+            fields = self.continuous_fields(
+                calibration.reshape(-1, calibration.shape[-1])
+            )
+            hamiltonians = fields["hamiltonians"].reshape(
+                calibration.shape[0],
+                calibration.shape[1],
+                self.nstates,
+                self.nstates,
+            )
+            from .sampling_symmetry import infer_state_repr
+
+            self.state_repr, self.state_validation = infer_state_repr(
+                self.coord_repr, hamiltonians
+            )
+            self.state_validation.update(self._validate_state_repr())
+            if (
+                self.state_validation["independent_maximum_covariance_error"]
+                > 2.0e-3
+                or self.state_validation["minimum_manifold_singular_value"] < 0.9
+            ):
+                raise RuntimeError(
+                    "selected-state symmetry validation failed: "
+                    f"{self.state_validation}"
+                )
+        except Exception as error:
+            self.state_validation = {"error": str(error)}
+            self.symmetry_validation["state_error"] = str(error)
+            if strict:
+                raise
+        return self.state_repr
+
+    def mace_group(self, feature_rank, *, tolerance=None):
+        """Return the detected finite-group data consumed by MACE."""
+
+        if self._symmetry is None or self.coord_repr is None:
+            return None
+        state_repr = self._ensure_state_repr(strict=True)
+        return self._symmetry.mace_group(
+            state_repr,
+            feature_rank=int(feature_rank),
+            tolerance=tolerance,
+        )
+
     def coordinates(self, index):
         """Return generalized coordinates for one product-grid index."""
 
@@ -969,7 +1923,7 @@ class AbInitioFit:
         index = tuple(int(value) for value in index)
         image = self._symmetry_images.get(index)
         if image is None:
-            image = self.symmetry.resolve(self.coordinates(index))
+            image = self._symmetry.resolve(self.coordinates(index))
             if len(image.representative_coordinates) != len(self.grids):
                 raise ValueError(
                     "sampling-symmetry representative has the wrong coordinate dimension"
@@ -980,7 +1934,7 @@ class AbInitioFit:
     def _index_for_coordinates(self, coordinates):
         index = []
         tolerance = max(
-            float(getattr(self.symmetry, "tolerance", 0.0)), 1.0e-12
+            float(getattr(self._symmetry, "tolerance", 0.0)), 1.0e-12
         )
         for axis, (grid, value) in enumerate(zip(self.grids, coordinates)):
             matches = np.flatnonzero(
@@ -1003,7 +1957,7 @@ class AbInitioFit:
     def representative_coordinates(self, index):
         """Return the canonical generalized coordinates for one orbit image."""
 
-        if self.symmetry is None:
+        if self._symmetry is None:
             return self.coordinates(index)
         return tuple(self._symmetry_image(index).representative_coordinates)
 
@@ -1017,11 +1971,11 @@ class AbInitioFit:
         """Expand explicit grid samples to complete molecular-symmetry orbits."""
 
         points = tuple(dict.fromkeys(self.frames._index(point) for point in points))
-        if self.symmetry is None:
+        if self._symmetry is None:
             return points
         expanded = []
         for point in points:
-            for coordinates in self.symmetry.images(self.coordinates(point)):
+            for coordinates in self._symmetry.images(self.coordinates(point)):
                 expanded.append(self._index_for_coordinates(coordinates))
         return tuple(dict.fromkeys(expanded))
 
@@ -1032,11 +1986,11 @@ class AbInitioFit:
             (self.frames._index(left), self.frames._index(right))
             for left, right in pairs
         )
-        if self.symmetry is None:
+        if self._symmetry is None:
             return tuple(dict.fromkeys(normalized))
         expanded = []
         for left, right in normalized:
-            for left_coordinates, right_coordinates in self.symmetry.pair_images(
+            for left_coordinates, right_coordinates in self._symmetry.pair_images(
                 self.coordinates(left), self.coordinates(right)
             ):
                 expanded.append(
@@ -1048,7 +2002,7 @@ class AbInitioFit:
         return tuple(dict.fromkeys(expanded))
 
     def _transform_symmetry_record(self, record, representative, index):
-        return self.symmetry.transform_record(
+        return self._record_symmetry.transform_record(
             record,
             self._symmetry_image(index),
             representative_geometry=self.representative_geometry(representative),
@@ -1057,7 +2011,7 @@ class AbInitioFit:
         )
 
     def _symmetry_view_key(self, index):
-        return self.symmetry.view_key(self._symmetry_image(index))
+        return self._record_symmetry.view_key(self._symmetry_image(index))
 
     def sample(self, index):
         """Describe one grid point for provenance and database queries."""
@@ -1068,14 +2022,14 @@ class AbInitioFit:
             "coordinates": self.coordinates(index),
             "geometry": self.sample_geometry(index),
         }
-        if self.symmetry is not None:
+        if self._record_symmetry is not None:
             image = self._symmetry_image(index)
             sample.update(
                 {
                     "representative_index": self._representative_index(index),
                     "representative_coordinates": image.representative_coordinates,
                     "representative_geometry": self.representative_geometry(index),
-                    "sampling_symmetry": self.symmetry.view_key(image),
+                    "sampling_symmetry": self._symmetry.view_key(image),
                 }
             )
         source = self.frames.sources.get(index)
@@ -1089,7 +2043,11 @@ class AbInitioFit:
 
     def _database_key(self, index):
         return {
-            "geometry": self.representative_geometry(index),
+            "geometry": (
+                self.representative_geometry(index)
+                if self._record_symmetry is not None
+                else self.sample_geometry(index)
+            ),
             "protocol": self.protocol,
         }
 
@@ -1488,6 +2446,9 @@ class AbInitioFit:
         samples_path.write_text(json.dumps(_jsonable(samples), indent=2) + "\n")
         self.labels = labels
         self.metadata = {} if metadata is None else metadata
+        mace_path = None
+        if getattr(self, "mace", None) is not None:
+            mace_path = self.mace.save(directory / "mace.pt")
         summary = {
             "class": type(self).__name__,
             "grid": list(self.shape),
@@ -1498,6 +2459,7 @@ class AbInitioFit:
             "energy_model": energy_path.name,
             "link_models": [path.name for path in link_paths],
             "feature_model": None if feature_path is None else feature_path.name,
+            "mace_model": None if mace_path is None else mace_path.name,
             "grids": grid_path.name,
             "samples": samples_path.name,
             "seconds": self.seconds,
@@ -1505,6 +2467,9 @@ class AbInitioFit:
             "message": self.message,
             "config": self.config,
             "sampling": self.info,
+            "validation": getattr(self, "validation", None),
+            "acceptance": getattr(self, "acceptance", None),
+            "model": getattr(self, "model", None),
             "metadata": self.metadata,
             "database": (
                 None if self.database is None else str(self.database.path)
@@ -1513,9 +2478,20 @@ class AbInitioFit:
             "overlap_protocol": self.overlap_protocol,
             "sampling_symmetry": (
                 None
-                if self.symmetry is None
-                else self.symmetry.metadata()
+                if self._symmetry is None
+                else self._symmetry.metadata()
             ),
+            "symmetry": {
+                "group": self.group,
+                "coord_repr": self.coord_repr,
+                "state_repr": self.state_repr,
+                "coord_irreps": self.coord_irreps,
+                "coord_blocks": self.coord_blocks,
+                "coord_basis": self.coord_basis,
+                "detection": self.symmetry_validation,
+                "irreps": self.irrep_validation,
+                "states": self.state_validation,
+            },
             "run_id": self.run_id,
         }
         summary_path = directory / "summary.json"
@@ -1528,11 +2504,12 @@ class AbInitioFit:
             "grids": grid_path,
             "samples": samples_path,
             "summary": summary_path,
+            "mace": mace_path,
         }
         return self
 
     @classmethod
-    def load(cls, directory):
+    def load(cls, directory, *, geometry=None):
         """Restore fitted fields without electronic-structure callbacks."""
         from pyqed.mps.functional import load_field_model
 
@@ -1543,11 +2520,36 @@ class AbInitioFit:
                 np.asarray(archive[f"grid_{axis}"], dtype=float)
                 for axis in range(len(summary["grid"]))
             )
+        symmetry = summary.get("symmetry", {})
+        sampling_symmetry = summary.get("sampling_symmetry") or {}
+        coordinate_representations = symmetry.get("coord_repr")
+        restored_symmetry = False
+        if (
+            coordinate_representations is not None
+            and len(coordinate_representations) > 1
+        ):
+            from .sampling_symmetry import FiniteGroupSamplingSymmetry
+
+            operations = sampling_symmetry.get("operations")
+            if operations is not None and len(operations) != len(
+                coordinate_representations
+            ):
+                operations = None
+            restored_symmetry = FiniteGroupSamplingSymmetry(
+                coordinate_representations,
+                name=symmetry.get(
+                    "group", sampling_symmetry.get("name", "finite-group")
+                ),
+                operations=operations,
+                origin=sampling_symmetry.get("origin"),
+                tolerance=float(sampling_symmetry.get("tolerance", 1.0e-10)),
+            )
         fit = cls(
             grids,
             summary["nstates"],
             anchor=summary["anchor"],
             energy_shift=summary.get("energy_shift"),
+            symmetry=restored_symmetry,
         )
         fit.energy = load_field_model(directory / summary["energy_model"])
         fit.links = tuple(
@@ -1561,10 +2563,25 @@ class AbInitioFit:
             else load_field_model(directory / feature_model)
         )
         fit.info = summary.get("sampling")
+        fit.validation = summary.get("validation")
+        fit.acceptance = summary.get("acceptance")
+        fit.model = summary.get("model")
         fit.config = summary.get("config")
         fit.protocol = summary.get("protocol")
         fit.overlap_protocol = summary.get("overlap_protocol")
         fit.sampling_symmetry_metadata = summary.get("sampling_symmetry")
+        fit.group = symmetry.get("group", "C1")
+        if symmetry.get("coord_repr") is not None:
+            fit.coord_repr = np.asarray(symmetry["coord_repr"], dtype=float)
+        if symmetry.get("state_repr") is not None:
+            fit.state_repr = np.asarray(symmetry["state_repr"])
+        fit.coord_irreps = symmetry.get("coord_irreps")
+        fit.coord_blocks = symmetry.get("coord_blocks")
+        if symmetry.get("coord_basis") is not None:
+            fit.coord_basis = np.asarray(symmetry["coord_basis"], dtype=float)
+        fit.symmetry_validation = symmetry.get("detection")
+        fit.irrep_validation = symmetry.get("irreps")
+        fit.state_validation = symmetry.get("states")
         fit.run_id = summary.get("run_id")
         fit.seconds = summary.get("seconds")
         fit.success = bool(summary.get("success", True))
@@ -1585,7 +2602,22 @@ class AbInitioFit:
                 else directory / summary["samples"]
             ),
             "summary": directory / "summary.json",
+            "mace": (
+                None
+                if summary.get("mace_model") is None
+                else directory / summary["mace_model"]
+            ),
         }
+        mace_model = summary.get("mace_model")
+        fit.mace_checkpoint = (
+            None if mace_model is None else directory / mace_model
+        )
+        if fit.mace_checkpoint is not None and geometry is not None:
+            from pyqed.ml import MACE
+
+            fit.mace = MACE.load(
+                fit.mace_checkpoint, geometry, distill=False
+            )
         return fit
 
     def close(self):
@@ -1600,6 +2632,12 @@ class AbInitioFit:
             elif status == "fitting":
                 self.database.update_run(self.run_id, "interrupted")
         self.frames.close()
+        if (
+            self.database is not None
+            and self.database.connection is not None
+            and self.run_id is not None
+        ):
+            self.database.release_claims(self.run_id)
         if self._owns_database and self.database is not None:
             self.database.close()
 

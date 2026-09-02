@@ -305,14 +305,18 @@ try:
     from .mcscf.soc_si import (
         SOCStateInteractionResult,
         SingletTripletSOCResult,
+        align_triplet_multiplet_phases,
         st_soc,
         soc_state_interaction,
+        spin_lower,
     )
 except (ImportError, OSError):
     SOCStateInteractionResult = None
     SingletTripletSOCResult = None
+    align_triplet_multiplet_phases = None
     st_soc = None
     soc_state_interaction = None
+    spin_lower = None
 
 try:
     from .qmmm import (

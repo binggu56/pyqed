@@ -16,9 +16,40 @@ from pyqed.ml import (
     qcschema_training_records,
     transform_electronic_gauge,
 )
+from pyqed.ml.mace import _validate_finite_group
 
 
 MACE_AVAILABLE = importlib.util.find_spec("mace") is not None
+
+
+@pytest.mark.skipif(not MACE_AVAILABLE, reason="mace-torch is not installed")
+def test_mace_finite_group_rotates_about_chart_origin():
+    grid = np.linspace(0.8, 1.2, 3)
+    identity = np.eye(2)
+    reflection = np.diag((1.0, -1.0))
+    fit = MACE(
+        (grid, grid),
+        ("H", "H"),
+        lambda q: np.asarray(((0.0, 0.0, 0.0), (q[0], q[1], 0.0))),
+        1,
+        channels=2,
+        max_ell=1,
+        interactions=1,
+        radial_basis=2,
+        radial_mlp=(4,),
+        cutoff=3.0,
+    )
+    fit.finite_group_ = _validate_finite_group(
+        (identity, reflection),
+        np.ones((2, 1, 1)),
+        np.ones((2, 1, 1)),
+        ndim=2,
+        nstates=1,
+        feature_rank=1,
+        origin=(1.0, 1.0),
+    )
+    orbit = fit._finite_group_coordinates(np.asarray(((1.1, 1.2),)))
+    np.testing.assert_allclose(orbit, ((1.1, 1.2), (1.1, 0.8)))
 
 
 @pytest.mark.skipif(not MACE_AVAILABLE, reason="mace-torch is not installed")
@@ -1214,6 +1245,8 @@ def test_mace_y_finite_noncommuting_group_is_exact_and_checkpointed(tmp_path):
         links,
         feature_rank=4,
         finite_group=group,
+        energy_representation="direct",
+        energy_objective="trace-traceless",
         hidden=(4,),
         epochs=2,
         sync_steps=5,
@@ -1241,9 +1274,32 @@ def test_mace_y_finite_noncommuting_group_is_exact_and_checkpointed(tmp_path):
         gram, np.broadcast_to(np.eye(2), gram.shape), atol=2.0e-7
     )
 
+    fit.refine_hamiltonian(
+        coordinates,
+        energy,
+        epochs=3,
+        learning_rate=1.0e-3,
+        seed=5,
+    )
+    refined = fit.predict_covariant(probe)
+    np.testing.assert_allclose(refined["feature"], base["feature"], atol=2.0e-7)
+    for coordinate_action, electronic in zip(
+        coordinate_group, electronic_group
+    ):
+        transformed = fit.predict_covariant(probe @ coordinate_action.T)
+        np.testing.assert_allclose(
+            transformed["energy"],
+            electronic @ refined["energy"] @ electronic.conj().T,
+            atol=2.0e-6,
+        )
+
     checkpoint = fit.save(tmp_path / "d3_y.pt")
     restored = MACE.load(checkpoint, geometry, distill=False)
     np.testing.assert_allclose(
         restored.predict_covariant(probe)["feature"], base["feature"], atol=2.0e-6
     )
+    np.testing.assert_allclose(
+        restored.predict_covariant(probe)["energy"], refined["energy"], atol=2.0e-6,
+    )
     assert len(restored.finite_group_["coordinate_representations"]) == 6
+    assert restored.energy_objective_ == "trace-traceless"

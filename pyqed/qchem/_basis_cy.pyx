@@ -10,6 +10,35 @@ from libc.string cimport memset
 from scipy.special.cython_special cimport hyp1f1
 
 
+cdef extern from *:
+    """
+    static inline void phase_axpy_ri(
+        int n,
+        double alpha,
+        const double * __restrict phase_real,
+        const double * __restrict phase_imag,
+        double * __restrict output_real,
+        double * __restrict output_imag
+    ) {
+        #if defined(__clang__)
+        #pragma clang loop vectorize(enable) interleave(enable)
+        #endif
+        for (int i = 0; i < n; ++i) {
+            output_real[i] += alpha * phase_real[i];
+            output_imag[i] += alpha * phase_imag[i];
+        }
+    }
+    """
+    void phase_axpy_ri(
+        int n,
+        double alpha,
+        const double* phase_real,
+        const double* phase_imag,
+        double* output_real,
+        double* output_imag,
+    ) noexcept nogil
+
+
 cdef double PI = 3.141592653589793238462643383279502884
 cdef double ERI_PREFAC = 2.0 * (PI ** 2.5)
 DEF OS_MAX_STATES = 65536
@@ -3962,6 +3991,10 @@ cdef int accumulate_shell_triplet_short_range_vrr_hrr_bloch(
     uint8_t[::1] mirror_flags_v,
     double[:, :, :, ::1] out_real_v,
     double[:, :, :, ::1] out_imag_v,
+    int64_t[::1] direct_bins_v,
+    int64_t[::1] mirror_bins_v,
+    bint folded_mode,
+    int output_aux_offset,
     int p0,
     int p1,
     int q0,
@@ -3992,7 +4025,7 @@ cdef int accumulate_shell_triplet_short_range_vrr_hrr_bloch(
     cdef int nbloch = phase_real_v.shape[1]
     cdef int lA, lB, lC, max_a_l, max_c_l, max_m_l
     cdef int ia, ib, ic, idx_pq, ip, iq, iap, task, active_idx, nactive, b
-    cdef int ao_p, ao_q, aux_i
+    cdef int ao_p, ao_q, aux_i, output_aux_i
     cdef int ax[OS_VRR_MAX_CART]
     cdef int ay[OS_VRR_MAX_CART]
     cdef int az[OS_VRR_MAX_CART]
@@ -4236,28 +4269,47 @@ cdef int accumulate_shell_triplet_short_range_vrr_hrr_bloch(
                             value = prefac * full_value
                             if value == 0.0:
                                 continue
-                            if mirror_flags_v[task] != 0:
-                                for b in range(nbloch):
-                                    out_real_v[aux_i, ao_p, ao_q, b] += (
-                                        phase_real_v[task, b] * value
-                                    )
-                                    out_imag_v[aux_i, ao_p, ao_q, b] += (
-                                        phase_imag_v[task, b] * value
-                                    )
-                                    out_real_v[aux_i, ao_q, ao_p, b] += (
-                                        mirror_phase_real_v[task, b] * value
-                                    )
-                                    out_imag_v[aux_i, ao_q, ao_p, b] += (
-                                        mirror_phase_imag_v[task, b] * value
-                                    )
+                            if folded_mode:
+                                output_aux_i = aux_i - output_aux_offset
+                                out_real_v[
+                                    output_aux_i,
+                                    ao_p,
+                                    ao_q,
+                                    direct_bins_v[task],
+                                ] += value
+                                if mirror_flags_v[task] != 0:
+                                    out_real_v[
+                                        output_aux_i,
+                                        ao_q,
+                                        ao_p,
+                                        mirror_bins_v[task],
+                                    ] += value
+                            elif mirror_flags_v[task] != 0:
+                                phase_axpy_ri(
+                                    nbloch,
+                                    value,
+                                    &phase_real_v[task, 0],
+                                    &phase_imag_v[task, 0],
+                                    &out_real_v[aux_i, ao_p, ao_q, 0],
+                                    &out_imag_v[aux_i, ao_p, ao_q, 0],
+                                )
+                                phase_axpy_ri(
+                                    nbloch,
+                                    value,
+                                    &mirror_phase_real_v[task, 0],
+                                    &mirror_phase_imag_v[task, 0],
+                                    &out_real_v[aux_i, ao_q, ao_p, 0],
+                                    &out_imag_v[aux_i, ao_q, ao_p, 0],
+                                )
                             else:
-                                for b in range(nbloch):
-                                    out_real_v[aux_i, ao_p, ao_q, b] += (
-                                        phase_real_v[task, b] * value
-                                    )
-                                    out_imag_v[aux_i, ao_p, ao_q, b] += (
-                                        phase_imag_v[task, b] * value
-                                    )
+                                phase_axpy_ri(
+                                    nbloch,
+                                    value,
+                                    &phase_real_v[task, 0],
+                                    &phase_imag_v[task, 0],
+                                    &out_real_v[aux_i, ao_p, ao_q, 0],
+                                    &out_imag_v[aux_i, ao_p, ao_q, 0],
+                                )
     return 1
 
 
@@ -4286,8 +4338,15 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
     cnp.ndarray[uint8_t, ndim=1] mirror_flags,
     double eta,
     double primitive_exp_cutoff=0.0,
+    object output_real=None,
+    object output_imag=None,
+    object direct_bins=None,
+    object mirror_bins=None,
+    int aux_shell_begin=0,
+    int aux_shell_end=-1,
+    int output_aux_offset=0,
 ):
-    """Build one relative-translation group and accumulate its Bloch sums."""
+    """Accumulate one relative-translation group into Bloch-sum buffers."""
 
     cdef int nao = shells.shape[0]
     cdef int naux = aux_shells.shape[0]
@@ -4316,6 +4375,7 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
     cdef int64_t primitive_candidates = 0
     cdef int64_t primitive_skips = 0
     cdef int64_t shell_task_skips = 0
+    cdef bint folded_mode = direct_bins is not None or mirror_bins is not None
     cdef double value
     cdef size_t direct_vrr_table_cap = (
         <size_t>(OS_VRR_PAIR_MAX_L + 1) * <size_t>(OS_VRR_PAIR_MAX_L + 1)
@@ -4325,6 +4385,8 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
     )
     cdef cnp.ndarray[double, ndim=4] out_real
     cdef cnp.ndarray[double, ndim=4] out_imag
+    cdef cnp.ndarray[int64_t, ndim=1] direct_bins_array
+    cdef cnp.ndarray[int64_t, ndim=1] mirror_bins_array
     cdef int64_t[:, ::1] shells_v = shells
     cdef double[:, ::1] left_origins_v = left_origins
     cdef double[:, ::1] right_origins_v = right_origins
@@ -4349,6 +4411,8 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
     cdef uint8_t[::1] mirror_flags_v = mirror_flags
     cdef double[:, :, :, ::1] out_real_v
     cdef double[:, :, :, ::1] out_imag_v
+    cdef int64_t[::1] direct_bins_v
+    cdef int64_t[::1] mirror_bins_v
 
     if eta < 0.0:
         raise ValueError("eta must be non-negative.")
@@ -4362,14 +4426,34 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
         raise ValueError("pair_mask must have shape (nao, nao).")
     if aux_pair_mask.shape[0] != naux or aux_pair_mask.shape[1] != nao or aux_pair_mask.shape[2] != nao:
         raise ValueError("aux_pair_mask must have shape (naux, nao, nao).")
-    if phase_real.shape[0] != ntask or phase_imag.shape[0] != ntask or phase_imag.shape[1] != nbloch:
-        raise ValueError("phase arrays must have shape (ntask, nbloch).")
-    if mirror_phase_real.shape[0] != ntask or mirror_phase_real.shape[1] != nbloch:
-        raise ValueError("mirror phase arrays must have shape (ntask, nbloch).")
-    if mirror_phase_imag.shape[0] != ntask or mirror_phase_imag.shape[1] != nbloch:
-        raise ValueError("mirror phase arrays must have shape (ntask, nbloch).")
     if mirror_flags.shape[0] != ntask:
         raise ValueError("mirror_flags must have shape (ntask,).")
+    if aux_shell_end < 0:
+        aux_shell_end = naux_shell
+    if (
+        aux_shell_begin < 0
+        or aux_shell_begin > aux_shell_end
+        or aux_shell_end > naux_shell
+    ):
+        raise ValueError("Invalid auxiliary-shell range.")
+    if folded_mode:
+        if direct_bins is None or mirror_bins is None:
+            raise ValueError("direct_bins and mirror_bins must be provided together.")
+        direct_bins_array = np.ascontiguousarray(direct_bins, dtype=np.int64)
+        mirror_bins_array = np.ascontiguousarray(mirror_bins, dtype=np.int64)
+        if direct_bins_array.shape[0] != ntask or mirror_bins_array.shape[0] != ntask:
+            raise ValueError("folded bin arrays must have shape (ntask,).")
+    else:
+        if phase_real.shape[0] != ntask or phase_imag.shape[0] != ntask or phase_imag.shape[1] != nbloch:
+            raise ValueError("phase arrays must have shape (ntask, nbloch).")
+        if mirror_phase_real.shape[0] != ntask or mirror_phase_real.shape[1] != nbloch:
+            raise ValueError("mirror phase arrays must have shape (ntask, nbloch).")
+        if mirror_phase_imag.shape[0] != ntask or mirror_phase_imag.shape[1] != nbloch:
+            raise ValueError("mirror phase arrays must have shape (ntask, nbloch).")
+        direct_bins_array = np.zeros(ntask, dtype=np.int64)
+        mirror_bins_array = np.zeros(ntask, dtype=np.int64)
+    direct_bins_v = direct_bins_array
+    mirror_bins_v = mirror_bins_array
 
     pair_storage_size = <size_t>nshell * <size_t>nshell * <size_t>pair_cap
     shell_pair_n = <int*>malloc(nshell * nshell * sizeof(int))
@@ -4395,8 +4479,66 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
         free(active_tasks)
         raise MemoryError("Could not allocate grouped short-range scratch arrays.")
 
-    out_real = np.zeros((naux, nao, nao, nbloch), dtype=np.float64)
-    out_imag = np.zeros((naux, nao, nao, nbloch), dtype=np.float64)
+    if folded_mode:
+        if output_real is None:
+            raise ValueError("output_real is required for folded accumulation.")
+        if not isinstance(output_real, np.ndarray):
+            raise TypeError("output_real must be a NumPy array.")
+        if output_real.dtype != np.float64 or not output_real.flags.c_contiguous:
+            raise TypeError("output_real must be a C-contiguous float64 array.")
+        if (
+            output_real.shape[1] != nao
+            or output_real.shape[2] != nao
+        ):
+            raise ValueError("output_real must have shape (naux_batch, nao, nao, nbins).")
+        if output_aux_offset < 0 or output_aux_offset > naux:
+            raise ValueError("output_aux_offset is outside the auxiliary basis.")
+        if aux_shell_begin < aux_shell_end and (
+            aux_shell_starts_v[aux_shell_begin] < output_aux_offset
+            or aux_shell_stops_v[aux_shell_end - 1]
+            > output_aux_offset + output_real.shape[0]
+        ):
+            raise ValueError("The auxiliary-shell range is outside output_real.")
+        nbloch = output_real.shape[3]
+        if (
+            np.min(direct_bins_array, initial=0) < 0
+            or np.max(direct_bins_array, initial=-1) >= nbloch
+            or np.min(mirror_bins_array, initial=0) < 0
+            or np.max(mirror_bins_array, initial=-1) >= nbloch
+        ):
+            raise ValueError("folded bin index is outside the output buffer.")
+        out_real = output_real
+        out_imag = np.zeros((1, 1, 1, 1), dtype=np.float64)
+    elif (output_real is None) != (output_imag is None):
+        raise ValueError("output_real and output_imag must be provided together.")
+    elif output_real is None:
+        out_real = np.zeros((naux, nao, nao, nbloch), dtype=np.float64)
+        out_imag = np.zeros((naux, nao, nao, nbloch), dtype=np.float64)
+    else:
+        if not isinstance(output_real, np.ndarray) or not isinstance(
+            output_imag,
+            np.ndarray,
+        ):
+            raise TypeError("output buffers must be NumPy arrays.")
+        if output_real.dtype != np.float64 or output_imag.dtype != np.float64:
+            raise TypeError("output buffers must have dtype float64.")
+        if (
+            output_real.shape[0] != naux
+            or output_real.shape[1] != nao
+            or output_real.shape[2] != nao
+            or output_real.shape[3] != nbloch
+            or output_imag.shape[0] != naux
+            or output_imag.shape[1] != nao
+            or output_imag.shape[2] != nao
+            or output_imag.shape[3] != nbloch
+        ):
+            raise ValueError(
+                "output buffers must have shape (naux, nao, nao, nbloch)."
+            )
+        if not output_real.flags.c_contiguous or not output_imag.flags.c_contiguous:
+            raise ValueError("output buffers must be C-contiguous.")
+        out_real = output_real
+        out_imag = output_imag
     out_real_v = out_real
     out_imag_v = out_imag
 
@@ -4427,7 +4569,7 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
                 else:
                     shell_pair_n[pq_pair_idx] = 0
 
-        for ash in range(naux_shell):
+        for ash in range(aux_shell_begin, aux_shell_end):
             a0 = <int>aux_shell_starts_v[ash]
             a1 = <int>aux_shell_stops_v[ash]
             for ish in range(nshell):
@@ -4473,6 +4615,10 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
                         mirror_flags_v,
                         out_real_v,
                         out_imag_v,
+                        direct_bins_v,
+                        mirror_bins_v,
+                        folded_mode,
+                        output_aux_offset,
                         p0,
                         p1,
                         q0,
@@ -4522,16 +4668,46 @@ cpdef compute_short_range_three_center_bloch_shell_blocked_group_masked(
                                         )
                                         if value == 0.0:
                                             continue
-                                        if mirror_flags_v[task] != 0:
-                                            for b in range(nbloch):
-                                                out_real_v[a, p, q, b] += phase_real_v[task, b] * value
-                                                out_imag_v[a, p, q, b] += phase_imag_v[task, b] * value
-                                                out_real_v[a, q, p, b] += mirror_phase_real_v[task, b] * value
-                                                out_imag_v[a, q, p, b] += mirror_phase_imag_v[task, b] * value
+                                        if folded_mode:
+                                            out_real_v[
+                                                a - output_aux_offset,
+                                                p,
+                                                q,
+                                                direct_bins_v[task],
+                                            ] += value
+                                            if mirror_flags_v[task] != 0:
+                                                out_real_v[
+                                                    a - output_aux_offset,
+                                                    q,
+                                                    p,
+                                                    mirror_bins_v[task],
+                                                ] += value
+                                        elif mirror_flags_v[task] != 0:
+                                            phase_axpy_ri(
+                                                nbloch,
+                                                value,
+                                                &phase_real_v[task, 0],
+                                                &phase_imag_v[task, 0],
+                                                &out_real_v[a, p, q, 0],
+                                                &out_imag_v[a, p, q, 0],
+                                            )
+                                            phase_axpy_ri(
+                                                nbloch,
+                                                value,
+                                                &mirror_phase_real_v[task, 0],
+                                                &mirror_phase_imag_v[task, 0],
+                                                &out_real_v[a, q, p, 0],
+                                                &out_imag_v[a, q, p, 0],
+                                            )
                                         else:
-                                            for b in range(nbloch):
-                                                out_real_v[a, p, q, b] += phase_real_v[task, b] * value
-                                                out_imag_v[a, p, q, b] += phase_imag_v[task, b] * value
+                                            phase_axpy_ri(
+                                                nbloch,
+                                                value,
+                                                &phase_real_v[task, 0],
+                                                &phase_imag_v[task, 0],
+                                                &out_real_v[a, p, q, 0],
+                                                &out_imag_v[a, p, q, 0],
+                                            )
 
     free(shell_pair_n)
     free(shell_pair_a); free(shell_pair_b); free(shell_pair_p)

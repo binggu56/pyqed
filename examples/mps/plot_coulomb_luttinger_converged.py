@@ -175,7 +175,7 @@ def main():
         )
     axes[0].format(
         xlabel=r"momentum $ka$",
-        ylabel=r"$K(k)$",
+        ylabel=r"$K_{\mathrm{LL}}(k)$",
         xlim=(1.0e-8, 10.0),
         ylim=(0.0, 1.04),
         title="Converged momentum dependence",

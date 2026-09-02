@@ -16,6 +16,7 @@ __all__ = [
     "KRHF",
     "KRHFForceCalculator",
     "KRHFHessian",
+    "PeriodicPhononMode",
     "Phonon",
     "RHF",
     "interpolate_q_path",
@@ -26,6 +27,7 @@ def __getattr__(name):
     if name in {
         "FiniteDisplacementPhonon",
         "KRHFForceCalculator",
+        "PeriodicPhononMode",
         "Phonon",
         "interpolate_q_path",
     }:

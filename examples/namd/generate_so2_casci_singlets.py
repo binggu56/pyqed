@@ -82,43 +82,9 @@ def geometry(r1, r2, theta):
 def ao_diagonal_symmetry_operator(molecule, signs, *, tolerance=1.0e-10):
     """Return an AO representation for a diagonal Cartesian point operation."""
 
-    def same_array(left, right):
-        left = np.asarray(left, dtype=float)
-        right = np.asarray(right, dtype=float)
-        return left.shape == right.shape and np.allclose(
-            left, right, atol=tolerance, rtol=0.0
-        )
+    from pyqed.ldr.so2 import _ao_diagonal_operator
 
-    basis = list(molecule._bas)
-    if len(basis) != int(molecule.nao):
-        raise NotImplementedError(
-            "SO2 point-group lifting currently requires native Cartesian AOs"
-        )
-    signs = np.asarray(signs, dtype=float)
-    if signs.shape != (3,) or not np.all(np.isin(signs, (-1.0, 1.0))):
-        raise ValueError("Cartesian symmetry signs must contain three values +/-1")
-    operator = np.zeros((len(basis), len(basis)))
-    for source, basis_fn in enumerate(basis):
-        shell = tuple(int(value) for value in basis_fn.shell)
-        target_origin = signs * np.asarray(basis_fn.origin, dtype=float)
-        exponents = np.asarray(basis_fn.exps, dtype=float)
-        coefficients = np.asarray(basis_fn.coefs, dtype=float)
-        matches = [
-            target
-            for target, candidate in enumerate(basis)
-            if tuple(int(value) for value in candidate.shell) == shell
-            and np.allclose(candidate.origin, target_origin, atol=tolerance, rtol=0.0)
-            and same_array(candidate.exps, exponents)
-            and same_array(candidate.coefs, coefficients)
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"could not uniquely map AO {source} under the point operation"
-            )
-        operator[matches[0], source] = float(
-            np.prod(signs ** np.asarray(shell))
-        )
-    return operator
+    return _ao_diagonal_operator(molecule, signs, tolerance=tolerance)
 
 
 def ao_c2x_exchange_operator(molecule, *, tolerance=1.0e-10):

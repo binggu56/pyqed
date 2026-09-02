@@ -1130,6 +1130,66 @@ def test_soc_state_interaction_builds_hermitian_matrix():
     assert result.eigenvectors.shape == (2, 2)
 
 
+def test_spatial_soc_spin_orbital_order_matches_kronecker_reference():
+    """The spin-first Kronecker product is grouped spin-orbital ordering."""
+    from pyqed.qchem.soc import (
+        reorder_spin_orbital_matrix,
+        spatial_soc_to_spin_orbital,
+    )
+
+    rng = np.random.default_rng(14)
+    spatial = rng.normal(size=(3, 4, 4))
+    spatial = spatial - spatial.swapaxes(-1, -2)
+    pauli = np.asarray(
+        (
+            ((0.0, 1.0), (1.0, 0.0)),
+            ((0.0, -1.0j), (1.0j, 0.0)),
+            ((1.0, 0.0), (0.0, -1.0)),
+        ),
+        dtype=complex,
+    )
+    grouped = sum(
+        np.kron(1.0j * pauli[component], spatial[component])
+        for component in range(3)
+    )
+    interleaved = reorder_spin_orbital_matrix(
+        grouped, source="grouped", target="interleaved"
+    )
+
+    np.testing.assert_allclose(
+        spatial_soc_to_spin_orbital(spatial, order="grouped"), grouped
+    )
+    np.testing.assert_allclose(
+        spatial_soc_to_spin_orbital(spatial, order="interleaved"), interleaved
+    )
+    np.testing.assert_allclose(grouped, grouped.conj().T)
+
+
+def test_spin_pure_singlets_have_zero_soc_matrix_element():
+    """A rank-one spin operator cannot couple two spin-pure singlets."""
+    from pyqed.qchem.soc import spatial_soc_to_spin_orbital
+
+    mol = Molecule(atom="H 0 0 0; H 0 0 0.74", unit="angstrom", basis="sto-3g")
+    mol.build()
+    mc = CASCI(
+        mol.RHF().run(), ncas=2, nelecas=2, ms2=0, multiplicity=1
+    ).run(nstates=2, method="direct_ci")
+    spatial = np.asarray(
+        (
+            ((0.0, 0.13), (-0.13, 0.0)),
+            ((0.0, -0.21), (0.21, 0.0)),
+            ((0.0, 0.08), (-0.08, 0.0)),
+        )
+    )
+    hso = spatial_soc_to_spin_orbital(spatial, order="grouped")
+
+    np.testing.assert_allclose(mc.spin_square(0), 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(mc.spin_square(1), 0.0, atol=1.0e-10)
+    np.testing.assert_allclose(
+        mc.soc_matrix_element(0, ket_id=1, hso=hso), 0.0, atol=1.0e-12
+    )
+
+
 @pytest.mark.parametrize(
     ("atom", "basis"),
     [

@@ -65,7 +65,7 @@ def test_qchem_letta_constructs_su2_state_from_mean_field():
     assert state.ncore == 0
     assert state.D == 2
     assert state.is_native_su2
-    state.run(nsweeps=1, algorithm="one_site", tol=0.0)
+    state.run(nsweeps=1, tol=0.0)
     assert np.isfinite(state.energy)
     state.close()
 
@@ -103,6 +103,70 @@ def test_su2_letta_accepts_nearest_neighbor_graph_alias():
     assert state.graph == ((0, 1), (1, 2), (2, 3))
     assert state.frontier_states == (1, 3, 3, 3, 1)
     state.close()
+
+
+def test_qchem_direct_complementary_energy_matches_explicit_mpo_reference():
+    h1e = np.array(
+        [
+            [-1.0, -0.2, 0.0, 0.0],
+            [-0.2, -0.4, -0.1, 0.0],
+            [0.0, -0.1, 0.2, -0.15],
+            [0.0, 0.0, -0.15, 0.7],
+        ]
+    )
+    rng = np.random.default_rng(19)
+    cholesky = rng.normal(scale=0.15, size=(4, 4, 5))
+    cholesky = 0.5 * (cholesky + cholesky.swapaxes(0, 1))
+    eri = np.einsum("pqL,rsL->pqrs", cholesky, cholesky)
+    direct = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=11,
+        hamiltonian_representation="complementary",
+    )
+    explicit = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=11,
+        hamiltonian_representation="mpo",
+    )
+
+    assert direct.hamiltonian_representation == "complementary"
+    assert all(not factor.reduced_terms for factor in direct.mpo)
+    assert all(factor.reduced_terms for factor in explicit.mpo)
+    np.testing.assert_allclose(direct.expectation(), explicit.expectation(), atol=2e-12)
+    direct.run(
+        nsweeps=1,
+        algorithm="projected",
+        tol=0.0,
+        max_local_parameters=512,
+        max_matrix_free_parameters=512,
+    )
+    assert all(
+        update["solver_info"]["environment_reused"]
+        for update in direct.history[-1]["updates"]
+    )
+    explicit.tensors = [
+        {key: np.array(value, copy=True) for key, value in tensor.items()}
+        for tensor in direct.tensors
+    ]
+    explicit._materialized_site_cache.clear()
+    np.testing.assert_allclose(
+        direct.expectation(),
+        explicit.expectation(),
+        rtol=2e-11,
+        atol=2e-11,
+    )
+    direct.close()
+    explicit.close()
 
 
 def _dense_vector_from_reduced_spatial_mps(sites):
@@ -197,7 +261,11 @@ def test_su2_letta_neutral_ties_embed_reduced_mps_exactly():
 
     identity = _identity_mpo_factors_for_sites_and_mpo(base, state.mpo)
     base_energy = (
-        contract_chain_expectation(base, state.mpo)
+        contract_chain_expectation(
+            base,
+            state.mpo,
+            moving_environment=state._su2_moving_environment,
+        )
         / contract_chain_expectation(base, identity)
     )
 
@@ -263,6 +331,7 @@ def test_su2_letta_conditional_moving_environment_matches_rebuild_path():
         graph=[(0, 1), (1, 2), (2, 3)],
         D=1,
         seed=9,
+        hamiltonian_representation="mpo",
     )
     rebuilt = copy.deepcopy(initial)
     moving = initial
@@ -324,6 +393,7 @@ def test_su2_letta_cpp_boundaries_match_recursive_reduced_blocks():
         graph=[(0, 1), (1, 2), (2, 3)],
         D=1,
         seed=9,
+        hamiltonian_representation="complementary",
     )
     state.canonicalize_conditional_center(0)
     sites = state.materialize()
@@ -358,17 +428,8 @@ def test_su2_letta_cpp_boundaries_match_recursive_reduced_blocks():
                     actual_blocks[key], expected_block, atol=3.0e-13
                 )
 
-    cache_keys = tuple(
-        tuple(core._environment_reduced_block_cache)
-        for core in state.mpo
-    )
-    assert any(key[0] == "left" for keys in cache_keys for key in keys)
-    assert any(key[0] == "right" for keys in cache_keys for key in keys)
-    BlockSparseEnvironmentChain.build(sites, state.mpo)
-    assert cache_keys == tuple(
-        tuple(core._environment_reduced_block_cache)
-        for core in state.mpo
-    )
+    assert state.hamiltonian_representation == "complementary"
+    assert all(not core.reduced_terms for core in state.mpo)
 
 
 def test_qchem_su2_letta_sweep_reaches_two_orbital_one_body_reference():
@@ -456,6 +517,7 @@ def test_default_wigner_eckart_sweep_matches_polarization_reference():
         graph=[(0, 1)],
         D=1,
         seed=2,
+        hamiltonian_representation="mpo",
     )
     automatic = copy.deepcopy(initial)
     wigner_eckart = copy.deepcopy(initial)
@@ -512,6 +574,7 @@ def test_wigner_eckart_local_transition_plan_and_grouped_routes_are_exact():
         graph=[(0, 1), (1, 2)],
         D=1,
         seed=2,
+        hamiltonian_representation="mpo",
     )
     sites = state.materialize()
     identity = _identity_mpo_factors_for_sites_and_mpo(sites, state.mpo)
@@ -602,6 +665,7 @@ def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():
         graph=[(0, 1)],
         D=1,
         seed=2,
+        hamiltonian_representation="mpo",
     )
     dense = copy.deepcopy(initial)
     matrix_free = copy.deepcopy(initial)
@@ -655,6 +719,7 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         D=2,
         seed=3,
         n_threads=2,
+        hamiltonian_representation="mpo",
     )
     before = state.expectation()
     monkeypatch.setenv("PYQED_VALIDATE_LETTA_PROJECTED_ROUTE", "1")
@@ -688,6 +753,17 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
     assert all(
         update["solver_info"]["projected_metric_backend"]
         == "connected_reduced_blocks"
+        for update in cycle["updates"]
+    )
+    assert all(
+        update["solver_info"]["embedding_representation"] == "block_scatter"
+        for update in cycle["updates"]
+    )
+    assert all(
+        update["solver_info"]["embedding_bytes"]
+        < 16
+        * update["solver_info"]["frontier_dimension"]
+        * update["parameters"]
         for update in cycle["updates"]
     )
     fused = [
@@ -775,6 +851,7 @@ def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
         graph=[(0, 1), (1, 2), (2, 3)],
         D=2,
         seed=3,
+        hamiltonian_representation="mpo",
     )
     sites = state.materialize()
     reference = state._wigner_eckart_matrix_free_problem(1, sites=sites)
@@ -806,6 +883,51 @@ def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
     )
     assert frontier[-1]["local_action_backend"] == "frontier_projected_pair"
     assert frontier[-1]["backend"] == "compiled_contextual_channel_resolved"
+    state.close()
+
+
+def test_projected_coordinate_cache_reuses_and_delta_updates_embeddings():
+    norb = 4
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    eri = np.zeros((norb, norb, norb, norb))
+    indices = np.arange(norb)
+    eri[indices, indices, indices, indices] = 1.0
+    state = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=3,
+    )
+    sites = state.materialize()
+    _merged, layout = state._pair_coordinate_space(1, sites)
+    _current, initial = state._local_pair_embedding(1, sites, 1, layout)
+    _current, reused = state._local_pair_embedding(1, sites, 1, layout)
+    assert reused is initial
+    assert state._embedding_numeric_cache_hits == 1
+
+    fixed = state._pack_site(2)
+    changed = np.array(fixed, copy=True)
+    changed[np.flatnonzero(np.abs(changed) > 0.0)[0]] *= 1.01
+    state._set_site_vector(2, changed)
+    changed_sites = state.materialize()
+    _merged, changed_layout = state._pair_coordinate_space(1, changed_sites)
+    _current, incremental = state._local_pair_embedding(
+        1, changed_sites, 1, changed_layout
+    )
+    incremental = np.array(incremental, copy=True)
+    assert state._embedding_incremental_updates == 1
+    assert state._pair_coordinate_cache_hits >= 1
+
+    state._embedding_numeric_cache.clear()
+    _current, rebuilt = state._local_pair_embedding(
+        1, changed_sites, 1, changed_layout
+    )
+    np.testing.assert_allclose(incremental, rebuilt, atol=1.0e-13)
     state.close()
 
 
@@ -853,6 +975,7 @@ def test_native_two_site_su2_letta_accepts_an_empty_triplet_operator():
         graph=[(0, 1)],
         D=1,
         seed=3,
+        hamiltonian_representation="mpo",
     )
 
     state.run(nsweeps=1, algorithm="two_site", tol=0.0)
@@ -877,6 +1000,7 @@ def test_metric_retraction_converges_despite_null_coefficient_directions():
         graph=[(0, 1), (1, 2), (2, 3)],
         D=1,
         seed=7,
+        hamiltonian_representation="mpo",
     )
 
     state.run(
@@ -960,7 +1084,7 @@ def test_su2_letta_checkpoint_resume_preserves_state_and_diagnostics(tmp_path):
     checkpoint = tmp_path / "su2-letta.chk"
     state.run(
         nsweeps=1,
-        algorithm="two_site",
+        algorithm="projected",
         tol=0.0,
         checkpoint=checkpoint,
     )
@@ -974,7 +1098,7 @@ def test_su2_letta_checkpoint_resume_preserves_state_and_diagnostics(tmp_path):
 
     restored.run(
         nsweeps=1,
-        algorithm="two_site",
+        algorithm="projected",
         tol=1.0e-12,
         reset_history=False,
     )
@@ -1102,6 +1226,7 @@ def test_wigner_eckart_sweep_matches_three_site_polarization_reference():
         graph=[(0, 1), (1, 2)],
         D=1,
         seed=8,
+        hamiltonian_representation="mpo",
     )
     reduced = copy.deepcopy(initial)
     reference = copy.deepcopy(initial)
@@ -1137,6 +1262,7 @@ def test_reduced_block_actions_match_component_expanded_reference():
         graph=[(0, 1), (1, 2)],
         D=1,
         seed=8,
+        hamiltonian_representation="mpo",
     )
     sites = state.materialize()
     component_mpo = tuple(expand_rank_coupled_mpo(core) for core in state.mpo)

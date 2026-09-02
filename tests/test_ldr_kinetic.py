@@ -57,6 +57,34 @@ def test_linked_sparse_matrix_and_operator_agree():
     )
 
 
+def test_periodic_linked_fourier_kinetic_is_gauge_covariant():
+    size = 5
+    nuclear = ExponentialDVR(npts=size, L=2.0 * np.pi).t()
+    phases = np.exp(1j * np.asarray((0.1, -0.2, 0.35, 0.7, -0.4)))
+    links = {
+        (0, (index,)): np.exp(0.13j * (index + 1))
+        for index in range(size)
+    }
+    transformed = {
+        (0, (index,)): (
+            phases[index].conjugate()
+            * links[(0, (index,))]
+            * phases[(index + 1) % size]
+        )
+        for index in range(size)
+    }
+    reference = kinetic.matrix(
+        nuclear, (size,), 1, links=links, periodic_axes=(0,)
+    )
+    actual = kinetic.matrix(
+        nuclear, (size,), 1, links=transformed, periodic_axes=(0,)
+    )
+    gauge = np.diag(phases)
+
+    np.testing.assert_allclose(actual, gauge.conj().T @ reference @ gauge)
+    np.testing.assert_allclose(actual, actual.conj().T)
+
+
 def test_dense_overlap_and_link_representations_give_same_action():
     nuclear = np.array(
         [[0.6, -0.2, 0.1], [-0.2, 0.8, -0.15], [0.1, -0.15, 0.9]],

@@ -1,13 +1,21 @@
 import numpy as np
 import pickle
+import importlib.util
+import pytest
 
 from pyqed.ldr import (
     AbInitioFit,
+    Coord,
     ElectronicDatabase,
+    FiniteGroupSamplingSymmetry,
     PhenolCASSCFOverlap,
     PhenolReflectionSymmetry,
     PhenolSACASSCFProvider,
     SamplingSymmetryImage,
+)
+from pyqed.ldr.sampling_symmetry import (
+    detect_symmetry,
+    infer_state_repr,
 )
 from pyqed.models.phenol_coordinates import (
     PHENOL_SPECIES,
@@ -18,6 +26,386 @@ from pyqed.models.phenol_coordinates import (
 def toy_geometry(coordinates):
     radius, torsion = coordinates
     return np.asarray([[radius, np.cos(torsion), np.sin(torsion)]])
+
+
+class _ToyMolecule:
+    natom = 2
+    charge = 0
+    spin = 0
+    basis = "toy"
+
+    def __init__(self, distance=1.4):
+        self.distance = float(distance)
+
+    def atom_symbol(self, _index):
+        return "H"
+
+    def atom_charges(self):
+        return np.ones(2, dtype=int)
+
+    def atom_coords(self):
+        return np.asarray(((0.0, 0.0, 0.0), (self.distance, 0.0, 0.0)))
+
+    def set_geom(self, geometry):
+        geometry = np.asarray(geometry, dtype=float)
+        self.distance = float(np.linalg.norm(geometry[1] - geometry[0]))
+
+    def build(self):
+        return self
+
+
+class _ToyFrame:
+    def __init__(self, distance):
+        angle = 0.15 * float(distance)
+        self.vectors = np.asarray(((np.cos(angle),), (np.sin(angle),)))
+
+    def overlap(self, other):
+        return self.vectors.T @ other.vectors
+
+
+class _ToyResult:
+    def __init__(self, distance):
+        self.e_tot = np.asarray((0.08 * (distance - 1.4) ** 2,))
+        self._frame = _ToyFrame(distance)
+
+    def frame(self):
+        return self._frame
+
+
+class _ToyScanner:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def __call__(self, molecule):
+        self.calls.append(molecule.distance)
+        return _ToyResult(molecule.distance)
+
+
+class _ToyElectronic(_ToyResult):
+    nstates = 1
+
+    def __init__(self):
+        super().__init__(1.4)
+        self.mol = _ToyMolecule()
+        self.calls = []
+
+    def as_scanner(self, nstates=None):
+        assert nstates == 1
+        return _ToyScanner(self.calls)
+
+
+def s3_coordinate_group():
+    angle = 2.0 * np.pi / 3.0
+    rotation = np.eye(3)
+    rotation[1:, 1:] = (
+        (np.cos(angle), -np.sin(angle)),
+        (np.sin(angle), np.cos(angle)),
+    )
+    reflection = np.diag((1.0, 1.0, -1.0))
+    return np.asarray(
+        [np.linalg.matrix_power(rotation, power) for power in range(3)]
+        + [
+            reflection @ np.linalg.matrix_power(rotation, power)
+            for power in range(3)
+        ]
+    )
+
+
+def test_finite_group_sampling_keeps_one_representative_per_s3_orbit():
+    group = s3_coordinate_group()
+    symmetry = FiniteGroupSamplingSymmetry(
+        group,
+        name="H3+-S3",
+        operations=("identity", "C3", "C3^2", "sigma", "sigma-C3", "sigma-C3^2"),
+    )
+    coordinate = np.asarray((0.1, 0.03, -0.04))
+    orbit = np.einsum("gij,j->gi", group, coordinate)
+    representatives, inverse, operations = symmetry.canonicalize_many(
+        orbit, unique=True
+    )
+    assert representatives.shape == (1, 3)
+    np.testing.assert_array_equal(inverse, np.zeros(6, dtype=int))
+    assert len(operations) == 6
+    assert np.arctan2(representatives[0, 2], representatives[0, 1]) >= 0.0
+    assert np.arctan2(representatives[0, 2], representatives[0, 1]) <= np.pi / 3.0
+    assert symmetry.representative_count(384) == 64
+
+    grid = tuple(np.linspace(-1.0, 1.0, 3) for _ in range(3))
+    with AbInitioFit(grid, 1, lambda index: index, symmetry=symmetry) as fit:
+        assert fit.group == "H3+-S3"
+        np.testing.assert_allclose(fit.coord_repr, group)
+
+
+def test_loaded_fit_restores_finite_group_operations(tmp_path):
+    group = s3_coordinate_group()
+    symmetry = FiniteGroupSamplingSymmetry(
+        group,
+        name="H3+-S3",
+        operations=("identity", "C3", "C3^2", "sigma", "sigma-C3", "sigma-C3^2"),
+    )
+    grid = tuple(np.linspace(-0.2, 0.2, 3) for _ in range(3))
+
+    def builder(index):
+        coordinates = np.asarray([axis[value] for axis, value in zip(grid, index)])
+        return np.ones((1, 1)), np.asarray([coordinates @ coordinates])
+
+    output = tmp_path / "fit"
+    with AbInitioFit(
+        grid,
+        1,
+        builder,
+        frame=lambda record: record[0],
+        energies=lambda record: record[1],
+        overlap=lambda left, right: left.T @ right,
+        symmetry=symmetry,
+    ) as fit:
+        fit.run(rank=2, degrees=2, sweeps=2, validation=8, seed=3)
+        fit.save(output)
+
+    restored = AbInitioFit.load(output)
+    assert restored.group == "H3+-S3"
+    assert restored._symmetry is not None
+    assert len(restored.orbit((0.1, 0.03, -0.04))) == 6
+    assert restored.reduced_size(13) == 3
+
+
+def test_detects_s3_from_molecule_and_coordinate_chart():
+    root3 = np.sqrt(3.0)
+    triangle = np.asarray(
+        ((-0.5, -0.5 / root3, 0.0),
+         (0.5, -0.5 / root3, 0.0),
+         (0.0, 1.0 / root3, 0.0))
+    )
+
+    def geometry(q):
+        breathing, x, y = np.asarray(q, dtype=float)
+        strain = np.asarray(((x, y), (y, -x)))
+        value = np.array(triangle, copy=True)
+        value[:, :2] = triangle[:, :2] @ (
+            (1.5 + breathing) * np.eye(2) + strain
+        )
+        return value.astype(np.float32)
+
+    class Molecule:
+        def atom_coords(self):
+            return geometry((0.0, 0.0, 0.0))
+
+        def atom_charges(self):
+            return np.ones(3, dtype=int)
+
+    coord = Coord(
+        to_cartesian=geometry,
+        bounds=((-0.4, 0.4), (-0.5, 0.5), (-0.5, 0.5)),
+    )
+    symmetry, validation = detect_symmetry(Molecule(), coord)
+
+    assert validation["detected"]
+    assert validation["group"] == "S3"
+    assert validation["order"] == 6
+    assert symmetry.order == 6
+    np.testing.assert_allclose(
+        symmetry.coordinate_representations[:, 0, 0], 1.0, atol=1.0e-8
+    )
+
+
+def test_native_fit_owns_automatic_symmetry(tmp_path):
+    root3 = np.sqrt(3.0)
+    triangle = np.asarray(
+        ((-0.5, -0.5 / root3, 0.0),
+         (0.5, -0.5 / root3, 0.0),
+         (0.0, 1.0 / root3, 0.0))
+    )
+
+    def geometry(q):
+        breathing, x, y = np.asarray(q, dtype=float)
+        strain = np.asarray(((x, y), (y, -x)))
+        value = np.array(triangle, copy=True)
+        value[:, :2] = triangle[:, :2] @ (
+            (1.5 + breathing) * np.eye(2) + strain
+        )
+        return value
+
+    class Molecule:
+        natom = 3
+        charge = 1
+        spin = 0
+
+        def atom_coords(self):
+            return geometry((0.0, 0.0, 0.0))
+
+        def atom_charges(self):
+            return np.ones(3, dtype=int)
+
+        def atom_symbol(self, _index):
+            return "H"
+
+    class Electronic:
+        e_tot = np.asarray((0.0,))
+        nstates = 1
+        mol = Molecule()
+
+    coord = Coord(
+        to_cartesian=geometry,
+        bounds=((-0.4, 0.4), (-0.5, 0.5), (-0.5, 0.5)),
+    )
+    with AbInitioFit(
+        Electronic(),
+        coord=coord,
+        states=(0,),
+        database=tmp_path / "electronic.sqlite",
+    ) as fit:
+        assert fit.group == "S3"
+        assert fit.coord_repr.shape == (6, 3, 3)
+        assert fit.coord_irreps == ("A1", "E")
+        assert fit.coord_blocks == ((0,), (1, 2))
+        finite_group = fit.mace_group(feature_rank=2)
+        assert fit.state_repr.shape == (6, 1, 1)
+        assert finite_group["ambient_representations"].shape == (6, 2, 2)
+
+
+@pytest.mark.skipif(
+    importlib.util.find_spec("mace") is None, reason="mace-torch is not installed"
+)
+def test_native_build_uses_adaptive_mace_and_distills_to_ftt(tmp_path):
+    coord = Coord(
+        to_cartesian=lambda q: np.asarray(
+            ((0.0, 0.0, 0.0), (float(q[0]), 0.0, 0.0))
+        ),
+        bounds=((1.1, 1.7),),
+        periodic_axes=(0,),
+    )
+    fit = AbInitioFit(
+        _ToyElectronic(),
+        coord=coord,
+        states=(0,),
+        symmetry=False,
+        database=tmp_path / "electronic.sqlite",
+        fit_options={
+            "model": "mace",
+            "initial": 6,
+            "batch": 2,
+            "maximum": 6,
+            "calibration": 4,
+            "validation": 4,
+            "ensemble": 2,
+            "epochs": 2,
+            "sync_steps": 5,
+            "feature_rank": 2,
+            "hidden": (4,),
+            "encoder": {
+                "channels": 2,
+                "max_ell": 1,
+                "interactions": 1,
+                "correlation": 1,
+                "radial_basis": 2,
+                "radial_mlp": (4,),
+                "cutoff": 3.0,
+            },
+            "rank": 4,
+            "degrees": 2,
+            "hamiltonian_atol": 1.0,
+            "hamiltonian_rms": 1.0,
+            "link_rtol": 1.0,
+            "distill_rtol": 1.0,
+            "coverage": 0.0,
+        },
+    ).build()
+
+    assert fit.success
+    assert fit.model == "mace-ftt"
+    assert len(fit.ensemble) == 2
+    assert fit.energy.output_shape_ == (1, 1)
+    assert fit.feature.output_shape_ == (2, 1)
+    assert fit.mace.periodic_axes == (0,)
+    assert fit.acceptance["accepted"]
+    assert "selected_member" in fit.validation
+    assert "final" in fit.validation
+    saved = fit.save(tmp_path / "fit")
+    assert saved.paths["mace"].is_file()
+    restored = AbInitioFit.load(
+        tmp_path / "fit", geometry=coord.cartesian
+    )
+    assert restored.acceptance["accepted"]
+    assert restored.mace.success
+    assert restored.mace.periodic_axes == (0,)
+
+    repeated_electronic = _ToyElectronic()
+    repeated = AbInitioFit(
+        repeated_electronic,
+        coord=coord,
+        states=(0,),
+        symmetry=False,
+        database=tmp_path / "electronic.sqlite",
+    )
+    reusable = repeated._database_coordinates()
+    assert len(reusable) >= 2
+    with repeated:
+        repeated.continuous_fields(reusable[:2])
+    assert repeated_electronic.calls == []
+
+
+def test_infers_selected_state_representation_from_gauged_hamiltonians():
+    coordinate = s3_coordinate_group()
+    state = coordinate[:, 1:, 1:]
+    random = np.random.default_rng(17)
+    orbits = []
+    for _ in range(3):
+        value = random.normal(size=(2, 2))
+        value = value + value.T
+        orbits.append([operation @ value @ operation.T for operation in state])
+
+    inferred, validation = infer_state_repr(coordinate, np.asarray(orbits))
+
+    assert validation["maximum_covariance_error"] < 1.0e-12
+    assert validation["closure_error"] < 1.0e-12
+    for orbit in orbits:
+        for operation, expected in zip(inferred, orbit):
+            np.testing.assert_allclose(
+                operation @ orbit[0] @ operation.T, expected, atol=1.0e-12
+            )
+
+
+def test_joint_pair_reduction_preserves_raw_nonunitary_link():
+    group = s3_coordinate_group()
+    operations = ("identity", "C3", "C3^2", "sigma", "sigma-C3", "sigma-C3^2")
+    symmetry = FiniteGroupSamplingSymmetry(group, operations=operations)
+    coordinates = np.asarray(
+        ((0.1, 0.03, -0.04), (0.11, 0.035, -0.042))
+    )
+    reduced, pairs, pair_operations = symmetry.canonicalize_pairs(
+        coordinates, ((0, 1),)
+    )
+    np.testing.assert_array_equal(pairs, ((0, 1),))
+    np.testing.assert_allclose(
+        np.linalg.norm(reduced[1] - reduced[0]),
+        np.linalg.norm(coordinates[1] - coordinates[0]),
+    )
+
+    electronic = group[:, 1:, 1:]
+    raw_link = np.asarray(((0.91, 0.12), (-0.08, 0.73)))
+    transported = symmetry.transform_link(
+        raw_link, pair_operations[0], electronic
+    )
+    np.testing.assert_allclose(
+        np.linalg.svd(transported, compute_uv=False),
+        np.linalg.svd(raw_link, compute_uv=False),
+    )
+    assert not np.allclose(transported.conj().T @ transported, np.eye(2))
+
+
+def test_coordinate_only_group_never_aliases_untransformed_records():
+    symmetry = FiniteGroupSamplingSymmetry(s3_coordinate_group())
+    grid = tuple(np.asarray((-0.1, 0.0, 0.1)) for _ in range(3))
+    built = []
+
+    def builder(index):
+        built.append(index)
+        return index
+
+    with AbInitioFit(grid, 1, builder, symmetry=symmetry) as fit:
+        fit.frames.get_many(((1, 2, 0), (1, 0, 2)))
+        assert fit._record_symmetry is None
+        assert len(built) == 2
 
 
 def test_sampling_symmetry_builds_and_stores_only_one_representative(tmp_path):

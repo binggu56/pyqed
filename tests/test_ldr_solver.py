@@ -234,6 +234,29 @@ def test_podolsky_false_or_none_omits_pseudopotential():
         np.testing.assert_allclose(without.to_dense(), explicit_zero.to_dense())
 
 
+def test_podolsky_can_reject_an_ill_conditioned_chart():
+    grid = DVR([(-0.5, 0.5), (-0.5, 0.5)], [2, 2], mass=1.0)
+    coord = _coord(grid)
+    metric = np.broadcast_to(
+        np.diag((1.0, 1.0e-4)), (*grid.shape, 2, 2)
+    ).copy()
+
+    with np.testing.assert_raises_regex(
+        ValueError, "condition number.*restrict or replace"
+    ):
+        keo_tools.podolsky(
+            metric=metric,
+            pseudopotential=False,
+            max_metric_condition=100.0,
+        ).bind(coord, grid=grid)
+
+    accepted = keo_tools.podolsky(
+        metric=metric,
+        pseudopotential=False,
+    ).bind(coord, grid=grid)
+    assert accepted.metric.shape == (*grid.shape, 2, 2)
+
+
 def test_diabatic_and_local_ldr_hamiltonians_are_unitarily_equivalent():
     dvr, potential = _diabatic_model()
     solver = LDR(dvr, 2).set_diabatic(potential)

@@ -422,6 +422,12 @@ def test_cphf_relaxed_gamma_krhf_hessian_matches_gradient_difference():
     assert hessian.response.residual_norm < 1.0e-10
     assert hessian.first_order_density.shape == (2, 3, 2, 2)
     assert hessian.frequencies().shape == (6,)
+    mode = hessian.mode([0.0, 0.0, 0.0], branch=5)
+    assert mode.branch == 5
+    assert mode.eigenvector.shape == (2, 3)
+    np.testing.assert_allclose(np.linalg.norm(mode.eigenvector), 1.0)
+    with pytest.raises(ValueError, match="Gamma-point"):
+        hessian.mode([0.25, 0.0, 0.0], branch=5)
 
 
 def test_analytic_periodic_hessian_matches_derivative_difference_backend():
@@ -2384,8 +2390,31 @@ def test_native_3d_gdf_krhf_mesh_bands_and_off_mesh_guard(monkeypatch, tmp_path)
 
     mesh_bands = mf.band_structure(kpts=mf.kpts, exchange="mesh", reference="none")
     np.testing.assert_allclose(mesh_bands["mo_energy"], mf.mo_energy, atol=1.0e-10)
-    with pytest.raises(NotImplementedError, match="self-consistent k mesh"):
-        mf.band_structure(kpts=mf.kpts, exchange="finite_q")
+    direct_mesh_bands = mf.band_structure(
+        kpts=mf.kpts,
+        exchange="finite_q",
+        reference="none",
+    )
+    np.testing.assert_allclose(
+        direct_mesh_bands["mo_energy"],
+        mesh_bands["mo_energy"],
+        atol=1.0e-10,
+    )
+    scaled_path = np.asarray(
+        [[0.0, 0.0, 0.0], [0.125, 0.0, 0.0]],
+    )
+    direct_path = mf.band_structure(
+        scaled_kpts=scaled_path,
+        exchange="finite_q",
+        reference="none",
+    )
+    assert direct_path["mo_energy"].shape == (2, cell.nao)
+    assert np.all(np.isfinite(direct_path["mo_energy"]))
+    assert not direct_path["interpolated"]
+    assert mf.with_df.band_build_timings["off_mesh_kpoints"] == 2
+    assert mf.with_df.band_build_timings["qpoints"] >= 2
+    assert set(mf.with_df.cache_files) == prebuilt_files
+    assert not mf.with_df._disk_maps
     cache_files = mf.with_df.cache_files
     mf.with_df.close()
     assert all(not os.path.exists(path) for path in cache_files)
@@ -2940,6 +2969,87 @@ def test_optional_pyscf_3d_hydrogen_centered_krhf_reference_scale():
     recip = 2.0 * np.pi * np.linalg.inv(lattice).T
     ref_bands, _ = ref_mf.get_bands(scaled_path @ recip)
     assert np.max(np.abs(native_bands["mo_energy"] - ref_bands)) < 1e-5
+
+
+def test_optional_pyscf_gdf_band_kpoint_jk():
+    pyscf_pbc_scf = pytest.importorskip("pyscf.pbc.scf")
+
+    from pyqed.pbc.gw.integrals import (
+        _gdf_normalize_auxbasis_name,
+        _pyscf_builtin_basis_dict,
+        _pyscf_cell_from_reference,
+    )
+    from pyqed.pbc.gw.response import KPointTransitionSpace
+
+    cell = Cell(
+        atom="H 0 0 0; H 1.4 0 0",
+        a=np.diag([5.0, 5.0, 5.0]),
+        basis="sto-3g",
+        unit="bohr",
+        dimension=3,
+        spin=0,
+        integral_options={"eri_representation": "direct"},
+    ).build()
+    kpts = cell.make_kpts((2, 1, 1))
+    mf = cell.KRHF(
+        kpts=kpts,
+        eta=0.5,
+        real_cut=2,
+        pair_cut=2,
+        recip_cut=5,
+    ).density_fit(
+        auxbasis="def2-svp-jkfit",
+        precision=1.0e-10,
+        storage="memory",
+        stream_pairs=True,
+    )
+    mf.with_df.build(workers=2)
+    mf.run(max_cycle=40, conv_tol=1.0e-10, conv_tol_dm=1.0e-8)
+    assert mf.converged
+
+    reciprocal = 2.0 * np.pi * np.linalg.inv(cell.lattice_vectors).T
+    band_kpts = np.vstack(
+        (
+            np.asarray(
+                [[0.0, 0.0, 0.0], [0.125, 0.0, 0.0], [0.5, 0.0, 0.0]]
+            )
+            @ reciprocal,
+            kpts[0] + reciprocal[0],
+        )
+    )
+    actual_j, actual_k = mf.with_df.get_jk(
+        mf.dm,
+        kpts_band=band_kpts,
+        workers=2,
+    )
+
+    space = KPointTransitionSpace(mf, qpts="mesh")
+    reference_cell = _pyscf_cell_from_reference(space.reference)
+    reference_cell.precision = 1.0e-12
+    reference_cell.verbose = 0
+    reference_cell.build()
+    auxbasis = _pyscf_builtin_basis_dict(
+        _gdf_normalize_auxbasis_name("def2-svp-jkfit"),
+        cell._atom_symbols,
+    )
+    reference = pyscf_pbc_scf.KRHF(
+        reference_cell,
+        kpts=kpts,
+        exxdiv="ewald",
+    ).density_fit(auxbasis=auxbasis)
+    reference.with_df.linear_dep_threshold = 1.0e-12
+    reference.with_df.build(j_only=False, kpts_band=band_kpts)
+    expected_j, expected_k = reference.with_df.get_jk(
+        np.asarray(mf.dm),
+        kpts=kpts,
+        kpts_band=band_kpts,
+        exxdiv=None,
+    )
+
+    np.testing.assert_allclose(actual_j, expected_j, atol=2.0e-10)
+    np.testing.assert_allclose(actual_k, expected_k, atol=2.0e-10)
+    assert mf.with_df.band_build_timings["off_mesh_kpoints"] == 4
+    assert mf.with_df.band_build_timings["factor_bytes"] > 0
 
 
 def test_optional_pyscf_3d_hydrogen_one_body_reference():

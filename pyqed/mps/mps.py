@@ -68,6 +68,8 @@ class _TensorCoreList(list):
         super().__init__(self._coerce(value) for value in values)
 
     def _coerce(self, value):
+        if not hasattr(self, "_dirs") or not hasattr(self, "_names"):
+            return value
         return _as_shared_tensor(value, dirs=self._dirs, names=self._names)
 
     def __setitem__(self, key, value):

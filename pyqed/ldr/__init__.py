@@ -11,6 +11,7 @@ __all__ = [
     "ElectronicDatabase",
     "SamplingSymmetry",
     "SamplingSymmetryImage",
+    "FiniteGroupSamplingSymmetry",
     "PhenolReflectionSymmetry",
     "PhenolSACASSCFProvider",
     "PeriodicSSHHolsteinHalfFilledScan",
@@ -18,6 +19,15 @@ __all__ = [
     "PeriodicSSHHolsteinMomentumGQD",
     "PhenolCASSCFOverlap",
     "phenol_sa6_protocol",
+    "ETHYLENE_CI_BOUNDS",
+    "ETHYLENE_MECI_ANGSTROM",
+    "ETHYLENE_MECI_BOHR",
+    "ETHYLENE_CI_PYRAMID_SHIFT",
+    "ETHYLENE_SPECIES",
+    "EthyleneCIElectronicDriver",
+    "default_ethylene_database_path",
+    "ethylene_ci_geometry",
+    "ethylene_ci_protocol",
     "core",
     "solver",
     "CGLDR",
@@ -64,6 +74,7 @@ def __getattr__(name):
     if name in {
         "SamplingSymmetry",
         "SamplingSymmetryImage",
+        "FiniteGroupSamplingSymmetry",
         "PhenolReflectionSymmetry",
     }:
         from . import sampling_symmetry
@@ -79,6 +90,22 @@ def __getattr__(name):
         from . import phenol
 
         value = getattr(phenol, name)
+        globals()[name] = value
+        return value
+    if name in {
+        "ETHYLENE_CI_BOUNDS",
+        "ETHYLENE_MECI_ANGSTROM",
+        "ETHYLENE_MECI_BOHR",
+        "ETHYLENE_CI_PYRAMID_SHIFT",
+        "ETHYLENE_SPECIES",
+        "EthyleneCIElectronicDriver",
+        "default_ethylene_database_path",
+        "ethylene_ci_geometry",
+        "ethylene_ci_protocol",
+    }:
+        from . import ethylene
+
+        value = getattr(ethylene, name)
         globals()[name] = value
         return value
 

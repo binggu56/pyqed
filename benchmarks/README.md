@@ -41,6 +41,11 @@ benchmark, and record every setting.
 
 ## Reviewed validation records
 
+- [`ch2o-soc-pysoc`](ch2o-soc-pysoc/RESULT.md) compares the full multicenter
+  one-electron Breit--Pauli AO operator for PySOC's bundled formaldehyde case
+  with PySOC 2.3.0 / MolSOC 0.1.  The claim is operator-level only: PyQED
+  CASCI and PySOC LR-TDDFT/TD-DFTB state couplings are not treated as
+  equivalent.
 - [`h2-sto3g-rhf-pyscf`](h2-sto3g-rhf-pyscf/RESULT.md) compares one native
   PyQED RHF total energy with PySCF 2.12.1.  Its
   [`manifest.json`](h2-sto3g-rhf-pyscf/manifest.json) records the exact input,

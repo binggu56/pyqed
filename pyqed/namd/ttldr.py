@@ -257,7 +257,10 @@ def _nearest_links(solver):
     """Return flat nearest-neighbour graph links from either LDR storage form."""
     nx = _solver_shape(solver)
     nstates = int(solver.nstates)
-    _indices, _flat, edges = overlap_layout(nx)
+    periodic_axes = tuple(getattr(solver, "periodic_axes", ()))
+    _indices, _flat, edges = overlap_layout(
+        nx, periodic_axes=periodic_axes
+    )
     stored = _solver_links(solver)
     overlap = _solver_overlaps(solver)
     if overlap is not None:
@@ -382,6 +385,7 @@ class _OverlapOracle:
             )
         )
         self.links = _solver_links(solver)
+        self.periodic_axes = tuple(getattr(solver, "periodic_axes", ()))
         self.gauges = (
             None
             if gauges is None
@@ -417,6 +421,8 @@ class _OverlapOracle:
                             getattr(self.solver, "overlap_path_average", False),
                         )
                     ),
+                    shape=self.nx,
+                    periodic_axes=self.periodic_axes,
                 )
             else:
                 block = linked_block(
@@ -858,6 +864,7 @@ class TNLDR:
     absorber_yields: np.ndarray | None = field(default=None, init=False)
     absorbed_probabilities: np.ndarray | None = field(default=None, init=False)
     absorption_closure: np.ndarray | None = field(default=None, init=False)
+    direct_validation: dict | None = field(default=None, init=False)
     tdvp_truncation_errors: np.ndarray | None = field(default=None, init=False)
     tdvp_norm_defects: np.ndarray | None = field(default=None, init=False)
     history: object | None = field(default=None, init=False)
@@ -1512,6 +1519,133 @@ class TNLDR:
         if physical and self.gauge_sync:
             values = np.einsum("...ia,...a->...i", self.gauges, values, optimize=True)
         return values
+
+    def validate(
+        self,
+        reference,
+        state,
+        *,
+        dt,
+        steps,
+        hamiltonian_rtol=5.0e-3,
+        population_atol=1.0e-2,
+        norm_atol=1.0e-10,
+        max_elements=4_000_000,
+        strict=True,
+    ):
+        """Gate a fitted MPO against a direct-product Hamiltonian and dynamics.
+
+        ``reference`` may be a product-grid :class:`~pyqed.ldr.LDR` or a
+        :class:`TNLDR`.  A direct LDR carrying ``procrustes_gauges`` is rotated
+        into the fit's common Procrustes frame before comparison.  Propagation
+        is exact in the finite product space, so this checks the complete
+        MACE-to-FTT-to-MPO path independently of TDVP truncation.
+        """
+        from scipy.sparse.linalg import expm_multiply
+
+        if not isinstance(reference, TNLDR):
+            reference = TNLDR.from_ldr(reference)
+        if tuple(reference.dims) != tuple(self.dims):
+            raise ValueError(
+                f"reference dimensions {reference.dims} != {self.dims}"
+            )
+        size = int(np.prod(self.dims))
+        if size * size > int(max_elements):
+            raise MemoryError(
+                f"dense validation needs {size * size} matrix elements; "
+                "increase max_elements explicitly"
+            )
+        fitted_h = np.asarray(self.hamiltonian.to_dense(), dtype=complex)
+        reference_h = np.asarray(reference.hamiltonian.to_dense(), dtype=complex)
+        gauges = getattr(getattr(reference, "solver", None), "procrustes_gauges", None)
+        if gauges is not None:
+            gauges = np.asarray(gauges, dtype=complex).reshape(
+                size // self.nstates, self.nstates, self.nstates
+            )
+            reference_h = np.einsum(
+                "ixa,ixjy,jyb->iajb",
+                gauges.conj(),
+                reference_h.reshape(
+                    size // self.nstates,
+                    self.nstates,
+                    size // self.nstates,
+                    self.nstates,
+                ),
+                gauges,
+                optimize=True,
+            ).reshape(size, size)
+        values = (
+            self.dense(state, physical=False)
+            if isinstance(state, MPS)
+            else np.asarray(state, dtype=complex)
+        )
+        if values.shape != self.dims:
+            raise ValueError(f"state shape {values.shape} != {self.dims}")
+        initial = values.reshape(-1)
+        norm = float(np.linalg.norm(initial))
+        if norm <= np.finfo(float).tiny:
+            raise ValueError("validation state has zero norm")
+        initial = initial / norm
+        steps = int(steps)
+        if steps < 1 or float(dt) <= 0.0:
+            raise ValueError("dt and steps must be positive")
+        stop = float(dt) * steps
+        fitted_states = expm_multiply(
+            -1j * fitted_h, initial, start=0.0, stop=stop, num=steps + 1
+        )
+        reference_states = expm_multiply(
+            -1j * reference_h, initial, start=0.0, stop=stop, num=steps + 1
+        )
+
+        def populations(states):
+            states = states.reshape(len(states), size // self.nstates, self.nstates)
+            if gauges is not None:
+                states = np.einsum("xia,txa->txi", gauges, states, optimize=True)
+            return np.sum(np.abs(states) ** 2, axis=1)
+
+        fitted_populations = populations(fitted_states)
+        reference_populations = populations(reference_states)
+        h_scale = max(float(np.linalg.norm(reference_h)), np.finfo(float).tiny)
+        h_error = float(np.linalg.norm(fitted_h - reference_h) / h_scale)
+        population_error = float(
+            np.max(np.abs(fitted_populations - reference_populations))
+        )
+        fitted_norms = np.sum(np.abs(fitted_states) ** 2, axis=1)
+        reference_norms = np.sum(np.abs(reference_states) ** 2, axis=1)
+        norm_error = float(
+            max(
+                np.max(np.abs(fitted_norms - 1.0)),
+                np.max(np.abs(reference_norms - 1.0)),
+            )
+        )
+        fidelity = np.abs(
+            np.einsum("ti,ti->t", reference_states.conj(), fitted_states)
+        ) ** 2
+        accepted = bool(
+            h_error <= float(hamiltonian_rtol)
+            and population_error <= float(population_atol)
+            and norm_error <= float(norm_atol)
+        )
+        self.direct_validation = {
+            "accepted": accepted,
+            "hamiltonian_relative_error": h_error,
+            "maximum_population_error": population_error,
+            "maximum_norm_error": norm_error,
+            "minimum_fidelity": float(np.min(fidelity)),
+            "hamiltonian_rtol": float(hamiltonian_rtol),
+            "population_atol": float(population_atol),
+            "norm_atol": float(norm_atol),
+            "times": np.linspace(0.0, stop, steps + 1),
+            "fitted_populations": fitted_populations,
+            "reference_populations": reference_populations,
+        }
+        if strict and not accepted:
+            raise RuntimeError(
+                "TNLDR failed direct-product acceptance gates: "
+                f"Hamiltonian={h_error:.3e}, populations={population_error:.3e}, "
+                f"norm={norm_error:.3e}"
+            )
+        return self
 
     def projectors(self):
         """Return projectors onto states of the driver's working frame.

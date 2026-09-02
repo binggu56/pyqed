@@ -81,6 +81,7 @@ class KGW:
         self.evgw_history = []
         self.spectral_result = None
         self.photoemission_result = None
+        self.band_result = None
         self._periodic_cache = None
         self._periodic_space = None
         self.method = None
@@ -231,6 +232,7 @@ class KGW:
         self.evgw_history = []
         self.spectral_result = None
         self.photoemission_result = None
+        self.band_result = None
         self._periodic_cache = None
         self._periodic_space = None
         self.info = dict(self._gw.info)
@@ -286,6 +288,7 @@ class KGW:
         self._periodic_cache = periodic_cache
         self.spectral_result = None
         self.photoemission_result = None
+        self.band_result = None
 
         if method_key in g0w0_methods:
             from .self_energy import diagonal_g0w0
@@ -330,6 +333,107 @@ class KGW:
             }
         )
         return self
+
+    def band_structure(
+        self,
+        kpts=None,
+        scaled_kpts=None,
+        qp_bands=None,
+        intermediate_bands=None,
+        pair_workers=None,
+        reference="fermi",
+        linearized=None,
+        solve_roots=None,
+        maxiter=50,
+        tol=1.0e-6,
+    ):
+        r"""Evaluate direct off-mesh diagonal G0W0 quasiparticle bands.
+
+        The method closes every requested :math:`\mathbf k_b` under the SCF
+        screening mesh, computes the KRHF states at
+        :math:`\mathbf k_b-\mathbf q`, and builds only the required GDF orbital
+        pairs.  Mesh RPA poles from the preceding :meth:`g0w0` run are reused.
+
+        This is an adaptation of the diagonal Hedin G0W0 self-energy
+        (L. Hedin, Phys. Rev. 139, A796 (1965),
+        doi:10.1103/PhysRev.139.A796), not a band interpolation.  The current
+        route supports native GDF, pole-frequency G0W0, closed-shell
+        insulators, and fixed mean-field screening.  Off-mesh finite-size
+        head/wing corrections and eigenvalue-only self-consistency are not yet
+        included.
+        """
+
+        if not self.periodic_backend or self.e_qp is None:
+            raise ValueError("Run periodic KGW.g0w0() before requesting GW bands.")
+        if self.method != "g0w0":
+            raise NotImplementedError(
+                "Off-mesh GW bands currently require a G0W0 calculation."
+            )
+        if self.info.get("backend") == "kpoint_diagonal_ac_rpa":
+            raise NotImplementedError(
+                "Off-mesh GW bands currently use pole-frequency integration."
+            )
+        if self.info.get("coulomb_component") != "gdf":
+            raise NotImplementedError(
+                "Off-mesh GW bands currently require coulomb_component='gdf'."
+            )
+        if self.info.get("finite_size_correction", False):
+            raise NotImplementedError(
+                "Off-mesh GW bands do not yet include the finite-size head/wing term."
+            )
+        if self.info.get("uses_energy_table") or self.info.get("uses_omega_table"):
+            raise NotImplementedError(
+                "Off-mesh GW bands currently require mean-field intermediate and "
+                "on-shell energies."
+            )
+        if kpts is not None and scaled_kpts is not None:
+            raise ValueError("Specify either kpts or scaled_kpts, not both.")
+        if scaled_kpts is not None:
+            scaled = np.asarray(scaled_kpts, dtype=float)
+            if scaled.ndim == 1:
+                scaled = scaled.reshape(1, 3)
+            if scaled.ndim != 2 or scaled.shape[1] != 3:
+                raise ValueError("scaled_kpts must have shape (nkpts, 3) or (3,).")
+            kpts = self.kref.scaled_to_cartesian(scaled)
+        elif kpts is None:
+            kpts = np.asarray(self.kpts, dtype=float)
+
+        if qp_bands is None:
+            qp_bands = self.info.get("qp_bands")
+            if isinstance(qp_bands, dict):
+                raise ValueError(
+                    "Pass an explicit common qp_bands list for off-mesh bands."
+                )
+        if intermediate_bands is None:
+            intermediate_bands = self.info.get("intermediate_bands")
+        if linearized is None:
+            linearized = bool(self.info.get("linearized", False))
+        if solve_roots is None:
+            solve_roots = bool(self.info.get("solve_roots", False))
+
+        from .self_energy import _diagonal_g0w0_bands
+
+        self.band_result = _diagonal_g0w0_bands(
+            self._periodic_space,
+            kpts,
+            qp_bands=qp_bands,
+            eta=float(self.info.get("eta", self.eta)),
+            q_indices=self.info.get("q_indices"),
+            direct_scale=float(self.info.get("direct_scale", 2.0)),
+            coulomb_component=self.info.get("coulomb_component", "gdf"),
+            g2_tol=float(self.info.get("g2_tol", 1.0e-16)),
+            thresh=float(self.info.get("thresh", 1.0e-10)),
+            linearized=bool(linearized),
+            linearized_step=float(self.info.get("linearized_step", 1.0e-6)),
+            solve_roots=bool(solve_roots),
+            maxiter=maxiter,
+            tol=tol,
+            cache=self._periodic_cache,
+            intermediate_bands=intermediate_bands,
+            pair_workers=pair_workers,
+            reference=reference,
+        )
+        return self.band_result
 
     def _use_periodic_backend(self, backend, kwargs):
         if backend is not None:

@@ -16,9 +16,11 @@ from pyqed.pbc.gw import (
     KPointTransitionSpace,
     analytic_tda_electron_phonon_coupling,
     commensurate_gdf_screened_tda_kernel_derivative,
+    phonon_tda_electron_phonon_coupling,
     periodic_tda_operator,
     validate_commensurate_gdf_screened_tda_kernel_derivative,
 )
+from pyqed.pbc import FiniteDisplacementPhonon, KRHFForceCalculator
 from pyqed.qchem.pbc import (
     Cell,
     commensurate_gdf_q_derivative,
@@ -33,9 +35,15 @@ def _jsonable(value):
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
     if isinstance(value, np.ndarray):
+        if np.iscomplexobj(value):
+            if np.max(np.abs(value.imag), initial=0.0) <= 1.0e-14:
+                return value.real.tolist()
+            return {"real": value.real.tolist(), "imag": value.imag.tolist()}
         return value.tolist()
     if isinstance(value, np.generic):
-        return value.item()
+        return _jsonable(value.item())
+    if isinstance(value, complex):
+        return {"real": float(value.real), "imag": float(value.imag)}
     return value
 
 
@@ -51,13 +59,31 @@ def _compact_lih_basis():
     }
 
 
-def _rocksalt_lih(lattice_constant, basis):
+def _lih_cell(lattice_constant, basis, *, structure="rocksalt", bond_length=1.6):
+    structure = str(structure).strip().lower()
+    basis_data = _compact_lih_basis() if basis == "compact" else basis
+    if structure == "molecular":
+        center = 0.5 * float(lattice_constant)
+        half_bond = 0.5 * float(bond_length)
+        return Cell(
+            atom=[
+                ("Li", (center - half_bond, center, center)),
+                ("H", (center + half_bond, center, center)),
+            ],
+            a=np.eye(3) * float(lattice_constant),
+            basis=basis_data,
+            unit="bohr",
+            dimension=3,
+            spin=0,
+            integral_options={"eri_representation": "direct"},
+        ).build()
+    if structure != "rocksalt":
+        raise ValueError("structure must be 'rocksalt' or 'molecular'.")
     half = 0.5 * float(lattice_constant)
     lattice = np.asarray(
         [[0.0, half, half], [half, 0.0, half], [half, half, 0.0]],
         dtype=float,
     )
-    basis_data = _compact_lih_basis() if basis == "compact" else basis
     return Cell(
         atom=[("Li", (0.0, 0.0, 0.0)), ("H", (half, half, half))],
         a=lattice,
@@ -90,9 +116,16 @@ def _solve_case(
     *,
     build_spectrum=False,
     keep_objects=False,
+    phonons=None,
+    phonon_branch=None,
 ):
     started = time.perf_counter()
-    cell = _rocksalt_lih(args.lattice_constant, args.basis)
+    cell = _lih_cell(
+        args.lattice_constant,
+        args.basis,
+        structure=args.structure,
+        bond_length=args.bond_length,
+    )
     mean_field = cell.KRHF(
         nk=(int(nk), 1, 1),
         eta=0.7,
@@ -142,26 +175,43 @@ def _solve_case(
     )
 
     derivative_started = time.perf_counter()
-    q_derivative = gdf_q_derivative(
-        mean_field,
-        qpoint,
-        [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
-        cphf_tol=1.0e-9,
-    )
-    kernel_derivative = commensurate_gdf_screened_tda_kernel_derivative(
-        source_operator,
-        q_derivative,
-    )
-    coupling = analytic_tda_electron_phonon_coupling(
-        space,
-        zero_q_index,
-        phonon_q_index,
-        args.frequency,
-        q_derivative.fock_derivative,
-        overlap_derivative=q_derivative.overlap_derivative,
-        kernel_derivative=kernel_derivative,
-        branch=args.branch,
-    ).validate_momentum(space)
+    if phonons is None:
+        mode_vector = np.asarray([[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]])
+        q_derivative = gdf_q_derivative(
+            mean_field,
+            qpoint,
+            mode_vector,
+            cphf_tol=1.0e-9,
+        )
+        kernel_derivative = commensurate_gdf_screened_tda_kernel_derivative(
+            source_operator,
+            q_derivative,
+        )
+        coupling = analytic_tda_electron_phonon_coupling(
+            space,
+            zero_q_index,
+            phonon_q_index,
+            args.frequency,
+            q_derivative.fock_derivative,
+            overlap_derivative=q_derivative.overlap_derivative,
+            kernel_derivative=kernel_derivative,
+            branch=args.branch,
+        ).validate_momentum(space)
+        mode_source = "supplied_benchmark"
+    else:
+        coupling = phonon_tda_electron_phonon_coupling(
+            source_operator,
+            phonons,
+            phonon_q_index,
+            phonon_branch,
+            kernel_derivative="screened_gdf",
+            cphf_tol=1.0e-9,
+        )
+        q_derivative = coupling.q_derivative
+        components = coupling.gdf_kernel_derivative_components
+        kernel_derivative = components["bare"] + components["screened"]
+        mode_vector = np.asarray(coupling.mode_vector)
+        mode_source = coupling.info["phonon_source"]
     derivative_seconds = time.perf_counter() - derivative_started
 
     nroots = min(args.nroots, source_operator.shape[0] - 1)
@@ -179,6 +229,11 @@ def _solve_case(
         "qpoint_cartesian": qpoint.tolist(),
         "source_q_index": int(zero_q_index),
         "target_q_index": int(target_q_index),
+        "phonon_source": mode_source,
+        "phonon_branch": int(coupling.branch),
+        "phonon_frequency_hartree": float(coupling.frequency),
+        "phonon_frequency_ev": float(coupling.frequency * au2ev),
+        "phonon_mode": _jsonable(mode_vector),
         "source_exciton_ev": (source.e * au2ev).tolist(),
         "target_exciton_ev": (target.e * au2ev).tolist(),
         "exciton_phonon_coupling_mev_real": (
@@ -196,6 +251,7 @@ def _solve_case(
         ),
         "kernel_derivative_norm": float(np.linalg.norm(kernel_derivative)),
         "q_derivative_info": _jsonable(q_derivative.info),
+        "coupling_info": _jsonable(coupling.info),
         "q_factor_info": _jsonable(factor_info),
         "scf_seconds": float(scf_seconds),
         "derivative_seconds": float(derivative_seconds),
@@ -213,8 +269,8 @@ def _solve_case(
         )
         continuum = channel.continuum
         phonon_continuum = ExcitonPhononContinuum((channel,))
-        lower = min(float(np.min(source.e)), float(np.min(target.e) - args.frequency))
-        upper = max(float(np.max(source.e)), float(np.max(target.e) + args.frequency))
+        lower = min(float(np.min(source.e)), float(np.min(target.e) - coupling.frequency))
+        upper = max(float(np.max(source.e)), float(np.max(target.e) + coupling.frequency))
         padding = 0.08 / au2ev
         energies = np.linspace(lower - padding, upper + padding, args.spectrum_points)
         embedding = phonon_continuum.run_spectrum(
@@ -235,7 +291,7 @@ def _solve_case(
         validation_derivative = commensurate_gdf_q_derivative(
             mean_field,
             qpoint,
-            [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+            mode_vector,
             cphf_tol=1.0e-9,
         )
         result["reference_residuals"] = {
@@ -251,6 +307,124 @@ def _solve_case(
         )
         result["objects"] = (source_operator, validation_derivative)
     return result
+
+
+def _native_phonons(args):
+    basis = _compact_lih_basis() if args.basis == "compact" else args.basis
+    cell = _lih_cell(
+        args.lattice_constant,
+        args.basis,
+        structure=args.structure,
+        bond_length=args.bond_length,
+    )
+    scf_options = {
+        "eta": 0.7,
+        "real_cut": args.pair_cut,
+        "pair_cut": args.pair_cut,
+        "recip_cut": args.phonon_recip_cut,
+        "one_body_nuclear_cut": 1,
+        "jk_builder": args.phonon_jk_builder,
+        "eri_screen_tol": 0.0,
+        "pair_ft_screen_tol": 0.0,
+        "one_body_screen_tol": 0.0,
+    }
+    gdf_options = (
+        {
+            "auxbasis": args.auxbasis,
+            "reciprocal_kernel": "full",
+            "recip_cut": args.phonon_recip_cut,
+            "pair_cut": args.pair_cut,
+            "pair_screen_tol": 0.0,
+            "metric_tol": 1.0e-12,
+            "storage": "memory",
+        }
+        if args.phonon_jk_builder == "gdf"
+        else None
+    )
+    calculator = KRHFForceCalculator(
+        basis,
+        scf_options=scf_options,
+        gdf_options=gdf_options,
+        run_options={
+            "max_cycle": 80,
+            "conv_tol": 1.0e-11,
+            "conv_tol_dm": 1.0e-9,
+        },
+    )
+    phonons = FiniteDisplacementPhonon(
+        cell,
+        calculator,
+        supercell=(args.phonon_supercell_x, 1, 1),
+        displacement=args.phonon_displacement,
+    )
+    started = time.perf_counter()
+    phonons.run()
+    qpoint = np.asarray([0.5, 0.0, 0.0])
+    frequencies = phonons.frequencies(qpoint, units="au")
+    if args.phonon_branch < 0:
+        stable = np.flatnonzero(frequencies > args.minimum_phonon_frequency)
+        if len(stable) == 0:
+            values = np.array2string(frequencies, precision=5)
+            raise RuntimeError(
+                "The native LiH force constants have no stable zone-boundary "
+                f"mode; signed frequencies (Ha): {values}."
+            )
+        branch = int(stable[-1])
+    else:
+        branch = int(args.phonon_branch)
+    mode = phonons.mode(qpoint, branch)
+    if mode.frequency <= args.minimum_phonon_frequency:
+        raise RuntimeError(
+            f"Selected LiH phonon branch {branch} has frequency "
+            f"{mode.frequency:.6e} Ha."
+        )
+    bands = phonons.band_structure(
+        [[0.0, 0.0, 0.0], qpoint, [0.0, 0.0, 0.0]],
+        labels=(r"$\Gamma$", "X", r"$\Gamma$"),
+        points_per_segment=args.phonon_path_points,
+        units="cm-1",
+    )
+    info = {
+        "supercell": list(phonons.supercell),
+        "displacement_bohr": float(phonons.displacement),
+        "reciprocal_cutoff": int(args.phonon_recip_cut),
+        "jk_builder": str(args.phonon_jk_builder),
+        "structure": str(args.structure),
+        "branch": branch,
+        "frequency_hartree": float(mode.frequency),
+        "frequency_ev": float(mode.frequency * au2ev),
+        "mode": _jsonable(mode.eigenvector),
+        "acoustic_sum_rule_residual": phonons.acoustic_sum_rule_residual,
+        "force_evaluations": len(calculator.history),
+        "seconds": float(time.perf_counter() - started),
+        "bands": _jsonable(bands),
+    }
+    return phonons, branch, info
+
+
+def _plot_phonons(info, output):
+    output = Path(output).expanduser().resolve()
+    bands = info["bands"]
+    distances = np.asarray(bands["distances"])
+    frequencies = np.asarray(bands["frequencies"])
+    fig, axis = plt.subplots(figsize=(5.0, 3.5), constrained_layout=True)
+    for branch, values in enumerate(frequencies.T):
+        color = "#D55E00" if branch == info["branch"] else "#28666E"
+        axis.plot(distances, values, color=color, linewidth=1.35)
+    ticks = np.asarray(bands["ticks"], dtype=int)
+    for tick in ticks:
+        axis.axvline(distances[tick], color="0.75", linewidth=0.7)
+    axis.axhline(0.0, color="0.3", linewidth=0.7)
+    axis.set_xticks(distances[ticks], bands["labels"])
+    axis.set_xlim(distances[0], distances[-1])
+    axis.set_ylabel(r"Frequency (cm$^{-1}$)")
+    axis.set_title(f"Native LiH {info['structure']} finite-displacement phonons")
+    axis.spines[["top", "right"]].set_visible(False)
+    axis.grid(axis="y", alpha=0.2, linewidth=0.6)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output)
+    fig.savefig(output.with_suffix(".pdf"))
+    plt.close(fig)
 
 
 def _plot(results, output):
@@ -280,9 +454,15 @@ def _plot(results, output):
     axes[0, 0].set(
         xlabel="GDF reciprocal cutoff",
         ylabel=r"$\max_{SS'}|g_{SS'\nu}|$ (meV)",
-        title="a  Zone-boundary coupling convergence",
+        title=(
+            "a  Zone-boundary coupling convergence"
+            if len(results) > 1
+            else "a  Selected zone-boundary coupling"
+        ),
         xticks=sorted({row["recip_cut"] for row in results}),
     )
+    if len(results) == 1:
+        axes[0, 0].set_ylim(0.0, 1.15 * final["maximum_coupling_mev"])
     axes[0, 0].legend(frameon=False)
 
     converged = {}
@@ -311,6 +491,7 @@ def _plot(results, output):
         xticks=nks,
     )
     axes[0, 1].legend(frameon=False)
+    axes[0, 1].ticklabel_format(axis="y", style="plain", useOffset=False)
 
     energies = np.asarray(final["spectrum_energy_ev"])
     spectrum = np.asarray(final["spectral_density"])
@@ -345,6 +526,7 @@ def _plot(results, output):
         xticks=nks,
     )
     axes[1, 1].legend(frameon=False)
+    axes[1, 1].set_ylim(bottom=0.0)
 
     for axis in axes.reshape(-1):
         axis.grid(alpha=0.2, lw=0.6)
@@ -356,6 +538,13 @@ def _plot(results, output):
 
 
 def run(args):
+    phonons = None
+    phonon_branch = None
+    phonon_info = None
+    if args.native_phonons:
+        print("Building native LiH force constants", flush=True)
+        phonons, phonon_branch, phonon_info = _native_phonons(args)
+        _plot_phonons(phonon_info, args.phonon_figure)
     cases = [
         (nk, cutoff)
         for nk in args.meshes
@@ -376,6 +565,8 @@ def run(args):
             cutoff,
             build_spectrum=(nk, cutoff) == final_case,
             keep_objects=False,
+            phonons=phonons,
+            phonon_branch=phonon_branch,
         )
         results.append(result)
 
@@ -392,6 +583,8 @@ def run(args):
             args.validation_recip_cut,
             build_spectrum=False,
             keep_objects=True,
+            phonons=phonons,
+            phonon_branch=phonon_branch,
         )
         source_operator, q_derivative = validation_case.pop("objects")
         checked = validate_commensurate_gdf_screened_tda_kernel_derivative(
@@ -418,14 +611,15 @@ def run(args):
 
     _plot(results, args.figure)
     payload = {
-        "system": "rocksalt LiH",
+        "system": f"{args.structure} LiH",
         "basis": str(args.basis),
         "auxbasis": str(args.auxbasis),
         "mesh_family": "Nk x 1 x 1",
         "qpoint_policy": "fixed self-opposite zone boundary",
-        "frequency_hartree": float(args.frequency),
-        "frequency_ev": float(args.frequency * au2ev),
-        "mode": [[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]],
+        "frequency_hartree": float(results[-1]["phonon_frequency_hartree"]),
+        "frequency_ev": float(results[-1]["phonon_frequency_ev"]),
+        "mode": results[-1]["phonon_mode"],
+        "native_phonons": phonon_info,
         "temperature_kelvin": float(args.temperature),
         "cases": results,
         "unprojected_supercell_validation": validation,
@@ -434,7 +628,7 @@ def run(args):
         "fidelity": (
             "direct primitive-cell full-reciprocal one-body, GDF, and CPHF "
             "response; static direct-RPA TDA kernel; commensurate displaced "
-            "validation; supplied phonon mode/frequency; one-phonon "
+            "validation; native finite-displacement or supplied phonon mode; one-phonon "
             "Fan/Feshbach"
         ),
     }
@@ -462,10 +656,28 @@ def main():
     parser.add_argument("--recip-cuts", type=int, nargs="+", default=(2, 3, 4))
     parser.add_argument("--pair-cut", type=int, default=2)
     parser.add_argument("--lattice-constant", type=float, default=7.72)
+    parser.add_argument(
+        "--structure",
+        choices=("rocksalt", "molecular"),
+        default="rocksalt",
+    )
+    parser.add_argument("--bond-length", type=float, default=1.6)
     parser.add_argument("--basis", default="compact")
     parser.add_argument("--auxbasis", default="sto-3g")
     parser.add_argument("--frequency", type=float, default=0.008)
     parser.add_argument("--branch", type=int, default=0)
+    parser.add_argument("--native-phonons", action="store_true")
+    parser.add_argument("--phonon-supercell-x", type=int, default=2)
+    parser.add_argument("--phonon-displacement", type=float, default=0.01)
+    parser.add_argument("--phonon-recip-cut", type=int, default=2)
+    parser.add_argument(
+        "--phonon-jk-builder",
+        choices=("reciprocal", "gdf"),
+        default="reciprocal",
+    )
+    parser.add_argument("--phonon-branch", type=int, default=-1)
+    parser.add_argument("--phonon-path-points", type=int, default=21)
+    parser.add_argument("--minimum-phonon-frequency", type=float, default=1.0e-10)
     parser.add_argument("--temperature", type=float, default=300.0)
     parser.add_argument("--nroots", type=int, default=2)
     parser.add_argument("--eta-ev", type=float, default=0.04)
@@ -485,6 +697,11 @@ def main():
         type=Path,
         default=Path("/private/tmp/pbc_lih_exciton_phonon_convergence.png"),
     )
+    parser.add_argument(
+        "--phonon-figure",
+        type=Path,
+        default=Path("/private/tmp/pbc_lih_native_phonons.png"),
+    )
     args = parser.parse_args()
     if min(args.meshes) < 2 or min(args.recip_cuts) < 1:
         parser.error("meshes must be >=2 and reciprocal cutoffs must be positive")
@@ -492,6 +709,10 @@ def main():
         parser.error("the fixed zone-boundary benchmark requires even meshes")
     if args.validation_recip_cut < 1:
         parser.error("validation reciprocal cutoff must be positive")
+    if args.phonon_supercell_x < 2 or args.phonon_supercell_x % 2:
+        parser.error("phonon-supercell-x must be an even integer >= 2")
+    if args.phonon_recip_cut < 1 or args.phonon_path_points < 2:
+        parser.error("phonon reciprocal cutoff and path points must be positive")
     run(args)
 
 

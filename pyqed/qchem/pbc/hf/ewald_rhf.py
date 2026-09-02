@@ -2179,9 +2179,16 @@ class EwaldRHF:
         nk=None,
         scaled_kpts=None,
         reference="fermi",
-        exchange="mesh_interpolate",
+        exchange="finite_q",
         sort_bands="energy",
     ):
+        """Evaluate the frozen-density Fock operator at arbitrary k points.
+
+        ``exchange="finite_q"`` builds the required target-to-SCF-mesh GDF
+        factors on demand when ``jk_builder="gdf"``.  The selected factors are
+        released after the path contraction.  ``mesh_interpolate`` remains an
+        inexpensive one-dimensional diagnostic.
+        """
         if self.dm is None:
             raise RuntimeError("Run SCF before calling band_structure().")
         if kpts is not None and nk is not None:
@@ -2216,11 +2223,10 @@ class EwaldRHF:
             raise ValueError(
                 "exchange must be 'mesh_interpolate', 'average', 'finite_q', or 'mesh'."
             )
-        if self.jk_builder == "gdf" and exchange_key in ("average", "finite_q"):
+        if self.jk_builder == "gdf" and exchange_key == "average":
             raise NotImplementedError(
-                "GDF band Fock matrices are available on the self-consistent k mesh. "
-                "Use exchange='mesh' there or exchange='mesh_interpolate' between "
-                "mesh points."
+                "GDF band Fock matrices use exchange='finite_q', 'mesh', or "
+                "'mesh_interpolate'."
             )
         sort_key = str(sort_bands).lower()
         if sort_key not in ("energy", "overlap"):
@@ -2235,6 +2241,27 @@ class EwaldRHF:
         occupied = scf_energy[scf_occ > 1e-12]
         e_fermi = float(np.max(occupied)) if occupied.size else None
 
+        gdf_band_veff = None
+        if self.jk_builder == "gdf" and exchange_key == "finite_q":
+            if self.with_df is None:
+                from pyqed.qchem.pbc.gdf import PeriodicGDF
+
+                self.with_df = PeriodicGDF(self)
+            vj_band, vk_band = self.with_df.get_jk(
+                dm_k,
+                kpts_band=kpts,
+            )
+            gdf_band_veff = []
+            for kvec, vj, vk in zip(kpts, vj_band, vk_band):
+                overlap, _hcore = self._one_body_at_k(kvec)
+                veff = vj - 0.5 * vk
+                match = self._matching_k_index(kvec)
+                if self.madelung is not None and match is not None:
+                    veff -= 0.5 * self.madelung * (
+                        overlap @ dm_k[match] @ overlap
+                    )
+                gdf_band_veff.append(_symmetrize(veff))
+
         if exchange_key == "mesh_interpolate":
             mo_energy = _interpolate_periodic_1d_bands(
                 self.kpts,
@@ -2248,9 +2275,11 @@ class EwaldRHF:
         else:
             dm_avg = self._average_density(dm_k)
             prev_coeff = None
-            for kvec in kpts:
+            for target_index, kvec in enumerate(kpts):
                 overlap, hcore = self._one_body_at_k(kvec)
-                if exchange_key == "average":
+                if gdf_band_veff is not None:
+                    veff = gdf_band_veff[target_index]
+                elif exchange_key == "average":
                     veff = self.get_veff(dm_avg, overlap)
                 elif exchange_key == "mesh":
                     match = self._matching_k_index(kvec)

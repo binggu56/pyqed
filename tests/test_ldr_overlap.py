@@ -16,6 +16,30 @@ def test_layout_and_snake_cover_product_grid():
         assert sum(abs(a - b) for a, b in zip(left, right)) == 1
 
 
+def test_periodic_layout_and_transport_retain_closing_holonomy():
+    _, _, edges = overlap.layout((4,), periodic_axes=(0,))
+    assert len(edges) == 4
+    assert edges[-1][1:] == ((3,), 3, 0)
+
+    links = {
+        (0, (0,)): 1.0 + 0.0j,
+        (0, (1,)): 1.0 + 0.0j,
+        (0, (2,)): 1.0 + 0.0j,
+        (0, (3,)): -1.0 + 0.0j,
+    }
+    seam = overlap.between(
+        (3,), (0,), links, shape=(4,), periodic_axes=(0,)
+    )
+    reverse = overlap.between(
+        (0,), (3,), links, shape=(4,), periodic_axes=(0,)
+    )
+    wilson = np.prod([links[(0, (index,))] for index in range(4)])
+
+    np.testing.assert_allclose(seam, -1.0)
+    np.testing.assert_allclose(reverse, seam.conjugate())
+    np.testing.assert_allclose(wilson, -1.0)
+
+
 def test_scalar_links_compose_and_form_hermitian_dense_overlap():
     shape = (2, 3)
     links = overlap.nearest(

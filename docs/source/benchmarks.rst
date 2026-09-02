@@ -66,6 +66,10 @@ output a release claim until a completed manifest and artifacts are reviewed.
    * - Spin--orbit validation
      - ``examples/qchem/benchmark_soc_vs_pyscf.py``
      - Selected spin--orbit quantities against PySCF
+   * - External spin--orbit integral validation
+     - ``benchmarks/ch2o-soc-pysoc/run.py``
+     - Matched formaldehyde one-electron AO operator against PySOC/MolSOC;
+       not an excited-state comparison
    * - Molecular GW PES comparison
      - ``examples/qchem/gw/benchmark_pes_molgw.py``
      - Selected molecular GW quantities against MOLGW

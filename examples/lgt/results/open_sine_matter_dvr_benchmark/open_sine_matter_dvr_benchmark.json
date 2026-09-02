@@ -1,0 +1,513 @@
+{
+  "method": "open paired DCT-IV/DST-IV DVR with interval links eliminated",
+  "fidelity": "exact open-boundary Gauss-law reduction; paired spectral regulator is an adaptation; N=40 DMRG timing is a bounded failed attempt",
+  "physical_sector_dimension_n2": 6,
+  "physical_sector_max_error": {
+    "H": 0.0,
+    "M_V": 0.0,
+    "M_S": 0.0
+  },
+  "matter_n12": {
+    "bond_dim": 32,
+    "half_sweeps": 2,
+    "ground_energy": -8.687518122970369,
+    "ground_seconds": 4.501729332841933,
+    "scalar_mean": -3.1759841781681326e-05,
+    "tdvp_step_seconds": {
+      "vector": 1.3801241249311715,
+      "scalar": 1.3803811250254512
+    },
+    "setup": {
+      "seconds": 0.019110915949568152,
+      "chain_sites": 12,
+      "raw_mpo_bond": 47,
+      "compressed_mpo_bond": 27
+    }
+  },
+  "matter_n40_setup": {
+    "seconds": 0.30034108296968043,
+    "chain_sites": 40,
+    "raw_mpo_bond": 159,
+    "compressed_mpo_bond": 43
+  },
+  "n40_half_sweep_lower_bound_seconds": 765.0,
+  "n40_peak_memory_gb_before_interrupt": 6.56,
+  "explicit_n12": {
+    "method": "open paired DCT-IV/DST-IV gauge-DVR DMRG plus TDVP",
+    "fidelity": "open-boundary spectral adaptation with exact Wilson lines and Gauss sectors; single finite-volume/cutoff point",
+    "npts": 12,
+    "fermion_modes": 24,
+    "chain_length": 23,
+    "bond_dim": 32,
+    "length": 20.0,
+    "gL": 20.0,
+    "coupling": 1.0,
+    "flux_cutoff": 3,
+    "mass_over_g": 0.0,
+    "dt": 0.1,
+    "ground_half_sweeps": 8,
+    "ground_energy": -8.102378671526784,
+    "raw_hamiltonian_mpo_bond": 46,
+    "compressed_hamiltonian_mpo_bond": 26,
+    "hamiltonian_mpo_bonds": [
+      6,
+      6,
+      10,
+      10,
+      14,
+      14,
+      18,
+      18,
+      22,
+      22,
+      26,
+      26,
+      22,
+      22,
+      18,
+      18,
+      14,
+      14,
+      10,
+      10,
+      6,
+      6,
+      1
+    ],
+    "gauss_law": "exact site-by-site target-QN block structure",
+    "setup_seconds": 0.059608666924759746,
+    "ground_seconds": 2.623088292311877,
+    "ground_history": [
+      {
+        "half_sweep": 1,
+        "direction": "lr",
+        "energy": -8.102378671526777,
+        "local_energy": -8.6543169434912,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 2,
+        "direction": "rl",
+        "energy": -8.102378671526777,
+        "local_energy": -8.685195946157569,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 3,
+        "direction": "lr",
+        "energy": -8.102378671526777,
+        "local_energy": -8.685728541638532,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 4,
+        "direction": "rl",
+        "energy": -8.102378671526777,
+        "local_energy": -8.411460551716301,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 5,
+        "direction": "lr",
+        "energy": -8.102378671526777,
+        "local_energy": -8.685750657958899,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 6,
+        "direction": "rl",
+        "energy": -8.102378671526777,
+        "local_energy": -8.335046194223818,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 7,
+        "direction": "lr",
+        "energy": -8.102378671526777,
+        "local_energy": -8.685253803882214,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 8,
+        "direction": "rl",
+        "energy": -8.102378671526777,
+        "local_energy": -8.090360709364068,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 9,
+        "direction": "recenter-right",
+        "energy": -8.102378671526784,
+        "local_energy": -8.102378671526804,
+        "truncation": 0.0,
+        "states_kept": 32
+      }
+    ],
+    "references": [
+      "https://doi.org/10.1103/PhysRevD.11.395",
+      "https://doi.org/10.1103/PhysRevD.13.1043",
+      "https://doi.org/10.1016/j.aop.2011.09.001"
+    ],
+    "scalar_elastic_mean": 0.000783574524536076,
+    "vector_seconds": 91.18431537505239,
+    "scalar_seconds": 169.3852210000623,
+    "readiness_only": false,
+    "vector_steps": 60,
+    "scalar_steps": 100,
+    "M_V_over_g": null,
+    "M_S_over_g": 0.8356651168122269,
+    "M_V_pole_rank_mad": null,
+    "M_S_pole_rank_mad": 0.006647771535530367,
+    "M_V_extraction_error": "fewer than three matrix-pencil ranks support a pole",
+    "M_S_extraction_error": null,
+    "mass_extraction_success": false,
+    "continuum_M_V_over_g": 0.5641895835477563,
+    "continuum_M_S_over_g": 1.1283791670955126,
+    "M_V_relative_error": null,
+    "M_S_relative_error": -0.25941107281938025,
+    "vector_pole_audit": [
+      {
+        "rank": 6,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 8,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 10,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 12,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 14,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 16,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 18,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 20,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 22,
+        "candidates": [],
+        "dominant": null
+      },
+      {
+        "rank": 24,
+        "candidates": [],
+        "dominant": null
+      }
+    ],
+    "scalar_pole_audit": [
+      {
+        "rank": 6,
+        "candidates": [
+          {
+            "frequency": 0.8941287727146533,
+            "amplitude": 0.1967440969998305,
+            "root_modulus": 0.9776237815926153
+          }
+        ],
+        "dominant": 0.8941287727146533
+      },
+      {
+        "rank": 8,
+        "candidates": [
+          {
+            "frequency": 0.8452439301245082,
+            "amplitude": 0.2168363190007996,
+            "root_modulus": 0.9752835256523084
+          }
+        ],
+        "dominant": 0.8452439301245082
+      },
+      {
+        "rank": 10,
+        "candidates": [
+          {
+            "frequency": 0.8354418244387896,
+            "amplitude": 0.22426645291894245,
+            "root_modulus": 0.9746894834927541
+          }
+        ],
+        "dominant": 0.8354418244387896
+      },
+      {
+        "rank": 12,
+        "candidates": [
+          {
+            "frequency": 0.8291042287047901,
+            "amplitude": 0.23035626034829554,
+            "root_modulus": 0.9741930104370164
+          }
+        ],
+        "dominant": 0.8291042287047901
+      },
+      {
+        "rank": 14,
+        "candidates": [
+          {
+            "frequency": 0.8356826008350452,
+            "amplitude": 0.217025877863192,
+            "root_modulus": 0.9753428842748538
+          }
+        ],
+        "dominant": 0.8356826008350452
+      },
+      {
+        "rank": 16,
+        "candidates": [
+          {
+            "frequency": 0.8050213694418821,
+            "amplitude": 0.2321286478379504,
+            "root_modulus": 0.974278662900207
+          }
+        ],
+        "dominant": 0.8050213694418821
+      },
+      {
+        "rank": 18,
+        "candidates": [
+          {
+            "frequency": 0.8475844829482978,
+            "amplitude": 0.21811775332968503,
+            "root_modulus": 0.9751335965471715
+          }
+        ],
+        "dominant": 0.8475844829482978
+      },
+      {
+        "rank": 20,
+        "candidates": [
+          {
+            "frequency": 0.8359250503432339,
+            "amplitude": 0.2454528032515685,
+            "root_modulus": 0.9727784508386725
+          }
+        ],
+        "dominant": 0.8359250503432339
+      },
+      {
+        "rank": 22,
+        "candidates": [
+          {
+            "frequency": 0.8356476327894086,
+            "amplitude": 0.24281589781181753,
+            "root_modulus": 0.9730138396008728
+          }
+        ],
+        "dominant": 0.8356476327894086
+      },
+      {
+        "rank": 24,
+        "candidates": [
+          {
+            "frequency": 0.828930461848603,
+            "amplitude": 0.2385860313421382,
+            "root_modulus": 0.9734793994148172
+          }
+        ],
+        "dominant": 0.828930461848603
+      }
+    ],
+    "kogut_susskind_reference": {
+      "M_V_over_g": 0.5826426670595651,
+      "M_S_over_g": 1.2101475326063134,
+      "M_V_pole_rank_mad": 0.000144157813827539,
+      "M_S_pole_rank_mad": 0.05553899434651999,
+      "x": 16.0,
+      "nsites": 80,
+      "bond_dim": 128
+    }
+  },
+  "explicit_n40": {
+    "method": "open paired DCT-IV/DST-IV gauge-DVR DMRG plus TDVP",
+    "fidelity": "open-boundary spectral adaptation with exact Wilson lines and Gauss sectors; single finite-volume/cutoff point",
+    "npts": 40,
+    "fermion_modes": 80,
+    "chain_length": 79,
+    "bond_dim": 128,
+    "length": 20.0,
+    "gL": 20.0,
+    "coupling": 1.0,
+    "flux_cutoff": 3,
+    "mass_over_g": 0.0,
+    "dt": 0.1,
+    "ground_half_sweeps": 2,
+    "ground_energy": -120.6307075153767,
+    "raw_hamiltonian_mpo_bond": 158,
+    "compressed_hamiltonian_mpo_bond": 40,
+    "hamiltonian_mpo_bonds": [
+      6,
+      6,
+      10,
+      10,
+      14,
+      14,
+      18,
+      18,
+      22,
+      22,
+      26,
+      26,
+      30,
+      30,
+      34,
+      34,
+      34,
+      34,
+      36,
+      36,
+      38,
+      38,
+      38,
+      38,
+      38,
+      38,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      40,
+      38,
+      38,
+      38,
+      38,
+      38,
+      38,
+      36,
+      36,
+      34,
+      34,
+      34,
+      34,
+      30,
+      30,
+      26,
+      26,
+      22,
+      22,
+      18,
+      18,
+      14,
+      14,
+      10,
+      10,
+      6,
+      6,
+      1
+    ],
+    "gauss_law": "exact site-by-site target-QN block structure",
+    "setup_seconds": 1.4435643339529634,
+    "ground_seconds": 554.7672103336081,
+    "ground_history": [
+      {
+        "half_sweep": 1,
+        "direction": "lr",
+        "energy": -120.63070751537676,
+        "local_energy": -121.30646172679627,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 2,
+        "direction": "rl",
+        "energy": -120.63070751537676,
+        "local_energy": -121.39925751874961,
+        "truncation": 0.0,
+        "states_kept": 4
+      },
+      {
+        "half_sweep": 3,
+        "direction": "recenter-right",
+        "energy": -120.6307075153767,
+        "local_energy": -120.63070751537722,
+        "truncation": 0.0,
+        "states_kept": 128
+      }
+    ],
+    "references": [
+      "https://doi.org/10.1103/PhysRevD.11.395",
+      "https://doi.org/10.1103/PhysRevD.13.1043",
+      "https://doi.org/10.1016/j.aop.2011.09.001"
+    ],
+    "readiness_only": true,
+    "tdvp_attempted": false,
+    "tdvp_note": "Use the production mode for channel construction and checkpointed TDVP; readiness mode is intentionally bounded."
+  },
+  "explicit_step": {
+    "npts": 12,
+    "bond_dim": 32,
+    "dt": 0.1,
+    "dense_single_seconds": 1.5907276661600918,
+    "dense_factorized_seconds": 2.723295833915472,
+    "symmetric_single_seconds": 1.0787517079152167,
+    "dense_single_backend": "single-MPO TDVP",
+    "dense_factorized_backend": "compiled-sum-tdvp-sweep",
+    "symmetric_single_backend": "exact-Gauss block-sparse",
+    "factorized_infidelity_vs_dense_single": 1.1102230246251565e-15,
+    "symmetric_infidelity_vs_dense_single": 3.1086244689504383e-15,
+    "factorized_components": 13,
+    "factorized_max_mpo_bond": 6,
+    "single_raw_mpo_bond": 46,
+    "large_npts": 40,
+    "large_bond_dim": 128,
+    "large_factorized_vacuum_seconds": 834.5891739591025,
+    "large_factorized_peak_memory_gb": 11.9,
+    "large_symmetric_excited_seconds_lower_bound": 1200.0,
+    "large_symmetric_peak_memory_gb": 6.0,
+    "large_comparison_caveat": "The factorized measurement used the vacuum while the symmetric lower bound used the vector source; compare only as feasibility data."
+  },
+  "references": [
+    "https://doi.org/10.1007/JHEP11(2013)158",
+    "https://doi.org/10.1103/PhysRevD.107.054506"
+  ]
+}

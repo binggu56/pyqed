@@ -39,6 +39,31 @@ def _folded_short_range_cache_scope(mf):
         _gdf_close_folded_short_range_cache(mf)
 
 
+@contextmanager
+def _temporary_gdf_cache_scope(mf):
+    """Release cache entries created only for an arbitrary band path."""
+
+    prefix = "_pbc_gdf_"
+    snapshots = {
+        name: set(value)
+        for name, value in vars(mf).items()
+        if name.startswith(prefix) and isinstance(value, dict)
+    }
+    try:
+        yield
+    finally:
+        for name, value in tuple(vars(mf).items()):
+            if not name.startswith(prefix) or not isinstance(value, dict):
+                continue
+            previous = snapshots.get(name)
+            if previous is None:
+                delattr(mf, name)
+                continue
+            for key in tuple(value):
+                if key not in previous:
+                    value.pop(key, None)
+
+
 @dataclass(frozen=True)
 class DiskCDERI:
     """Descriptor for one dense or Hermitian-packed disk-backed factor block."""
@@ -154,10 +179,12 @@ def _wrap_scaled(values):
 class _KMeshReference:
     """Integral-only k-mesh view, independent of GW transition spaces."""
 
-    def __init__(self, mf):
+    def __init__(self, mf, kpts=None):
         self._pbc_mf = mf
         self.cell = mf.cell
-        self.kpts = np.asarray(mf.kpts, dtype=float).reshape(-1, 3)
+        if kpts is None:
+            kpts = mf.kpts
+        self.kpts = np.asarray(kpts, dtype=float).reshape(-1, 3)
         self.nkpts = int(len(self.kpts))
         self.reciprocal_vectors = 2.0 * np.pi * np.linalg.inv(
             np.asarray(self.cell.lattice_vectors, dtype=float)
@@ -234,6 +261,188 @@ class _KMeshSpace:
         return index
 
 
+class _SelectedPairSpace:
+    """Integral space containing only requested arbitrary k-point pairs."""
+
+    disable_opposite_q_reuse = True
+
+    def __init__(self, mf, band_kpts, tol=1.0e-8):
+        mesh_kpts = np.asarray(mf.kpts, dtype=float).reshape(-1, 3)
+        band_kpts = np.asarray(band_kpts, dtype=float).reshape(-1, 3)
+        combined = [np.asarray(kvec, dtype=float) for kvec in mesh_kpts]
+        band_indices = []
+        for kvec in band_kpts:
+            value = np.asarray(kvec, dtype=float)
+            match = next(
+                (
+                    index
+                    for index, existing in enumerate(combined)
+                    if np.max(np.abs(existing - value)) <= tol
+                ),
+                None,
+            )
+            if match is None:
+                match = len(combined)
+                combined.append(value)
+            band_indices.append(int(match))
+
+        self.reference = _KMeshReference(mf, np.asarray(combined))
+        self.mesh_indices = tuple(range(len(mesh_kpts)))
+        self.band_indices = tuple(band_indices)
+        scaled_kpts = self.reference.cartesian_to_scaled(self.reference.kpts)
+        scaled_qpts = [np.zeros(3, dtype=float)]
+        pairs_by_q = {0: []}
+
+        def q_index_for_pair(left, right):
+            q_scaled = scaled_kpts[int(right)] - scaled_kpts[int(left)]
+            for q_index, existing in enumerate(scaled_qpts):
+                if np.max(np.abs(q_scaled - existing)) <= tol:
+                    return q_index
+            scaled_qpts.append(q_scaled)
+            pairs_by_q[len(scaled_qpts) - 1] = []
+            return len(scaled_qpts) - 1
+
+        for index in dict.fromkeys((*self.mesh_indices, *self.band_indices)):
+            pairs_by_q[0].append((int(index), int(index)))
+        for band_index in dict.fromkeys(self.band_indices):
+            for mesh_index in self.mesh_indices:
+                q_index = q_index_for_pair(mesh_index, band_index)
+                pair = (int(mesh_index), int(band_index))
+                if pair not in pairs_by_q[q_index]:
+                    pairs_by_q[q_index].append(pair)
+
+        self.qpts = self.reference.scaled_to_cartesian(
+            np.asarray(scaled_qpts, dtype=float)
+        )
+        self.q0_index = 0
+        self._pairs_by_q = {
+            int(q_index): tuple(pairs)
+            for q_index, pairs in pairs_by_q.items()
+        }
+        size = self.reference.nkpts
+        self.q_index_by_kpair = np.full((size, size), -1, dtype=np.int64)
+        for q_index, pairs in self._pairs_by_q.items():
+            for left, right in pairs:
+                self.q_index_by_kpair[left, right] = int(q_index)
+
+    def normalize_q_index(self, q_index):
+        index = int(q_index)
+        if index < 0 or index >= len(self.qpts):
+            raise IndexError(
+                f"q_index {index} is out of range for {len(self.qpts)} q points."
+            )
+        return index
+
+    def find_qpoint_index(self, qvec, tol=1.0e-8):
+        scaled = self.reference.cartesian_to_scaled(self.qpts)
+        target = self.reference.cartesian_to_scaled(qvec)
+        distances = np.max(np.abs(scaled - target), axis=1)
+        index = int(np.argmin(distances))
+        if distances[index] > tol:
+            raise ValueError("Requested q point is not present in the selected pair space.")
+        return index
+
+    def requested_pair_keys(self, q_index):
+        return self._pairs_by_q[self.normalize_q_index(q_index)]
+
+
+class _RequestedPairSpace:
+    """Integral space for an explicit set of arbitrary k-point pairs."""
+
+    disable_opposite_q_reuse = True
+
+    def __init__(self, mf, kpts, pairs, tol=1.0e-8):
+        kpts = np.asarray(kpts, dtype=float)
+        if kpts.ndim != 2 or kpts.shape[1] != 3 or len(kpts) == 0:
+            raise ValueError("kpts must have shape (nkpts, 3) with at least one row.")
+        if not np.all(np.isfinite(kpts)):
+            raise ValueError("kpts must contain finite values.")
+
+        raw_pairs = np.asarray(pairs, dtype=object)
+        if raw_pairs.ndim != 2 or raw_pairs.shape[1] != 2 or len(raw_pairs) == 0:
+            raise ValueError("pairs must have shape (npairs, 2) with at least one row.")
+        normalized_pairs = []
+        for raw_left, raw_right in raw_pairs:
+            if isinstance(raw_left, (bool, np.bool_)) or isinstance(
+                raw_right,
+                (bool, np.bool_),
+            ):
+                raise TypeError("pairs must contain integer k-point indices.")
+            try:
+                left = int(raw_left.__index__())
+                right = int(raw_right.__index__())
+            except (AttributeError, TypeError) as exc:
+                raise TypeError(
+                    "pairs must contain integer k-point indices."
+                ) from exc
+            if left < 0 or right < 0 or left >= len(kpts) or right >= len(kpts):
+                raise IndexError("pairs contains an out-of-range k-point index.")
+            pair = (left, right)
+            if pair not in normalized_pairs:
+                normalized_pairs.append(pair)
+
+        self.reference = _KMeshReference(mf, kpts)
+        scaled_kpts = self.reference.cartesian_to_scaled(kpts)
+        scaled_qpts = [np.zeros(3, dtype=float)]
+        pairs_by_q = {0: []}
+        self.q_index_by_kpair = np.full(
+            (len(kpts), len(kpts)),
+            -1,
+            dtype=np.int64,
+        )
+        for left, right in normalized_pairs:
+            q_scaled = scaled_kpts[right] - scaled_kpts[left]
+            q_index = next(
+                (
+                    index
+                    for index, existing in enumerate(scaled_qpts)
+                    if np.max(np.abs(q_scaled - existing)) <= tol
+                ),
+                None,
+            )
+            if q_index is None:
+                q_index = len(scaled_qpts)
+                scaled_qpts.append(q_scaled)
+                pairs_by_q[q_index] = []
+            pairs_by_q[int(q_index)].append((left, right))
+            self.q_index_by_kpair[left, right] = int(q_index)
+
+        self.qpts = self.reference.scaled_to_cartesian(
+            np.asarray(scaled_qpts, dtype=float)
+        )
+        self.q0_index = 0
+        self._pairs_by_q = {
+            int(q_index): tuple(pair_rows)
+            for q_index, pair_rows in pairs_by_q.items()
+        }
+        self.pairs = tuple(normalized_pairs)
+        self.active_q_indices = tuple(
+            q_index
+            for q_index, pair_rows in self._pairs_by_q.items()
+            if pair_rows
+        )
+
+    def normalize_q_index(self, q_index):
+        index = int(q_index)
+        if index < 0 or index >= len(self.qpts):
+            raise IndexError(
+                f"q_index {index} is out of range for {len(self.qpts)} q points."
+            )
+        return index
+
+    def find_qpoint_index(self, qvec, tol=1.0e-8):
+        scaled = self.reference.cartesian_to_scaled(self.qpts)
+        target = self.reference.cartesian_to_scaled(qvec)
+        distances = np.max(np.abs(scaled - target), axis=1)
+        index = int(np.argmin(distances))
+        if distances[index] > tol:
+            raise ValueError("Requested q point is not present in the pair space.")
+        return index
+
+    def requested_pair_keys(self, q_index):
+        return self._pairs_by_q[self.normalize_q_index(q_index)]
+
+
 @dataclass
 class PeriodicGDF:
     """Persistent q-resolved periodic GDF backend.
@@ -305,6 +514,8 @@ class PeriodicGDF:
     _q_locks: list = field(init=False, repr=False)
     build_timings: dict = field(default_factory=dict, init=False)
     multi_q_build_timings: list = field(default_factory=list, init=False)
+    band_build_timings: dict = field(default_factory=dict, init=False)
+    pair_build_timings: dict = field(default_factory=dict, init=False)
 
     def __post_init__(self):
         mf = self.mf
@@ -1826,18 +2037,284 @@ class PeriodicGDF:
 
         return _pair_keys_for_q(self._space, self._space.normalize_q_index(q_index))
 
-    def get_jk(self, dm):
-        """Contract AO densities with persistent GDF factors."""
-
-        densities = [np.asarray(dm)] if self.nkpts == 1 and np.asarray(dm).ndim == 2 else list(dm)
+    def _density_blocks(self, dm):
+        densities = (
+            [np.asarray(dm)]
+            if self.nkpts == 1 and np.asarray(dm).ndim == 2
+            else list(dm)
+        )
         if len(densities) != self.nkpts:
             raise ValueError(
                 f"dm must provide one AO density for each of {self.nkpts} k-points."
             )
         nao = int(self.mf.cell.nao)
+        densities = [np.asarray(density) for density in densities]
         for density in densities:
             if density.shape != (nao, nao):
-                raise ValueError(f"Each AO density must have shape ({nao}, {nao}).")
+                raise ValueError(
+                    f"Each AO density must have shape ({nao}, {nao})."
+                )
+        return densities
+
+    def _pair_backend(self, space):
+        backend = PeriodicGDF(
+            self.mf,
+            g2_tol=self.g2_tol,
+            storage=self.storage,
+            max_memory_mb=self.max_memory_mb,
+            cache_dir=self.cache_dir,
+            release_raw_ao=self.release_raw_ao,
+            stream_pairs=self.stream_pairs,
+            stream_pair_batch_size=self.stream_pair_batch_size,
+            stream_pair_batch_mb=self.stream_pair_batch_mb,
+            folded_batch_mb=self.folded_batch_mb,
+        )
+        backend._space = space
+        backend._q_locks = [
+            threading.RLock() for _qvec in backend._space.qpts
+        ]
+        return backend
+
+    def _selected_pair_backend(self, band_kpts):
+        return self._pair_backend(_SelectedPairSpace(self.mf, band_kpts))
+
+    def get_pair_factors(self, kpts, pairs, mo_coeff, workers=None):
+        """Build MO GDF factors for explicitly requested arbitrary k pairs.
+
+        The returned tuple follows ``pairs``.  Each block has shape
+        ``(rank_q, nmo_left, nmo_right)``.  AO factors and build-only caches are
+        released before this method returns.
+        """
+
+        space = _RequestedPairSpace(self.mf, kpts, pairs)
+        raw_coefficients = np.asarray(mo_coeff)
+        if raw_coefficients.ndim == 2 and space.reference.nkpts == 1:
+            coefficients = [raw_coefficients]
+        else:
+            coefficients = [np.asarray(block) for block in mo_coeff]
+        if len(coefficients) != space.reference.nkpts:
+            raise ValueError("mo_coeff must provide one block for every k point.")
+        nao = int(self.mf.cell.nao)
+        for block in coefficients:
+            if np.asarray(block).ndim != 2 or np.asarray(block).shape[0] != nao:
+                raise ValueError(
+                    f"Each mo_coeff block must have shape ({nao}, nmo)."
+                )
+
+        requested_pairs = []
+        raw_pairs = np.asarray(pairs, dtype=object)
+        for raw_left, raw_right in raw_pairs:
+            requested_pairs.append(
+                (int(raw_left.__index__()), int(raw_right.__index__()))
+            )
+
+        started = time.perf_counter()
+        factor_seconds = 0.0
+        transform_seconds = 0.0
+        factor_bytes = 0
+        factors = []
+        backend = self._pair_backend(space)
+        with self._build_lock:
+            try:
+                with _temporary_gdf_cache_scope(self.mf):
+                    factor_started = time.perf_counter()
+                    backend.build(
+                        q_indices=space.active_q_indices,
+                        workers=workers,
+                    )
+                    factor_seconds = time.perf_counter() - factor_started
+                    factor_bytes = backend.memory_bytes + backend.disk_bytes
+
+                    transform_started = time.perf_counter()
+                    for left, right in requested_pairs:
+                        q_index = int(space.q_index_by_kpair[left, right])
+                        ao_factor = backend.cderi(q_index, left, right)
+                        block = np.einsum(
+                            "ui,Puv,vj->Pij",
+                            np.asarray(coefficients[left]).conj(),
+                            ao_factor,
+                            np.asarray(coefficients[right]),
+                            optimize=True,
+                        )
+                        factors.append(np.ascontiguousarray(block))
+                    transform_seconds = time.perf_counter() - transform_started
+            finally:
+                backend.close()
+
+        self.pair_build_timings = {
+            "kpoints": int(space.reference.nkpts),
+            "pairs": int(len(requested_pairs)),
+            "unique_pairs": int(len(space.pairs)),
+            "qpoints": int(len(space.active_q_indices)),
+            "factor_bytes": int(factor_bytes),
+            "factor_seconds": float(factor_seconds),
+            "transform_seconds": float(transform_seconds),
+            "output_bytes": int(sum(block.nbytes for block in factors)),
+            "total_seconds": float(time.perf_counter() - started),
+        }
+        return tuple(factors)
+
+    def _get_jk_at_kpts(self, densities, kpts_band, workers=None):
+        requested = np.asarray(kpts_band, dtype=float)
+        single_kpt = requested.ndim == 1
+        if single_kpt:
+            if requested.shape != (3,):
+                raise ValueError("kpts_band must have shape (nband, 3) or (3,).")
+            requested = requested.reshape(1, 3)
+        elif requested.ndim != 2 or requested.shape[1] != 3:
+            raise ValueError("kpts_band must have shape (nband, 3) or (3,).")
+        if not np.all(np.isfinite(requested)):
+            raise ValueError("kpts_band must contain finite values.")
+
+        mesh_matches = []
+        off_mesh = []
+        off_mesh_rows = []
+        for row, kvec in enumerate(requested):
+            distances = np.max(
+                np.abs(np.asarray(self.mf.kpts, dtype=float) - kvec),
+                axis=1,
+            )
+            match = int(np.argmin(distances))
+            if distances[match] <= 1.0e-8:
+                mesh_matches.append(match)
+            else:
+                mesh_matches.append(None)
+                off_mesh.append(kvec)
+                off_mesh_rows.append(row)
+
+        mesh_vj = mesh_vk = None
+        if any(index is not None for index in mesh_matches):
+            mesh_vj, mesh_vk = self.get_jk(densities)
+        nao = int(self.mf.cell.nao)
+        vj = np.zeros((len(requested), nao, nao), dtype=np.complex128)
+        vk = np.zeros_like(vj)
+        for row, mesh_index in enumerate(mesh_matches):
+            if mesh_index is not None:
+                vj[row] = mesh_vj[mesh_index]
+                vk[row] = mesh_vk[mesh_index]
+
+        started = time.perf_counter()
+        factor_seconds = 0.0
+        contraction_seconds = 0.0
+        qpoints = 0
+        factor_bytes = 0
+        if off_mesh:
+            backend = self._selected_pair_backend(off_mesh)
+            try:
+                with _temporary_gdf_cache_scope(self.mf):
+                    factor_started = time.perf_counter()
+                    backend.build(q_indices=range(len(backend.qpts)), workers=workers)
+                    factor_seconds = time.perf_counter() - factor_started
+                    qpoints = len(backend.qpts)
+                    factor_bytes = backend.memory_bytes + backend.disk_bytes
+
+                    contraction_started = time.perf_counter()
+                    q0 = backend._space.q0_index
+                    density_factor = None
+                    for mesh_index, density in zip(
+                        backend._space.mesh_indices,
+                        densities,
+                    ):
+                        block = backend._resolve_factor(
+                            backend._cderi_factor(q0, mesh_index, mesh_index)
+                        )
+                        if density_factor is None:
+                            rank = (
+                                block.rank
+                                if isinstance(block, PackedHermitianCDERI)
+                                else block.shape[0]
+                            )
+                            density_factor = np.zeros(
+                                rank,
+                                dtype=np.complex128,
+                            )
+                        if isinstance(block, PackedHermitianCDERI):
+                            density_factor += block.contract_density(density)
+                        else:
+                            density_factor += np.einsum(
+                                "Pij,ji->P",
+                                block,
+                                density,
+                                optimize=True,
+                            )
+                    density_factor /= self.nkpts
+
+                    for output_row, band_index in zip(
+                        off_mesh_rows,
+                        backend._space.band_indices,
+                    ):
+                        diagonal = backend.cderi(q0, band_index, band_index)
+                        j_block = np.einsum(
+                            "Pij,P->ij",
+                            diagonal,
+                            density_factor.conj(),
+                            optimize=True,
+                        )
+                        vj[output_row] = 0.5 * (
+                            j_block + j_block.conj().T
+                        )
+                        k_block = np.zeros(
+                            (nao, nao),
+                            dtype=np.complex128,
+                        )
+                        for mesh_index, density in zip(
+                            backend._space.mesh_indices,
+                            densities,
+                        ):
+                            q_index = int(
+                                backend._space.q_index_by_kpair[
+                                    mesh_index,
+                                    band_index,
+                                ]
+                            )
+                            block = backend.cderi(
+                                q_index,
+                                mesh_index,
+                                band_index,
+                            )
+                            block = block.conj().transpose(0, 2, 1)
+                            k_block += np.einsum(
+                                "Pim,mn,Pjn->ij",
+                                block,
+                                density,
+                                block.conj(),
+                                optimize=True,
+                            )
+                        k_block /= self.nkpts
+                        vk[output_row] = 0.5 * (
+                            k_block + k_block.conj().T
+                        )
+                    contraction_seconds = (
+                        time.perf_counter() - contraction_started
+                    )
+            finally:
+                backend.close()
+
+        self.band_build_timings = {
+            "band_kpoints": int(len(requested)),
+            "off_mesh_kpoints": int(len(off_mesh)),
+            "qpoints": int(qpoints),
+            "factor_bytes": int(factor_bytes),
+            "factor_seconds": float(factor_seconds),
+            "contraction_seconds": float(contraction_seconds),
+            "total_seconds": float(time.perf_counter() - started),
+        }
+        if single_kpt:
+            return vj[0], vk[0]
+        return vj, vk
+
+    def get_jk(self, dm, kpts_band=None, workers=None):
+        """Contract AO densities on the SCF mesh or arbitrary band k points."""
+
+        densities = self._density_blocks(dm)
+        if kpts_band is not None:
+            with self._build_lock:
+                return self._get_jk_at_kpts(
+                    densities,
+                    kpts_band,
+                    workers=workers,
+                )
+        nao = int(self.mf.cell.nao)
 
         q0 = self._space.q0_index
         density_factor = None
@@ -2004,6 +2481,8 @@ class PeriodicGDF:
             self._q_metadata.clear()
             self.build_timings.clear()
             self.multi_q_build_timings.clear()
+            self.band_build_timings.clear()
+            self.pair_build_timings.clear()
             self._memory_bytes = 0
             self._configuration_key = None
             for filename in files:

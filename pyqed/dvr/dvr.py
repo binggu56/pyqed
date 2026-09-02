@@ -120,6 +120,10 @@ class DVR:
         self.names = names
         self.axis_by_name = {name: axis for axis, name in enumerate(names)}
         self.axes = axes
+        self.periodic_axes = tuple(
+            index for index, axis in enumerate(axes)
+            if bool(getattr(axis, "periodic", False))
+        )
         self.dvr = self.axes
         self.x = tuple(np.asarray(axis.x) for axis in axes)
         self.shape = tuple(int(axis.npts) for axis in axes)

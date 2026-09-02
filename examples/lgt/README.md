@@ -128,6 +128,63 @@ Dense spectral hops carry unique non-wrapping Wilson lines, and all local
 Gauss laws are exact MPS quantum numbers.  Its finite-state hopping MPO has
 an exact bond dimension linear in the number of DVR cells.
 
+`open_sine_dvr_n40_mv_ms.py` provides a checkpointed (M_V,M_S) driver.
+Use `--readiness-only` for the bounded MPO and ground-state diagnostic; the
+production mode additionally constructs the two channel sources and runs the
+full TDVP windows.  A pole is reported only when at least three matrix-pencil
+ranks support it, so under-resolved pilots are saved as explicit rejected-pole
+diagnostics rather than forced mass estimates.
+
+```bash
+PYTHONPATH=. OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+python examples/lgt/open_sine_dvr_n40_mv_ms.py --readiness-only
+```
+
+For an open interval, `OpenSineMatterDVRMPO` instead solves Gauss's law before
+building the MPS,
+
+$$
+L_n=L_{\mathrm{left}}-\sum_{j=0}^{n}q_j,
+$$
+
+uses boundary-Wilson-line-dressed matter fields to fix the open links to one,
+and represents the electric energy as a bond-three cumulative-charge MPO.  The
+chain then has `N` four-state matter sites rather than `2*N-1` alternating
+matter/link sites, and there is no independent flux cutoff.  This is exact for
+fixed boundary flux and total charge.  It follows the established interval
+reduction used by M. C. Bañuls
+et al., *JHEP* **11**, 158 (2013), DOI: 10.1007/JHEP11(2013)158, with boundary
+details reviewed by T. Okuda, *Phys. Rev. D* **107**, 054506 (2023), DOI:
+10.1103/PhysRevD.107.054506.  Applying it to the paired DCT-IV/DST-IV regulator
+is a new adaptation, not a reproduction of those staggered calculations.
+
+The same checkpointed mass driver selects this representation with
+`--eliminate-links`.  `open_sine_matter_dvr_benchmark.py` validates `H`, `M_V`,
+and `M_S` against the explicit-link physical sector, then profiles the current
+DMRG/TDVP implementation:
+
+```bash
+PYTHONPATH=. OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 \
+python examples/lgt/open_sine_matter_dvr_benchmark.py
+```
+
+The reduction lowers chain length and MPO setup cost, but the present MPS
+backend stores only the remaining global U(1) charge blocks.  Those blocks are
+coarser than the explicit formulation's site-by-site Gauss blocks.  The
+included benchmark therefore treats the interrupted `N=40, D=128` half-sweep
+as a performance lower bound, not as a converged mass calculation.
+
+`build_factorized_mpos()` also exposes the exact separable derivative as a sum
+of `N+1` compact MPOs: one bond-six Wilson-string automaton per spectral mode
+plus one bond-two electric/mass component.  The companion
+`open_sine_dvr_factorized_tdvp_benchmark.py` compares this experimental dense
+sum-TDVP route with the single-MPO and exact-Gauss paths.  It is a validation
+and profiling alternative, not the production default: at the tested sizes,
+the component and dense-environment overhead outweighs the smaller individual
+MPO bonds.
+
 This is an open-boundary spectral adaptation rather than an exact reproduction
 of a published DVR lattice Hamiltonian.  The gauge construction follows
 J. Kogut and L. Susskind, *Phys. Rev. D* **11**, 395 (1975), DOI:

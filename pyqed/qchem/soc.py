@@ -342,7 +342,7 @@ def spatial_soc_to_spin_orbital(hso_xyz, order='interleaved'):
     ], dtype=complex)
     n = hso_xyz.shape[-1]
     mat = np.einsum('sxy,spq->xpyq', pauli, hso_xyz).reshape(2 * n, 2 * n)
-    return reorder_spin_orbital_matrix(mat, source='interleaved', target=order)
+    return reorder_spin_orbital_matrix(mat, source='grouped', target=order)
 
 
 def get_soc_1e_spin_orbital(mf, representation='mo', mo_coeff=None,

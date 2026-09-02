@@ -204,6 +204,29 @@ The API returns both Cartesian force constants and signed frequencies:
    force_constants = hessian.kernel(second_derivative_backend="analytic")
    frequencies_cm1 = hessian.frequencies()
 
+Both the analytic Gamma Hessian and ``FiniteDisplacementPhonon`` expose one
+branch through ``mode(qpoint, branch)``.  The returned
+``PeriodicPhononMode`` carries the signed frequency in atomic units and the
+unit-norm eigenvector of the mass-weighted dynamical matrix,
+
+.. math::
+
+   \sum_{B\beta}D_{A\alpha,B\beta}(q)e_{B\beta}^{q\nu}
+   =\omega_{q\nu}^{2}e_{A\alpha}^{q\nu},
+   \qquad
+   \sum_{A\alpha}|e_{A\alpha}^{q\nu}|^2=1.
+
+Its ``cartesian_displacement`` property is
+
+.. math::
+
+   u_{A\alpha}^{q\nu}
+   =\frac{e_{A\alpha}^{q\nu}}{\sqrt{M_A}}.
+
+Fractional reciprocal coordinates are stored explicitly.  A deterministic
+global phase is chosen for each eigenvector; only sums over a degenerate mode
+subspace are gauge invariant when branches are exactly degenerate.
+
 The default ``second_derivative_backend="auto"`` selects the analytic path
 when available.  ``"finite_difference"`` keeps the derivative-difference
 backend available for validation; only that backend uses ``step``.
@@ -291,6 +314,24 @@ reproducible with
 
    PYTHONPATH=. python examples/pbc_gamma_hessian.py \
        --output /private/tmp/pbc_gamma_hessian.pdf
+
+The native phonon-to-exciton interface is exercised by
+
+.. code-block:: console
+
+   PYTHONPATH=. python examples/pbc_lih_exciton_phonon_convergence.py \
+       --native-phonons --structure molecular --lattice-constant 7.0 \
+       --meshes 2 --recip-cuts 2 --skip-validation
+
+This periodic molecular-cell run selects a stable internal branch and is an
+engine qualification; several low-frequency branches of the compact model
+remain imaginary and are not a mechanically stable material reference.  The
+rocksalt KRHF references tested at :math:`a=7.72\,a_0` have imaginary harmonic
+modes and are rejected by the coupling driver.  A rocksalt material benchmark
+therefore requires a mechanically stable electronic reference, expected to be
+periodic DFT rather than the present KRHF force driver.  Converged material predictions
+require supercell, displacement, force, k-mesh, q-mesh, orbital-basis, and
+auxiliary-basis convergence.
 
 PySCF Benchmark
 ---------------

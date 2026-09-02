@@ -1,0 +1,23 @@
+{
+  "npts": 12,
+  "bond_dim": 32,
+  "dt": 0.1,
+  "dense_single_seconds": 1.5907276661600918,
+  "dense_factorized_seconds": 2.723295833915472,
+  "symmetric_single_seconds": 1.0787517079152167,
+  "dense_single_backend": "single-MPO TDVP",
+  "dense_factorized_backend": "compiled-sum-tdvp-sweep",
+  "symmetric_single_backend": "exact-Gauss block-sparse",
+  "factorized_infidelity_vs_dense_single": 1.1102230246251565e-15,
+  "symmetric_infidelity_vs_dense_single": 3.1086244689504383e-15,
+  "factorized_components": 13,
+  "factorized_max_mpo_bond": 6,
+  "single_raw_mpo_bond": 46,
+  "large_npts": 40,
+  "large_bond_dim": 128,
+  "large_factorized_vacuum_seconds": 834.5891739591025,
+  "large_factorized_peak_memory_gb": 11.9,
+  "large_symmetric_excited_seconds_lower_bound": 1200.0,
+  "large_symmetric_peak_memory_gb": 6.0,
+  "large_comparison_caveat": "The factorized measurement used the vacuum while the symmetric lower bound used the vector source; compare only as feasibility data."
+}

@@ -392,5 +392,33 @@ class KRHFHessian:
             return np.array(values, copy=True), eigenvectors
         return np.array(values, copy=True)
 
+    def mode(self, qpoint, branch):
+        """Return one analytic Gamma-point mass-weighted phonon mode."""
+
+        from pyqed.pbc.phonon import PeriodicPhononMode, _normalize_branch
+
+        qpoint = np.asarray(qpoint, dtype=float)
+        if qpoint.shape != (3,) or not np.all(np.isfinite(qpoint)):
+            raise ValueError("qpoint must contain three finite fractional coordinates.")
+        if np.max(np.abs(qpoint - np.rint(qpoint)), initial=0.0) > 1.0e-10:
+            raise ValueError("KRHFHessian provides Gamma-point phonon modes only.")
+        frequencies, eigenvectors = self.frequencies(
+            units="au",
+            return_eigenvectors=True,
+        )
+        branch = _normalize_branch(branch, len(frequencies))
+        masses = np.asarray(
+            self.cell.unit_molecule.atom_mass_list(),
+            dtype=float,
+        ) * amu_to_au
+        return PeriodicPhononMode(
+            qpoint=np.zeros(3),
+            branch=branch,
+            frequency=frequencies[branch],
+            eigenvector=eigenvectors[:, branch],
+            masses=masses,
+            source=type(self).__name__,
+        )
+
 
 __all__ = ["KRHFHessian"]

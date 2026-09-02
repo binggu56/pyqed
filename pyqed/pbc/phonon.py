@@ -2,12 +2,97 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from itertools import product
 import time
 
 import numpy as np
 
 from pyqed.units import amu_to_au, au2wavenumber
+
+
+def _normalize_qpoint(qpoint):
+    qpoint = np.asarray(qpoint, dtype=float)
+    if qpoint.shape != (3,) or not np.all(np.isfinite(qpoint)):
+        raise ValueError("qpoint must contain three finite fractional coordinates.")
+    return np.ascontiguousarray(qpoint)
+
+
+def _normalize_branch(branch, nmode):
+    if isinstance(branch, (bool, np.bool_)):
+        raise TypeError("branch must be an integer.")
+    try:
+        index = int(branch)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise TypeError("branch must be an integer.") from exc
+    if index != branch:
+        raise TypeError("branch must be an integer.")
+    if index < 0 or index >= int(nmode):
+        raise IndexError(f"branch {index} is out of range for {nmode} phonon modes.")
+    return index
+
+
+def _canonicalize_eigenvector(eigenvector):
+    vector = np.asarray(eigenvector, dtype=np.complex128).reshape(-1)
+    norm = float(np.linalg.norm(vector))
+    if not np.isfinite(norm) or norm == 0.0:
+        raise ValueError("phonon eigenvector must have finite nonzero norm.")
+    vector = vector / norm
+    pivot = int(np.argmax(np.abs(vector)))
+    vector *= np.exp(-1.0j * np.angle(vector[pivot]))
+    if np.max(np.abs(vector.imag), initial=0.0) <= 1.0e-13:
+        vector = vector.real.astype(np.complex128)
+    return vector
+
+
+@dataclass(frozen=True)
+class PeriodicPhononMode:
+    r"""One normalized harmonic mode at a fractional reciprocal point.
+
+    ``eigenvector`` is the unit-norm eigenvector of the mass-weighted
+    dynamical matrix.  The Cartesian displacement per unit mass-weighted
+    coordinate is therefore :math:`e_{A\alpha}/\sqrt{M_A}`.
+    ``frequency`` is the signed harmonic frequency in atomic units.
+    """
+
+    qpoint: np.ndarray
+    branch: int
+    frequency: float
+    eigenvector: np.ndarray
+    masses: np.ndarray
+    source: str = "periodic_phonon"
+
+    def __post_init__(self):
+        qpoint = _normalize_qpoint(self.qpoint)
+        masses = np.asarray(self.masses, dtype=float)
+        if masses.ndim != 1 or len(masses) == 0 or np.any(masses <= 0.0):
+            raise ValueError("masses must contain one positive atomic-unit mass per atom.")
+        eigenvector = _canonicalize_eigenvector(self.eigenvector)
+        if eigenvector.size != 3 * len(masses):
+            raise ValueError("eigenvector must contain three components per atom.")
+        frequency = float(self.frequency)
+        if not np.isfinite(frequency):
+            raise ValueError("frequency must be finite.")
+        branch = _normalize_branch(self.branch, eigenvector.size)
+        qpoint.setflags(write=False)
+        masses = np.ascontiguousarray(masses)
+        masses.setflags(write=False)
+        eigenvector = np.ascontiguousarray(eigenvector.reshape(len(masses), 3))
+        eigenvector.setflags(write=False)
+        object.__setattr__(self, "qpoint", qpoint)
+        object.__setattr__(self, "branch", branch)
+        object.__setattr__(self, "frequency", frequency)
+        object.__setattr__(self, "eigenvector", eigenvector)
+        object.__setattr__(self, "masses", masses)
+        object.__setattr__(self, "source", str(self.source))
+
+    @property
+    def stable(self):
+        return self.frequency > 0.0
+
+    @property
+    def cartesian_displacement(self):
+        return self.eigenvector / np.sqrt(self.masses)[:, None]
 
 
 def _normalize_supercell(supercell):
@@ -403,6 +488,26 @@ class FiniteDisplacementPhonon:
             return frequencies, eigenvectors
         return frequencies
 
+    def mode(self, qpoint, branch):
+        """Return one mass-weighted phonon mode in atomic units."""
+
+        qpoint = _normalize_qpoint(qpoint)
+        matrix = self.dynamical_matrix(qpoint)
+        if np.max(np.abs(matrix.imag), initial=0.0) <= 1.0e-13:
+            eigenvalues, eigenvectors = np.linalg.eigh(matrix.real)
+        else:
+            eigenvalues, eigenvectors = np.linalg.eigh(matrix)
+        branch = _normalize_branch(branch, len(eigenvalues))
+        frequency = np.sign(eigenvalues[branch]) * np.sqrt(abs(eigenvalues[branch]))
+        return PeriodicPhononMode(
+            qpoint=qpoint,
+            branch=branch,
+            frequency=frequency,
+            eigenvector=eigenvectors[:, branch],
+            masses=self.masses * amu_to_au,
+            source=type(self).__name__,
+        )
+
     def band_structure(
         self,
         vertices,
@@ -444,6 +549,7 @@ Phonon = FiniteDisplacementPhonon
 __all__ = [
     "FiniteDisplacementPhonon",
     "KRHFForceCalculator",
+    "PeriodicPhononMode",
     "Phonon",
     "interpolate_q_path",
 ]

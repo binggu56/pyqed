@@ -14,7 +14,7 @@ from pyqed.pbc.gw import (
     KPointTransitionSpace,
     diagonal_g0w0,
     gamma_gdf_g0w0_energy_derivative,
-    gamma_tda_electron_phonon_coupling,
+    phonon_tda_electron_phonon_coupling,
     periodic_bse_matrices,
     periodic_tda_operator,
 )
@@ -114,7 +114,8 @@ def run(output):
         raise RuntimeError("No stable nonzero Gamma phonon mode was found")
     branch = int(positive[np.argmax(hessian.freq_au[positive])])
     frequency = float(hessian.freq_au[branch])
-    mode = modes[:, branch]
+    phonon_mode = hessian.mode([0.0, 0.0, 0.0], branch)
+    mode = phonon_mode.eigenvector.real
 
     space = KPointTransitionSpace(mean_field, qpts="gamma")
     operator = periodic_tda_operator(
@@ -135,11 +136,11 @@ def run(output):
         if transition.occ_band == occupied_band
         and transition.vir_band == virtual_band
     )
-    coupling = gamma_tda_electron_phonon_coupling(
+    coupling = phonon_tda_electron_phonon_coupling(
         operator,
-        mode,
-        frequency,
-        branch=branch,
+        hessian,
+        0,
+        branch,
         kernel_derivative="screened_gdf",
         cphf_tol=1.0e-11,
     )

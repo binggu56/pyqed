@@ -33,6 +33,127 @@ class SingletTripletSOCResult:
     hso: np.ndarray
 
 
+def spin_lower(ci, source_basis, target_basis):
+    r"""Apply $S_- = \sum_p a^\dagger_{p\beta}a_{p\alpha}$ to a CI vector."""
+
+    source_occupations = np.asarray(source_basis, dtype=np.int8)
+    target_occupations = np.asarray(target_basis, dtype=np.int8)
+    if source_occupations.ndim != 3 or source_occupations.shape[1] != 2:
+        raise TypeError("source_basis must contain alpha/beta occupations")
+    if target_occupations.ndim != 3 or target_occupations.shape[1] != 2:
+        raise TypeError("target_basis must contain alpha/beta occupations")
+    source = np.asarray(ci).reshape(-1)
+    if len(source) != len(source_occupations):
+        raise ValueError("CI vector and source determinant basis differ in size")
+    dtype = np.result_type(source.dtype, complex)
+    output = np.zeros(len(target_occupations), dtype=dtype)
+    target_lookup = {
+        occupation.tobytes(): index
+        for index, occupation in enumerate(target_occupations)
+    }
+    nalpha = int(np.sum(source_occupations[0, 0]))
+    for determinant, (alpha, beta) in enumerate(source_occupations):
+        for orbital in np.flatnonzero(alpha):
+            if beta[orbital]:
+                continue
+            lowered_alpha = alpha.copy()
+            lowered_alpha[orbital] = 0
+            raised_beta = beta.copy()
+            raised_beta[orbital] = 1
+            target = target_lookup.get(
+                np.stack((lowered_alpha, raised_beta)).tobytes()
+            )
+            if target is None:
+                continue
+            alpha_sign = -1 if int(np.sum(alpha[:orbital])) % 2 else 1
+            beta_parity = int(nalpha - 1 + np.sum(beta[:orbital]))
+            beta_sign = -1 if beta_parity % 2 else 1
+            output[target] += alpha_sign * beta_sign * source[determinant]
+    return output
+
+
+def align_triplet_multiplet_phases(triplets, *, tolerance=1.0e-6):
+    r"""Fix relative $M_S$ phases using exact spin-ladder matrix elements.
+
+    The $M_S=0$ roots define the phase reference.  The $M_S=+1$ and $-1$
+    roots are rephased so both adjacent $S_-$ matrix elements are positive.
+    Only scalar phases are applied; roots are never mixed or unitarized.
+    """
+
+    missing = set((-1, 0, 1)).difference(triplets)
+    if missing:
+        raise ValueError(f"triplets lacks M_S sectors {sorted(missing)}")
+    root_count = len(triplets[0].ci)
+    if any(len(triplets[ms].ci) != root_count for ms in (-1, 1)):
+        raise ValueError("triplet M_S sectors must contain the same roots")
+
+    plus_to_zero = np.asarray(
+        [
+            [
+                np.vdot(
+                    triplets[0].ci[left],
+                    spin_lower(
+                        triplets[1].ci[right],
+                        triplets[1].binary,
+                        triplets[0].binary,
+                    ),
+                )
+                for right in range(root_count)
+            ]
+            for left in range(root_count)
+        ]
+    )
+    zero_to_minus = np.asarray(
+        [
+            [
+                np.vdot(
+                    triplets[-1].ci[left],
+                    spin_lower(
+                        triplets[0].ci[right],
+                        triplets[0].binary,
+                        triplets[-1].binary,
+                    ),
+                )
+                for right in range(root_count)
+            ]
+            for left in range(root_count)
+        ]
+    )
+    diagonal_plus = np.diag(plus_to_zero)
+    diagonal_minus = np.diag(zero_to_minus)
+    expected = np.sqrt(2.0)
+    off_diagonal = max(
+        np.linalg.norm(plus_to_zero - np.diag(diagonal_plus)),
+        np.linalg.norm(zero_to_minus - np.diag(diagonal_minus)),
+    )
+    amplitude_error = max(
+        np.max(np.abs(np.abs(diagonal_plus) - expected)),
+        np.max(np.abs(np.abs(diagonal_minus) - expected)),
+    )
+    if max(off_diagonal, amplitude_error) > float(tolerance):
+        raise RuntimeError(
+            "triplet roots do not form matched spin-one multiplets: "
+            f"off-diagonal={off_diagonal:.3e}, amplitude error={amplitude_error:.3e}"
+        )
+
+    plus_phases = np.conj(diagonal_plus) / np.abs(diagonal_plus)
+    minus_phases = diagonal_minus / np.abs(diagonal_minus)
+    triplets[1].ci = [
+        phase * np.asarray(state)
+        for phase, state in zip(plus_phases, triplets[1].ci)
+    ]
+    triplets[-1].ci = [
+        phase * np.asarray(state)
+        for phase, state in zip(minus_phases, triplets[-1].ci)
+    ]
+    return {
+        "off_diagonal": float(off_diagonal),
+        "amplitude_error": float(amplitude_error),
+        "plus_phases": plus_phases,
+        "minus_phases": minus_phases,
+    }
+
+
 def _normalize_states(states):
     if not states:
         raise ValueError("states must contain at least one CASCI state.")
@@ -222,6 +343,7 @@ def st_soc(
         ms: _run_casci(ms2=2 * ms, multiplicity=3, root=triplet_root)
         for ms in (-1, 0, 1)
     }
+    align_triplet_multiplet_phases(triplets)
 
     states = [(singlet, singlet_root)] + [
         (triplets[ms], triplet_root) for ms in (-1, 0, 1)
