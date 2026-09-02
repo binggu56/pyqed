@@ -700,8 +700,19 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         update["solver_info"]["projected_route_validation_error"]
         for update in fused
     ) < 1.0e-12
-    assert state._projected_route_cache_hits > 0
-    assert state._metric_component_cache_hits > 0
+    certified = [
+        update for row in state.history for update in row["updates"]
+        if update["solver_info"]["davidson"].get(
+            "stationary_residual_certificate", False
+        )
+    ]
+    assert state._projected_route_cache_hits > 0 or certified
+    assert (
+        state._metric_component_cache_hits > 0
+        or state._stationary_certificate_cache_hits > 0
+    )
+    assert state._stationary_certificate_cache_hits > 0
+    assert cycle["environment_chain_reuses"] > 0
     assert state._embedding_basis_cache_hits > 0
     assert all(
         update["solver_info"]["route_backend"]
@@ -722,12 +733,13 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         in {
             "projected_diagonal_seed_constant_shift",
             "native_constant_shift",
+            "stationary_residual_certificate",
         }
         for update in cycle["updates"]
     )
     assert any(
         update["solver_info"]["davidson"].get("native_davidson", False)
-        for update in cycle["updates"]
+        for row in state.history for update in row["updates"]
     )
     assert max(
         update["solver_info"]["davidson"]["orthonormality_error"]
@@ -735,6 +747,17 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
     ) < 1.0e-10
     assert cycle["energy"] == pytest.approx(state.expectation(), abs=2.0e-10)
     assert cycle["norm"] == pytest.approx(state.norm(), abs=2.0e-10)
+    revision = state._state_revision
+    original = state._pack_site(0)
+    changed = np.array(original, copy=True)
+    changed[0] += 1.0e-8
+    state._set_site_vector(0, changed)
+    assert state._state_revision > revision
+    assert all(
+        int(record[0]) != state._state_revision
+        for record in state._stationary_certificate_cache.values()
+    )
+    state._set_site_vector(0, original)
 
 
 def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
@@ -957,6 +980,40 @@ def test_su2_letta_checkpoint_resume_preserves_state_and_diagnostics(tmp_path):
     )
     assert len(restored.history) == 2
     assert restored.history[-1]["sweep"] == 2
+
+
+def test_su2_letta_final_only_checkpoint_avoids_cycle_deep_copies(
+    tmp_path, monkeypatch
+):
+    state = SU2LETTA.from_integrals(
+        np.array([[0.0, -1.0], [-1.0, 0.0]]),
+        nelec=2,
+        spin=0,
+        graph="nn",
+        D=1,
+        seed=4,
+    )
+    checkpoint = tmp_path / "su2-letta-final.chk"
+    writes = []
+    save_checkpoint = state.save_checkpoint
+
+    def counted_save(path):
+        writes.append(path)
+        save_checkpoint(path)
+
+    monkeypatch.setattr(state, "save_checkpoint", counted_save)
+    state.run(
+        nsweeps=2,
+        algorithm="projected",
+        tol=0.0,
+        checkpoint=checkpoint,
+        checkpoint_every="final",
+    )
+
+    assert writes == [checkpoint]
+    restored = SU2LETTA.load_checkpoint(checkpoint)
+    assert restored.history == state.history
+    assert restored.energy == pytest.approx(state.energy, abs=2.0e-12)
 
 
 def test_auto_solver_always_selects_the_exact_reduced_path():

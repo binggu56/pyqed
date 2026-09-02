@@ -716,6 +716,9 @@ class NonAbelianFrontierLETTA:
         self._metric_component_topology_cache = {}
         self._metric_component_cache_hits = 0
         self._metric_component_cache_misses = 0
+        self._state_revision = 0
+        self._stationary_certificate_cache = {}
+        self._stationary_certificate_cache_hits = 0
         self._materialized_site_cache = {}
         self._materialized_site_cache_hits = 0
         self._materialized_site_cache_misses = 0
@@ -1184,6 +1187,7 @@ class NonAbelianFrontierLETTA:
                     }
                 )
         if any(bool(update.get("applied", False)) for update in updates):
+            self._state_revision += 1
             self._invalidate_materialized_sites(bond, bond + 1)
         return tuple(updates)
 
@@ -1550,6 +1554,8 @@ class NonAbelianFrontierLETTA:
         if offset != vector.size:
             raise ValueError("local SU2LETTA parameter vector has the wrong size.")
         self.tensors[site] = updated
+        if not np.array_equal(vector, previous):
+            self._state_revision += 1
         cached = self._materialized_site_cache.get(int(site))
         route = self._we_route_cache.get(int(site))
         if (
@@ -3578,6 +3584,28 @@ class NonAbelianFrontierLETTA:
         requested_solver = str(solver).lower().replace("-", "_")
         if bond is None:
             bond = site if site < self.nsites - 1 else site - 1
+        cached_certificate = self._stationary_certificate_cache.get(site)
+        if (
+            environment_sweeps is not None
+            and requested_solver in {"auto", "wigner_eckart"}
+            and cached_certificate is not None
+            and int(cached_certificate[0]) == int(self._state_revision)
+            and float(cached_certificate[1]) <= float(davidson_tol)
+        ):
+            update = copy.deepcopy(cached_certificate[2])
+            update["requested_solver"] = requested_solver
+            update["auto_selected"] = requested_solver == "auto"
+            update["magnetic_expansion_factor"] = float(
+                self._magnetic_expansion_factor(bond)
+            )
+            davidson = update["solver_info"]["davidson"]
+            davidson["stationary_certificate_cache_hit"] = True
+            davidson["certificate_source_bond"] = int(
+                cached_certificate[3]
+            )
+            update["solver_info"]["environment_reused"] = True
+            self._stationary_certificate_cache_hits += 1
+            return update
         solver = self._select_local_solver(requested_solver)
         matrix_free = False
         solver_info = {}
@@ -3695,6 +3723,118 @@ class NonAbelianFrontierLETTA:
             whitened_current = (
                 whitener.conj().T @ projected_metric.matvec(current_reduced)
             )
+            current_coordinate_norm = float(np.linalg.norm(whitened_current))
+            if current_coordinate_norm <= np.finfo(float).tiny:
+                raise np.linalg.LinAlgError(
+                    "the current local SU2LETTA vector is outside the retained "
+                    "metric range."
+                )
+            normalized_current = whitened_current / current_coordinate_norm
+            current_projected_h = (
+                whitener.conj().T @ current_h / current_coordinate_norm
+            )
+            current_local_energy = float(
+                np.real(np.vdot(normalized_current, current_projected_h))
+            )
+            current_residual = float(
+                np.linalg.norm(
+                    current_projected_h
+                    - current_local_energy * normalized_current
+                )
+            )
+            reconstructed_current = whitener @ whitened_current
+            reconstruction_delta = reconstructed_current - current_reduced
+            reconstruction_error = float(
+                np.sqrt(max(
+                    np.real(np.vdot(
+                        reconstruction_delta,
+                        projected_metric.matvec(reconstruction_delta),
+                    )) / max(float(denominator), np.finfo(float).tiny),
+                    0.0,
+                ))
+            )
+            stationary_certificate = bool(
+                current_residual <= float(davidson_tol)
+                and reconstruction_error
+                <= max(1.0e-11, 0.1 * float(davidson_tol))
+            )
+            if stationary_certificate:
+                cached_krylov = self._projected_krylov_cache.get(
+                    (int(site), int(bond))
+                )
+                recycled_vectors = int(
+                    0
+                    if cached_krylov is None
+                    else cached_krylov.shape[1]
+                )
+                orthonormality_error = float(
+                    np.linalg.norm(
+                        whitener.conj().T
+                        @ projected_metric.matvec(whitener)
+                        - np.eye(whitener.shape[1])
+                    )
+                )
+                solver_info["projected_action_backend"] = (
+                    "certified_current_residual"
+                )
+                solver_info["davidson"] = {
+                    "metric": current_residual,
+                    "residual": current_residual,
+                    "davidson_iterations": 0,
+                    "davidson_converged": True,
+                    "subspace_dim": 1,
+                    "restarts": 0,
+                    "packed_dimension": int(whitener.shape[1]),
+                    "native_davidson": False,
+                    "stationary_residual_certificate": True,
+                    "reconstruction_error": reconstruction_error,
+                    "recycled_vectors": recycled_vectors,
+                    "transported_ritz_vectors": recycled_vectors,
+                    "fused_cpp_action": False,
+                    "preconditioner_mode": "stationary_residual_certificate",
+                    "metric_rank": int(whitener.shape[1]),
+                    "metric_nullity": int(support.size - whitener.shape[1]),
+                    "metric_condition": float(
+                        np.max(retained_metric) / np.min(retained_metric)
+                    ),
+                    "orthonormality_error": orthonormality_error,
+                    "metric_whitening_backend": whitening_backend,
+                }
+                update = {
+                    "site": site,
+                    "energy_before": float(before),
+                    "energy_after": float(before),
+                    "local_energy": float(current_local_energy + self.ecore),
+                    "support": int(support.size),
+                    "parameters": int(current.size),
+                    "accepted": True,
+                    "stationary": True,
+                    "stationary_step": 0.0,
+                    "norm_before": float(denominator),
+                    "norm_after": float(denominator),
+                    "native_su2": True,
+                    "solver": solver,
+                    "requested_solver": requested_solver,
+                    "auto_selected": requested_solver == "auto",
+                    "workers": int(self.workers),
+                    "fully_wigner_eckart_reduced": True,
+                    "matrix_free": True,
+                    "local_linear_algebra": (
+                        "metric_orthonormal_projected_davidson"
+                    ),
+                    "solver_info": solver_info,
+                    "magnetic_expansion_factor": float(
+                        self._magnetic_expansion_factor(bond)
+                    ),
+                    "environment_backend": self.local_environment_backend,
+                }
+                self._stationary_certificate_cache[site] = (
+                    int(self._state_revision),
+                    current_residual,
+                    copy.deepcopy(update),
+                    int(bond),
+                )
+                return update
             orthonormal_design = np.ascontiguousarray(
                 projected_design @ whitener
             )
@@ -4007,9 +4147,18 @@ class NonAbelianFrontierLETTA:
         consecutive_cycles = int(consecutive_cycles)
         if consecutive_cycles < 1:
             raise ValueError("consecutive_cycles must be positive.")
-        checkpoint_every = int(checkpoint_every)
-        if checkpoint_every < 1:
-            raise ValueError("checkpoint_every must be positive.")
+        final_checkpoint_only = (
+            checkpoint_every is None
+            or str(checkpoint_every).lower().replace("-", "_")
+            in {"final", "at_end"}
+        )
+        checkpoint_interval = None
+        if not final_checkpoint_only:
+            checkpoint_interval = int(checkpoint_every)
+            if checkpoint_interval < 1:
+                raise ValueError(
+                    "checkpoint_every must be positive, None, or 'final'."
+                )
         requested_solver = str(solver).lower().replace("-", "_")
         local_solver = self._select_local_solver(requested_solver)
         if gauge is not None:
@@ -4049,11 +4198,15 @@ class NonAbelianFrontierLETTA:
         self.converged = False
         streak = 0
         canonical_center = None
+        h_chain = n_chain = None
         for sweep in range(nsweeps):
             cycle_started = time.perf_counter()
             updates = []
             gauge_updates = []
             environment_build_s = 0.0
+            hamiltonian_environment_build_s = 0.0
+            norm_environment_build_s = 0.0
+            environment_chain_reuses = 0
             for direction, bonds in (
                 ("lr", range(self.nsites - 1)),
                 ("rl", range(self.nsites - 2, -1, -1)),
@@ -4062,7 +4215,20 @@ class NonAbelianFrontierLETTA:
                 recentered = False
                 if conditional_gauge:
                     center = 0 if direction == "lr" else self.nsites - 1
-                    if canonical_center != center:
+                    needed_side = (
+                        None
+                        if moving_environment is None
+                        else moving_environment.needed_prebuilt_side(direction)
+                    )
+                    preserve_moving_boundary = bool(
+                        algorithm == "projected"
+                        and needed_side is not None
+                        and moving_environment.hamiltonian_valid_boundary_side
+                        == needed_side
+                        and moving_environment.norm_valid_boundary_side
+                        == needed_side
+                    )
+                    if canonical_center != center and not preserve_moving_boundary:
                         center_updates = self.canonicalize_conditional_center(
                             center, rcond=gauge_rcond
                         )
@@ -4090,20 +4256,38 @@ class NonAbelianFrontierLETTA:
                         h_reuse, n_reuse = moving_environment.reuse_sides_for(
                             direction
                         )
-                    h_chain = BlockSparseEnvironmentChain.build(
-                        materialized,
-                        self.mpo,
-                        renormalized_blocks=moving_environment.hamiltonian_stack,
-                        sweep_direction=direction,
-                        reuse_prebuilt_boundary_side=h_reuse,
-                    )
-                    n_chain = BlockSparseEnvironmentChain.build(
-                        materialized,
-                        moving_environment.identity_mpo_factors,
-                        renormalized_blocks=moving_environment.norm_stack,
-                        sweep_direction=direction,
-                        reuse_prebuilt_boundary_side=n_reuse,
-                    )
+                    if h_chain is not None and h_reuse is not None:
+                        h_chain.sites = list(materialized)
+                        environment_chain_reuses += 1
+                    else:
+                        hamiltonian_environment_started = time.perf_counter()
+                        h_chain = BlockSparseEnvironmentChain.build(
+                            materialized,
+                            self.mpo,
+                            renormalized_blocks=(
+                                moving_environment.hamiltonian_stack
+                            ),
+                            sweep_direction=direction,
+                            reuse_prebuilt_boundary_side=h_reuse,
+                        )
+                        hamiltonian_environment_build_s += (
+                            time.perf_counter() - hamiltonian_environment_started
+                        )
+                    if n_chain is not None and n_reuse is not None:
+                        n_chain.sites = list(materialized)
+                        environment_chain_reuses += 1
+                    else:
+                        norm_environment_started = time.perf_counter()
+                        n_chain = BlockSparseEnvironmentChain.build(
+                            materialized,
+                            moving_environment.identity_mpo_factors,
+                            renormalized_blocks=moving_environment.norm_stack,
+                            sweep_direction=direction,
+                            reuse_prebuilt_boundary_side=n_reuse,
+                        )
+                        norm_environment_build_s += (
+                            time.perf_counter() - norm_environment_started
+                        )
                     environment_sweeps = (
                         h_chain.start_sweep(direction),
                         n_chain.start_sweep(direction),
@@ -4362,6 +4546,11 @@ class NonAbelianFrontierLETTA:
                     algorithm in {"two_site", "projected"} and reuse_environments
                 ),
                 "environment_build_s": float(environment_build_s),
+                "hamiltonian_environment_build_s": float(
+                    hamiltonian_environment_build_s
+                ),
+                "norm_environment_build_s": float(norm_environment_build_s),
+                "environment_chain_reuses": int(environment_chain_reuses),
                 "moving_environment_backend": (
                     (
                         "cpp_su2_local_boundaries_python_metric"
@@ -4394,6 +4583,9 @@ class NonAbelianFrontierLETTA:
                     "projected_route_hits": int(
                         self._projected_route_cache_hits
                     ),
+                    "stationary_certificate_hits": int(
+                        self._stationary_certificate_cache_hits
+                    ),
                     "materialized_site_hits": int(
                         self._materialized_site_cache_hits
                     ),
@@ -4408,7 +4600,11 @@ class NonAbelianFrontierLETTA:
                     f"trunc={max_truncation:.3e}"
                 )
             self.energy = float(energy)
-            if checkpoint is not None and record["sweep"] % checkpoint_every == 0:
+            if (
+                checkpoint is not None
+                and checkpoint_interval is not None
+                and record["sweep"] % checkpoint_interval == 0
+            ):
                 self.save_checkpoint(checkpoint)
             if streak >= consecutive_cycles:
                 self.converged = True

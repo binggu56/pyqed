@@ -131,12 +131,13 @@ def run(args):
         eri,
         nelec=nelecas,
         spin=0,
-        graph=graph,
+        graph="nn",
         D=args.D,
         ecore=ecore,
         cutoff=args.integral_cutoff,
         seed=args.seed,
         workers=args.workers,
+        n_threads=args.n_threads,
         we_route_memory=args.route_memory,
     )
     started = time.perf_counter()
@@ -170,6 +171,7 @@ def run(args):
             "su2_letta_energy": float(state.energy),
             "su2_letta_error": float(state.energy - exact_energy),
             "D": int(args.D),
+            "n_threads": int(args.n_threads),
             "nparameters": int(state.nparameters),
             "storage_nbytes": int(state.storage_nbytes),
             "tie_graph": [list(edge) for edge in graph],
@@ -216,8 +218,13 @@ def main():
     )
     parser.add_argument("--D", type=int, default=2)
     parser.add_argument("--cycles", type=int, default=4)
-    parser.add_argument("--algorithm", choices=("one_site", "two_site"), default="two_site")
+    parser.add_argument(
+        "--algorithm",
+        choices=("projected", "one_site", "two_site"),
+        default="projected",
+    )
     parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--n-threads", type=int, default=1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--integral-cutoff", type=float, default=1.0e-10)
     parser.add_argument("--tol", type=float, default=1.0e-8)

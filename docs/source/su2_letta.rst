@@ -69,7 +69,12 @@ Restartable run
        gauge="conditional",
        reuse_environments=True,
        checkpoint="su2_letta.chk",
+       checkpoint_every="final",
    )
+
+Use ``checkpoint_every="final"`` (or ``None``) for short benchmarks to write
+one restart file after the run.  A positive integer retains periodic restart
+checkpoints and the final checkpoint for longer calculations.
 
 The convergence decision is made only after complete LR/RL cycles.  Inspect
 ``state.convergence_summary`` for the energy change, maximum local residual,
@@ -132,10 +137,15 @@ coordinates was tested and was slower for strongly rank-deficient sites.
 Accepted parameter changes update cached unfolded MPS blocks through the
 persistent scatter map.  Ritz vectors are transported through the new metric
 whitener on the next visit.  Updates below the metric step tolerance preserve
-their tensor, gauge, and environment revisions.  A complete cycle in which
-every update is stationary is a deterministic fixed point and satisfies the
-requested consecutive-cycle check without executing an identical extra
-cycle.  Physical ``graph="nn"`` states use a dedicated bounded-frontier
+their tensor, gauge, and environment revisions.  Before Davidson, the current
+vector is tested against the exact metric-orthonormal projected residual.  A
+passing site receives a revision-scoped stationary certificate.  Later visits
+reuse that certificate without reconstructing the local pair problem, but any
+parameter or conditional-gauge change increments the state revision and
+invalidates every older certificate.  A complete cycle in which every update
+is stationary is a deterministic fixed point and satisfies the requested
+consecutive-cycle check without executing an identical extra cycle.  Physical
+``graph="nn"`` states use a dedicated bounded-frontier
 ``nearest-neighbor-block-scatter`` constraint plan; general graphs retain the
 generic grouped route representation.
 
@@ -143,9 +153,11 @@ For a physical nearest-neighbor tie chain, ``gauge="conditional"`` applies an
 exact reduced QR gauge independently for every crossing physical SU(2) sector.
 The adjacent tensor absorbs the transfer matrix, so the graph-tied state is
 unchanged.  Projected and two-site sweeps then reuse incrementally advanced
-Hamiltonian and norm environments within and across half-sweeps whenever the
-tracked canonical center already has the required position.  A real gauge
-coordinate change invalidates the affected side and triggers a rebuild.  The
+Hamiltonian and norm environments within and across half-sweeps.  When a
+projected half-sweep already owns the required boundary, it retains that
+boundary and lets the exact local norm handle a noncanonical center instead of
+performing a gauge-only rebuild.  A real local gauge or parameter change is
+carried into the moving boundary as it advances.  The
 projected cycle energy and norm are taken from its terminal exact local
 Rayleigh quotient, avoiding redundant full-chain contractions; validation
 tests compare these values to explicit chain contractions.  General graphs
@@ -176,10 +188,12 @@ Python-side independent local setup.  Avoid combining large values for both
 with a multithreaded BLAS.
 
 For the pyrazine STO-3G CAS(6,6), ``D=4`` nearest-neighbor benchmark, the first
-cycle takes about 2.8 seconds and the stationary complete LR/RL cycle takes
-about 1.5 seconds on the development machine.  The one-thread run reaches its
-stationary fixed point in two cycles and about 4.45 seconds, compared with
-9.22 seconds for the earlier three-cycle projected implementation.  This small
+cycle takes about 2.4 seconds and its certified stationary LR/RL cycle takes
+about 0.07--0.08 seconds on the development machine.  With a final-only
+checkpoint, the one-thread run reaches its stationary fixed point in two
+cycles and about 2.5 seconds, compared with 4.45 seconds before stationary
+certification and 9.22 seconds for the earlier three-cycle projected
+implementation.  This small
 ``D`` does not contain enough parallel reduced-block work for material OpenMP
 scaling.  The run retained the CASCI energy within ``1e-13`` Hartree.  This is the fast
 LETTA path, but its tied metric and embedding work still make it slower than an
