@@ -10,10 +10,10 @@ Author: Zi-Hao Chen
 from functools import reduce
 import itertools
 from pyqed import Mol, LVC, Mode, pauli
-from pyqed.HEOM.deom import Bath
-from pyqed.HEOM.deom import single_oscillator as so
-from pyqed.HEOM.deom import decompose_spectrum_pade as pade
-from pyqed.HEOM.deom import decompose_spectrum_prony as prony
+from pyqed.heom.deom import Bath
+from pyqed.heom.deom import single_oscillator as so
+from pyqed.heom.deom import decompose_spectrum_pade as pade
+from pyqed.heom.deom import decompose_spectrum_prony as prony
 import sympy as sp
 import numpy as np
 import matplotlib.pyplot as plt
