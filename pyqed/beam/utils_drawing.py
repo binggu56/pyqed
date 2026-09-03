@@ -3,6 +3,7 @@
 """ Functions for drawing """
 
 import os
+import subprocess
 
 import matplotlib.animation as manimation
 import matplotlib.image as mpimg
@@ -36,21 +37,28 @@ def concatenate_drawings(kind1='png',
                          raiz='fig4_nsensors_1',
                          nombreFigura="figura2.png",
                          directorio=""):
-    listaArchivos = os.listdir(directorio)
+    directory = directorio or "."
+    listaArchivos = os.listdir(directory)
     print(listaArchivos)
 
-    texto_ficheros = ""
+    drawing_files = []
     for fichero in sorted(listaArchivos):
         if fichero[-3:] == kind1 and fichero[0:len(raiz)] == raiz:
             print(fichero)
-            texto_ficheros = texto_ficheros + " " + directorio + fichero
+            drawing_files.append(os.path.join(directory, fichero))
 
-    os.system("cd " + directorio)
-    texto1 = "montage %s -tile %dx%d -geometry %d x %d -5-5 %s" % (
-        texto_ficheros, nx, ny, geometria_x, geometria_y, nombreFigura)
+    command = [
+        "montage",
+        *drawing_files,
+        "-tile",
+        f"{nx}x{ny}",
+        "-geometry",
+        f"{geometria_x}x{geometria_y}-5-5",
+        os.fspath(nombreFigura),
+    ]
 
-    print(texto1)
-    os.system(texto1)
+    print(command)
+    subprocess.run(command, check=True)
 
     print("Finished")
 
@@ -262,10 +270,15 @@ def change_image_size(image_name,
         convert image_name -resize '100x200!' final_filename.png
             - obliga a tener el tamaño, no mantiene escala
         """
-    texto = "convert {} -resize {} {}".format(image_name, length,
-                                              final_filename)
-    print(texto)
-    os.system(texto)
+    command = [
+        "convert",
+        os.fspath(image_name),
+        "-resize",
+        str(length),
+        os.fspath(final_filename),
+    ]
+    print(command)
+    subprocess.run(command, check=True)
 
 
 def extract_image_from_video(nombre_video=None,
@@ -278,9 +291,13 @@ def extract_image_from_video(nombre_video=None,
     convert 'animacion.avi[5,10]' animacion_frame.png. Extracts frame 5 and 10
     """
 
-    texto = "convert '%s%s' %s" % (nombre_video, num_frame, final_filename)
-    print(texto)
-    os.system(texto)
+    command = [
+        "convert",
+        f"{nombre_video}{num_frame}",
+        os.fspath(final_filename),
+    ]
+    print(command)
+    subprocess.run(command, check=True)
 
 
 def normalize_draw(u, logarithm=0, normalize=False, cut_value=None):
@@ -354,9 +371,21 @@ def make_video_from_file(self, files, filename=''):
     print("Start", files)
     if not (filename) == '':
         print('Making movie animation.mpg - this make take a while')
-        texto = "mencoder 'mf://_tmp*.png' -mf kind=png:fps=10 -ovc lavc -lavcopts vcodec=wmv2 -oac copy -o " + filename
-        # texto = "mencoder 'mf://home/_tmp*.png' -mf kind=png:fps=10 -ovc lavc -lavcopts vcodec=wmv2 -oac copy -o " + filename
-        os.system(texto)
+        command = [
+            "mencoder",
+            "mf://_tmp*.png",
+            "-mf",
+            "kind=png:fps=10",
+            "-ovc",
+            "lavc",
+            "-lavcopts",
+            "vcodec=wmv2",
+            "-oac",
+            "copy",
+            "-o",
+            os.fspath(filename),
+        ]
+        subprocess.run(command, check=True)
         # os.system("convert _tmp*.png animation2.gif")  # este sale muy grande
         # esto podria hacer mas pequeno convert -geometry 400 -loop 5  animation2.gif animation3.gif
         # cleanup
