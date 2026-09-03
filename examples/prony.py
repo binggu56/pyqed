@@ -1,7 +1,12 @@
 '''
 This example shows how to use the DEOM class to simulate the dynamics of a two-level system coupled to a drude bath.
 '''
-from pyqed.deom import decompose_spectrum_prony, spectrum_exp, decompose_spectrum_pade, prony_fitting
+from pyqed.heom.deom import (
+    decompose_spectrum_pade,
+    fit_spectrum_prony,
+    prony_fitting,
+    spectrum_exp,
+)
 from pyqed.units import au2fs, au2k, au2wavenumber
 import sympy as sp
 import numpy as np
@@ -22,7 +27,7 @@ sp_para_dict = {lamd_sp: lamd, gams_sp: gams}
 phixx_sp = (lamd_sp * gams_sp * gams_sp / (gams_sp *
             gams_sp + w_sp * w_sp)).subs(sp_para_dict)
 
-etal_pade, etar_pade, etaa_pade, expn_pade = decompose_spectrum_prony(
+etal_pade, etar_pade, etaa_pade, expn_pade = fit_spectrum_prony(
     phixx_sp, w_sp, au2k / 3, ['a', 4], scale=25000, n=2500, npsd=100, bose_fermi=2)
 etal_pade1, etar_pade1, etaa_pade1, expn_pade1 = decompose_spectrum_pade(
     phixx_sp, w_sp, au2k / 3, 4, bose_fermi=2)
