@@ -605,7 +605,7 @@ test("uses a static, repository-owned deployment", async () => {
   assert.match(nextConfig, /trailingSlash:\s*true/);
   assert.match(nextConfig, /unoptimized:\s*true/);
   assert.match(packageJson.scripts.build, /^next build$/);
-  assert.equal(packageJson.dependencies.next, "16.2.10");
+  assert.equal(packageJson.dependencies.next, "16.3.4");
   assert.equal(packageJson.dependencies["3dmol"], "2.5.5");
   assert.doesNotMatch(packageText, /vinext|wrangler|drizzle|cloudflare/i);
   assert.doesNotMatch(layout, /Analytics/);

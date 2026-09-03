@@ -1,0 +1,71 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, bg, stable]
+  pull_request:
+    branches: [main, bg, stable]
+  schedule:
+    - cron: "23 20 * * 3"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: ${{ matrix.language }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:${{ matrix.language }}
+
+  compiled-code:
+    name: c-cpp
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    env:
+      PYQED_BUILD_EXTENSIONS: "1"
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools
+          PYQED_BUILD_EXTENSIONS=0 python -m pip install -e .
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+          queries: security-extended
+      - name: Compile extension modules
+        run: python setup.py build_ext --inplace
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:c-cpp
