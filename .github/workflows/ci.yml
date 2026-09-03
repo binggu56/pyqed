@@ -20,6 +20,19 @@ env:
   MPLBACKEND: Agg
 
 jobs:
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
   hygiene:
     name: Repository hygiene
     runs-on: ubuntu-latest
