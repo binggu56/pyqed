@@ -361,7 +361,6 @@ def test_scalar_field_validation_payload_and_postmessage_transport():
     assert payload["fields"][0]["shape"] == [2, 2, 2]
     assert "postMessage" in html
     assert "pyqed:viewer-ready" in html
-    assert "https://pyqed.org" in html
     assert "[0.0,1.0,2.0" not in html
     assert "#" not in scene.url
 

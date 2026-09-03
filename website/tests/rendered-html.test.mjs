@@ -328,6 +328,23 @@ test("validates encoded scalar fields and ESP density mappings", () => {
     }),
     /non-negative integer/i,
   );
+  assert.throws(
+    () => validateSceneMessage({
+      type: "pyqed:scene",
+      scene: {
+        version: 1,
+        kind: "pyqed-scene",
+        molecule: null,
+        fields: [{
+          ...esp,
+          surface_field: undefined,
+          metadata: JSON.parse('{"__proto__":{"polluted":true}}'),
+        }],
+      },
+    }),
+    /unsafe or overlong key/i,
+  );
+  assert.equal({}.polluted, undefined);
 });
 
 test("validates, normalizes, and displaces nested normal-mode scenes", () => {
@@ -613,7 +630,7 @@ test("uses a static, repository-owned deployment", async () => {
   assert.match(privacy, /no visitor tracking/i);
   assert.match(workflow, /actions\/deploy-pages@v4/);
   assert.match(workflow, /path:\s*website\/out/);
-  assert.match(sitemap, /https:\/\/pyqed\.org\/viewer/);
+  assert.match(sitemap, /^\s*url: "https:\/\/pyqed\.org\/viewer",\s*$/m);
   assert.match(moleculeViewer, /window\.location\.hash/);
   assert.match(moleculeViewer, /event\.source === window\.parent/);
   assert.match(moleculeViewer, /validateSceneMessage\(event\.data\)/);

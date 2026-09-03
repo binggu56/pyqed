@@ -110,14 +110,14 @@ function sanitizeMetadata(value, context, depth = 0, budget = { entries: 0 }) {
     return value.map((entry, index) => sanitizeMetadata(entry, `${context}[${index}]`, depth + 1, budget));
   }
   if (!isRecord(value)) fail(`${context} must contain JSON-compatible values only.`);
-  const result = Object.create(null);
+  const entries = [];
   for (const [key, entry] of Object.entries(value)) {
     if (key.length === 0 || key.length > 80 || key === "__proto__" || key === "constructor" || key === "prototype") {
       fail(`${context} contains an unsafe or overlong key.`);
     }
-    result[key] = sanitizeMetadata(entry, `${context}.${key}`, depth + 1, budget);
+    entries.push([key, sanitizeMetadata(entry, `${context}.${key}`, depth + 1, budget)]);
   }
-  return result;
+  return Object.fromEntries(entries);
 }
 
 function determinant(axes) {
