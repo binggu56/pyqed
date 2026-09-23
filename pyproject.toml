@@ -44,6 +44,7 @@ dependencies = [
     "numpy>=2.0",
     "opt-einsum>=3.3",
     "periodictable>=1.7",
+    "pybind11>=2.12",
     "scipy>=1.13",
 ]
 

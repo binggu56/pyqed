@@ -45,3 +45,7 @@ recursive-exclude pyqed *.dylib *.pyc *.so
 recursive-exclude pyqed *Bing*Mac*
 recursive-exclude pyqed *gugroup*
 recursive-exclude * __pycache__
+
+include pyqed/linalg/davidson.hpp
+include pyqed/linalg/nonsymmetric_davidson.hpp
+include pyqed/linalg/nonsymmetric_module.cpp

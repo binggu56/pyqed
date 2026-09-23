@@ -348,6 +348,12 @@ class BSE(object):
         if gw_ref is not None and gw_ref.e_qp is not None:
             self.e_qp = gw_ref.e_qp
         self.e_rpa = None
+        charge = getattr(gw_ref, '_charge_screening', None)
+        if (screening == 'TDH' and charge is not None
+                and np.array_equal(charge['energy'], self.e_mf)
+                and np.array_equal(charge['mo_coeff'], self.mo_coeff)):
+            self.e_rpa = charge['poles'].copy()
+            self._M = charge['couplings'].copy()
         self._bse_tda_info = None
         self.excitation_energies = None
         self.e = None
@@ -533,6 +539,9 @@ class BSE(object):
         max_cycle=80,
         return_info=False,
         return_vectors=False,
+        eigensolver=None,
+        max_space=None,
+        batch_columns=None,
     ):
         '''Run full BSE excitations and return ``self`` for a chainable API.
 
@@ -540,8 +549,13 @@ class BSE(object):
         quasiparticle energies.  ``run()`` computes full BSE excitation
         energies and stores them in ``.e``.  Full BSE amplitudes are stored in
         ``.xy`` with ``.x``/``.y`` views.  Use :class:`TDA` for the
-        Tamm-Dancoff approximation.
+        Tamm-Dancoff approximation. The matrix-free path defaults to
+        Davidson; select ``eigensolver="arpack"`` for SciPy Arnoldi. ``max_space``
+        and ``batch_columns`` are documented in :func:`solve_bse`, together
+        with method references and limitations.
         '''
+        if eigensolver not in (None, "arpack", "davidson"):
+            raise ValueError("eigensolver must be arpack or davidson")
         if not use_qp or self.e_qp is None:
             self.e_qp = self.e_mf.copy()
 
@@ -550,15 +564,19 @@ class BSE(object):
             or (low_rank == 'auto' and getattr(self, '_pair_factors', None) is not None)
         )
         if use_low_rank:
-            self.bse_full_low_rank(
+            self.solve_bse(
                 nroots=nroots,
                 tol=tol,
                 max_cycle=max_cycle,
                 return_info=return_info,
                 return_vectors=return_vectors,
+                eigensolver="davidson" if eigensolver is None else eigensolver,
+                max_space=max_space, batch_columns=batch_columns,
             )
             return self
 
+        if eigensolver is not None or max_space is not None or batch_columns is not None:
+            raise ValueError("Iterative full BSE options require low_rank=True")
         self._ensure_screening()
         A, B = bse_AB_matrices(self)
         e, vec = _full_bse_vectors_from_casida(A, B, nroots)
@@ -566,21 +584,25 @@ class BSE(object):
         self.info = {"solver": "dense_full_bse", "converged": True}
         return self
 
-    def bse_full_low_rank(
+    def solve_bse(
         self,
         nroots=5,
         tol=1e-8,
         max_cycle=80,
         return_info=False,
         return_vectors=True,
+        eigensolver="davidson",
+        max_space=None,
+        batch_columns=None,
     ):
-        return bse_full_low_rank(
+        return solve_bse(
             self,
             nroots=nroots,
             tol=tol,
             max_cycle=max_cycle,
             return_info=return_info,
             return_vectors=return_vectors,
+            eigensolver=eigensolver, max_space=max_space, batch_columns=batch_columns,
         )
 
     def wavefunction_overlap(
@@ -1136,6 +1158,45 @@ def _bse_tda_matvec(gw, x):
     return y.reshape(-1)
 
 
+def _bse_tda_matmat(gw, vectors, batch_columns=8):
+    """Exact column-batched version of the existing molecular TDA action.
+
+    No change to its static screened kernel or excitation space. Explicit
+    two-stage contractions avoid forming a transition-space matrix; scratch
+    scales with the factor count times occupied/virtual sizes times the batch.
+    This experimental helper does not change the public solver default.
+    """
+    vectors=np.asarray(vectors)
+    nocc=gw.nocc
+    nvir=gw.nso-nocc
+    if vectors.ndim!=2 or vectors.shape[0]!=nocc*nvir or batch_columns<1:
+        raise ValueError('Invalid TDA trial block or batch size')
+    if gw.e_rpa is None or gw._M is None:
+        e_rpa,t_rpa=gw.rpa(method=gw.screening)
+        gw._M=gw.get_m_rpa(e_rpa,t_rpa)
+    factors=getattr(gw,'_pair_factors',None)
+    out=np.empty(vectors.shape,dtype=np.result_type(vectors,gw._M,float))
+    diagonal=_bse_tda_diag(gw).reshape(nocc,nvir,1)
+    screened_virtual=gw._M[nocc:,nocc:,:]/gw.e_rpa
+    for start in range(0,vectors.shape[1],batch_columns):
+        stop=min(start+batch_columns,vectors.shape[1])
+        x=vectors[:,start:stop].reshape(nocc,nvir,-1)
+        y=diagonal*x
+        if factors is not None:
+            vo=factors[:,nocc:,:nocc]
+            projected=np.einsum('Pbj,jbk->Pk',vo,x,optimize=True)
+            y+=2*np.einsum('Pai,Pk->iak',vo,projected,optimize=True)
+            projected=np.einsum('Pij,jbk->Pibk',factors[:,:nocc,:nocc],x,optimize=True)
+            y-=np.einsum('Pab,Pibk->iak',factors[:,nocc:,nocc:],projected,optimize=True)
+        else:
+            y+=2*np.einsum('aibj,jbk->iak',gw.eri[nocc:,:nocc,nocc:,:nocc],x,optimize=True)
+            y-=np.einsum('abij,jbk->iak',gw.eri[nocc:,nocc:,:nocc,:nocc],x,optimize=True)
+        projected=np.einsum('ijL,jbk->Libk',gw._M[:nocc,:nocc,:],x,optimize=True)
+        y+=4*np.einsum('abL,Libk->iak',screened_virtual,projected,optimize=True)
+        out[:,start:stop]=y.reshape(nocc*nvir,-1)
+    return out
+
+
 def _bse_b_matvec(gw, x):
     nocc = gw.nocc
     nvir = gw.nso - nocc
@@ -1190,6 +1251,36 @@ def _bse_full_matvec(gw, xy):
     return np.concatenate((ax_by, -bx_ay))
 
 
+def _bse_full_matmat(gw, vectors, batch_columns=8):
+    """Exact bounded-column action of the existing real molecular A/B kernel."""
+    vectors = np.asarray(vectors)
+    nocc, nvir = gw.nocc, gw.nso-gw.nocc
+    dim = nocc*nvir
+    if vectors.ndim != 2 or vectors.shape[0] != 2*dim or batch_columns < 1:
+        raise ValueError("Invalid full BSE block or batch size")
+    ax = _bse_tda_matmat(gw, vectors[:dim], batch_columns)
+    ay = _bse_tda_matmat(gw, vectors[dim:], batch_columns)
+    factors = getattr(gw, '_pair_factors', None)
+    out = np.empty(vectors.shape, dtype=np.result_type(ax, ay))
+    for start in range(0, vectors.shape[1], batch_columns):
+        stop = min(start+batch_columns, vectors.shape[1])
+        for source, target, a_part, sign in ((vectors[dim:], out[:dim], ax, 1),
+                                             (vectors[:dim], out[dim:], ay, -1)):
+            x = source[:, start:stop].reshape(nocc, nvir, -1)
+            if factors is None:
+                y = 2*np.einsum('aijb,jbk->iak', gw.eri[nocc:,:nocc,:nocc,nocc:], x, optimize=True)
+                y -= np.einsum('ajib,jbk->iak', gw.eri[nocc:,:nocc,:nocc,nocc:], x, optimize=True)
+            else:
+                projected = np.einsum('Pjb,jbk->Pk', factors[:,:nocc,nocc:], x, optimize=True)
+                y = 2*np.einsum('Pai,Pk->iak', factors[:,nocc:,:nocc], projected, optimize=True)
+                projected = np.einsum('Pib,jbk->Pijk', factors[:,:nocc,nocc:], x, optimize=True)
+                y -= np.einsum('Paj,Pijk->iak', factors[:,nocc:,:nocc], projected, optimize=True)
+            projected = np.einsum('ibL,jbk->Lijk', gw._M[:nocc,nocc:,:], x, optimize=True)
+            y += 4*np.einsum('ajL,Lijk->iak', gw._M[nocc:,:nocc,:]/gw.e_rpa, projected, optimize=True)
+            target[:, start:stop] = sign*(a_part[:, start:stop]+y.reshape(dim, -1))
+    return out
+
+
 def bse_tda_low_rank(
     gw,
     nroots=5,
@@ -1241,68 +1332,127 @@ def bse_tda_low_rank(
     return eigvals, eigvecs
 
 
-def bse_full_low_rank(
-    gw,
-    nroots=5,
-    tol=1e-8,
-    max_cycle=80,
-    return_info=False,
-    return_vectors=True,
+def solve_bse(
+    gw, nroots=5, tol=1e-8, max_cycle=80, return_info=False,
+    return_vectors=True, eigensolver="davidson", max_space=None, batch_columns=None,
 ):
-    '''Lowest positive full BSE roots from a matrix-free low-rank block solve.'''
+    """Lowest positive molecular full-BSE roots from a matrix-free action.
+
+    ``eigensolver="arpack"`` uses SciPy Arnoldi; ``"davidson"`` (default)
+    uses :func:`pyqed.linalg.davidson_nonsymmetric` with positive-real harmonic
+    Ritz selection and orbital-gap diagonal preconditioning. This adapts
+    Davidson, J. Comput. Phys. 17, 87–94 (1975),
+    doi:10.1016/0021-9991(75)90065-0, and Morgan, Linear Algebra Appl. 154–156,
+    289–309 (1991), doi:10.1016/0024-3795(91)90381-6. It is not a
+    structure-preserving BSE solver, stability test, or guarantee that all
+    lowest positive roots have been found. Screening and the static BSE
+    kernel are unchanged. Only the existing real-orbital molecular operator
+    is supported. Returned vectors must have positive BSE metric and pass
+    absolute residual checks after metric orthonormalization. Degenerate
+    complex eigenvector mixtures are converted to an independent real basis
+    using SVD of their real and imaginary parts; the physical residual gate
+    is applied after that conversion. No partial
+    solutions or silent solver fallback are accepted.
+
+    ``max_space`` controls Davidson space or ARPACK ncv. ``batch_columns``
+    enables bounded block actions for Davidson (ARPACK uses vector actions).
+    """
     from scipy.sparse.linalg import ArpackNoConvergence, LinearOperator, eigs
 
+    if eigensolver not in ("arpack", "davidson"):
+        raise ValueError("eigensolver must be arpack or davidson")
+    if not np.isfinite(tol) or tol <= 0 or int(max_cycle) != max_cycle or max_cycle < 1:
+        raise ValueError("Require positive tolerance and integer max_cycle")
+    if batch_columns is not None and (
+        isinstance(batch_columns, bool) or int(batch_columns) != batch_columns or batch_columns < 1
+    ):
+        raise ValueError("batch_columns must be a positive integer")
+    if batch_columns is not None and eigensolver != "davidson":
+        raise ValueError("batch_columns requires eigensolver='davidson'")
     dim = gw.nocc * (gw.nso - gw.nocc)
+    if isinstance(nroots, bool) or int(nroots) != nroots or nroots < 1 or dim < 1:
+        raise ValueError("nroots must be positive and the excitation space nonempty")
     nroots = min(int(nroots), dim)
-    if nroots < 1:
-        raise ValueError("nroots must be positive.")
-
+    if max_space is not None and (
+        isinstance(max_space, bool) or int(max_space) != max_space or max_space < 1
+    ):
+        raise ValueError("max_space must be a positive integer")
     if gw.e_rpa is None or gw._M is None:
         e_rpa, t_rpa = gw.rpa(method=gw.screening)
         gw._M = gw.get_m_rpa(e_rpa, t_rpa)
 
-    shape = (2 * dim, 2 * dim)
-    operator = LinearOperator(
-        shape,
-        matvec=lambda vec: _bse_full_matvec(gw, vec),
-        dtype=float,
-    )
-    k = min(max(2 * nroots + 4, nroots + 2), shape[0] - 2)
-    info = {
-        "solver": "low_rank_full_bse",
-        "converged": True,
-        "nroots": nroots,
-        "arnoldi_roots": k,
-    }
+    info = dict(solver="low_rank_full_bse", eigensolver=eigensolver,
+                converged=False, nroots=nroots)
+    gw.info = gw._bse_full_info = info
+    calls = 0
+    def action(vec):
+        nonlocal calls
+        calls += 1
+        return _bse_full_matvec(gw, vec)
+    def block_action(vectors):
+        nonlocal calls
+        calls += vectors.shape[1]
+        return _bse_full_matmat(gw, vectors, int(batch_columns))
     try:
-        eigvals, eigvecs = eigs(
-            operator,
-            k=k,
-            which='SM',
-            tol=tol,
-            maxiter=max_cycle,
-        )
-    except ArpackNoConvergence as err:
-        eigvals = err.eigenvalues
-        eigvecs = err.eigenvectors
-        info["converged"] = False
-        info["message"] = str(err)
+        if eigensolver == "davidson":
+            from pyqed.linalg import davidson_nonsymmetric
+            diagonal = _bse_tda_diag(gw)
+            eigvals, eigvecs, diagnostics = davidson_nonsymmetric(
+                action, nroots, diag=np.r_[diagonal, -diagonal],
+                matmat=block_action if batch_columns is not None else None,
+                selection="positive_real", tolerance=tol, iterations=max_cycle,
+                space=max_space,
+            )
+            info["davidson"] = diagnostics
+        else:
+            k = min(max(2*nroots+4, nroots+2), 2*dim-2)
+            if k < 1:
+                raise ValueError("ARPACK full BSE needs a larger space; use davidson or dense BSE")
+            info["arnoldi_roots"] = k
+            operator = LinearOperator((2*dim, 2*dim), matvec=action, dtype=float)
+            eigvals, eigvecs = eigs(operator, k=k, which='SM', tol=tol,
+                                    maxiter=max_cycle, ncv=max_space)
 
-    eigvals = np.asarray(eigvals)
-    eigvecs = np.asarray(eigvecs)
-    real_mask = np.abs(eigvals.imag) < max(1e-8, 100 * tol)
-    pos = np.where(real_mask & (eigvals.real > 0.0))[0]
-    order = pos[np.argsort(eigvals.real[pos])]
-    if order.size < nroots:
-        raise RuntimeError(
-            f"Low-rank full BSE found only {order.size} positive real roots; requested {nroots}."
-        )
-    order = order[:nroots]
-    roots = eigvals.real[order]
-    vectors = eigvecs[:, order].real
-    vectors = _metric_orthonormalize_full_bse_vectors(vectors, dim)
-    gw._bse_full_info = info
-    gw.info = info
+        eigvals = np.asarray(eigvals)
+        eigvecs = np.asarray(eigvecs)
+        real_mask = np.abs(eigvals.imag) < max(1e-8, 100*tol)
+        pos = np.where(real_mask & (eigvals.real > 0.0))[0]
+        order = pos[np.argsort(eigvals.real[pos])][:nroots]
+        if len(order) != nroots:
+            raise RuntimeError(f"Full BSE found only {len(order)} positive real roots; requested {nroots}")
+        roots = eigvals.real[order]
+        vectors = np.array(eigvecs[:, order], dtype=complex, copy=True)
+        # A repeated real eigenvalue can have arbitrary complex mixtures,
+        # not just per-vector phases. Recover a real basis within each cluster.
+        real_vectors = np.empty(vectors.shape, dtype=float)
+        cluster_tol = max(.01*tol, 100*np.finfo(float).eps*max(1., max(abs(roots))))
+        start = 0
+        while start < nroots:
+            stop = start+1
+            while stop < nroots and roots[stop]-roots[start] <= cluster_tol:
+                stop += 1
+            block = vectors[:, start:stop]
+            u, singular, _ = np.linalg.svd(np.column_stack((block.real, block.imag)), full_matrices=False)
+            count = stop-start
+            if len(singular) < count or singular[count-1] <= 1e-12*singular[0]:
+                raise RuntimeError("Full BSE selected vectors lack an independent real basis")
+            real_vectors[:, start:stop] = u[:, :count]
+            start = stop
+        vectors = real_vectors
+        metric = np.r_[np.ones(dim), -np.ones(dim)]
+        gram = vectors.T @ (metric[:, None]*vectors)
+        if np.linalg.eigvalsh((gram+gram.T)/2)[0] <= 0:
+            raise RuntimeError("Positive BSE roots have nonpositive metric; possible unstable reference")
+        vectors = _metric_orthonormalize_full_bse_vectors(vectors, dim)
+        residuals = np.linalg.norm(np.column_stack([action(v) for v in vectors.T])-vectors*roots, axis=0)
+        metric_error = float(np.linalg.norm(vectors.T@(metric[:, None]*vectors)-np.eye(nroots), ord=np.inf))
+        info.update(residual_norms=residuals, metric_error=metric_error, operator_columns=calls)
+        if not np.all(np.isfinite(residuals)) or np.max(residuals) > tol or metric_error > 1e-8:
+            raise RuntimeError("Full BSE failed residual/metric checks after normalization")
+        info["converged"] = True
+    except (RuntimeError, ValueError, np.linalg.LinAlgError, ArpackNoConvergence) as exc:
+        info.update(message=str(exc), operator_columns=calls)
+        raise
     if hasattr(gw, '_store_excitations'):
         gw._store_excitations(roots, vectors, 'full')
     else:
@@ -1311,14 +1461,9 @@ def bse_full_low_rank(
         gw.xy = vectors
         gw.XY = vectors
         gw.bse_metric = 'full'
-
     if not return_vectors:
-        if return_info:
-            return roots, info
-        return roots
-    if return_info:
-        return roots, vectors, info
-    return roots, vectors
+        return (roots, info) if return_info else roots
+    return (roots, vectors, info) if return_info else (roots, vectors)
 
 
 def _as_state_matrix(vectors, name):

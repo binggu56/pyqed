@@ -21,6 +21,76 @@ Mean-field, GW, and BSE have distinct roles:
 * ``GW`` computes quasiparticle energies and screening information.
 * ``BSE`` computes neutral excitation energies from the GW/RPA reference.
 
+Exact charge screening and quasiparticle root tracking
+------------------------------------------------------
+
+Restricted TDH/Casida screening in ``GW`` now uses the complete spatial
+charge block. With occupied-virtual gaps D and Coulomb pair matrix K, it
+forms and diagonalizes
+
+.. math::
+
+   C = D^2 + 4 D^{1/2} K D^{1/2}.
+
+This is an exact spin adaptation of the Casida formulation (Stratmann, Scuseria and Frisch,
+*J. Chem. Phys.* **109**, 8218 (1998)), not a truncated screening-pole
+approximation. The other three spin sectors have zero Coulomb coupling and
+do not contribute to the GW self-energy. All charge poles are retained.
+The diagonal gap matrix replaces a generic dense matrix-square-root solve.
+
+Default TDH ``GW.rpa()`` returns spatial transition vectors, with
+nocc_spatial*nvir_spatial rows; ``get_m_rpa`` applies their sqrt(2) spin
+normalization and continues to return spin-indexed couplings. TDHF, TDA
+screening and explicit non-Casida calls retain the full spin formulation.
+The direct RPA correlation-energy helper still uses its original full-spin
+reference implementation. This reduction supports real restricted orbitals.
+
+``BSE(gw)`` reuses the spatial screening poles and couplings when the
+screening is TDH and its mean-field energies and MO coefficients match the
+cached GW reference exactly. Changed-energy evGW screening is not reused
+for mean-field BSE screening. Cached arrays are copied into the BSE object.
+This avoids a second spatial RPA solve without changing the static kernel.
+
+A separate numerical issue was exposed by the changed floating-point
+summation order: the old unconstrained secant solve could select a
+negative-weight quasiparticle crossing. Molecular diagonal Dyson roots
+now use analytic self-energy derivatives and coupling continuation from
+zero to full self-energy, checking positive residue and an absolute
+1e-9 Hartree equation residual. Failed Newton steps trigger an outward
+bracket search from the previous root, accepting the nearest found upward
+crossing; the coupling step is reduced if no acceptable bracket is found.
+At a branch fold this can select a neighboring positive-weight branch;
+it is not a guarantee of uninterrupted analytic continuation. Failure raises
+instead of silently replacing the result with a mean-field energy. ``qp_weights`` and ``qp_residuals``
+record these checks for the last Dyson solve (before any evGW damping).
+This is a numerical branch-selection adaptation of Hedin's Dyson equation, *Phys. Rev.* **139**, A796 (1965),
+https://doi.org/10.1103/PhysRev.139.A796; it is not a complete satellite
+solver and does not guarantee the root with largest spectral weight.
+
+Root continuation is a behavior change separate from the exact screening
+reduction: high virtual roots may differ from the former secant-selected
+branches. Comparisons isolating charge reduction therefore use the same
+continuation solver for both full-spin and spatial-charge screening.
+``benchmarks/benchmark_gw_charge_screening.py`` performs that comparison
+on pyrazine with shared CD/RHF input and writes reproducible figures.
+
+On pyrazine/6-31G with CD threshold 1e-10 and one thread, three-run median
+GW time falls from 30.03 s (full-spin reference with the same safeguarded
+QP solver) to 2.31 s, a 13.0x speedup. Maximum QP and BSE differences
+between representations are 2.65e-14 and 1.53e-15 Hartree respectively.
+BSE screening preparation falls from 3.93 s to 0.002 s; the batched
+Davidson solve itself remains about 10.7 s. Relative to the original
+secant-selected branches, eight high virtual QP energies change materially;
+the first five BSE excitations shift by at most 0.550 meV.
+
+A separate optimized pyrazine/6-31G* run (one measurement) takes 7.79 s
+for CD/RHF, 17.25 s for GW, 0.006 s for BSE screening reuse, and 45.54 s
+for five batched-Davidson BSE roots: about 71 s total. Its maximum BSE
+residual is 6.35e-10 Hartree. This larger-basis run has no full-spin timing
+comparison. Reproducible reports, source snapshots and PNG/PDF figures
+are in ``/private/tmp/gw_charge_pyrazine_631g_final`` and
+``/private/tmp/gw_charge_pyrazine_631gstar_bracket``.
+
 Basic Example
 -------------
 
@@ -385,6 +455,293 @@ set ``use_qp=False``:
 
    bse = BSE(gw).run(nroots=5, use_qp=False)
    tda = TDA(gw).run(nroots=5, use_qp=False)
+
+Nonsymmetric Davidson for molecular full BSE
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The matrix-free molecular full-BSE path defaults to compiled nonsymmetric
+Davidson. SciPy Arnoldi remains available with ``eigensolver="arpack"``:
+
+.. code-block:: python
+
+   bse = BSE(gw).run(
+       nroots=5, low_rank=True, eigensolver="davidson",
+       tol=1e-9, max_cycle=200, max_space=40, batch_columns=8,
+   )
+   print(bse.e, bse.info["residual_norms"], bse.info["metric_error"])
+
+The same controls are accepted by ``BSE.solve_bse`` and the module-level
+``solve_bse``. ``max_space`` is Davidson's subspace cap or ARPACK's ``ncv``.
+``batch_columns`` optionally applies the full A/B kernel to bounded blocks;
+it requires Davidson. It is unset by default. Iterative controls require the
+matrix-free path: use ``low_rank=True`` explicitly if the reference does not
+have pair factors. Dense Casida, Hermitian TDA, periodic BSE, and GW screening
+are unchanged. The existing real-orbital molecular kernel is used; accepting
+complex trial vectors does not add complex-orbital BSE support.
+
+The solver uses ``pyqed.linalg.davidson_nonsymmetric`` with positive-real
+harmonic Ritz selection and signed orbital-energy gaps as an approximate
+diagonal preconditioner (interaction contributions to the diagonal are
+omitted). This is an adaptation of E. R. Davidson, *J. Comput. Phys.* **17**,
+87–94 (1975), https://doi.org/10.1016/0021-9991(75)90065-0, with harmonic
+extraction inspired by R. B. Morgan, *Linear Algebra Appl.* **154–156**,
+289–309 (1991), https://doi.org/10.1016/0024-3795(91)90381-6. It is not a
+structure-preserving BSE algorithm, a stability test, or a guarantee of
+completeness of the lowest positive spectrum. There are no left eigenvectors
+or biorthogonal iteration. Existing static screening and A/B couplings are
+retained exactly; batching only changes contraction order.
+
+Both iterative solvers reject partial convergence and a nonpositive selected
+BSE metric. Nearly real roots may have complex eigenvector mixtures within
+degenerate eigenspaces. For each root cluster the real and imaginary parts
+are combined by SVD into an independent real basis, before BSE metric
+orthonormalization. Clusters span at most the larger of 0.01*tol and a
+100-machine-epsilon energy scale. A requested subset of a degenerate
+multiplet can return any independent real basis of that subset. The full
+physical residual check rejects invalid or excessively mixed real vectors.
+After metric orthonormalization, every returned eigenpair must pass the
+absolute residual threshold ``tol``; the metric error must be below 1e-8.
+Normalization can amplify residuals near an instability, so a solver may
+converge internally yet fail this final check. No silent fallback or tolerance
+relaxation occurs. Positive roots elsewhere in an unstable spectrum may still
+pass these selected-state checks; global stability must be established
+separately. Failures leave ``info["converged"]`` false and raise an exception.
+Davidson's diagnostics are in ``info["davidson"]``; ``operator_columns`` counts
+all applied columns, including final validation.
+
+``benchmarks/benchmark_bse_nonsymmetric.py --output /private/tmp/bse-comparison``
+compares both solvers, including optional batching, against small dense
+references. It uses synthetic symmetric factor kernels with the production
+screened molecular actions, not ab initio molecules. Set the four documented
+BLAS/OpenMP thread limits to one and run with ``PYTHONPATH=.``. Compilation and
+warmup are excluded, three shuffled repeats are timed, and the report includes
+post-normalization residuals, metric errors, operator counts, and reproducible
+PNG/PDF figures. Use ``--plot-only`` to regenerate figures from the report.
+
+A single-thread run on 23 September 2026 (three-repeat medians, five roots,
+absolute normalized residual tolerance 1e-9) gave:
+
+.. list-table:: Synthetic factorized full-BSE kernels
+   :header-rows: 1
+
+   * - Dimension
+     - ARPACK (s)
+     - Davidson (s)
+     - Batched Davidson (s)
+   * - 128
+     - 0.158
+     - 0.0259
+     - 0.00968
+   * - 384
+     - 0.346
+     - 0.0553
+     - 0.0199
+
+Operator-column counts, including validation, were 304 versus 40 and 564
+versus 56 for ARPACK versus either Davidson action. These synthetic kernels
+have useful gap preconditioning; the gains do not establish performance for
+real molecules or weakly stable references. ARPACK was the default at that stage.
+Reports and figures are saved under ``/private/tmp/bse_nonsymmetric_integration``.
+
+Real-molecule qualification (23 September 2026)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``benchmarks/benchmark_bse_molecules.py`` runs RHF/G0W0/BSE on LiH, HF, H2O,
+NH3, N2 (1.098 Angstrom), and stretched N2 (1.80 Angstrom), all cc-pVDZ.
+It uses PySCF RHF with explicit AO-to-MO transformation and PyQED exact-frequency
+G0W0 with TDH screening and eta=0.001 Hartree. All six references converged
+without QP Newton fallback; their dense A+B and A-B matrices are positive
+definite. Five lowest positive roots are checked against independent dense
+A/B spectra at an absolute normalized residual threshold of 1e-9 Hartree.
+Each method has one warmup and three timed runs; the iteration cap is 200.
+
+.. list-table:: Successful attempts, including warmup (out of four)
+   :header-rows: 1
+
+   * - Molecule
+     - BSE dimension
+     - ARPACK
+     - Davidson (scalar and batched)
+   * - LiH
+     - 68
+     - 4
+     - 0
+   * - HF
+     - 140
+     - 2
+     - 0
+   * - H2O
+     - 190
+     - 4
+     - 4
+   * - NH3
+     - 240
+     - 3
+     - 4
+   * - N2
+     - 294
+     - 2
+     - 0
+   * - Stretched N2
+     - 294
+     - 0
+     - 0
+
+In this pre-repair run Davidson failed its projected nonsymmetric eigensolve
+on the four diatomic cases. The QR repair below resolves those failures. ARPACK failures are incomplete
+convergence of its oversampled 14-root search. Neither failure is counted as
+a valid time-to-solution. H2O medians are 1.990 s (ARPACK), 0.163 s (Davidson),
+and 0.0533 s (batched Davidson). NH3 Davidson medians are 0.239 and 0.0764 s;
+ARPACK's warmup failure prevents an all-attempts reliability claim.
+Successful Davidson roots differ from dense references by less than
+9e-12 Hartree, with normalized residuals below 7.6e-10 Hartree.
+
+These pre-repair results ruled out inferring general robustness from synthetic
+kernels alone; Davidson remained opt-in. ARPACK also needs care on clustered spectra.
+The molecular cases, errors, geometries, settings, source hashes, logs, and
+reproducible timing/residual and excitation-energy figures are recorded under
+``/private/tmp/bse_real_molecules_20260923``. This is solver qualification,
+not a claim of quantitative experimental accuracy or RHF orbital stability.
+
+QR extraction and degenerate-state repair
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The harmonic projected failure was isolated to Accelerate's generalized QZ
+solve on a finite, moderately conditioned LiH pencil after restart. The
+solver now factors the shifted trial action by Householder QR and solves the
+equivalent reciprocal ordinary eigenproblem using a triangular solve.
+This retains Morgan's harmonic Ritz condition without forming normal equations
+or a full physical matrix; see ``docs/nonsymmetric_davidson.md`` for the
+formulation, diagnostics, and limitations. No tolerance or subspace-cap
+relaxation is used.
+
+The QR repair also exposed a conversion issue: degenerate real BSE states can
+be returned as complex linear combinations rather than individually phase-real
+vectors. The real-basis SVD conversion described above resolves it, including
+when the requested root count cuts through a degenerate multiplet. Final
+physical residual and positive-metric checks remain mandatory.
+
+All 37 focused tests pass, including real/complex rotated degenerate blocks
+that reproduce the old QZ failure and degenerate complex-mixture conversion.
+The same six molecular cases now pass all four attempts with both Davidson
+actions (24/24 each):
+
+.. list-table:: Repaired solver medians, three timed repeats (seconds)
+   :header-rows: 1
+
+   * - Molecule
+     - Davidson
+     - Batched Davidson
+   * - LiH
+     - 0.0508
+     - 0.0146
+   * - HF
+     - 0.0905
+     - 0.0265
+   * - H2O
+     - 0.1414
+     - 0.0456
+   * - NH3
+     - 0.2244
+     - 0.0712
+   * - N2
+     - 0.2672
+     - 0.0910
+   * - Stretched N2
+     - 0.2931
+     - 0.1085
+
+Maximum root error is 2.59e-10 Hartree and maximum normalized residual is
+7.53e-10 Hartree, below the unchanged 1e-9 threshold. ARPACK's pass counts
+remain 4, 2, 4, 3, 2, 0 out of four, under the same iteration cap. Its
+accepted medians are 0.257 s for LiH and 1.662 s for H2O. These measurements
+validate this molecular set, not universal interior-root completeness,
+defective problems, Linux performance, or experimental accuracy. The default
+solver was unchanged by the repair; the subsequent pyrazine qualification
+below supports the switch to Davidson. Reports, figures, source snapshots and
+reproduction instructions are in ``/private/tmp/bse_real_molecules_repaired``.
+
+Pyrazine qualification and default selection
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The idealized planar D2h pyrazine geometry from
+``benchmarks/benchmark_pyrazine_rhf.py`` was tested with STO-3G, RHF,
+G0W0/TDH, five full-BSE roots, tolerance 1e-9 Hartree, and 200 iterations.
+The independent dense reference has dimension 546; both A-B and A+B are
+positive definite. There were no quasiparticle Newton fallback events.
+Both Davidson variants passed one warmup and three timed repetitions in
+13 iterations (95 operator columns). Median solver times were 1.184 s
+for scalar Davidson and 0.527 s with ``batch_columns=8``. The maximum
+root error was 2.04e-11 Hartree and normalized residual 8.48e-10 Hartree.
+ARPACK failed all four attempts, returning only 10--13 of its 14 requested
+Arnoldi roots at the iteration cap; partial results remain rejected.
+
+Together with the six cc-pVDZ molecule checks above, this supports making
+Davidson the default for ``solve_bse`` and ``BSE.solve_bse``, and for the
+matrix-free branch of ``BSE.run``. ``BSE.run(eigensolver=None)`` selects
+the path's default; explicit iterative solver controls require
+``low_rank=True`` (or automatic selection through pair factors). Dense
+Casida and TDA dispatch are unchanged. Batching remains opt-in. No fallback
+or weaker residual gate was added. The pyrazine test qualifies this solver
+case, not basis convergence or experimental excitation accuracy; a
+cc-pVDZ pyrazine preparation was stopped in favor of this smaller complete
+reference and supplies no validation result.
+
+Reproduce with the repository's single-thread environment and ``PYTHONPATH=.``::
+
+   python benchmarks/benchmark_bse_molecules.py --cases pyrazine \
+       --basis sto-3g --output /private/tmp/bse_pyrazine_sto3g
+
+Reports and reproducible comparison/energy figures are saved in that output
+directory. Timing excludes RHF, GW, screening and dense-reference preparation.
+
+Pyrazine / 6-31G with Cholesky integrals
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The larger 62-orbital pyrazine case has a 1722-dimensional full-BSE matrix.
+``benchmarks/benchmark_bse_molecules.py --cases pyrazine --basis 6-31g``
+now accepts ``--integrals cd --cd-tol 1e-10`` for the PyQED CD/RHF path,
+or ``--integrals exact`` for the independent PySCF RHF/exact-integral path.
+CD retained 958 factors through GW/BSE without constructing dense molecular
+ERIs on that path. Dense A/B matrices are validation only; the benchmark's
+vectorized reference equations are checked against the original explicit
+sums for both integral representations.
+
+Both Davidson variants passed all four attempts in each workflow, using
+five roots and tolerance 1e-9 Hartree. Timings are single-thread medians of
+three repetitions, following one warmup:
+
+.. list-table:: Pyrazine / 6-31G timings in seconds
+   :header-rows: 1
+
+   * - Integral workflow
+     - GW preparation
+     - Scalar Davidson
+     - Batched Davidson (8 columns)
+   * - Exact / PySCF RHF
+     - 44.412
+     - 17.784
+     - 5.529
+   * - CD / PyQED RHF
+     - 21.740
+     - 35.076
+     - 11.063
+
+Batching gives 3.17x speedup with CD and 3.22x with exact integrals.
+CD reduces measured GW preparation by 2.04x, but its BSE contractions are
+2.00x slower in the batched solve at this size. These preparation timings
+include differing integral and RHF implementations; they are not an isolated
+factorization algorithm comparison. The CD-versus-exact excitation shift
+is at most 7.61e-6 Hartree (0.207 meV), including all RHF/GW numerical
+differences. Both references are stable and neither uses a QP fallback.
+
+ARPACK exceeded the 120-second wall limit in both workflows. The benchmark
+now bounds each solver attempt with ``--solver-timeout`` and skips repeated
+attempts after a failed warmup; timeout times are not converged solver
+speedups. Solver timings exclude SCF, GW, screening and dense validation.
+The reproducible reports/figures are under
+``/private/tmp/bse_pyrazine_631g_comparison``; its ``compare.py`` combines
+the ``bse_pyrazine_631g_exact`` and ``bse_pyrazine_631g_cd`` output directories.
 
 Potential Energy Surfaces
 -------------------------

@@ -13,7 +13,7 @@ Refs
 import numpy as np
 import scipy.linalg
 import sys
-from scipy.optimize import newton
+from scipy.optimize import brentq, newton
 
 from functools import reduce
 
@@ -303,6 +303,7 @@ def _set_rhf_orbitals(gw, mo_energy, mo_coeff, v_static_spatial=None):
     else:
         gw.eri = None
     gw._M = None
+    gw._charge_screening = None
     gw._sigma_x_matrix = None
     gw._qp_energy_so = gw.e_mf.copy()
 
@@ -381,6 +382,60 @@ def rpa_AB_matrices(gw, method='TDH'):
 
     return A, B
 
+def _charge_rpa(gw):
+    """Exact restricted TDH charge block of the spin-orbital Casida problem.
+
+    Algebraic spin adaptation of the Casida formulation (Stratmann,
+    Scuseria and Frisch, J. Chem. Phys. 109, 8218 (1998)). All charge
+    modes are retained; spin modes with identically zero Coulomb coupling
+    are omitted. This is not screening-pole truncation. Real RHF only.
+    """
+    energy = _active_energy(gw)
+    if gw.nocc % 2 or not np.array_equal(energy[::2], energy[1::2]):
+        raise ValueError('Charge screening requires paired restricted orbital energies')
+    no = gw.nocc//2
+    spatial = energy[::2]
+    gaps = (spatial[no:][None, :]-spatial[:no, None]).ravel()
+    if np.any(gaps <= 0):
+        raise np.linalg.LinAlgError('TDH screening requires positive occupied-virtual gaps')
+    if gw._pair_factors is not None:
+        pairs = gw._pair_factors[:, :no, no:].reshape(len(gw._pair_factors), -1)
+        coulomb = pairs.T @ pairs
+    else:
+        eri = gw.eri[::2, ::2, ::2, ::2]
+        coulomb = eri[:no, no:, :no, no:].reshape(len(gaps), len(gaps))
+    root_gap = np.sqrt(gaps)
+    casida = 4*root_gap[:, None]*coulomb*root_gap[None, :]
+    casida[np.diag_indices(len(gaps))] += gaps*gaps
+    values, vectors = scipy.linalg.eigh(_symmetrize(casida))
+    if values[0] <= 0:
+        raise np.linalg.LinAlgError('TDH charge Casida matrix is not positive definite')
+    return np.sqrt(values), vectors
+
+
+def _charge_couplings(gw, poles, vectors):
+    no = gw.nocc//2
+    energy = _active_energy(gw)[::2]
+    gaps = (energy[no:][None, :]-energy[:no, None]).ravel()
+    weights = vectors*np.sqrt(gaps)[:, None]/np.sqrt(poles)[None, :]
+    if gw._pair_factors is not None:
+        factors = gw._pair_factors
+        pairs = factors[:, :no, no:].reshape(len(factors), -1)
+        spatial = np.einsum('PL,Ppq->pqL', pairs @ weights, factors, optimize=True)
+    else:
+        eri = gw.eri[::2, ::2, ::2, ::2]
+        spatial = np.einsum('il,ipq->pql', weights,
+                            eri[:no, no:].reshape(len(gaps), len(energy), len(energy)),
+                            optimize=True)
+    # Spatial BSE uses M; normalized spin-charge modes couple with sqrt(2) M.
+    gw._charge_screening = dict(energy=energy.copy(), mo_coeff=gw.mo_coeff.copy(),
+                                poles=poles.copy(), couplings=spatial)
+    result = np.zeros((gw.nso, gw.nso, len(poles)), dtype=spatial.dtype)
+    result[::2, ::2] = np.sqrt(2)*spatial
+    result[1::2, 1::2] = np.sqrt(2)*spatial
+    return result
+
+
 def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
     r'''Get the RPA eigenvalues and eigenvectors.
 
@@ -395,9 +450,18 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
       [ A  B ][X] = omega [ 1  0 ][X]
       [-B -A ][Y] =       [ 0  1 ][Y]
 
+    Restricted TDH with Casida uses the exact spatial charge block:
+    returned vectors have nocc_spatial*nvir_spatial rows. All Coulomb-active
+    poles are retained; uncoupled spin modes are omitted. TDHF and explicit
+    non-Casida requests retain the full spin problem. See _charge_rpa.
+
     See, e.g. Stratmann, Scuseria, and Frisch,
               J. Chem. Phys., 109, 8218 (1998)
     '''
+    gw._M = None
+    gw._charge_screening = None
+    if method == 'TDH' and using_casida and not using_tda:
+        return _charge_rpa(gw)
     A, B = rpa_AB_matrices(gw, method=method)
 
     if using_tda:
@@ -452,10 +516,15 @@ def get_m_rpa(gw, e_rpa, t_rpa):
     r'''Get the (intermediate) M_{pq,L} tensor needed to calculate the self-energy.
 
     M_{pq,L} = \sum_{ia} ( (eps_a-eps_i)/erpa_L )^{1/2} T_{ai,L} (ai|pq)
+
+    Charge-reduced TDH vectors include the sqrt(2) spin normalization
+    in the couplings. The returned tensor still uses spin-orbital p,q.
     '''
     nso = gw.nso
     nocc = gw.nocc
     nvir = nso - nocc
+    if t_rpa.shape[0] == (nocc//2)*(nvir//2):
+        return _charge_couplings(gw, e_rpa, t_rpa)
     energy = _active_energy(gw)
     t_by_e = t_rpa.copy()
     for L in range(len(e_rpa)):
@@ -541,35 +610,86 @@ def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
     else:
         return list(sigma_c), list(sigma_x)
 
-def _solve_qp_energies(gw, e_rpa, t_rpa, initial_so_energy):
-    egw = np.zeros(int(gw.nso/2))
+def _continue_qp_root(correction, derivative, energy, tol=1e-9):
+    """Track a positive-weight diagonal Dyson root from zero coupling.
 
-    for p in range(0,gw.nso,2):
-
-        def quasiparticle(omega):
-            
-            sigma_c_ppw, sigma_x_ppw = sigma(gw, p, p, omega, e_rpa, t_rpa)
-            
-            sigma_ppw = sigma_c_ppw + sigma_x_ppw
-            
-            return omega - gw.e_mf[p] - (sigma_ppw.real - gw.v_mf[p,p])
-
+    Numerical continuation of Hedin's Dyson equation, Phys. Rev. 139,
+    A796 (1965), doi:10.1103/PhysRev.139.A796. This is a branch-selection
+    prescription, not a complete satellite solver or a guarantee of the
+    largest spectral weight. Failed Newton steps use nearby upward-crossing
+    brackets; a fold can lead to a neighboring positive-weight branch.
+    Unresolved branches raise; no MF fallback.
+    """
+    root, coupling, increment = float(energy), 0., .125
+    while coupling < 1.:
+        target = min(1., coupling+increment)
+        residual = lambda w: w-energy-target*correction(w).real
+        slope = lambda w: 1-target*derivative(w).real
         try:
-            egw[int(p/2)] = newton(quasiparticle, initial_so_energy[p], tol=1e-6, maxiter=100)
+            candidate = float(newton(residual, root, fprime=slope, tol=tol, maxiter=100))
+            valid = (np.isfinite(candidate) and np.isfinite(slope(candidate))
+                     and slope(candidate) > 0 and abs(residual(candidate)) <= tol)
+        except (RuntimeError, OverflowError):
+            valid = False
+        if not valid:
+            # Near a pole, Newton can leave the positive-weight branch.
+            # Search outward from the preceding root for an upward crossing.
+            left = right = root
+            for radius in np.geomspace(1e-7, 2*max(1., abs(root)), 80):
+                candidates = []
+                for lo, hi in ((root-radius, left), (right, root+radius)):
+                    if residual(lo) <= 0 <= residual(hi):
+                        trial = brentq(residual, lo, hi, xtol=tol*.01)
+                        if slope(trial) > 0 and abs(residual(trial)) <= tol:
+                            candidates.append(trial)
+                if candidates:
+                    candidate = min(candidates, key=lambda w: abs(w-root))
+                    valid = True
+                    break
+                left, right = root-radius, root+radius
+        if valid:
+            root, coupling = candidate, target
+            increment = min(.125, 2*increment)
+        else:
+            increment *= .5
+            if increment < 1e-4:
+                raise RuntimeError('Could not track a positive-weight quasiparticle root')
+    return root
 
-        except RuntimeError:
-            print("Newton-Raphson unconverged, setting GW eval to input eval.")
-            egw[int(p/2)] = initial_so_energy[p]
-        
-        print(egw[int(p/2)])
-    
+
+def _solve_qp_energies(gw, e_rpa, t_rpa):
+    if gw._M is None:
+        gw._M = get_m_rpa(gw, e_rpa, t_rpa)
+    energy = _active_energy(gw)
+    centers = np.concatenate((energy[:gw.nocc, None]-e_rpa,
+                              energy[gw.nocc:, None]+e_rpa)).ravel()
+    shifts = np.repeat(np.r_[-np.ones(gw.nocc), np.ones(gw.nso-gw.nocc)], len(e_rpa))*1j*gw.eta
+    exchange = _sigma_x_matrix(gw)
+    egw = np.zeros(gw.nso//2)
+    gw.qp_weights = np.full_like(egw, np.nan)
+    gw.qp_residuals = np.full_like(egw, np.nan)
+    for p in range(0, gw.nso, 2):
+        weights = (gw._M[:, p, :]**2).ravel()
+        active = weights != 0
+        poles, broadening, residue = centers[active], shifts[active], weights[active]
+        static = exchange[p, p]-gw.v_mf[p, p]
+        def correction(w):
+            return np.sum(residue/(w-poles+broadening))+static
+        def derivative(w):
+            return -np.sum(residue/(w-poles+broadening)**2)
+        egw[p//2] = _continue_qp_root(correction, derivative, gw.e_mf[p])
+        gw.qp_weights[p//2] = 1/(1-derivative(egw[p//2]).real)
+        gw.qp_residuals[p//2] = abs(egw[p//2]-gw.e_mf[p]-correction(egw[p//2]).real)
+        print(egw[p//2])
     return egw
 
 
 def kernel(gw, so_energy, so_coeff, verbose=logger.NOTE):
     '''Get the GW-corrected spatial orbital energies.
 
-    Note: Works in spin-orbitals but returns energies for spatial orbitals.
+    TDH uses the exact charge-reduced Casida screening described in
+    :func:`rpa`, retaining all charge poles. Self-energies are exposed in
+    spin-orbital indices; returned QP energies are spatial.
 
     Args:
         gw : instance of :class:`GW`
@@ -590,7 +710,7 @@ def kernel(gw, so_energy, so_coeff, verbose=logger.NOTE):
     print("done.")
     print("# --- Calculating GW QP corrections ...")
 
-    egw = _solve_qp_energies(gw, e_rpa, t_rpa, gw._qp_energy_so)
+    egw = _solve_qp_energies(gw, e_rpa, t_rpa)
     
     print("done.")
 
@@ -632,7 +752,7 @@ def evgw_kernel(
             gw._M = fixed_M
 
         print(f"# --- evGW cycle {cycle} QP corrections ...")
-        updated = _solve_qp_energies(gw, e_rpa, t_rpa, gw._qp_energy_so)
+        updated = _solve_qp_energies(gw, e_rpa, t_rpa)
         mixed = current + damping * (updated - current)
         delta = float(np.max(np.abs(mixed - current)))
         history.append({
@@ -781,6 +901,18 @@ def is_positive_def(A):
 
 
 class GW(object):
+    """Restricted molecular GW with exact spectral screening.
+
+    Default TDH/Casida screening uses the complete spatial charge block,
+    an exact spin adaptation of Stratmann, Scuseria and Frisch,
+    J. Chem. Phys. 109, 8218 (1998). It omits only spin modes with zero
+    Coulomb coupling, not charge poles. Orbital-gap scaling replaces a
+    dense matrix square root. TDHF and explicit non-Casida RPA retain
+    the full spin representation. Matching TDH screening can be reused
+    by BSE; QP roots are tracked by positive-weight coupling continuation
+    (see :func:`_continue_qp_root`); frequency integration is unchanged.
+    See :func:`rpa` for returned mode conventions.
+    """
     __array_priority__ = 1000
 
     def __init__(self, mf, ao2mofn=None,
@@ -934,6 +1066,7 @@ class GW(object):
         if mo_energy is None:
             mo_energy = self._scf.mo_energy
 
+        self.converged = False
         method = method.lower()
         if method in ('g0w0', 'gw', 'oneshot', 'one-shot'):
             self.e_qp = kernel(self, mo_energy, mo_coeff, verbose=self.verbose)
