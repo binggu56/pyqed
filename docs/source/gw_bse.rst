@@ -457,7 +457,7 @@ set ``use_qp=False``:
    tda = TDA(gw).run(nroots=5, use_qp=False)
 
 Nonsymmetric Davidson for molecular full BSE
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The matrix-free molecular full-BSE path defaults to compiled nonsymmetric
 Davidson. SciPy Arnoldi remains available with ``eigensolver="arpack"``:
@@ -544,7 +544,7 @@ real molecules or weakly stable references. ARPACK was the default at that stage
 Reports and figures are saved under ``/private/tmp/bse_nonsymmetric_integration``.
 
 Real-molecule qualification (23 September 2026)
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 ``benchmarks/benchmark_bse_molecules.py`` runs RHF/G0W0/BSE on LiH, HF, H2O,
 NH3, N2 (1.098 Angstrom), and stretched N2 (1.80 Angstrom), all cc-pVDZ.
@@ -604,7 +604,7 @@ reproducible timing/residual and excitation-energy figures are recorded under
 not a claim of quantitative experimental accuracy or RHF orbital stability.
 
 QR extraction and degenerate-state repair
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The harmonic projected failure was isolated to Accelerate's generalized QZ
 solve on a finite, moderately conditioned LiH pencil after restart. The
@@ -662,7 +662,7 @@ below supports the switch to Davidson. Reports, figures, source snapshots and
 reproduction instructions are in ``/private/tmp/bse_real_molecules_repaired``.
 
 Pyrazine qualification and default selection
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The idealized planar D2h pyrazine geometry from
 ``benchmarks/benchmark_pyrazine_rhf.py`` was tested with STO-3G, RHF,
@@ -696,7 +696,7 @@ Reports and reproducible comparison/energy figures are saved in that output
 directory. Timing excludes RHF, GW, screening and dense-reference preparation.
 
 Pyrazine / 6-31G with Cholesky integrals
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The larger 62-orbital pyrazine case has a 1722-dimensional full-BSE matrix.
 ``benchmarks/benchmark_bse_molecules.py --cases pyrazine --basis 6-31g``

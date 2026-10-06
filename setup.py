@@ -220,52 +220,8 @@ def _extensions_to_build():
         casscf_macros = []
         extensions.append(
             Extension(
-                "pyqed.qchem._gaussian_grid",
-                ["pyqed/qchem/gaussian_grid.cpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                optional=False,
-            )
-        )
-        extensions.append(
-            Extension(
-                "pyqed.qchem._geminal_integrals",
-                ["pyqed/qchem/geminal_integrals.cpp"],
-                depends=["pyqed/qchem/_boys.hpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                optional=False,
-            )
-        )
-        extensions.append(
-            Extension(
-                "pyqed.qchem.cc._contractions",
-                ["pyqed/qchem/cc/contractions.cpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                extra_link_args=accelerate_link_args,
-                optional=False,
-            )
-        )
-        extensions.append(
-            Extension(
-                "pyqed.qchem._ao2mo",
-                ["pyqed/qchem/_ao2mo.cpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                extra_link_args=accelerate_link_args,
-                optional=False,
-            )
-        )
-        extensions.append(
-            Extension(
                 "pyqed.qchem._integrals_cpp",
                 ["pyqed/qchem/_integrals.cpp"],
-                depends=["pyqed/qchem/_boys.hpp", "pyqed/qchem/ri_derivatives.hpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=qchem_integral_compile_args,
@@ -290,21 +246,9 @@ def _extensions_to_build():
             Extension(
                 "pyqed.qchem._gdf_cpp",
                 ["pyqed/qchem/_gdf_cpp.cpp"],
-                depends=["pyqed/qchem/_boys.hpp", "pyqed/qchem/_shell_fourier.hpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=cpp_compile_args,
-                optional=False,
-            )
-        )
-        extensions.append(
-            Extension(
-                "pyqed.qchem.cc._ccsd_t_kernels",
-                ["pyqed/qchem/cc/_ccsd_t_kernels.cpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                extra_link_args=accelerate_link_args,
                 optional=False,
             )
         )
@@ -374,26 +318,6 @@ def _extensions_to_build():
             Extension(
                 "pyqed.letta._physical_blocks_cpp",
                 ["pyqed/letta/_physical_blocks_cpp.cpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                optional=True,
-            )
-        )
-        extensions.append(
-            Extension(
-                "pyqed.letta._factor_operator",
-                ["pyqed/letta/factor_operator.cpp"],
-                include_dirs=cpp_include_dirs,
-                language="c++",
-                extra_compile_args=cpp_compile_args,
-                optional=True,
-            )
-        )
-        extensions.append(
-            Extension(
-                "pyqed.letta._charge_sampling",
-                ["pyqed/letta/charge_sampling.cpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=cpp_compile_args,
