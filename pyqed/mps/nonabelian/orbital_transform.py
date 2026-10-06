@@ -33,7 +33,7 @@ from pyqed.symmetry import IrrepTensor
 
 def is_fully_reduced_su2_mps(state):
     """Return whether every site uses PyQED's fully reduced SU(2) layout."""
-    sites = list(getattr(state, "sites", state))
+    sites = list(getattr(state, "tensors", state))
     return bool(sites) and all(
         isinstance(site, IrrepTensor)
         and site.rank == 3
@@ -48,7 +48,7 @@ def _as_reduced_mps(state):
     if isinstance(state, MPS):
         return state.copy()
     return MPS.from_tensors(
-        list(getattr(state, "sites", state)),
+        list(getattr(state, "tensors", state)),
         center=getattr(state, "center", None),
         target_sector=getattr(state, "target_sector", None),
     )
@@ -420,7 +420,7 @@ def apply_spatial_orbital_transform(
     """
     transformed = _as_reduced_mps(state)
     input_bond = max(
-        [1] + [len(site.qns[2]) for site in transformed.tensors[:-1]]
+        [1] + [sum(site.legs[2].dims.values()) for site in transformed.tensors[:-1]]
     )
     requested_max_bond = max_bond
     adaptive = False
@@ -534,13 +534,13 @@ def apply_spatial_orbital_transform(
             truncation_errors.append(error)
             gate_bonds.append(int(bond))
             gate_budgets.append(gate_budget)
-            gate_kept_bonds.append(len(transformed.tensors[bond].qns[2]))
+            gate_kept_bonds.append(sum(transformed.tensors[bond].legs[2].dims.values()))
             native_mix_calls += gate_native_mix_calls
             mix_batches += gate_mix_batches
             gate_count += 1
             peak_reduced_bond = max(
                 peak_reduced_bond,
-                *(len(site.qns[2]) for site in transformed.tensors[:-1]),
+                *(sum(site.legs[2].dims.values()) for site in transformed.tensors[:-1]),
             )
     if not return_info:
         return transformed

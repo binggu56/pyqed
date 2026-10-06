@@ -11,9 +11,24 @@ from opt_einsum import contract, contract_expression
 
 
 class OrbitalContractionPlan:
-    """Compiled fixed-shape contractions for a CASSCF orbital subproblem."""
+    """Compiled fixed-shape contractions for a CASSCF orbital subproblem.
 
-    def __init__(self, h1e, eri, u_shape, dm1_shape, dm2_shape):
+    With factorized integrals and ``ncore > 0``, contract a doubly occupied
+    inactive core analytically and retain the complete active 2-RDM. This is
+    an exact specialization of the embedded spatial CAS density contraction,
+    not a cumulant truncation or an additional electronic-structure
+    approximation. The supplied densities must have the closed-shell core
+    embedding used by the CASCI/DMRG drivers. Other density structures should
+    use ``ncore=0``; rank-four integrals use the general reference path.
+
+    The inactive contractions follow normal-ordering/Wick factorization:
+    W. Kutzelnigg and D. Mukherjee, J. Chem. Phys. 107, 432–449 (1997),
+    doi:10.1063/1.474405. This implementation is an algebraic specialization
+    for the local spin-traced CAS convention, not a reproduction of that
+    paper's general multireference normal-ordering implementation.
+    """
+
+    def __init__(self, h1e, eri, u_shape, dm1_shape, dm2_shape, ncore=0):
         self.h1e = h1e
         u_shape = tuple(u_shape)
         dm1_shape = tuple(dm1_shape)
@@ -31,7 +46,12 @@ class OrbitalContractionPlan:
         )
 
         self.factorized = np.ndim(eri) == 3
+        if not 0 <= int(ncore) <= u_shape[1]:
+            raise ValueError("ncore must fit within the orbital columns")
+        self.ncore = int(ncore) if self.factorized else 0
         if self.factorized:
+            self._orbital_cache = None
+            self._pair_cache = None
             pair_shape = (eri.shape[0], u_shape[1], u_shape[1])
             self._transform_pairs = contract_expression(
                 "Ppq,pa,qb->Pab",
@@ -41,18 +61,21 @@ class OrbitalContractionPlan:
                 constants=[0],
                 optimize=optimize,
             )
+            active_size = u_shape[1] - self.ncore
+            density_pair_shape = (eri.shape[0], active_size, active_size)
+            density_shape = (active_size,) * 4
             self._two_energy = contract_expression(
                 "Pab,Pcd,abcd->",
-                pair_shape,
-                pair_shape,
-                dm2_shape,
+                density_pair_shape,
+                density_pair_shape,
+                density_shape,
                 optimize=optimize,
             )
             self._left = contract_expression(
-                "Pcd,abcd->Pab", pair_shape, dm2_shape, optimize=optimize
+                "Pcd,abcd->Pab", density_pair_shape, density_shape, optimize=optimize
             )
             self._right = contract_expression(
-                "Pab,abcd->Pcd", pair_shape, dm2_shape, optimize=optimize
+                "Pab,abcd->Pcd", density_pair_shape, density_shape, optimize=optimize
             )
             self._two_gradient = (
                 contract_expression(
@@ -121,11 +144,30 @@ class OrbitalContractionPlan:
         else:
             raise ValueError("eri must be a rank-3 pair factor or rank-4 tensor")
 
+    def _pairs(self, U):
+        if self._orbital_cache is None or not np.array_equal(U, self._orbital_cache):
+            self._pair_cache = self._transform_pairs(U, U)
+            self._orbital_cache = np.array(U, copy=True)
+        return self._pair_cache
+
     def energy(self, U, _h1e, _eri, dm1, dm2):
         e = self._one_energy(U, U, dm1)
         if self.factorized:
-            transformed = self._transform_pairs(U, U)
-            e += 0.5 * self._two_energy(transformed, transformed, dm2)
+            transformed = self._pairs(U)
+            if self.ncore:
+                c = self.ncore
+                cc, ca = transformed[:, :c, :c], transformed[:, :c, c:]
+                ac, aa = transformed[:, c:, :c], transformed[:, c:, c:]
+                density = dm1[c:, c:]
+                core_charge = np.trace(cc, axis1=1, axis2=2)
+                active_charge = np.einsum('Pab,ab->P', aa, density)
+                e += 2 * np.dot(core_charge, core_charge + active_charge)
+                e -= np.einsum('Pij,Pji->', cc, cc)
+                e -= 0.5 * (np.einsum('Pia,Pib,ab->', ca, ca, density, optimize=True)
+                            + np.einsum('Pai,Pbi,ab->', ac, ac, density, optimize=True))
+                e += 0.5 * self._two_energy(aa, aa, dm2[c:, c:, c:, c:])
+            else:
+                e += 0.5 * self._two_energy(transformed, transformed, dm2)
         else:
             e += 0.5 * self._two_energy(U, U, U, U, dm2)
         return e
@@ -133,7 +175,25 @@ class OrbitalContractionPlan:
     def gradient(self, U, _h1e, _eri, dm1, dm2):
         g = self.h1e @ U @ dm1.T + self.h1e.T @ U @ dm1
         if self.factorized:
-            transformed = self._transform_pairs(U, U)
+            transformed = self._pairs(U)
+            if self.ncore:
+                c = self.ncore
+                density = dm1[c:, c:]
+                active = transformed[:, c:, c:]
+                core_charge = np.trace(transformed[:, :c, :c], axis1=1, axis2=2)
+                active_charge = np.einsum('Pab,ab->P', active, density)
+                pair_gradient = np.zeros_like(transformed, dtype=np.result_type(transformed, dm1, dm2))
+                pair_gradient[:, :c, :c] = -2 * transformed[:, :c, :c].swapaxes(1, 2)
+                indices = np.arange(c)
+                pair_gradient[:, indices, indices] += (4*core_charge + 2*active_charge)[:, None]
+                pair_gradient[:, :c, c:] = -0.5 * (transformed[:, :c, c:] @ (density+density.T))
+                pair_gradient[:, c:, :c] = -0.5 * ((density+density.T) @ transformed[:, c:, :c])
+                active_dm2 = dm2[c:, c:, c:, c:]
+                pair_gradient[:, c:, c:] = (
+                    2 * core_charge[:, None, None] * density
+                    + 0.5 * (self._left(active, active_dm2) + self._right(active, active_dm2))
+                )
+                return g + self._two_gradient[0](U, pair_gradient) + self._two_gradient[1](U, pair_gradient)
             left = self._left(transformed, dm2)
             right = self._right(transformed, dm2)
             g += 0.5 * (
@@ -189,12 +249,25 @@ def _factorized_two_electron_gradient_action(U, D, pair_factors, dm2):
     )
 
 
+def isd_step(X, G, step):
+    """Implicit steepest-descent step followed by polar projection.
+
+    Implements Eq. (16) of Zhang, Hu and Gu, *Constrained Optimization
+    Algorithms for Orbital Optimization in Quantum Chemistry* (2026),
+    https://arxiv.org/abs/2606.17761: ``polar(solve(I + step*A, X))``,
+    with ``A = G X^H - X G^H``. The adjoint extends the real formulation
+    to complex orbitals; no Cayley or explicit-descent substitution is used.
+    """
+    skew = G @ X.T.conj() - X @ G.T.conj()
+    return project(np.linalg.solve(np.eye(X.shape[0], dtype=skew.dtype) + step * skew, X))
+
+
 def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
              rho1=0.5, delta=0.2, epsilon=1e-5, algorithm='RCG',
              history_size=7, max_iterations=200, max_step_norm=None,
              newton_shift=1e-4, newton_max_cycle=6,
              newton_max_subspace=12, newton_tol=1e-4,
-             gradient_fn=None):
+             gradient_fn=None, projection_fn=None):
     """
     Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
 
@@ -225,8 +298,13 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         Backtracking reduction factor.
     epsilon : float, optional
         Convergence threshold on the Riemannian gradient norm.
-    algorithm : {'RCG', 'SD', 'LBFGS', 'NEWTON', 'AH'}, optional
+    algorithm : {'ISD', 'RCG', 'SD', 'LBFGS', 'NEWTON', 'AH'}, optional
         Optimization algorithm on the Stiefel manifold.
+        ISD follows Eqs. (16), (33)-(34) of Zhang, Hu and Gu (2026),
+        https://arxiv.org/abs/2606.17761: implicit skew-gradient solve,
+        polar projection, nonmonotone Armijo search and alternating BB steps.
+        The iteration cap and optional step bound are practical safeguards;
+        ISD requires the complete Stiefel space, without a custom projection.
     history_size : int, optional
         Number of secant pairs kept by the limited-memory BFGS backend.
     max_iterations : int or None, optional
@@ -239,6 +317,12 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     gradient_fn : callable or None, optional
         Euclidean gradient callable with the same arguments as ``f``.  The
         module-level orbital gradient is used by default.
+    projection_fn : callable or None, optional
+        Orthogonal projection ``projection_fn(X, vector)`` onto the permitted
+        tangent directions. Applies to gradients, directions and secant
+        transport. The default is the complete Stiefel tangent space.
+        Supported for SD, RCG and LBFGS; the Hessian implementations require
+        the complete Stiefel tangent space.
 
     Returns
     -------
@@ -249,26 +333,42 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
     References
     ----------
-    Optimization Lett. 2022, 16:1773
+    The limited-memory two-loop recursion adapts J. Nocedal, "Updating
+    quasi-Newton matrices with limited storage", Math. Comp. 35, 773–782
+    (1980), https://doi.org/10.1090/S0025-5718-1980-0572855-7, to tangent
+    vectors. Polar retraction and projected vector transport follow the
+    framework of P.-A. Absil, R. Mahony and R. Sepulchre, *Optimization
+    Algorithms on Matrix Manifolds*, Princeton University Press (2008),
+    https://sites.uclouvain.be/absil/amsbook/. Every retained secant pair is
+    reprojected at the current point; nonpositive curvature pairs are dropped.
+    This is a projected-transport adaptation, not a reproduction of Euclidean
+    L-BFGS or a method with its superlinear convergence guarantee. A restricted
+    projection searches only its allowed directions at each inner step.
     """
     algorithm = algorithm.upper().replace('-', '_')
     if algorithm == 'AUGMENTED_HESSIAN':
         algorithm = 'AH'
-    if algorithm not in ('RCG', 'SD', 'LBFGS', 'NEWTON', 'AH'):
+    if algorithm not in ('ISD', 'RCG', 'SD', 'LBFGS', 'NEWTON', 'AH'):
         raise ValueError(
-            "Unknown orthogonality-constrained optimizer '{}'. Use 'RCG', 'SD', 'LBFGS', 'NEWTON' or 'AH'.".format(
+            "Unknown orthogonality-constrained optimizer '{}'. Use 'ISD', 'RCG', 'SD', 'LBFGS', 'NEWTON' or 'AH'.".format(
                 algorithm
             )
         )
 
+    if projection_fn is not None and algorithm in ('ISD', 'NEWTON', 'AH'):
+        raise ValueError("A custom tangent projection requires SD, RCG or LBFGS")
+
     # Start from a projected point so the optimizer can be called with slightly
     # noisy guesses without violating the manifold constraint.
     gradient_eval = gradient if gradient_fn is None else gradient_fn
+    project_tangent = grad if projection_fn is None else projection_fn
+    if algorithm == 'ISD':
+        project_tangent = lambda x, g: g - x @ (g.T.conj() @ x)
     X = project(X0)
     C = f(X, *args)
     Q = 1.0
     G = gradient_eval(X, *args)
-    df = grad(X, G)
+    df = project_tangent(X, G)
     direction = -df
     v = C
     k = 0
@@ -277,7 +377,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
     while norm(df) > epsilon and (max_iterations is None or k < int(max_iterations)):
         if algorithm == 'LBFGS':
-            direction = -lbfgs_direction(df, lbfgs_s, lbfgs_y)
+            direction = -project_tangent(X, lbfgs_direction(df, lbfgs_s, lbfgs_y))
         elif algorithm in ('NEWTON', 'AH'):
             direction = matrix_free_newton_direction(
                 X,
@@ -290,12 +390,14 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
                 max_step=max_step_norm,
             )
 
-        directional_derivative = np.real(inner(df, direction))
+        if algorithm != 'ISD':
+            direction = project_tangent(X, direction)
+        directional_derivative = np.real(inner(G if algorithm == 'ISD' else df, direction))
         if directional_derivative >= 0:
             # Restart if conjugacy was lost numerically and the direction no
             # longer points downhill.
             direction = -df
-            directional_derivative = -np.real(inner(df, df))
+            directional_derivative = -np.real(inner(G if algorithm == 'ISD' else df, df))
 
         step = max(min(tau, tauM), taum)
         step = clip_step_size(direction, step, max_step_norm)
@@ -305,7 +407,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         # while still converging more aggressively than strict monotone descent.
         accepted = False
         while True:
-            Y = retract(X, step * direction)
+            Y = isd_step(X, G, step) if algorithm == 'ISD' else retract(X, step * direction)
             trial_value = f(Y, *args)
             if trial_value <= C + rho1 * step * directional_derivative:
                 accepted = True
@@ -324,14 +426,14 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         v = trial_value
         Cnew = (eta * Q * C + v) / Qnew
         Gnew = gradient_eval(Xnew, *args)
-        df_new = grad(Xnew, Gnew)
+        df_new = project_tangent(Xnew, Gnew)
 
-        transported_grad = transport(Xnew, df)
+        transported_grad = project_tangent(Xnew, df)
         if algorithm == 'RCG':
             beta_num = np.real(inner(df_new, df_new - transported_grad))
             beta_den = max(abs(np.real(inner(df, df))), 1e-16)
             beta = max(0.0, beta_num / beta_den)
-            transported_dir = transport(Xnew, direction)
+            transported_dir = project_tangent(Xnew, direction)
             direction = -df_new + beta * transported_dir
         elif algorithm == 'LBFGS':
             update_lbfgs_history(
@@ -341,13 +443,26 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
                 accepted_step,
                 df_new - transported_grad,
                 history_size,
+                projection_fn=project_tangent,
             )
-            direction = -lbfgs_direction(df_new, lbfgs_s, lbfgs_y)
+            direction = -project_tangent(Xnew, lbfgs_direction(df_new, lbfgs_s, lbfgs_y))
         else:
             direction = -df_new
 
-        transported_step = transport(Xnew, accepted_step)
-        tau = safe_stepsize(k + 1, transported_step, df_new - transported_grad, step)
+        transported_step = project_tangent(Xnew, accepted_step)
+        # L-BFGS already scales its direction with an inverse-Hessian model.
+        # A second BB curvature scale can suppress stiff-coordinate steps twice.
+        if algorithm == 'ISD':
+            displacement, difference = Xnew - X, df_new - df
+            curvature = abs(inner(displacement, difference))
+            square = abs(inner(difference, difference))
+            tau = (stepsize(k + 1, displacement, difference)
+                   if min(curvature, square) > np.finfo(float).tiny else step)
+            if not np.isfinite(tau) or tau <= 0:
+                tau = step
+        else:
+            tau = (1.0 if algorithm == 'LBFGS' else
+                   safe_stepsize(k + 1, transported_step, df_new - transported_grad, step))
         tau = max(min(tau, tauM), taum)
 
         k += 1
@@ -663,7 +778,7 @@ def riemannian_hessian_action(X, direction, euclidean_grad, h1e, h2e, dm1, dm2):
     return tangent_projection(X, dG - D @ A - X @ dA)
 
 
-def lbfgs_direction(grad_vec, s_history, y_history):
+def lbfgs_direction(grad_vec, s_history, y_history, initial_inverse=None):
     """
     Apply the standard two-loop recursion for limited-memory BFGS.
 
@@ -671,9 +786,16 @@ def lbfgs_direction(grad_vec, s_history, y_history):
     usual Euclidean algebra on those tangent coordinates because the optimizer
     already transports them back to the current tangent space before they enter
     the history.
+
+    Adapted from J. Nocedal, Math. Comp. 35, 773–782 (1980),
+    https://doi.org/10.1090/S0025-5718-1980-0572855-7; projected manifold
+    transport does not inherit unconstrained superlinear guarantees.
+
+    ``initial_inverse`` optionally applies a positive-definite initial
+    inverse-Hessian model instead of a scalar identity.
     """
     if len(s_history) == 0:
-        return grad_vec.copy()
+        return grad_vec.copy() if initial_inverse is None else initial_inverse(grad_vec)
 
     q = grad_vec.copy()
     alpha = []
@@ -681,7 +803,7 @@ def lbfgs_direction(grad_vec, s_history, y_history):
 
     for s_vec, y_vec in zip(reversed(s_history), reversed(y_history)):
         sy = np.real(inner(s_vec, y_vec))
-        if abs(sy) < 1e-16:
+        if sy <= 0.0:
             alpha.append(0.0)
             rho.append(0.0)
             continue
@@ -693,10 +815,11 @@ def lbfgs_direction(grad_vec, s_history, y_history):
 
     s_last = s_history[-1]
     y_last = y_history[-1]
-    yy = np.real(inner(y_last, y_last))
+    inverse_y = y_last if initial_inverse is None else initial_inverse(y_last)
+    yy = np.real(inner(y_last, inverse_y))
     sy = np.real(inner(s_last, y_last))
-    gamma = sy / yy if yy > 1e-16 else 1.0
-    r = gamma * q
+    gamma = sy / yy if yy > 0.0 else 1.0
+    r = gamma * (q if initial_inverse is None else initial_inverse(q))
 
     for idx, (s_vec, y_vec) in enumerate(zip(s_history, y_history)):
         rho_i = rho[-1 - idx]
@@ -709,17 +832,30 @@ def lbfgs_direction(grad_vec, s_history, y_history):
     return r
 
 
-def update_lbfgs_history(s_history, y_history, Xnew, raw_step, raw_grad_diff, history_size):
+def update_lbfgs_history(s_history, y_history, Xnew, raw_step, raw_grad_diff, history_size,
+                         projection_fn=None):
     """
     Store one transported secant pair for the manifold L-BFGS update.
 
     ``raw_step`` and ``raw_grad_diff`` are first built in ambient coordinates
     and then projected to the new tangent space before they are stored.
     """
-    s_vec = transport(Xnew, raw_step)
-    y_vec = transport(Xnew, raw_grad_diff)
+    project_tangent = transport if projection_fn is None else projection_fn
+    # All pairs must live at Xnew, including those retained from earlier steps.
+    for index in range(len(s_history) - 1, -1, -1):
+        s = project_tangent(Xnew, s_history[index])
+        y = project_tangent(Xnew, y_history[index])
+        if np.real(inner(s, y)) <= 1e-10 * norm(s) * norm(y):
+            del s_history[index]
+            del y_history[index]
+        else:
+            s_history[index] = s
+            y_history[index] = y
+    s_vec = project_tangent(Xnew, raw_step)
+    y_vec = project_tangent(Xnew, raw_grad_diff)
     curvature = np.real(inner(s_vec, y_vec))
-    if curvature <= 1e-12:
+    # Judge curvature by the secant angle, not the magnitude of a small step.
+    if curvature <= 1e-10 * norm(s_vec) * norm(y_vec):
         return
 
     s_history.append(s_vec.copy())

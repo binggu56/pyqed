@@ -12,6 +12,8 @@ import ctypes
 import sys
 import time
 import weakref
+from array import array as integer_array
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 
@@ -50,6 +52,9 @@ from pyqed.symmetry import IrrepTensor
 from pyqed.mps.su2 import SU2Irrep
 
 
+_BOUNDARY_ROUTE_CACHE_MAX_BYTES = 4 * 1024**2
+
+
 @lru_cache(maxsize=1)
 def _numeric_allocator_relief():
     """Return the platform allocator's free-page release hook, if available."""
@@ -81,6 +86,7 @@ def _release_free_numeric_pages():
 
 
 _USE_REAL_RANK_COUPLED_ACCUMULATE = True
+_BOUNDARY_ZERO_COMPACTION_MIN_BYTES = 64 * 1024**2
 _IDENTITY_MPO_CORE_CACHE = {}
 _RANK_COUPLED_REAL_TERM_COALESCE = (
     os.environ.get("PYQED_SU2_RANK_COUPLED_COALESCE_TERMS", "0")
@@ -120,16 +126,23 @@ def _su2_kernel_module():
     return module
 
 
+def _has_material_imaginary_part(array):
+    """Check the real-buffer tolerance without allocating a converted buffer."""
+    arr = np.asarray(array)
+    if arr.dtype.kind != "c" or not arr.size:
+        return False
+    scale = max(1.0, float(np.max(np.abs(arr.real))))
+    tolerance = 64.0 * np.finfo(np.float64).eps * scale
+    return float(np.max(np.abs(arr.imag))) > tolerance
+
+
 def _real64_contiguous_or_none(array):
     """Return a real float64 buffer, or ``None`` for genuinely complex data."""
 
     arr = np.asarray(array)
+    if _has_material_imaginary_part(arr):
+        return None
     if arr.dtype.kind == "c":
-        if arr.size:
-            scale = max(1.0, float(np.max(np.abs(arr.real))))
-            tolerance = 64.0 * np.finfo(np.float64).eps * scale
-            if float(np.max(np.abs(arr.imag))) > tolerance:
-                return None
         arr = arr.real
     if arr.dtype == np.float64 and arr.flags.c_contiguous:
         return arr
@@ -359,7 +372,7 @@ _DIAG_BLOCK_PATH = _cached_einsum_path(
     (2, 2),
 )
 _RANK_COUPLED_SMALL_CONTRACTION_WORK = int(
-    os.environ.get("PYQED_SU2_RANK_COUPLED_ACCUMULATE_WORK", "1000000000")
+    os.environ.get("PYQED_SU2_RANK_COUPLED_ACCUMULATE_WORK", "65536")
 )
 _RANK_COUPLED_GREEDY_CONTRACTION_WORK = int(
     os.environ.get("PYQED_SU2_RANK_COUPLED_GREEDY_WORK", "8000000")
@@ -392,6 +405,20 @@ def _rank_coupled_right_work(A_conj, W_block, F_block, B_block):
     )
 
 
+def _left_virtual_products(environment, bra, ket):
+    """Contract singleton-physical virtual matrices once per left channel."""
+    if bra.shape[1] * ket.shape[0] <= bra.shape[0] * ket.shape[1]:
+        return (bra.T @ environment) @ ket
+    return bra.T @ (environment @ ket)
+
+
+def _right_virtual_products(bra, environment, ket):
+    """Contract singleton-physical virtual matrices once per right channel."""
+    if bra.shape[0] * ket.shape[1] <= bra.shape[1] * ket.shape[0]:
+        return (bra @ environment) @ ket.T
+    return bra @ (environment @ ket.T)
+
+
 def _contract_rank_coupled_left_step(E_block, A_conj, W_block, B_block):
     """
     Contract one left environment update term without dynamic path planning.
@@ -403,6 +430,12 @@ def _contract_rank_coupled_left_step(E_block, A_conj, W_block, B_block):
     :returns: Contribution with indices ``yrs``.
     """
 
+    work = _rank_coupled_left_work(E_block, A_conj, W_block, B_block)
+    if W_block.shape[2:] == (1, 1) and work >= 16384:
+        a, b = A_conj[:, 0, :], B_block[:, 0, :]
+        products = _left_virtual_products(E_block, a, b)
+        return (W_block[:, :, 0, 0].T @ products.reshape(products.shape[0], -1)).reshape(
+            W_block.shape[1], a.shape[1], b.shape[1])
     if (
         E_block.shape[0] == 1
         and W_block.shape[0] == 1
@@ -447,6 +480,12 @@ def _contract_rank_coupled_right_step(A_conj, W_block, F_block, B_block):
     :returns: Contribution with indices ``xij``.
     """
 
+    work = _rank_coupled_right_work(A_conj, W_block, F_block, B_block)
+    if W_block.shape[2:] == (1, 1) and work >= 16384:
+        a, b = A_conj[:, 0, :], B_block[:, 0, :]
+        products = _right_virtual_products(a, F_block, b)
+        return (W_block[:, :, 0, 0] @ products.reshape(products.shape[0], -1)).reshape(
+            W_block.shape[0], a.shape[0], b.shape[0])
     if (
         F_block.shape[0] == 1
         and W_block.shape[0] == 1
@@ -1452,14 +1491,16 @@ def _right_reduced_recoupling_coeff(
 
 
 def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    # Virtual charges constrain routing, not spin recoupling. Physical charges
+    # must remain in the key because they select local fermionic operators.
     cache_key = (
         "left",
-        q_lb,
-        q_lk,
+        _sector_irrep(q_lb),
+        _sector_irrep(q_lk),
         q_pb,
         q_pk,
-        q_rb,
-        q_rk,
+        _sector_irrep(q_rb),
+        _sector_irrep(q_rk),
         bool(getattr(W, "normal_complementary_right_dual", False)),
         id(getattr(W, "normal_complementary_plan", None)),
     )
@@ -1552,6 +1593,13 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
 
     for term in W.reduced_terms:
         op_rank = _reduced_operator_rank(term.reduced_operator)
+        operator_blocks = {}
+        for component in ordered_two_m_values(op_rank):
+            block = term.reduced_operator.component_block(component, q_pb, q_pk)
+            if block is not None and np.any(block):
+                operator_blocks[int(component)] = block
+        if not operator_blocks:
+            continue
         for left_idx, right_idx, visible_coeff in iter_virtual_routes(
             term.visible_virtual_block
         ):
@@ -1709,7 +1757,7 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             and left_irrep.two_j == 1
                         ):
                             dual_factor = -1.0
-                        op_block = term.reduced_operator.component_block(component, q_pb, q_pk)
+                        op_block = operator_blocks.get(int(component))
                         if op_block is None:
                             continue
                         recoupled = _left_reduced_recoupling_coeff(
@@ -1741,14 +1789,15 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
 
 
 def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
+    # As on the left, share spin recoupling without merging physical charges.
     cache_key = (
         "right",
-        q_lb,
-        q_lk,
+        _sector_irrep(q_lb),
+        _sector_irrep(q_lk),
         q_pb,
         q_pk,
-        q_rb,
-        q_rk,
+        _sector_irrep(q_rb),
+        _sector_irrep(q_rk),
         bool(getattr(W, "normal_complementary_right_dual", False)),
         id(getattr(W, "normal_complementary_plan", None)),
     )
@@ -1840,6 +1889,13 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
 
     for term in W.reduced_terms:
         op_rank = _reduced_operator_rank(term.reduced_operator)
+        operator_blocks = {}
+        for component in ordered_two_m_values(op_rank):
+            block = term.reduced_operator.component_block(component, q_pb, q_pk)
+            if block is not None and np.any(block):
+                operator_blocks[int(component)] = block
+        if not operator_blocks:
+            continue
         for left_idx, right_idx, visible_coeff in iter_virtual_routes(
             term.visible_virtual_block
         ):
@@ -1997,7 +2053,7 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
                             and left_irrep.two_j == 1
                         ):
                             dual_factor = -1.0
-                        op_block = term.reduced_operator.component_block(component, q_pb, q_pk)
+                        op_block = operator_blocks.get(int(component))
                         if op_block is None:
                             continue
                         recoupled = _right_reduced_recoupling_coeff(
@@ -2264,7 +2320,7 @@ class LeftBlock(_BlockEnvironment):
                     self,
                     ket_site,
                 )
-                return LeftBlock(data, rank_coupled=True)
+                return LeftBlock(_compact_zero_boundary_map(data), rank_coupled=True)
             data, packed, topology_revision, numeric_revision = cpp_result
             return LeftBlock(
                 data,
@@ -2333,7 +2389,7 @@ class RightBlock(_BlockEnvironment):
                     self,
                     ket_site,
                 )
-                return RightBlock(data, rank_coupled=True)
+                return RightBlock(_compact_zero_boundary_map(data), rank_coupled=True)
             data, packed, topology_revision, numeric_revision = cpp_result
             return RightBlock(
                 data,
@@ -2563,68 +2619,69 @@ def _empty_packed_boundary_from_specs(output_specs, *, side, bond):
     return packed, {key: index for index, key in enumerate(ordered_keys)}
 
 
-def _contract_rank_coupled_boundary_cpp(
-    W,
-    A,
-    E_map,
-    B,
-    *,
-    moving_environment,
-    side,
-    parent_bond,
-    child_bond,
-    numeric_revision,
-):
-    """Plan one reduced boundary update and execute all numerical routes in C++."""
+def _compact_zero_boundary_map(data):
+    """Drop zero channels without packing or copying Python-owned arrays."""
+    total = sum(block.nbytes for channels in data.values() for block in channels.values())
+    if total < _BOUNDARY_ZERO_COMPACTION_MIN_BYTES:
+        return data
+    kept = {}
+    retained = 0
+    for key, channels in data.items():
+        blocks = {channel: block for channel, block in channels.items()
+                  if np.count_nonzero(block)}
+        if blocks:
+            kept[key] = RankCoupledChannelBlocks(blocks, len(channels))
+            retained += sum(block.nbytes for block in blocks.values())
+    return kept if kept and retained <= .75 * total else data
 
-    if (
-        not isinstance(W, RankCoupledMPO)
-        or parent_bond is None
-        or child_bond is None
-        or not hasattr(moving_environment, "advance_boundary")
-    ):
-        return None
-    side = str(side).lower()
-    edge = "left" if side == "left" else "right"
-    packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
-    if packed_parent is None:
-        return None
-    # LETTA commonly carries numerically real tensors in complex arrays.  Keep
-    # those on the real boundary store installed by the local contextual
-    # action; only select the complex route when the parent or site tensors
-    # contain a material imaginary component.  A genuinely complex MPOCore block
-    # is caught by ``register`` below and falls back to the Python contraction.
-    complex_update = bool(
-        _real64_contiguous_or_none(packed_parent.block_pool.data) is None
-        or any(
-            _real64_contiguous_or_none(block) is None
-            for block in A.data.values()
-        )
-        or any(
-            _real64_contiguous_or_none(block) is None
-            for block in B.data.values()
-        )
+
+def _compact_zero_boundary_blocks(packed):
+    """Remove exactly zero operator channels from large reduced arenas.
+
+    This changes numerical storage, not the virtual basis. Every boundary
+    update rescans its values; small and wholly zero arenas remain unchanged.
+    """
+    pool = packed.block_pool
+    if pool.data.nbytes < _BOUNDARY_ZERO_COMPACTION_MIN_BYTES:
+        return packed
+    keep = {
+        i for i in range(pool.offsets.size - 1)
+        if np.count_nonzero(pool.data[int(pool.offsets[i]):int(pool.offsets[i + 1])])
+    }
+    retained = sum(int(pool.offsets[i + 1] - pool.offsets[i]) for i in keep)
+    if not keep or retained > .75 * pool.data.size:
+        return packed
+    sectors = packed.sector_codec.sectors
+    rows, arrays = [], []
+    for row, ket_id in enumerate(packed.ket_sector_ids):
+        entries = []
+        for entry in range(int(packed.entry_offsets[row]), int(packed.entry_offsets[row + 1])):
+            channels = []
+            for i in range(int(packed.channel_offsets[entry]), int(packed.channel_offsets[entry + 1])):
+                if i in keep:
+                    channels.append((int(packed.channel_ids[i]), len(arrays)))
+                    arrays.append(pool.array(i))
+            if channels:
+                entries.append((sectors[int(packed.out_sector_ids[entry])], tuple(channels)))
+        if entries:
+            rows.append((sectors[int(ket_id)], tuple(entries)))
+    return type(packed).from_rows(
+        rows, arrays, side=packed.side, bond=packed.bond,
+        representation=packed.representation,
     )
-    if complex_update and not hasattr(moving_environment, "advance_boundary_complex"):
-        return None
-    if (
-        not complex_update
-        and getattr(W, "normal_complementary_owner", None) is moving_environment
-        and getattr(W, "normal_complementary_plan", None) is not None
-    ):
-        return _contract_normal_complementary_boundary_cpp(
-            W,
-            A,
-            E_map,
-            B,
-            moving_environment=moving_environment,
-            side=side,
-            parent_bond=parent_bond,
-            child_bond=child_bond,
-            numeric_revision=numeric_revision,
-        )
 
+
+def _plan_rank_coupled_boundary(W, A, packed_parent, B, *, side, complex_update=False,
+                               require_real=False, grouped_routes=False):
+    """Build reduced routes independently of parent/output storage ownership.
+
+    Sparse transport groups four integer indices per route by output block,
+    avoiding per-route Python tuples and repeated sector keys. Within each
+    output block, insertion order preserves the original contraction sum.
+    """
+    edge = "left" if side == "left" else "right"
     sectors = tuple(packed_parent.sector_codec.sectors)
+    support = getattr(packed_parent.block_pool, 'has_nonzero', None)
     parent_blocks = {}
     for row_index, ket_id in enumerate(packed_parent.ket_sector_ids):
         q_in = sectors[int(ket_id)]
@@ -2637,10 +2694,20 @@ def _contract_rank_coupled_boundary_cpp(
             parent_blocks[(q_out, q_in)] = {
                 int(packed_parent.channel_ids[channel_index]): int(channel_index)
                 for channel_index in range(channel_start, channel_stop)
+                if (support(channel_index) if support is not None else
+                    np.any(packed_parent.block_pool.array(channel_index)))
             }
 
-    a_entries_by_edge = _rank_coupled_site_entries_by_edge(A, edge)
-    b_entries_by_edge = _rank_coupled_site_entries_by_edge(B, edge)
+    # Recompute numerical support for each update: a currently zero tensor can
+    # become active at the next optimization step.
+    def supported_entries(tensor):
+        return {
+            sector: tuple(entry for entry in entries if np.any(entry[2]))
+            for sector, entries in _rank_coupled_site_entries_by_edge(tensor, edge).items()
+        }
+
+    a_entries_by_edge = supported_entries(A)
+    b_entries_by_edge = (a_entries_by_edge if A is B else supported_entries(B))
     bra_arrays = []
     ket_arrays = []
     mpo_arrays = []
@@ -2649,7 +2716,7 @@ def _contract_rank_coupled_boundary_cpp(
     bra_indices = {}
     ket_indices = {}
     mpo_indices = {}
-    routes = []
+    routes = {} if grouped_routes else []
     output_specs = {}
     reduced_cache = {}
     reduced_physical = (
@@ -2662,24 +2729,29 @@ def _contract_rank_coupled_boundary_cpp(
     )
 
     def register(array, arrays, index, *, block_key=None, keys=None):
+        key = id(array)
+        found = index.get(key)
+        if found is not None:
+            return int(found)
         packed = (
             np.ascontiguousarray(array, dtype=np.complex128)
             if complex_update
             else _real64_contiguous_or_none(array)
         )
         if packed is None:
+            if require_real:
+                raise NotImplementedError('Boundary routes require genuinely complex execution')
             return None
-        key = id(packed)
-        found = index.get(key)
-        if found is None:
-            found = len(arrays)
-            index[key] = found
-            arrays.append(packed)
-            if keys is not None:
-                keys.append(block_key)
+        found = len(arrays)
+        index[key] = found
+        arrays.append(packed)
+        if keys is not None:
+            keys.append(block_key)
         return int(found)
 
     for (q_boundary_bra, q_boundary_ket), channel_map in parent_blocks.items():
+        if not channel_map:
+            continue
         a_entries = a_entries_by_edge.get(q_boundary_bra)
         b_entries = b_entries_by_edge.get(q_boundary_ket)
         if not a_entries or not b_entries:
@@ -2806,17 +2878,86 @@ def _contract_rank_coupled_boundary_cpp(
                         raise ValueError(
                             "SU(2) boundary routes disagree on an output block shape."
                         )
-                    routes.append(
-                        (
-                            int(parent_index),
-                            int(bra_index),
-                            int(ket_index),
-                            int(mpo_index),
-                            output_key,
-                        )
-                    )
+                    if grouped_routes:
+                        group = routes.get(output_key)
+                        if group is None:
+                            group = routes[output_key] = integer_array('q')
+                        group.extend((parent_index, bra_index, ket_index, mpo_index))
+                    else:
+                        routes.append((parent_index, bra_index, ket_index, mpo_index, output_key))
     if not routes:
         return None
+
+    return bra_arrays, ket_arrays, mpo_arrays, bra_keys, ket_keys, routes, output_specs
+
+
+def _contract_rank_coupled_boundary_cpp(
+    W,
+    A,
+    E_map,
+    B,
+    *,
+    moving_environment,
+    side,
+    parent_bond,
+    child_bond,
+    numeric_revision,
+):
+    """Plan one reduced boundary update and execute all numerical routes in C++."""
+
+    if (
+        not isinstance(W, RankCoupledMPO)
+        or parent_bond is None
+        or child_bond is None
+        or not hasattr(moving_environment, "advance_boundary")
+    ):
+        return None
+    side = str(side).lower()
+    edge = "left" if side == "left" else "right"
+    packed_parent = E_map.ensure_packed(side=side, bond=int(parent_bond))
+    if packed_parent is None:
+        return None
+    # LETTA commonly carries numerically real tensors in complex arrays.  Keep
+    # those on the real boundary store installed by the local contextual
+    # action; only select the complex route when the parent or site tensors
+    # contain a material imaginary component.  A genuinely complex MPOCore block
+    # is caught by ``register`` below and falls back to the Python contraction.
+    complex_update = bool(
+        _has_material_imaginary_part(packed_parent.block_pool.data)
+        or any(
+            _has_material_imaginary_part(block)
+            for block in A.data.values()
+        )
+        or any(
+            _has_material_imaginary_part(block)
+            for block in B.data.values()
+        )
+    )
+    if complex_update and not hasattr(moving_environment, "advance_boundary_complex"):
+        return None
+    if (
+        not complex_update
+        and getattr(W, "normal_complementary_owner", None) is moving_environment
+        and getattr(W, "normal_complementary_plan", None) is not None
+    ):
+        return _contract_normal_complementary_boundary_cpp(
+            W,
+            A,
+            E_map,
+            B,
+            moving_environment=moving_environment,
+            side=side,
+            parent_bond=parent_bond,
+            child_bond=child_bond,
+            numeric_revision=numeric_revision,
+        )
+
+    plan = _plan_rank_coupled_boundary(
+        W, A, packed_parent, B, side=side, complex_update=complex_update,
+    )
+    if plan is None:
+        return None
+    bra_arrays, ket_arrays, mpo_arrays, bra_keys, ket_keys, routes, output_specs = plan
 
     output_table, output_indices = _empty_packed_boundary_from_specs(
         output_specs,
@@ -2845,7 +2986,8 @@ def _contract_rank_coupled_boundary_cpp(
     from .su2_qchem_plan import PackedArrayPool
 
     bra_pool = PackedArrayPool.from_arrays(bra_arrays)
-    ket_pool = PackedArrayPool.from_arrays(ket_arrays)
+    ket_pool = (bra_pool if A is B and bra_keys == ket_keys
+                else PackedArrayPool.from_arrays(ket_arrays))
     mpo_pool = PackedArrayPool.from_arrays(mpo_arrays)
     labels, topology_revision = _packed_boundary_labels(output_table)
     numeric_revision = int(
@@ -2984,6 +3126,17 @@ def _contract_rank_coupled_boundary_cpp(
         _array_cache=None,
     )
     output_table = replace(output_table, block_pool=output_pool)
+    if not complex_update and not bool(getattr(W, "fully_reduced_identity", False)):
+        compact = _compact_zero_boundary_blocks(output_table)
+        if compact is not output_table:
+            output_table = compact
+            labels, topology_revision = _packed_boundary_labels(output_table)
+            moving_environment.release_boundary(side, int(child_bond))
+            moving_environment.install_boundary(
+                side, int(child_bond), output_table.block_pool.data,
+                output_table.block_pool.offsets, labels,
+                int(topology_revision), int(numeric_revision),
+            )
     data = _PackedRankCoupledEnvironmentMap(
         output_table,
         n_channels=(
@@ -3142,6 +3295,7 @@ def _pack_normal_complementary_boundary_routes_cpp(
     )
     specs = {}
     output_keys = [None] * int(output_specs.shape[0])
+    allowed_outputs = np.zeros(len(output_keys), dtype=bool)
     for (
         next_bra,
         next_ket,
@@ -3150,6 +3304,16 @@ def _pack_normal_complementary_boundary_routes_cpp(
         ket_dim,
         output_id,
     ) in output_specs:
+        bra_spin = int(next_sectors[int(next_bra)].irrep.two_j)
+        ket_spin = int(next_sectors[int(next_ket)].irrep.two_j)
+        operator_spin = int(output_quantum_numbers[int(output_channel), 1])
+        # A reduced boundary is an irreducible operator between these sectors.
+        # Forbidden spin triangles are exactly zero, independent of tensors.
+        if (operator_spin < abs(bra_spin - ket_spin)
+                or operator_spin > bra_spin + ket_spin
+                or (bra_spin + ket_spin + operator_spin) % 2):
+            continue
+        allowed_outputs[int(output_id)] = True
         output_key = (
             next_sectors[int(next_bra)],
             next_sectors[int(next_ket)],
@@ -3161,13 +3325,17 @@ def _pack_normal_complementary_boundary_routes_cpp(
             int(bra_dim),
             int(ket_dim),
         )
+    if not np.all(allowed_outputs):
+        integer_routes = integer_routes[allowed_outputs[integer_routes[:, 6]]]
+    if not integer_routes.size:
+        return None
     output_table, output_indices = _empty_packed_boundary_from_specs(
         specs,
         side=side,
         bond=int(child_bond),
     )
     output_remap = np.asarray(
-        [output_indices[key] for key in output_keys],
+        [output_indices[key] if key is not None else -1 for key in output_keys],
         dtype=np.int64,
     )
     integer_routes[:, 6] = output_remap[integer_routes[:, 6]]
@@ -3284,10 +3452,8 @@ def _contract_normal_complementary_boundary_cpp(
         cached_route_plan is not None
         and cached_route_plan.get("routes") is None
     ):
-        # A fully C++ half sweep may replace the action stored for this bond
-        # after Python discarded its duplicate route array. Repack the compact
-        # topology for this explicit reference/expectation contraction instead
-        # of assuming that the last C++ action still has this cache revision.
+        # Oversized route arrays are discarded after use. Repack their topology
+        # rather than assuming that the compiled owner still has this revision.
         cached_route_plan = None
     if cached_route_plan is None:
         cached_route_plan = _pack_normal_complementary_boundary_routes_cpp(
@@ -3373,19 +3539,20 @@ def _contract_normal_complementary_boundary_cpp(
         def register(array, arrays, keys, index, source_keys):
             nonlocal cacheable
             source_array = np.asarray(array)
+            array_id = id(source_array)
+            found = index.get(array_id)
+            if found is not None:
+                return int(found)
             real = _real64_contiguous_or_none(source_array)
             if real is None:
                 return None
-            array_id = id(source_array)
-            found = index.get(array_id)
-            if found is None:
-                found = len(arrays)
-                index[array_id] = found
-                arrays.append(real)
-                source_key = source_keys.get(array_id)
-                if source_key is None:
-                    cacheable = False
-                keys.append(source_key)
+            found = len(arrays)
+            index[array_id] = found
+            arrays.append(real)
+            source_key = source_keys.get(array_id)
+            if source_key is None:
+                cacheable = False
+            keys.append(source_key)
             return int(found)
 
         for (q_boundary_bra, q_boundary_ket), channel_map in parent_blocks.items():
@@ -3527,7 +3694,7 @@ def _contract_normal_complementary_boundary_cpp(
                     and key != route_cache_key
                 ):
                     route_cache.pop(key)
-            route_cache[route_cache_key] = {
+            cached_route_plan = {
                 "bra_keys": tuple(bra_keys),
                 "ket_keys": tuple(ket_keys),
                 "routes": integer_routes,
@@ -3536,6 +3703,7 @@ def _contract_normal_complementary_boundary_cpp(
                 "topology_revision": int(topology_revision),
                 "route_topology_revision": int(route_topology_revision),
             }
+            route_cache[route_cache_key] = cached_route_plan
     numeric_revision = int(
         1 if numeric_revision is None else numeric_revision
     )
@@ -3596,7 +3764,8 @@ def _contract_normal_complementary_boundary_cpp(
         from .su2_qchem_plan import PackedArrayPool
 
         bra_pool = PackedArrayPool.from_arrays(bra_arrays)
-        ket_pool = PackedArrayPool.from_arrays(ket_arrays)
+        ket_pool = (bra_pool if A is B and bra_keys == ket_keys
+                    else PackedArrayPool.from_arrays(ket_arrays))
         values, _same_topology = (
             moving_environment.advance_normal_complementary_boundary(
                 side,
@@ -3624,7 +3793,13 @@ def _contract_normal_complementary_boundary_cpp(
             )
         )
     if cached_route_plan is not None:
-        cached_route_plan["routes"] = None
+        retained_bytes = sum(
+            record["routes"].nbytes
+            for record in route_cache.values()
+            if record.get("routes") is not None
+        )
+        if retained_bytes > _BOUNDARY_ROUTE_CACHE_MAX_BYTES:
+            cached_route_plan["routes"] = None
     output_pool = replace(
         output_table.block_pool,
         data=np.ascontiguousarray(values, dtype=np.float64),
@@ -3632,6 +3807,16 @@ def _contract_normal_complementary_boundary_cpp(
         _array_cache=None,
     )
     output_table = replace(output_table, block_pool=output_pool)
+    compact = _compact_zero_boundary_blocks(output_table)
+    if compact is not output_table:
+        output_table = compact
+        labels, topology_revision = _packed_boundary_labels(output_table)
+        moving_environment.release_boundary(side, int(child_bond))
+        moving_environment.install_boundary(
+            side, int(child_bond), output_table.block_pool.data,
+            output_table.block_pool.offsets, labels,
+            int(topology_revision), int(numeric_revision),
+        )
     data = _PackedRankCoupledEnvironmentMap(
         output_table,
         n_channels=int(
@@ -3817,8 +4002,18 @@ def _contract_from_left_blocks_rank_coupled(W, A, E_map, B):
                     _RANK_COUPLED_SMALL_CONTRACTION_WORK,
                 ):
                     continue
+                virtual_products = {}
                 for left_idx, right_idx, w_block in reduced:
                     if left_idx >= len(e_arrays):
+                        continue
+                    e_block = e_arrays[left_idx]
+                    if w_block.shape[2:] == (1, 1) and _rank_coupled_left_work(e_block, A_conj, w_block, B_arr) >= 16384:
+                        products = virtual_products.get(left_idx)
+                        if products is None:
+                            products = _left_virtual_products(e_block, A_conj[:, 0, :], B_arr[:, 0, :])
+                            virtual_products[left_idx] = products
+                        target[right_idx] += (w_block[:, :, 0, 0].T @ products.reshape(products.shape[0], -1)).reshape(
+                            w_block.shape[1], bra_dim, ket_dim)
                         continue
                     target[right_idx] += _contract_rank_coupled_left_step(
                         e_arrays[left_idx],
@@ -4068,8 +4263,18 @@ def _contract_from_right_blocks_rank_coupled(W, A, F_map, B):
                     _RANK_COUPLED_SMALL_CONTRACTION_WORK,
                 ):
                     continue
+                virtual_products = {}
                 for left_idx, right_idx, w_block in reduced:
                     if right_idx >= len(f_arrays):
+                        continue
+                    f_block = f_arrays[right_idx]
+                    if w_block.shape[2:] == (1, 1) and _rank_coupled_right_work(A_conj, w_block, f_block, B_arr) >= 16384:
+                        products = virtual_products.get(right_idx)
+                        if products is None:
+                            products = _right_virtual_products(A_conj[:, 0, :], f_block, B_arr[:, 0, :])
+                            virtual_products[right_idx] = products
+                        target[left_idx] += (w_block[:, :, 0, 0] @ products.reshape(products.shape[0], -1)).reshape(
+                            w_block.shape[0], bra_dim, ket_dim)
                         continue
                     target[left_idx] += _contract_rank_coupled_right_step(
                         A_conj,
@@ -4942,6 +5147,89 @@ def build_dense_bond_operator(sites, mpo_factors, bond, two_site_template):
     )
 
 
+class _ArrayLRU:
+    """A local byte-bounded cache for immutable contraction intermediates."""
+
+    def __init__(self, budget):
+        self.budget = int(budget)
+        self.nbytes = 0
+        self.values = OrderedDict()
+
+    def get(self, key, compute):
+        if key in self.values:
+            self.values.move_to_end(key)
+            return self.values[key]
+        value = compute()
+        if value.nbytes <= self.budget:
+            while self.values and self.nbytes + value.nbytes > self.budget:
+                _, old = self.values.popitem(last=False)
+                self.nbytes -= old.nbytes
+            self.values[key] = value
+            self.nbytes += value.nbytes
+        return value
+
+
+def one_site_reduced_adjoint(bra, ket, core, left, right, *, cache_bytes=8 * 2**20):
+    """Collect reduced adjoint blocks; see ``iter_one_site_reduced_adjoint``."""
+    return dict(iter_one_site_reduced_adjoint(bra, ket, core, left, right,
+                                            cache_bytes=cache_bytes))
+
+
+def iter_one_site_reduced_adjoint(bra, ket, core, left, right, *, cache_bytes=8 * 2**20):
+    """Contract a rank-coupled reduced operator into bra parameter blocks.
+
+    Wigner--Eckart contraction adapted from Weichselbaum, Physical Review B
+    86, 245124 (2012), https://doi.org/10.1103/PhysRevB.86.245124. Inputs use
+    channel-resolved reduced boundaries; this forms no magnetic-state basis.
+    Sparse boundaries are decoded one channel at a time. Weighted-right and
+    ket-absorption caches each retain at most ``cache_bytes``; individual
+    contraction temporaries and the returned action are outside that budget.
+    Ket products are shared across bra blocks with the same left sector and
+    remain valid only for this frozen local action.
+    Channel contributions use compensated accumulation, with one correction
+    array for the current bra block, to reduce cancellation in residual audits.
+    """
+    if not np.isfinite(cache_bytes) or cache_bytes < 0:
+        raise ValueError('The local action cache budget must be finite and nonnegative')
+    ket_blocks = {
+        key: np.ascontiguousarray(value.real)
+        if np.iscomplexobj(value) and not np.any(value.imag) else value
+        for key, value in ket.data.items()
+        if np.any(value)
+    }
+    weighted=_ArrayLRU(cache_bytes)
+    products=_ArrayLRU(cache_bytes)
+    for (lb,pb,rb), template in bra.data.items():
+        out = np.zeros_like(template, dtype=complex)
+        correction = np.zeros_like(out)
+        for (lk,pk,rk),b in ket_blocks.items():
+            e,f=left.get((lb,lk)),right.get((rb,rk))
+            if e is None or f is None: continue
+            terms=_left_reduced_rank_coupled_block(core,lb,lk,pb,pk,rb,rk)
+            for (lc,rc),w in (terms or {}).items():
+                lc,rc=int(lc),int(rc)
+                if lc not in e or rc not in f: continue
+                key=(rb,rk,rc)
+                def weight_right():
+                    irrep=core.right_channel_irreps[rc]
+                    weights=np.array([_component_basis_norm(rb,rk,irrep,m) for m in ordered_two_m_values(irrep)])
+                    return f[rc]*weights[:,None,None]
+                weighted_right=weighted.get(key,weight_right)
+                if w.shape[2:]==(1,1):
+                    components=np.einsum('xy,yrs->xrs',w[:,:,0,0],weighted_right)
+                    product=products.get((lb,lk,pk,rk,lc),lambda: e[lc]@b[:,0,:])
+                    contribution = np.sum(product@components.transpose(0,2,1),axis=0)[:,None,:]
+                else:
+                    contribution = np.einsum('xij,xypq,jqs,yrs->ipr',e[lc],w,b,weighted_right,optimize=True)
+                adjusted = contribution-correction
+                updated = out+adjusted
+                correction[:] = (updated-out)-adjusted
+                out[:] = updated
+                del contribution, adjusted, updated
+        yield (lb, pb, rb), out
+
+
+
 @dataclass
 class BlockSparseEnvironmentChain:
     """
@@ -4967,6 +5255,7 @@ class BlockSparseEnvironmentChain:
         require_symbolic_payloads=False,
         sweep_direction=None,
         reuse_prebuilt_boundary_side=None,
+        boundaries_only=False,
     ):
         """
         Build block-sparse renormalized environments for a chain.
@@ -4986,8 +5275,14 @@ class BlockSparseEnvironmentChain:
             rebuilt here, making the sweep use the stack as a moving
             environment.
         :returns: :class:`BlockSparseEnvironmentChain`.
+
+        ``boundaries_only=True`` initializes just the two endpoint blocks for
+        subsequent exact checkpoint/recomputation of a frozen chain. It cannot
+        be combined with a persistent renormalized stack.
         """
 
+        if boundaries_only and renormalized_blocks is not None:
+            raise ValueError("Endpoint-only construction cannot use a persistent stack.")
         if len(sites) != len(mpo_factors):
             raise ValueError("BlockSparseEnvironmentChain requires one MPOCore core per site tensor.")
         if len(sites) < 2:
@@ -5065,6 +5360,8 @@ class BlockSparseEnvironmentChain:
         nsites = len(sites)
         build_left = sweep_direction is None or sweep_direction == "rl"
         build_right = sweep_direction is None or sweep_direction == "lr"
+        if boundaries_only:
+            build_left = build_right = False
         if reuse_prebuilt_boundary_side == "left":
             build_left = False
         elif reuse_prebuilt_boundary_side == "right":
@@ -5211,6 +5508,60 @@ class BlockSparseEnvironmentChain:
         )
         chain.store_boundary_blocks()
         return chain
+
+    def iter_right_boundaries(self, stride):
+        """Yield frozen-chain right blocks in site order, consuming storage.
+
+        Retain segment endpoints, then reconstruct each segment exactly with
+        the same reduced contractions. Storage is O(n/stride + stride) blocks,
+        not a byte limit; a single block can still be large. No truncation or
+        change to the SU(2) representation is introduced. This iterator owns
+        the right stack, including buffers in a core's boundary owner.
+        """
+        if int(stride) != stride or stride < 1:
+            raise ValueError("stride must be a positive integer")
+        stride = int(stride)
+        if self.renormalized_blocks is not None:
+            raise ValueError("Checkpoint iteration cannot use a persistent stack")
+        n = len(self.sites)
+        if len(self.right_envs) != n or self.right_envs[-1] is None:
+            raise ValueError("Checkpoint iteration requires an initialized right endpoint")
+
+        def advance(block, i):
+            return block.advance(
+                self.mpo_factors[i], self.sites[i], self.sites[i],
+                phys_slices=self.site_layouts[i]['sector_slices'][1],
+                moving_environment=getattr(self.mpo_factors[i],
+                                           'normal_complementary_owner', None),
+                parent_bond=i, child_bond=i - 1, numeric_revision=n - i)
+
+        def release(i):
+            owner = getattr(self.mpo_factors[i], 'normal_complementary_owner', None)
+            if owner is not None:
+                owner.release_boundary('right', i)
+
+        try:
+            current = self.right_envs[-1]
+            self.right_envs[:-1] = [None] * (n - 1)
+            for i in range(n - 1, stride - 1, -1):
+                current = advance(current, i)
+                if self.right_envs[i] is None:
+                    release(i)
+                if i % stride == 0:
+                    self.right_envs[i - 1] = current
+            del current
+            for begin in range(0, n, stride):
+                end = min(begin + stride, n) - 1
+                for i in range(end, begin, -1):
+                    self.right_envs[i - 1] = advance(self.right_envs[i], i)
+                for i in range(begin, end + 1):
+                    yield i, self.right_envs[i]
+                    self.right_envs[i] = None
+                    release(i)
+        finally:
+            self.right_envs.clear()
+            for i in range(n):
+                release(i)
 
     def store_boundary_blocks(self):
         """

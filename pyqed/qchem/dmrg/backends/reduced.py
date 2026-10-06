@@ -658,6 +658,8 @@ class ComplementaryOperatorFamily:
         :returns: Sorted tuple of key lengths.
         """
 
+        if isinstance(self.entries, ComplementaryEntries):
+            return (int(self.entries.indices.shape[1]),) if len(self.entries) else ()
         return tuple(sorted({len(tuple(key)) for key in self.entries}))
 
     def as_metadata(self):
@@ -866,8 +868,16 @@ def _build_su2_moving_environment(
         return None
     try:
         from pyqed.mps.nonabelian._su2_kernel import SU2MovingEnvironment
-    except ImportError:
-        return None
+    except ImportError as error:
+        if isinstance(error, ModuleNotFoundError) and error.name == (
+            "pyqed.mps.nonabelian._su2_kernel"
+        ):
+            return None
+        raise ImportError(
+            "The SU(2) extension is installed but cannot load. Rebuild it "
+            "with a compatible OpenMP runtime; refusing to silently change "
+            "the reduced Hamiltonian implementation."
+        ) from error
     return SU2MovingEnvironment(
         np.ascontiguousarray(h_spatial, dtype=float),
         np.ascontiguousarray(eri_spatial, dtype=float),

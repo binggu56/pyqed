@@ -13,7 +13,7 @@ import copy
 from functools import lru_cache, reduce
 import importlib
 import numpy as np
-from scipy.linalg import eigh
+from scipy.linalg import eigh, lu_factor, lu_solve
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse.linalg import eigsh
 
@@ -84,6 +84,7 @@ class _AOBasisFrame:
     _ao_cart2sph: object
 
 
+
 @dataclass(frozen=True)
 class CASCIFrame:
     """Compact CASCI state used for electronic overlaps between geometries."""
@@ -126,6 +127,7 @@ class CASCIFrame:
 
     def overlap(self, other):
         return overlap(self, other)
+
 
 
 def _cpp_attr(*names):
@@ -444,6 +446,10 @@ def transform_spatial_eri_to_mo(mf, mo_left, mo_right=None, mo_left_2=None, mo_r
         mo_left_2 = mo_left
     if mo_right_2 is None:
         mo_right_2 = mo_right
+
+    transform = getattr(mf, 'transform_eri', None)
+    if callable(transform) and not use_cholesky:
+        return transform(mo_left, mo_right, mo_left_2, mo_right_2)
 
     if use_cholesky:
         if eri_factors is None:
@@ -1043,6 +1049,7 @@ class CASCI:
         requested_nstates,
         *,
         use_cholesky=None,
+        slater_condon=None,
     ):
         """Dense PySCF-like singlet spin-adapted CI with optional spatial symmetry."""
         transform, pairs = self._spin0_symm_basis(binary)
@@ -1065,7 +1072,7 @@ class CASCI:
         self.spin0_symm_transform = transform
         self.spin0_pair_indices = pairs
 
-        SC1, SC2 = SlaterCondon(binary)
+        SC1, SC2 = SlaterCondon(binary) if slater_condon is None else slater_condon
         self.SC1 = SC1
         self.SC2 = SC2
         H_CI = CI_H(binary, h1e, h2e, SC1, SC2)
@@ -1609,6 +1616,7 @@ class CASCI:
         # print('------------------------------')
         # print("             CASCI              ")
         # print('------------------------------\n')
+        self.converged = False
         solvent_response_model = None
         if solvent_response is not None:
             solvent_response_model = str(solvent_response).lower()
@@ -1758,7 +1766,7 @@ class CASCI:
             self.direct_ci_fallback_reason = getattr(
                 direct_solver, 'direct_ci_fallback_reason', None
             )
-            self.converged = getattr(direct_solver, 'converged', True)
+            self.converged = bool(getattr(direct_solver, 'converged', False))
             return self
 
         if isinstance(binary, FCIStringBasis):
@@ -1843,6 +1851,7 @@ class CASCI:
         # nuclear repulsion energy is included in Ecore
         self.e_tot = E + self.e_core
         self.ci = [X[:, n] for n in range(nstates)]
+        self.converged = bool(np.all(np.isfinite(self.e_tot)) and np.all(np.isfinite(X)))
 
         if self.verbose >= 1:
             for i in range(nstates):
@@ -2069,7 +2078,15 @@ class CASCI:
         return dm1, dm2
 
     def spin_square(self, state_id=0):
+        """Evaluate S² directly when the current direct-CI result is available.
 
+        Reuse the solver's spin-operator action instead of constructing full
+        RDMs. Detached or replaced CI data keep the general RDM reference path.
+        """
+        solver = self._direct_solver
+        if (solver is not None and self.ci is solver.ci
+                and self.binary is solver.binary):
+            return solver.spin_square(state_id)
         return spin_square(*self.make_rdm12(state_id))
 
 
@@ -3032,6 +3049,15 @@ def _spin_string_ops(strings):
 
 @lru_cache(maxsize=16)
 def _cached_spin_string_links(bit_tuple, nmo):
+    """Cache complete operator links, not CI-dependent contractions."""
+    builder = _cpp_attr("density_string_links")
+    if builder is not None and nmo <= 62:
+        arrays = builder(np.asarray(bit_tuple, dtype=np.uint64), nmo)
+        return arrays[:5], arrays[5:]
+    return _density_string_links_reference(bit_tuple, nmo)
+
+
+def _density_string_links_reference(bit_tuple, nmo):
     bits = list(bit_tuple)
     bit_index = {bits_i: idx for idx, bits_i in enumerate(bits)}
     one_links = []
@@ -3338,8 +3364,16 @@ def make_rdm2(ci, Binary, SC1, SC2):
     return _make_tdm2_link_contractions(ci, ci, Binary)
 
 
+
+
 def make_state_average_rdms(ci_roots, weights, binary):
-    """Build weighted spin-traced active-space 1- and 2-RDMs for many roots."""
+    """Build weighted spin-traced active-space 1- and 2-RDMs for many roots.
+
+    For real CI roots the compiled contraction computes one alpha-excitation
+    orientation, reconstructs its Hermitian partner, then adds the exchanged
+    spin ordering. This is exact density symmetry, not a singlet assumption
+    or a truncation. Complex roots retain the general contraction path.
+    """
     roots = list(ci_roots)
     weights = np.asarray(weights, dtype=float)
     if weights.ndim != 1 or len(roots) != weights.size or weights.size == 0:
@@ -3455,22 +3489,25 @@ def _occupation_lists(strings):
 
 
 def _string_overlap_matrix(saa_eff, bra_occ, ket_occ, dtype):
+    """Exact string minors in bounded batches (no determinant-pair Python loop)."""
     out = np.empty((len(bra_occ), len(ket_occ)), dtype=dtype)
-    for i, occ_i in enumerate(bra_occ):
-        for j, occ_j in enumerate(ket_occ):
-            out[i, j] = np.linalg.det(saa_eff[np.ix_(occ_i, occ_j)])
+    if not out.size:
+        return out
+    bra = np.asarray(bra_occ, dtype=int)
+    ket = np.asarray(ket_occ, dtype=int)
+    # Bound the gathered minor tensor to about 32 MiB; LAPACK may copy it.
+    row_bytes = max(1, len(ket)*bra.shape[1]*ket.shape[1]*np.asarray(saa_eff).dtype.itemsize)
+    batch = max(1, (32*1024**2)//row_bytes)
+    for start in range(0, len(bra), batch):
+        minors = saa_eff[bra[start:start+batch, None, :, None], ket[None, :, None, :]]
+        out[start:start+batch] = np.linalg.det(minors)
     return out
 
 
 def _string_transform_matrix(orbital_transform, occ_strings, dtype):
     """Induced determinant-space transform for an active-orbital rotation."""
     occ_lists = _occupation_lists(occ_strings)
-    nstr = len(occ_lists)
-    out = np.empty((nstr, nstr), dtype=dtype)
-    for i, occ_i in enumerate(occ_lists):
-        for j, occ_j in enumerate(occ_lists):
-            out[i, j] = np.linalg.det(orbital_transform[np.ix_(occ_i, occ_j)])
-    return out
+    return _string_overlap_matrix(orbital_transform, occ_lists, occ_lists, dtype)
 
 
 def _string_singular_weights(sigma, occ_strings):
@@ -3733,12 +3770,20 @@ def _factorized_ci_overlap(
 
 
 def _transform_ci_tensors_to_biorthogonal_basis(ci_tensors, alpha_transform, beta_transform):
-    """Apply inverse determinant-space transforms to CI tensors state by state."""
-    out = np.empty(ci_tensors.shape, dtype=np.result_type(ci_tensors, alpha_transform, beta_transform))
-    for i, ci in enumerate(ci_tensors):
-        alpha_rot = np.linalg.solve(alpha_transform, ci)
-        out[i] = np.linalg.solve(beta_transform, alpha_rot.T).T
-    return out
+    """Apply exact inverse transforms with one factorization per spin space.
+
+    All roots share the factorizations. Identical alpha/beta transforms share
+    a factorization too. Transposes here are ordinary, not Hermitian.
+    """
+    states, na, nb = ci_tensors.shape
+    alpha_lu = lu_factor(alpha_transform)
+    beta_lu = alpha_lu if beta_transform is alpha_transform else lu_factor(beta_transform)
+    if np.any(np.diag(alpha_lu[0]) == 0) or np.any(np.diag(beta_lu[0]) == 0):
+        raise np.linalg.LinAlgError('Singular string-space biorthogonal transform')
+    rhs = ci_tensors.transpose(1, 0, 2).reshape(na, states*nb)
+    rotated = lu_solve(alpha_lu, rhs).reshape(na, states, nb).transpose(1, 0, 2)
+    rhs = rotated.transpose(2, 0, 1).reshape(nb, states*na)
+    return lu_solve(beta_lu, rhs).reshape(nb, states, na).transpose(1, 2, 0)
 
 
 def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
@@ -3760,9 +3805,11 @@ def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
     ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
 
     g_left_alpha = _string_transform_matrix(prep.x_left, bra_alpha, dtype)
-    g_left_beta = _string_transform_matrix(prep.x_left, bra_beta, dtype)
+    g_left_beta = (g_left_alpha if np.array_equal(bra_alpha, bra_beta)
+                   else _string_transform_matrix(prep.x_left, bra_beta, dtype))
     g_right_alpha = _string_transform_matrix(prep.x_right, ket_alpha, dtype)
-    g_right_beta = _string_transform_matrix(prep.x_right, ket_beta, dtype)
+    g_right_beta = (g_right_alpha if np.array_equal(ket_alpha, ket_beta)
+                    else _string_transform_matrix(prep.x_right, ket_beta, dtype))
 
     ci_bra_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_bra, g_left_alpha, g_left_beta)
     ci_ket_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_ket, g_right_alpha, g_right_beta)

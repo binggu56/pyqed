@@ -199,6 +199,7 @@ def test_su2_dmrgscf_separates_orbital_options_from_inner_sweeps():
         verbose=0,
     )
 
+    events = []
     mc.run(
         nstates=1,
         nsweeps=2,
@@ -207,9 +208,14 @@ def test_su2_dmrgscf_separates_orbital_options_from_inner_sweeps():
         optimizer_max_step_norm=0.1,
         diis=False,
         mixer_zero_block_noise_scale=0.0,
+        macro_callback=events.append,
     )
 
     assert mc.converged
+    assert len(events) == 1
+    assert events[0]["diagnostics"]["accepted"]
+    np.testing.assert_allclose(events[0]["energy"], mc.e_tot, atol=1e-8)
+    assert events[0]["casci"].export_ground_state() is not None
 
 
 def test_su2_co_macro_solver_drops_topology_owned_route_cache():

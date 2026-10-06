@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from operator import index
 import numpy as np
 
 from pyqed.mps.nonabelian import (
@@ -31,7 +32,23 @@ ORTHONORMALIZED_OPERATOR_ITERMAX_DEFAULT = 30
 
 
 class SU2DMRG:
-    """Stateful owner for one spatial-orbital SU(2) DMRG calculation."""
+    """Stateful owner for one spatial-orbital SU(2) DMRG calculation.
+
+    ``virtual_boundary='periodic'`` selects fixed-D one-site reduced Davidson
+    sweeps with an exact spin-zero multiplicity trace. This adapts Verstraete,
+    Porras and Cirac, PRL 93, 227205 (2004), doi:10.1103/PhysRevLett.93.227205,
+    and Weichselbaum, PRB 86, 245124 (2012), doi:10.1103/PhysRevB.86.245124.
+    Environment-derived sector norm gauges adapt Rossini, Giovannetti and
+    Fazio, J. Stat. Mech. P05021 (2011), doi:10.1088/1742-5468/2011/05/P05021.
+    Optional circular passes carry exact QR gauges across the seam;
+    ordering follows Pippan, White and Evertz, PRB 81, 081103(R) (2010),
+    doi:10.1103/PhysRevB.81.081103. environment='compressed' enables
+    rectangular reduced circular transfer compression through exact D² seam
+    factors and a small QR/SVD core. This is a restricted-seam adaptation;
+    physical states remain untruncated and no physical norm ridge is added.
+    Exact sweep audits remain mandatory. It supports a singlet ground state
+    and per-sector D, without spin-carrying seams or global convergence guarantees.
+    """
 
     backend = "su2"
 
@@ -61,6 +78,74 @@ class SU2DMRG:
     def run(self, qcdmrg, **kwargs):
         _run_spatial_qchem_dmrg(self, qcdmrg, **kwargs)
         return self
+
+
+def _run_periodic_qchem_dmrg(solver, qcdmrg, *, nsweeps, max_bond,
+        initial_guess, bond_multiplicity, seed, conv_tol, nstates, weights,
+        local_solver_kwargs, verbose, residual_tol=1e-7, metric_rtol=1e-11,
+        max_parameters=4096, max_bond_mode='per_sector', su2_kernel_backend='auto',
+        norm_gauge=False, gauge_floor=1e-8, sweep_schedule='circular', reuse_boundaries=True, environment='compressed',
+        compression_tol=1e-10, compression_max_rank=None):
+    from pyqed.mps.nonabelian.periodic import PeriodicReducedMPS, run_periodic_sweeps
+    from .reduced import build_spatial_reduced_hamiltonian_mpo, build_su2_normal_complementary_mpo
+
+    if nstates != 1 or (weights is not None and not np.array_equal(weights, [1])):
+        raise NotImplementedError('periodic SU2DMRG currently supports one ground state')
+    if max_bond_mode != 'per_sector':
+        raise ValueError('periodic D is a multiplicity per sector; use max_bond_mode=per_sector')
+    if getattr(qcdmrg, 'spatial_site_basis', None) not in {'fully_reduced','fully_reduced_su2'}:
+        raise ValueError('periodic SU2DMRG requires fully reduced spatial sites')
+    target = spatial_target_sector(qcdmrg.nelecas, qcdmrg.spin)
+    if int(target.irrep.two_j) != 0:
+        raise NotImplementedError('periodic SU2DMRG requires a singlet target')
+    dimension = index(max_bond if max_bond is not None else getattr(qcdmrg,'D',bond_multiplicity))
+    if isinstance(initial_guess, PeriodicReducedMPS):
+        state=initial_guess.copy()
+        if state.closure_dimension!=dimension or state.target_sector!=target:
+            raise ValueError('initial periodic state has a different D or target')
+    elif initial_guess is None or (isinstance(initial_guess,str) and initial_guess=='random'):
+        state=PeriodicReducedMPS.random(qcdmrg.ncas,target_sector=target,dimension=dimension,seed=seed)
+    else:
+        raise ValueError('periodic initial_guess must be random or a PeriodicReducedMPS')
+    # Build active reduced operators with the chemistry constant kept external.
+    eri=qcdmrg.h2e
+    if eri is None and getattr(qcdmrg,'h2e_factors',None) is not None:
+        raise NotImplementedError('periodic SU2DMRG needs an explicit reduced MPO from active two-electron integrals')
+    if eri is not None and np.asarray(eri).ndim==4: eri=np.asarray(eri)[None,None,...]
+    hamiltonian=build_spatial_reduced_hamiltonian_mpo(qcdmrg.h1e,eri=eri,
+                            fully_reduced=True,n_elec=qcdmrg.nelecas,spin=qcdmrg.spin,ecore=0.)
+    factors=tuple(hamiltonian.factors)
+    owner=getattr(factors[0],'normal_complementary_owner',None)
+    if owner is not None:
+        factors=tuple(build_su2_normal_complementary_mpo(owner,fully_reduced=True,materialize_reduced_terms=True))
+        for factor in factors:
+            object.__setattr__(factor,'normal_complementary_right_dual',True)
+            object.__setattr__(factor,'normal_complementary_owner',None)
+            object.__setattr__(factor,'normal_complementary_force_contextual_routes',True)
+    previous=configure_su2_kernel_policy(backend=su2_kernel_backend)
+    try:
+        result=run_periodic_sweeps(state,factors,nsweeps=nsweeps,
+                        conv_tol=1e-10 if conv_tol is None else conv_tol,residual_tol=residual_tol,
+                        metric_rtol=metric_rtol,max_parameters=max_parameters,
+                        local_solver_kwargs=local_solver_kwargs,verbose=verbose,
+                        norm_gauge=norm_gauge,gauge_floor=gauge_floor,
+                        sweep_schedule=sweep_schedule,reuse_boundaries=reuse_boundaries,
+                        environment=environment,compression_tol=compression_tol,compression_max_rank=compression_max_rank)
+        result['diagnostics']['contraction_backend']=get_su2_kernel_policy()['actual']
+    finally:
+        configure_su2_kernel_policy(backend=previous['backend'],debug_check=previous['debug_check'],
+                                   debug_check_tol=previous['debug_check_tol'])
+    solver.ground_state=result['mps']; solver.states=[solver.ground_state]
+    solver.energy=solver.e_active=solver.e_tot=result['best_energy']
+    solver.energies=np.array([solver.energy]); solver.nstates=1; solver.weights=np.array([1.])
+    solver.state_average_energy=solver.energy; solver.includes_core_energy=False
+    solver.e_core=0.; solver.target_sector=target; solver.max_sweeps=nsweeps
+    solver.history=result['history']; solver.diagnostics=result['diagnostics']
+    solver.ncompleted=result['ncompleted']; solver.ncompleted_half_sweeps=2*solver.ncompleted
+    solver.success=solver.converged=result['converged']
+    solver.message='converged periodic one-site stationarity' if solver.converged else 'periodic sweep limit reached'
+    solver.mpo=factors
+    return solver
 
 
 def _qchem_sweep_measure(sweep_result):
@@ -249,14 +334,18 @@ def _expectation_from_nonabelian_mps(
     *,
     moving_environment=None,
 ):
+    sites=state.tensors
+    if getattr(state,'bc',None)=='periodic':
+        sites=state.lifted_tensors()
+        moving_environment=None
     numerator = contract_chain_expectation(
-        state.tensors,
+        sites,
         mpo_factors,
         moving_environment=moving_environment,
     )
     denominator = contract_chain_expectation(
-        state.tensors,
-        _identity_mpo_factors_for_sites_and_mpo(state.tensors, mpo_factors),
+        sites,
+        _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors),
     )
     denom = float(np.real(denominator))
     if abs(denom) < 1.0e-15:
@@ -442,6 +531,17 @@ def _run_spatial_qchem_dmrg(
         raise ValueError("DMRG Hamiltonian MPO is not built. Call build() before the backend.")
     if qcdmrg.spin_purification:
         raise NotImplementedError("Spin-purification penalties are not supported by the SU(2) backend.")
+    virtual_boundary = sweep_kwargs.pop('virtual_boundary', 'open')
+    if virtual_boundary not in {'open', 'periodic'}:
+        raise ValueError("virtual_boundary must be 'open' or 'periodic'")
+    if virtual_boundary == 'periodic':
+        if n_threads not in {None,1}:
+            raise NotImplementedError('periodic SU2DMRG currently supports n_threads=1')
+        return _run_periodic_qchem_dmrg(solver, qcdmrg, nsweeps=nsweeps,
+                    max_bond=max_bond, initial_guess=initial_guess,
+                    bond_multiplicity=bond_multiplicity, seed=seed, conv_tol=conv_tol,
+                    nstates=nstates, weights=weights, local_solver_kwargs=local_solver_kwargs,
+                    verbose=verbose, **sweep_kwargs)
     active_hamiltonian = getattr(qcdmrg, "_active_hamiltonian", None)
     mpo_factors = active_hamiltonian.mpo if active_hamiltonian is not None else qcdmrg.H
     complementary_operator_families = (

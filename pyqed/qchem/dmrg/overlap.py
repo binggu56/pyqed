@@ -659,7 +659,7 @@ def overlap(bra, ket, bra_state_ids=None, ket_state_ids=None, s=None):
     Two fully reduced SU(2) DMRG states use the sector-preserving
     biorthogonal circuit and never recover determinant amplitudes. Its default
     intermediate-MPS compression is practical rather than formally exact;
-    call :func:`su2_biorthogonal_overlap` with ``cutoff=0, max_bond=None`` for
+    call :func:`su2_biorthogonal_overlap` with ``tol=None, max_bond=None`` for
     the untruncated route. Other combinations use the determinant-space bridge
     and are intended for small active spaces.
     """
@@ -740,8 +740,9 @@ def su2_biorthogonal_overlap(
     ket_state_ids=None,
     s=None,
     *,
-    cutoff=1.0e-10,
-    max_bond="auto",
+    tol=1e-8,
+    max_bond=None,
+    memory_limit=2**24,
     return_info=False,
 ):
     """Cross-geometry overlap in the fully reduced SU(2) representation.
@@ -754,12 +755,13 @@ def su2_biorthogonal_overlap(
     one-particle maps as adjacent Gaussian gates directly to reduced SU(2)
     channels.  Thus the route is sector preserving and determinant free.
 
-    The defaults ``cutoff=1e-10`` and ``max_bond="auto"`` compress intermediate
-    MPSs for practical polynomial-style scaling. Use ``cutoff=0`` and
-    ``max_bond=None`` for an untruncated result exact up to floating-point
-    roundoff. Exact arbitrary maps can still cause exponential MPS bond growth;
-    the method avoids the unconditional ``4**ncas`` storage of determinant
-    recovery but cannot remove that fundamental worst case.
+    Uses the shared MPS/LETTA balanced-LU counter-transformation and direct
+    reduced chain contraction. tol=1e-8 controls the absolute full overlap
+    matrix Frobenius truncation bound (including frozen cores), excluding
+    roundoff and factorization error. max_bond is an optional cap; failure
+    to certify tol raises OverlapConvergenceError. tol=None disables the
+    accuracy requirement. Each root is transformed once and reused for all
+    root pairs. This is an adaptation of the cited formulations.
     """
     if not hasattr(bra, "dmrg") or not hasattr(ket, "dmrg"):
         raise TypeError("The SU(2) overlap backend supports DMRG-backed objects only.")
@@ -781,49 +783,46 @@ def su2_biorthogonal_overlap(
         np.dtype(np.result_type(s_mo, complex)),
     )
 
-    from pyqed.mps.nonabelian.orbital_transform import apply_spatial_orbital_transform
-
-    transformed_bra = []
-    transformed_ket = []
-    transform_info = {"bra": [], "ket": []}
-    for state in bra_states:
-        transformed, info = apply_spatial_orbital_transform(
-            state,
-            prep.x_left,
-            cutoff=cutoff,
-            max_bond=max_bond,
-            return_info=True,
-        )
-        transformed_bra.append(transformed)
-        transform_info["bra"].append(info)
-    for state in ket_states:
-        transformed, info = apply_spatial_orbital_transform(
-            state,
-            prep.x_right,
-            cutoff=cutoff,
-            max_bond=max_bond,
-            return_info=True,
-        )
-        transformed_ket.append(transformed)
-        transform_info["ket"].append(info)
-    value = prep.core_factor * _reduced_su2_overlap_matrix(
-        transformed_bra, transformed_ket
+    from pyqed.mps.mps import MPS
+    from pyqed.mps.nonabelian.overlap import (
+        orbital_factors, transform_orbitals, _transformed_norm_bound,
+        _check_tol, _check_controls, OverlapConvergenceError,
     )
-    if not return_info:
-        return value
-    return value, {
-        "backend": "su2",
-        "exact": all(
-            info["exact"]
-            for side in transform_info.values()
-            for info in side
-        ),
-        "sector_preserving": True,
-        "determinant_expansion": False,
-        "component_expansion": False,
-        "core_factor": prep.core_factor,
-        "transforms": transform_info,
-    }
+    _check_tol(tol)
+    _check_controls(max_bond, 0.0, memory_limit)
+    bra_states = [state if isinstance(state, MPS) else MPS.from_tensors(state) for state in bra_states]
+    ket_states = [state if isinstance(state, MPS) else MPS.from_tensors(state) for state in ket_states]
+    _, _, a, b = orbital_factors(prep.saa_eff)
+    lt = rt = None
+    if tol is not None and abs(prep.core_factor):
+        active_tol = tol/abs(prep.core_factor)
+        na = np.linalg.norm([_transformed_norm_bound(state, a) for state in bra_states])
+        nb = np.linalg.norm([_transformed_norm_bound(state, b) for state in ket_states])
+        lt = min(np.sqrt(active_tol)/4, active_tol/(4*max(nb, 1.0)))/np.sqrt(len(bra_states))
+        rt = min(np.sqrt(active_tol)/4, active_tol/(4*max(na, 1.0)))/np.sqrt(len(ket_states))
+    transformed_bra, transformed_ket = [], []
+    transform_info = {"bra": [], "ket": []}
+    for name, states, matrix, allowance, output in (
+            ('bra', bra_states, a, lt, transformed_bra),
+            ('ket', ket_states, b, rt, transformed_ket)):
+        for state in states:
+            transformed, info = transform_orbitals(
+                state, matrix, cutoff=0, max_bond=max_bond, _state_tol=allowance,
+                memory_limit=memory_limit, return_info=True)
+            output.append(transformed)
+            transform_info[name].append(info)
+    el, er = [np.linalg.norm([i['state_error_bound'] for i in transform_info[side]]) for side in ('bra', 'ket')]
+    nl, nr = [np.linalg.norm([i['transformed_batch_norm'] for i in transform_info[side]]) for side in ('bra', 'ket')]
+    bound = float(abs(prep.core_factor)*(el*nr+er*nl+el*er))
+    info = dict(backend='su2', exact=bool(el == 0 and er == 0), sector_preserving=True,
+                determinant_expansion=False, component_expansion=False, core_factor=prep.core_factor,
+                transforms=transform_info, tol=tol, max_bond=max_bond,
+                overlap_error_bound=bound, tolerance_met=None if tol is None else bool(bound <= tol))
+    if tol is not None and (not np.isfinite(bound) or bound > tol):
+        raise OverlapConvergenceError(tol, info)
+    value = prep.core_factor*np.array([[left.overlap(right, memory_limit=memory_limit)
+                                       for right in transformed_ket] for left in transformed_bra])
+    return (value, info) if return_info else value
 
 
 def _mpo_biorthogonal_overlap(
@@ -935,8 +934,9 @@ def biorthogonal_overlap(
     identity_tol=1e-10,
     phase_align_tol=1e-14,
     backend="auto",
-    cutoff=1.0e-10,
-    max_bond="auto",
+    tol=1e-8,
+    max_bond=None,
+    memory_limit=2**24,
     return_info=False,
 ):
     """Biorthogonal overlap for DMRG states.
@@ -946,10 +946,9 @@ def biorthogonal_overlap(
     small-active-space determinant route.
 
     ``backend="su2"`` applies nonunitary transforms directly to reduced charge
-    x SU(2) tensors. Its practical defaults are ``cutoff=1e-10`` and an
-    adaptive ``max_bond="auto"`` cap. With ``cutoff=0`` and ``max_bond=None``
-    it performs no truncation and does not construct determinants or spin
-    components.
+    x SU(2) tensors through the shared MPS/LETTA engine. ``tol=1e-8`` controls
+    absolute truncation error; ``max_bond=None`` permits adaptive ranks.
+    ``tol=None, max_bond=None`` disables truncation.
 
     ``backend="structured"`` applies the exact determinant-space
     biorthogonal transform recovered from DMRG coefficients and is intended
@@ -973,8 +972,9 @@ def biorthogonal_overlap(
             bra_state_ids=bra_state_ids,
             ket_state_ids=ket_state_ids,
             s=s,
-            cutoff=cutoff,
+            tol=tol,
             max_bond=max_bond,
+            memory_limit=memory_limit,
             return_info=return_info,
         )
     if backend == "structured":

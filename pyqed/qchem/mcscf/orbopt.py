@@ -7,6 +7,7 @@ Lightweight orbital-optimization helpers for native first-order CASSCF.
 import numpy as np
 import importlib
 from scipy.linalg import expm
+from .integral_blocks import IntegralBlocks
 
 _CASSCF_CPP_UNINITIALIZED = object()
 _casscf_cpp = _CASSCF_CPP_UNINITIALIZED
@@ -43,14 +44,31 @@ def embed_rdm2(dm2, nmo):
     return full
 
 
-def generalized_fock(h1_mo, eri_mo, dm1, dm2):
+def generalized_fock(h1_mo, eri_mo, dm1, dm2, nocc=None):
     """
-    Build a simple generalized Fock matrix from full-space MO integrals and RDMs.
+    Build the generalized Fock matrix from MO integrals and RDMs.
+
+    With ``nocc``, RDM entries outside the core+active block must be zero;
+    only that block is contracted, avoiding work on the zero virtual RDM.
     """
     h1_mo = np.asarray(h1_mo)
+    if isinstance(eri_mo, IntegralBlocks):
+        nocc = eri_mo.nocc
+        fock = np.zeros_like(h1_mo, dtype=np.result_type(h1_mo, dm1, dm2))
+        fock[:, :nocc] = h1_mo[:, :nocc] @ dm1[:nocc, :nocc]
+        fock[:, :nocc] += np.einsum('prst,rqst->pq', eri_mo.pooo,
+            dm2[:nocc, :nocc, :nocc, :nocc], optimize=True)
+        return fock
     eri_mo = np.asarray(eri_mo)
     dm1 = np.asarray(dm1)
     dm2 = np.asarray(dm2)
+    if nocc is not None:
+        fock = np.zeros_like(h1_mo, dtype=np.result_type(h1_mo, eri_mo, dm1, dm2))
+        fock[:, :nocc] = h1_mo[:, :nocc] @ dm1[:nocc, :nocc]
+        fock[:, :nocc] += np.einsum(
+            'prst,rqst->pq', eri_mo[:, :nocc, :nocc, :nocc],
+            dm2[:nocc, :nocc, :nocc, :nocc], optimize=True)
+        return fock
     f1 = np.einsum("pr,rq->pq", h1_mo, dm1, optimize=True)
     f2 = np.einsum("prst,rqst->pq", eri_mo, dm2, optimize=True)
     return f1 + f2
@@ -153,6 +171,71 @@ def orbital_hessian_action_from_integrals(h1_mo, eri_mo, dm1, dm2, kappa):
     deri = orbital_eri_response(eri_mo, kappa)
     dfock = generalized_fock(dh1, deri, dm1, dm2)
     return orbital_gradient(dfock)
+
+
+def create_integral_hessian_action(h1_mo, eri_mo, dm1, dm2, nocc):
+    """Precontract the exact frozen-density integral-response Hessian.
+
+    For real orbitals and antisymmetric rotation generators, this is an
+    algebraic reordering of
+    :func:`orbital_hessian_action_from_integrals`, not an approximate Hessian.
+    Density indices outside the core+active block must be zero. The cached
+    response tensor has shape ``(nmo, nocc, nmo, nocc)``; each application
+    contracts only this tensor and the one-electron response, without forming
+    derivative ERIs. Inputs must remain unchanged for the action's lifetime.
+    """
+    h1 = np.asarray(h1_mo)
+    if isinstance(eri_mo, IntegralBlocks):
+        ppoo, popo, pooo = eri_mo.ppoo, eri_mo.popo, eri_mo.pooo
+        poop = popo.transpose(0, 1, 3, 2)
+    else:
+        eri = np.asarray(eri_mo)
+        ppoo, popo, pooo = eri[:, :, :nocc, :nocc], eri[:, :nocc, :, :nocc], eri[:, :nocc, :nocc, :nocc]
+        poop = eri[:, :nocc, :nocc, :]
+    return _block_hessian_action(h1, ppoo, popo, poop, pooo, dm1, dm2, nocc)
+
+
+def create_factor_response_action(h1, factors, dm1, dm2):
+    """Precontract real CD Hessian responses when three blocks fit in 64 MiB.
+
+    Exact for the supplied factors: this removes auxiliary-rank work from
+    repeated Hessian products. Larger/complex cases retain the factor action.
+    The bound covers the three principal blocks, not total process memory.
+    """
+    nmo, nocc = h1.shape[0], dm1.shape[0]
+    if any(np.iscomplexobj(a) for a in (h1, factors, dm1, dm2)):
+        return None
+    if 3 * nmo**2 * nocc**2 * 8 > 64 * 1024**2:
+        return None
+    ppoo = np.einsum('Ppq,Pij->pqij', factors, factors[:, :nocc, :nocc], optimize=True)
+    popo = np.einsum('Ppi,Pqj->piqj', factors[:, :, :nocc], factors[:, :, :nocc], optimize=True)
+    return _block_hessian_action(h1, ppoo, popo, popo.transpose(0, 1, 3, 2),
+                                 ppoo[:, :nocc], dm1, dm2, nocc)
+
+
+def _block_hessian_action(h1, ppoo, popo, poop, pooo, dm1, dm2, nocc):
+    d1 = np.asarray(dm1)[:nocc, :nocc]
+    d2 = np.asarray(dm2)[:nocc, :nocc, :nocc, :nocc]
+    # The first ERI-index response is -kappa @ F; precontract the other three.
+    response = np.einsum('past,bqst->pqab', ppoo, d2,
+                         optimize=True)
+    response += np.einsum('prat,rqbt->pqab', popo, d2,
+                          optimize=True)
+    response += np.einsum('prsa,rqsb->pqab', poop, d2,
+                          optimize=True)
+    fock = h1[:, :nocc] @ d1
+    fock += np.einsum('prst,rqst->pq', pooo, d2,
+                      optimize=True)
+
+    def action(kappa):
+        kappa = np.asarray(kappa)
+        dfock = -kappa @ fock + (h1 @ kappa[:, :nocc]) @ d1
+        dfock += np.einsum('pqab,ab->pq', response, kappa[:, :nocc], optimize=True)
+        full = np.zeros_like(h1, dtype=np.result_type(dfock, h1))
+        full[:, :nocc] = dfock
+        return orbital_gradient(full)
+
+    return action
 
 
 def create_factor_hessian_workspace(

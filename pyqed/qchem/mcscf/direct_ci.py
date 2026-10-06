@@ -233,11 +233,12 @@ def _build_davidson_guess(diag, nroots, guess=None, min_vectors=None):
 
     The default strategy mirrors standard CI Davidson practice: use unit vectors
     associated with the smallest diagonal Hamiltonian elements.  If the caller
-    provides trial vectors via ``ci0`` we include them first, then fill any
-    missing columns from the diagonal guess.
+    provides trial vectors via ``ci0`` we retain a rank-complete root-sized
+    basis, then fill missing independent columns from the diagonal guess.
+    An explicit ``min_vectors`` can request a larger restart space.
     """
     n = diag.size
-    target_cols = max(nroots, 2 * nroots)
+    target_cols = nroots if guess is not None else 2 * nroots
     if min_vectors is not None:
         target_cols = max(target_cols, int(min_vectors))
     target_cols = min(n, target_cols)
@@ -255,13 +256,21 @@ def _build_davidson_guess(diag, nroots, guess=None, min_vectors=None):
         cols.extend(guess_cols[:target_cols])
 
     dtype = np.result_type(np.asarray(diag).dtype, *(col.dtype for col in cols), float)
+    if cols:
+        seeds = _orthonormalize_columns(np.column_stack(cols))
+        if seeds.shape[1] >= target_cols:
+            return seeds
+        cols = [seeds[:, i] for i in range(seeds.shape[1])]
     order = np.argsort(np.real(diag))
     for idx in order:
         e = np.zeros(n, dtype=dtype)
         e[idx] = 1.0
         cols.append(e)
         if len(cols) >= target_cols:
-            break
+            seeds = _orthonormalize_columns(np.column_stack(cols))
+            if seeds.shape[1] >= target_cols:
+                return seeds
+            cols = [seeds[:, i] for i in range(seeds.shape[1])]
 
     return _orthonormalize_columns(np.column_stack(cols))
 
@@ -3264,6 +3273,12 @@ class CASCI(mcscf.casci.CASCI):
         Exact diagonalization (FCI) on the complete active space (CAS) by FCI or
         Jordan-Wigner transformation
 
+        The real restricted spin-pair BLAS action reconstructs the alpha
+        scatter from the transpose of the beta scatter during symmetric
+        pair projection. This is exact algebra, with no determinant
+        truncation; general determinant and spin-penalty actions retain
+        both contributions. Summation order may differ in floating point.
+
         .. math::
             H = h_{ij}c_i^\dagger c_j + \frac{1}{2} v_{pqrs} c_p^\dagger c_q^\dagger c_s c_r\
                 -\mu \sum_\sigma c_{i\sigma}^\dag c_{i\sigma}
@@ -3326,6 +3341,7 @@ class CASCI(mcscf.casci.CASCI):
         self.direct_spin0_native_davidson = True
         self._s2_operator = None
         self._s2_diag = None
+        self._s2_dense_cache = None
         self._direct_spatial_h1 = None
         self._direct_spatial_eri = None
         self._direct_pair_factors = None
@@ -4182,6 +4198,7 @@ class CASCI(mcscf.casci.CASCI):
                 binary,
                 requested_nstates,
                 use_cholesky=use_cholesky,
+                slater_condon=self.ensure_slater_condon_cache(),
             )
             self.direct_ci_diagnostics = {
                 'backend': 'direct_spin0_symm_dense',
@@ -5595,6 +5612,19 @@ class CASCI(mcscf.casci.CASCI):
             raise ValueError('Run CASCI before requesting S^2.')
 
         ci = self.ci[state_id]
+
+        if self.solver_backend == 'direct_spin0_symm_dense':
+            # Only the explicitly dense small-space solver uses this matrix.
+            # Cache the operator, never the expectation or CI coefficients.
+            key = (self.ncas, self.binary.shape, self.binary.tobytes())
+            cached = self._s2_dense_cache
+            if cached is None or cached[0] != key:
+                h1_s2, h2_s2 = build_spin_square_operator(self.ncas)
+                sc1, sc2 = (self.ensure_slater_condon_cache() if cached is None
+                            else SlaterCondon(self.binary))
+                matrix = CI_H(self.binary, h1_s2, h2_s2, sc1, sc2)
+                self._s2_dense_cache = (key, matrix)
+            return float(np.vdot(ci, self._s2_dense_cache[1] @ ci).real)
 
         spin_conn = self.spin_string_connectivity
         if spin_conn is not None and isinstance(self.binary, FCIStringBasis):

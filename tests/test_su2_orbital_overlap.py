@@ -133,7 +133,7 @@ def test_reduced_su2_orbital_circuit_matches_component_reference():
     assert info["determinant_expansion"] is False
     assert all(
         site.metadata.get("physical_basis") == "fully_reduced_su2"
-        for site in transformed.sites
+        for site in transformed.tensors
     )
 
     compressed, compressed_info = apply_spatial_orbital_transform(
@@ -147,7 +147,7 @@ def test_reduced_su2_orbital_circuit_matches_component_reference():
     assert compressed_info["max_bond"] == 2
     assert compressed_info["sum_gate_discarded_weight"] > 0.0
     assert compressed_info["truncated_gate_count"] > 0
-    assert all(len(site.qns[2]) <= 2 for site in compressed.sites[:-1])
+    assert all(sum(site.legs[2].dims.values()) <= 2 for site in compressed.tensors[:-1])
     assert not np.allclose(_component_tensor(compressed), expected, atol=2.0e-13)
 
     adaptive, adaptive_info = apply_spatial_orbital_transform(
@@ -169,7 +169,7 @@ def test_reduced_su2_orbital_circuit_matches_component_reference():
         "adjacent_gate_count"
     ]
     assert max(adaptive_info["gate_kept_reduced_bonds"]) <= 64
-    assert all(len(site.qns[2]) <= 64 for site in adaptive.sites[:-1])
+    assert all(sum(site.legs[2].dims.values()) <= 64 for site in adaptive.tensors[:-1])
 
     _, ceiling_info = apply_spatial_orbital_transform(
         state,
@@ -319,16 +319,10 @@ def test_cross_geometry_su2_overlap_is_exact_and_determinant_free(monkeypatch):
     np.testing.assert_allclose(actual, cas_bra.overlap(cas_ket), atol=1.0e-8)
     np.testing.assert_allclose(dmrg_bra.overlap(dmrg_bra), [[1.0]], atol=1.0e-10)
     assert info["backend"] == "su2"
-    assert info["exact"] is False
-    assert info["transforms"]["bra"][0]["cutoff"] == 1.0e-10
-    assert info["transforms"]["bra"][0]["requested_max_bond"] == "auto"
-    transform_info = info["transforms"]["bra"][0]
-    input_bond = transform_info["input_reduced_bond_dimension"]
-    assert transform_info["max_bond"] == max(
-        input_bond,
-        min(8192, max(256, 16 * input_bond)),
-    )
-    assert transform_info["sum_gate_discarded_weight"] >= 0.0
+    assert info['tol'] == 1e-8
+    assert info['max_bond'] is None
+    assert info['overlap_error_bound'] <= 1e-8
+    assert info['tolerance_met']
     assert info["sector_preserving"] is True
     assert info["determinant_expansion"] is False
     assert info["component_expansion"] is False

@@ -1648,7 +1648,10 @@ def test_cpp_su2_engine_advances_direct_normal_complementary_boundary(side):
     x_dim = int(source_qn[1]) + 1
     y_dim = int(target_qn[1]) + 1
     q_lb = SpinChargeSector(0, SU2Irrep(0))
-    q_lk = SpinChargeSector(0, SU2Irrep(0))
+    # The synthetic bra and ket use different virtual dimensions.  Give them
+    # distinct charge sectors so one IrrepTensor Leg has a unique degeneracy
+    # for every sector, as a physical block-sparse tensor must.
+    q_lk = SpinChargeSector(2, SU2Irrep(0))
     q_pb = SpinChargeSector(1, SU2Irrep(1))
     q_pk = SpinChargeSector(0, SU2Irrep(0))
     q_rb = SpinChargeSector(1, SU2Irrep(1))
@@ -2335,6 +2338,65 @@ def test_factor_match_topology_cache_is_compact_and_byte_bounded(monkeypatch):
     su2_qchem_plan._factor_match_layout_put(cache, "oversized", oversized)
     assert tuple(cache) == ("second",)
     cache.clear()
+
+
+def test_split_qchem_factor_pool_streaming_matches_materialized_operator(monkeypatch):
+    from pyqed.mps.nonabelian import su2_qchem_plan as plans
+
+    class Entry:
+        key = ('only',)
+        shape = (2, 1, 1, 2)
+        size = 4
+        offset = 0
+        slice = slice(0, 4)
+
+    class Basis(tuple):
+        size = 4
+
+    class SplitTable:
+        def __init__(self, factors):
+            self.factors = factors
+            self.calls = 0
+            self.factor_indices = np.arange(len(factors), dtype=np.int64)
+            # Logical factors exist, but no rank-5 payload is retained here.
+            self.factor_pool = SimpleNamespace(
+                data=np.empty(0), shape_offsets=np.array([0], dtype=np.int64), n_arrays=0)
+
+        def factor(self, index):
+            self.calls += 1
+            return self.factors[index]
+
+        def factor_shape(self, index):
+            return self.factors[index].shape
+
+    rng = np.random.default_rng(21)
+    left = [np.einsum('xlk,xwab->lkwab', rng.normal(size=(2, 2, 2)),
+                      rng.normal(size=(2, 1, 1, 1))) for _ in range(2)]
+    right = [np.einsum('wydc,yqr->wqrdc', rng.normal(size=(1, 2, 1, 1)),
+                       rng.normal(size=(2, 2, 2))) for _ in range(2)]
+    plan = SimpleNamespace(bond=0, left_factor_table=SplitTable(left),
+                           right_factor_table=SplitTable(right),
+                           _factorized_kernel=plans.SU2QChemSweepPlan._factorized_kernel)
+    compiled = plans.PackedSU2QChemCompiledTerms(
+        basis=Basis((Entry(),)), plan=plan, in_indices=[0, 0], out_indices=[0, 0],
+        left_indices=[0, 1], right_indices=[0, 1])
+    monkeypatch.setattr(plans, '_PACKED_QCHEM_ENTRY_KERNEL_CACHE_MAX_ELEMENTS', 0)
+    vector = rng.normal(size=4) + 1j*rng.normal(size=4)
+    expected = plans.SU2QChemSweepPlan._factorized_kernel(
+        np.stack(left), np.stack(right), Entry(), Entry()) @ vector
+    np.testing.assert_allclose(compiled.apply_packed(vector, base_dtype=complex),
+                               expected, rtol=1e-12, atol=1e-12)
+    calls = (plan.left_factor_table.calls, plan.right_factor_table.calls)
+    np.testing.assert_allclose(compiled.apply_packed(2*vector, base_dtype=complex),
+                               2*expected, rtol=1e-12, atol=1e-12)
+    assert calls == (plan.left_factor_table.calls, plan.right_factor_table.calls)
+    assert 0 < compiled._stream_factor_cache_nbytes <= 8*1024**2
+    oversized = SplitTable([np.broadcast_to(0., (1024, 1025))])
+    before = compiled._stream_factor_cache_nbytes
+    compiled._stream_factor(oversized, 0)
+    compiled._stream_factor(oversized, 0)
+    assert oversized.calls == 2
+    assert compiled._stream_factor_cache_nbytes == before
 
 
 def test_packed_qchem_streaming_matvec_avoids_dense_kernel_cache(monkeypatch):
@@ -3105,6 +3167,19 @@ def test_cpp_factor_route_projection_runs_davidson_without_python_callbacks():
         abs=1.0e-10,
     )
     assert owner.stats["factor_route_projected_davidson_calls"] == 1
+    panel = np.column_stack(
+        (np.ones(3, dtype=complex), np.arange(3, dtype=complex))
+    )
+    np.testing.assert_allclose(
+        owner.factor_route_projected_matmat("projection", panel),
+        np.column_stack(
+            [
+                owner.factor_route_projected_matvec("projection", panel[:, i])
+                for i in range(panel.shape[1])
+            ]
+        ),
+        atol=1.0e-12,
+    )
     table_stats = MovingEnvironmentFactorRouteTable(
         owner,
         "projection",

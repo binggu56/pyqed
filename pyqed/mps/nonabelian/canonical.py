@@ -13,6 +13,44 @@ from .decompose import svd_two_site
 from pyqed.symmetry import IrrepTensor
 
 
+def left_qr_sites(sites):
+    """Exactly left-orthogonalize fully reduced sites without bond growth.
+
+    Sectorwise single-site QR and absorption, with no singular-value
+    truncation. Operates on copies, including their sector multiplicities.
+    """
+    current = [site.copy() for site in sites]
+    for i in range(len(current)-1):
+        left, right = current[i:i+2]
+        if left.metadata.get('physical_basis') != 'fully_reduced_su2':
+            raise ValueError('left_qr_sites requires fully reduced SU2 tensors')
+        ld, rd = dict(left.data), dict(right.data)
+        qns = []
+        for sector in dict.fromkeys(left.qns[2]):
+            keys = [key for key in ld if key[2] == sector]
+            if not keys:
+                continue
+            width = ld[keys[0]].shape[2]
+            matrix = np.concatenate([ld[key].reshape(-1,width) for key in keys])
+            q, r = np.linalg.qr(matrix,mode='reduced')
+            rank = q.shape[1]
+            qns.extend([sector]*rank)
+            offset = 0
+            for key in keys:
+                shape = ld[key].shape
+                rows = shape[0]*shape[1]
+                ld[key] = q[offset:offset+rows].reshape(shape[0],shape[1],rank)
+                offset += rows
+            for key in rd:
+                if key[0] == sector:
+                    rd[key] = np.einsum('ab,bpr->apr',r,rd[key],optimize=True)
+        current[i] = IrrepTensor(data=ld,qns=[left.qns[0],left.qns[1],qns],
+                                 dirs=left.dirs,metadata=dict(left.metadata))
+        current[i+1] = IrrepTensor(data=rd,qns=[qns,right.qns[1],right.qns[2]],
+                                   dirs=right.dirs,metadata=dict(right.metadata))
+    return current
+
+
 def _site_dense_matrix(site, *, mode):
     if not isinstance(site, IrrepTensor) or site.rank != 3:
         raise ValueError("_site_dense_matrix expects a rank-3 IrrepTensor site tensor.")

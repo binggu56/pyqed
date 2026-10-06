@@ -812,6 +812,8 @@ def sweep_once(
         state averaging.
     local_solver_kwargs
         Optional keyword arguments forwarded to the Davidson local solver.
+        Owned SU(2) sweeps accept ``workspace_budget_bytes`` (default 32 MiB)
+        to control the memory cap on the requested Davidson subspace.
     local_guess_cache
         Optional mapping from bond index to a previously optimized rank-4
         two-site tensor used as the initial guess for the local Davidson solve.
@@ -1113,7 +1115,7 @@ def sweep_once(
         and root_sites is None
         and root_target_mpo_factors is None
         and not force_canonical_local_norm
-        and str(max_bond_mode).lower() == "reduced"
+        and str(max_bond_mode).lower() in {"reduced", "per_sector"}
         and (
             int(nlocal_states) == 1
             or int(
@@ -1181,7 +1183,9 @@ def sweep_once(
                 local_solver_kwargs.get("itermax", 100)
             ),
             max_space=local_solver_kwargs.get("max_space"),
-            workspace_budget_bytes=32 * 1024 * 1024,
+            workspace_budget_bytes=int(
+                local_solver_kwargs.get("workspace_budget_bytes", 32 * 1024 * 1024)
+            ),
             workspace_basis_arrays=3,
             accept_unconverged=True,
         )

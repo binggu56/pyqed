@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -2881,6 +2882,11 @@ struct Spin0PairSigmaWorkspace {
     std::vector<npy_int32> blas_link_pair;
     std::vector<npy_int32> blas_link_ket;
     std::vector<npy_int8> blas_link_sign;
+    struct OrbitalLink {
+        npy_int32 bra, ket, pair;
+        npy_int8 sign;
+    };
+    std::vector<OrbitalLink> orbital_links;
     std::vector<double> effective_pair_eri;
     std::vector<double> blas_sigma_buffers;
     std::vector<double> blas_t1_buffers;
@@ -3238,7 +3244,7 @@ struct Spin0PairSigmaWorkspace {
     bool apply(const double* cdata, double* sigma_pair);
 #ifdef PYQED_HAVE_CBLAS
     bool initialize_blas_pair();
-    bool apply_blas_det(const double* cdata, double* sigma_data);
+    bool apply_blas_det(const double* cdata, double* sigma_data, bool paired = false);
     bool apply_blas_pair(const double* cdata, double* sigma_pair);
 #endif
 };
@@ -3336,6 +3342,17 @@ bool Spin0PairSigmaWorkspace::initialize_blas_pair() {
         blas_link_sign[static_cast<std::size_t>(slot)] = -phase_a[link];
     }
 
+    orbital_links.clear();
+    orbital_links.reserve(n_blas_link);
+    for (npy_intp bra = 0; bra < n_alpha; ++bra) {
+        for (npy_intp pos = blas_link_offsets[bra]; pos < blas_link_offsets[bra+1]; ++pos) {
+            orbital_links.push_back({static_cast<npy_int32>(bra), blas_link_ket[pos],
+                                     blas_link_pair[pos], blas_link_sign[pos]});
+        }
+    }
+    std::stable_sort(orbital_links.begin(), orbital_links.end(),
+                    [](const OrbitalLink& a, const OrbitalLink& b) { return a.pair < b.pair; });
+
     npy_intp nocc = 0;
     for (npy_intp orb = 0; orb < n; ++orb) {
         nocc += alpha[idx_occ(n, 0, orb)] != 0;
@@ -3408,13 +3425,15 @@ bool Spin0PairSigmaWorkspace::apply_blas_pair(
         }
     }
 
-    if (!apply_blas_det(c_det.data(), sigma_det.data())) {
+    if (!apply_blas_det(c_det.data(), sigma_det.data(), true)) {
         return false;
     }
     for (npy_intp pair = 0; pair < n_pair; ++pair) {
         const npy_intp ldet = left[pair];
         const npy_intp rdet = right[pair];
-        sigma_pair[pair] = (
+        // For symmetric C, the omitted alpha scatter is the transpose of
+        // the beta scatter. Pair projection of their sum is twice either.
+        sigma_pair[pair] = 2.0 * (
             ldet == rdet
                 ? sigma_det[static_cast<std::size_t>(ldet)]
                 : (
@@ -3428,7 +3447,8 @@ bool Spin0PairSigmaWorkspace::apply_blas_pair(
 
 bool Spin0PairSigmaWorkspace::apply_blas_det(
     const double* cdata,
-    double* sigma_data
+    double* sigma_data,
+    bool paired
 ) {
     std::fill(blas_sigma_buffers.begin(), blas_sigma_buffers.end(), 0.0);
 
@@ -3470,19 +3490,8 @@ bool Spin0PairSigmaWorkspace::apply_blas_det(
             }
 
             const double* c_row = cdata + bra_a * n_beta;
-            for (npy_intp bra_b = 0; bra_b < n_beta; ++bra_b) {
-                const npy_intp beta_begin =
-                    blas_link_offsets[static_cast<std::size_t>(bra_b)];
-                const npy_intp beta_end =
-                    blas_link_offsets[static_cast<std::size_t>(bra_b + 1)];
-                for (npy_intp pos = beta_begin; pos < beta_end; ++pos) {
-                    const npy_intp orbital = blas_link_pair[static_cast<std::size_t>(pos)];
-                    const npy_intp ket_b = blas_link_ket[static_cast<std::size_t>(pos)];
-                    const double sign = static_cast<double>(
-                        blas_link_sign[static_cast<std::size_t>(pos)]
-                    );
-                    t1[orbital * n_beta + bra_b] += sign * c_row[ket_b];
-                }
+            for (const auto& link : orbital_links) {
+                t1[link.pair * n_beta + link.bra] += static_cast<double>(link.sign) * c_row[link.ket];
             }
 
             cblas_dgemm(
@@ -3503,21 +3512,11 @@ bool Spin0PairSigmaWorkspace::apply_blas_det(
             );
 
             double* sigma_row = local_sigma + bra_a * n_beta;
-            for (npy_intp bra_b = 0; bra_b < n_beta; ++bra_b) {
-                const npy_intp beta_begin =
-                    blas_link_offsets[static_cast<std::size_t>(bra_b)];
-                const npy_intp beta_end =
-                    blas_link_offsets[static_cast<std::size_t>(bra_b + 1)];
-                for (npy_intp pos = beta_begin; pos < beta_end; ++pos) {
-                    const npy_intp orbital = blas_link_pair[static_cast<std::size_t>(pos)];
-                    const npy_intp ket_b = blas_link_ket[static_cast<std::size_t>(pos)];
-                    const double sign = static_cast<double>(
-                        blas_link_sign[static_cast<std::size_t>(pos)]
-                    );
-                    sigma_row[ket_b] += sign * vt1[orbital * n_beta + bra_b];
-                }
+            for (const auto& link : orbital_links) {
+                sigma_row[link.ket] += static_cast<double>(link.sign) * vt1[link.pair * n_beta + link.bra];
             }
 
+            if (paired) continue;
             for (npy_intp pos = alpha_begin; pos < alpha_end; ++pos) {
                 const npy_intp orbital = blas_link_pair[static_cast<std::size_t>(pos)];
                 const npy_intp ket_a = blas_link_ket[static_cast<std::size_t>(pos)];
@@ -4119,7 +4118,8 @@ PyObject* create_spin0_pair_workspace(PyObject*, PyObject* args) {
     );
 }
 
-PyObject* apply_spin0_pair_workspace_det(PyObject*, PyObject* args) {
+template <bool paired>
+PyObject* apply_spin0_workspace_impl(PyObject* args) {
     PyObject* capsule = nullptr;
     PyObject* c_object = nullptr;
     if (!PyArg_ParseTuple(args, "OO", &capsule, &c_object)) {
@@ -4135,24 +4135,27 @@ PyObject* apply_spin0_pair_workspace_det(PyObject*, PyObject* args) {
     if (!c) {
         return nullptr;
     }
-    if (PyArray_NDIM(c.obj) != 1 || PyArray_DIM(c.obj, 0) != workspace->n_det) {
+    const npy_intp dimension = paired ? workspace->n_pair : workspace->n_det;
+    if (PyArray_NDIM(c.obj) != 1 || PyArray_DIM(c.obj, 0) != dimension) {
         PyErr_SetString(
             PyExc_ValueError,
             "Direct-CI workspace input has an incompatible determinant dimension."
         );
         return nullptr;
     }
-    npy_intp output_dims[1] = {workspace->n_det};
+    npy_intp output_dims[1] = {dimension};
     PyObject* output_object = PyArray_SimpleNew(1, output_dims, NPY_DOUBLE);
     if (output_object == nullptr) {
         return nullptr;
     }
 #ifdef PYQED_HAVE_CBLAS
     auto* output = reinterpret_cast<PyArrayObject*>(output_object);
-    if (!workspace->apply_blas_det(
-            static_cast<const double*>(PyArray_DATA(c.obj)),
-            static_cast<double*>(PyArray_DATA(output))
-        )) {
+    const auto* input_data = static_cast<const double*>(PyArray_DATA(c.obj));
+    auto* output_data = static_cast<double*>(PyArray_DATA(output));
+    const bool success = paired
+        ? workspace->apply_blas_pair(input_data, output_data)
+        : workspace->apply_blas_det(input_data, output_data);
+    if (!success) {
         Py_DECREF(output_object);
         return nullptr;
     }
@@ -4165,6 +4168,14 @@ PyObject* apply_spin0_pair_workspace_det(PyObject*, PyObject* args) {
     );
     return nullptr;
 #endif
+}
+
+PyObject* apply_spin0_pair_workspace_det(PyObject*, PyObject* args) {
+    return apply_spin0_workspace_impl<false>(args);
+}
+
+PyObject* apply_spin0_pair_workspace(PyObject*, PyObject* args) {
+    return apply_spin0_workspace_impl<true>(args);
 }
 
 bool jacobi_eigh_small(
@@ -4339,8 +4350,17 @@ void projected_matrix_vt_av(
     std::size_t n,
     int m,
     std::vector<double>& T,
-    std::vector<double>& T_col
+    std::vector<double>& T_col,
+    int previous_m = 0
 ) {
+    // Appending basis vectors leaves the old projected block unchanged.
+    // Move backwards because the row stride grows in the same buffer.
+    for (int row = previous_m - 1; row >= 0; --row) {
+        for (int col = previous_m - 1; col >= 0; --col) {
+            T[static_cast<std::size_t>(row)*m+col] =
+                T[static_cast<std::size_t>(row)*previous_m+col];
+        }
+    }
 #ifdef PYQED_HAVE_CBLAS
     constexpr int col_major = 102;
     constexpr int no_trans = 111;
@@ -4352,19 +4372,29 @@ void projected_matrix_vt_av(
             trans,
             no_trans,
             m,
-            m,
+            m - previous_m,
             static_cast<int>(n),
             1.0,
             V.data(),
             static_cast<int>(n),
-            AV.data(),
+            AV.data() + static_cast<std::size_t>(previous_m)*n,
             static_cast<int>(n),
             0.0,
-            T_col.data(),
+            T_col.data() + static_cast<std::size_t>(previous_m)*m,
             m
         );
+        if (previous_m > 0) {
+            cblas_dgemm(
+                col_major, trans, no_trans, m - previous_m, previous_m,
+                static_cast<int>(n), 1.0,
+                V.data() + static_cast<std::size_t>(previous_m)*n, static_cast<int>(n),
+                AV.data(), static_cast<int>(n), 0.0,
+                T_col.data() + previous_m, m
+            );
+        }
         for (int row = 0; row < m; ++row) {
             for (int col = 0; col < m; ++col) {
+                if (row < previous_m && col < previous_m) continue;
                 T[static_cast<std::size_t>(row) * static_cast<std::size_t>(m) + static_cast<std::size_t>(col)] =
                     T_col[static_cast<std::size_t>(row) + static_cast<std::size_t>(col) * static_cast<std::size_t>(m)];
             }
@@ -4372,10 +4402,10 @@ void projected_matrix_vt_av(
         return;
     }
 #endif
-    std::fill(T.begin(), T.end(), 0.0);
     for (int i = 0; i < m; ++i) {
         const double* vi = V.data() + static_cast<std::size_t>(i) * n;
         for (int j = 0; j < m; ++j) {
+            if (i < previous_m && j < previous_m) continue;
             const double* avj = AV.data() + static_cast<std::size_t>(j) * n;
             double dot = 0.0;
             for (std::size_t k = 0; k < n; ++k) {
@@ -4502,7 +4532,19 @@ void build_restart_block(
 }
 
 PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
-    const Py_ssize_t nargs = PyTuple_Size(args);
+    Py_ssize_t nargs = PyTuple_Size(args);
+    PyObject* timings = nullptr;
+    if ((nargs == 53 || nargs == 60) && PyDict_Check(PyTuple_GET_ITEM(args, nargs-1))) {
+        timings = PyTuple_GET_ITEM(args, --nargs);
+    }
+    auto now = [timings]() {
+        return timings ? std::chrono::duration<double>(
+            std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
+    };
+    const double started = now();
+    double matvec_seconds = 0.0, subspace_seconds = 0.0, correction_seconds = 0.0;
+    double restart_seconds = 0.0;
+    int matvecs = 0, iterations = 0, restarts = 0;
     if (nargs != 52 && nargs != 59) {
         PyErr_SetString(
             PyExc_TypeError,
@@ -4750,6 +4792,7 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
         }
     }
     auto sigma_matvec = [&](const double* input, double* output) -> bool {
+        const double tick = now();
         if (!sigma_workspace.apply(input, output)) {
             return false;
         }
@@ -4761,6 +4804,8 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
                 output[row] += spin_penalty_shift * spin_penalty_sigma[row];
             }
         }
+        matvec_seconds += now() - tick;
+        ++matvecs;
         return true;
     };
 
@@ -4789,8 +4834,12 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     std::vector<double> previous_theta = theta;
     std::vector<double> resid_norm(static_cast<std::size_t>(nroots), 0.0);
     bool converged = false;
+    int projected_m = 0;
     for (int cycle = 0; cycle < max_cycle; ++cycle) {
-        projected_matrix_vt_av(V, AV, n, m, T, T_col);
+        ++iterations;
+        const double subspace_tick = now();
+        projected_matrix_vt_av(V, AV, n, m, T, T_col, projected_m);
+        projected_m = m;
         if (!jacobi_eigh_small(
                 std::vector<double>(T.begin(), T.begin() + static_cast<std::ptrdiff_t>(m) * m),
                 m,
@@ -4817,6 +4866,8 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
         }
         build_restart_block(V, n, m, nroots, evecs, root_order, root_coeff, ritz);
         build_restart_block(AV, n, m, nroots, evecs, root_order, root_coeff, aritz);
+        subspace_seconds += now() - subspace_tick;
+        const double correction_tick = now();
 
         bool all_converged = cycle > 0;
         bool residuals_converged = true;
@@ -4837,6 +4888,7 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
                 resid_norm[static_cast<std::size_t>(root)] < residual_tol;
         }
         if (all_converged || residuals_converged) {
+            correction_seconds += now() - correction_tick;
             converged = true;
             break;
         }
@@ -4886,10 +4938,14 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
             ++accepted;
         }
 
+        correction_seconds += now() - correction_tick;
         if (accepted == 0) {
             break;
         }
         if (m + accepted > capacity) {
+            ++restarts;
+            const double restart_tick = now();
+            const double matvec_before = matvec_seconds;
             int keep = std::min(m, thick_keep_target);
             keep = std::min(keep, capacity - accepted);
             build_restart_block(V, n, m, keep, evecs, root_order, restart_coeff, restart_V);
@@ -4911,6 +4967,8 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
             std::copy(restart_V.begin(), restart_V.begin() + static_cast<std::ptrdiff_t>(restart_size), V.begin());
             std::copy(restart_AV.begin(), restart_AV.begin() + static_cast<std::ptrdiff_t>(restart_size), AV.begin());
             m = keep + accepted;
+            projected_m = 0;
+            restart_seconds += now() - restart_tick - (matvec_seconds - matvec_before);
         } else {
             for (int col = 0; col < accepted; ++col) {
                 std::copy(
@@ -4964,6 +5022,19 @@ PyObject* davidson_spin0_pair(PyObject*, PyObject* args) {
     }
     PyTuple_SET_ITEM(result, 0, energies_obj);
     PyTuple_SET_ITEM(result, 1, vecs_obj);
+    if (timings) {
+        PyObject* data = Py_BuildValue("{s:d,s:d,s:d,s:d,s:d,s:i,s:i,s:i}",
+            "total", now()-started, "matvec", matvec_seconds,
+            "subspace", subspace_seconds, "correction", correction_seconds,
+            "restart", restart_seconds, "matvecs", matvecs,
+            "iterations", iterations, "restarts", restarts);
+        if (!data || PyDict_Update(timings, data) < 0) {
+            Py_XDECREF(data);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        Py_DECREF(data);
+    }
     return result;
 }
 
@@ -5781,7 +5852,8 @@ PyObject* scatter_opposite_spin_rdm2(PyObject*, PyObject* args) {
     Py_RETURN_NONE;
 }
 
-PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
+template<bool use_symmetry>
+PyObject* state_average_spin_rdms_impl(PyObject* args) {
     if (PyTuple_Size(args) != 27) {
         PyErr_SetString(
             PyExc_TypeError,
@@ -5981,11 +6053,47 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
     std::vector<double> beta_overlap;
     std::vector<double> coeff_by_det;
     std::vector<double> weighted_coeff_by_det;
+    std::vector<double> opposite_density;
+    bool exchange_symmetric = use_symmetry && nalpha == nbeta && na1 == nb1;
+    for (npy_intp link = 0; exchange_symmetric && link < na1; ++link) {
+        exchange_symmetric = a1p[link] == b1p[link] && a1q[link] == b1q[link]
+            && a1bra[link] == b1bra[link] && a1ket[link] == b1ket[link]
+            && a1phase[link] == b1phase[link];
+    }
+    for (npy_intp root = 0; exchange_symmetric && root < nroot; ++root) {
+        for (npy_intp a = 0; exchange_symmetric && a < nalpha; ++a) {
+            for (npy_intp b = 0; b < a; ++b) {
+                if (coeff[root*ndet+a*nbeta+b] != coeff[root*ndet+b*nbeta+a]) {
+                    exchange_symmetric = false;
+                    break;
+                }
+            }
+        }
+    }
+    auto representative = [nmo](npy_intp p, npy_intp q, npy_intp r, npy_intp s) {
+        return std::min(std::min(idx4(nmo,p,q,r,s), idx4(nmo,q,p,s,r)),
+                        std::min(idx4(nmo,r,s,p,q), idx4(nmo,s,r,q,p)));
+    };
+    std::vector<std::vector<npy_intp>> beta_links;
     try {
         alpha_overlap.assign(static_cast<std::size_t>(nalpha * nalpha), 0.0);
         beta_overlap.assign(static_cast<std::size_t>(nbeta * nbeta), 0.0);
         coeff_by_det.resize(static_cast<std::size_t>(ndet * nroot));
         weighted_coeff_by_det.resize(static_cast<std::size_t>(ndet * nroot));
+        opposite_density.assign(static_cast<std::size_t>(nmo*nmo*nmo*nmo), 0.0);
+        if (exchange_symmetric) {
+            beta_links.resize(nmo*nmo);
+            for (npy_intp p = 0; p < nmo; ++p) {
+                for (npy_intp q = p; q < nmo; ++q) {
+                    auto& links = beta_links[p*nmo+q];
+                    for (npy_intp lb = 0; lb < nb1; ++lb) {
+                        if (idx4(nmo,p,q,b1p[lb],b1q[lb]) == representative(p,q,b1p[lb],b1q[lb])) {
+                            links.push_back(lb);
+                        }
+                    }
+                }
+            }
+        }
     } catch (...) {
         Py_DECREF(dm1_result);
         Py_DECREF(dm2_result);
@@ -6007,13 +6115,15 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
             croot, static_cast<int>(nbeta), beta,
             alpha_overlap.data(), static_cast<int>(nalpha)
         );
-        cblas_dgemm(
-            row_major, trans, no_trans,
-            static_cast<int>(nbeta), static_cast<int>(nbeta), static_cast<int>(nalpha),
-            root_weights[root], croot, static_cast<int>(nbeta),
-            croot, static_cast<int>(nbeta), beta,
-            beta_overlap.data(), static_cast<int>(nbeta)
-        );
+        if (!exchange_symmetric) {
+            cblas_dgemm(
+                row_major, trans, no_trans,
+                static_cast<int>(nbeta), static_cast<int>(nbeta), static_cast<int>(nalpha),
+                root_weights[root], croot, static_cast<int>(nbeta),
+                croot, static_cast<int>(nbeta), beta,
+                beta_overlap.data(), static_cast<int>(nbeta)
+            );
+        }
     }
 #else
     for (npy_intp root = 0; root < nroot; ++root) {
@@ -6028,7 +6138,7 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
                 alpha_overlap[bra * nalpha + ket] += weight * value;
             }
         }
-        for (npy_intp bra = 0; bra < nbeta; ++bra) {
+        for (npy_intp bra = 0; !exchange_symmetric && bra < nbeta; ++bra) {
             for (npy_intp ket = 0; ket < nbeta; ++ket) {
                 double value = 0.0;
                 for (npy_intp alpha = 0; alpha < nalpha; ++alpha) {
@@ -6049,6 +6159,7 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
         }
     }
 
+    const double* beta_density = exchange_symmetric ? alpha_overlap.data() : beta_overlap.data();
     for (npy_intp link = 0; link < na1; ++link) {
         d1[idx2(nmo, a1p[link], a1q[link])] +=
             static_cast<double>(a1phase[link]) *
@@ -6057,7 +6168,7 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
     for (npy_intp link = 0; link < nb1; ++link) {
         d1[idx2(nmo, b1p[link], b1q[link])] +=
             static_cast<double>(b1phase[link]) *
-            beta_overlap[b1bra[link] * nbeta + b1ket[link]];
+            beta_density[b1bra[link] * nbeta + b1ket[link]];
     }
     for (npy_intp link = 0; link < na2; ++link) {
         d2[idx4(nmo, a2p[link], a2q[link], a2r[link], a2s[link])] +=
@@ -6067,25 +6178,59 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
     for (npy_intp link = 0; link < nb2; ++link) {
         d2[idx4(nmo, b2p[link], b2q[link], b2r[link], b2s[link])] +=
             static_cast<double>(b2phase[link]) *
-            beta_overlap[b2bra[link] * nbeta + b2ket[link]];
+            beta_density[b2bra[link] * nbeta + b2ket[link]];
     }
 
     for (npy_intp la = 0; la < na1; ++la) {
+        // For real CI roots, reversing both excitations gives the same
+        // density element. Contract one alpha orientation and scatter its
+        // Hermitian partner; diagonal alpha links are counted only once.
+        if (use_symmetry && a1p[la] > a1q[la]) {
+            continue;
+        }
         const npy_intp bra_alpha = a1bra[la];
         const npy_intp ket_alpha = a1ket[la];
         const double alpha_phase = static_cast<double>(a1phase[la]);
-        for (npy_intp lb = 0; lb < nb1; ++lb) {
+        const auto* selected = exchange_symmetric ? &beta_links[a1p[la]*nmo+a1q[la]] : nullptr;
+        const npy_intp count = selected ? static_cast<npy_intp>(selected->size()) : nb1;
+        for (npy_intp index = 0; index < count; ++index) {
+            const npy_intp lb = selected ? (*selected)[index] : index;
             const npy_intp bra_det = bra_alpha * nbeta + b1bra[lb];
             const npy_intp ket_det = ket_alpha * nbeta + b1ket[lb];
             const double* bra_coeff = weighted_coeff_by_det.data() + bra_det * nroot;
             const double* ket_coeff = coeff_by_det.data() + ket_det * nroot;
             double value = 0.0;
-            for (npy_intp root = 0; root < nroot; ++root) {
-                value += bra_coeff[root] * ket_coeff[root];
+            if (use_symmetry && nroot == 3) {
+                value = bra_coeff[0] * ket_coeff[0]
+                      + bra_coeff[1] * ket_coeff[1]
+                      + bra_coeff[2] * ket_coeff[2];
+            } else {
+                for (npy_intp root = 0; root < nroot; ++root) {
+                    value += bra_coeff[root] * ket_coeff[root];
+                }
             }
             value *= alpha_phase * static_cast<double>(b1phase[lb]);
-            d2[idx4(nmo, a1p[la], a1q[la], b1p[lb], b1q[lb])] += value;
-            d2[idx4(nmo, b1p[lb], b1q[lb], a1p[la], a1q[la])] += value;
+            if constexpr (use_symmetry) {
+                opposite_density[idx4(nmo, a1p[la], a1q[la], b1p[lb], b1q[lb])] += value;
+            } else {
+                d2[idx4(nmo, a1p[la], a1q[la], b1p[lb], b1q[lb])] += value;
+                d2[idx4(nmo, b1p[lb], b1q[lb], a1p[la], a1q[la])] += value;
+            }
+        }
+    }
+    if constexpr (use_symmetry) {
+        for (npy_intp p = 0; p < nmo; ++p) {
+            for (npy_intp q = 0; q < nmo; ++q) {
+                for (npy_intp r = 0; r < nmo; ++r) {
+                    for (npy_intp s = 0; s < nmo; ++s) {
+                        const auto key = exchange_symmetric ? representative(p,q,r,s)
+                            : (p <= q ? idx4(nmo,p,q,r,s) : idx4(nmo,q,p,s,r));
+                        const double value = opposite_density[key];
+                        d2[idx4(nmo, p, q, r, s)] += value;
+                        d2[idx4(nmo, r, s, p, q)] += value;
+                    }
+                }
+            }
         }
     }
     Py_END_ALLOW_THREADS
@@ -6099,6 +6244,14 @@ PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
     PyTuple_SET_ITEM(result, 0, dm1_result);
     PyTuple_SET_ITEM(result, 1, dm2_result);
     return result;
+}
+
+PyObject* state_average_spin_rdms(PyObject*, PyObject* args) {
+    return state_average_spin_rdms_impl<true>(args);
+}
+
+PyObject* state_average_spin_rdms_reference(PyObject*, PyObject* args) {
+    return state_average_spin_rdms_impl<false>(args);
 }
 
 struct SpinFreeLink {
@@ -6138,6 +6291,65 @@ bool create_bit(std::uint64_t bits, npy_intp idx, std::uint64_t& out_bits, int& 
     phase = fermion_phase(bits, idx);
     out_bits = bits | (1ULL << static_cast<unsigned>(idx));
     return true;
+}
+
+PyObject* density_string_links(PyObject*, PyObject* args) {
+    PyObject* bits_obj = nullptr;
+    int nmo = 0;
+    if (!PyArg_ParseTuple(args, "Oi", &bits_obj, &nmo)) return nullptr;
+    ArrayRef bits_ref(bits_obj, NPY_UINT64, NPY_ARRAY_IN_ARRAY);
+    if (!bits_ref) return nullptr;
+    if (PyArray_NDIM(bits_ref.obj) != 1 || nmo < 0 || nmo > 62) {
+        PyErr_SetString(PyExc_ValueError, "Expected a bit-string vector and 0 <= nmo <= 62.");
+        return nullptr;
+    }
+    const npy_intp count = PyArray_SIZE(bits_ref.obj);
+    const auto* bits = static_cast<const npy_uint64*>(PyArray_DATA(bits_ref.obj));
+    std::vector<npy_intp> columns[12];
+    try {
+        std::unordered_map<std::uint64_t, npy_intp> lookup;
+        for (npy_intp i = 0; i < count; ++i) lookup[bits[i]] = i;
+        for (npy_intp ket = 0; ket < count; ++ket) {
+            for (int q = 0; q < nmo; ++q) {
+                std::uint64_t b1, b2, b3, b4;
+                int f1, f2, f3, f4;
+                if (!annihilate_bit(bits[ket], q, b1, f1)) continue;
+                for (int p = 0; p < nmo; ++p) {
+                    if (!create_bit(b1, p, b2, f2)) continue;
+                    const auto found = lookup.find(b2);
+                    if (found == lookup.end()) continue;
+                    const npy_intp row[] = {p, q, found->second, ket, f1*f2};
+                    for (int j = 0; j < 5; ++j) columns[j].push_back(row[j]);
+                }
+                for (int s = 0; s < nmo; ++s) {
+                    if (!annihilate_bit(b1, s, b2, f2)) continue;
+                    for (int r = 0; r < nmo; ++r) {
+                        if (!create_bit(b2, r, b3, f3)) continue;
+                        for (int p = 0; p < nmo; ++p) {
+                            if (!create_bit(b3, p, b4, f4)) continue;
+                            const auto found = lookup.find(b4);
+                            if (found == lookup.end()) continue;
+                            const npy_intp row[] = {p, q, r, s, found->second, ket, f1*f2*f3*f4};
+                            for (int j = 0; j < 7; ++j) columns[j+5].push_back(row[j]);
+                        }
+                    }
+                }
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        return PyErr_NoMemory();
+    }
+    PyObject* result = PyTuple_New(12);
+    if (result == nullptr) return nullptr;
+    for (int j = 0; j < 12; ++j) {
+        npy_intp dims[] = {static_cast<npy_intp>(columns[j].size())};
+        PyObject* array = PyArray_SimpleNew(1, dims, NPY_INTP);
+        if (array == nullptr) { Py_DECREF(result); return nullptr; }
+        if (dims[0]) std::memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject*>(array)),
+                                columns[j].data(), columns[j].size()*sizeof(npy_intp));
+        PyTuple_SET_ITEM(result, j, array);
+    }
+    return result;
 }
 
 inline npy_intp single_bit_index(std::uint64_t bits) {
@@ -8998,10 +9210,12 @@ PyMethodDef methods[] = {
     {"apply_factor_hessian_workspace", apply_factor_hessian_workspace, METH_VARARGS, "Apply a native factorized orbital-Hessian workspace to one or more rotations."},
     {"scatter_opposite_spin_rdm2", scatter_opposite_spin_rdm2, METH_VARARGS, "Accumulate opposite-spin spin-string RDM2 contractions in place."},
     {"state_average_spin_rdms", state_average_spin_rdms, METH_VARARGS, "Build weighted multiroot spin-traced active-space 1- and 2-RDMs."},
+    {"state_average_spin_rdms_reference", state_average_spin_rdms_reference, METH_VARARGS, "Validation-only full-orientation RDM contraction."},
     {"sigma_compact_spin_string", sigma_compact_spin_string, METH_VARARGS, "Apply the RHF spin-string compact direct-CI sigma kernel."},
     {"sigma_compact_spin0_pair", sigma_compact_spin0_pair, METH_VARARGS, "Apply the spin-adapted pair-space RHF direct-CI sigma kernel."},
     {"create_spin0_pair_workspace", create_spin0_pair_workspace, METH_VARARGS, "Create a persistent packed-BLAS restricted direct-CI workspace."},
     {"apply_spin0_pair_workspace_det", apply_spin0_pair_workspace_det, METH_VARARGS, "Apply a packed-BLAS workspace to a determinant-space CI vector."},
+    {"apply_spin0_pair_workspace", apply_spin0_pair_workspace, METH_VARARGS, "Apply a packed-BLAS workspace to a symmetric pair-space CI vector."},
     {"davidson_spin0_pair", davidson_spin0_pair, METH_VARARGS, "Solve low spin0-pair direct-CI roots with a native block Davidson loop."},
     {"davidson_rhf_workspace", davidson_rhf_workspace, METH_VARARGS, "Solve low restricted direct-CI roots in a persistent packed-BLAS workspace."},
     {"sigma_values_conn", sigma_values_conn, METH_VARARGS, "Apply precomputed connection-value direct-CI sigma to one or more CI vectors."},
@@ -9019,6 +9233,7 @@ PyMethodDef methods[] = {
     {"nevpt_a22_4rdm_terms", nevpt_a22_4rdm_terms, METH_VARARGS, "Build contracted A22 4-RDM terms without materializing the full 4-RDM."},
     {"nevpt_a16_a22_4rdm_terms", nevpt_a16_a22_4rdm_terms, METH_VARARGS, "Build contracted A16 and A22 4-RDM terms using one shared determinant workspace."},
     {"single_string_links", single_string_links, METH_VARARGS, "Build single-excitation spin-string links."},
+    {"density_string_links", density_string_links, METH_VARARGS, "Build complete one- and two-body density operator links."},
     {"double_string_links", double_string_links, METH_VARARGS, "Build double-excitation spin-string links."},
     {nullptr, nullptr, 0, nullptr},
 };

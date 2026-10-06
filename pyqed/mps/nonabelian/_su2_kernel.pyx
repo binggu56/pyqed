@@ -604,7 +604,7 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         ) except +
         const CppFamilyData& family(int family_id) except +
 
-    cdef cppclass CppDavidsonResult "pyqed::dmrg::DavidsonResult":
+    cdef cppclass CppDavidsonResult "pyqed::linalg::DavidsonResult":
         cpp_bool accepted
         double energy
         vector[cpp_complex[double]] vector
@@ -617,7 +617,7 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         uint64_t matvec_calls
         uint64_t norm_matvec_calls
 
-    cdef cppclass CppBlockDavidsonResult "pyqed::dmrg::BlockDavidsonResult":
+    cdef cppclass CppBlockDavidsonResult "pyqed::linalg::BlockDavidsonResult":
         cpp_bool accepted
         vector[double] energies
         vector[vector[cpp_complex[double]]] vectors
@@ -829,6 +829,8 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             uint64_t numeric_revision,
             const double* route_coefficients,
             cpp_bool metric_boundary,
+            cpp_bool accumulate_output,
+            cpp_bool finalize_update,
         ) except +
         cpp_bool advance_boundary_complex(
             const string& side,
@@ -1350,6 +1352,13 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             const cpp_complex[double]* input,
             cpp_complex[double]* output,
             size_t dimension,
+        ) except +
+        void factor_route_projected_matmat(
+            const string& key,
+            const cpp_complex[double]* input,
+            cpp_complex[double]* output,
+            size_t dimension,
+            size_t vectors,
         ) except +
         void factor_route_projected_real_matvec(
             const string& key,
@@ -2661,6 +2670,8 @@ cdef class SU2MovingEnvironment:
         unsigned long long numeric_revision,
         bint metric_boundary=False,
         object route_coefficients=None,
+        bint accumulate_output=False,
+        bint finalize_update=True,
     ):
         """Advance one owned reduced boundary from a packed recursive route batch."""
 
@@ -2784,6 +2795,8 @@ cdef class SU2MovingEnvironment:
             <uint64_t>numeric_revision,
             <const double*>cnp.PyArray_DATA(route_coefficient_arr),
             <cpp_bool>metric_boundary,
+            <cpp_bool>accumulate_output,
+            <cpp_bool>finalize_update,
         )
         if metric_boundary:
             buffer_handle = self._engine.retain_metric_boundary_buffer(
@@ -5468,6 +5481,27 @@ cdef class SU2MovingEnvironment:
             <const cpp_complex[double]*>cnp.PyArray_DATA(input_arr),
             <cpp_complex[double]*>cnp.PyArray_DATA(output_arr),
             <size_t>input_arr.size,
+        )
+        return output_arr
+
+    def factor_route_projected_matmat(self, object key, object vectors):
+        cdef cnp.ndarray input_arr
+        cdef cnp.ndarray output_arr
+        cdef string key_name = str(key).encode()
+        input_arr = np.asfortranarray(vectors, dtype=np.complex128)
+        if input_arr.ndim != 2:
+            raise ValueError("Projected matmat input must be a matrix.")
+        output_arr = np.empty(
+            (input_arr.shape[0], input_arr.shape[1]),
+            dtype=np.complex128,
+            order="F",
+        )
+        self._engine.factor_route_projected_matmat(
+            key_name,
+            <const cpp_complex[double]*>cnp.PyArray_DATA(input_arr),
+            <cpp_complex[double]*>cnp.PyArray_DATA(output_arr),
+            <size_t>input_arr.shape[0],
+            <size_t>input_arr.shape[1],
         )
         return output_arr
 
@@ -9979,3 +10013,61 @@ def diagonal_packed_qchem_factor_routes(
                         pos = offset + (((k * B + b) * C + c) * R + r)
                         result[pos] += acc
     return result
+
+
+def accumulate_parameter_routes(
+    cnp.complex128_t[:, ::1] output,
+    const double[:, :, ::1] left,
+    const double[:, :, ::1] right,
+    const double[:, ::1] weights,
+    const double[::1] metric_weights,
+    const cnp.int64_t[:, ::1] bra,
+    const cnp.int64_t[:, ::1] ket,
+    cnp.complex128_t[:, ::1] correction=None,
+):
+    """Accumulate a real scalar-physical reduced term into tied coordinates.
+
+    Route rows contain parameter, left-multiplicity and right-multiplicity
+    indices. Component and route order match the tiled NumPy contraction.
+    An optional persistent correction array compensates accumulation across
+    routes and calls; it does not change component products or their precision.
+    """
+    cdef Py_ssize_t u, v, x, y
+    cdef double value
+    cdef cnp.complex128_t adjusted, updated
+    if (output is None or left is None or right is None or weights is None
+            or metric_weights is None or bra is None or ket is None):
+        raise ValueError('Parameter contraction arrays cannot be None')
+    if (left.shape[0] != weights.shape[0] or right.shape[0] != weights.shape[1]
+            or metric_weights.shape[0] != weights.shape[1]
+            or bra.shape[1] != 3 or ket.shape[1] != 3):
+        raise ValueError('Incompatible parameter contraction shapes')
+    if correction is not None and (correction.shape[0] != output.shape[0]
+                                   or correction.shape[1] != output.shape[1]):
+        raise ValueError('Incompatible parameter correction shape')
+    for u in range(bra.shape[0]):
+        if (bra[u, 0] < 0 or bra[u, 0] >= output.shape[0]
+                or bra[u, 1] < 0 or bra[u, 1] >= left.shape[1]
+                or bra[u, 2] < 0 or bra[u, 2] >= right.shape[1]):
+            raise ValueError('Bra parameter route is out of bounds')
+    for v in range(ket.shape[0]):
+        if (ket[v, 0] < 0 or ket[v, 0] >= output.shape[1]
+                or ket[v, 1] < 0 or ket[v, 1] >= left.shape[2]
+                or ket[v, 2] < 0 or ket[v, 2] >= right.shape[2]):
+            raise ValueError('Ket parameter route is out of bounds')
+    with nogil:
+        for u in range(bra.shape[0]):
+            for v in range(ket.shape[0]):
+                value = 0.0
+                for x in range(weights.shape[0]):
+                    for y in range(weights.shape[1]):
+                        value += (left[x, bra[u, 1], ket[v, 1]]
+                                  * right[y, bra[u, 2], ket[v, 2]]
+                                  * weights[x, y] * metric_weights[y])
+                if correction is None:
+                    output[bra[u, 0], ket[v, 0]] += value
+                else:
+                    adjusted = value-correction[bra[u, 0], ket[v, 0]]
+                    updated = output[bra[u, 0], ket[v, 0]]+adjusted
+                    correction[bra[u, 0], ket[v, 0]] = (updated-output[bra[u, 0], ket[v, 0]])-adjusted
+                    output[bra[u, 0], ket[v, 0]] = updated

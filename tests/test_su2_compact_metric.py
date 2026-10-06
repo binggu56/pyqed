@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from pyqed.mps.nonabelian import solver as solver_module
 from pyqed.mps.nonabelian.basis import (
@@ -66,6 +67,40 @@ def test_packed_generalized_davidson_caps_owned_basis_workspace(monkeypatch):
     assert objective["workspace_max_space"] == 2
     assert objective["workspace_limited"] is True
     assert objective["estimated_basis_workspace_bytes"] == 2 * bytes_per_column
+
+
+def test_packed_davidson_adaptive_confirmation_removes_floor_16():
+    size = 24
+    diagonal = np.arange(size, dtype=float)
+    guess = np.zeros(size)
+    guess[0] = 1.0
+    common = dict(
+        H=lambda vector: diagonal * vector,
+        h_diag=diagonal,
+        tol=1.0e-12,
+        tol_residual=1.0e-12,
+        itermax=30,
+        max_space=24,
+    )
+
+    _, _, legacy = solver_module._solve_packed_generalized_davidson(
+        guess,
+        minimum_explored_dimension=16,
+        convergence_confirmations=1,
+        **common,
+    )
+    theta, _, adaptive = solver_module._solve_packed_generalized_davidson(
+        guess,
+        minimum_explored_dimension=2,
+        convergence_confirmations=2,
+        **common,
+    )
+
+    assert abs(theta) < 1.0e-12
+    assert adaptive["davidson_converged"]
+    assert adaptive["davidson_iterations"] < legacy["davidson_iterations"]
+    assert adaptive["convergence_streak"] == 2
+    assert adaptive["root_overlap"] == pytest.approx(1.0)
 
 
 def test_kronecker_metric_and_transform_match_dense_reference():
@@ -323,3 +358,67 @@ def test_factor_metric_svd_preserves_state_and_exact_norm():
         np.eye(2),
         atol=1.0e-12,
     )
+
+
+def test_generalized_davidson_retains_overlap_after_imperfect_orthogonalization(monkeypatch):
+    orthogonalize = solver_module._metric_orthonormalize_packed_columns
+    def imperfect(*args, **kwargs):
+        vectors, images = orthogonalize(*args, **kwargs)
+        return vectors*1.0001, images*1.0001
+    monkeypatch.setattr(solver_module, '_metric_orthonormalize_packed_columns', imperfect)
+    h = np.array([[-2., .3], [.3, -1.]])
+    theta, vector, _ = solver_module._solve_packed_generalized_davidson(
+        np.array([1., .4]), lambda x: h@x, h_diag=np.diag(h),
+        N=lambda x: x, n_diag=np.ones(2), tol=1e-11, tol_residual=1e-10,
+        max_space=2, itermax=20)
+    assert abs(theta-np.linalg.eigvalsh(h)[0]) < 1e-10
+    assert np.linalg.norm(h@vector-theta*vector)/np.linalg.norm(vector) < 1e-10
+
+
+def test_generalized_davidson_checks_actual_returned_vector(monkeypatch):
+    canonicalize = solver_module._canonicalize_eigenvector
+
+    def perturbed(vector, **kwargs):
+        result = np.array(canonicalize(vector, **kwargs), copy=True)
+        result[-1] += 1e-5
+        return result
+
+    monkeypatch.setattr(solver_module, '_canonicalize_eigenvector', perturbed)
+    h = np.array([[-2., .3], [.3, -1.]])
+    theta, vector, info = solver_module._solve_packed_generalized_davidson(
+        np.array([1., .4]), lambda x: h @ x, h_diag=np.diag(h),
+        N=lambda x: x, n_diag=np.ones(2), tol=1e-11,
+        tol_residual=1e-10, max_space=2, itermax=20,
+    )
+    residual = np.linalg.norm(h @ vector - theta * vector)
+    assert residual > 1e-6
+    assert info['residual'] == pytest.approx(residual, rel=1e-12)
+    assert not info['davidson_converged']
+
+
+def test_metric_orthogonalization_refreshes_cancelled_action():
+    basis = np.array([[1.], [0.], [0.]])
+    cached_images = np.array([[1.], [1e-7], [0.]])
+    vector = np.array([1., 1e-4, 1e-4])
+    result, image = solver_module._metric_orthogonalize_packed_vector(
+        vector, vector.copy(), basis, cached_images,
+        tol=1e-12, metric_operator=lambda x: x,
+    )
+    np.testing.assert_allclose(image, result, atol=1e-15)
+    np.testing.assert_allclose(np.vdot(result, image), 1., atol=1e-15)
+    np.testing.assert_allclose(basis.T @ result, 0., atol=1e-15)
+
+
+def test_generalized_davidson_measures_both_projected_triangles():
+    from scipy.linalg import eigh
+
+    h = np.array([[-2., .300001], [.3, -1.]])
+    n = np.diag([1., 2.])
+    theta, _, info = solver_module._solve_packed_generalized_davidson(
+        np.array([1., 0.]), lambda x: h @ x, h_diag=np.diag(h),
+        N=lambda x: n @ x, n_diag=np.diag(n), tol=1e-12,
+        tol_residual=1e-12, max_space=2, itermax=4,
+    )
+    expected = eigh((h+h.T)/2, n, eigvals_only=True)[0]
+    assert theta == pytest.approx(expected, abs=1e-12)
+    assert not info['davidson_converged']

@@ -641,14 +641,11 @@ def _fully_reduced_spatial_mps_to_component_mps(state):
         physical_indices[sector] = tuple(int(index) for index in state_indices)
 
     def axis_layout(tensor, axis):
-        sectors = []
-        for sector in tensor.qns[axis]:
-            if sector not in sectors:
-                sectors.append(sector)
+        leg = tensor.legs[axis]
         layout = {}
         offset = 0
-        for sector in sectors:
-            multiplicity = tensor.qns[axis].count(sector)
+        for sector in leg.sectors:
+            multiplicity = int(leg.dims[sector])
             width = multiplicity * sector.irrep.dim
             layout[sector] = (offset, multiplicity, width)
             offset += width
@@ -4429,6 +4426,23 @@ class DMRG(CASCI):
 
         return self
 
+    def spin_square(self, state_id=0):
+        """Return S² from the exact SU(2) target irrep, or spin-resolved RDMs.
+
+        A reduced SU(2) state has a definite total spin by construction. This
+        diagnostic never expands that state into magnetic/determinant space.
+        """
+        if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
+            raise ValueError('Run DMRG before requesting spin diagnostics.')
+        states = self.dmrg.states or [self.dmrg.ground_state]
+        state = states[state_id]
+        target = getattr(state, 'target_sector', None)
+        if state.has_nonabelian_symmetry and target is not None:
+            spin = target.irrep.two_j / 2
+            return float(spin * (spin + 1))
+        from pyqed.qchem.mcscf.casci import spin_square
+        return spin_square(*self.make_rdm12(state_id, spatial=False))
+
     def calc_spin_square(self):
         """
         Builds the S^2 MPO and evaluates its expectation value.
@@ -4440,6 +4454,11 @@ class DMRG(CASCI):
         """
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             return 0.0
+
+        if self.spatial_site_basis in {'fully_reduced', 'fully_reduced_su2'}:
+            states = self.dmrg.states or [self.dmrg.ground_state]
+            values = np.array([self.spin_square(i) for i in range(len(states))])
+            return values if self.nstates > 1 else float(values[0])
 
         if self.site == "spatial":
             import pyqed.mps.mps as mps_lib
@@ -4562,8 +4581,8 @@ class DMRG(CASCI):
         identity_tol=1e-10,
         phase_align_tol=1e-14,
         backend="auto",
-        cutoff=1.0e-10,
-        max_bond="auto",
+        tol=1e-8,
+        max_bond=None,
         return_info=False,
     ):
         from pyqed.qchem.dmrg.overlap import biorthogonal_overlap
@@ -4581,7 +4600,7 @@ class DMRG(CASCI):
             identity_tol=identity_tol,
             phase_align_tol=phase_align_tol,
             backend=backend,
-            cutoff=cutoff,
+            tol=tol,
             max_bond=max_bond,
             return_info=return_info,
         )
@@ -4916,10 +4935,14 @@ class DMRG(CASCI):
                 )
                 local_tol_explicit = "tol" in local_solver_kwargs
                 local_itermax_explicit = "itermax" in local_solver_kwargs
-                local_solver_kwargs.setdefault("tol", davidson_tol)
-                local_solver_kwargs.setdefault("itermax", davidson_max_iter)
+                periodic_virtual = kwargs.get('virtual_boundary','open') == 'periodic'
+                local_solver_kwargs.setdefault("tol", 1e-12 if periodic_virtual and not davidson_tol_explicit else davidson_tol)
+                local_solver_kwargs.setdefault("itermax", 100 if periodic_virtual and not davidson_max_iter_explicit else davidson_max_iter)
+                if periodic_virtual:
+                    local_solver_kwargs.setdefault('tol_residual',1e-10)
                 if (
                     has_su2
+                    and not periodic_virtual
                     and not davidson_tol_explicit
                     and not local_tol_explicit
                     and "local_solver_schedule" not in kwargs
@@ -5665,9 +5688,12 @@ class DMRG(CASCI):
         runtime = getattr(self, "_su2_runtime", None)
         moving_environment = getattr(runtime, "moving_environment", None)
         native_npdm = getattr(moving_environment, "spatial_npdm", None)
+        periodic_virtual = getattr(state,'bc',None)=='periodic'
+        if periodic_virtual and native_npdm is None:
+            raise NotImplementedError('periodic SU2 RDMs require the reduced compiled NPDM contraction')
         if native_npdm is not None:
             payload = native_npdm(
-                state.tensors,
+                state.lifted_tensors() if periodic_virtual else state.tensors,
                 spin_rotation_reduction=is_singlet,
             )
             diagnostics = {

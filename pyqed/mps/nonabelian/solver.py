@@ -1428,7 +1428,7 @@ def _build_iterative_guess(diag_h, neigen, *, guess=None, diag_n=None):
     return _orthonormalize_columns_dense(np.column_stack(cols))
 
 
-def _metric_orthogonalize_packed_vector(vector, metric_vector, basis, metric_basis, *, tol):
+def _metric_orthogonalize_packed_vector(vector, metric_vector, basis, metric_basis, *, tol, metric_floor=0.0, metric_operator=None):
     """
     Orthogonalize one packed vector against an ``N``-orthonormal basis.
 
@@ -1437,31 +1437,41 @@ def _metric_orthogonalize_packed_vector(vector, metric_vector, basis, metric_bas
     :param basis: Existing packed basis columns.
     :param metric_basis: Existing ``N @ basis`` columns.
     :param tol: Linear-dependence cutoff in the metric norm.
+    :param metric_floor: Minimum norm Rayleigh quotient of a retained direction.
+    :param metric_operator: Optional fresh metric action after cancellation.
     :returns: ``(vector, metric_vector)`` normalized to unit metric norm, or
         ``(None, None)`` when the candidate is dependent.
     """
 
     vector = np.asarray(vector, dtype=complex).reshape(-1)
     metric_vector = np.asarray(metric_vector, dtype=complex).reshape(-1)
+    # An absolute squared cutoff alone admits cancellation noise in null
+    # directions of a semidefinite metric, then amplifies it to unit norm.
+    metric_scale = float(np.sum(np.abs(vector.conj() * metric_vector)))
     if basis.size:
         for _ in range(2):
             overlap = basis.conj().T @ metric_vector
             vector = vector - basis @ overlap
             metric_vector = metric_vector - metric_basis @ overlap
+            if metric_operator is not None:
+                metric_vector = np.asarray(metric_operator(vector), dtype=complex).reshape(-1)
     norm2 = float(np.real(np.vdot(vector, metric_vector)))
-    if norm2 <= float(tol) ** 2:
+    roundoff = max(float(tol), 64 * np.finfo(float).eps) * metric_scale
+    cutoff = float(metric_floor) * float(np.vdot(vector, vector).real)
+    if not np.isfinite(norm2) or norm2 <= max(float(tol) ** 2, roundoff, cutoff):
         return None, None
     norm = np.sqrt(norm2)
     return vector / norm, metric_vector / norm
 
 
-def _metric_orthonormalize_packed_columns(columns, metric_operator, *, tol=1e-12):
+def _metric_orthonormalize_packed_columns(columns, metric_operator, *, tol=1e-12, metric_floor=0.0):
     """
     Build an ``N``-orthonormal packed basis from candidate columns.
 
     :param columns: Candidate packed basis vectors.
     :param metric_operator: Callable applying the positive local metric ``N``.
     :param tol: Linear-dependence cutoff in the metric norm.
+    :param metric_floor: Minimum norm Rayleigh quotient of a retained direction.
     :returns: ``(V, N @ V)`` with ``V.conj().T @ N @ V = I``.
     """
 
@@ -1492,6 +1502,8 @@ def _metric_orthonormalize_packed_columns(columns, metric_operator, *, tol=1e-12
             basis,
             metric_basis,
             tol=tol,
+            metric_floor=metric_floor,
+            metric_operator=metric_operator,
         )
         if vector is None:
             continue
@@ -1770,7 +1782,18 @@ def _solve_packed_generalized_davidson(
     profile=False,
     initial_vectors=None,
     return_recycle_space=False,
+    minimum_explored_dimension=None,
+    convergence_confirmations=1,
+    root_overlap_tolerance=None,
+    workspace_bytes=None,
+    metric_rtol=0.0,
 ):
+    """Solve in packed reduced coordinates using a generalized Ritz problem.
+
+    Retain the measured projected overlap even after metric orthogonalization:
+    finite-precision Krylov vectors need not have an identity Gram matrix.
+    This small overlap matrix follows the same bounded subspace as Hs.
+    """
     timing = {
         "davidson": 0.0,
         "matvec": 0.0,
@@ -1797,6 +1820,26 @@ def _solve_packed_generalized_davidson(
         timing["matvec"] += time.perf_counter() - t0
         h_matvec_count += 1
         return out
+
+    def H_columns(vectors):
+        nonlocal h_matvec_count
+        vectors = np.asarray(vectors, dtype=complex)
+        matmat = getattr(H_raw, "matmat", None)
+        if matmat is None or vectors.shape[1] == 1:
+            return np.column_stack(
+                [
+                    np.asarray(H_timed(vectors[:, i]), dtype=complex).reshape(-1)
+                    for i in range(vectors.shape[1])
+                ]
+            )
+        t0 = time.perf_counter() if profile else None
+        output = np.asarray(matmat(vectors), dtype=complex)
+        if output.shape != vectors.shape:
+            raise ValueError("Batched Hamiltonian action changed the panel shape.")
+        if profile:
+            timing["matvec"] += time.perf_counter() - t0
+            h_matvec_count += int(vectors.shape[1])
+        return output
 
     def N_timed(vec):
         nonlocal n_matvec_count
@@ -1838,17 +1881,37 @@ def _solve_packed_generalized_davidson(
         * np.dtype(np.complex128).itemsize
         * int(_PACKED_DAVIDSON_OWNED_BASIS_ARRAYS)
     )
-    budget_columns = (
-        int(_PACKED_DAVIDSON_BASIS_MAX_BYTES) // max(1, basis_column_bytes)
-    )
+    workspace_bytes = (_PACKED_DAVIDSON_BASIS_MAX_BYTES if workspace_bytes is None
+                       else int(workspace_bytes))
+    if workspace_bytes <= 0:
+        raise ValueError("Davidson workspace_bytes must be positive.")
+    budget_columns = workspace_bytes // max(1, basis_column_bytes)
     minimum_columns = min(int(guess_packed.size), 2)
     max_space = max(
         minimum_columns,
         min(int(requested_max_space), max(1, int(budget_columns))),
     )
     tol_res = np.sqrt(tol) if tol_residual is None else tol_residual
+    if minimum_explored_dimension is None:
+        minimum_explored_dimension = min(guess_packed.size, int(max_space), 16)
+    else:
+        minimum_explored_dimension = max(
+            1,
+            min(
+                guess_packed.size,
+                int(max_space),
+                int(minimum_explored_dimension),
+            ),
+        )
+    convergence_confirmations = max(1, int(convergence_confirmations))
+    if root_overlap_tolerance is None:
+        root_overlap_tolerance = max(1.0e-10, np.sqrt(max(float(tol), 0.0)))
+    root_overlap_tolerance = max(0.0, float(root_overlap_tolerance))
 
     metric_orthonormal_krylov = bool(has_norm_operator)
+    metric_floor = float(metric_rtol) * float(np.max(np.abs(n_diag)))
+    if not np.isfinite(metric_floor) or metric_floor < 0:
+        raise ValueError("metric_rtol must be finite and nonnegative.")
     Vp = _build_iterative_guess(h_diag, 1, guess=guess_packed, diag_n=n_diag)
     if initial_vectors is not None:
         recycled = np.asarray(initial_vectors, dtype=complex)
@@ -1861,7 +1924,7 @@ def _solve_packed_generalized_davidson(
         Vp = np.column_stack((Vp, recycled))
     if metric_orthonormal_krylov:
         t0 = time.perf_counter() if profile else None
-        Vp, BVp = _metric_orthonormalize_packed_columns(Vp, N, tol=lindep)
+        Vp, BVp = _metric_orthonormalize_packed_columns(Vp, N, tol=lindep, metric_floor=metric_floor)
         if profile:
             timing["orthogonalize"] += time.perf_counter() - t0
         if Vp.shape[1] == 0:
@@ -1869,7 +1932,7 @@ def _solve_packed_generalized_davidson(
     else:
         Vp = _orthonormalize_columns_dense(Vp, tol=lindep)
         BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
-    AVp = np.column_stack([np.asarray(H(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
+    AVp = H_columns(Vp)
     preconditioner_mode = None
     seed_scores = h_diag / np.where(np.abs(n_diag) > 1.0e-12, n_diag, 1.0)
     seed_order = np.argsort(seed_scores)
@@ -1931,21 +1994,24 @@ def _solve_packed_generalized_davidson(
 
         preconditioner_mode = "packed_diagonal"
 
-    def _expand_projected_matrix(mat, overlap_col, diag_val):
+    def _expand_projected_matrix(mat, overlap_col, overlap_row, diag_val):
         if mat.size == 0:
             return np.asarray([[diag_val]], dtype=complex)
         overlap_col = np.asarray(overlap_col, dtype=complex).reshape(-1, 1)
         top = np.hstack([mat, overlap_col])
-        bottom = np.hstack([overlap_col.conj().T, np.asarray([[diag_val]], dtype=complex)])
+        bottom = np.hstack([np.asarray(overlap_row).reshape(1, -1), np.asarray([[diag_val]], dtype=complex)])
         return np.vstack([top, bottom])
 
     prev_theta = None
+    prev_ritz = None
+    convergence_streak = 0
+    last_root_overlap = 0.0
     converged = False
     residual_norm = None
     iterations = 0
     restarts = 0
     Hs = Vp.conj().T @ AVp
-    Ns = None if metric_orthonormal_krylov else Vp.conj().T @ BVp
+    Ns = Vp.conj().T @ BVp
 
     def _generalized_restart_vectors(Hs_local, Ns_local, keep, *, tol_local):
         Hs_local = 0.5 * (np.asarray(Hs_local) + np.asarray(Hs_local).conj().T)
@@ -1976,17 +2042,15 @@ def _solve_packed_generalized_davidson(
             )
 
         Ns_local = 0.5 * (np.asarray(Ns_local) + np.asarray(Ns_local).conj().T)
-        if np.allclose(Ns_local, np.eye(Ns_local.shape[0], dtype=Ns_local.dtype), atol=1.0e-10, rtol=1.0e-10):
+        if np.array_equal(Ns_local, np.eye(Ns_local.shape[0], dtype=Ns_local.dtype)):
             return _lowest_projected_root_with_reference(Hs_local, None)
         theta_local, coeff_local, _ = _solve_generalized_dense(Hs_local, Ns_local, tol=max(tol, 1e-12))
         return theta_local, coeff_local
 
+    correction_fallbacks = 0
     for iterations in range(1, itermax + 1):
         t0 = time.perf_counter() if profile else None
-        if metric_orthonormal_krylov:
-            theta, coeff = _lowest_projected_root_with_reference(Hs, None)
-        else:
-            theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
+        theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
         if profile:
             timing["projected"] += time.perf_counter() - t0
         ritz_p = Vp @ coeff
@@ -1995,12 +2059,25 @@ def _solve_packed_generalized_davidson(
         resid_p = aritz_p - theta * britz_p
         residual_norm = float(np.linalg.norm(resid_p))
         de = np.inf if prev_theta is None else abs(theta - prev_theta)
-        min_explored_dim = min(guess_packed.size, int(max_space), 16)
-        if (
+        ritz_norm = float(np.linalg.norm(ritz_p))
+        last_root_overlap = (
+            0.0
+            if prev_ritz is None or ritz_norm <= np.finfo(float).tiny
+            else float(
+                abs(np.vdot(prev_ritz, ritz_p))
+                / max(np.linalg.norm(prev_ritz) * ritz_norm, np.finfo(float).tiny)
+            )
+        )
+        convergence_candidate = bool(
             residual_norm <= tol_res
-            and (prev_theta is None or de <= tol)
-            and Vp.shape[1] >= min_explored_dim
-        ):
+            and prev_theta is not None
+            and de <= tol
+            and prev_ritz is not None
+            and 1.0 - min(last_root_overlap, 1.0) <= root_overlap_tolerance
+            and Vp.shape[1] >= minimum_explored_dimension
+        )
+        convergence_streak = convergence_streak + 1 if convergence_candidate else 0
+        if convergence_streak >= convergence_confirmations:
             converged = True
             break
 
@@ -2017,11 +2094,31 @@ def _solve_packed_generalized_davidson(
                 Vp,
                 BVp,
                 tol=lindep,
+                metric_floor=metric_floor,
+                metric_operator=N,
             )
             if profile:
                 timing["orthogonalize"] += time.perf_counter() - t0
             if corr_p is None:
-                break
+                # A diagonal preconditioner can send a valid residual into
+                # the metric null space. Do not mistake that failure for an
+                # exhausted variational subspace. Try the unpreconditioned
+                # residual, then its metric-filtered image, with identical
+                # support and linear-dependence checks.
+                trial = np.asarray(resid_p, dtype=complex)
+                for _ in range(2):
+                    trial_n = np.asarray(N(trial), dtype=complex).reshape(-1)
+                    corr_p, corr_n = _metric_orthogonalize_packed_vector(
+                        trial, trial_n, Vp, BVp, tol=lindep,
+                        metric_floor=metric_floor,
+                        metric_operator=N,
+                    )
+                    correction_fallbacks += 1
+                    if corr_p is not None:
+                        break
+                    trial = trial_n
+                if corr_p is None:
+                    break
         else:
             t0 = time.perf_counter() if profile else None
             if Vp.shape[1]:
@@ -2044,12 +2141,7 @@ def _solve_packed_generalized_davidson(
                 1,
                 min(int(max_space) - 1, max(2, int(max_space) // 32), 4),
             )
-            if metric_orthonormal_krylov:
-                Hs = 0.5 * (Hs + Hs.conj().T)
-                _evals, restart_coeffs = np.linalg.eigh(Hs)
-                restart_coeffs = restart_coeffs[:, :restart_keep]
-            else:
-                restart_coeffs = _generalized_restart_vectors(Hs, Ns, restart_keep, tol_local=max(tol, 1e-12))
+            restart_coeffs = _generalized_restart_vectors(Hs, Ns, restart_keep, tol_local=max(tol, 1e-12))
             restart_vectors = []
             if restart_coeffs is not None:
                 restart_vectors.extend(Vp @ restart_coeffs[:, i] for i in range(restart_coeffs.shape[1]))
@@ -2061,14 +2153,15 @@ def _solve_packed_generalized_davidson(
                     np.column_stack(restart_vectors),
                     N,
                     tol=lindep,
+                    metric_floor=metric_floor,
                 )
             else:
                 Vp = _orthonormalize_columns_dense(np.column_stack(restart_vectors), tol=lindep)
                 BVp = np.column_stack([np.asarray(N(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
             restarts += 1
-            AVp = np.column_stack([np.asarray(H(Vp[:, i]), dtype=complex).reshape(-1) for i in range(Vp.shape[1])])
+            AVp = H_columns(Vp)
             Hs = Vp.conj().T @ AVp
-            Ns = None if metric_orthonormal_krylov else Vp.conj().T @ BVp
+            Ns = Vp.conj().T @ BVp
             if profile:
                 timing["restart"] += time.perf_counter() - t0
         else:
@@ -2077,22 +2170,21 @@ def _solve_packed_generalized_davidson(
             if not metric_orthonormal_krylov:
                 corr_n = np.asarray(N(corr_p), dtype=complex).reshape(-1)
             h_overlap = Vp.conj().T @ h_corr
+            h_row = corr_p.conj() @ AVp
+            n_row = corr_p.conj() @ BVp
             Vp = np.column_stack([Vp, corr_p])
             AVp = np.column_stack([AVp, h_corr])
             BVp = np.column_stack([BVp, corr_n])
-            Hs = _expand_projected_matrix(Hs, h_overlap, np.vdot(corr_p, h_corr))
-            if not metric_orthonormal_krylov:
-                n_overlap = Vp[:, :-1].conj().T @ corr_n
-                Ns = _expand_projected_matrix(Ns, n_overlap, np.vdot(corr_p, corr_n))
+            Hs = _expand_projected_matrix(Hs, h_overlap, h_row, np.vdot(corr_p, h_corr))
+            n_overlap = Vp[:, :-1].conj().T @ corr_n
+            Ns = _expand_projected_matrix(Ns, n_overlap, n_row, np.vdot(corr_p, corr_n))
             if profile:
                 timing["basis_update"] += time.perf_counter() - t0
         prev_theta = theta
+        prev_ritz = np.array(ritz_p, copy=True)
 
     t0 = time.perf_counter() if profile else None
-    if metric_orthonormal_krylov:
-        theta, coeff = _lowest_projected_root_with_reference(Hs, None)
-    else:
-        theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
+    theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
     guess_h = np.asarray(H(guess_packed), dtype=complex).reshape(-1)
     guess_n = np.asarray(N(guess_packed), dtype=complex).reshape(-1)
     guess_denom = np.vdot(guess_packed, guess_n)
@@ -2112,7 +2204,12 @@ def _solve_packed_generalized_davidson(
         else Vp @ coeff
     )
     vec_packed = _canonicalize_eigenvector(vec_packed, reference=guess_packed)
-    residual_norm = float(np.linalg.norm((AVp @ coeff) - theta * (BVp @ coeff)))
+    # Cached basis actions can drift after cancellation and restarts. Report
+    # the residual of the actual returned vector, including reference reuse.
+    final_h = np.asarray(H(vec_packed), dtype=complex).reshape(-1)
+    final_n = np.asarray(N(vec_packed), dtype=complex).reshape(-1)
+    residual_norm = float(np.linalg.norm(final_h - theta * final_n))
+    converged = bool(converged and residual_norm <= tol_res)
     if profile:
         timing["davidson"] = time.perf_counter() - total_t0
     info = {
@@ -2126,18 +2223,25 @@ def _solve_packed_generalized_davidson(
         "reduced_krylov": False,
         "packed_krylov": True,
         "metric_orthonormal_krylov": metric_orthonormal_krylov,
-        "projected_problem": "standard" if metric_orthonormal_krylov else "generalized",
+        "metric_direction_floor": metric_floor,
+        "correction_fallbacks": correction_fallbacks,
+        "projected_problem": "generalized",
         "preconditioner_mode": preconditioner_mode,
         "reduced_preconditioner": False,
         "restarts": int(restarts),
         "packed_dimension": int(guess_packed.size),
         "requested_max_space": int(requested_max_space),
         "workspace_max_space": int(max_space),
-        "workspace_budget_bytes": int(_PACKED_DAVIDSON_BASIS_MAX_BYTES),
+        "workspace_budget_bytes": int(workspace_bytes),
         "estimated_basis_workspace_bytes": int(
             basis_column_bytes * int(max_space)
         ),
         "workspace_limited": bool(int(max_space) < int(requested_max_space)),
+        "minimum_explored_dimension": int(minimum_explored_dimension),
+        "convergence_confirmations": int(convergence_confirmations),
+        "convergence_streak": int(convergence_streak),
+        "root_overlap": float(last_root_overlap),
+        "root_overlap_tolerance": float(root_overlap_tolerance),
     }
     if profile:
         info["solver_timing"] = {
@@ -2147,9 +2251,10 @@ def _solve_packed_generalized_davidson(
         info["matvec_count"] = int(h_matvec_count)
         info["norm_matvec_count"] = int(n_matvec_count)
     if return_recycle_space:
-        info["_recycle_space"] = np.array(
-            Vp[:, : min(4, Vp.shape[1])], copy=True
-        )
+        # Retain the current Ritz vector, not merely the oldest basis columns.
+        info["_recycle_space"] = np.column_stack((
+            vec_packed, Vp[:, : min(3, Vp.shape[1])],
+        ))
     return float(theta), vec_packed, info
 
 
@@ -3815,13 +3920,12 @@ def _solve_standard_davidson_roots(
             energies, vecs, info = davidson(
                 projected_matvec,
                 int(nroots),
-                tol=tol,
-                itermax=itermax,
+                iterations=itermax,
                 diag=projected_diag,
                 precond=projected_precond,
                 guess=projected_guess,
-                max_space=max_space,
-                tol_residual=tol_residual,
+                space=max_space,
+                tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
                 lindep=lindep,
                 return_info=True,
                 return_partial=allow_unconverged,
@@ -3867,13 +3971,12 @@ def _solve_standard_davidson_roots(
     energies, vecs, info = davidson(
         op_resolved,
         int(nroots),
-        tol=tol,
-        itermax=itermax,
+        iterations=itermax,
         diag=diag,
         precond=davidson_precond,
         guess=guess_vec,
-        max_space=max_space,
-        tol_residual=tol_residual,
+        space=max_space,
+        tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
         lindep=lindep,
         return_info=True,
         return_partial=allow_unconverged,
@@ -3957,11 +4060,10 @@ def _target_projector_basis(
             evals, vecs, info = davidson(
                 _shifted_square,
                 nroots,
-                tol=min(1.0e-10, max(float(target_tol) ** 2, 1.0e-14)),
-                itermax=int(itermax),
+                iterations=int(itermax),
                 diag=diag,
-                max_space=max_space or min(dim, max(64, 16 * nroots)),
-                tol_residual=max(float(target_tol) ** 2, 1.0e-12),
+                space=max_space or min(dim, max(64, 16 * nroots)),
+                tolerance=max(float(target_tol) ** 2, 1.0e-12),
                 return_info=True,
             )
         except RuntimeError:
@@ -4434,12 +4536,11 @@ def _solve_orthonormalized_operator_davidson(
         energies, vecs, info = davidson(
             H_orthonormal,
             1,
-            tol=tol,
-            itermax=itermax,
+            iterations=itermax,
             diag=ortho_diag,
             guess=guess_y,
-            max_space=max_space,
-            tol_residual=tol_residual,
+            space=max_space,
+            tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
             lindep=lindep,
             return_info=True,
             return_partial=allow_unconverged,
@@ -4615,28 +4716,26 @@ def _solve_orthonormalized_operator_davidson_roots(
         energies, vecs, info = davidson(
             H_orthonormal,
             nroots,
-            tol=tol,
-            itermax=itermax,
+            iterations=itermax,
             diag=ortho_diag,
             guess=guess_y,
-            max_space=max_space,
-            tol_residual=tol_residual,
+            space=max_space,
+            tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
             lindep=lindep,
             return_info=True,
             return_partial=allow_unconverged,
         ) if projector_y is None else davidson(
             lambda coeff: projector_y.conj().T @ H_orthonormal(projector_y @ coeff),
             nroots,
-            tol=tol,
-            itermax=itermax,
+            iterations=itermax,
             diag=np.real((np.abs(projector_y) ** 2).T @ ortho_diag),
             guess=(
                 projector_y.conj().T @ guess_y
                 if guess_y is not None and guess_y.shape[0] == projector_y.shape[0]
                 else None
             ),
-            max_space=max_space,
-            tol_residual=tol_residual,
+            space=max_space,
+            tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
             lindep=lindep,
             return_info=True,
             return_partial=allow_unconverged,
@@ -7815,12 +7914,11 @@ def _solve_preorthonormalized_local_problem(
             energies, vecs, info = davidson(
                 timed_matvec,
                 nroots,
-                tol=tol,
-                itermax=itermax,
+                iterations=itermax,
                 diag=problem.diag,
                 guess=guess_y,
-                max_space=max_space,
-                tol_residual=tol_residual,
+                space=max_space,
+                tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
                 lindep=lindep,
                 return_info=True,
                 return_partial=allow_unconverged,
@@ -7865,12 +7963,11 @@ def _solve_preorthonormalized_local_problem(
             energies, vecs, info = davidson(
                 projected_matvec,
                 nroots,
-                tol=tol,
-                itermax=itermax,
+                iterations=itermax,
                 diag=projected_diag,
                 guess=projected_guess,
-                max_space=max_space,
-                tol_residual=tol_residual,
+                space=max_space,
+                tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
                 lindep=lindep,
                 return_info=True,
                 return_partial=allow_unconverged,
@@ -9348,14 +9445,13 @@ def solve_local_two_site(
             raise RuntimeError("Use dense generalized solve path when a norm operator is supplied.")
         theta, vecs, info = davidson(
             operator,
-            neigen=1,
-            tol=tol,
-            itermax=itermax,
+            roots=1,
+            iterations=itermax,
             diag=diag,
             precond=precond,
             guess=guess_vec.reshape(-1, 1),
-            max_space=max_space,
-            tol_residual=tol_residual,
+            space=max_space,
+            tolerance=tol_residual if tol_residual is not None else np.sqrt(tol),
             lindep=lindep,
             return_info=True,
         )

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../dmrg_linalg_core.hpp"
+#include "../../linalg/davidson.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1556,7 +1556,7 @@ struct CanonicalProjectionInfo {
 
 struct ActiveBondCanonicalSolveResult {
     CanonicalProjectionInfo projection;
-    pyqed::dmrg::DavidsonResult davidson;
+    pyqed::linalg::DavidsonResult davidson;
     int complementary_action_status = -1;
     std::size_t metric_routes = 0;
     std::size_t requested_restart_dimension = 0;
@@ -1567,7 +1567,7 @@ struct ActiveBondCanonicalSolveResult {
 
 struct ActiveBondStateAverageSolveResult {
     CanonicalProjectionInfo projection;
-    pyqed::dmrg::BlockDavidsonResult davidson;
+    pyqed::linalg::BlockDavidsonResult davidson;
     int complementary_action_status = -1;
     std::size_t metric_routes = 0;
     std::size_t requested_restart_dimension = 0;
@@ -2036,7 +2036,7 @@ public:
         Complex* output,
         std::size_t dimension
     ) const;
-    pyqed::dmrg::DavidsonResult local_davidson(
+    pyqed::linalg::DavidsonResult local_davidson(
         const std::string& key,
         const Complex* diagonal,
         const Complex* guess,
@@ -2189,7 +2189,7 @@ public:
         const std::string& key,
         std::size_t dimension
     ) const noexcept;
-    pyqed::dmrg::DavidsonResult factor_route_davidson(
+    pyqed::linalg::DavidsonResult factor_route_davidson(
         const std::string& key,
         const Complex* diagonal,
         const Complex* guess,
@@ -2199,7 +2199,7 @@ public:
         int restart_dimension,
         bool accept_unconverged
     );
-    pyqed::dmrg::DavidsonResult active_bond_complementary_davidson(
+    pyqed::linalg::DavidsonResult active_bond_complementary_davidson(
         const std::string& key,
         const Complex* guess,
         std::size_t dimension,
@@ -2316,13 +2316,20 @@ public:
         Complex* output,
         std::size_t dimension
     );
+    void factor_route_projected_matmat(
+        const std::string& key,
+        const Complex* input,
+        Complex* output,
+        std::size_t dimension,
+        std::size_t vectors
+    );
     void factor_route_projected_real_matvec(
         const std::string& key,
         const double* input,
         double* output,
         std::size_t dimension
     );
-    pyqed::dmrg::DavidsonResult factor_route_projected_davidson(
+    pyqed::linalg::DavidsonResult factor_route_projected_davidson(
         const std::string& key,
         const Complex* diagonal,
         const Complex* guess,
@@ -2403,7 +2410,7 @@ public:
         std::size_t orthonormal_dimension,
         std::size_t parent_dimension
     );
-    pyqed::dmrg::DavidsonResult factor_route_generalized_davidson(
+    pyqed::linalg::DavidsonResult factor_route_generalized_davidson(
         const std::string& factor_route_key,
         const std::string& metric_key,
         const Complex* h_diagonal,
@@ -2417,7 +2424,7 @@ public:
         int restart_dimension,
         bool accept_unconverged
     );
-    pyqed::dmrg::DavidsonResult
+    pyqed::linalg::DavidsonResult
     active_bond_complementary_generalized_davidson(
         const std::string& factor_route_key,
         const std::string& metric_key,
@@ -2430,7 +2437,7 @@ public:
         int restart_dimension,
         bool accept_unconverged
     );
-    pyqed::dmrg::DavidsonResult
+    pyqed::linalg::DavidsonResult
     factor_route_projected_generalized_davidson(
         const std::string& projection_key,
         const std::string& metric_key,
@@ -3654,15 +3661,15 @@ private:
     std::uint64_t canonical_projection_cache_clock_ = 0;
     std::uint64_t canonical_projection_cache_evictions_ = 0;
 
-    pyqed::dmrg::DavidsonWorkspace davidson_workspace_;
-    pyqed::dmrg::RealDavidsonWorkspace real_davidson_workspace_;
-    pyqed::dmrg::RealBlockDavidsonWorkspace
+    pyqed::linalg::DavidsonWorkspace davidson_workspace_;
+    pyqed::linalg::RealDavidsonWorkspace real_davidson_workspace_;
+    pyqed::linalg::RealBlockDavidsonWorkspace
         real_block_davidson_workspace_;
-    pyqed::dmrg::GeneralizedDavidsonWorkspace
+    pyqed::linalg::GeneralizedDavidsonWorkspace
         generalized_davidson_workspace_;
-    pyqed::dmrg::RealGeneralizedDavidsonWorkspace
+    pyqed::linalg::RealGeneralizedDavidsonWorkspace
         real_generalized_davidson_workspace_;
-    pyqed::dmrg::ComplexThinSVDWorkspace block_svd_workspace_;
+    pyqed::linalg::ComplexThinSVDWorkspace block_svd_workspace_;
     std::string metric_key_;
     std::vector<FactorizedMetricRoute> metric_routes_;
     std::size_t metric_dimension_ = 0;

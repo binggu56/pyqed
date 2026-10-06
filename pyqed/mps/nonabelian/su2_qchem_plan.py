@@ -1838,6 +1838,9 @@ class PackedSU2QChemCompiledTerms:
         self._diag_match_cache = None
         self._block_matrix_cache = {}
         self._entry_kernel_group_cache = None
+        self._stream_factor_cache = {}
+        self._stream_factor_cache_nbytes = 0
+        self._stream_factor_cache_keys = None
         self._cpp_factor_route_args = None
         self._cpp_factor_route_key = None
         self._cpp_factor_routes_installed = False
@@ -2251,6 +2254,48 @@ class PackedSU2QChemCompiledTerms:
             )
         )
 
+    def _stream_factor(self, table, entry):
+        """Reuse immutable local factors within an 8 MiB payload budget.
+
+        The compiled operator owns fixed boundary tables for its lifetime.
+        Admission favors frequent, small factors, avoiding cache churn;
+        uncached factors continue to use the exact bounded streaming path.
+        """
+        if table.factor_pool.n_arrays:
+            return table.factor(entry)
+        if self._stream_factor_cache_keys is None:
+            candidates = []
+            for source, indices in ((self.plan.left_factor_table, self.left_indices),
+                                    (self.plan.right_factor_table, self.right_indices)):
+                if source.factor_pool.n_arrays:
+                    continue
+                ids, first, counts = np.unique(
+                    source.factor_indices[indices], return_index=True, return_counts=True)
+                boundary = getattr(source, 'factor_boundary_pool', None)
+                operator = getattr(source, 'factor_w_pool', None)
+                itemsize = (np.result_type(boundary.data.dtype, operator.data.dtype).itemsize
+                            if boundary is not None and operator is not None else 16)
+                for factor_id, index, count in zip(ids, first, counts):
+                    size = int(np.prod(source.factor_shape(int(indices[index])))) * itemsize
+                    candidates.append((float(count)/max(size, 1), size,
+                                       (id(source), int(factor_id))))
+            remaining = 8 * 1024**2
+            self._stream_factor_cache_keys = set()
+            for _, size, candidate in sorted(candidates, key=lambda row: -row[0]):
+                if size <= remaining:
+                    self._stream_factor_cache_keys.add(candidate)
+                    remaining -= size
+        key = (id(table), int(table.factor_indices[int(entry)]))
+        cached = self._stream_factor_cache.get(key)
+        if cached is not None:
+            return cached
+        factor = table.factor(entry)
+        if (key in self._stream_factor_cache_keys
+                and self._stream_factor_cache_nbytes + factor.nbytes <= 8 * 1024**2):
+            self._stream_factor_cache[key] = factor
+            self._stream_factor_cache_nbytes += factor.nbytes
+        return factor
+
     def _apply_packed_streaming(self, vector, *, base_dtype):
         """Apply packed factor routes in bounded batches without dense kernels."""
 
@@ -2282,7 +2327,7 @@ class PackedSU2QChemCompiledTerms:
                 left_stack = np.ascontiguousarray(
                     np.stack(
                         [
-                            left_table.factor(int(idx))
+                            self._stream_factor(left_table, int(idx))
                             for idx in left_indices[start:stop]
                         ],
                         axis=0,
@@ -2291,7 +2336,7 @@ class PackedSU2QChemCompiledTerms:
                 right_stack = np.ascontiguousarray(
                     np.stack(
                         [
-                            right_table.factor(int(idx))
+                            self._stream_factor(right_table, int(idx))
                             for idx in right_indices[start:stop]
                         ],
                         axis=0,
@@ -2356,6 +2401,17 @@ class PackedSU2QChemCompiledTerms:
             return result
         left_pool = self.plan.left_factor_table.factor_pool
         right_pool = self.plan.right_factor_table.factor_pool
+        # Split factor tables store primitive rank-3/4 arrays and reconstruct
+        # rank-5 entries through their structured API. The raw-pool kernel
+        # cannot consume those primitive entries; use the reduced streaming path.
+        for table, pool in ((self.plan.left_factor_table, left_pool),
+                            (self.plan.right_factor_table, right_pool)):
+            indices = np.asarray(table.factor_indices)
+            ranks = np.diff(pool.shape_offsets)
+            if np.any(indices < 0) or np.any(indices >= ranks.size):
+                return None
+            if np.any(ranks[indices] != 5):
+                return None
         if np.iscomplexobj(left_pool.data) or np.iscomplexobj(right_pool.data):
             return None
         try:

@@ -29030,6 +29030,37 @@ class MPS:
 
             return G
 
+    def overlap(self, other, *, s=None, tol=1e-8, max_bond=None,
+                memory_limit=2**24, return_info=False):
+        """Overlap of finite MPSs, optionally across spatial-orbital bases.
+
+        Reduced SU(2) states share the LETTA biorthogonal engine. ``tol``
+        bounds absolute truncation error; ``max_bond`` is an optional cap.
+        See pyqed.mps.nonabelian.overlap.biorthogonalize for the
+        Malmqvist/Knecht adaptation, references and error-bound limitations.
+        Other tensor representations currently support same-basis overlap.
+        """
+        from .nonabelian.orbital_transform import is_fully_reduced_su2_mps
+        from .nonabelian.overlap import overlap, _check_tol, _check_controls
+        if not isinstance(other, MPS) or self.L != other.L:
+            raise ValueError('Overlap requires two MPSs with matching site counts.')
+        if self.bc != 'finite' or other.bc != 'finite':
+            raise NotImplementedError('MPS.overlap currently supports finite boundaries only.')
+        _check_tol(tol)
+        _check_controls(max_bond, 0.0, memory_limit)
+        reduced = is_fully_reduced_su2_mps(self)
+        if reduced != is_fully_reduced_su2_mps(other):
+            raise TypeError('Overlap requires matching MPS representations.')
+        if reduced:
+            return overlap(self, other, s=s, tol=tol, max_bond=max_bond,
+                           memory_limit=memory_limit, return_info=return_info)
+        if s is not None:
+            raise NotImplementedError('Orbital overlap requires fully reduced SU(2) spatial-orbital MPS tensors.')
+        value = self._mps_dot(self, other)
+        info = dict(backend='mps_chain', exact=True, overlap_error_bound=0.0,
+                    tol=tol, tolerance_met=None if tol is None else True)
+        return (value, info) if return_info else value
+
     def _mps_dot(self, mps1, mps2):
         """
         Calculate the inner product (overlap) between two Matrix Product States.

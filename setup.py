@@ -12,6 +12,7 @@ import sys
 from setuptools import Extension, setup
 from setuptools.archive_util import unpack_archive
 from setuptools.command.build_py import build_py as _build_py
+from setuptools.command.build_ext import build_ext as _build_ext
 from setuptools.command.install_egg_info import install_egg_info as _install_egg_info
 
 
@@ -43,6 +44,23 @@ class _CleanBuildPy(_build_py):
             for path in super().find_data_files(package, src_dir)
             if not _is_sync_conflict_copy(path)
         ]
+
+
+class _LinkedBuildExt(_build_ext):
+    def build_extension(self, ext):
+        super().build_extension(ext)
+        if sys.platform != "darwin":
+            return
+        for argument in ext.extra_link_args or ():
+            runtime = Path(argument)
+            if runtime.is_absolute() and runtime.name == "libomp.dylib":
+                # libomp's install name is @rpath even when linked by full
+                # path. Conda's earlier RPATH can select an incompatible ABI.
+                subprocess.run(
+                    ["install_name_tool", "-change", "@rpath/libomp.dylib",
+                     str(runtime), self.get_ext_fullpath(ext.name)],
+                    check=True,
+                )
 
 
 class _CleanInstallEggInfo(_install_egg_info):
@@ -202,8 +220,52 @@ def _extensions_to_build():
         casscf_macros = []
         extensions.append(
             Extension(
+                "pyqed.qchem._gaussian_grid",
+                ["pyqed/qchem/gaussian_grid.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=False,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem._geminal_integrals",
+                ["pyqed/qchem/geminal_integrals.cpp"],
+                depends=["pyqed/qchem/_boys.hpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=False,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem.cc._contractions",
+                ["pyqed/qchem/cc/contractions.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                extra_link_args=accelerate_link_args,
+                optional=False,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem._ao2mo",
+                ["pyqed/qchem/_ao2mo.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                extra_link_args=accelerate_link_args,
+                optional=False,
+            )
+        )
+        extensions.append(
+            Extension(
                 "pyqed.qchem._integrals_cpp",
                 ["pyqed/qchem/_integrals.cpp"],
+                depends=["pyqed/qchem/_boys.hpp", "pyqed/qchem/ri_derivatives.hpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=qchem_integral_compile_args,
@@ -228,9 +290,21 @@ def _extensions_to_build():
             Extension(
                 "pyqed.qchem._gdf_cpp",
                 ["pyqed/qchem/_gdf_cpp.cpp"],
+                depends=["pyqed/qchem/_boys.hpp", "pyqed/qchem/_shell_fourier.hpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=cpp_compile_args,
+                optional=False,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.qchem.cc._ccsd_t_kernels",
+                ["pyqed/qchem/cc/_ccsd_t_kernels.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                extra_link_args=accelerate_link_args,
                 optional=False,
             )
         )
@@ -275,7 +349,7 @@ def _extensions_to_build():
                 depends=[
                     "pyqed/mps/nonabelian/su2_dmrg_engine.hpp",
                     "pyqed/mps/nonabelian/su2_coupling_core.hpp",
-                    "pyqed/mps/dmrg_linalg_core.hpp",
+                    "pyqed/linalg/davidson.hpp",
                 ],
                 include_dirs=cpp_include_dirs,
                 language="c++",
@@ -300,6 +374,26 @@ def _extensions_to_build():
             Extension(
                 "pyqed.letta._physical_blocks_cpp",
                 ["pyqed/letta/_physical_blocks_cpp.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.letta._factor_operator",
+                ["pyqed/letta/factor_operator.cpp"],
+                include_dirs=cpp_include_dirs,
+                language="c++",
+                extra_compile_args=cpp_compile_args,
+                optional=True,
+            )
+        )
+        extensions.append(
+            Extension(
+                "pyqed.letta._charge_sampling",
+                ["pyqed/letta/charge_sampling.cpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=cpp_compile_args,
@@ -365,6 +459,7 @@ if any(
 # accelerators plus explicitly requested optional extension groups.
 setup(
     cmdclass={
+        "build_ext": _LinkedBuildExt,
         "build_py": _CleanBuildPy,
         "install_egg_info": _CleanInstallEggInfo,
     },

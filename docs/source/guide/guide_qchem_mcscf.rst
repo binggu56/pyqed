@@ -72,6 +72,124 @@ Basic CASSCF
 of active electrons, either as an integer for closed-shell active spaces or as
 ``(nalpha, nbeta)`` for explicit spin sectors.
 
+Constrained Orbital Optimization (COCAS)
+---------------------------------------
+
+``COCAS`` alternates CASCI with orthonormality-constrained orbital
+minimization at fixed RDMs. The default ``diis_residual="step"`` pairs each
+orbital-map output with its displacement from the accepted base, using the
+original absolute regularization. Candidates are aligned in redundant
+orbital gauges before entering history. Exact CASCI discards active-active
+gauge rotations; finite-bond DMRG retains them as physical variables.
+
+.. code-block:: python
+
+   from pyqed.qchem import COCAS
+
+   mc = COCAS(mf, ncas=8, nelecas=8, optimizer="LBFGS",
+              optimizer_max_steps=20, diis=True, diis_space=6,
+              diis_start=2, orb_grad_tol=1e-4).run()
+
+Two opt-in residual variants are available:
+
+* ``diis_residual="transported_step"`` aligns all historical orbital-map
+  displacements in a common redundant gauge, then projects them into the
+  current physical tangent space.
+* ``diis_residual="gradient"`` uses the physical gradient evaluated with
+  each accepted post-CI state's RDMs, with the same gauge alignment and
+  tangent transport. State averaging uses weighted RDMs.
+
+The optional variants normalize the Gram matrix before regularization and
+retry excessive weights with a shorter history. They are experiments, not
+general convergence improvements: in the Fe(CO)5 def2-SVP CAS(8,8) CD test,
+transported displacement did not reduce the six-step restart convergence,
+while the raw gradient variant needed twelve steps. Both were worse than
+the original displacement DIIS after a bounded 20-step RHF-start comparison,
+so the original mode remains the default.
+
+The inner L-BFGS optimizer transports every retained secant pair to the
+current tangent space and discards pairs with nonpositive projected
+curvature. ``physical_inner=True`` optionally restricts inner SD/RCG/L-BFGS
+gradients, directions and transported history to physical orbital blocks.
+It discards core-core rotations, and discards active-active rotations only
+for exact CASCI; finite-bond DMRG retains active-active rotations. This is an
+experimental restriction: active rotations are redundant for CI-relaxed
+CAS energies, while frozen active RDMs generally change their energy under
+such rotations. The restricted inner subproblem therefore differs from
+unrestricted fixed-RDM minimization. It is not supported with AH or NEWTON.
+
+The limited-memory recursion adapts J. Nocedal, *Updating quasi-Newton
+matrices with limited storage*, Math. Comp. **35**, 773–782 (1980),
+https://doi.org/10.1090/S0025-5718-1980-0572855-7. Polar retraction and
+projected vector transport follow P.-A. Absil, R. Mahony and R. Sepulchre,
+*Optimization Algorithms on Matrix Manifolds*, Princeton University Press
+(2008), https://sites.uclouvain.be/absil/amsbook/. The manifold adaptation
+does not inherit the Euclidean method's superlinear convergence guarantee.
+
+``orbital_update="relaxed_lbfgs"`` selects one physical orbital step per CI
+solve, using L-BFGS secants between accepted post-CI states. This uses the
+observed change in the CI-relaxed gradient without solving explicit CI
+response equations. Choose ``diis=False`` with this update. For example:
+
+.. code-block:: python
+
+   mc = COCAS(mf, ncas=8, nelecas=8, orbital_update="relaxed_lbfgs",
+              diis=False, max_cycles=100, orb_grad_tol=1e-4).run()
+
+The positive initial inverse-Hessian model divides reference-Fock-basis
+directions by twice the absolute orbital-energy gap times a diagonal
+occupation, with occupations floored at 0.1 and curvature floored at 0.1
+Hartree. It handles a noncanonical starting MO basis by diagonalizing the
+reference RHF Fock matrix. This is a heuristic preconditioner; active-space
+two-electron curvature and CI response are learned only approximately
+through secants. The complete step still obeys the macro trust radius and
+is checked against a fresh CI energy. Exact CASCI and finite-bond DMRG use
+their respective physical blocks; fixed-weight state averaging uses weighted
+RDMs. No superlinear or quadratic convergence guarantee applies, especially
+with approximate CI solves or nonsmooth root changes.
+
+``optimizer`` and the inner tolerance/iteration budget apply only to
+``orbital_update="fixed_rdm"``, which remains the default.
+``optimizer_history`` controls the retained secant count in both updates.
+``optimizer_max_step_norm`` controls the relaxed tangent step, with a
+default bound of 0.25. The relaxed update has no frozen-RDM inner loop.
+Its default macro rejection budget is 20, and its minimum trust radius is
+``1e-8``, allowing late backtracking of an inaccurate secant step. The
+fixed-RDM defaults remain eight rejections and a ``1e-4`` minimum radius.
+Explicit user values override these defaults.
+
+In the Fe(CO)5 def2-SVP CAS(8,8) CD ``1e-8`` test from the RHF frontier
+guess, the preconditioned CI-relaxed update converged in 73 accepted macros
+to ``-1825.529432066209`` Hartree with physical gradient ``9.25e-5``.
+An independent check of the returned CI/orbital pair confirmed both energy
+and gradient. The controlled original-method comparison was bounded at 20
+macros, so these data do not establish a full-run macroiteration speedup.
+Separately, ``physical_inner=True`` gave gradient ``0.154`` after eight
+macros versus ``0.570`` for the original update, with lower energy; that
+restricted-inner comparison is a bounded progress test, not convergence.
+
+All modes reject rank-deficient orbital extrapolations before polar
+normalization. The macro trust radius bounds the complete step. An
+energy-increasing CI trial clears DIIS and retries the ordinary update
+before shrinking that radius. ``macro_diagnostics`` includes ``diis_used``,
+``diis_space``, ``diis_residual``, and, for extrapolated steps,
+``diis_max_weight``, alongside energy and physical-gradient norms.
+
+This is an adaptation of the fixed-RDM CO workflow of J. Zhang, S. Hu and
+B. Gu, *Constrained Optimization Algorithms for Orbital Optimization in
+Quantum Chemistry* (2026), https://arxiv.org/abs/2606.17761, and the Pulay
+least-squares acceleration of P. Pulay, *Improved SCF convergence
+acceleration*, J. Comput. Chem. **3**, 556–560 (1982),
+https://doi.org/10.1002/jcc.540030413. ``optimizer="ISD"`` implements the paper's
+implicit skew-gradient solve, polar projection, nonmonotone Armijo search
+and alternating BB steps (Eqs. 16, 33--34), with practical iteration and
+step bounds. It uses the complete Stiefel space and rejects
+``physical_inner=True``. Other inner optimizers and optional transported
+DIIS residuals are adaptations. No coupled CI-response microsteps are
+included. Neither quadratic convergence nor a general reduction in
+macroiterations is guaranteed; compare both energy and physical-gradient
+convergence for the system of interest.
+
 Active Space Selection
 ----------------------
 

@@ -3,7 +3,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "dmrg_linalg_core.hpp"
+#include "../linalg/davidson.hpp"
 #include "nonabelian/su2_coupling_core.hpp"
 
 #include <algorithm>
@@ -473,8 +473,8 @@ static py::tuple lapack_svd(py::object matrix_obj) {
         return py::make_tuple(u_out, s_out, vt_out);
     }
 #endif
-    static thread_local pyqed::dmrg::ComplexThinSVDWorkspace workspace;
-    pyqed::dmrg::complex_thin_svd(
+    static thread_local pyqed::linalg::ComplexThinSVDWorkspace workspace;
+    pyqed::linalg::complex_thin_svd(
         static_cast<const cdouble*>(matrix.data()),
         m,
         n,
@@ -48029,7 +48029,7 @@ private:
     long long dmrg_half_sweep_calls = 0;
     long long dmrg_half_sweep_bonds = 0;
     double dmrg_half_sweep_seconds = 0.0;
-    pyqed::dmrg::ComplexThinSVDWorkspace dmrg_svd_workspace;
+    pyqed::linalg::ComplexThinSVDWorkspace dmrg_svd_workspace;
     std::unordered_map<
         std::string,
         std::vector<py::array_t<cdouble, py::array::c_style | py::array::forcecast>>
@@ -48053,7 +48053,7 @@ private:
     std::string last_key;
 
     static void canonicalize_dense_svd_workspace(
-        pyqed::dmrg::ComplexThinSVDWorkspace& workspace,
+        pyqed::linalg::ComplexThinSVDWorkspace& workspace,
         ssize_t rows,
         ssize_t cols
     ) {
@@ -48216,7 +48216,7 @@ private:
         }
         {
             py::gil_scoped_release release;
-            pyqed::dmrg::complex_thin_svd(
+            pyqed::linalg::complex_thin_svd(
                 flat.data(),
                 static_cast<size_t>(rows),
                 static_cast<size_t>(cols),
@@ -52082,12 +52082,160 @@ static py::tuple rank_coupled_reduced_actions_cpp(
     return py::tuple(actions);
 }
 
+class BosonicGrowthAction {
+public:
+    using ComplexArray = py::array_t<cdouble, py::array::c_style | py::array::forcecast>;
+
+    struct SurfaceTerm {
+        cdouble coefficient;
+        ComplexArray environment;
+        ComplexArray local;
+        ssize_t bond;
+    };
+
+    BosonicGrowthAction(
+        ComplexArray coefficients,
+        ComplexArray left,
+        ComplexArray right,
+        py::sequence surfaces
+    ) : coefficients_(std::move(coefficients)), left_(std::move(left)),
+        right_(std::move(right)) {
+        const auto c = coefficients_.request();
+        const auto l = left_.request();
+        const auto r = right_.request();
+        if (c.ndim != 1 || l.ndim != 3 || r.ndim != 3 ||
+            l.shape[0] != c.shape[0] || r.shape[0] != c.shape[0] ||
+            l.shape[1] != l.shape[2] || r.shape[1] != r.shape[2]) {
+            throw std::invalid_argument("invalid bosonic product arrays");
+        }
+        terms_ = c.shape[0];
+        block_ = l.shape[1];
+        local_ = r.shape[1];
+        if (terms_ == 0) {
+            block_ = 0;
+            local_ = 0;
+        }
+        for (py::handle item : surfaces) {
+            py::tuple spec = py::cast<py::tuple>(item);
+            if (spec.size() != 3) {
+                throw std::invalid_argument("bosonic surface terms need coefficient, environment, local");
+            }
+            ComplexArray environment = py::cast<ComplexArray>(spec[1]);
+            ComplexArray local_values = py::cast<ComplexArray>(spec[2]);
+            const auto e = environment.request();
+            const auto v = local_values.request();
+            if (e.ndim != 3 || v.ndim != 2 || e.shape[0] != v.shape[0]
+                || e.shape[1] != e.shape[2]) {
+                throw std::invalid_argument("invalid bosonic surface arrays");
+            }
+            if (block_ == 0) {
+                block_ = e.shape[1];
+                local_ = v.shape[1];
+            }
+            if (e.shape[1] != block_ || v.shape[1] != local_) {
+                throw std::invalid_argument("inconsistent bosonic growth dimensions");
+            }
+            surfaces_.push_back(SurfaceTerm{
+                py::cast<cdouble>(spec[0]), std::move(environment),
+                std::move(local_values), e.shape[0]
+            });
+        }
+        if (block_ < 1 || local_ < 1) {
+            throw std::invalid_argument("empty bosonic growth action");
+        }
+    }
+
+    py::array_t<cdouble> matvec(ComplexArray vector) const {
+        const auto x_info = vector.request();
+        if (x_info.ndim != 1 || x_info.shape[0] != block_ * local_) {
+            throw std::invalid_argument("bosonic growth vector dimension mismatch");
+        }
+        const auto* x = static_cast<const cdouble*>(x_info.ptr);
+        py::array_t<cdouble> result(block_ * local_);
+        auto out_info = result.request();
+        auto* out = static_cast<cdouble*>(out_info.ptr);
+        std::fill(out, out + block_ * local_, cdouble(0.0, 0.0));
+        const auto c = coefficients_.unchecked<1>();
+        const auto l = left_.unchecked<3>();
+        const auto r = right_.unchecked<3>();
+        std::vector<cdouble> temporary(static_cast<size_t>(block_ * local_));
+        for (ssize_t term = 0; term < terms_; ++term) {
+#ifdef __APPLE__
+            const cdouble one(1.0, 0.0);
+            const cdouble zero(0.0, 0.0);
+            const cdouble coefficient = c(term);
+            cblas_zgemm(101, 111, 111, static_cast<int>(block_),
+                static_cast<int>(local_), static_cast<int>(block_), &one,
+                &l(term, 0, 0), static_cast<int>(block_), x,
+                static_cast<int>(local_), &zero, temporary.data(),
+                static_cast<int>(local_));
+            cblas_zgemm(101, 111, 112, static_cast<int>(block_),
+                static_cast<int>(local_), static_cast<int>(local_), &coefficient,
+                temporary.data(), static_cast<int>(local_), &r(term, 0, 0),
+                static_cast<int>(local_), &one, out, static_cast<int>(local_));
+#else
+            for (ssize_t i = 0; i < block_; ++i) {
+                for (ssize_t s = 0; s < local_; ++s) {
+                    cdouble value = 0.0;
+                    for (ssize_t j = 0; j < block_; ++j)
+                        for (ssize_t t = 0; t < local_; ++t)
+                            value += l(term, i, j) * x[j * local_ + t] * r(term, s, t);
+                    out[i * local_ + s] += c(term) * value;
+                }
+            }
+#endif
+        }
+        const cdouble one(1.0, 0.0);
+        for (const auto& surface : surfaces_) {
+            const auto e = surface.environment.unchecked<3>();
+            const auto v = surface.local.unchecked<2>();
+            for (ssize_t bond = 0; bond < surface.bond; ++bond) {
+                for (ssize_t site = 0; site < local_; ++site) {
+                    const cdouble alpha = surface.coefficient * v(bond, site);
+                    if (alpha == cdouble(0.0, 0.0)) continue;
+#ifdef __APPLE__
+                    cblas_zgemv(101, 111, static_cast<int>(block_),
+                        static_cast<int>(block_), &alpha, &e(bond, 0, 0),
+                        static_cast<int>(block_), x + site, static_cast<int>(local_),
+                        &one, out + site, static_cast<int>(local_));
+#else
+                    for (ssize_t i = 0; i < block_; ++i) {
+                        cdouble value = 0.0;
+                        for (ssize_t j = 0; j < block_; ++j)
+                            value += e(bond, i, j) * x[j * local_ + site];
+                        out[i * local_ + site] += alpha * value;
+                    }
+#endif
+                }
+            }
+        }
+        return result;
+    }
+
+private:
+    ComplexArray coefficients_;
+    ComplexArray left_;
+    ComplexArray right_;
+    ssize_t terms_ = 0;
+    ssize_t block_ = 0;
+    ssize_t local_ = 0;
+    std::vector<SurfaceTerm> surfaces_;
+};
+
 PYBIND11_MODULE(_cpp_davidson, m) {
     m.doc() = "Optional C++ packed Davidson kernels for PyQED MPS.";
     m.def("openmp_available", &openmp_available_cpp);
     m.def("set_num_threads", &set_dmrg_openmp_threads, py::arg("n_threads"));
     m.def("get_num_threads", &get_dmrg_openmp_threads);
     m.def("openmp_info", &dmrg_openmp_info);
+    py::class_<BosonicGrowthAction>(m, "BosonicGrowthAction")
+        .def(py::init<BosonicGrowthAction::ComplexArray,
+                      BosonicGrowthAction::ComplexArray,
+                      BosonicGrowthAction::ComplexArray,
+                      py::sequence>(),
+             py::arg("coefficients"), py::arg("left"), py::arg("right"),
+             py::arg("surfaces"))
+        .def("matvec", &BosonicGrowthAction::matvec, py::arg("vector"));
     m.def(
         "lapack_svd",
         &lapack_svd,

@@ -1,19 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Generic Davidson eigensolvers used across pyqed.
-
-The original module bundled a dense-matrix demo implementation.  This version
-keeps the same public ``davidson(A, neigen, ...)`` entry point, but upgrades it
-to a proper block Davidson routine with thick restart, explicit residual-based
-convergence checks, optional matrix-free matvec support, and a compatibility
-wrapper ``davidson_solver`` used by some older model code.
-"""
+"""Unified real symmetric and complex Hermitian Davidson eigensolver."""
 
 from __future__ import annotations
 
 import logging
-from typing import Callable
 
 import numpy as np
 
@@ -206,7 +197,7 @@ def _expand_projected_matrix(T, V, AV, new_block, AV_new):
     return np.vstack((top, bottom))
 
 
-def davidson(
+def _iterate(
     A,
     neigen,
     tol=1e-6,
@@ -269,7 +260,7 @@ def davidson(
         max_space = min(n, max(24, 12 * neigen))
     tol_res = np.sqrt(tol) if tol_residual is None else tol_residual
 
-    V = _build_guess(diag_arr, neigen, guess=guess)
+    V = _build_guess(diag_arr, neigen, guess=guess)[:, :max_space]
     AV = _apply_columns(matvec, V)
     T = _build_projected_matrix(V, AV)
     precondition = _resolve_preconditioner(A, diag_arr, jacobi=jacobi, precond=precond)
@@ -299,7 +290,7 @@ def davidson(
         max_de = np.max(np.abs(de))
 
         root_conv = resid_norms < tol_res
-        locked |= root_conv
+        locked = root_conv.copy()
 
         info.update(
             iterations=iteration,
@@ -346,7 +337,8 @@ def davidson(
 
         new_block = np.column_stack(new_vecs)
         if V.shape[1] + new_block.shape[1] > max_space:
-            keep = min(theta_all.size, max(2 * neigen + 2, neigen + 1))
+            keep = min(theta_all.size, max_space - new_block.shape[1],
+                       max(2 * neigen + 2, neigen + 1))
             restart_cols = [V @ alpha_all[:, order[i]] for i in range(keep)]
             restart_cols.extend(new_block[:, i] for i in range(new_block.shape[1]))
             V = _orthonormalize_columns(np.column_stack(restart_cols))
@@ -370,11 +362,177 @@ def davidson(
     raise RuntimeError("Davidson solver did not converge within itermax iterations.")
 
 
-def davidson_solver(A, neigen, **kwargs):
-    """Backward-compatible wrapper used by older model code."""
-    return davidson(A, neigen=neigen, **kwargs)
+def davidson(matrix, roots, tolerance=1e-10, iterations=200, space=None,
+             memory_limit=512*1024**2, guess=None, *, diag=None, precond=None,
+             lindep=1e-12, backend="auto", return_info=True, return_partial=False,
+             matmat=None, dtype=None):
+    """Compute the lowest eigenpairs of a symmetric or Hermitian operator.
 
+    Dense matrices, callable operators, sparse matrices, and LinearOperator
+    objects use the compiled block solver when available. Custom preconditioners
+    or nondefault ``lindep`` use the Python implementation. ``backend='python'`` or ``'compiled'`` forces a path;
+    unsupported compiled inputs raise ValueError, and an unavailable required
+    extension raises ImportError. Auto falls back only on extension absence,
+    never on a failed solve. Callable/LinearOperator inputs require ``diag``;
+    sparse diagonals are extracted without densifying. Matrix-free actions
+    must be Hermitian; global Hermiticity cannot be checked without assembling
+    the operator. ``matmat(X)`` (or the operator's matmat method) accepts (n,k)
+    blocks; otherwise the solver calls matvec on each column. Compiled callbacks
+    receive owned input arrays, so retaining or modifying them is safe. The
+    GIL is released for compiled solver work and acquired for each callback.
+    ``dtype`` selects real or complex arithmetic; it defaults to the operator's
+    dtype, or complex128 for an untyped callable. Use dtype=float for an untyped
+    real operator. Incompatible callback shapes/dtypes or nonfinite values raise.
+    Python callback overhead remains; block actions reduce callback frequency.
 
-def block_davidson(A, neig=3, max_iterations=20, tol=1e-9):
-    """Compatibility alias to the upgraded block Davidson implementation."""
-    return davidson(A, neigen=neig, tol=tol, itermax=max_iterations)
+    Returns ``(values, vectors, info)`` by default, or just the eigenpairs with
+    ``return_info=False``. ``tolerance`` is an absolute residual norm on both
+    paths. Failure raises RuntimeError unless ``return_partial=True``; inspect
+    ``info['converged']`` when accepting partial Ritz pairs. ``info['backend']``
+    identifies the implementation used. Values/vectors are NumPy arrays.
+    Guesses have shape (n,) or (n, nguess); ``precond(residual, value, vector)``
+    may be callable or a diagonal array. ``space`` caps the search space and
+    defaults to min(n, max(24, 4*roots)). ``memory_limit`` limits a conservative
+    scratch-space estimate, excluding input storage and operator callbacks.
+
+    Both implementations adapt E. R. Davidson, J. Comput. Phys. 17, 87-94
+    (1975), doi:10.1016/0021-9991(75)90065-0, using block expansion, diagonal
+    preconditioning, thick restarts and explicit residual tests. The compiled
+    path additionally retains bounded GD+k-inspired history (Stathopoulos and
+    McCombs, ACM TOMS 37(2), Article 21, 2010,
+    doi:10.1145/1731022.1731031). The Python path omits this history; neither
+    reproduces PRIMME or implements inner Jacobi-Davidson solves. The compiled
+    path temporarily freezes a converged lowest prefix at restarts (residual
+    below 0.9*tolerance), solves in its orthogonal complement, and restores
+    all couplings for a final Rayleigh-Ritz residual check. A newly discovered
+    lower active root disables freezing. This is a heuristic deflation policy,
+    not PRIMME locking or a guarantee of lowest-root completeness. Neither
+    path provides universal convergence/performance guarantees. Accelerate real
+    blocks use adapted guarded CholeskyQR2 (Fukaya et al., ScalA 2014,
+    doi:10.1109/ScalA.2014.11) with pivoted QR fallback; complex blocks use
+    pivoted QR directly. Portable builds use scalar contractions and Jacobi
+    projected solves. Both public modules expose this same function.
+    """
+    if backend not in ("auto", "python", "compiled"):
+        raise ValueError("backend must be auto, python, or compiled")
+    if isinstance(roots, bool) or int(roots) != roots or roots < 1:
+        raise ValueError("roots must be a positive integer")
+    if not np.isfinite(tolerance) or tolerance <= 0 or iterations < 1:
+        raise ValueError("Require positive finite tolerance and iteration count")
+    roots = int(roots)
+    operator_dtype = getattr(matrix, "dtype", None)
+    sparse = hasattr(matrix, "tocsr")
+    operator = callable(matrix) or sparse or hasattr(matrix, "matvec")
+    if matmat is None:
+        matmat = getattr(matrix, "matmat", None)
+    if matmat is not None and not callable(matmat):
+        raise ValueError("matmat must be callable")
+    if sparse or hasattr(matrix, "matvec"):
+        if len(matrix.shape) != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError("Expected a square operator")
+        if sparse:
+            if diag is None:
+                diag = matrix.diagonal()
+            if matmat is None:
+                matmat = matrix.dot
+        if diag is not None and np.asarray(diag).size != matrix.shape[0]:
+            raise ValueError("Operator and diagonal dimensions differ")
+        matrix = matrix.dot if sparse else matrix.matvec
+    if not operator:
+        matrix = np.asarray(matrix)
+        if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
+            raise ValueError("Expected a square matrix")
+        if not np.all(np.isfinite(matrix)) or not np.allclose(
+                matrix, matrix.conj().T, rtol=1e-12, atol=1e-13):
+            raise ValueError("Expected a finite Hermitian matrix")
+        n = matrix.shape[0]
+    else:
+        if diag is None:
+            raise ValueError("Matrix-free Davidson requires diag")
+        n = np.asarray(diag).size
+    if roots > n:
+        raise ValueError("roots cannot exceed the dimension")
+    space = min(n, max(24, 4*roots) if space is None else int(space))
+    if space < roots or (space == roots and roots < n):
+        raise ValueError("Davidson space must allow expansion beyond roots")
+    if diag is not None:
+        diag = np.asarray(diag).reshape(n)
+        if not np.all(np.isfinite(diag)) or np.any(np.abs(np.imag(diag)) > 1e-12):
+            raise ValueError("Hermitian diagonal must be finite and real")
+        diag = np.real(diag)
+    if guess is not None:
+        guess = np.asarray(guess)
+        if guess.ndim == 1:
+            guess = guess[:, None]
+        if (guess.ndim != 2 or guess.shape[0] != n or not 1 <= guess.shape[1] <= min(space, 2*roots)
+                or not np.all(np.isfinite(guess))):
+            raise ValueError("Invalid Davidson guess shape or values")
+    use_callback = operator or diag is not None or matmat is not None
+    eligible = precond is None and lindep == 1e-12
+    if backend == "compiled" and not eligible:
+        raise ValueError("Compiled Davidson requires default preconditioner/lindep")
+    if dtype is None:
+        complex_data = np.iscomplexobj(guess) or (
+            (operator_dtype is None or np.dtype(operator_dtype).kind == "c")
+            if operator else np.iscomplexobj(matrix)
+        )
+    else:
+        dtype = np.dtype(dtype)
+        if dtype.kind not in "fc":
+            raise ValueError("dtype must be a real or complex floating type")
+        complex_data = dtype.kind == "c"
+        if not complex_data and (np.iscomplexobj(guess) or
+                                 (not operator and np.iscomplexobj(matrix))):
+            raise ValueError("Real dtype cannot represent complex matrix or guess")
+    scalar_dtype = np.complex128 if complex_data else np.float64
+    estimate = np.dtype(scalar_dtype).itemsize*(
+        2*n*space + (18 if use_callback else 14)*n*roots + 8*space*space)
+    if estimate > memory_limit:
+        raise MemoryError("Davidson estimated workspace exceeds memory_limit")
+    kernel = None
+    if eligible and backend != "python":
+        from pyqed.linalg import davidson_kernels
+        kernel = davidson_kernels.davidson_operator if use_callback else davidson_kernels.davidson
+        if kernel is None and backend == "compiled":
+            raise ImportError(f"Compiled Davidson unavailable: {davidson_kernels.build_error}")
+    if use_callback:
+        action = matrix if operator else matrix.dot
+        if diag is None:
+            diag = matrix.diagonal().real
+        if matmat is None and not operator:
+            matmat = matrix.dot
+    if kernel is not None:
+        if guess is not None:
+            guess = np.ascontiguousarray(guess, dtype=scalar_dtype)
+        if use_callback:
+            values, vectors, info = kernel(
+                action, np.ascontiguousarray(diag, dtype=float), roots, tolerance,
+                int(iterations), space, int(memory_limit), guess, matmat, complex_data)
+        else:
+            values, vectors, info = kernel(
+                np.ascontiguousarray(matrix, dtype=scalar_dtype), roots, tolerance,
+                int(iterations), space, int(memory_limit), guess)
+        info = dict(info, backend="compiled")
+    else:
+        if diag is None:
+            diag = matrix.diagonal().real
+        if use_callback and matmat is not None:
+            def block_action(x):
+                return action(x)
+            block_action.matmat = matmat
+            matrix = block_action
+        values, vectors, info = _iterate(
+            matrix, roots, itermax=int(iterations), diag=diag, precond=precond,
+            guess=guess, max_space=space, tol_residual=tolerance, lindep=lindep,
+            return_info=True, return_partial=True,
+        )
+        info = dict(info, backend="python")
+    values = np.asarray(values)
+    info["residual_norms"] = np.asarray(info["residual_norms"])
+    info["converged"] = bool(info["converged"])
+    info["max_iterations_reached"] = bool(
+        not info["converged"] and info["iterations"] >= iterations
+    )
+    if not info["converged"] and not return_partial:
+        raise RuntimeError("Davidson solver did not converge within the iteration/subspace limits")
+    return (values, vectors, info) if return_info else (values, vectors)

@@ -19,10 +19,80 @@ from pyqed.qchem.mcscf.casci import (
 # from pyqed.qchem.mcscf.casci import CASCI
 
 
-from pyqed.optimize import OrbitalContractionPlan, minimize
+from pyqed.optimize import OrbitalContractionPlan, minimize, lbfgs_direction, update_lbfgs_history
 from pyqed.optimize import grad as opt_grad
 from pyqed.optimize import gradient as opt_gradient
 from pyqed.optimize import norm as opt_norm
+
+
+class RelaxedOrbitalLBFGS:
+    """One physical orbital step per CI-relaxed gradient evaluation.
+
+    Adapt Nocedal's limited-memory BFGS (Math. Comp. 35, 773–782, 1980,
+    https://doi.org/10.1090/S0025-5718-1980-0572855-7) with polar retraction
+    and projected vector transport (Absil, Mahony and Sepulchre,
+    *Optimization Algorithms on Matrix Manifolds*, 2008,
+    https://sites.uclouvain.be/absil/amsbook/). Secants use consecutive
+    accepted post-CI states, so they include observed CI relaxation without
+    explicit CI-response equations. The positive initial inverse model uses
+    reference-Fock gaps times diagonal occupations, floored at 0.1 Hartree;
+    it is a heuristic curvature approximation, not the exact orbital Hessian.
+
+    Exact CASCI discards active-active directions; finite-bond DMRG retains
+    them. The outer driver must reject uphill CI energies and bound steps.
+    Neither superlinear convergence nor a reduced macro count is guaranteed.
+    Fixed-weight state averaging supplies weighted RDMs and gradients.
+    """
+
+    def __init__(self, ncore, ncas, *, active_active=False, reference_fock=None,
+                 history_size=7, max_step_norm=0.25):
+        self.ncore, self.ncas = int(ncore), int(ncas)
+        self.active_active = bool(active_active)
+        self.history_size = int(history_size)
+        self.max_step_norm = float(max_step_norm)
+        if self.history_size < 1 or self.max_step_norm <= 0:
+            raise ValueError("L-BFGS history size and step bound must be positive")
+        self.reference_spectrum = None
+        if reference_fock is not None:
+            fock = np.asarray(reference_fock)
+            if fock.ndim != 2 or fock.shape[0] != fock.shape[1] or not np.all(np.isfinite(fock)):
+                raise ValueError("Reference Fock must be a finite square matrix")
+            self.reference_spectrum = np.linalg.eigh(0.5 * (fock + fock.conj().T))
+        self.s_history, self.y_history = [], []
+        self.last_base = self.last_gradient = None
+
+    def project(self, base, vector):
+        return _physical_orbital_gradient(base, vector, self.ncore, self.ncas,
+                                          active_active=self.active_active)
+
+    def update(self, base, euclidean_gradient, dm1):
+        gradient = self.project(base, euclidean_gradient)
+        if not np.all(np.isfinite(gradient)):
+            raise ValueError("Nonfinite CI-relaxed orbital gradient")
+        if self.last_base is not None and opt_norm(base - self.last_base) > 1e-12:
+            update_lbfgs_history(
+                self.s_history, self.y_history, base, base - self.last_base,
+                gradient - self.project(base, self.last_gradient), self.history_size,
+                projection_fn=self.project,
+            )
+        inverse = None
+        if self.reference_spectrum is not None:
+            energies, vectors = self.reference_spectrum
+            orbitals = vectors.conj().T @ base
+            column_energy = np.sum(abs(orbitals)**2 * energies[:, None], axis=0)
+            occupations = np.maximum(np.diag(dm1).real, 0.1)
+            diagonal = np.maximum(2 * abs(energies[:, None] - column_energy)
+                                   * occupations[None, :], 0.1)
+            inverse = lambda v: self.project(base, vectors @ ((vectors.conj().T @ v) / diagonal))
+        direction = -self.project(base, lbfgs_direction(
+            gradient, self.s_history, self.y_history, initial_inverse=inverse))
+        if not np.all(np.isfinite(direction)) or np.vdot(gradient, direction).real >= 0:
+            self.s_history.clear()
+            self.y_history.clear()
+            direction = -gradient if inverse is None else -inverse(gradient)
+        self.last_base, self.last_gradient = base.copy(), gradient.copy()
+        scale = min(1., self.max_step_norm / max(opt_norm(direction), 1e-16))
+        return _orthonormalize_columns(base + scale * direction)
 
 
 def _orthonormalize_columns(U, eps=1.0e-12):
@@ -43,109 +113,158 @@ def _orthonormalize_columns(U, eps=1.0e-12):
 
 
 class OrbitalDIIS:
-    """Pulay extrapolation for the CASSCF orbital subspace transform ``U``.
+    """Pulay acceleration of the outer CO map with optional transported errors.
 
-    The main branch carried a simple DIIS accelerator based on recent orbital
-    updates.  On ``bg`` we keep the newer optimizer backends and wrap the DIIS
-    logic in a small helper so both state-specific and state-averaged CASSCF
-    can reuse it without duplicating the bookkeeping.
-    r"""
+    This adapts Pulay, J. Comput. Chem. 3, 556–560 (1982),
+    https://doi.org/10.1002/jcc.540030413, and the fixed-RDM CO workflow of
+    Zhang, Hu and Gu (2026), https://arxiv.org/abs/2606.17761. The
+    default ``step`` mode uses the original fixed-RDM map displacement and
+    absolute regularization. ``transported_step`` compares displacements
+    in one tangent frame with scale-relative regularization; ``gradient``
+    uses the physical gradient at the accepted, post-CI base in that frame.
+    Both optional modes align redundant gauges and rotate residuals with
+    their orbitals before tangent projection. These are DIIS adaptations,
+    not a coupled CI-response or quadratically convergent CASSCF algorithm.
+    """
 
-    def __init__(self, max_space=6, start=2, regularization=1.0e-10):
-        self.max_space = max_space
-        self.start = start
-        self.regularization = regularization
+    def __init__(self, max_space=6, start=2, regularization=1.0e-10,
+                 residual_kind="step"):
+        if residual_kind not in ("step", "transported_step", "gradient"):
+            raise ValueError("DIIS residual must be 'step', 'transported_step' or 'gradient'")
+        self.residual_kind = residual_kind
+        self.max_space = max(1, int(max_space))
+        self.start = max(2, int(start))
+        self.regularization = float(regularization)
+        self.bases = []
         self.vectors = []
         self.errors = []
+        self.last_info = {}
 
     def reset(self):
+        self.bases.clear()
         self.vectors.clear()
         self.errors.clear()
+        self.last_info = {}
 
-    def update(self, base, candidate, *, ncore, ncas, active_active):
-        """Extrapolate the outer CO fixed-point residual ``candidate - base``."""
-
+    def update(self, base, candidate, *, residual=None, ncore, ncas, active_active):
+        """Pair a map output with a displacement or accepted-base gradient."""
+        if self.residual_kind == "gradient" and residual is None:
+            raise ValueError("Gradient DIIS requires the accepted post-CI gradient")
         candidate = _align_redundant_gauge(
-            base,
-            candidate,
-            ncore,
-            ncas,
-            active_active=active_active,
+            base, candidate, ncore, ncas, active_active=active_active
         )
+        self.bases.append(base.copy())
         self.vectors.append(candidate.copy())
-        self.errors.append((candidate - base).copy())
-
+        error = residual if self.residual_kind == "gradient" else candidate - base
+        self.errors.append(error.copy())
         if len(self.errors) > self.max_space:
-            self.errors.pop(0)
+            self.bases.pop(0)
             self.vectors.pop(0)
-
+            self.errors.pop(0)
+        self.last_info = {"diis_used": False, "diis_space": len(self.errors),
+                          "diis_residual": self.residual_kind}
         if len(self.errors) < self.start:
             return candidate
 
-        bsize = len(self.errors)
-        bmat = -1.0 * np.ones((bsize + 1, bsize + 1), dtype=float)
-        rhs = np.zeros(bsize + 1, dtype=float)
-        bmat[bsize, bsize] = 0.0
-        rhs[bsize] = -1.0
+        transported = self.residual_kind != "step"
+        vectors, errors = self.vectors, self.errors
+        if transported:
+            vectors, errors = [], []
+            for old_base, vector, error in zip(self.bases, self.vectors, self.errors):
+                rotation = _redundant_gauge_rotation(
+                    base, old_base, ncore, ncas, active_active=active_active
+                )
+                vectors.append(vector @ rotation)
+                errors.append(_physical_orbital_gradient(
+                    base, error @ rotation, ncore, ncas, active_active=active_active
+                ))
 
-        for i in range(bsize):
-            for j in range(bsize):
-                bmat[i, j] = np.vdot(self.errors[i], self.errors[j]).real
-        bmat[:bsize, :bsize] += np.eye(bsize) * self.regularization
-
-        try:
-            coeff = np.linalg.solve(bmat, rhs)
-        except np.linalg.LinAlgError:
+        # Optional transported errors use relative regularization. Keep the
+        # original map residual's conditioning in the default mode: the
+        # alternatives did not reduce macrosteps in the Fe(CO)5 comparison.
+        gram = np.array([[np.vdot(a, b).real for b in errors] for a in errors])
+        scale = float(np.max(np.diag(gram)))
+        if not np.isfinite(scale) or scale <= np.finfo(float).tiny:
             return candidate
-        if np.max(np.abs(coeff[:-1])) > 5.0:
+        if transported:
+            gram /= scale
+        # Drop old entries if cancellation demands excessively large weights.
+        offset = 0
+        while len(errors) - offset >= self.start:
+            size = len(errors) - offset
+            bmat = -np.ones((size + 1, size + 1))
+            subset = gram[offset:, offset:]
+            if transported:
+                subset_scale = float(np.max(np.diag(subset)))
+                if subset_scale <= np.finfo(float).tiny:
+                    return candidate
+                subset = subset / subset_scale
+            bmat[:size, :size] = subset + self.regularization * np.eye(size)
+            bmat[size, size] = 0.0
+            rhs = np.zeros(size + 1)
+            rhs[-1] = -1.0
+            try:
+                weights = np.linalg.solve(bmat, rhs)[:-1]
+            except np.linalg.LinAlgError:
+                if not transported:
+                    return candidate
+                offset += 1
+                continue
+            if np.all(np.isfinite(weights)) and np.max(np.abs(weights)) <= 5.0:
+                break
+            if not transported:
+                return candidate
+            offset += 1
+        else:
             return candidate
 
-        U_new = np.zeros_like(candidate, dtype=candidate.dtype)
-        for weight, vector in zip(coeff[:-1], self.vectors):
-            U_new += weight * vector
-
-        U_new = _orthonormalize_columns(U_new)
+        extrapolated = sum(weight * vector for weight, vector in zip(weights, vectors[offset:]))
+        overlap = extrapolated.conj().T @ extrapolated
+        if np.linalg.eigvalsh(overlap)[0] < 1.0e-8:
+            return candidate
+        extrapolated = _orthonormalize_columns(extrapolated)
+        self.last_info = {"diis_used": True, "diis_space": len(weights),
+                          "diis_residual": self.residual_kind,
+                          "diis_max_weight": float(np.max(np.abs(weights)))}
         return _align_redundant_gauge(
-            base,
-            U_new,
-            ncore,
-            ncas,
-            active_active=active_active,
+            base, extrapolated, ncore, ncas, active_active=active_active
         )
 
 
 def _apply_orbital_diis(
-    diis_helper, base, candidate, *, ncore, ncas, active_active
+    diis_helper, base, candidate, *, residual, ncore, ncas, active_active
 ):
-    """Apply residual-based DIIS to the outer CO fixed-point map."""
-
+    """Accelerate the map using solver-appropriate transported residuals."""
     if diis_helper is None:
         return candidate
     return diis_helper.update(
-        base,
-        candidate,
-        ncore=ncore,
-        ncas=ncas,
+        base, candidate, residual=residual, ncore=ncore, ncas=ncas,
         active_active=active_active,
     )
 
 
-def _align_redundant_gauge(base, candidate, ncore, ncas, *, active_active):
-    """Align only orbital blocks that are redundant for the active solver."""
-
-    base = np.asarray(base)
-    aligned = np.asarray(candidate).copy()
+def _redundant_gauge_rotation(base, candidate, ncore, ncas, *, active_active):
+    """Return the right rotation aligning solver-redundant column blocks."""
+    rotation = np.eye(candidate.shape[1], dtype=candidate.dtype)
     blocks = [(0, int(ncore))]
     if not active_active:
         blocks.append((int(ncore), int(ncore) + int(ncas)))
     for start, stop in blocks:
-        if stop - start <= 0:
+        if stop <= start:
             continue
         block = slice(start, stop)
-        overlap = aligned[:, block].conj().T @ base[:, block]
+        overlap = candidate[:, block].conj().T @ base[:, block]
         left, _, right_h = np.linalg.svd(overlap, full_matrices=False)
-        aligned[:, block] = aligned[:, block] @ (left @ right_h)
-    return aligned
+        rotation[block, block] = left @ right_h
+    return rotation
+
+
+def _align_redundant_gauge(base, candidate, ncore, ncas, *, active_active):
+    """Align only orbital blocks that are redundant for the active solver."""
+    candidate = np.asarray(candidate)
+    return candidate @ _redundant_gauge_rotation(
+        np.asarray(base), candidate, ncore, ncas, active_active=active_active
+    )
 
 
 def _fresh_casci_like(source, *, solver_cls=None):
@@ -605,30 +724,80 @@ def _set_convergence_metadata(mc, *, macro_converged, macro_iterations):
     mc.converged = bool(mc.macro_converged and mc.solver_converged)
 
 
+def _notify_macro(callback, mc, mo_coeff, history, row):
+    """Expose a completed orbital trial for diagnostics and paired checkpoints."""
+    if callback is not None:
+        callback(dict(macro=row["macro"], energy=row["energy"],
+                      mo_coeff=mo_coeff, casci=mc, energy_history=list(history),
+                      diagnostics=dict(row)))
+
+
 class COCAS(CASCI):
     """
 
-    Using the OptOrbFCI algorithm to optimize orbitals
-    (better than conventional CASSCF algorithm)
+    Fixed-RDM constrained orbital optimization with a CASCI solver.
 
+    Adapted from Zhang, Hu and Gu, "Constrained Optimization Algorithms for
+    Orbital Optimization in Quantum Chemistry" (2026),
+    https://arxiv.org/abs/2606.17761. The selectable inner optimizer and
+    optional transported outer DIIS can differ from the paper's formulation.
+    ``optimizer="ISD"`` selects its implicit solve, polar projection and
+    alternating BB inner updates; ``diis_residual="step"`` keeps the orbital-map
+    displacement. ``"transported_step"`` and ``"gradient"`` select experimental
+    transported displacement and post-CI gradient residuals respectively;
+    neither is a general convergence improvement. Pulay extrapolation follows
+    J. Comput. Chem. 3,
+    556–560 (1982), https://doi.org/10.1002/jcc.540030413, with gauge
+    alignment, tangent transport and scale-relative regularization.
+    The driver uses only RDMs, omits CI-response microsteps, and provides
+    no general macroiteration or quadratic-convergence guarantee.
 
+    ``physical_inner=True`` restricts inner SD/RCG/L-BFGS directions and
+    transported secants to the same physical blocks used by convergence
+    checks. It removes core-core directions and, for exact CASCI, active-active
+    directions. Finite-bond DMRG retains active-active directions. This is an
+    experimental restriction of the fixed-RDM subproblem: CAS gauge invariance
+    applies after CI relaxation, not to arbitrary frozen active RDMs, so this
+    option does not exactly minimize the full frozen-RDM orbital objective.
+    L-BFGS adapts Nocedal, Math. Comp. 35, 773–782 (1980),
+    https://doi.org/10.1090/S0025-5718-1980-0572855-7, using polar retraction
+    and projected transport in the framework of Absil, Mahony and Sepulchre,
+    *Optimization Algorithms on Matrix Manifolds* (2008),
+    https://sites.uclouvain.be/absil/amsbook/. Every retained secant is
+    transported at each inner step; unconstrained superlinear guarantees do
+    not carry over.
+
+    ``orbital_update="relaxed_lbfgs"`` with ``diis=False`` instead takes one
+    preconditioned physical step per CI solve. Its L-BFGS history spans
+    accepted post-CI states rather than frozen-RDM inner steps; see
+    :class:`RelaxedOrbitalLBFGS` for references and approximations. A reference
+    RHF Fock matrix supplies the positive orbital-gap scaling, including when
+    the starting MO basis is noncanonical. ``optimizer`` and its inner
+    tolerance/iteration budget apply only to ``"fixed_rdm"`` updates.
+    ``optimizer_history`` and ``optimizer_max_step_norm`` also control the
+    relaxed update, whose default tangent-step bound is 0.25.
+
+    Energy-increasing DIIS trials reset the extrapolation history and retry
+    the unextrapolated orbital update before shrinking the macro trust radius.
 
     """
     def __init__(self, mf, ncas, nelecas, max_cycles=30,
                  optimizer='RCG', optimizer_history=7,
-                 diis=True, diis_space=6, diis_start=2,
+                 diis=True, diis_space=6, diis_start=2, diis_residual="step",
                  ci_method='direct_ci', direct_ci_dense_fallback_ndets=0,
                  optimizer_tol=1.0e-4,
                  optimizer_max_steps=200,
                  optimizer_max_step_norm=None,
+                 physical_inner=False,
+                 orbital_update="fixed_rdm",
                  macro_tol=1.0e-6,
                  ci_tol=0.0,
                  orb_grad_tol=None,
                  reject_macro_energy=True,
                  macro_energy_rise_tol=1.0e-8,
-                 macro_reject_max=8,
+                 macro_reject_max=None,
                  macro_trust_radius=0.25,
-                 macro_trust_min=1.0e-4,
+                 macro_trust_min=None,
                  macro_trust_max=1.0,
                  macro_trust_shrink=0.5,
                  macro_trust_grow=1.5,
@@ -644,6 +813,12 @@ class COCAS(CASCI):
         # Orbital optimization backend for the U-matrix formulation.
         self.optimizer = optimizer.upper()
         self.optimizer_history = optimizer_history
+        self.physical_inner = bool(physical_inner)
+        if orbital_update not in ("fixed_rdm", "relaxed_lbfgs"):
+            raise ValueError("Orbital update must be 'fixed_rdm' or 'relaxed_lbfgs'")
+        if orbital_update == "relaxed_lbfgs" and diis:
+            raise ValueError("CI-relaxed L-BFGS requires diis=False")
+        self.orbital_update = orbital_update
         self.optimizer_tol = float(optimizer_tol)
         self.optimizer_max_steps = (
             None if optimizer_max_steps is None else int(optimizer_max_steps)
@@ -656,11 +831,13 @@ class COCAS(CASCI):
         )
         self.reject_macro_energy = bool(reject_macro_energy)
         self.macro_energy_rise_tol = float(macro_energy_rise_tol)
-        self.macro_reject_max = int(macro_reject_max)
+        self.macro_reject_max = int((20 if orbital_update == "relaxed_lbfgs" else 8)
+                                    if macro_reject_max is None else macro_reject_max)
         self.macro_trust_radius = (
             None if macro_trust_radius is None else float(macro_trust_radius)
         )
-        self.macro_trust_min = float(macro_trust_min)
+        self.macro_trust_min = float((1e-8 if orbital_update == "relaxed_lbfgs" else 1e-4)
+                                     if macro_trust_min is None else macro_trust_min)
         self.macro_trust_max = float(macro_trust_max)
         self.macro_trust_shrink = float(macro_trust_shrink)
         self.macro_trust_grow = float(macro_trust_grow)
@@ -670,6 +847,9 @@ class COCAS(CASCI):
         self.diis = diis
         self.diis_space = diis_space
         self.diis_start = diis_start
+        if diis_residual not in ("step", "transported_step", "gradient"):
+            raise ValueError("DIIS residual must be 'step', 'transported_step' or 'gradient'")
+        self.diis_residual = diis_residual
         self.ci_method = ci_method
         self._use_cholesky_requested = use_cholesky
         self.use_cholesky = False
@@ -688,7 +868,8 @@ class COCAS(CASCI):
         self.macro_iterations = 0
 
 
-    def run(self, nstates= None, weights = None, use_cholesky=None):
+    def run(self, nstates= None, weights = None, use_cholesky=None,
+            macro_callback=None, raise_on_nonconvergence=True):
         mf = self.mf
 
         # canonical molecular orbs
@@ -735,6 +916,9 @@ class COCAS(CASCI):
         for i in range(ncas+ncore):
             U0[i, i] = 1.
 
+        reference_fock = (C0.conj().T @ mf.get_fock() @ C0
+                          if self.orbital_update == "relaxed_lbfgs" else None)
+
         if nstates == 1: # ground state only
             C, mc = kernel(
                 mc, U0, nelecas, ncas, C0, h1e, eri,
@@ -744,6 +928,8 @@ class COCAS(CASCI):
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
                 optimizer_max_step_norm=self.optimizer_max_step_norm,
+                physical_inner=self.physical_inner,
+                orbital_update=self.orbital_update, reference_fock=reference_fock,
                 tol=self.macro_tol,
                 orb_grad_tol=self.orb_grad_tol,
                 reject_macro_energy=self.reject_macro_energy,
@@ -758,8 +944,11 @@ class COCAS(CASCI):
                 diis=self.diis,
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
+                diis_residual=self.diis_residual,
                 ci_method=self.ci_method,
                 use_cholesky=self.use_cholesky,
+                macro_callback=macro_callback,
+                raise_on_nonconvergence=raise_on_nonconvergence,
             )
 
         elif nstates > 1:
@@ -776,6 +965,8 @@ class COCAS(CASCI):
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
                 optimizer_max_step_norm=self.optimizer_max_step_norm,
+                physical_inner=self.physical_inner,
+                orbital_update=self.orbital_update, reference_fock=reference_fock,
                 tol=self.macro_tol,
                 orb_grad_tol=self.orb_grad_tol,
                 reject_macro_energy=self.reject_macro_energy,
@@ -790,8 +981,11 @@ class COCAS(CASCI):
                 diis=self.diis,
                 diis_space=self.diis_space,
                 diis_start=self.diis_start,
+                diis_residual=self.diis_residual,
                 ci_method=self.ci_method,
                 use_cholesky=self.use_cholesky,
+                macro_callback=macro_callback,
+                raise_on_nonconvergence=raise_on_nonconvergence,
             )
 
         self.mo_coeff = C
@@ -858,18 +1052,34 @@ def energy(U, h1e, eri, dm1, dm2):
     return e
 
 
+def _relaxed_update(orbital_update, diis, mc, ncas, reference_fock, history_size, max_step):
+    if orbital_update == "fixed_rdm":
+        return None
+    if orbital_update != "relaxed_lbfgs":
+        raise ValueError("Orbital update must be 'fixed_rdm' or 'relaxed_lbfgs'")
+    if diis:
+        raise ValueError("CI-relaxed L-BFGS requires diis=False")
+    return RelaxedOrbitalLBFGS(
+        mc.ncore, ncas, active_active=hasattr(mc, "D"),
+        reference_fock=reference_fock, history_size=history_size,
+        max_step_norm=0.25 if max_step is None else max_step,
+    )
+
+
 
 def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
            optimizer='RCG', optimizer_history=7, optimizer_tol=1.0e-4,
            optimizer_max_steps=200, optimizer_max_step_norm=None,
+           physical_inner=False,
+           orbital_update="fixed_rdm", reference_fock=None,
            diis=True,
-           diis_space=6, diis_start=2, ci_method='direct_ci',
+           diis_space=6, diis_start=2, diis_residual="step", ci_method='direct_ci',
            reject_macro_energy=True, macro_energy_rise_tol=1.0e-8,
            macro_reject_max=8,
            orb_grad_tol=None, macro_trust_radius=0.25,
            macro_trust_min=1.0e-4, macro_trust_max=1.0,
            macro_trust_shrink=0.5, macro_trust_grow=1.5,
-           warm_start_dmrg=True,
+           warm_start_dmrg=True, macro_callback=None,
            raise_on_nonconvergence=True, **kwargs):
     r"""
     complete active space orbital optimization with orthonomality constraint
@@ -921,7 +1131,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     dm1, dm2 = mc.make_rdm12(0, with_core=with_core)
     timing["rdm_seconds"] += time.perf_counter() - timing_start
     contraction_plan = OrbitalContractionPlan(
-        h1e, eri, U0.shape, dm1.shape, dm2.shape
+        h1e, eri, U0.shape, dm1.shape, dm2.shape, ncore=mc.ncore
     )
 
     # eri = mc.eri_so[0, 0] # for spin-restricted calculation
@@ -933,7 +1143,8 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
 
     orbital_diis = None
     if diis:
-        orbital_diis = OrbitalDIIS(max_space=diis_space, start=diis_start)
+        orbital_diis = OrbitalDIIS(max_space=diis_space, start=diis_start,
+                                   residual_kind=diis_residual)
 
     cap0 = optimizer_max_step_norm
     gt = optimizer_tol if orb_grad_tol is None else float(orb_grad_tol)
@@ -945,7 +1156,22 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
     active_active = hasattr(mc, "D")
     diag = []
 
+    relaxed = _relaxed_update(orbital_update, diis, mc, ncas, reference_fock,
+                              optimizer_history, cap0)
+
     def opt_u(u, d1, d2, use_diis=True):
+        if relaxed is not None:
+            start = time.perf_counter()
+            candidate = relaxed.update(u, contraction_plan.gradient(u, h1e, eri, d1, d2), d1)
+            timing["orbital_opt_seconds"] += time.perf_counter() - start
+            return _align_redundant_gauge(u, candidate, mc.ncore, ncas,
+                                          active_active=active_active)
+        residual = None
+        if use_diis and orbital_diis is not None and orbital_diis.residual_kind == "gradient":
+            residual = _physical_orbital_gradient(
+                u, contraction_plan.gradient(u, h1e, eri, d1, d2),
+                mc.ncore, ncas, active_active=active_active,
+            )
         timing_start = time.perf_counter()
         u1, e1 = minimize(
             contraction_plan.energy,
@@ -957,6 +1183,9 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
             max_iterations=optimizer_max_steps,
             max_step_norm=cap0,
             gradient_fn=contraction_plan.gradient,
+            projection_fn=(lambda x, g: _physical_orbital_gradient(
+                x, g, mc.ncore, ncas, active_active=active_active,
+            )) if physical_inner else None,
         )
         u1 = _align_redundant_gauge(
             u,
@@ -970,6 +1199,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
                 orbital_diis,
                 u,
                 u1,
+                residual=residual,
                 ncore=mc.ncore,
                 ncas=ncas,
                 active_active=active_active,
@@ -1009,6 +1239,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
 
         ok = False
         rej = 0
+        diis_rejected = False
         for ir in range(int(macro_reject_max) + 1):
             mo_coeff = C0 @ U
 
@@ -1047,6 +1278,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
                         "solver": False,
                     }
                 )
+                _notify_macro(macro_callback, current_mc, mo_coeff, e_history, diag[-1])
                 break
 
             if (not reject_macro_energy) or current_mc.e_tot <= e_old + macro_energy_rise_tol:
@@ -1054,6 +1286,12 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
                 break
 
             rej += 1
+            if orbital_diis is not None and not diis_rejected:
+                orbital_diis.reset()
+                diis_rejected = True
+                U_target = opt_u(U_acc, dm1, dm2, use_diis=False)
+                U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
+                continue
             tr = None if tr is None else max(tr_min, tr * tr_dn)
             U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
 
@@ -1098,6 +1336,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
             "step": step_norm,
             "tr": tr,
             "rej": rej,
+            "diis_rejected": diis_rejected,
             "active_active_optimized": active_active,
             "su2_runtime_rebuilt": bool(
                 getattr(current_mc, "_co_su2_runtime_rebuilt", False)
@@ -1107,9 +1346,12 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
             ),
         }
         row.update(_sdiag(current_mc))
+        if orbital_diis is not None:
+            row.update(orbital_diis.last_info)
         gradient_spike = bool(gn > 0.0 and gn_new > 1.5 * gn)
         row["diis_reset"] = gradient_spike
         diag.append(row)
+        _notify_macro(macro_callback, current_mc, mo_coeff, e_history, row)
         if e_now < best_e:
             best_e = e_now
             best_mc = current_mc
@@ -1211,15 +1453,17 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                          optimizer_history=7, optimizer_tol=1.0e-4,
                          optimizer_max_steps=200,
                          optimizer_max_step_norm=None,
+                         physical_inner=False,
+                         orbital_update="fixed_rdm", reference_fock=None,
                          diis=True, diis_space=6,
-                         diis_start=2, ci_method='direct_ci',
+                         diis_start=2, diis_residual="step", ci_method='direct_ci',
                          reject_macro_energy=True,
                          macro_energy_rise_tol=1.0e-8,
                          macro_reject_max=8,
                          orb_grad_tol=None, macro_trust_radius=0.25,
                          macro_trust_min=1.0e-4, macro_trust_max=1.0,
                          macro_trust_shrink=0.5, macro_trust_grow=1.5,
-                         warm_start_dmrg=True,
+                         warm_start_dmrg=True, macro_callback=None,
                          raise_on_nonconvergence=True, **kwargs):
 
     if mc.ncore > 0:
@@ -1232,7 +1476,8 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     
     orbital_diis = None
     if diis:
-        orbital_diis = OrbitalDIIS(max_space=diis_space, start=diis_start)
+        orbital_diis = OrbitalDIIS(max_space=diis_space, start=diis_start,
+                                   residual_kind=diis_residual)
 
     dm1 = 0
     dm2 = 0
@@ -1241,7 +1486,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
         dm1 += _dm1 * weights[n]
         dm2 += _dm2 * weights[n]
     contraction_plan = OrbitalContractionPlan(
-        h1e, eri, U0.shape, dm1.shape, dm2.shape
+        h1e, eri, U0.shape, dm1.shape, dm2.shape, ncore=mc.ncore
     )
 
     # State-averaged CASSCF uses the same ``U`` variable as the state-specific
@@ -1257,7 +1502,20 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
     active_active = hasattr(mc, "D")
     diag = []
 
+    relaxed = _relaxed_update(orbital_update, diis, mc, ncas, reference_fock,
+                              optimizer_history, cap0)
+
     def opt_u(u, d1, d2, use_diis=True):
+        if relaxed is not None:
+            candidate = relaxed.update(u, contraction_plan.gradient(u, h1e, eri, d1, d2), d1)
+            return _align_redundant_gauge(u, candidate, mc.ncore, ncas,
+                                          active_active=active_active)
+        residual = None
+        if use_diis and orbital_diis is not None and orbital_diis.residual_kind == "gradient":
+            residual = _physical_orbital_gradient(
+                u, contraction_plan.gradient(u, h1e, eri, d1, d2),
+                mc.ncore, ncas, active_active=active_active,
+            )
         u1, e1 = minimize(
             contraction_plan.energy,
             u,
@@ -1268,6 +1526,9 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             max_iterations=optimizer_max_steps,
             max_step_norm=cap0,
             gradient_fn=contraction_plan.gradient,
+            projection_fn=(lambda x, g: _physical_orbital_gradient(
+                x, g, mc.ncore, ncas, active_active=active_active,
+            )) if physical_inner else None,
         )
         u1 = _align_redundant_gauge(
             u,
@@ -1281,6 +1542,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                 orbital_diis,
                 u,
                 u1,
+                residual=residual,
                 ncore=mc.ncore,
                 ncas=ncas,
                 active_active=active_active,
@@ -1315,6 +1577,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
 
         ok = False
         rej = 0
+        diis_rejected = False
         for ir in range(int(macro_reject_max) + 1):
             mo_coeff = C0 @ U
 
@@ -1352,12 +1615,19 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                         "solver": False,
                     }
                 )
+                _notify_macro(macro_callback, current_mc, mo_coeff, e_history, diag[-1])
                 break
             if (not reject_macro_energy) or eAve <= e_old + macro_energy_rise_tol:
                 ok = True
                 break
 
             rej += 1
+            if orbital_diis is not None and not diis_rejected:
+                orbital_diis.reset()
+                diis_rejected = True
+                U_target = opt_u(U_acc, dm1, dm2, use_diis=False)
+                U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
+                continue
             tr = None if tr is None else max(tr_min, tr * tr_dn)
             U, step_norm = _limit_stiefel_displacement(U_acc, U_target, tr)
 
@@ -1403,6 +1673,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             "step": step_norm,
             "tr": tr,
             "rej": rej,
+            "diis_rejected": diis_rejected,
             "active_active_optimized": active_active,
             "su2_runtime_rebuilt": bool(
                 getattr(current_mc, "_co_su2_runtime_rebuilt", False)
@@ -1412,9 +1683,12 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             ),
         }
         row.update(_sdiag(current_mc))
+        if orbital_diis is not None:
+            row.update(orbital_diis.last_info)
         gradient_spike = bool(gn > 0.0 and gn_new > 1.5 * gn)
         row["diis_reset"] = gradient_spike
         diag.append(row)
+        _notify_macro(macro_callback, current_mc, mo_coeff, e_history, row)
         if e_now < best_e:
             best_e = e_now
             best_mc = current_mc

@@ -247,6 +247,7 @@ def _ao_overlap(mf):
         overlap = mf.get_ovlp()
     else:
         overlap = getattr(getattr(mf, "mol", None), "overlap", None)
+        overlap = overlap() if callable(overlap) else None
     if overlap is None:
         return np.eye(int(getattr(mf, "nao")))
     return np.asarray(overlap)
@@ -357,6 +358,15 @@ class DMRGSCF(QCDMRG):
         self.fixed_mps_trial_count = 0
 
     def run(self, nstates=1, weights=None, require_conv=True, mo_coeff=None, **kwargs):
+        """Optimize orbitals and the active MPS.
+
+        With the constrained driver, ``macro_callback(event)`` receives each
+        completed accepted trial or failed active solve. The event contains
+        ``macro``, ``energy``, ``mo_coeff``, ``casci``, ``energy_history``, and
+        ``diagnostics``; copy or serialize states inside the callback to retain
+        a checkpoint. ``local_solver_kwargs['workspace_budget_bytes']`` sets
+        the owned SU(2) Davidson workspace limit (default 32 MiB).
+        """
         self.micro_history = []
         self.dmrg_solve_count = 0
         self.rdm_build_count = 0
@@ -380,7 +390,10 @@ class DMRGSCF(QCDMRG):
             "diis_space": kwargs.pop("diis_space", 6),
             "diis_start": kwargs.pop("diis_start", 2),
             "ci_method": kwargs.pop("ci_method", "direct_ci"),
+            "macro_callback": kwargs.pop("macro_callback", None),
         }
+        if orbital_options["macro_callback"] is not None and orbital_driver != "constrained":
+            raise ValueError("macro_callback currently requires the constrained orbital driver.")
         # One exact DMRG keyframe followed by fixed-MPS AH steps amortizes the
         # sweep and 2-RDM costs while retaining an exact solve each macrocycle.
         orbital_micro_cycles = int(kwargs.pop("orbital_micro_cycles", 4))

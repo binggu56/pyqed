@@ -1,4 +1,4 @@
-"""Optional C++ Davidson backends for dense and packed-Abelian local solves."""
+"""Optional MPS/DMRG kernels; generic Davidson is owned by pyqed.linalg."""
 
 from __future__ import annotations
 
@@ -46,6 +46,7 @@ AbelianTDVPBondHeffPlan = None
 AbelianTDVPTwoSiteHeffPlan = None
 AbelianEnvironmentAdvancePlan = None
 BlockTable = None
+BosonicGrowthAction = None
 RenormalizedTable = None
 SparseRenormalizedTable = None
 GroupedRenormalizedTable = None
@@ -201,7 +202,7 @@ def _compile_extension():
         return None
 
     source = Path(__file__).with_name("davidson.cpp")
-    core_header = Path(__file__).with_name("dmrg_linalg_core.hpp")
+    core_header = Path(__file__).resolve().parents[1] / "linalg" / "davidson.hpp"
     if not source.exists():
         CPP_DAVIDSON_BUILD_ERROR = f"source file not found: {source}"
         return None
@@ -349,6 +350,7 @@ def _initialize():
     global AbelianTDVPTwoSiteHeffPlan
     global AbelianEnvironmentAdvancePlan
     global BlockTable
+    global BosonicGrowthAction
     global RenormalizedTable
     global SparseRenormalizedTable
     global GroupedRenormalizedTable
@@ -421,10 +423,16 @@ def _initialize():
         os.environ.get("PYQED_MPS_FORCE_CPP_DAVIDSON_REBUILD", "0")
     )
     stale_extension = bool(
-        source.exists()
-        and extension_path is not None
+        extension_path is not None
         and extension_path.exists()
-        and source.stat().st_mtime_ns > extension_path.stat().st_mtime_ns
+        and any(
+            dependency.exists()
+            and dependency.stat().st_mtime_ns > extension_path.stat().st_mtime_ns
+            for dependency in (
+                source,
+                source.parent.parent / "linalg" / "davidson.hpp",
+            )
+        )
     )
     if force_rebuild or stale_extension:
         module = _compile_extension()
@@ -554,6 +562,7 @@ def _initialize():
         None,
     )
     BlockTable = getattr(module, "BlockTable", None)
+    BosonicGrowthAction = getattr(module, "BosonicGrowthAction", None)
     RenormalizedTable = getattr(module, "RenormalizedTable", BlockTable)
     SparseRenormalizedTable = getattr(module, "SparseRenormalizedTable", None)
     GroupedRenormalizedTable = getattr(module, "GroupedRenormalizedTable", None)

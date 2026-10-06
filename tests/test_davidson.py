@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from pyqed.davidson import davidson, davidson_solver
+from pyqed.davidson import davidson
 
 
 def _random_symmetric(n, seed=1):
@@ -22,7 +22,7 @@ def _canonicalize_columns(v):
 def test_davidson_matches_dense_eigh_lowest_roots():
     h = _random_symmetric(18, seed=4)
     w_ref, v_ref = np.linalg.eigh(h)
-    w, v = davidson(h, neigen=3, tol=1e-10, itermax=80)
+    w, v = davidson(h, roots=3, tolerance=1e-10, iterations=80, return_info=False)
 
     assert np.allclose(w, w_ref[:3], atol=1e-9, rtol=1e-9)
     assert np.allclose(
@@ -42,11 +42,11 @@ def test_davidson_supports_matrix_free_matvec():
 
     w, v = davidson(
         matvec,
-        neigen=2,
+        roots=2,
         diag=np.diag(h),
-        tol=1e-10,
-        itermax=80,
-    )
+        tolerance=1e-10,
+        iterations=80,
+     return_info=False)
 
     assert np.allclose(w, w_ref[:2], atol=1e-9, rtol=1e-9)
     assert v.shape == (16, 2)
@@ -69,21 +69,23 @@ def test_davidson_uses_matrix_free_block_action():
     matvec.matmat = matmat
     w, _ = davidson(
         matvec,
-        neigen=3,
+        roots=3,
         diag=np.diag(h),
-        tol=1.0e-10,
-        itermax=80,
-    )
+        tolerance=1.0e-10,
+        iterations=80,
+     return_info=False)
 
     np.testing.assert_allclose(w, w_ref[:3], atol=1.0e-9, rtol=1.0e-9)
     assert calls["matmat"] > 0
     assert calls["columns"] >= 3
 
 
-def test_davidson_solver_wrapper_matches_davidson():
+def test_public_modules_export_same_solver():
+    from pyqed.linalg import davidson as linalg_davidson
+    assert linalg_davidson is davidson
     h = _random_symmetric(12, seed=12)
-    w1, v1 = davidson(h, neigen=2, tol=1e-9, itermax=60)
-    w2, v2 = davidson_solver(h, neigen=2, tol=1e-9, itermax=60)
+    w1, v1 = davidson(h, roots=2, tolerance=1e-9, iterations=60, return_info=False)
+    w2, v2 = davidson(h, roots=2, tolerance=1e-9, iterations=60, return_info=False)
 
     assert np.allclose(w1, w2, atol=1e-10, rtol=1e-10)
     assert np.allclose(
@@ -107,9 +109,9 @@ def test_davidson_supports_callable_preconditioner_and_reports_locking():
 
     w, _, info = davidson(
         h,
-        neigen=3,
-        tol=1e-10,
-        itermax=80,
+        roots=3,
+        tolerance=1e-10,
+        iterations=80,
         precond=precond,
         return_info=True,
     )
@@ -129,11 +131,11 @@ def test_davidson_incremental_projected_updates_match_dense_path():
 
     w, _, info = davidson(
         matvec,
-        neigen=4,
+        roots=4,
         diag=np.diag(h),
-        tol=1e-10,
-        itermax=100,
-        max_space=16,
+        tolerance=1e-10,
+        iterations=100,
+        space=16,
         return_info=True,
     )
 
@@ -145,13 +147,13 @@ def test_davidson_can_return_partial_ritz_pairs_on_iteration_limit():
     h = _random_symmetric(18, seed=41)
 
     with pytest.raises(RuntimeError):
-        davidson(h, neigen=2, tol=1e-14, itermax=1)
+        davidson(h, roots=2, tolerance=1e-14, iterations=1, return_info=False)
 
     w, v, info = davidson(
         h,
-        neigen=2,
-        tol=1e-14,
-        itermax=1,
+        roots=2,
+        tolerance=1e-14,
+        iterations=1,
         return_info=True,
         return_partial=True,
     )

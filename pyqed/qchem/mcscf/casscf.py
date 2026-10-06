@@ -31,6 +31,8 @@ from .orbopt import (
     apply_factor_hessian_workspace,
     augmented_hessian_direction,
     create_factor_hessian_workspace,
+    create_factor_response_action,
+    create_integral_hessian_action,
     davidson_augmented_hessian_direction,
     diagonal_hessian,
     diagonal_inverse_hessian,
@@ -55,6 +57,7 @@ from .orbopt import (
 )
 from .reduced_ci import ReducedCISubspace, _transition_rdms_with_core, ci_diagonal
 from ..ci.fci import FCIStringBasis
+from .integral_blocks import IntegralBlocks, FactorIntegralBlocks
 
 
 class OrbitalDIIS:
@@ -217,6 +220,7 @@ class FirstOrderCASSCF:
         self.ci = None
         self.history = []
         self.converged = False
+        self._spin_square_cache = None
         self.casci = None
         self.orbital_diis = None
         self.lbfgs_s = []
@@ -338,8 +342,16 @@ class FirstOrderCASSCF:
         return mc
 
     def _casci_verbose(self):
-        """Keep CASSCF-level verbosity from leaking raw internal CASCI solves."""
-        return max(0, self.verbose - 1)
+        """Internal CI logging must not trigger diagnostic spin contractions."""
+        return 0
+
+    def _finalize_spin_diagnostics(self):
+        """Measure every final root once, independently of logging verbosity."""
+        values = self.spin_square()
+        if self.verbose >= 1:
+            for i, ss in enumerate(values):
+                print("CASSCF Root {}  E = {:.10f}  S^2 = {:.6f}".format(
+                    i, self.e_tot[i], ss))
 
     def _log_casscf_cycle(self, cycle, energy, gnorm, step_norm, micro_cycles=None):
         if self.verbose < 1:
@@ -389,6 +401,25 @@ class FirstOrderCASSCF:
         self.shift = probe.shift
         return self
 
+    def _require_converged_ci(self, mc, nstates):
+        from pyqed.mps.mps import MPS
+        def finite_root(root):
+            if isinstance(root, MPS):
+                blocks = [block for tensor in root.tensors for block in tensor.data.values()]
+                return bool(blocks) and all(block.size and np.all(np.isfinite(block)) for block in blocks)
+            return bool(np.size(root)) and bool(np.all(np.isfinite(root)))
+        energies = np.asarray(getattr(mc, 'e_tot', None))
+        roots = getattr(mc, 'ci', None)
+        valid = (bool(getattr(mc, 'converged', False))
+                 and energies.dtype.kind in 'fci' and energies.size >= nstates
+                 and np.all(np.isfinite(energies))
+                 and roots is not None and len(roots) >= nstates
+                 and all(finite_root(root) for root in roots))
+        if not valid:
+            self.converged = False
+            raise RuntimeError('CASSCF requires a converged inner CI solve with finite energies '
+                               'and coefficients for every requested root.')
+
     def _make_casci(self, mo_coeff, nstates, ci0=None):
         mc = CASCI(
             self.mf,
@@ -421,6 +452,7 @@ class FirstOrderCASSCF:
             ci0=ci0,
             use_cholesky=self.use_cholesky,
         )
+        self._require_converged_ci(mc, solve_nstates)
         self._reorder_tracked_ci_root(mc, requested_nstates, ci0)
         self.ncore = mc.ncore
         self._update_casci_cache(mc)
@@ -936,6 +968,7 @@ class FirstOrderCASSCF:
         # previous attempt before rebuilding the macroiteration history.
         self.history = []
         self.converged = False
+        self._spin_square_cache = None
         self.casci = None
         self.mo_coeff = None
         self.e_tot = None
@@ -1246,19 +1279,33 @@ class FirstOrderCASSCF:
                 )
             )
 
+        self.converged = False
         if self.casci is None or not np.allclose(mo_coeff, self.casci.mo_coeff):
             self.casci = self._make_casci(mo_coeff, nstates=self.nstates, ci0=ci_guess)
-
+        self._require_converged_ci(self.casci, self.nstates)
+        self.converged = True
         self.mo_coeff = self.casci.mo_coeff
         self.ci = self.casci.ci
         self.e_tot = self.casci.e_tot
         self.ncore = self.casci.ncore
+        self._finalize_spin_diagnostics()
         return self
 
-    def spin_square(self, state_id=0):
-        if self.casci is None:
-            raise ValueError("Run CASSCF before requesting spin diagnostics.")
-        return self.casci.spin_square(state_id)
+    def spin_square(self, state_id=None):
+        """Return cached final-root S² values, or one value for ``state_id``.
+
+        Values are measured at convergence and invalidated by a new run.
+        The all-roots result is a copy, so callers cannot modify the cache.
+        """
+        if not self.converged or self.casci is None:
+            raise ValueError("A converged CASSCF result is required for spin diagnostics.")
+        if self._spin_square_cache is None:
+            self._spin_square_cache = np.asarray([
+                self.casci.spin_square(i) for i in range(len(self.casci.ci))
+            ], dtype=float)
+        if state_id is None:
+            return self._spin_square_cache.copy()
+        return float(self._spin_square_cache[state_id])
 
     def make_rdm1(self, state_id=0, **kwargs):
         if self.casci is None:
@@ -1294,6 +1341,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     This implementation follows the macro/microiteration architecture of
     second-order CASSCF: within each macroiteration, MO integrals are frozen and
     the CI coefficients and orbital rotations are optimized in microiterations.
+
+    Real state-averaged analytic QN calculations use exact occupied integral
+    blocks and compact RDMs with packed-s8 or dense AO sources. Microsteps
+    rebuild these blocks from the unchanged AO source, rather than storing or
+    rotating a full MO tensor. CD sources use batched occupied blocks when
+    these require less storage than full MO factors; their trial steps build
+    only CI/gradient blocks. Other modes retain their dense/factorized paths.
+
+    The inner AH solve allows 30 iterations and a 40-vector subspace by
+    default, including the initial-subspace path. These are iteration limits,
+    not a guarantee that each inner solve reaches its residual tolerance.
 
     Coupling modes are:
 
@@ -1333,10 +1391,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         diis=False,
         diis_space=6,
         diis_start=2,
-        ah_max_cycle=6,
-        ah_max_subspace=12,
+        ah_max_cycle=30,
+        ah_max_subspace=40,
         ah_pspace_size=12,
-        ah_pspace_max_cycle=6,
+        ah_pspace_max_cycle=30,
         ah_trust_metric="component",
         ah_adaptive_trust=False,
         ah_fd_step=5.0e-4,
@@ -1590,7 +1648,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self.nelec = int(np.rint(np.sum(self.mo_occ)))
             self._energy_nuc = float(np.real(parent_mf.energy_nuc()))
             self._h1_mo = np.array(h1_mo, copy=True)
-            self.eri = np.array(eri_mo, copy=True)
+            self.eri = eri_mo if isinstance(eri_mo, IntegralBlocks) else np.array(eri_mo, copy=True)
+
+        def transform_eri(self, a, b, c, d):
+            if isinstance(self.eri, IntegralBlocks):
+                return self.eri.transform(a, b, c, d)
+            return np.einsum('pi,qj,pqrs,rk,sl->ijkl', a.conj(), b,
+                             self.eri, c.conj(), d, optimize=True)
 
         def energy_nuc(self):
             return self._energy_nuc
@@ -1606,6 +1670,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         def get_eri_mo(self, mo_coeff=None, notation="chem"):
             if mo_coeff is None:
                 mo_coeff = self.mo_coeff
+            if isinstance(self.eri, IntegralBlocks):
+                if notation != 'chem':
+                    raise NotImplementedError('Only chem notation is supported.')
+                return self.eri.transform(*([mo_coeff] * 4))
             eri = np.einsum(
                 "pi,qj,pqrs,rk,sl->ijkl",
                 mo_coeff.conj(),
@@ -1621,6 +1689,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
         def get_veff(self, dm):
             dm = np.asarray(dm)
+            if isinstance(self.eri, IntegralBlocks):
+                return self.eri.veff(dm)
             j = np.einsum("rs,pqrs->pq", dm, self.eri, optimize=True)
             k = np.einsum("rs,prqs->pq", dm, self.eri, optimize=True)
             return j - 0.5 * k
@@ -1634,7 +1704,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self.nelec = int(np.rint(np.sum(self.mo_occ)))
             self._energy_nuc = float(np.real(parent_mf.energy_nuc()))
             self._h1_mo = np.array(h1_mo, copy=True)
-            self.eri_factors = np.array(pair_factors, copy=True)
+            # Trial factor arrays are never updated in place. Keep a read-only
+            # view so accepted CI and QN workspaces can share their storage.
+            self.eri_factors = np.asarray(pair_factors).view()
+            self.eri_factors.flags.writeable = False
             self.cholesky_jk = True
             self.cholesky_tol = getattr(parent_mf, "cholesky_tol", None)
             self.cholesky_max_rank = getattr(parent_mf, "cholesky_max_rank", None)
@@ -1658,13 +1731,19 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         def get_veff(self, dm):
             dm = np.asarray(dm)
             factors = self.eri_factors
-            coeff = np.einsum("Pkl,lk->P", factors, dm, optimize=True)
+            occupied = np.flatnonzero(np.any(dm != 0, axis=0) | np.any(dm != 0, axis=1))
+            density = dm[np.ix_(occupied, occupied)]
+            left = factors[:, :, occupied]
+            right = factors[:, occupied, :]
+            coeff = np.einsum("Pkl,lk->P", left[:, occupied, :], density, optimize=True)
             j = np.einsum("P,Pij->ij", coeff, factors, optimize=True)
-            k = np.einsum("Pil,lk,Pkj->ij", factors, dm, factors, optimize=True)
+            k = np.einsum("Pil,lk,Pkj->ij", left, density, right, optimize=True)
             return j - 0.5 * k
 
     def _transform_frozen_integrals(self, h1_ref, eri_ref, U):
         h1 = U.conj().T @ h1_ref @ U
+        if isinstance(eri_ref, IntegralBlocks):
+            return h1, eri_ref.rotate(U)
         eri = np.einsum(
             "pi,qj,pqrs,rk,sl->ijkl",
             U.conj(),
@@ -1678,14 +1757,66 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
     def _transform_frozen_factor_integrals(self, h1_ref, pair_ref, U):
         h1 = U.conj().T @ h1_ref @ U
-        pair_factors = np.einsum(
-            "pi,Ppq,qj->Pij",
-            U.conj(),
-            pair_ref,
-            U,
-            optimize=True,
-        )
+        pair_factors = U.conj().T @ (pair_ref @ U)
         return h1, pair_factors
+
+    def _factor_block_source(self, coefficients):
+        if (self.use_cholesky and self.coupling == 'qn'
+                and self.ah_hessian != 'finite_difference'
+                and self.micro_ci_mode == 'full' and self.nstates > 1
+                and not np.iscomplexobj(coefficients)):
+            factors = _get_mf_cholesky_factors(self.mf)
+            source = getattr(factors, 'pair_factors', factors)
+            nocc = self._default_ncore() + self.ncas
+            if not np.iscomplexobj(source) and 2*nocc**2 <= source.shape[0]:
+                return source
+        return None
+
+    def _block_integral_source(self, coefficients):
+        if (self.coupling != 'qn' or self.ah_hessian == 'finite_difference'
+                or self.micro_ci_mode != 'full' or self.nstates == 1
+                or np.iscomplexobj(coefficients)):
+            return None
+        for owner in (self.mf, self.mf.mol):
+            for name in ('eri_s8', 'eri'):
+                source = getattr(owner, name, None)
+                if source is not None and np.ndim(source) in (1, 4) and not np.iscomplexobj(source):
+                    return np.asarray(source)
+        return None
+
+    def _transform_trial_integrals(self, h1_ref, eri_ref, U):
+        """Exact occupied-block trial transform for real, analytic SA-QN steps.
+
+        CI, the gradient, and the local integral Hessian need at most two
+        virtual indices. Other solver paths retain the full transformation.
+        The dense buffer is retained for the existing integral consumers;
+        entries with three or four virtual indices are deliberately absent.
+        Never use this buffer as a reference for a subsequent finite rotation.
+        """
+        if isinstance(eri_ref, FactorIntegralBlocks):
+            return U.T @ h1_ref @ U, eri_ref.trial_rotate(U)
+        if isinstance(eri_ref, IntegralBlocks):
+            return self._transform_frozen_integrals(h1_ref, eri_ref, U)
+        if (self.coupling != 'qn' or self.ah_hessian == 'finite_difference'
+                or self.micro_ci_mode != 'full' or self.nstates == 1
+                or np.iscomplexobj(U) or np.iscomplexobj(eri_ref)):
+            return self._transform_frozen_integrals(h1_ref, eri_ref, U)
+        nocc = self._default_ncore() + self.ncas
+        occ = U[:, :nocc]
+        h1 = U.T @ h1_ref @ U
+        # Contract the restricted indices first, before either full index.
+        ppoo = np.einsum('pi,qj,pqrs,rk,sl->ijkl', U, U, eri_ref,
+                         occ, occ, optimize=True)
+        popo = np.einsum('pi,qj,pqrs,rk,sl->ijkl', U, occ, eri_ref,
+                         U, occ, optimize=True)
+        eri = np.zeros_like(eri_ref)
+        eri[:, :, :nocc, :nocc] = ppoo
+        eri[:nocc, :nocc, :, :] = ppoo.transpose(2, 3, 0, 1)
+        eri[:, :nocc, :, :nocc] = popo
+        eri[:nocc, :, :, :nocc] = popo.transpose(1, 0, 2, 3)
+        eri[:, :nocc, :nocc, :] = popo.transpose(0, 1, 3, 2)
+        eri[:nocc, :, :nocc, :] = popo.transpose(1, 0, 3, 2)
+        return h1, eri
 
     def _orbital_unitary(self, kappa):
         kappa = np.asarray(kappa, dtype=float)
@@ -1737,6 +1868,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             ci0=ci0,
             use_cholesky=False,
         )
+        self._require_converged_ci(mc, solve_nstates)
         self._reorder_tracked_ci_root(mc, requested_nstates, ci0)
         self._update_casci_cache(mc)
         return mc
@@ -1781,6 +1913,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             ci0=ci0,
             use_cholesky=True,
         )
+        self._require_converged_ci(mc, solve_nstates)
         self._reorder_tracked_ci_root(mc, requested_nstates, ci0)
         self._update_casci_cache(mc)
         return mc
@@ -1815,6 +1948,18 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         trial_mc.solver_backend = "fixed_ci_keyframe_factor"
         return trial_mc
 
+    def _can_reuse_micro_ci(self, mc, nstates):
+        """Reuse only fully solved, accepted uncoupled/QN line-search roots."""
+        return (
+            self.micro_ci_mode == "full"
+            and self.coupling in {"qn", "none"}
+            and mc is not None
+            and bool(getattr(mc, "converged", False))
+            and len(mc.ci) == nstates
+            and np.shape(mc.e_tot) == (nstates,)
+            and np.all(np.isfinite(mc.e_tot))
+        )
+
     def _micro_line_search(
         self,
         h1_ref,
@@ -1831,7 +1976,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         minimum_decrease = max(1.0e-14, min(1.0e-10, 1.0e-5 * self.conv_tol))
         while scale >= 0.125:
             trial_U = self._apply_orbital_update(U, scale * kappa)
-            h1_trial, eri_trial = self._transform_frozen_integrals(h1_ref, eri_ref, trial_U)
+            h1_trial, eri_trial = self._transform_trial_integrals(h1_ref, eri_ref, trial_U)
             if relax_ci:
                 trial_mc = self._make_integral_casci(
                     h1_trial,
@@ -2152,6 +2297,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         )
         if len(self._qn_updates) > self.optimizer_history:
             self._qn_updates.pop(0)
+            # Each stored B@s includes earlier rank-two updates. Dropping
+            # the oldest pair requires rebuilding the retained sequence.
+            retained = [(y, s) for y, s, *_ in self._qn_updates]
+            self._qn_updates = []
+            for y, s in retained:
+                self._append_qn_update(s, y, base_matvec)
 
     def _relaxed_ci_hessian_action(
         self,
@@ -2359,6 +2510,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         kappa = np.asarray(kappa)
         nocc_like = int(dm1_occ.shape[0])
 
+        if factor_cache is not None:
+            if 'response_action' not in factor_cache:
+                factor_cache['response_action'] = create_factor_response_action(
+                    h1_mo, pair_factors, dm1_occ, dm2_occ)
+            if factor_cache['response_action'] is not None:
+                return factor_cache['response_action'](kappa)
+
         pair_full_occ = pair_factors[:, :, :nocc_like]
         pair_occ_occ = pair_full_occ[:, :nocc_like, :]
         pair_full_occ_matrix = None
@@ -2449,6 +2607,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         pair_occ_occ = pair_full_occ[:, :nocc, :]
         if factor_cache is None:
             factor_cache = {}
+
+        if 'response_action' not in factor_cache:
+            factor_cache['response_action'] = create_factor_response_action(
+                h1_mo, pair_factors, dm1_occ, dm2_occ)
+        if factor_cache['response_action'] is not None:
+            return np.stack([factor_cache['response_action'](k) for k in kappas])
 
         pair_matrix = factor_cache.get("pair_full_occ_matrix")
         if pair_matrix is None:
@@ -2626,14 +2790,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         the same at the current point because both unitary maps have identical
         first and second derivatives at zero: ``U = I + K + 1/2 K^2 + O(K^3)``.
         """
+        inputs = (h1_mo, eri_mo, dm1, dm2)
+        cached = getattr(self, '_integral_hessian_cache', None)
+        if cached is None or not all(a is b for a, b in zip(inputs, cached[0])):
+            action = create_integral_hessian_action(
+                *inputs, nocc=mc.ncore + mc.ncas,
+            )
+            self._integral_hessian_cache = (inputs, action)
+        else:
+            action = cached[1]
         return self._pack_orbitals(
-            orbital_hessian_action_from_integrals(
-                h1_mo,
-                eri_mo,
-                dm1,
-                dm2,
-                self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo),
-            ),
+            action(self._unpack_orbitals(vec, mc.ncore, mc.ncas, self.nmo)),
             mc.ncore,
             mc.ncas,
             self.nmo,
@@ -4773,14 +4940,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
     def _ao_overlap(self):
         overlap = getattr(self.mol, "overlap", None)
-        if overlap is not None:
-            return np.asarray(overlap)
+        if callable(overlap):
+            return np.asarray(overlap())
         get_ovlp = getattr(self.mf, "get_ovlp", None)
         if callable(get_ovlp):
             return np.asarray(get_ovlp())
         if self.active_overlap_floor > 0.0:
             raise ValueError(
-                "active_overlap_floor requires an AO overlap matrix on mol.overlap "
+                "active_overlap_floor requires an AO overlap matrix on mol.overlap() "
                 "or mf.get_ovlp()."
             )
         return None
@@ -4991,6 +5158,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self.micro_history = []
         self.active_overlap_history = []
         self.converged = False
+        self._spin_square_cache = None
         self.casci = None
         self.mo_coeff = None
         self.e_tot = None
@@ -5021,15 +5189,19 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ci_guess = self._copy_ci_guess(ci0)
         zero_step_recoveries = 0
 
+        factor_source = self._factor_block_source(mo_coeff)
+        factorized = self.use_cholesky and factor_source is None
+
         for macro in range(1, self.max_cycle + 1):
             mo_coeff, ci_guess = self._internal_preopt(mo_coeff, ci_guess, macro)
             self._full_derivative_cache = None
+            self._integral_hessian_cache = None
             self._full_derivative_sigma_cache = None
             self._full_coupled_seed = None
             self._joint_trial_sigma_cache = {}
             self.mo_coeff_ref = mo_coeff
             h1_ref = self.mf.get_hcore_mo(mo_coeff)
-            if self.use_cholesky:
+            if factorized:
                 pair_ref = transform_eri_factors_to_mo_pair(
                     _get_mf_cholesky_factors(self.mf),
                     mo_coeff,
@@ -5037,7 +5209,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 eri_ref = None
             else:
                 pair_ref = None
-                eri_ref = self.mf.get_eri_mo(mo_coeff, notation="chem")
+                if factor_source is not None:
+                    eri_ref = FactorIntegralBlocks(factor_source, mo_coeff, self._default_ncore() + self.ncas)
+                else:
+                    source = self._block_integral_source(mo_coeff)
+                    eri_ref = (IntegralBlocks(source, mo_coeff, self._default_ncore() + self.ncas)
+                               if source is not None else
+                               self.mf.get_eri_mo(mo_coeff, notation="chem"))
 
             U = np.eye(self.nmo)
             micro_mc = None
@@ -5057,9 +5235,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             keyframe_mc = None
             keyframe_ci = None
             ci_keyframe_mc = None
+            accepted_ci = None
 
             for micro in range(1, self.max_micro_cycle + 1):
-                if self.use_cholesky:
+                if micro == 1:
+                    h1_cur, eri_cur, pair_cur = h1_ref, eri_ref, pair_ref
+                elif accepted_ci is not None and accepted_ci[0] is U:
+                    frozen = accepted_ci[1].mf
+                    h1_cur = frozen._h1_mo
+                    eri_cur = None if factorized else frozen.eri
+                    pair_cur = frozen.eri_factors if factorized else None
+                elif factorized:
                     h1_cur, pair_cur = self._transform_frozen_factor_integrals(
                         h1_ref,
                         pair_ref,
@@ -5073,7 +5259,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 if self.coupling == "partial":
                     solve_nstates += max(0, self.coupled_ci_roots)
                 ci_relaxed = self.micro_ci_mode == "full" or micro == 1
-                if self.use_cholesky:
+                ci_reused = (
+                    accepted_ci is not None and accepted_ci[0] is U
+                    and self._can_reuse_micro_ci(accepted_ci[1], solve_nstates)
+                )
+                if ci_reused:
+                    mc = accepted_ci[1]
+                elif factorized:
                     if ci_relaxed:
                         mc = self._make_factor_integral_casci(
                             h1_cur,
@@ -5107,8 +5299,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         )
                 if ci_relaxed:
                     ci_keyframe_mc = mc
+                accepted_ci = None
                 energy = self._objective_energy(mc, self.state_id)
-                if self.use_cholesky:
+                if factorized:
                     dm1_occ, dm2_occ = self._effective_rdms_occ(mc, self.state_id)
                     nocc_like = mc.ncore + mc.ncas
                     fock = generalized_fock_from_factors(
@@ -5123,15 +5316,19 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     dm1 = dm1_occ
                     dm2 = dm2_occ
                 else:
-                    dm1, dm2 = self._effective_rdms(mc, self.state_id)
-                    fock = generalized_fock(h1_cur, eri_cur, dm1, dm2)
+                    if isinstance(eri_cur, IntegralBlocks):
+                        dm1, dm2 = self._effective_rdms_occ(mc, self.state_id)
+                    else:
+                        dm1, dm2 = self._effective_rdms(mc, self.state_id)
+                    fock = generalized_fock(h1_cur, eri_cur, dm1, dm2,
+                                            nocc=mc.ncore + mc.ncas)
                     grad = orbital_gradient(fock)
                     gnorm = self._gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
                     grad_vec = self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
                 if (
                     self.nstates == 1
                     and self.exact_state_specific_gradient
-                    and not self.use_cholesky
+                    and not factorized
                 ):
                     grad_vec = self._exact_orbital_gradient_vector(
                         mc,
@@ -5150,7 +5347,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 use_parameterized_hessian = self.ah_hessian == "finite_difference"
                 if use_parameterized_hessian:
                     orbital_hessian_model = "parameterized_finite_difference"
-                elif self.use_cholesky:
+                elif factorized:
                     orbital_hessian_model = "factorized_analytic_integral_response"
                 elif self.orbital_parameterization == "wmk":
                     orbital_hessian_model = "analytic_wmk_second_order"
@@ -5160,7 +5357,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 factor_hessian_cache = {}
 
                 def base_hessian_action(vec):
-                    if self.use_cholesky and not use_parameterized_hessian:
+                    if factorized and not use_parameterized_hessian:
                         return self._pack_orbitals(
                             self._orbital_hessian_action_from_factors(
                                 h1_cur,
@@ -5174,7 +5371,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             mc.ncas,
                             self.nmo,
                         )
-                    if self.use_cholesky:
+                    if factorized:
                         return self._factor_parameterized_orbital_hessian_action(
                             h1_cur,
                             pair_cur,
@@ -5204,7 +5401,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     )
 
                 base_hessian_action_block = None
-                if self.use_cholesky and not use_parameterized_hessian:
+                if factorized and not use_parameterized_hessian:
                     def base_hessian_action_block(vectors):
                         vectors = np.asarray(vectors, dtype=float)
                         kappas = np.stack(
@@ -5240,12 +5437,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                 if self.coupling == "qn" and qn_base_hessian_action is None:
                     h1_qn = np.array(h1_cur, copy=True)
-                    if self.use_cholesky:
-                        pair_qn = np.array(pair_cur, copy=True)
+                    if factorized:
+                        pair_qn = pair_cur
                         eri_qn = None
                     else:
                         pair_qn = None
-                        eri_qn = np.array(eri_cur, copy=True)
+                        eri_qn = eri_cur if isinstance(eri_cur, IntegralBlocks) else np.array(eri_cur, copy=True)
                     dm1_qn = np.array(dm1, copy=True)
                     dm2_qn = np.array(dm2, copy=True)
                     ncore_qn = mc.ncore
@@ -5255,14 +5452,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
                     ci_qn = None
                     if not (
-                        self.use_cholesky
+                        factorized
                         and not use_parameterized_hessian
                     ):
-                        ci_qn = np.array(mc.ci[self.state_id], copy=True)
+                        ci_qn = copy.deepcopy(mc.ci[self.state_id])
                     grad_qn = np.array(grad_vec, copy=True)
 
                     def qn_base_hessian_action(vec):
-                        if self.use_cholesky and not use_parameterized_hessian:
+                        if factorized and not use_parameterized_hessian:
                             return self._pack_orbitals(
                                 self._orbital_hessian_action_from_factors(
                                     h1_qn,
@@ -5276,7 +5473,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 mc.ncas,
                                 self.nmo,
                             )
-                        if self.use_cholesky:
+                        if factorized:
                             return self._factor_parameterized_orbital_hessian_action(
                                 h1_qn,
                                 pair_qn,
@@ -5305,7 +5502,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             vec,
                         )
 
-                    if self.use_cholesky and not use_parameterized_hessian:
+                    if factorized and not use_parameterized_hessian:
                         def qn_base_hessian_action_block(vectors):
                             vectors = np.asarray(vectors, dtype=float)
                             kappas = np.stack(
@@ -5353,7 +5550,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         )
                     )
                 elif self.coupling == "relaxed_fd":
-                    if self.use_cholesky:
+                    if factorized:
                         hessian_action = lambda vec: self._factor_relaxed_ci_hessian_action(
                             h1_ref,
                             pair_ref,
@@ -5392,6 +5589,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     )
 
                 micro_record = {
+                    "ci_reused": bool(ci_reused),
                     "macro": macro,
                     "micro": micro,
                     "energy": energy,
@@ -5528,7 +5726,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         step_vec,
                         step_limit,
                         return_info=True,
-                        pair_factors=pair_cur if self.use_cholesky else None,
+                        pair_factors=pair_cur if factorized else None,
                     )
                 else:
                     ah_guess = self._orbital_pspace_guess(
@@ -5632,7 +5830,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                                 np.dot(grad_vec, candidate_step)
                                 + 0.5 * np.dot(candidate_step, step_hv)
                             )
-                        if self.use_cholesky:
+                        if factorized:
                             trial_accepted, joint = self._factor_joint_trust_region_micro_search(
                                 h1_ref,
                                 pair_ref,
@@ -5704,7 +5902,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         model_linear = float(np.dot(grad_vec, candidate_step))
                         model_quadratic = float(np.dot(candidate_step, step_hv))
                         predicted = -(model_linear + 0.5 * model_quadratic)
-                        if self.use_cholesky:
+                        if factorized:
                             trial_accepted, trial_U, _, trial_mc, trial_scale = (
                                 self._factor_micro_line_search(
                                     h1_ref,
@@ -5743,7 +5941,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             # after the roots relax. Retry exactly only in this
                             # narrow tail instead of diagonalizing every trial.
                             exact_tail_retry = True
-                            if self.use_cholesky:
+                            if factorized:
                                 trial_accepted, trial_U, _, trial_mc, trial_scale = (
                                     self._factor_micro_line_search(
                                         h1_ref,
@@ -5990,6 +6188,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         step_vec,
                     )
                 micro_mc = trial_mc
+                # U and these roots belong to the same accepted line-search
+                # geometry. Never carry this reuse across a macro keyframe.
+                if self._can_reuse_micro_ci(trial_mc, solve_nstates):
+                    accepted_ci = (U, trial_mc)
                 local_ci_guess = self._copy_ci_guess(trial_mc.ci)
                 prev_micro_grad_vec = grad_vec.copy()
                 prev_micro_step_vec = accepted_scale * step_vec
@@ -6082,6 +6284,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 energy_converged
                 and micro_gnorm < self.conv_tol_grad_relaxed
                 and micro_ci_relaxed
+                and bool(getattr(micro_mc, "converged", False))
             ):
                 self.converged = True
                 break
@@ -6098,6 +6301,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             if active_orbitals is None and finite_energies:
                 self._try_active_restarts(initial_mo_coeff, min(finite_energies))
             if self.converged:
+                self._finalize_spin_diagnostics()
                 return self
             self.mo_coeff = np.array(mo_coeff, copy=True)
             self.casci = self._make_casci(
@@ -6122,16 +6326,20 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self.casci = micro_mc
             self.casci.mo_coeff = np.array(mo_coeff, copy=True)
         else:
+            self.converged = False
             self.casci = self._make_casci(
                 mo_coeff,
                 nstates=self.nstates,
                 ci0=ci_guess,
             )
+        self._require_converged_ci(self.casci, self.nstates)
+        self.converged = True
         self.ci = self.casci.ci
         self.e_tot = self.casci.e_tot
         self.ncore = self.casci.ncore
         if active_orbitals is None:
             self._try_active_restarts(initial_mo_coeff, float(np.ravel(self.e_tot)[0]))
+        self._finalize_spin_diagnostics()
         return self
 
 

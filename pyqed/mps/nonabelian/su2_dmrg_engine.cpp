@@ -603,16 +603,27 @@ std::size_t complementary_batch_target_elements() noexcept {
     return static_cast<std::size_t>(parsed);
 }
 
-std::size_t complementary_execution_cache_elements() noexcept {
+constexpr std::size_t large_complementary_plan_actions = 4'096;
+
+std::size_t complementary_execution_cache_elements(
+    std::size_t action_count = 0
+) noexcept {
     const char* value =
         std::getenv("PYQED_SU2_EXECUTION_CACHE_ELEMENTS");
     if (value == nullptr || value[0] == '\0') {
-        return 12'000'000;
+        // Large contextual plans reuse the packed boundary panels for every
+        // Davidson vector.  A small fixed cache made their repeated packing
+        // more expensive than the contractions it was meant to feed.
+        return action_count >= large_complementary_plan_actions
+            ? 96'000'000
+            : 12'000'000;
     }
     char* end = nullptr;
     const unsigned long long parsed = std::strtoull(value, &end, 10);
     if (end == value || *end != '\0' || parsed == 0) {
-        return 12'000'000;
+        return action_count >= large_complementary_plan_actions
+            ? 96'000'000
+            : 12'000'000;
     }
     return static_cast<std::size_t>(parsed);
 }
@@ -749,11 +760,18 @@ bool relieve_heap_at_half_sweep() noexcept {
     return value == nullptr || value[0] == '\0' || value[0] != '0';
 }
 
-std::size_t output_fusion_copy_budget() noexcept {
+std::size_t output_fusion_copy_budget(
+    std::size_t action_count = 0
+) noexcept {
     const char* value =
         std::getenv("PYQED_SU2_OUTPUT_FUSION_COPY_BUDGET");
     if (value == nullptr || value[0] == '\0') {
-        return 512;
+        // On large complementary plans the saved factor loads dominate the
+        // extra contiguous copies.  Retain the conservative small-plan
+        // threshold while allowing profitable large-plan fusion.
+        return action_count >= large_complementary_plan_actions
+            ? 8'192
+            : 512;
     }
     char* end = nullptr;
     const unsigned long long parsed =
@@ -761,7 +779,11 @@ std::size_t output_fusion_copy_budget() noexcept {
     return (
         end != value && end != nullptr && end[0] == '\0'
         ? static_cast<std::size_t>(parsed)
-        : 512
+        : (
+            action_count >= large_complementary_plan_actions
+            ? 8'192
+            : 512
+        )
     );
 }
 
@@ -8852,7 +8874,7 @@ void MovingEnvironment::local_diagonal(
     }
 }
 
-pyqed::dmrg::DavidsonResult MovingEnvironment::local_davidson(
+pyqed::linalg::DavidsonResult MovingEnvironment::local_davidson(
     const std::string& key,
     const Complex* diagonal,
     const Complex* guess,
@@ -8867,12 +8889,12 @@ pyqed::dmrg::DavidsonResult MovingEnvironment::local_davidson(
         throw std::invalid_argument("Local Davidson received a null vector.");
     }
     generalized_davidson_workspace_ =
-        pyqed::dmrg::GeneralizedDavidsonWorkspace{};
+        pyqed::linalg::GeneralizedDavidsonWorkspace{};
     real_generalized_davidson_workspace_ =
-        pyqed::dmrg::RealGeneralizedDavidsonWorkspace{};
+        pyqed::linalg::RealGeneralizedDavidsonWorkspace{};
     std::vector<Complex> diagonal_vector(diagonal, diagonal + dimension);
     std::vector<Complex> guess_vector(guess, guess + dimension);
-    auto result = pyqed::dmrg::davidson(
+    auto result = pyqed::linalg::davidson(
         diagonal_vector,
         std::move(guess_vector),
         tolerance,
@@ -12106,7 +12128,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
     static constexpr std::size_t target_wave_batches = 32;
     static constexpr std::size_t target_wave_bindings = 4'096;
     const std::size_t requested_output_copy_budget =
-        output_fusion_copy_budget();
+        output_fusion_copy_budget(raw_execution_actions_);
     const std::size_t requested_shared_right_copy_budget =
         shared_right_copy_budget();
     const std::size_t max_copy_elements_per_saved_gemm = (
@@ -12958,7 +12980,9 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
         const bool use_channel_left_output_groups =
             group_channel_left_outputs()
             && channel_unique_left_elements
-                <= complementary_execution_cache_elements();
+                <= complementary_execution_cache_elements(
+                    raw_execution_actions_
+                );
         for (
             std::size_t scheduled_index = 0;
             scheduled_index < wave.batches.size();
@@ -16886,7 +16910,9 @@ void MovingEnvironment::build_persistent_output_group_schedule() {
                 static_cast<long double>(la + dq)
                 * static_cast<long double>(total_k);
             const long double copy_budget =
-                static_cast<long double>(output_fusion_copy_budget())
+                static_cast<long double>(
+                    output_fusion_copy_budget(raw_execution_actions_)
+                )
                 * static_cast<long double>(binding_count - 1);
             if (binding_count < 2 || copied_elements > copy_budget) {
                 continue;
@@ -18442,7 +18468,7 @@ void MovingEnvironment::prepare_complementary_execution_slab() {
         std::numeric_limits<std::size_t>::max();
     restore_planned_complementary_right_layout();
     const std::size_t max_slab_elements =
-        complementary_execution_cache_elements();
+        complementary_execution_cache_elements(raw_execution_actions_);
     const std::size_t ordinary_cache_budget_elements =
         raw_execution_actions_ >= 20'000 ? 0 : 2'000'000;
     const double started = wall_seconds();
@@ -19559,7 +19585,7 @@ void MovingEnvironment::accumulate_raw_output_product(
         return;
     }
     if (cols == 1) {
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             111,
             static_cast<int>(rows),
@@ -19575,7 +19601,7 @@ void MovingEnvironment::accumulate_raw_output_product(
         );
         return;
     }
-    pyqed::dmrg::cblas_dgemv(
+    pyqed::linalg::cblas_dgemv(
         101,
         112,
         static_cast<int>(inner),
@@ -19603,7 +19629,7 @@ void MovingEnvironment::accumulate_reduced_contextual_output_product(
     std::int64_t output_stride
 ) {
     if (rows == 1) {
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             right.transposed() ? 111 : 112,
             static_cast<int>(
@@ -19624,7 +19650,7 @@ void MovingEnvironment::accumulate_reduced_contextual_output_product(
         return;
     }
     if (cols == 1 && left_stride == inner && output_stride == 1) {
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             111,
             static_cast<int>(rows),
@@ -20018,7 +20044,7 @@ void MovingEnvironment::apply_raw_factor_groups(
             }
         }
 #ifdef __APPLE__
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101, 111,
             static_cast<int>(execution.rows),
             static_cast<int>(execution.cols),
@@ -20031,7 +20057,7 @@ void MovingEnvironment::apply_raw_factor_groups(
             raw_output_real_.data(),
             1
         );
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101, 111,
             static_cast<int>(execution.rows),
             static_cast<int>(execution.cols),
@@ -20530,7 +20556,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 target += execution.sizes[segment];
             }
         }
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             111,
             static_cast<int>(execution.rows),
@@ -23037,7 +23063,7 @@ void MovingEnvironment::add_raw_factor_adjoint_real(
             );
         }
 #ifdef __APPLE__
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             112,
             static_cast<int>(execution.rows),
@@ -28375,21 +28401,36 @@ bool MovingEnvironment::install_contextual_factor_routes(
         return true;
     };
     auto structural_plan = contextual_route_plans_.end();
-    for (
-        auto candidate = contextual_route_plans_.begin();
-        candidate != contextual_route_plans_.end();
-        ++candidate
-    ) {
-        if (
-            candidate->second.bond == bond &&
-            candidate->second.structural_revision == structural_revision &&
-            candidate->second.n_basis == n_basis &&
-            candidate->second.decomposed.ready &&
-            candidate->second.execution &&
-            remap_decomposed_boundaries(candidate->second, false)
+    const std::size_t cached_bond_plans = static_cast<std::size_t>(
+        std::count_if(
+            contextual_route_plans_.begin(),
+            contextual_route_plans_.end(),
+            [bond](const auto& item) {
+                return item.second.bond == bond;
+            }
+        )
+    );
+    // Seed both center-motion topologies before recycling a structurally
+    // compatible entry.  The two directions generally share quantum labels
+    // but have different boundary shapes, so renaming the sole cached entry
+    // made each half sweep destroy the plan needed by the next cycle.
+    if (cached_bond_plans >= 2) {
+        for (
+            auto candidate = contextual_route_plans_.begin();
+            candidate != contextual_route_plans_.end();
+            ++candidate
         ) {
-            structural_plan = candidate;
-            break;
+            if (
+                candidate->second.bond == bond &&
+                candidate->second.structural_revision == structural_revision &&
+                candidate->second.n_basis == n_basis &&
+                candidate->second.decomposed.ready &&
+                candidate->second.execution &&
+                remap_decomposed_boundaries(candidate->second, false)
+            ) {
+                structural_plan = candidate;
+                break;
+            }
         }
     }
     if (structural_plan != contextual_route_plans_.end()) {
@@ -28465,14 +28506,6 @@ bool MovingEnvironment::install_contextual_factor_routes(
     }
     if (cached_plan != contextual_route_plans_.end()) {
         contextual_route_plans_.erase(cached_plan);
-    }
-    for (auto candidate = contextual_route_plans_.begin();
-         candidate != contextual_route_plans_.end();) {
-        if (candidate->second.bond == bond) {
-            candidate = contextual_route_plans_.erase(candidate);
-        } else {
-            ++candidate;
-        }
     }
     using LookupKey = std::array<std::int64_t, 3>;
     auto boundary_lookup = [](const PackedArena& arena) {
@@ -29315,9 +29348,14 @@ bool MovingEnvironment::install_contextual_factor_routes(
         return false;
     }
 
+    // A converged two-way sweep normally has two stable local topologies per
+    // bond: one produced while moving the center right and one while moving
+    // it left.  Keeping only one made the opposing half sweep evict exactly
+    // the plan needed by the next cycle, forcing route matching, reduced
+    // recoupling, and execution-schedule reconstruction on every visit.
     const std::size_t cache_limit = std::max<std::size_t>(
         2,
-        system_->n_sites()
+        2 * (system_->n_sites() - 1)
     );
     while (contextual_route_plans_.size() >= cache_limit) {
         auto victim = contextual_route_plans_.end();
@@ -30549,6 +30587,7 @@ bool MovingEnvironment::install_raw_factor_routes(
     std::vector<double>().swap(raw_batch_temporary_imag_);
     std::vector<Complex>().swap(factor_route_scratch_);
     raw_factor_routes_ = true;
+    reduced_contextual_routes_ = false;
     factor_routes_direct_actions_ = direct_actions;
     factor_route_count_ = n_routes;
     factor_route_key_ = key;
@@ -31042,7 +31081,7 @@ bool MovingEnvironment::factor_route_installed(
     );
 }
 
-pyqed::dmrg::DavidsonResult MovingEnvironment::factor_route_davidson(
+pyqed::linalg::DavidsonResult MovingEnvironment::factor_route_davidson(
     const std::string& key,
     const Complex* diagonal,
     const Complex* guess,
@@ -31059,9 +31098,9 @@ pyqed::dmrg::DavidsonResult MovingEnvironment::factor_route_davidson(
         );
     }
     generalized_davidson_workspace_ =
-        pyqed::dmrg::GeneralizedDavidsonWorkspace{};
+        pyqed::linalg::GeneralizedDavidsonWorkspace{};
     real_generalized_davidson_workspace_ =
-        pyqed::dmrg::RealGeneralizedDavidsonWorkspace{};
+        pyqed::linalg::RealGeneralizedDavidsonWorkspace{};
     const auto values_are_real = [dimension](const Complex* values) {
         for (std::size_t index = 0; index < dimension; ++index) {
             if (
@@ -31079,14 +31118,14 @@ pyqed::dmrg::DavidsonResult MovingEnvironment::factor_route_davidson(
         && values_are_real(diagonal)
         && values_are_real(guess)
     ) {
-        davidson_workspace_ = pyqed::dmrg::DavidsonWorkspace{};
+        davidson_workspace_ = pyqed::linalg::DavidsonWorkspace{};
         std::vector<double> diagonal_vector(dimension);
         std::vector<double> guess_vector(dimension);
         for (std::size_t index = 0; index < dimension; ++index) {
             diagonal_vector[index] = diagonal[index].real();
             guess_vector[index] = guess[index].real();
         }
-        auto result = pyqed::dmrg::real_davidson(
+        auto result = pyqed::linalg::real_davidson(
             diagonal_vector,
             std::move(guess_vector),
             tolerance,
@@ -31110,10 +31149,10 @@ pyqed::dmrg::DavidsonResult MovingEnvironment::factor_route_davidson(
         ++factor_route_davidson_calls_;
         return result;
     }
-    real_davidson_workspace_ = pyqed::dmrg::RealDavidsonWorkspace{};
+    real_davidson_workspace_ = pyqed::linalg::RealDavidsonWorkspace{};
     std::vector<Complex> diagonal_vector(diagonal, diagonal + dimension);
     std::vector<Complex> guess_vector(guess, guess + dimension);
-    auto result = pyqed::dmrg::davidson(
+    auto result = pyqed::linalg::davidson(
         diagonal_vector,
         std::move(guess_vector),
         tolerance,
@@ -31166,7 +31205,7 @@ bool MovingEnvironment::active_bond_complementary_action_ready(
     );
 }
 
-pyqed::dmrg::DavidsonResult
+pyqed::linalg::DavidsonResult
 MovingEnvironment::active_bond_complementary_davidson(
     const std::string& key,
     const Complex* guess,
@@ -31241,7 +31280,7 @@ MovingEnvironment::active_bond_complementary_davidson(
     ) {
         ++canonical_projection_davidson_calls_;
     }
-    pyqed::dmrg::DavidsonResult result = projected
+    pyqed::linalg::DavidsonResult result = projected
         ? factor_route_projected_davidson(
             key,
             active_bond_h_diagonal_.data(),
@@ -31698,7 +31737,7 @@ MovingEnvironment::prepare_and_solve_active_bond_state_average(
     }
     result.estimated_workspace_bytes = fixed_workspace_bytes
         + column_bytes * result.workspace_restart_dimension;
-    result.davidson = pyqed::dmrg::real_block_davidson(
+    result.davidson = pyqed::linalg::real_block_davidson(
         diagonal,
         guesses,
         nroots,
@@ -32748,7 +32787,7 @@ void MovingEnvironment::lift_projection(const Complex* input) {
                 projection_real_input_[col] = value.real();
                 projection_imag_input_[col] = value.imag();
             }
-            pyqed::dmrg::cblas_dgemv(
+            pyqed::linalg::cblas_dgemv(
                 101,
                 111,
                 static_cast<int>(component.rows),
@@ -32762,7 +32801,7 @@ void MovingEnvironment::lift_projection(const Complex* input) {
                 projection_real_output_.data(),
                 1
             );
-            pyqed::dmrg::cblas_dgemv(
+            pyqed::linalg::cblas_dgemv(
                 101,
                 111,
                 static_cast<int>(component.rows),
@@ -32795,7 +32834,7 @@ void MovingEnvironment::lift_projection(const Complex* input) {
                 )
             ];
         }
-        pyqed::dmrg::cblas_zgemv(
+        pyqed::linalg::cblas_zgemv(
             101,
             111,
             static_cast<int>(component.rows),
@@ -32929,7 +32968,7 @@ void MovingEnvironment::project_projection(
                 projection_imag_input_[row] =
                     projection_component_work_[row].imag();
             }
-            pyqed::dmrg::cblas_dgemv(
+            pyqed::linalg::cblas_dgemv(
                 101,
                 112,
                 static_cast<int>(component.rows),
@@ -32943,7 +32982,7 @@ void MovingEnvironment::project_projection(
                 projection_real_output_.data(),
                 1
             );
-            pyqed::dmrg::cblas_dgemv(
+            pyqed::linalg::cblas_dgemv(
                 101,
                 112,
                 static_cast<int>(component.rows),
@@ -32971,7 +33010,7 @@ void MovingEnvironment::project_projection(
         }
         const Complex alpha{1.0, 0.0};
         const Complex beta{0.0, 0.0};
-        pyqed::dmrg::cblas_zgemv(
+        pyqed::linalg::cblas_zgemv(
             101,
             113,
             static_cast<int>(component.rows),
@@ -33105,7 +33144,7 @@ void MovingEnvironment::lift_projection_real(const double* input) {
                 )
             ];
         }
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             111,
             static_cast<int>(component.rows),
@@ -33220,7 +33259,7 @@ void MovingEnvironment::project_projection_real(
                 static_cast<std::size_t>(component.parent_indices[row])
             ];
         }
-        pyqed::dmrg::cblas_dgemv(
+        pyqed::linalg::cblas_dgemv(
             101,
             112,
             static_cast<int>(component.rows),
@@ -33436,6 +33475,27 @@ void MovingEnvironment::factor_route_projected_matvec(
     ++projected_matvec_calls_;
 }
 
+void MovingEnvironment::factor_route_projected_matmat(
+    const std::string& key,
+    const Complex* input,
+    Complex* output,
+    std::size_t dimension,
+    std::size_t vectors
+) {
+    require_projection_key(key, dimension);
+    if (input == nullptr || output == nullptr) {
+        throw std::invalid_argument("Projected matmat received a null panel.");
+    }
+    for (std::size_t column = 0; column < vectors; ++column) {
+        apply_projection(
+            input + column * dimension,
+            output + column * dimension,
+            dimension
+        );
+    }
+    projected_matvec_calls_ += vectors;
+}
+
 void MovingEnvironment::factor_route_projected_real_matvec(
     const std::string& key,
     const double* input,
@@ -33457,7 +33517,7 @@ void MovingEnvironment::factor_route_projected_real_matvec(
     ++projected_matvec_calls_;
 }
 
-pyqed::dmrg::DavidsonResult
+pyqed::linalg::DavidsonResult
 MovingEnvironment::factor_route_projected_davidson(
     const std::string& key,
     const Complex* diagonal,
@@ -33473,9 +33533,9 @@ MovingEnvironment::factor_route_projected_davidson(
         throw std::invalid_argument("Projected Davidson received a null vector.");
     }
     generalized_davidson_workspace_ =
-        pyqed::dmrg::GeneralizedDavidsonWorkspace{};
+        pyqed::linalg::GeneralizedDavidsonWorkspace{};
     real_generalized_davidson_workspace_ =
-        pyqed::dmrg::RealGeneralizedDavidsonWorkspace{};
+        pyqed::linalg::RealGeneralizedDavidsonWorkspace{};
     const auto values_are_real = [dimension](const Complex* values) {
         for (std::size_t index = 0; index < dimension; ++index) {
             if (
@@ -33494,14 +33554,14 @@ MovingEnvironment::factor_route_projected_davidson(
         && values_are_real(diagonal)
         && values_are_real(guess)
     ) {
-        davidson_workspace_ = pyqed::dmrg::DavidsonWorkspace{};
+        davidson_workspace_ = pyqed::linalg::DavidsonWorkspace{};
         std::vector<double> diagonal_vector(dimension);
         std::vector<double> guess_vector(dimension);
         for (std::size_t index = 0; index < dimension; ++index) {
             diagonal_vector[index] = diagonal[index].real();
             guess_vector[index] = guess[index].real();
         }
-        auto result = pyqed::dmrg::real_davidson(
+        auto result = pyqed::linalg::real_davidson(
             diagonal_vector,
             std::move(guess_vector),
             tolerance,
@@ -33525,10 +33585,10 @@ MovingEnvironment::factor_route_projected_davidson(
         ++projected_davidson_calls_;
         return result;
     }
-    real_davidson_workspace_ = pyqed::dmrg::RealDavidsonWorkspace{};
+    real_davidson_workspace_ = pyqed::linalg::RealDavidsonWorkspace{};
     std::vector<Complex> diagonal_vector(diagonal, diagonal + dimension);
     std::vector<Complex> guess_vector(guess, guess + dimension);
-    auto result = pyqed::dmrg::davidson(
+    auto result = pyqed::linalg::davidson(
         diagonal_vector,
         std::move(guess_vector),
         tolerance,
@@ -35258,8 +35318,8 @@ MovingEnvironment::prepare_canonical_reduced_projection(
                 metric[col * component_dimension + row] = value;
             }
         }
-        pyqed::dmrg::RealSymmetricEigendecomposition eig =
-            pyqed::dmrg::symmetric_eigh(
+        pyqed::linalg::RealSymmetricEigendecomposition eig =
+            pyqed::linalg::symmetric_eigh(
                 metric,
                 component_dimension
             );
@@ -35474,7 +35534,7 @@ void MovingEnvironment::lift_factor_route_projection_vector(
     );
 }
 
-pyqed::dmrg::DavidsonResult
+pyqed::linalg::DavidsonResult
 MovingEnvironment::factor_route_generalized_davidson(
     const std::string& factor_route_key,
     const std::string& metric_key,
@@ -35500,8 +35560,8 @@ MovingEnvironment::factor_route_generalized_davidson(
             "Generalized Davidson received a null vector."
         );
     }
-    davidson_workspace_ = pyqed::dmrg::DavidsonWorkspace{};
-    real_davidson_workspace_ = pyqed::dmrg::RealDavidsonWorkspace{};
+    davidson_workspace_ = pyqed::linalg::DavidsonWorkspace{};
+    real_davidson_workspace_ = pyqed::linalg::RealDavidsonWorkspace{};
     const auto values_are_real = [dimension](const Complex* values) {
         for (std::size_t index = 0; index < dimension; ++index) {
             if (
@@ -35522,7 +35582,7 @@ MovingEnvironment::factor_route_generalized_davidson(
         && values_are_real(guess)
     ) {
         generalized_davidson_workspace_ =
-            pyqed::dmrg::GeneralizedDavidsonWorkspace{};
+            pyqed::linalg::GeneralizedDavidsonWorkspace{};
         std::vector<double> h_diagonal_vector(dimension);
         std::vector<double> n_diagonal_vector(dimension);
         std::vector<double> guess_vector(dimension);
@@ -35531,7 +35591,7 @@ MovingEnvironment::factor_route_generalized_davidson(
             n_diagonal_vector[index] = n_diagonal[index].real();
             guess_vector[index] = guess[index].real();
         }
-        auto result = pyqed::dmrg::real_generalized_davidson(
+        auto result = pyqed::linalg::real_generalized_davidson(
             h_diagonal_vector,
             n_diagonal_vector,
             std::move(guess_vector),
@@ -35572,7 +35632,7 @@ MovingEnvironment::factor_route_generalized_davidson(
         return result;
     }
     real_generalized_davidson_workspace_ =
-        pyqed::dmrg::RealGeneralizedDavidsonWorkspace{};
+        pyqed::linalg::RealGeneralizedDavidsonWorkspace{};
     std::vector<Complex> h_diagonal_vector(
         h_diagonal,
         h_diagonal + dimension
@@ -35582,7 +35642,7 @@ MovingEnvironment::factor_route_generalized_davidson(
         n_diagonal + dimension
     );
     std::vector<Complex> guess_vector(guess, guess + dimension);
-    auto result = pyqed::dmrg::generalized_davidson(
+    auto result = pyqed::linalg::generalized_davidson(
         h_diagonal_vector,
         n_diagonal_vector,
         std::move(guess_vector),
@@ -35614,7 +35674,7 @@ MovingEnvironment::factor_route_generalized_davidson(
     return result;
 }
 
-pyqed::dmrg::DavidsonResult
+pyqed::linalg::DavidsonResult
 MovingEnvironment::active_bond_complementary_generalized_davidson(
     const std::string& factor_route_key,
     const std::string& metric_key,
@@ -35692,7 +35752,7 @@ MovingEnvironment::active_bond_complementary_generalized_davidson(
         };
     }
     ++active_bond_complementary_generalized_davidson_calls_;
-    pyqed::dmrg::DavidsonResult result = projected
+    pyqed::linalg::DavidsonResult result = projected
         ? factor_route_projected_generalized_davidson(
             factor_route_key,
             metric_key,
@@ -35733,7 +35793,7 @@ MovingEnvironment::active_bond_complementary_generalized_davidson(
     return result;
 }
 
-pyqed::dmrg::DavidsonResult
+pyqed::linalg::DavidsonResult
 MovingEnvironment::factor_route_projected_generalized_davidson(
     const std::string& projection_key,
     const std::string& metric_key,
@@ -35759,8 +35819,8 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
             "Projected generalized Davidson received a null vector."
         );
     }
-    davidson_workspace_ = pyqed::dmrg::DavidsonWorkspace{};
-    real_davidson_workspace_ = pyqed::dmrg::RealDavidsonWorkspace{};
+    davidson_workspace_ = pyqed::linalg::DavidsonWorkspace{};
+    real_davidson_workspace_ = pyqed::linalg::RealDavidsonWorkspace{};
     const auto values_are_real = [dimension](const Complex* values) {
         for (std::size_t index = 0; index < dimension; ++index) {
             if (
@@ -35782,7 +35842,7 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
         && values_are_real(guess)
     ) {
         generalized_davidson_workspace_ =
-            pyqed::dmrg::GeneralizedDavidsonWorkspace{};
+            pyqed::linalg::GeneralizedDavidsonWorkspace{};
         std::vector<double> h_diagonal_vector(dimension);
         std::vector<double> n_diagonal_vector(dimension);
         std::vector<double> guess_vector(dimension);
@@ -35791,7 +35851,7 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
             n_diagonal_vector[index] = n_diagonal[index].real();
             guess_vector[index] = guess[index].real();
         }
-        auto result = pyqed::dmrg::real_generalized_davidson(
+        auto result = pyqed::linalg::real_generalized_davidson(
             h_diagonal_vector,
             n_diagonal_vector,
             std::move(guess_vector),
@@ -35903,10 +35963,10 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
                 guess,
                 guess + dimension
             );
-            pyqed::dmrg::GeneralizedDavidsonWorkspace
+            pyqed::linalg::GeneralizedDavidsonWorkspace
                 reference_workspace;
             const auto reference =
-                pyqed::dmrg::generalized_davidson(
+                pyqed::linalg::generalized_davidson(
                     reference_h,
                     reference_n,
                     std::move(reference_guess),
@@ -35964,7 +36024,7 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
         return result;
     }
     real_generalized_davidson_workspace_ =
-        pyqed::dmrg::RealGeneralizedDavidsonWorkspace{};
+        pyqed::linalg::RealGeneralizedDavidsonWorkspace{};
     std::vector<Complex> h_diagonal_vector(
         h_diagonal,
         h_diagonal + dimension
@@ -35974,7 +36034,7 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
         n_diagonal + dimension
     );
     std::vector<Complex> guess_vector(guess, guess + dimension);
-    auto result = pyqed::dmrg::generalized_davidson(
+    auto result = pyqed::linalg::generalized_davidson(
         h_diagonal_vector,
         n_diagonal_vector,
         std::move(guess_vector),
@@ -36080,7 +36140,7 @@ BlockSVDResult MovingEnvironment::blockwise_svd(
         ) {
             throw std::invalid_argument("Blockwise SVD packed offsets do not match shapes.");
         }
-        pyqed::dmrg::complex_thin_svd(
+        pyqed::linalg::complex_thin_svd(
             values + begin,
             n_rows,
             n_cols,
@@ -39500,15 +39560,15 @@ void MovingEnvironment::release_workspaces() {
     std::vector<double>().swap(active_bond_n_diagonal_real_);
     std::vector<Complex>().swap(active_bond_h_diagonal_);
     std::vector<Complex>().swap(active_bond_n_diagonal_);
-    davidson_workspace_ = pyqed::dmrg::DavidsonWorkspace{};
-    real_davidson_workspace_ = pyqed::dmrg::RealDavidsonWorkspace{};
+    davidson_workspace_ = pyqed::linalg::DavidsonWorkspace{};
+    real_davidson_workspace_ = pyqed::linalg::RealDavidsonWorkspace{};
     real_block_davidson_workspace_ =
-        pyqed::dmrg::RealBlockDavidsonWorkspace{};
+        pyqed::linalg::RealBlockDavidsonWorkspace{};
     generalized_davidson_workspace_ =
-        pyqed::dmrg::GeneralizedDavidsonWorkspace{};
+        pyqed::linalg::GeneralizedDavidsonWorkspace{};
     real_generalized_davidson_workspace_ =
-        pyqed::dmrg::RealGeneralizedDavidsonWorkspace{};
-    block_svd_workspace_ = pyqed::dmrg::ComplexThinSVDWorkspace{};
+        pyqed::linalg::RealGeneralizedDavidsonWorkspace{};
+    block_svd_workspace_ = pyqed::linalg::ComplexThinSVDWorkspace{};
     std::vector<double>().swap(boundary_update_temporary_);
     std::vector<double>().swap(boundary_update_product_);
 #ifdef __APPLE__
@@ -40521,7 +40581,8 @@ MovingEnvironment::complementary_execution_slab_capacity_bytes()
 std::size_t
 MovingEnvironment::complementary_execution_slab_budget_bytes()
     const noexcept {
-    return complementary_execution_cache_elements() * sizeof(double);
+    return complementary_execution_cache_elements(raw_execution_actions_)
+        * sizeof(double);
 }
 std::size_t
 MovingEnvironment::complementary_execution_slab_required_bytes()
