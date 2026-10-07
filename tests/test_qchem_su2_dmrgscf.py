@@ -186,7 +186,8 @@ def test_qchem_su2_sweep_measure_prefers_objective_residual():
     assert _qchem_sweep_measure(sweep_result) == 1.0e-2
 
 
-def test_su2_dmrgscf_separates_orbital_options_from_inner_sweeps():
+@pytest.mark.parametrize("optimizer,gap_floor", [("RCG", None), ("ISD", 0.1)])
+def test_su2_dmrgscf_separates_orbital_options_from_inner_sweeps(optimizer, gap_floor):
     mf = _h2_rhf()
     mc = DMRGSCF(
         mf,
@@ -203,7 +204,8 @@ def test_su2_dmrgscf_separates_orbital_options_from_inner_sweeps():
     mc.run(
         nstates=1,
         nsweeps=2,
-        optimizer="RCG",
+        optimizer=optimizer,
+        isd_gap_floor=gap_floor,
         optimizer_max_steps=5,
         optimizer_max_step_norm=0.1,
         diis=False,

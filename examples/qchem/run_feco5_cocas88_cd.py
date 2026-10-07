@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fe(CO)5 def2-SVP frontier COCAS with Cholesky integrals."""
+"""Fe(CO)5 frontier COCAS with Cholesky integrals and exact CASCI."""
 
 import argparse
 import hashlib
@@ -49,8 +49,8 @@ def plot_result(output, result):
     for axis in axes:
         axis.xaxis.set_major_locator(MaxNLocator(integer=True))
     cas = f"{result['nelecas']},{result['ncas']}"
-    name = f"feco5_def2svp_cocas{result['nelecas']}{result['ncas']}_cd_convergence"
-    fig.suptitle(f"Fe(CO)₅ · def2-SVP · COCAS({cas}) · CD threshold {result['cd_tol']:g}\n"
+    name = f"feco5_{result['basis'].replace('-', '')}_cocas{result['nelecas']}{result['ncas']}_cd_convergence"
+    fig.suptitle(f"Fe(CO)₅ · {result['basis']} · COCAS({cas}) · {result['optimizer']} · CD threshold {result['cd_tol']:g}\n"
                  f"CO converged: {result.get('macro_converged', False)}")
     for suffix in ("png", "pdf"):
         fig.savefig(output / f"{name}.{suffix}", dpi=180)
@@ -59,6 +59,7 @@ def plot_result(output, result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--basis", default="def2-svp")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--cas", nargs=2, type=int, metavar=("ELECTRONS", "ORBITALS"), default=(8, 8))
     parser.add_argument("--max-macro", type=int, default=150)
@@ -68,22 +69,24 @@ def main():
     parser.add_argument("--no-diis", action="store_true")
     parser.add_argument("--diis-residual", choices=("step", "transported_step", "gradient"), default="step")
     parser.add_argument("--optimizer", choices=("ISD", "RCG", "LBFGS"), default="RCG")
+    parser.add_argument("--isd-gap-floor", type=float)
     parser.add_argument("--physical-inner", action="store_true")
     parser.add_argument("--orbital-update", choices=("fixed_rdm", "relaxed_lbfgs"), default="fixed_rdm")
     args = parser.parse_args()
     nelecas, ncas = args.cas
     if nelecas <= 0 or nelecas % 2 or ncas <= 0 or nelecas > 2*ncas:
         parser.error("Use a positive even active electron count and sufficient active orbitals")
-    output = args.output or Path(f"/private/tmp/feco5_def2svp_cocas{nelecas}{ncas}_cd")
+    output = args.output or Path(f"/private/tmp/feco5_{args.basis.replace('-', '')}_cocas{nelecas}{ncas}_cd")
     output.mkdir(parents=True, exist_ok=True)
     start = time.perf_counter()
-    config = dict(basis="def2-svp", atom_angstrom=ATOM, ncas=ncas, nelecas=nelecas,
+    config = dict(basis=args.basis, atom_angstrom=ATOM, ncas=ncas, nelecas=nelecas,
                   active_selection="RHF frontier", integral_representation="CD",
                   cd_tol=args.cd_tol, max_macro=args.max_macro, macro_tol=1e-6,
                   orbital_gradient_tol=1e-4, ci_tol=1e-10, optimizer=args.optimizer,
                   optimizer_tol=1e-4, optimizer_max_steps=args.optimizer_max_steps,
                   diis=not args.no_diis and args.orbital_update == "fixed_rdm", diis_residual=args.diis_residual,
                   orbital_update=args.orbital_update,
+                  isd_gap_floor=args.isd_gap_floor,
                   physical_inner=args.physical_inner, threads=1)
     config.update(macro_reject_max=20 if args.orbital_update == "relaxed_lbfgs" else 8,
                   macro_trust_min=1e-8 if args.orbital_update == "relaxed_lbfgs" else 1e-4)
@@ -140,7 +143,7 @@ def main():
                 mf = pickle.load(handle)
         else:
             print("Building matrix-free CD integrals", flush=True)
-            mol = Molecule(atom=ATOM, unit="angstrom", basis="def2-svp")
+            mol = Molecule(atom=ATOM, unit="angstrom", basis=args.basis)
             mol.build(eri="cd", options={"low_rank_tol": args.cd_tol, "eri_screen_tol": 0.0,
                                         "workers": 1, "eri_backend": "cpp"})
             print(f"Built CD molecule: nao={mol.nao}, electrons={mol.nelec}", flush=True)
@@ -159,6 +162,7 @@ def main():
                        optimizer_max_steps=args.optimizer_max_steps,
                        physical_inner=args.physical_inner,
                        orbital_update=args.orbital_update,
+                       isd_gap_floor=args.isd_gap_floor,
                        diis=config["diis"], diis_residual=args.diis_residual,
                        use_cholesky=True, verbose=1)
         print(f"Initial active orbitals (one based): {list(range(solver.ncore+1, solver.ncore+ncas+1))}", flush=True)

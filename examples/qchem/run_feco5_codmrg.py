@@ -83,6 +83,8 @@ def main():
     parser.add_argument("--davidson-space", type=int, default=96)
     parser.add_argument("--davidson-tol", type=float, default=1e-10)
     parser.add_argument("--optimizer", default="ISD")
+    parser.add_argument("--isd-gap-floor", type=float, default=0.1,
+                        help="Positive gap floor for ISD scaling; 0 selects plain ISD.")
     parser.add_argument("--diis", action="store_true")
     parser.add_argument("--optimizer-steps", type=int, default=100)
     parser.add_argument("--optimizer-history", type=int, default=7)
@@ -93,6 +95,9 @@ def main():
     parser.add_argument("--orbitals", type=Path, help="Starting full MO coefficients (.npy).")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+    if args.isd_gap_floor < 0:
+        parser.error("--isd-gap-floor must be nonnegative")
+    isd_gap_floor = args.isd_gap_floor if args.optimizer.upper() == 'ISD' and args.isd_gap_floor > 0 else None
     output = args.output or Path(f"/private/tmp/feco5_def2svp_cas1212_codmrg_D{args.D}")
     output.mkdir(parents=True, exist_ok=True)
     started = time.perf_counter()
@@ -108,6 +113,7 @@ def main():
                                          "PYQED_SU2_DISABLE_OUTPUT_FUSION")},
                   schmidt_cutoff=args.cutoff, orbital_gradient_tol=1e-4,
                   optimizer=args.optimizer, optimizer_max_steps=args.optimizer_steps, optimizer_history=args.optimizer_history, optimizer_tol=args.optimizer_tol, diis=args.diis,
+                  isd_gap_floor=isd_gap_floor,
                   macro_trust_radius=args.trust_radius, macro_trust_max=args.trust_max)
     if args.initial_state:
         config["initial_state_sha256"] = hashlib.sha256(args.initial_state.read_bytes()).hexdigest()
@@ -201,6 +207,7 @@ def main():
                    su2_kernel_backend="cpp", max_bond_mode="per_sector",
                    orb_grad_tol=1e-4, macro_callback=checkpoint,
                    optimizer=args.optimizer, optimizer_max_steps=args.optimizer_steps, optimizer_history=args.optimizer_history, optimizer_tol=args.optimizer_tol, diis=args.diis,
+                   isd_gap_floor=isd_gap_floor,
                    macro_trust_radius=args.trust_radius, macro_trust_max=args.trust_max,
                    warm_start_dmrg=True, require_conv=False, macro_energy_rise_tol=1e-5,
                    davidson_tol=args.davidson_tol, davidson_max_iter=args.davidson_iterations,

@@ -19,7 +19,7 @@ from pyqed.qchem.mcscf.casci import (
 # from pyqed.qchem.mcscf.casci import CASCI
 
 
-from pyqed.optimize import OrbitalContractionPlan, minimize, lbfgs_direction, update_lbfgs_history
+from pyqed.optimize import OrbitalContractionPlan, minimize, lbfgs_direction, update_lbfgs_history, orbital_gap_preconditioner
 from pyqed.optimize import grad as opt_grad
 from pyqed.optimize import gradient as opt_gradient
 from pyqed.optimize import norm as opt_norm
@@ -752,6 +752,12 @@ class COCAS(CASCI):
     The driver uses only RDMs, omits CI-response microsteps, and provides
     no general macroiteration or quadratic-convergence guarantee.
 
+    ``isd_gap_floor=0.1`` enables positive reference-Fock gap scaling of
+    the ISD skew generator, retaining the implicit solve and unscaled
+    convergence criterion. This heuristic preconditioned adaptation is
+    documented in :func:`pyqed.optimize.orbital_gap_preconditioner`; it is
+    not the paper's plain ISD or an exact orbital Hessian.
+
     ``physical_inner=True`` restricts inner SD/RCG/L-BFGS directions and
     transported secants to the same physical blocks used by convergence
     checks. It removes core-core directions and, for exact CASCI, active-active
@@ -788,6 +794,7 @@ class COCAS(CASCI):
                  optimizer_tol=1.0e-4,
                  optimizer_max_steps=200,
                  optimizer_max_step_norm=None,
+                 isd_gap_floor=None,
                  physical_inner=False,
                  orbital_update="fixed_rdm",
                  macro_tol=1.0e-6,
@@ -812,6 +819,9 @@ class COCAS(CASCI):
         self.mo_coeff = None # opt orb
         # Orbital optimization backend for the U-matrix formulation.
         self.optimizer = optimizer.upper()
+        self.isd_gap_floor = isd_gap_floor
+        if isd_gap_floor is not None and (self.optimizer != "ISD" or orbital_update != "fixed_rdm"):
+            raise ValueError("ISD gap scaling requires a fixed-RDM ISD update")
         self.optimizer_history = optimizer_history
         self.physical_inner = bool(physical_inner)
         if orbital_update not in ("fixed_rdm", "relaxed_lbfgs"):
@@ -917,13 +927,14 @@ class COCAS(CASCI):
             U0[i, i] = 1.
 
         reference_fock = (C0.conj().T @ mf.get_fock() @ C0
-                          if self.orbital_update == "relaxed_lbfgs" else None)
+                          if self.orbital_update == "relaxed_lbfgs" or self.isd_gap_floor is not None else None)
 
         if nstates == 1: # ground state only
             C, mc = kernel(
                 mc, U0, nelecas, ncas, C0, h1e, eri,
                 max_cycles=self.max_cycles,
                 optimizer=self.optimizer,
+                isd_gap_floor=self.isd_gap_floor,
                 optimizer_history=self.optimizer_history,
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
@@ -961,6 +972,7 @@ class COCAS(CASCI):
                 mc, weights=self.weights, U0=U0, nelecas=nelecas, ncas=ncas,
                 C0=C0, h1e=h1e, eri=eri,
                 optimizer=self.optimizer,
+                isd_gap_floor=self.isd_gap_floor,
                 optimizer_history=self.optimizer_history,
                 optimizer_tol=self.optimizer_tol,
                 optimizer_max_steps=self.optimizer_max_steps,
@@ -1052,6 +1064,16 @@ def energy(U, h1e, eri, dm1, dm2):
     return e
 
 
+def _isd_scaling(optimizer, orbital_update, reference_fock, gap_floor):
+    if gap_floor is None:
+        return None
+    if optimizer.upper() != "ISD" or orbital_update != "fixed_rdm":
+        raise ValueError("ISD gap scaling requires a fixed-RDM ISD update")
+    if reference_fock is None:
+        raise ValueError("ISD gap scaling requires the reference-basis Fock matrix")
+    return orbital_gap_preconditioner(reference_fock, gap_floor)
+
+
 def _relaxed_update(orbital_update, diis, mc, ncas, reference_fock, history_size, max_step):
     if orbital_update == "fixed_rdm":
         return None
@@ -1071,7 +1093,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
            optimizer='RCG', optimizer_history=7, optimizer_tol=1.0e-4,
            optimizer_max_steps=200, optimizer_max_step_norm=None,
            physical_inner=False,
-           orbital_update="fixed_rdm", reference_fock=None,
+           orbital_update="fixed_rdm", reference_fock=None, isd_gap_floor=None,
            diis=True,
            diis_space=6, diis_start=2, diis_residual="step", ci_method='direct_ci',
            reject_macro_energy=True, macro_energy_rise_tol=1.0e-8,
@@ -1158,6 +1180,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
 
     relaxed = _relaxed_update(orbital_update, diis, mc, ncas, reference_fock,
                               optimizer_history, cap0)
+    isd_scaling = _isd_scaling(optimizer, orbital_update, reference_fock, isd_gap_floor)
 
     def opt_u(u, d1, d2, use_diis=True):
         if relaxed is not None:
@@ -1183,6 +1206,7 @@ def kernel(mc, U0, nelecas, ncas, C0, h1e, eri, max_cycles=30, tol=1e-6,
             max_iterations=optimizer_max_steps,
             max_step_norm=cap0,
             gradient_fn=contraction_plan.gradient,
+            isd_preconditioner=isd_scaling,
             projection_fn=(lambda x, g: _physical_orbital_gradient(
                 x, g, mc.ncore, ncas, active_active=active_active,
             )) if physical_inner else None,
@@ -1454,7 +1478,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
                          optimizer_max_steps=200,
                          optimizer_max_step_norm=None,
                          physical_inner=False,
-                         orbital_update="fixed_rdm", reference_fock=None,
+                         orbital_update="fixed_rdm", reference_fock=None, isd_gap_floor=None,
                          diis=True, diis_space=6,
                          diis_start=2, diis_residual="step", ci_method='direct_ci',
                          reject_macro_energy=True,
@@ -1504,6 +1528,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
 
     relaxed = _relaxed_update(orbital_update, diis, mc, ncas, reference_fock,
                               optimizer_history, cap0)
+    isd_scaling = _isd_scaling(optimizer, orbital_update, reference_fock, isd_gap_floor)
 
     def opt_u(u, d1, d2, use_diis=True):
         if relaxed is not None:
@@ -1526,6 +1551,7 @@ def kernel_state_average(mc, weights, U0, nelecas, ncas, C0, h1e, eri,
             max_iterations=optimizer_max_steps,
             max_step_norm=cap0,
             gradient_fn=contraction_plan.gradient,
+            isd_preconditioner=isd_scaling,
             projection_fn=(lambda x, g: _physical_orbital_gradient(
                 x, g, mc.ncore, ncas, active_active=active_active,
             )) if physical_inner else None,

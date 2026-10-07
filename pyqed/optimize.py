@@ -249,7 +249,38 @@ def _factorized_two_electron_gradient_action(U, D, pair_factors, dm2):
     )
 
 
-def isd_step(X, G, step):
+def orbital_gap_preconditioner(reference_fock, gap_floor=0.1):
+    """Positive orbital-gap scaling of an ISD skew generator.
+
+    In the reference-Fock eigenbasis divide ``A[i,j]`` by
+    ``max(2*abs(e[i]-e[j]), gap_floor)``. Positive symmetric denominators
+    preserve skew-Hermiticity and the descent identity
+    ``Re<G, B X> = Re<A, B>/2 > 0`` for ``B = precondition(A)``.
+
+    This is a heuristic orbital-curvature adaptation of the ISD update of
+    Zhang, Hu and Gu (2026), https://arxiv.org/abs/2606.17761, inspired by
+    metric preconditioning (Shustin and Avron, *Riemannian optimization with
+    a preconditioning scheme on the generalized Stiefel manifold*, 2023,
+    https://arxiv.org/abs/1902.01635). It is not their metric construction
+    or an exact orbital Hessian, and inherits no rate guarantee. The positive
+    floor handles degenerate gaps without removing active-active rotations.
+    """
+    fock = np.asarray(reference_fock)
+    if (fock.ndim != 2 or fock.shape[0] != fock.shape[1]
+            or not np.all(np.isfinite(fock)) or not np.isfinite(gap_floor) or gap_floor <= 0):
+        raise ValueError("A finite square Fock matrix and positive gap floor are required")
+    if not np.allclose(fock, fock.T.conj(), rtol=1e-12, atol=1e-12):
+        raise ValueError("Reference Fock must be Hermitian")
+    energies, vectors = np.linalg.eigh(fock)
+    diagonal = np.maximum(2 * abs(energies[:, None] - energies[None, :]), gap_floor)
+
+    def precondition(skew):
+        return vectors @ ((vectors.T.conj() @ skew @ vectors) / diagonal) @ vectors.T.conj()
+
+    return precondition
+
+
+def isd_step(X, G, step, preconditioner=None):
     """Implicit steepest-descent step followed by polar projection.
 
     Implements Eq. (16) of Zhang, Hu and Gu, *Constrained Optimization
@@ -259,6 +290,8 @@ def isd_step(X, G, step):
     to complex orbitals; no Cayley or explicit-descent substitution is used.
     """
     skew = G @ X.T.conj() - X @ G.T.conj()
+    if preconditioner is not None:
+        skew = preconditioner(skew)
     return project(np.linalg.solve(np.eye(X.shape[0], dtype=skew.dtype) + step * skew, X))
 
 
@@ -267,7 +300,7 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
              history_size=7, max_iterations=200, max_step_norm=None,
              newton_shift=1e-4, newton_max_cycle=6,
              newton_max_subspace=12, newton_tol=1e-4,
-             gradient_fn=None, projection_fn=None):
+             gradient_fn=None, projection_fn=None, isd_preconditioner=None):
     """
     Minimize ``f(X)`` subject to orthonormal columns ``X.T @ X = I``.
 
@@ -323,6 +356,13 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         transport. The default is the complete Stiefel tangent space.
         Supported for SD, RCG and LBFGS; the Hessian implementations require
         the complete Stiefel tangent space.
+    isd_preconditioner : callable or None, optional
+        Positive self-adjoint scaling of the skew generator, for ISD only.
+        ``orbital_gap_preconditioner`` supplies a reference-Fock heuristic.
+        The implicit solve, polar projection and Armijo search are retained;
+        BB differences use the scaled search gradients. This is an adaptation
+        of plain ISD, not an exact reproduction or a convergence-rate claim.
+        Convergence is always checked with the unscaled canonical gradient.
 
     Returns
     -------
@@ -357,6 +397,8 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
 
     if projection_fn is not None and algorithm in ('ISD', 'NEWTON', 'AH'):
         raise ValueError("A custom tangent projection requires SD, RCG or LBFGS")
+    if isd_preconditioner is not None and algorithm != 'ISD':
+        raise ValueError("The ISD preconditioner requires algorithm='ISD'")
 
     # Start from a projected point so the optimizer can be called with slightly
     # noisy guesses without violating the manifold constraint.
@@ -376,7 +418,12 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
     lbfgs_y = []
 
     while norm(df) > epsilon and (max_iterations is None or k < int(max_iterations)):
-        if algorithm == 'LBFGS':
+        if algorithm == 'ISD':
+            skew = G @ X.T.conj() - X @ G.T.conj()
+            if isd_preconditioner is not None:
+                skew = isd_preconditioner(skew)
+            direction = -skew @ X
+        elif algorithm == 'LBFGS':
             direction = -project_tangent(X, lbfgs_direction(df, lbfgs_s, lbfgs_y))
         elif algorithm in ('NEWTON', 'AH'):
             direction = matrix_free_newton_direction(
@@ -398,6 +445,8 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
             # longer points downhill.
             direction = -df
             directional_derivative = -np.real(inner(G if algorithm == 'ISD' else df, df))
+            if algorithm == 'ISD':
+                skew = G @ X.T.conj() - X @ G.T.conj()
 
         step = max(min(tau, tauM), taum)
         step = clip_step_size(direction, step, max_step_norm)
@@ -407,7 +456,8 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         # while still converging more aggressively than strict monotone descent.
         accepted = False
         while True:
-            Y = isd_step(X, G, step) if algorithm == 'ISD' else retract(X, step * direction)
+            Y = (project(np.linalg.solve(np.eye(X.shape[0], dtype=skew.dtype) + step * skew, X))
+                 if algorithm == 'ISD' else retract(X, step * direction))
             trial_value = f(Y, *args)
             if trial_value <= C + rho1 * step * directional_derivative:
                 accepted = True
@@ -453,7 +503,11 @@ def minimize(f, X0, args=(), tau=2, taum=1e-15, tauM=1e15, eta=0.85,
         # L-BFGS already scales its direction with an inverse-Hessian model.
         # A second BB curvature scale can suppress stiff-coordinate steps twice.
         if algorithm == 'ISD':
-            displacement, difference = Xnew - X, df_new - df
+            scaled_new = df_new
+            if isd_preconditioner is not None:
+                new_skew = Gnew @ Xnew.T.conj() - Xnew @ Gnew.T.conj()
+                scaled_new = isd_preconditioner(new_skew) @ Xnew
+            displacement, difference = Xnew - X, scaled_new - skew @ X
             curvature = abs(inner(displacement, difference))
             square = abs(inner(difference, difference))
             tau = (stepsize(k + 1, displacement, difference)

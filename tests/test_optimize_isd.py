@@ -1,7 +1,7 @@
 """Reference implicit updates and analytic constrained minima for ISD."""
 import numpy as np
 import pytest
-from pyqed.optimize import isd_step, minimize, project
+from pyqed.optimize import isd_step, minimize, project, orbital_gap_preconditioner
 
 
 @pytest.mark.parametrize('complex_orbitals', [False, True])
@@ -35,6 +35,34 @@ def test_isd_rejects_restricted_projection():
     with pytest.raises(ValueError, match='custom tangent projection'):
         minimize(lambda u: 0., np.eye(2), algorithm='ISD',
                  gradient_fn=lambda u: u, projection_fn=lambda u, g: g)
+
+
+def test_gap_scaling_preserves_skew_and_descent():
+    rng = np.random.default_rng(24)
+    x = project(rng.normal(size=(7,3)) + 1j*rng.normal(size=(7,3)))
+    g = rng.normal(size=x.shape) + 1j*rng.normal(size=x.shape)
+    basis = project(rng.normal(size=(7,7)) + 1j*rng.normal(size=(7,7)))
+    fock = basis @ np.diag([0., 0., .1, 1., 10., 100., 1000.]) @ basis.conj().T
+    a = g @ x.conj().T - x @ g.conj().T
+    b = orbital_gap_preconditioner(fock)(a)
+    np.testing.assert_allclose(b, -b.conj().T, atol=1e-12)
+    slope = np.vdot(g, b @ x).real
+    np.testing.assert_allclose(slope, .5*np.vdot(a,b).real, atol=1e-12)
+    assert slope > 0
+    np.testing.assert_allclose(isd_step(x,g,.01,orbital_gap_preconditioner(fock)).conj().T
+                               @ isd_step(x,g,.01,orbital_gap_preconditioner(fock)), np.eye(3), atol=1e-12)
+
+
+def test_preconditioned_isd_resolves_large_curvature_spread():
+    matrix = np.diag([0., 1., 10., 10000.])
+    initial = project(np.array([[1.], [.1], [.02], [.001]]))
+    g = lambda u: 2 * matrix @ u
+    u, energy = minimize(lambda u: float((u.T @ matrix @ u).item()), initial,
+                        gradient_fn=g, algorithm='ISD', tau=1.,
+                        isd_preconditioner=orbital_gap_preconditioner(matrix),
+                        max_iterations=100, epsilon=1e-7)
+    assert energy < 1e-14
+    assert np.linalg.norm(g(u)-u@(g(u).T@u)) < 1e-7
 
 
 def test_isd_armijo_accepts_rotation_inside_frame():

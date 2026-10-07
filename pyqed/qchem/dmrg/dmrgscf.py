@@ -386,6 +386,7 @@ class DMRGSCF(QCDMRG):
             "optimizer_tol": kwargs.pop("optimizer_tol", 1.0e-4),
             "optimizer_max_steps": kwargs.pop("optimizer_max_steps", 200),
             "optimizer_max_step_norm": kwargs.pop("optimizer_max_step_norm", None),
+            "isd_gap_floor": kwargs.pop("isd_gap_floor", None),
             "diis": kwargs.pop("diis", True),
             "diis_space": kwargs.pop("diis_space", 6),
             "diis_start": kwargs.pop("diis_start", 2),
@@ -394,6 +395,8 @@ class DMRGSCF(QCDMRG):
         }
         if orbital_options["macro_callback"] is not None and orbital_driver != "constrained":
             raise ValueError("macro_callback currently requires the constrained orbital driver.")
+        if orbital_options["isd_gap_floor"] is not None and orbital_driver != "constrained":
+            raise ValueError("ISD gap scaling requires the constrained orbital driver")
         # One exact DMRG keyframe followed by fixed-MPS AH steps amortizes the
         # sweep and 2-RDM costs while retaining an exact solve each macrocycle.
         orbital_micro_cycles = int(kwargs.pop("orbital_micro_cycles", 4))
@@ -550,6 +553,12 @@ class DMRGSCF(QCDMRG):
                 )
             return self
 
+        if orbital_options["isd_gap_floor"] is not None:
+            if orbital_options["optimizer"].upper() != "ISD":
+                raise ValueError("ISD gap scaling requires optimizer='ISD'")
+            reference_fock = kwargs.pop("reference_fock", None)
+            orbital_options["reference_fock"] = (C0.conj().T @ mf.get_fock() @ C0
+                                                  if reference_fock is None else reference_fock)
         mc = _fresh_casci_like(self, solver_cls=QCDMRG)
 
         # DMRGSCF owns the final convergence policy so it can distinguish the

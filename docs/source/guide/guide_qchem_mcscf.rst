@@ -190,6 +190,22 @@ included. Neither quadratic convergence nor a general reduction in
 macroiterations is guaranteed; compare both energy and physical-gradient
 convergence for the system of interest.
 
+``optimizer="ISD", isd_gap_floor=0.1`` enables positive orbital-gap
+preconditioning. In the reference-Fock eigenbasis, the skew generator is
+divided elementwise by ``max(2*abs(e_i-e_j), isd_gap_floor)``. Symmetric
+positive weights preserve skew-Hermiticity and a descent direction. The
+implicit solve and polar projection remain; alternating BB steps use
+scaled search-gradient differences, while the stopping test uses the
+unscaled gradient. The gap floor retains degenerate and active-active
+directions. ``isd_gap_floor=None`` selects plain ISD.
+
+This is a heuristic curvature adaptation inspired by B. Shustin and
+H. Avron, *Riemannian optimization with a preconditioning scheme on the
+generalized Stiefel manifold* (2023), https://arxiv.org/abs/1902.01635.
+It is not their metric construction or an exact orbital Hessian and
+inherits no convergence-rate guarantee. The Fe(CO)5 runner enables a
+0.1 Hartree floor by default; ``--isd-gap-floor 0`` selects plain ISD.
+
 Active Space Selection
 ----------------------
 

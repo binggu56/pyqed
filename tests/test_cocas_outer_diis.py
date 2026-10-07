@@ -77,9 +77,12 @@ def test_ill_conditioned_history_falls_back_without_large_coefficients():
 
 
 @pytest.mark.parametrize('state_average', [False, True])
-@pytest.mark.parametrize('physical_inner', [False, True])
-@pytest.mark.parametrize('orbital_update', ['fixed_rdm', 'relaxed_lbfgs'])
-def test_orbital_updates_use_current_ci_rdms(monkeypatch, state_average, physical_inner, orbital_update):
+@pytest.mark.parametrize('physical_inner,orbital_update,gap_floor', [
+    (False, 'fixed_rdm', None), (True, 'fixed_rdm', None),
+    (False, 'relaxed_lbfgs', None), (True, 'relaxed_lbfgs', None),
+    (False, 'fixed_rdm', 0.1),
+])
+def test_orbital_updates_use_current_ci_rdms(monkeypatch, state_average, physical_inner, orbital_update, gap_floor):
     from types import SimpleNamespace
     import pyqed.qchem.mcscf.cocas as co
 
@@ -123,7 +126,12 @@ def test_orbital_updates_use_current_ci_rdms(monkeypatch, state_average, physica
     monkeypatch.setattr(co, 'OrbitalContractionPlan', Plan)
     monkeypatch.setattr(co, '_apply_orbital_diis', apply)
     monkeypatch.setattr(co, '_run_macro_casci', lambda _mc, *_a, mo_coeff, **_kw: state(mo_coeff))
-    def inner(_f, base, *, projection_fn, **_kw):
+    def inner(_f, base, *, projection_fn, isd_preconditioner, **_kw):
+        if gap_floor is not None:
+            skew = np.array([[0.0, 1.0], [-1.0, 0.0]])
+            np.testing.assert_allclose(isd_preconditioner(skew), skew / 2)
+        else:
+            assert isd_preconditioner is None
         if physical_inner:
             vector = np.array([[0.2], [0.5]])
             np.testing.assert_allclose(projection_fn(base, vector),
@@ -145,6 +153,8 @@ def test_orbital_updates_use_current_ci_rdms(monkeypatch, state_average, physica
     options = dict(max_cycles=2, tol=0, diis_residual='gradient',
                    physical_inner=physical_inner, orbital_update=orbital_update,
                    diis=orbital_update == 'fixed_rdm', raise_on_nonconvergence=False)
+    if gap_floor is not None:
+        options.update(optimizer='ISD', isd_gap_floor=gap_floor, reference_fock=matrix)
     if state_average:
         co.kernel_state_average(state(initial), weights, *args, **options)
     else:
