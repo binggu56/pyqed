@@ -77,7 +77,7 @@ export const links = {
     "https://github.com/binggu56/pyqed/blob/main/examples/namd/pyrazine_24mode_ldrfg.py",
   pypi: "https://pypi.org/project/pyqed/0.2.0/",
   release: "https://github.com/binggu56/pyqed/releases/tag/v0.2.0",
-  citation: "https://github.com/binggu56/pyqed/blob/main/CITATION.cff",
+  citation: paper.url,
   contributing:
     "https://github.com/binggu56/pyqed/blob/main/CONTRIBUTING.md",
   contributors: "https://github.com/binggu56/pyqed/graphs/contributors",

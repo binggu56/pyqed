@@ -179,7 +179,7 @@ const projectPaths = [
   {
     label: "Cite",
     title: paper.title,
-    description: `${paper.authors.join(", ")} · ${paper.journal} (${paper.year}). Cite the article for the project and the Zenodo archive for the exact software release.`,
+    description: `${paper.authors.join(", ")} · ${paper.journal} (${paper.year}).`,
     href: paper.url,
     action: `Open DOI ${paper.doi}`,
   },
@@ -648,16 +648,9 @@ export default function Home() {
               <div className="community-note">
                 <strong>Using PyQED in published work?</strong>
                 <p>
-                  Cite the <a href={paper.url}>PyQED project paper</a> for the
-                  framework and the <a href={softwareArchive.versionUrl}>
-                    archived v{release.version} release (DOI {softwareArchive.versionDoi})
-                  </a>{" "}
-                  for the software used. The all-versions DOI{" "}
-                  <a href={softwareArchive.conceptUrl}>
-                    {softwareArchive.conceptDoi}
-                  </a>{" "}
-                  resolves all archived versions; also record the exact commit
-                  and cite the algorithms used.
+                  Please cite <a href={paper.url}>{paper.title}</a> by{" "}
+                  {paper.authors.join(", ")}, published in <em>{paper.journal}</em>{" "}
+                  ({paper.year}). DOI: <a href={paper.url}>{paper.doi}</a>.
                 </p>
               </div>
             </div>
