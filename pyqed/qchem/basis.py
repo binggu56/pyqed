@@ -2492,6 +2492,16 @@ def _matrix_free_spherical_cd_factors(
     return factors, info
 
 
+def _ri_storage(shape):
+    """Packed RI workspace, using anonymous local disk above 32 MiB."""
+    size = int(np.prod(shape)) * 8
+    if size <= 32 * 2**20:
+        return np.empty(shape, dtype=np.float64)
+    with tempfile.TemporaryFile() as file:
+        file.truncate(size)
+        return np.memmap(file, mode="r+", dtype=np.float64, shape=shape)
+
+
 def _transform_ri_tensors_to_spherical(metric, j3_pair, primary_transform, aux_transform):
     metric = np.asarray(metric, dtype=np.float64)
     j3_pair = np.asarray(j3_pair, dtype=np.float64)
@@ -2508,7 +2518,7 @@ def _transform_ri_tensors_to_spherical(metric, j3_pair, primary_transform, aux_t
 
     bytes_per_aux = max(1, nao_cart * nao_cart * np.dtype(np.float64).itemsize)
     block_size = max(1, min(naux_cart, (32 << 20) // bytes_per_aux))
-    primary_spherical = np.empty((naux_cart, sph_rows.size), dtype=np.float64)
+    primary_spherical = _ri_storage((naux_cart, sph_rows.size))
     for start in range(0, naux_cart, block_size):
         stop = min(start + block_size, naux_cart)
         dense = np.zeros((stop - start, nao_cart, nao_cart), dtype=np.float64)
@@ -2526,7 +2536,12 @@ def _transform_ri_tensors_to_spherical(metric, j3_pair, primary_transform, aux_t
     metric_spherical = np.linalg.multi_dot(
         (aux_transform.T, metric, aux_transform)
     )
-    j3_spherical = aux_transform.T @ primary_spherical
+    del dense, transformed
+    j3_spherical = _ri_storage((aux_transform.shape[1], sph_rows.size))
+    pair_block = max(1, (16 << 20)//max(8*naux_cart, 1))
+    for start in range(0, sph_rows.size, pair_block):
+        stop = min(start+pair_block, sph_rows.size)
+        j3_spherical[:, start:stop] = aux_transform.T @ primary_spherical[:, start:stop]
     return (
         np.ascontiguousarray(metric_spherical, dtype=np.float64),
         np.ascontiguousarray(j3_spherical, dtype=np.float64),
@@ -3896,25 +3911,41 @@ def _compute_three_center_pair_tensor_parallel(
     return j3, computed, skipped
 
 
-def _metric_factorize_ri(metric, j3_pair, tol=1e-10, solver="auto", block_size=None):
+def _metric_factorize_ri(
+    metric, j3_pair, tol=1e-10, solver="auto", block_size=None, disk_backed=False
+):
+    """Whiten packed three-center factors in bounded pair blocks.
+
+    Disk-backed output preserves the same RI metric and rank selection; it
+    changes storage only. Temporary files are released with the arrays.
+    """
+    from scipy.linalg import solve_triangular
+
+    def allocate(shape):
+        return _ri_storage(shape) if disk_backed else np.empty(shape, dtype=np.float64)
+
     solver = str(solver or "auto").lower().replace("_", "-")
     if solver not in {"auto", "cholesky", "eig", "eigh"}:
-        raise ValueError("builtin_ri_metric_solver must be 'auto', 'cholesky', or 'eigh'.")
+        raise ValueError(
+            "builtin_ri_metric_solver must be 'auto', 'cholesky', or 'eigh'."
+        )
     metric = np.asarray(metric, dtype=np.float64)
     j3_pair = np.asarray(j3_pair, dtype=np.float64)
     naux, npair = j3_pair.shape
     if block_size is None:
-        block_size = max(1, min(npair, 8192))
+        block_size = max(1, min(npair, (16 << 20) // max(8 * naux, 1)))
     else:
         block_size = max(1, int(block_size))
 
     if solver in {"auto", "cholesky"}:
         try:
             chol = np.linalg.cholesky(metric)
-            factors = np.empty_like(j3_pair)
+            factors = allocate(j3_pair.shape)
             for start in range(0, npair, block_size):
                 stop = min(start + block_size, npair)
-                factors[:, start:stop] = np.linalg.solve(chol, j3_pair[:, start:stop])
+                factors[:, start:stop] = solve_triangular(
+                    chol, j3_pair[:, start:stop], lower=True, check_finite=False
+                )
             return factors, {
                 "metric_solver": "cholesky",
                 "metric_rank": int(naux),
@@ -3927,8 +3958,10 @@ def _metric_factorize_ri(metric, j3_pair, tol=1e-10, solver="auto", block_size=N
     evals, evecs = np.linalg.eigh(metric)
     keep = evals > float(tol)
     if not np.any(keep):
-        raise ValueError("Auxiliary Coulomb metric has no eigenvalues above ri_metric_tol.")
-    factors = np.empty((int(np.count_nonzero(keep)), npair), dtype=np.float64)
+        raise ValueError(
+            "Auxiliary Coulomb metric has no eigenvalues above ri_metric_tol."
+        )
+    factors = allocate((int(np.count_nonzero(keep)), npair))
     projector = evecs[:, keep].T / np.sqrt(evals[keep])[:, None]
     for start in range(0, npair, block_size):
         stop = min(start + block_size, npair)
@@ -4336,7 +4369,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         ri_timings["spherical_transform"] = time.perf_counter() - t0
         tensor_builder = f"{tensor_builder}-spherical-pair-blocked"
     kernel_info = dict(_NATIVE_RI_LAST_KERNEL_INFO or {})
-    evals, evecs = np.linalg.eigh(metric)
+    evals = np.linalg.eigvalsh(metric)
     keep = evals > tol
     if not np.any(keep):
         raise ValueError(
@@ -4349,9 +4382,11 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         j3_pair,
         tol=tol,
         solver=metric_solver,
+        disk_backed=True,
         block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
     )
     ri_timings["metric_factorize"] = time.perf_counter() - t0
+    del j3_pair
     factors = PackedRIFactors(factors_pair, primary_nao) if storage == "packed" else _pair_factors_to_full(factors_pair, primary_nao)
     info = {
         "auxbasis": auxbasis,

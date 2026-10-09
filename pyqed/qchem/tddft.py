@@ -180,6 +180,26 @@ def _pcm_kernel_ovov(mf, solvent):
     return 2.0 * kernel
 
 
+def _response_integrals(mol, left, right, other_left, other_right):
+    """MO integral blocks for the explicitly dense response reference."""
+    from .basis import mo_pair_factors
+
+    factors = getattr(mol, "eri_factors", None)
+    if factors is not None:
+        first = mo_pair_factors(factors, left, right)
+        second = mo_pair_factors(factors, other_left, other_right)
+        return np.einsum("Pij,Pkl->ijkl", first, second, optimize=True)
+    return np.einsum(
+        "pqrs,pi,qj,rk,sl->ijkl",
+        _dense_eri(mol),
+        left,
+        right,
+        other_left,
+        other_right,
+        optimize=True,
+    )
+
+
 def get_ab(mf):
     """
     Restricted singlet A/B matrices for linear-response TDDFT.
@@ -200,16 +220,7 @@ def get_ab(mf):
     a = np.diag(e_ia.ravel()).reshape(nocc, nvir, nocc, nvir)
     b = np.zeros_like(a)
 
-    eri = _dense_eri(mf.mol)
-    eri_iajb = np.einsum(
-        'pqrs,pi,qa,rj,sb->iajb',
-        eri,
-        orbo,
-        orbv,
-        orbo,
-        orbv,
-        optimize=True,
-    )
+    eri_iajb = _response_integrals(mf.mol, orbo, orbv, orbo, orbv)
     a += 2.0 * eri_iajb
     b += 2.0 * eri_iajb
 
@@ -220,26 +231,10 @@ def get_ab(mf):
         hyb = 1.0
 
     if hyb != 0.0:
-        eri_ijab = np.einsum(
-            'pqrs,pi,qj,ra,sb->ijab',
-            eri,
-            orbo,
-            orbo,
-            orbv,
-            orbv,
-            optimize=True,
-        )
+        eri_ijab = _response_integrals(mf.mol, orbo, orbo, orbv, orbv)
         a -= hyb * np.transpose(eri_ijab, (0, 2, 1, 3))
 
-        eri_jaib = np.einsum(
-            'pqrs,pj,qa,ri,sb->jaib',
-            eri,
-            orbo,
-            orbv,
-            orbo,
-            orbv,
-            optimize=True,
-        )
+        eri_jaib = _response_integrals(mf.mol, orbo, orbv, orbo, orbv)
         b -= hyb * np.transpose(eri_jaib, (2, 1, 0, 3))
 
     if hasattr(mf, 'xc'):
@@ -374,7 +369,83 @@ class TDA:
         )
         return self._contract_multipole(ints, hermi=False)
 
-    def run(self, nstates=None):
+    def run(self, nstates=None, *, solver='davidson', tolerance=1e-9,
+            iterations=200, space=None):
+        """Solve selected roots without building A/B (default: three roots).
+
+        Uses blocked Casida response (1995, doi:10.1142/9789812830586_0005)
+        and restarted Davidson (1975, doi:10.1016/0021-9991(75)90065-0).
+        These are adaptations, not reproductions of reference software.
+        Real singlet pure LDA and TDHF only; CD/RI accuracy is inherited
+        from the SCF integral representation. Full pure-LDA TDDFT uses the
+        Hermitian squared-frequency equation and requires positive gaps and
+        selected squared roots. This is not a complete stability analysis.
+        TDHF uses nonsymmetric Davidson, without an interior-root completeness
+        guarantee. Failures raise; no dense or external-solver fallback.
+        ``solver='dense'`` explicitly requests the reference implementation.
+        ``get_ab()`` explicitly materializes matrices for diagnostics.
+        """
+        if solver == 'dense':
+            return self._run_dense(nstates)
+        if solver != 'davidson':
+            raise ValueError("solver must be 'davidson' or 'dense'")
+        from pyqed.linalg import davidson, davidson_nonsymmetric
+        from .transition_response import TransitionResponse
+        dim = self.nocc*self.nvir
+        roots = min(3, dim) if nstates is None else nstates
+        if isinstance(roots, bool) or int(roots) != roots or not 1 <= roots <= dim:
+            raise ValueError('nstates must be between 1 and nocc*nvir')
+        roots = int(roots)
+        self.a = self.b = None
+        self._response_method = 'tddft' if isinstance(self, TDDFT) else 'tda'
+        response = TransitionResponse(self)
+        full = self._response_method == 'tddft'
+        controls = dict(tolerance=tolerance, iterations=iterations, space=space)
+        if full and response.exchange:
+            action = response.rpa
+            e, v, info = davidson_nonsymmetric(lambda x: action(x[:, None])[:, 0],
+                roots, diag=np.r_[response.gap, -response.gap], matmat=action,
+                selection='positive_real', **controls)
+            pivots = v[np.argmax(abs(v), axis=0), np.arange(v.shape[1])]
+            v *= np.exp(-1j*np.angle(pivots))
+            if np.max(abs(e.imag)) > 1e-8 or np.max(abs(v.imag)) > 1e-7:
+                raise ValueError('Complex TDHF roots or amplitudes are unsupported.')
+            e, v = e.real, v.real
+            x, y = np.split(v, 2)
+        else:
+            if full and np.any(response.gap <= 0):
+                raise ValueError('Casida response requires positive orbital gaps.')
+            action = response.casida if full else response.tda
+            diagonal = response.gap**2 if full else response.gap
+            e, v, info = davidson(lambda x: action(x[:, None])[:, 0], roots,
+                diag=diagonal, matmat=action, dtype=float, backend='compiled', **controls)
+            if full:
+                if np.any(e <= 0):
+                    raise ValueError('Nonpositive squared TDDFT frequency: unstable reference.')
+                e = np.sqrt(e)
+                plus = np.sqrt(response.gap[:, None]/e)*v
+                minus = np.sqrt(e/response.gap[:, None])*v
+                x, y = (plus+minus)/2, (plus-minus)/2
+            else:
+                x, y = v, np.zeros_like(v)
+        residual = response.rpa(np.vstack((x, y))) - np.vstack((x, y))*e if full else response.tda(x)-x*e
+        residuals = np.linalg.norm(residual, axis=0)/np.maximum(1., np.linalg.norm(np.vstack((x, y)), axis=0))
+        if np.max(residuals) > max(10*tolerance, 1e-10):
+            raise RuntimeError(f'TD response residual check failed: {residuals}')
+        self.e = e
+        self.xy = [(x[:, k].reshape(self.nocc, self.nvir), y[:, k].reshape(self.nocc, self.nvir)) for k in range(roots)]
+        self.solver_info = dict(info, response_residuals=residuals)
+        self.nstates = roots+1
+        self._geometry_scanner = None
+        return self
+
+
+    @property
+    def response_method(self):
+        return getattr(self, '_response_method', 'tddft' if isinstance(self, TDDFT) else 'tda')
+
+    def _run_dense(self, nstates=None):
+        self._response_method = 'tda'
         a, _ = self.get_ab()
         dim = self.nocc * self.nvir
         e, x = _eig_hermitian(a.reshape(dim, dim), nstates=nstates)
@@ -383,6 +454,8 @@ class TDA:
             (x[:, i].reshape(self.nocc, self.nvir), np.zeros((self.nocc, self.nvir)))
             for i in range(x.shape[1])
         ]
+        self.nstates = len(self.e) + 1
+        self._geometry_scanner = None
         return self
 
 
@@ -391,9 +464,21 @@ class TDDFT(TDA):
     Restricted singlet linear-response TDDFT.
     """
 
-    def run(self, nstates=None, using_tda=False):
+    def run(self, nstates=None, using_tda=False, **kwargs):
         if using_tda:
-            return super().run(nstates=nstates)
+            # Keep the requested response method even on a TDDFT instance.
+            tda = TDA(self._scf)
+            if hasattr(self, 'with_solvent'):
+                tda.with_solvent = self.with_solvent
+            tda.run(nstates=nstates, **kwargs)
+            self.__dict__.update(tda.__dict__)
+            return self
+        return super().run(nstates=nstates, **kwargs)
+
+
+    def _run_dense(self, nstates=None):
+
+        self._response_method = 'tddft'
 
         a, b = self.get_ab()
         dim = self.nocc * self.nvir
@@ -419,4 +504,6 @@ class TDDFT(TDA):
             x = vec[:dim, i].reshape(self.nocc, self.nvir)
             y = vec[dim:, i].reshape(self.nocc, self.nvir)
             self.xy.append((x, y))
+        self.nstates = len(self.e) + 1
+        self._geometry_scanner = None
         return self

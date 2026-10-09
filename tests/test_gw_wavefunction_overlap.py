@@ -56,7 +56,7 @@ def test_h2o_ccpvdz_wavefunction_overlap_keeps_cartesian_ao_metric():
             f"H 0  0.757 0.587"
         )
         mol = Molecule(atom=atom, basis="cc-pvdz", unit="angstrom")
-        mol.build(eri="dense")
+        mol.build(eri="dense", options={"coord_type": "cartesian"})
         mf = RHF(mol).run(verbose=0)
         tda = TDA(mf, screening="TDH", eta=1.0e-3).run(
             nroots=2,

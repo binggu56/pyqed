@@ -13,11 +13,13 @@ Refs
 import numpy as np
 import scipy.linalg
 import sys
+import tempfile
 from scipy.optimize import brentq, newton
 
 from functools import reduce
 
 from pyqed.units import au2ev
+from pyqed.gw.screening import FactorizedCouplings
 
 
 class _LoggerFallback:
@@ -37,12 +39,12 @@ _SUPPORTED_FREQ_INTEGRATION = {
     'spectral': 'exact',
     'sum_over_poles': 'exact',
     'sum-over-poles': 'exact',
-}
-
-_FREQ_INTEGRATION_TODO = {
     'contour': 'contour_deformation',
     'contour_deformation': 'contour_deformation',
     'cd': 'contour_deformation',
+}
+
+_FREQ_INTEGRATION_TODO = {
     'analytic_continuation': 'analytic_continuation',
     'ac': 'analytic_continuation',
     'imaginary_axis': 'imaginary_axis',
@@ -56,7 +58,7 @@ def _canonical_freq_int(freq_int):
     if key in _FREQ_INTEGRATION_TODO:
         raise NotImplementedError(
             f"GW frequency integration {freq_int!r} is not implemented yet. "
-            "Only the exact/sum-over-poles spectral representation is currently available."
+            "Use exact spectral integration or contour_deformation."
         )
     allowed = sorted(set(_SUPPORTED_FREQ_INTEGRATION) | set(_FREQ_INTEGRATION_TODO))
     raise ValueError(f"Unknown GW frequency integration {freq_int!r}. Expected one of {allowed}.")
@@ -201,14 +203,50 @@ def _get_ao_eri_factors(gw):
         eri_factors = getattr(gw.mol, 'eri_factors', None)
     if eri_factors is None:
         return None
-    return np.asarray(eri_factors, dtype=float)
+    return eri_factors
 
 
 def _build_spatial_pair_factors_mo(gw, mo_coeff):
     eri_factors = _get_ao_eri_factors(gw)
     if eri_factors is None:
         return None
-    return np.einsum('Pmn,mp,nq->Ppq', eri_factors, mo_coeff, mo_coeff, optimize=True)
+    from pyqed.qchem.basis import PackedRIFactors, mo_pair_factors
+
+    source = (
+        eri_factors.pair_factors
+        if isinstance(eri_factors, PackedRIFactors)
+        else np.asarray(eri_factors)
+    )
+    nao, nmo = mo_coeff.shape
+    dtype = np.result_type(source, mo_coeff)
+    out = _screening_storage(gw, (len(source), nmo, nmo), dtype)
+    budget = max(1e-6, gw.max_memory) * 1e6 / 8
+    block = max(
+        1,
+        min(
+            64,
+            int(
+                budget
+                / (np.dtype(dtype).itemsize * (nao * nao + nao * nmo + nmo * nmo))
+            ),
+        ),
+    )
+    for start in range(0, len(source), block):
+        out[start : start + block] = mo_pair_factors(
+            source[start : start + block], mo_coeff
+        )
+    return out
+
+
+def _screening_storage(gw, shape, dtype):
+    """Keep large exact spectral couplings in anonymous temporary storage."""
+    size = int(np.prod(shape)) * np.dtype(dtype).itemsize
+    budget = max(1e-6, getattr(gw, "max_memory", 4000)) * 1e6 / 4
+    if size <= budget:
+        return np.empty(shape, dtype=dtype)
+    with tempfile.TemporaryFile() as file:
+        file.truncate(size)
+        return np.memmap(file, mode="r+", dtype=dtype, shape=shape)
 
 
 def _spin_pair_factors(gw):
@@ -251,7 +289,7 @@ def _get_hcore_ao(gw):
 def _get_overlap_ao(gw):
     if hasattr(gw._scf, 'get_ovlp'):
         return np.asarray(gw._scf.get_ovlp(), dtype=float)
-    return np.asarray(gw.mol.overlap, dtype=float)
+    return np.asarray(gw.mol.overlap(), dtype=float)
 
 
 def _reference_total_energy(gw):
@@ -298,6 +336,11 @@ def _set_rhf_orbitals(gw, mo_energy, mo_coeff, v_static_spatial=None):
     gw._pair_factors = _build_spatial_pair_factors_mo(gw, gw.mo_coeff)
     gw._spin_pair_factors = None
     if gw._pair_factors is None:
+        required = (2*gw.mo_coeff.shape[1])**4*8
+        budget = getattr(gw, 'max_memory', 4000)*1e6
+        if required > budget:
+            raise MemoryError('Dense spin-orbital GW ERIs exceed max_memory; '
+                              'build the mean-field reference with CD/RI factors.')
         spatial_eri = _build_spatial_eri_mo(gw, gw.mo_coeff)
         gw.eri = _spin_orbital_eri_from_spatial(spatial_eri).real
     else:
@@ -400,29 +443,46 @@ def _charge_rpa(gw):
         raise np.linalg.LinAlgError('TDH screening requires positive occupied-virtual gaps')
     if gw._pair_factors is not None:
         pairs = gw._pair_factors[:, :no, no:].reshape(len(gw._pair_factors), -1)
-        coulomb = pairs.T @ pairs
+        casida = np.empty((len(gaps), len(gaps)), dtype=pairs.dtype, order='F')
+        np.matmul(pairs.T, pairs, out=casida)
     else:
         eri = gw.eri[::2, ::2, ::2, ::2]
-        coulomb = eri[:no, no:, :no, no:].reshape(len(gaps), len(gaps))
+        casida = np.array(eri[:no, no:, :no, no:].reshape(len(gaps), len(gaps)),
+                          order='F', copy=True)
     root_gap = np.sqrt(gaps)
-    casida = 4*root_gap[:, None]*coulomb*root_gap[None, :]
+    casida *= 4*root_gap[:, None]
+    casida *= root_gap[None, :]
     casida[np.diag_indices(len(gaps))] += gaps*gaps
-    values, vectors = scipy.linalg.eigh(_symmetrize(casida))
+    # Preserve symmetric averaging after gap scaling without a full matrix copy.
+    # Only the lower triangle is consumed by LAPACK.
+    for row in range(1, len(gaps)):
+        casida[row, :row] = .5*(casida[row, :row]+casida[:row, row])
+    values, vectors = scipy.linalg.eigh(casida, overwrite_a=True)
     if values[0] <= 0:
         raise np.linalg.LinAlgError('TDH charge Casida matrix is not positive definite')
     return np.sqrt(values), vectors
 
 
-def _charge_couplings(gw, poles, vectors):
+def _charge_spatial_couplings(gw, poles, vectors):
     no = gw.nocc//2
     energy = _active_energy(gw)[::2]
     gaps = (energy[no:][None, :]-energy[:no, None]).ravel()
-    weights = vectors*np.sqrt(gaps)[:, None]/np.sqrt(poles)[None, :]
     if gw._pair_factors is not None:
         factors = gw._pair_factors
         pairs = factors[:, :no, no:].reshape(len(factors), -1)
-        spatial = np.einsum('PL,Ppq->pqL', pairs @ weights, factors, optimize=True)
+        projection = _screening_storage(gw, (len(factors), len(poles)), factors.dtype)
+        budget = max(1e-6, getattr(gw, 'max_memory', 4000))*1e6/4
+        block = max(1, min(len(poles), int(budget)//
+                          (vectors.dtype.itemsize*(len(gaps)+len(factors)+len(energy)))))
+        root_gap = np.sqrt(gaps)
+        for start in range(0, len(poles), block):
+            stop = min(start+block, len(poles))
+            weights = vectors[:, start:stop]*root_gap[:, None]
+            weights /= np.sqrt(poles[start:stop])[None, :]
+            projection[:, start:stop] = pairs @ weights
+        spatial = FactorizedCouplings(factors, projection, poles)
     else:
+        weights = vectors*np.sqrt(gaps)[:, None]/np.sqrt(poles)[None, :]
         eri = gw.eri[::2, ::2, ::2, ::2]
         spatial = np.einsum('il,ipq->pql', weights,
                             eri[:no, no:].reshape(len(gaps), len(energy), len(energy)),
@@ -430,9 +490,16 @@ def _charge_couplings(gw, poles, vectors):
     # Spatial BSE uses M; normalized spin-charge modes couple with sqrt(2) M.
     gw._charge_screening = dict(energy=energy.copy(), mo_coeff=gw.mo_coeff.copy(),
                                 poles=poles.copy(), couplings=spatial)
-    result = np.zeros((gw.nso, gw.nso, len(poles)), dtype=spatial.dtype)
-    result[::2, ::2] = np.sqrt(2)*spatial
-    result[1::2, 1::2] = np.sqrt(2)*spatial
+    return spatial
+
+
+def _charge_couplings(gw, poles, vectors):
+    spatial = _charge_spatial_couplings(gw, poles, vectors)
+    result = _screening_storage(gw, (gw.nso, gw.nso, len(poles)), spatial.dtype)
+    for p in range(spatial.shape[0]):
+        result[2*p:2*p+2] = 0
+        result[2*p, ::2] = np.sqrt(2)*spatial[p]
+        result[2*p+1, 1::2] = np.sqrt(2)*spatial[p]
     return result
 
 
@@ -562,14 +629,15 @@ def _sigma_x_matrix(gw):
     if gw.eri is not None:
         sigma_x = -np.einsum('piiq->pq', gw.eri[:, :nocc, :nocc, :], optimize=True)
     else:
-        factors = _spin_pair_factors(gw)
-        sigma_x = -np.einsum('Ppi,Piq->pq', factors[:, :, :nocc], factors[:, :nocc, :], optimize=True)
+        factors = gw._pair_factors[:, :, :nocc//2]
+        spatial = -np.einsum('Ppi,Pqi->pq', factors, factors, optimize=True)
+        sigma_x = _spin_matrix_from_spatial(spatial)
 
     gw._sigma_x_matrix = sigma_x
     return sigma_x
 
 
-def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
+def sigma(gw, p, q, omegas, e_rpa=None, t_rpa=None, vir_sgn=1):
     '''
     self energy sigma_{pq} = i [GW]_{pq}
     '''
@@ -579,7 +647,21 @@ def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
     else:
         single_point = False
 
-    if gw._M is None:
+    if getattr(gw, 'freq_int', 'exact') == 'contour_deformation':
+        if p != q or vir_sgn != 1:
+            raise NotImplementedError('Contour GW currently provides diagonal time-ordered self-energies only')
+        contour = getattr(gw, '_contour', None)
+        if contour is None or p//2 not in contour.columns:
+            raise ValueError('Run contour GW with this spatial orbital in orbs first')
+        correlation = [contour.evaluate(p//2, w)[0] for w in omegas]
+        exchange = [_sigma_x_matrix(gw)[p, p]]*len(correlation)
+        return (correlation[0], exchange[0]) if single_point else (correlation, exchange)
+
+    charge = getattr(gw, '_charge_screening', None)
+    spatial = (gw._M is None and charge is not None
+               and np.array_equal(charge['poles'], e_rpa)
+               and np.array_equal(charge['energy'], _active_energy(gw)[::2]))
+    if gw._M is None and not spatial:
         gw._M = get_m_rpa(gw, e_rpa, t_rpa)
 
     nso = gw.nso
@@ -587,8 +669,17 @@ def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
     energy = _active_energy(gw)
     omega = np.asarray(omegas, dtype=float)
 
-    occ_weight = gw._M[:nocc, q, :] * gw._M[:nocc, p, :]
-    vir_weight = gw._M[nocc:nso, q, :] * gw._M[nocc:nso, p, :]
+    if spatial:
+        if p % 2 != q % 2:
+            zero = np.zeros(len(omega), dtype=complex)
+            return (zero[0], zero[0]) if single_point else (zero, zero.copy())
+        energy, nocc, nso = energy[::2], nocc//2, nso//2
+        m = charge['couplings']
+        occ_weight = 2*m[:nocc, q//2, :]*m[:nocc, p//2, :]
+        vir_weight = 2*m[nocc:, q//2, :]*m[nocc:, p//2, :]
+    else:
+        occ_weight = gw._M[:nocc, q, :] * gw._M[:nocc, p, :]
+        vir_weight = gw._M[nocc:nso, q, :] * gw._M[nocc:nso, p, :]
     occ_denom = (
         omega[:, None, None]
         - energy[:nocc][None, :, None]
@@ -658,18 +749,24 @@ def _continue_qp_root(correction, derivative, energy, tol=1e-9):
 
 
 def _solve_qp_energies(gw, e_rpa, t_rpa):
-    if gw._M is None:
+    charge = t_rpa.shape[0] == (gw.nocc//2)*((gw.nso-gw.nocc)//2)
+    if charge:
+        couplings = _charge_spatial_couplings(gw, e_rpa, t_rpa)
+    elif gw._M is None:
         gw._M = get_m_rpa(gw, e_rpa, t_rpa)
     energy = _active_energy(gw)
-    centers = np.concatenate((energy[:gw.nocc, None]-e_rpa,
-                              energy[gw.nocc:, None]+e_rpa)).ravel()
-    shifts = np.repeat(np.r_[-np.ones(gw.nocc), np.ones(gw.nso-gw.nocc)], len(e_rpa))*1j*gw.eta
+    nocc = gw.nocc
+    if charge:
+        energy, nocc = energy[::2], nocc//2
+    centers = np.concatenate((energy[:nocc, None]-e_rpa,
+                              energy[nocc:, None]+e_rpa)).ravel()
+    shifts = np.repeat(np.r_[-np.ones(nocc), np.ones(len(energy)-nocc)], len(e_rpa))*1j*gw.eta
     exchange = _sigma_x_matrix(gw)
     egw = np.zeros(gw.nso//2)
     gw.qp_weights = np.full_like(egw, np.nan)
     gw.qp_residuals = np.full_like(egw, np.nan)
     for p in range(0, gw.nso, 2):
-        weights = (gw._M[:, p, :]**2).ravel()
+        weights = (2*couplings[:, p//2, :]**2 if charge else gw._M[:, p, :]**2).ravel()
         active = weights != 0
         poles, broadening, residue = centers[active], shifts[active], weights[active]
         static = exchange[p, p]-gw.v_mf[p, p]
@@ -901,7 +998,7 @@ def is_positive_def(A):
 
 
 class GW(object):
-    """Restricted molecular GW with exact spectral screening.
+    """Restricted molecular GW with spectral or contour frequency integration.
 
     Default TDH/Casida screening uses the complete spatial charge block,
     an exact spin adaptation of Stratmann, Scuseria and Frisch,
@@ -912,11 +1009,35 @@ class GW(object):
     by BSE; QP roots are tracked by positive-weight coupling continuation
     (see :func:`_continue_qp_root`); frequency integration is unchanged.
     See :func:`rpa` for returned mode conventions.
+    Packed AO factors are transformed without full expansion. Default TDH
+    QP energies and self-energies use spatial couplings directly, avoiding
+    the spin-expanded coupling tensor. Explicit get_m_rpa retains spin indices.
+    Factorized charge screening retains auxiliary-to-pole coefficients and
+    forms orbital coupling blocks on demand, avoiding the full three-index
+    orbital-pair/pole tensor. BSE TDA contracts its static auxiliary metric
+    directly. This is exact reassociation of the same RI spectral equations,
+    without extra pole or rank truncation. Large coefficient arrays and
+    explicitly requested spin couplings use anonymous temporary memory maps,
+    with each array's RAM threshold set to one quarter of ``max_memory`` (MB). This is a storage
+    threshold, not a bound on process RSS. The charge Casida matrix is built
+    in place and consumed by diagonalization; factorized spectral couplings
+    are transformed in mode blocks without a full mode-weight matrix.
+    These are algebraically exact storage changes; complete charge diagonalization
+    still requires quadratic RAM in the number of occupied-virtual pairs.
+
+    ``freq_int='contour_deformation'`` selects the auxiliary-basis molecular
+    adaptation of Zhu and Chan, JCTC 17, 727–741 (2021),
+    doi:10.1021/acs.jctc.0c00704. It avoids Casida diagonalization, using
+    imaginary-axis quadrature and explicit residue terms. Currently restricted
+    to real CD/RI, TDH and diagonal G0W0; see ``ContourDeformation`` for
+    convergence requirements and fidelity limits. ``run(nw=64, orbs=[...])``
+    selects the quadrature size and spatial QP orbitals. Unrequested energies
+    are NaN. No analytic continuation is used.
     """
     __array_priority__ = 1000
 
     def __init__(self, mf, ao2mofn=None,
-                 screening='TDH', eta=1e-2, freq_int='exact'):
+                 screening='TDH', eta=None, freq_int='exact'):
 
         assert screening in ('TDH', 'TDHF', 'TDDFT')
 
@@ -924,6 +1045,11 @@ class GW(object):
         self._scf = mf
         self._ao2mofn = ao2mofn
         self.freq_int = _canonical_freq_int(freq_int)
+        if self.freq_int == 'contour_deformation':
+            if screening != 'TDH' or _get_ao_eri_factors(self) is None:
+                raise NotImplementedError('Contour GW requires TDH screening and CD/RI factors')
+            if np.iscomplexobj(mf.mo_coeff):
+                raise NotImplementedError('Contour GW requires real restricted orbitals')
         self.verbose = getattr(self.mol, 'verbose', getattr(mf, 'verbose', 0))
         self.stdout = getattr(self.mol, 'stdout', getattr(mf, 'stdout', sys.stdout))
         self.max_memory = getattr(mf, 'max_memory',
@@ -977,7 +1103,7 @@ class GW(object):
         print("There are %d spin-orbitals"%(self.nso))
 
         self.screening = screening
-        self.eta = eta
+        self.eta = (1e-6 if self.freq_int == 'contour_deformation' else 1e-2) if eta is None else eta
         self._M = None
         self._sigma_x_matrix = None
 
@@ -1068,8 +1194,14 @@ class GW(object):
 
         self.converged = False
         method = method.lower()
+        if self.freq_int == 'contour_deformation' and method not in ('g0w0', 'gw', 'oneshot', 'one-shot'):
+            raise NotImplementedError('Contour integration currently supports G0W0 only')
         if method in ('g0w0', 'gw', 'oneshot', 'one-shot'):
-            self.e_qp = kernel(self, mo_energy, mo_coeff, verbose=self.verbose)
+            if self.freq_int == 'contour_deformation':
+                from pyqed.gw.contour import kernel as contour_kernel
+                self.e_qp = contour_kernel(self, mo_energy, mo_coeff, **kwargs)
+            else:
+                self.e_qp = kernel(self, mo_energy, mo_coeff, verbose=self.verbose)
             self.converged = True
             self.method = 'g0w0'
         elif method in ('evgw', 'ev-gw', 'eigenvalue-only'):
@@ -1137,6 +1269,8 @@ class GW(object):
         }
         if self.scgw_result is not None:
             self.info["scgw"] = self.scgw_result.info
+        if self.freq_int == 'contour_deformation':
+            self.info['contour'] = self.contour_info
         logger.log(self, 'GW bandgap = %.15g', self.e_qp[self.nocc//2]-self.e_qp[self.nocc//2-1])
         return self
 
@@ -1231,7 +1365,7 @@ class GW(object):
         self.e_tot = _reference_total_energy(self) + e_corr
         return self.e_tot
 
-    def sigma(self, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
+    def sigma(self, p, q, omegas, e_rpa=None, t_rpa=None, vir_sgn=1):
         return sigma(self, p, q, omegas, e_rpa, t_rpa, vir_sgn)
 
     def g0(self, omega):

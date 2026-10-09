@@ -21,6 +21,137 @@ Mean-field, GW, and BSE have distinct roles:
 * ``GW`` computes quasiparticle energies and screening information.
 * ``BSE`` computes neutral excitation energies from the GW/RPA reference.
 
+Contour-deformation G0W0
+-----------------------
+
+For larger restricted molecules with native CD or RI integrals, select
+``freq_int='contour_deformation'`` (aliases ``'contour'`` and ``'cd'``):
+
+.. code-block:: python
+
+   from pyqed.gw.gw import GW
+
+   # mf is a converged real restricted reference with CD/RI factors.
+   no = int((mf.mo_occ > 0).sum())
+   gw = GW(mf, freq_int='contour_deformation', eta=1e-6).run(
+       orbs=[no-1, no], nw=64, quadrature_scale=0.5, tol=1e-9)
+   print(gw.e_qp[gw.orbital_indices])
+   print(gw.qp_residuals[gw.orbital_indices])
+   sigma_c, sigma_x = gw.sigma(2*(no-1), 2*(no-1), gw.e_qp[no-1])
+
+``orbs`` uses zero-based spatial indices, whereas ``sigma`` retains the GW
+driver's spin-orbital indexing. Omit ``orbs`` to solve all QP energies.
+Unrequested energies, QP weights and residuals are NaN; all intermediate
+occupied and virtual orbitals still contribute to screening and self-energy.
+Here ``cd`` means contour deformation; ``mol.build(eri='cd')`` independently
+selects Cholesky integral factors.
+
+This is a molecular adaptation of the density-fitted contour formulation of
+T. Zhu and G. K.-L. Chan, *All-Electron Gaussian-Based G0W0 for Valence and
+Core Excitation Energies of Periodic Systems*, JCTC **17**, 727–741 (2021),
+https://doi.org/10.1021/acs.jctc.0c00704. The auxiliary dielectric matrix uses
+the full direct-RPA response:
+
+.. math::
+
+   \Pi_{PQ}(i\nu) = -4\sum_{ia}
+       \frac{\Delta_{ia} F_{Pia}F_{Qia}}{\nu^2+\Delta_{ia}^2}.
+
+Transition blocks accumulate one auxiliary matrix at a time. Cholesky solves
+on the imaginary axis and general solves for real-frequency residues replace
+complete Casida diagonalization. The implementation integrates on a mapped
+Gauss–Legendre grid and adds the occupied/virtual poles inside the deformed
+contour. Subtracting the zero-frequency screened interaction treats the
+orbital-pole step analytically, stabilizing evaluation at mean-field orbital
+energies. It uses no analytic continuation, pole truncation, or additional
+RI rank approximation.
+
+Screening workspace scales quadratically in the auxiliary count rather than
+the occupied-virtual pair count. MO factors still occupy cubic storage, and
+the saved imaginary-axis matrix elements scale as selected-orbital count
+times MO count times ``nw``. Deep core or high virtual QP solves can be
+expensive because they require many real-frequency residue evaluations.
+
+This implementation supports diagonal G0W0 with real, gapped restricted
+references and TDH screening only. TDHF/TDDFT screening, evGW, qsGW,
+off-diagonal self-energies, unrestricted and periodic formulations are not
+implemented in this path. The existing positive-weight coupling-continuation
+root prescription is retained, including its branch-selection limitations.
+Converge ``nw`` (for example 32, 64, 128) and decrease ``eta`` independently;
+the contour default is ``eta=1e-6`` Hartree (spectral default: ``1e-2``).
+Agreement with the spectral equations is in the converged-quadrature,
+zero-regulator limit. The finite-eta regularization differs from spectral
+pole broadening. ``qp_residuals`` measures root convergence, not quadrature
+error; ``info['contour']`` records the controls used.
+
+BSE and BSE TDA reuse the contour driver's zero-frequency auxiliary Cholesky
+factor when the factors, orbital coefficients and mean-field energies match.
+Both full A/B actions and TDA avoid a screening eigensolve. The existing
+static BSE kernel is evaluated through
+
+.. math::
+
+   R = \frac{I-\epsilon^{-1}(0)}{4},
+   \qquad \sum_L \frac{M_{pqL}M_{rsL}}{\Omega_L}
+        = \sum_{PQ} F_{Ppq}R_{PQ}F_{Qrs}.
+
+Blocked Cholesky solves apply this metric to occupied-occupied and
+occupied-virtual pair factors; no full orbital-pair/pole tensor is produced.
+This is an exact reformulation of the existing static BSE kernel (Bruneval,
+JCP **136**, 194107 (2012), https://doi.org/10.1063/1.4718428), with no new
+screening truncation. It does not add a dynamical BSE kernel. The default
+iterative excitation solver remains matrix-free; explicit ``low_rank=False``
+still constructs and diagonalizes the BSE response matrix for small references.
+
+.. code-block:: python
+
+   from pyqed.gw.bse import BSE, TDA
+
+   gw = GW(mf, freq_int='contour_deformation').run(nw=64)
+   bse = BSE(gw).run(nroots=3, batch_columns=2)
+   tda = TDA(gw).run(nroots=3, batch_columns=2)
+
+BSE requires finite QP energies for all orbitals and rejects a partial
+``orbs`` calculation. A matching contour reference supplies static screening
+without populating ``bse.e_rpa`` or ``bse._M``; these remain None, rather than
+holding artificial screening poles. Changed reference orbitals or screening
+energies invalidate reuse. Spectral screening remains available for other
+references and screening methods.
+
+``benchmarks/benchmark_gw_tda_memory.py --molecule anthracene --integrals ri
+--gw-only --freq-int contour_deformation --nw 64 --orbs 46 47 --eta 1e-6
+--output /private/tmp/anthracene-contour`` reproduces the larger-molecule
+frontier-orbital memory check and writes diagnostic figures and an RSS trace.
+Use ``--compare-contour SPECTRAL_REPORT CONTOUR_REPORT...`` to plot saved
+reports with identical geometry, basis, integral preparation and ``eta``.
+On anthracene/6-31G with cc-pVDZ-JKFIT and ``eta=1e-6``, the HOMO/LUMO
+maximum errors against spectral GW were 1.35e-10 and 2.87e-13 Hartree at
+32 and 64 quadrature points. The 64-point frontier calculation peaked at
+395 MiB traced GW allocations and 1.55 GiB process RSS including preparation;
+MO-factor preparation set its sampled RSS peak. These are one-run memory
+measurements, not a process-RAM guarantee or an all-orbital timing comparison.
+The tests also compare all water/STO-3G QP energies with spectral GW and
+frontier energies with PySCF contour GW using identical RI factors.
+``benchmarks/benchmark_bse_static_screening.py`` compares static-auxiliary and
+spectral screening for TDA and full BSE in separate processes. Both use the
+same complete QP energies from a saved native RI GW report, isolating the
+screening representation. End-to-end contour GW/BSE is tested separately on
+water against dense spectral BSE, with guards against a hidden RPA rebuild.
+On anthracene/6-31G with cc-pVDZ-JKFIT (146 MOs, 4653 transitions),
+the three lowest TDA and full-BSE energies agreed within 1.4e-15 and
+6.2e-14 Hartree, respectively; all residuals were below 1e-8. In separate
+processes, peak RSS fell from 1.81 to 1.64 GiB, including RI/RHF preparation.
+Screening-stage traced allocations fell from 572 to 395 MiB. These fixed-QP
+measurements isolate screening and do not time a complete all-orbital GW run.
+With blocked MO transformation and auxiliary-blocked response contractions,
+the same static-screening benchmark reduced traced allocation peaks from
+395 to 92 MiB (GW preparation), 68 to 35 MiB (TDA), and 338 to 82 MiB
+(full BSE). The final run's process RSS was 1.56 GiB versus 1.64 GiB before;
+resident memory varies with native allocation and mapped-page residency.
+Excitations changed by less than 2.6e-15 Hartree. Use ``--compare-labels
+Before After`` with the benchmark's ``--compare`` option to plot storage
+revisions at fixed QP energies.
+
 Exact charge screening and quasiparticle root tracking
 ------------------------------------------------------
 
@@ -857,6 +988,82 @@ When available, AO Cholesky or RI factors are transformed to MO pair factors.
 This avoids storing the full four-index MO tensor in the GW self-energy and
 low-rank BSE/TDA paths.  The dense reference solvers are still intended for
 small and medium molecules.
+
+Molecular GW consumes packed AO factors without expanding the complete AO
+factor tensor. Default charge-screened quasiparticle energies and self-energies
+contract spatial couplings directly, without constructing spin-expanded
+couplings. With CD/RI, the default path stores auxiliary-to-pole coefficients
+and forms only the requested orbital coupling blocks. It never stores the
+full orbital-pair/pole coupling tensor. BSE TDA reuses these coefficients
+through the static auxiliary metric and caches only its occupied-pair
+contraction. This is exact reassociation of the existing RI spectral equations,
+without additional rank or pole truncation. Explicit conversion of the
+``FactorizedCouplings`` object to an array materializes the tensor and is
+intended for small references. The explicit ``get_m_rpa`` helper still returns
+spin couplings.
+Auxiliary-to-pole arrays and explicitly requested spin spectral
+couplings larger than one quarter of ``gw.max_memory`` (MB) use anonymous
+temporary memory maps, released when the arrays are discarded. Set the
+mean-field ``max_memory`` before constructing GW. Temporary storage follows
+Python's temporary-directory configuration; use local disk for large runs.
+This threshold does not cap process RSS or diagonalization workspace. The
+complete charge spectrum still needs a dense matrix with quadratic storage
+in the occupied-virtual pair count; no screening poles are truncated.
+GW transforms packed AO factors in auxiliary blocks directly into MO-factor
+storage. Arrays larger than one quarter of ``max_memory`` use anonymous
+local temporary memory maps; smaller arrays remain in memory. This avoids
+allocating the complete MO output on the Python heap, but mapped pages can
+still contribute to RSS. AO factors remain owned by the mean-field reference. Native RI construction
+keeps packed AO factors and spherical-transform work arrays larger than
+32 MiB in anonymous temporary memory maps. Auxiliary transformation and
+metric whitening use bounded pair blocks; Cholesky whitening uses triangular
+solves. The RI metric, rank criterion, and integral values are unchanged.
+Native integral generation can still allocate a full packed three-center
+input, and mapped pages can remain resident during SCF. In the same
+anthracene fixed-QP benchmark, these AO-storage changes reduced observed
+whole-process peak RSS from 1.56 to 1.16 GiB. Full-BSE roots agreed within
+1.4e-11 Hartree (residuals below 1e-8); this is a single-run measurement,
+not a strict RSS cap. The post-SCF allocation peaks were essentially unchanged.
+
+BSE direct and exchange contractions also block the auxiliary index, and
+full-BSE A-action outputs are restricted to the current trial-vector batch.
+These changes preserve every factor and excitation; no rank truncation or
+additional physical approximation is introduced.
+
+The charge Casida matrix is formed in place in LAPACK storage order and
+consumed by diagonalization, avoiding separate Coulomb, symmetrization and
+layout copies. Factorized spectral couplings are built in mode blocks sized
+from the same memory threshold. These changes preserve the complete spectral
+equations and do not introduce a screening approximation.
+
+Native molecular ``pyqed.qchem.tddft.TDA`` uses Davidson response actions by
+default. Its action transforms occupied-virtual, occupied-occupied and
+virtual-virtual CD/RI factors in auxiliary blocks and consumes each block
+immediately. Response preparation stores no complete MO pair factor tensor.
+Block sizes account for AO transformation scratch and the trial-vector count.
+This reduces persistent storage at the cost of repeated transformations;
+TDA omits the unused B exchange action. Full TDHF retains both A and B.
+Exchange contractions use explicit two-stage projections so NumPy cannot
+select a costly direct three-operand contraction for larger trial blocks.
+The molecular BSE TDA action also blocks auxiliary factors and screening
+poles, including in scalar actions. Matching GW screening is shared without
+copying its coupling tensor; iterative actions treat this storage as read-only.
+``solver='dense'`` and ``get_ab()`` still explicitly construct response
+matrices. The reproducible larger-molecule memory check is
+``benchmarks/benchmark_gw_tda_memory.py`` (naphthalene, 6-31G).
+Use ``--molecule anthracene`` or ``--molecule tetracene`` for larger checks,
+and ``--integrals ri --auxbasis cc-pvdz-jkfit`` for native auxiliary-basis RI
+instead of the default CD. ``--pyscf-ri`` explicitly selects an external
+RI/RHF preparation reference; GW and both TDA actions still run in PyQED.
+All calculation outputs are written to the requested ``--output`` directory.
+``--tda-only`` profiles the response solve without rerunning GW/BSE; use
+``--compare-tda OLD_CD NEW_CD OLD_RI NEW_RI`` to plot saved TDA allocation
+measurements before and after a response change.
+``--compare-gw BEFORE AFTER`` plots saved RI GW allocation peaks, full-run
+process RSS, and orbital-by-orbital quasiparticle energy differences.
+Reports also contain sampled resident memory by preparation, diagonalization,
+coupling preparation, quasiparticle solve and BSE stages, with a corresponding
+resident-memory diagnostic figure.
 
 Validation Notes
 ----------------

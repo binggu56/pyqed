@@ -22,6 +22,7 @@ from functools import reduce
 
 from pyqed import au2ev, is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
+from pyqed.gw.screening import FactorizedCouplings, StaticScreening
 
 
 class _LoggerFallback:
@@ -34,6 +35,34 @@ class _LoggerFallback:
 
 
 logger = _LoggerFallback()
+
+
+def _ensure_bse_screening(gw):
+    if getattr(gw, '_static_screening', None) is not None:
+        return
+    if gw.e_rpa is None or gw._M is None:
+        e_rpa, t_rpa = gw.rpa(method=gw.screening)
+        gw._M = gw.get_m_rpa(e_rpa, t_rpa)
+
+
+def _bse_screening(gw):
+    static = getattr(gw, '_static_screening', None)
+    return static if static is not None else gw._M
+
+
+def _static_b_action(screening, x, nocc):
+    occupied_virtual = screening.static_ov(nocc)
+    out = np.zeros_like(x, dtype=np.result_type(x, screening.dtype))
+    for first in range(0, len(screening.factors), 64):
+        s = slice(first, first + 64)
+        projected = np.einsum("Pib,jbk->Pijk", occupied_virtual[s], x, optimize=True)
+        out += 4 * np.einsum(
+            "Paj,Pijk->iak",
+            screening.factors[s, nocc:, :nocc],
+            projected,
+            optimize=True,
+        )
+    return out
 
 
 def _nelectron(mol):
@@ -87,14 +116,15 @@ def _get_ao_eri_factors(mf):
         eri_factors = getattr(mf.mol, 'eri_factors', None)
     if eri_factors is None:
         return None
-    return np.asarray(eri_factors, dtype=float)
+    return eri_factors
 
 
 def _get_mo_pair_factors(mf, mo_coeff):
     eri_factors = _get_ao_eri_factors(mf)
     if eri_factors is None:
         return None
-    return np.einsum('Pmn,mp,nq->Ppq', eri_factors, mo_coeff, mo_coeff, optimize=True)
+    from pyqed.qchem.basis import mo_pair_factors
+    return mo_pair_factors(eri_factors, mo_coeff)
 
 
 def _is_gw_reference(obj):
@@ -257,6 +287,13 @@ def _full_bse_vectors_from_casida(A, B, nroots):
 
 
 class BSE(object):
+    """Restricted static-screened BSE, with full A/B or TDA response.
+
+    Matching contour GW references reuse the zero-frequency auxiliary
+    dielectric factor. This is an exact reformulation of the static kernel,
+    not a dynamical BSE approximation; see :class:`StaticScreening` and
+    Bruneval, J. Chem. Phys. 136, 194107 (2012), doi:10.1063/1.4718428.
+    """
     def __init__(self, gw_or_mf, ao2mofn=None,
                  screening='TDH', eta=1e-2):
 
@@ -346,14 +383,23 @@ class BSE(object):
 
         self._e_qp = None
         if gw_ref is not None and gw_ref.e_qp is not None:
+            if not np.all(np.isfinite(gw_ref.e_qp)):
+                raise ValueError('BSE requires QP energies for all spatial orbitals; run GW without an orbs subset')
             self.e_qp = gw_ref.e_qp
         self.e_rpa = None
+        self._static_screening = None
+        contour = getattr(gw_ref, '_contour', None)
+        if (screening == 'TDH' and contour is not None
+                and contour.factors is self._pair_factors
+                and np.array_equal(contour.energy, self.e_mf)
+                and np.array_equal(contour.mo_coeff, self.mo_coeff)):
+            self._static_screening = contour.static_screening
         charge = getattr(gw_ref, '_charge_screening', None)
         if (screening == 'TDH' and charge is not None
                 and np.array_equal(charge['energy'], self.e_mf)
                 and np.array_equal(charge['mo_coeff'], self.mo_coeff)):
             self.e_rpa = charge['poles'].copy()
-            self._M = charge['couplings'].copy()
+            self._M = charge['couplings']
         self._bse_tda_info = None
         self.excitation_energies = None
         self.e = None
@@ -489,9 +535,7 @@ class BSE(object):
         return bse(self, using_tda, using_casida)
 
     def _ensure_screening(self):
-        if self.e_rpa is None or self._M is None:
-            e_rpa, t_rpa = self.rpa(method=self.screening)
-            self._M = self.get_m_rpa(e_rpa, t_rpa)
+        _ensure_bse_screening(self)
 
     def _run_tda(
         self,
@@ -503,6 +547,7 @@ class BSE(object):
         max_space=None,
         return_info=False,
         return_vectors=False,
+        batch_columns=None,
     ):
         if not use_qp or self.e_qp is None:
             self.e_qp = self.e_mf.copy()
@@ -512,16 +557,19 @@ class BSE(object):
             or (low_rank == 'auto' and getattr(self, '_pair_factors', None) is not None)
         )
         if use_low_rank:
-            self.bse_tda_low_rank(
+            self.solve_tda(
                 nroots=nroots,
                 tol=tol,
                 max_cycle=max_cycle,
                 max_space=max_space,
                 return_info=return_info,
                 return_vectors=return_vectors,
+                batch_columns=batch_columns,
             )
             return self
 
+        if batch_columns is not None:
+            raise ValueError('batch_columns requires the iterative TDA path; set low_rank=True')
         self._ensure_screening()
         e, vec = self.bse(using_tda=True, using_casida=False)
         e = e[:nroots]
@@ -628,7 +676,7 @@ class BSE(object):
         )
 
 
-    def bse_tda_low_rank(
+    def solve_tda(
         self,
         nroots=5,
         tol=1e-8,
@@ -636,8 +684,9 @@ class BSE(object):
         max_space=None,
         return_info=False,
         return_vectors=True,
+        batch_columns=None,
     ):
-        return bse_tda_low_rank(
+        return solve_tda(
             self,
             nroots=nroots,
             tol=tol,
@@ -645,6 +694,7 @@ class BSE(object):
             max_space=max_space,
             return_info=return_info,
             return_vectors=return_vectors,
+            batch_columns=batch_columns,
         )
 
     def as_scanner(
@@ -695,7 +745,13 @@ class TDA(BSE):
         max_space=None,
         return_info=False,
         return_vectors=False,
+        batch_columns=None,
     ):
+        """Solve TDA; ``batch_columns`` enables batched iterative actions.
+
+        With factorized integrals, ``low_rank='auto'`` selects this path.
+        Otherwise set ``low_rank=True`` explicitly; dense solves reject batching.
+        """
         return self._run_tda(
             nroots=nroots,
             low_rank=low_rank,
@@ -705,6 +761,7 @@ class TDA(BSE):
             max_space=max_space,
             return_info=return_info,
             return_vectors=return_vectors,
+            batch_columns=batch_columns,
         )
 
     def wavefunction_overlap(
@@ -925,7 +982,10 @@ def get_m_rpa(gw, e_rpa, t_rpa):
             ai += 1
     if gw.eri is None:
         weighted_pairs = np.einsum('a,al,aP->Pl', sqrt_eps, t_by_e, pair_ai, optimize=True)
-        M = np.einsum('Pl,Ppq->pql', weighted_pairs, gw._pair_factors, optimize=True)
+        from .gw import _screening_storage
+        M = _screening_storage(gw, (nso, nso, len(e_rpa)), gw._pair_factors.dtype)
+        for p in range(nso):
+            M[p] = gw._pair_factors[:, p, :].T @ weighted_pairs
     else:
         M = np.einsum('a,al,apq->pql', sqrt_eps, t_by_e, eri_product, optimize=True)
     return M
@@ -1062,6 +1122,11 @@ def bse_AB_matrices(gw):
     '''
     method = gw.screening
     assert method in ('TDH','TDHF','TDDFT')
+    _ensure_bse_screening(gw)
+    static = getattr(gw, '_static_screening', None)
+    if static is not None:
+        occupied = static.static_occupied(gw.nocc)
+        occupied_virtual = static.static_ov(gw.nocc)
 
     # restricted calculations only
     nso = gw.nso
@@ -1088,12 +1153,14 @@ def bse_AB_matrices(gw):
                     #if method == 'TDHF':
                     #    A[ia,jb] -= gw.eri[a,b,i,j]
                     #    B[ia,jb] -= gw.eri[a,j,i,b]
-                    for L in range(len(gw.e_rpa)):
-                        # MOLGW's no-RI SCREENED_COULOMB stores the induced
-                        # interaction as -2 w_s w_s / pole.  With the Casida
-                        # amplitudes used here this corresponds to +4 M M / w.
-                        A[ia, jb] += 4.*gw._M[i,j,L] * gw._M[a,b,L]/ gw.e_rpa[L]
-                        B[ia, jb] += 4.*gw._M[i,b,L] * gw._M[a,j,L]/ gw.e_rpa[L]
+                    if static is not None:
+                        A[ia, jb] += 4*np.dot(occupied[:,i,j], static.factors[:,a,b])
+                        B[ia, jb] += 4*np.dot(occupied_virtual[:,i,b-nocc], static.factors[:,a,j])
+                    else:
+                        for L in range(len(gw.e_rpa)):
+                            # The Casida convention gives induced screening +4 M M / w.
+                            A[ia, jb] += 4.*gw._M[i,j,L] * gw._M[a,b,L]/gw.e_rpa[L]
+                            B[ia, jb] += 4.*gw._M[i,b,L] * gw._M[a,j,L]/gw.e_rpa[L]
 
                     jb += 1
 
@@ -1112,50 +1179,7 @@ def _bse_tda_diag(gw):
 
 
 def _bse_tda_matvec(gw, x):
-    nocc = gw.nocc
-    nvir = gw.nso - nocc
-    xmat = np.asarray(x).reshape(nocc, nvir)
-    diag = _bse_tda_diag(gw).reshape(nocc, nvir)
-    y = diag * xmat
-
-    pair_factors = getattr(gw, '_pair_factors', None)
-    if pair_factors is not None:
-        occ_occ = pair_factors[:, :nocc, :nocc]
-        vir_vir = pair_factors[:, nocc:, nocc:]
-        vir_occ = pair_factors[:, nocc:, :nocc]
-
-        direct_projected = np.einsum('Pbj,jb->P', vir_occ, xmat, optimize=True)
-        y += 2.0 * np.einsum('Pai,P->ia', vir_occ, direct_projected, optimize=True)
-
-        exchange_projected = np.einsum('Pij,jb->Pib', occ_occ, xmat, optimize=True)
-        y -= np.einsum('Pab,Pib->ia', vir_vir, exchange_projected, optimize=True)
-    else:
-        y += 2.0 * np.einsum(
-            'aibj,jb->ia',
-            gw.eri[nocc:, :nocc, nocc:, :nocc],
-            xmat,
-            optimize=True,
-        )
-        y -= np.einsum(
-            'abij,jb->ia',
-            gw.eri[nocc:, nocc:, :nocc, :nocc],
-            xmat,
-            optimize=True,
-        )
-
-    if gw.e_rpa is None or gw._M is None:
-        e_rpa, t_rpa = gw.rpa(method=gw.screening)
-        gw._M = gw.get_m_rpa(e_rpa, t_rpa)
-
-    y += 4.0 * np.einsum(
-        'ijL,abL,jb,L->ia',
-        gw._M[:nocc, :nocc, :],
-        gw._M[nocc:, nocc:, :],
-        xmat,
-        1.0 / gw.e_rpa,
-        optimize=True,
-    )
-    return y.reshape(-1)
+    return _bse_tda_matmat(gw, np.asarray(x).reshape(-1, 1), 1)[:, 0]
 
 
 def _bse_tda_matmat(gw, vectors, batch_columns=8):
@@ -1164,124 +1188,158 @@ def _bse_tda_matmat(gw, vectors, batch_columns=8):
     No change to its static screened kernel or excitation space. Explicit
     two-stage contractions avoid forming a transition-space matrix; scratch
     scales with the factor count times occupied/virtual sizes times the batch.
-    This experimental helper does not change the public solver default.
+    Auxiliary factors and screening poles are blocked as well as trial
+    columns, avoiding full virtual-virtual pole weighting and quartic
+    contraction intermediates. The scalar action uses this same routine.
+    Reused factorized charge screening contracts the exact auxiliary static
+    metric, without materializing orbital-pair/pole couplings.
     """
-    vectors=np.asarray(vectors)
-    nocc=gw.nocc
-    nvir=gw.nso-nocc
-    if vectors.ndim!=2 or vectors.shape[0]!=nocc*nvir or batch_columns<1:
-        raise ValueError('Invalid TDA trial block or batch size')
-    if gw.e_rpa is None or gw._M is None:
-        e_rpa,t_rpa=gw.rpa(method=gw.screening)
-        gw._M=gw.get_m_rpa(e_rpa,t_rpa)
-    factors=getattr(gw,'_pair_factors',None)
-    out=np.empty(vectors.shape,dtype=np.result_type(vectors,gw._M,float))
-    diagonal=_bse_tda_diag(gw).reshape(nocc,nvir,1)
-    screened_virtual=gw._M[nocc:,nocc:,:]/gw.e_rpa
-    for start in range(0,vectors.shape[1],batch_columns):
-        stop=min(start+batch_columns,vectors.shape[1])
-        x=vectors[:,start:stop].reshape(nocc,nvir,-1)
-        y=diagonal*x
+    vectors = np.asarray(vectors)
+    nocc = gw.nocc
+    nvir = gw.nso - nocc
+    if vectors.ndim != 2 or vectors.shape[0] != nocc * nvir or batch_columns < 1:
+        raise ValueError("Invalid TDA trial block or batch size")
+    _ensure_bse_screening(gw)
+    screened = _bse_screening(gw)
+    factors = getattr(gw, "_pair_factors", None)
+    out = np.empty(vectors.shape, dtype=np.result_type(vectors, screened.dtype, float))
+    diagonal = _bse_tda_diag(gw).reshape(nocc, nvir, 1)
+    for start in range(0, vectors.shape[1], batch_columns):
+        stop = min(start + batch_columns, vectors.shape[1])
+        x = vectors[:, start:stop].reshape(nocc, nvir, -1)
+        y = diagonal * x
         if factors is not None:
-            vo=factors[:,nocc:,:nocc]
-            projected=np.einsum('Pbj,jbk->Pk',vo,x,optimize=True)
-            y+=2*np.einsum('Pai,Pk->iak',vo,projected,optimize=True)
-            projected=np.einsum('Pij,jbk->Pibk',factors[:,:nocc,:nocc],x,optimize=True)
-            y-=np.einsum('Pab,Pibk->iak',factors[:,nocc:,nocc:],projected,optimize=True)
+            for first in range(0, len(factors), 64):
+                f = factors[first : first + 64]
+                vo = f[:, nocc:, :nocc]
+                projected = np.einsum("Pbj,jbk->Pk", vo, x, optimize=True)
+                y += 2 * np.einsum("Pai,Pk->iak", vo, projected, optimize=True)
+                projected = np.einsum(
+                    "Pij,jbk->Pibk", f[:, :nocc, :nocc], x, optimize=True
+                )
+                y -= np.einsum(
+                    "Pab,Pibk->iak", f[:, nocc:, nocc:], projected, optimize=True
+                )
         else:
-            y+=2*np.einsum('aibj,jbk->iak',gw.eri[nocc:,:nocc,nocc:,:nocc],x,optimize=True)
-            y-=np.einsum('abij,jbk->iak',gw.eri[nocc:,nocc:,:nocc,:nocc],x,optimize=True)
-        projected=np.einsum('ijL,jbk->Libk',gw._M[:nocc,:nocc,:],x,optimize=True)
-        y+=4*np.einsum('abL,Libk->iak',screened_virtual,projected,optimize=True)
-        out[:,start:stop]=y.reshape(nocc*nvir,-1)
+            y += 2 * np.einsum(
+                "aibj,jbk->iak", gw.eri[nocc:, :nocc, nocc:, :nocc], x, optimize=True
+            )
+            y -= np.einsum(
+                "abij,jbk->iak", gw.eri[nocc:, nocc:, :nocc, :nocc], x, optimize=True
+            )
+        if isinstance(screened, (FactorizedCouplings, StaticScreening)):
+            occupied = screened.static_occupied(nocc)
+            for first in range(0, len(screened.factors), 64):
+                s = slice(first, first + 64)
+                projected = np.einsum("Pij,jbk->Pibk", occupied[s], x, optimize=True)
+                y += 4 * np.einsum(
+                    "Pab,Pibk->iak",
+                    screened.factors[s, nocc:, nocc:],
+                    projected,
+                    optimize=True,
+                )
+        else:
+            for first in range(0, len(gw.e_rpa), 64):
+                s = slice(first, first + 64)
+                projected = np.einsum(
+                    "ijL,jbk->Libk", gw._M[:nocc, :nocc, s], x, optimize=True
+                )
+                projected /= gw.e_rpa[s, None, None, None]
+                y += 4 * np.einsum(
+                    "abL,Libk->iak", gw._M[nocc:, nocc:, s], projected, optimize=True
+                )
+        out[:, start:stop] = y.reshape(nocc * nvir, -1)
     return out
 
 
-def _bse_b_matvec(gw, x):
-    nocc = gw.nocc
-    nvir = gw.nso - nocc
-    xmat = np.asarray(x).reshape(nocc, nvir)
-    y = np.zeros_like(xmat)
+def _bse_b_matmat(gw, vectors, batch_columns=8):
+    """Apply the B block with bounded auxiliary/pole and trial-vector batches."""
+    vectors = np.asarray(vectors)
+    nocc, nvir = gw.nocc, gw.nso - gw.nocc
+    dim = nocc * nvir
+    if vectors.ndim != 2 or vectors.shape[0] != dim or batch_columns < 1:
+        raise ValueError("Invalid BSE B trial block or batch size")
+    _ensure_bse_screening(gw)
+    screened = _bse_screening(gw)
+    factors = getattr(gw, "_pair_factors", None)
+    out = np.empty(vectors.shape, dtype=np.result_type(vectors, screened.dtype, float))
+    for start in range(0, vectors.shape[1], batch_columns):
+        stop = min(start + batch_columns, vectors.shape[1])
+        x = vectors[:, start:stop].reshape(nocc, nvir, -1)
+        if factors is None:
+            y = 2 * np.einsum(
+                "aijb,jbk->iak", gw.eri[nocc:, :nocc, :nocc, nocc:], x, optimize=True
+            )
+            y -= np.einsum(
+                "ajib,jbk->iak", gw.eri[nocc:, :nocc, :nocc, nocc:], x, optimize=True
+            )
+        else:
+            y = np.zeros_like(x, dtype=out.dtype)
+            for first in range(0, len(factors), 64):
+                f = factors[first : first + 64]
+                projected = np.einsum(
+                    "Pjb,jbk->Pk", f[:, :nocc, nocc:], x, optimize=True
+                )
+                y += 2 * np.einsum(
+                    "Pai,Pk->iak", f[:, nocc:, :nocc], projected, optimize=True
+                )
+                projected = np.einsum(
+                    "Pib,jbk->Pijk", f[:, :nocc, nocc:], x, optimize=True
+                )
+                y -= np.einsum(
+                    "Paj,Pijk->iak", f[:, nocc:, :nocc], projected, optimize=True
+                )
+        if isinstance(screened, (StaticScreening, FactorizedCouplings)):
+            y += _static_b_action(screened, x, nocc)
+        else:
+            for first in range(0, len(gw.e_rpa), 64):
+                poles = slice(first, first + 64)
+                projected = np.einsum(
+                    "ibL,jbk->Lijk", screened[:nocc, nocc:, poles], x, optimize=True
+                )
+                projected /= gw.e_rpa[poles, None, None, None]
+                y += 4 * np.einsum(
+                    "ajL,Lijk->iak",
+                    screened[nocc:, :nocc, poles],
+                    projected,
+                    optimize=True,
+                )
+        out[:, start:stop] = y.reshape(dim, -1)
+    return out
 
-    pair_factors = getattr(gw, '_pair_factors', None)
-    if pair_factors is not None:
-        vir_occ = pair_factors[:, nocc:, :nocc]
-        occ_vir = pair_factors[:, :nocc, nocc:]
 
-        direct_projected = np.einsum('Pjb,jb->P', occ_vir, xmat, optimize=True)
-        y += 2.0 * np.einsum('Pai,P->ia', vir_occ, direct_projected, optimize=True)
-
-        exchange_projected = np.einsum('Pib,jb->Pij', occ_vir, xmat, optimize=True)
-        y -= np.einsum('Paj,Pij->ia', vir_occ, exchange_projected, optimize=True)
-    else:
-        y += 2.0 * np.einsum(
-            'aijb,jb->ia',
-            gw.eri[nocc:, :nocc, :nocc, nocc:],
-            xmat,
-            optimize=True,
-        )
-        y -= np.einsum(
-            'ajib,jb->ia',
-            gw.eri[nocc:, :nocc, :nocc, nocc:],
-            xmat,
-            optimize=True,
-        )
-
-    if gw.e_rpa is None or gw._M is None:
-        e_rpa, t_rpa = gw.rpa(method=gw.screening)
-        gw._M = gw.get_m_rpa(e_rpa, t_rpa)
-
-    y += 4.0 * np.einsum(
-        'ibL,ajL,jb,L->ia',
-        gw._M[:nocc, nocc:, :],
-        gw._M[nocc:, :nocc, :],
-        xmat,
-        1.0 / gw.e_rpa,
-        optimize=True,
-    )
-    return y.reshape(-1)
+def _bse_b_matvec(gw, vector):
+    return _bse_b_matmat(gw, np.asarray(vector).reshape(-1, 1), 1)[:, 0]
 
 
-def _bse_full_matvec(gw, xy):
-    dim = gw.nocc * (gw.nso - gw.nocc)
-    x = xy[:dim]
-    y = xy[dim:]
-    ax_by = _bse_tda_matvec(gw, x) + _bse_b_matvec(gw, y)
-    bx_ay = _bse_b_matvec(gw, x) + _bse_tda_matvec(gw, y)
-    return np.concatenate((ax_by, -bx_ay))
+def _bse_full_matvec(gw, vector):
+    return _bse_full_matmat(gw, np.asarray(vector).reshape(-1, 1), 1)[:, 0]
 
 
 def _bse_full_matmat(gw, vectors, batch_columns=8):
-    """Exact bounded-column action of the existing real molecular A/B kernel."""
+    """Apply [A B; -B -A], retaining only one trial batch of each block."""
     vectors = np.asarray(vectors)
-    nocc, nvir = gw.nocc, gw.nso-gw.nocc
-    dim = nocc*nvir
-    if vectors.ndim != 2 or vectors.shape[0] != 2*dim or batch_columns < 1:
+    dim = gw.nocc * (gw.nso - gw.nocc)
+    if vectors.ndim != 2 or vectors.shape[0] != 2 * dim or batch_columns < 1:
         raise ValueError("Invalid full BSE block or batch size")
-    ax = _bse_tda_matmat(gw, vectors[:dim], batch_columns)
-    ay = _bse_tda_matmat(gw, vectors[dim:], batch_columns)
-    factors = getattr(gw, '_pair_factors', None)
-    out = np.empty(vectors.shape, dtype=np.result_type(ax, ay))
+    _ensure_bse_screening(gw)
+    out = np.empty(
+        vectors.shape, dtype=np.result_type(vectors, _bse_screening(gw).dtype, float)
+    )
+    x, y = vectors[:dim], vectors[dim:]
     for start in range(0, vectors.shape[1], batch_columns):
-        stop = min(start+batch_columns, vectors.shape[1])
-        for source, target, a_part, sign in ((vectors[dim:], out[:dim], ax, 1),
-                                             (vectors[:dim], out[dim:], ay, -1)):
-            x = source[:, start:stop].reshape(nocc, nvir, -1)
-            if factors is None:
-                y = 2*np.einsum('aijb,jbk->iak', gw.eri[nocc:,:nocc,:nocc,nocc:], x, optimize=True)
-                y -= np.einsum('ajib,jbk->iak', gw.eri[nocc:,:nocc,:nocc,nocc:], x, optimize=True)
-            else:
-                projected = np.einsum('Pjb,jbk->Pk', factors[:,:nocc,nocc:], x, optimize=True)
-                y = 2*np.einsum('Pai,Pk->iak', factors[:,nocc:,:nocc], projected, optimize=True)
-                projected = np.einsum('Pib,jbk->Pijk', factors[:,:nocc,nocc:], x, optimize=True)
-                y -= np.einsum('Paj,Pijk->iak', factors[:,nocc:,:nocc], projected, optimize=True)
-            projected = np.einsum('ibL,jbk->Lijk', gw._M[:nocc,nocc:,:], x, optimize=True)
-            y += 4*np.einsum('ajL,Lijk->iak', gw._M[nocc:,:nocc,:]/gw.e_rpa, projected, optimize=True)
-            target[:, start:stop] = sign*(a_part[:, start:stop]+y.reshape(dim, -1))
+        columns = slice(start, start + batch_columns)
+        for a_source, b_source, target, sign in (
+            (x, y, out[:dim], 1),
+            (y, x, out[dim:], -1),
+        ):
+            action = _bse_tda_matmat(gw, a_source[:, columns], batch_columns)
+            action += _bse_b_matmat(gw, b_source[:, columns], batch_columns)
+            target[:, columns] = sign * action
     return out
 
 
-def bse_tda_low_rank(
+def solve_tda(
     gw,
     nroots=5,
     tol=1e-8,
@@ -1289,28 +1347,41 @@ def bse_tda_low_rank(
     max_space=None,
     return_info=False,
     return_vectors=True,
+    batch_columns=None,
 ):
-    '''Lowest TDA-BSE roots from a factorized/matrix-free Davidson solve.'''
+    '''Lowest TDA-BSE roots from a factorized/matrix-free Davidson solve.
+
+    ``batch_columns`` opts into exact column batching of the existing static
+    screened operator (for example, 8); None retains single-vector callbacks.
+    This changes contraction order only, not screening, orbital gaps or the
+    Davidson formulation. The public Davidson docstring documents its method
+    references and adaptation limits. No universal speedup is guaranteed.
+    '''
     from pyqed.davidson import davidson
+
+    if batch_columns is not None and (isinstance(batch_columns,bool)
+            or int(batch_columns)!=batch_columns or batch_columns<1):
+        raise ValueError('batch_columns must be a positive integer or None')
+    if batch_columns is not None:batch_columns=int(batch_columns)
 
     diag = _bse_tda_diag(gw)
     nroots = min(int(nroots), diag.size)
     if nroots < 1:
         raise ValueError("nroots must be positive.")
 
-    if gw.e_rpa is None or gw._M is None:
-        e_rpa, t_rpa = gw.rpa(method=gw.screening)
-        gw._M = gw.get_m_rpa(e_rpa, t_rpa)
+    _ensure_bse_screening(gw)
 
     eigvals, eigvecs, info = davidson(
         lambda vec: _bse_tda_matvec(gw, vec),
-        neigen=nroots,
-        tol=tol,
-        itermax=max_cycle,
+        roots=nroots,
+        tolerance=tol,
+        iterations=max_cycle,
         diag=diag,
-        max_space=max_space,
+        space=max_space,
         return_info=True,
         return_partial=True,
+        matmat=None if batch_columns is None else lambda block: _bse_tda_matmat(gw,block,batch_columns),
+        dtype=np.result_type(diag, _bse_screening(gw).dtype),
     )
     gw._bse_tda_info = info
     gw.info = info
@@ -1377,9 +1448,7 @@ def solve_bse(
         isinstance(max_space, bool) or int(max_space) != max_space or max_space < 1
     ):
         raise ValueError("max_space must be a positive integer")
-    if gw.e_rpa is None or gw._M is None:
-        e_rpa, t_rpa = gw.rpa(method=gw.screening)
-        gw._M = gw.get_m_rpa(e_rpa, t_rpa)
+    _ensure_bse_screening(gw)
 
     info = dict(solver="low_rank_full_bse", eigensolver=eigensolver,
                 converged=False, nroots=nroots)
@@ -1489,9 +1558,9 @@ def _same_geometry_ao_overlap(bse_obj):
     if hasattr(mf, "get_ovlp"):
         return np.asarray(mf.get_ovlp(), dtype=float)
     overlap = getattr(bse_obj.mol, "overlap", None)
-    if overlap is None:
+    if not callable(overlap):
         raise ValueError("AO overlap was not supplied and cannot be inferred.")
-    return np.asarray(overlap, dtype=float)
+    return np.asarray(overlap(), dtype=float)
 
 
 def _cross_geometry_ao_overlap(bra, ket):
