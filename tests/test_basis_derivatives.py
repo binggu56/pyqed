@@ -29,6 +29,20 @@ def _h2(z):
     return mol
 
 
+@pytest.mark.parametrize('kernel',['overlap','kinetic','nuclear','hcore'])
+@pytest.mark.parametrize('workers',[1,2])
+def test_contracted_one_electron_curvature(kernel,workers):
+    from pyqed.qchem.basis_derivatives import contracted_one_electron_curvature
+    mol = _h2(1.4)
+    mol.builtin_parallel = workers > 1
+    mol.builtin_eri_workers = workers
+    mol.builtin_parallel_min_nao = 0
+    density = np.array([[.7,.2],[-.1,.4]])
+    full = one_electron_derivatives(mol,kernel,order=2).reshape(6,6,2,2)
+    actual = contracted_one_electron_curvature(mol,density,kernel)
+    np.testing.assert_allclose(actual,np.einsum('xyij,ij->xy',full,density),atol=2e-12)
+
+
 def test_builtin_first_derivatives_match_finite_difference_h2():
     mol = _h2(1.4)
     step = 1.0e-4
@@ -230,7 +244,8 @@ def test_cpp_directional_eri_derivatives_match_python_reference():
         np.testing.assert_allclose(actual, reference, atol=2.0e-10, rtol=1.0e-10)
 
 
-def test_cpp_directional_eri_scalar_contraction_matches_dense_p_shells():
+@pytest.mark.parametrize("exchange_fraction", [0., .1, .5])
+def test_cpp_directional_eri_scalar_contraction_matches_dense_p_shells(exchange_fraction):
     from pyqed.qchem.basis import _integrals_cpp
 
     if _integrals_cpp is None or not hasattr(
@@ -252,7 +267,7 @@ def test_cpp_directional_eri_scalar_contraction_matches_dense_p_shells():
     for order in (1, 2):
         derivative = _directional_eri_derivatives_cpp(mol, directions, order)
         veff = np.einsum("...pqrs,rs->...pq", derivative, dm_right, optimize=True)
-        veff -= 0.5 * np.einsum(
+        veff -= exchange_fraction * np.einsum(
             "...prqs,rs->...pq", derivative, dm_right, optimize=True
         )
         reference = np.einsum("pq,...pq->...", dm_left, veff, optimize=True)
@@ -263,12 +278,13 @@ def test_cpp_directional_eri_scalar_contraction_matches_dense_p_shells():
             dm_right,
             order=order,
             workers=2,
+            exchange_fraction=exchange_fraction,
         )
         np.testing.assert_allclose(actual, reference, atol=2.0e-10, rtol=1.0e-10)
 
 
-@pytest.mark.parametrize("angular_momentum", (2, 3))
-def test_cpp_directional_eri_derivatives_support_d_and_f_shells(
+@pytest.mark.parametrize("angular_momentum", (0, 1, 2, 3))
+def test_cpp_directional_eri_derivatives_match_finite_difference_shells(
     angular_momentum,
 ):
     from pyqed.qchem.basis import _integrals_cpp, _shell

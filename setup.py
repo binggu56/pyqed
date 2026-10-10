@@ -222,6 +222,7 @@ def _extensions_to_build():
             Extension(
                 "pyqed.qchem._integrals_cpp",
                 ["pyqed/qchem/_integrals.cpp"],
+                depends=["pyqed/qchem/ri_derivatives.hpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
                 extra_compile_args=qchem_integral_compile_args,

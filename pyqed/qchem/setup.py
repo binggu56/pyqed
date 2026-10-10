@@ -49,6 +49,7 @@ extensions = [
     Extension(
         name="_integrals_cpp",
         sources=["_integrals.cpp"],
+        depends=["ri_derivatives.hpp"],
         include_dirs=cpp_include_dirs,
         language="c++",
         extra_compile_args=["-std=c++17", "-O3"],

@@ -75,6 +75,8 @@ BAS_SLOTS  = 8
 
 _BUILTIN_OPTION_SPECS = (
     ("coord_type", "builtin_coord_type", "native_coord_type", str, "spherical"),
+    ("derivative_screen_tol", "derivative_screen_tol", "derivative_screen_tol", float, 0.),
+    ("derivative_kernel", "derivative_kernel", "derivative_kernel", str, "auto"),
     ("parallel", "builtin_parallel", "native_parallel", bool, False),
     (
         "eri_workers", "builtin_eri_workers", "native_eri_workers",
@@ -91,7 +93,7 @@ _BUILTIN_OPTION_SPECS = (
     ),
     ("eri_representation", "builtin_eri_representation", "native_eri_representation", str, "auto"),
     ("aosym", "builtin_aosym", "native_aosym", lambda v: None if v is None else str(v), "s8"),
-    ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: None if v is None else str(v), None),
+    ("auxbasis", "builtin_auxbasis", "native_auxbasis", lambda v: dict(v) if hasattr(v, 'items') else None if v is None else str(v), None),
     ("ri_metric_tol", "builtin_ri_metric_tol", "native_ri_metric_tol", float, 1e-10),
     ("ri_metric_solver", "builtin_ri_metric_solver", "native_ri_metric_solver", str, "auto"),
     ("ri_purpose", "builtin_ri_purpose", "native_ri_purpose", str, "jk"),
@@ -251,6 +253,10 @@ def _normalize_builtin_options(options, strict=False):
     raw_keys = set(raw_options)
     tmp = {"builtin_options": raw_options}
     normalized = _pop_builtin_options(tmp)
+    if not np.isfinite(normalized['derivative_screen_tol']) or normalized['derivative_screen_tol'] < 0:
+        raise ValueError('derivative_screen_tol must be finite and nonnegative.')
+    if normalized['derivative_kernel'] not in ('auto', 'recurrence', 'rys'):
+        raise ValueError('derivative_kernel must be auto, recurrence, or rys.')
     if (
         raw_keys & {"eri_representation", "builtin_eri_representation", "native_eri_representation"}
         and not raw_keys & {"aosym", "builtin_aosym", "native_aosym"}
@@ -1274,6 +1280,8 @@ class Molecule:
             self.builtin_options.get("aosym", "s1"),
         )
         self.builtin_coord_type = self.builtin_options["coord_type"]
+        self.derivative_screen_tol = self.builtin_options['derivative_screen_tol']
+        self.derivative_kernel = self.builtin_options['derivative_kernel']
         self.builtin_parallel = self.builtin_options["parallel"]
         self.builtin_eri_workers = self.builtin_options["eri_workers"]
         self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]

@@ -1,6 +1,8 @@
 Quantum Chemistry
 =================
 
+See :doc:`rhf_factor_hessian` for analytic RI/CD RHF Hessians and their limits.
+
 The :mod:`pyqed.qchem` package provides native quantum chemistry tools for
 molecular integrals, Hartree-Fock references, post-HF correlation methods,
 multiconfigurational methods, and excited-state calculations.

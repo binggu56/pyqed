@@ -898,9 +898,25 @@ def _contracted_three_center_from_signatures(sig_a, sig_b, sig_c):
     return _contracted_three_center_from_signatures_cached(sig_a, sig_b, sig_c)
 
 
+@lru_cache(maxsize=4096)
+def _active_primitives(exponents, coefficients):
+    exponents = np.asarray(exponents, dtype=np.float64)
+    coefficients = np.asarray(coefficients, dtype=np.float64)
+    if exponents.shape != coefficients.shape:
+        raise ValueError("Primitive exponents and weights must have matching shapes.")
+    active = coefficients != 0.0
+    exponents, coefficients = exponents[active], coefficients[active]
+    exponents.flags.writeable = coefficients.flags.writeable = False
+    return exponents, coefficients
+
+
 def _pack_signatures_for_numba(signatures):
     nsig = len(signatures)
-    max_prim = max(len(sig[2]) for sig in signatures) if signatures else 0
+    packed_primitives = []
+    for _, _, sig_exps, sig_weights in signatures:
+        packed_primitives.append(_active_primitives(tuple(sig_exps), tuple(sig_weights)))
+
+    max_prim = max((len(item[0]) for item in packed_primitives), default=0)
     shells = np.zeros((nsig, 3), dtype=np.int64)
     origins = np.zeros((nsig, 3), dtype=np.float64)
     exps = np.zeros((nsig, max_prim), dtype=np.float64)
@@ -908,13 +924,14 @@ def _pack_signatures_for_numba(signatures):
     nprim = np.zeros((nsig,), dtype=np.int64)
 
     for idx, sig in enumerate(signatures):
-        shell, origin, sig_exps, sig_weights = sig
+        shell, origin, _, _ = sig
+        sig_exps, sig_weights = packed_primitives[idx]
         shells[idx, :] = np.asarray(shell, dtype=np.int64)
         origins[idx, :] = np.asarray(origin, dtype=np.float64)
         n = len(sig_exps)
         nprim[idx] = n
-        exps[idx, :n] = np.asarray(sig_exps, dtype=np.float64)
-        weights[idx, :n] = np.asarray(sig_weights, dtype=np.float64)
+        exps[idx, :n] = sig_exps
+        weights[idx, :n] = sig_weights
 
     return shells, origins, exps, weights, nprim
 
@@ -3028,13 +3045,61 @@ def _compute_native_ri_tensors_cython(signatures, aux_signatures):
     return np.asarray(metric, dtype=np.float64), np.asarray(j3, dtype=np.float64)
 
 
-def _compute_native_ri_pair_tensors_cpp(signatures, aux_signatures, pair_bounds, ri_screen_tol):
+def _compute_native_ri_pair_tensors_cpp(
+    signatures, aux_signatures, pair_bounds, ri_screen_tol,
+    primary_transform=None, aux_transform=None, factor_options=None, pair_support=None,
+):
+    """Build packed integrals, or stream them into metric-whitened factors.
+
+    Streaming adapts PySCF's shell-block/whitening organization (Sun et al.,
+    WIREs Comput. Mol. Sci. 8, e1340, 2018, doi:10.1002/wcms.1340), not its
+    libcint engine. The OS/HGP integrals and screening are unchanged. Complete
+    supported shells and shell-ordered transforms are required when streaming.
+    """
     global _NATIVE_RI_LAST_KERNEL_INFO
     _NATIVE_RI_LAST_KERNEL_INFO = {}
     if _integrals_cpp is None or not hasattr(_integrals_cpp, "compute_ri_tensors_packed"):
         return None
     shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
     aux_shells, aux_origins, aux_exps, aux_weights, aux_nprim = _pack_signatures_for_numba(aux_signatures)
+    transforms = () if primary_transform is None else (
+        np.ascontiguousarray(primary_transform, dtype=np.float64),
+        np.ascontiguousarray(aux_transform, dtype=np.float64),
+    )
+    factors = factor_info = operator = None
+    whitening_seconds = block_seconds = 0.0
+    blocks = peak_pairs = 0
+    if factor_options is not None:
+        nprimary = len(signatures) if primary_transform is None else primary_transform.shape[1]
+        naux = len(aux_signatures) if aux_transform is None else aux_transform.shape[1]
+        npair = nprimary*(nprimary+1)//2
+        block_size = factor_options.get("block_size")
+        block_size = max(1, int(block_size)) if block_size is not None else max(1, (16 << 20)//max(8*naux, 1))
+
+        def consume(array, start, stop):
+            nonlocal factors, factor_info, operator, whitening_seconds, block_seconds, blocks, peak_pairs
+            begin = time.perf_counter()
+            if start is None:
+                metric = array if aux_transform is None else aux_transform.T @ array @ aux_transform
+                operator, factor_info = _ri_metric_operator(
+                    metric, factor_options.get("tol", 1e-10), factor_options.get("solver", "auto"))
+                factors = _ri_storage((factor_info["metric_rank"], npair))
+                factor_info["block_size"] = block_size
+            else:
+                factors[:, start:stop] = _whiten_ri_block(operator, array, factor_info["metric_solver"])
+                blocks += 1
+                peak_pairs = max(peak_pairs, stop-start)
+                block_seconds += time.perf_counter()-begin
+            whitening_seconds += time.perf_counter()-begin
+
+        transforms = (*transforms, consume, block_size) if transforms else (None, None, consume, block_size)
+    if pair_support is not None:
+        if transforms:
+            raise ValueError('Pair-selected RI tensors require unprojected output.')
+        support = np.asarray(pair_support, dtype=bool)
+        if support.shape != (len(signatures), len(signatures)) or not np.array_equal(support, support.T):
+            raise ValueError('RI pair support must be a symmetric AO square mask.')
+        transforms = (None, None, None, 0, np.ascontiguousarray(support))
     try:
         result = _integrals_cpp.compute_ri_tensors_packed(
             np.ascontiguousarray(shells, dtype=np.int64),
@@ -3049,20 +3114,29 @@ def _compute_native_ri_pair_tensors_cpp(signatures, aux_signatures, pair_bounds,
             np.ascontiguousarray(aux_nprim, dtype=np.int64),
             np.ascontiguousarray(pair_bounds, dtype=np.float64),
             float(ri_screen_tol),
+            *transforms,
         )
-        if len(result) == 5:
-            metric, j3_pair, computed, skipped, shell_blocked = result
-        else:
-            metric, j3_pair, computed, skipped = result
-            shell_blocked = False
+        metric, j3_pair, computed, skipped, shell_blocked, metric_seconds, triplet_seconds = result
     except Exception:
+        if factor_options is not None or pair_support is not None:
+            raise
         return None
+    if primary_transform is not None:
+        metric = aux_transform.T @ metric @ aux_transform
     _NATIVE_RI_LAST_KERNEL_INFO = {
         "tensor_kernel": "cpp-shell-block-vrr-hrr" if shell_blocked else "cpp-ao-loop-packed",
         "parallel_mode": "serial",
         "shell_blocked": bool(shell_blocked),
         "task_count": 1,
+        "spherical_output": primary_transform is not None,
+        "metric_seconds": float(metric_seconds),
+        "triplet_seconds": float(triplet_seconds-block_seconds),
     }
+    if factor_options is not None:
+        j3_pair = factors
+        _NATIVE_RI_LAST_KERNEL_INFO.update(
+            streamed=True, factor_info=factor_info, whitening_seconds=whitening_seconds,
+            block_count=blocks, peak_block_pairs=peak_pairs)
     return (
         np.asarray(metric, dtype=np.float64),
         np.asarray(j3_pair, dtype=np.float64),
@@ -3911,6 +3985,33 @@ def _compute_three_center_pair_tensor_parallel(
     return j3, computed, skipped
 
 
+def _ri_metric_operator(metric, tol, solver):
+    solver = str(solver or "auto").lower().replace("_", "-")
+    if solver not in {"auto", "cholesky", "eig", "eigh"}:
+        raise ValueError("builtin_ri_metric_solver must be 'auto', 'cholesky', or 'eigh'.")
+    if solver in {"auto", "cholesky"}:
+        try:
+            return np.asfortranarray(np.linalg.cholesky(metric)), {
+                "metric_solver": "cholesky", "metric_rank": int(metric.shape[0])}
+        except np.linalg.LinAlgError:
+            if solver == "cholesky":
+                raise
+    evals, evecs = np.linalg.eigh(metric)
+    keep = evals > float(tol)
+    if not np.any(keep):
+        raise ValueError("Auxiliary Coulomb metric has no eigenvalues above ri_metric_tol.")
+    return evecs[:, keep].T / np.sqrt(evals[keep])[:, None], {
+        "metric_solver": "eigh", "metric_rank": int(np.count_nonzero(keep))}
+
+
+def _whiten_ri_block(operator, block, solver):
+    if solver == "cholesky":
+        from scipy.linalg.blas import dtrsm
+        return dtrsm(1.0, operator, block.T, lower=True, trans_a=1,
+                     side=1, overwrite_b=True).T
+    return operator @ block
+
+
 def _metric_factorize_ri(
     metric, j3_pair, tol=1e-10, solver="auto", block_size=None, disk_backed=False
 ):
@@ -3919,16 +4020,9 @@ def _metric_factorize_ri(
     Disk-backed output preserves the same RI metric and rank selection; it
     changes storage only. Temporary files are released with the arrays.
     """
-    from scipy.linalg import solve_triangular
-
     def allocate(shape):
         return _ri_storage(shape) if disk_backed else np.empty(shape, dtype=np.float64)
 
-    solver = str(solver or "auto").lower().replace("_", "-")
-    if solver not in {"auto", "cholesky", "eig", "eigh"}:
-        raise ValueError(
-            "builtin_ri_metric_solver must be 'auto', 'cholesky', or 'eigh'."
-        )
     metric = np.asarray(metric, dtype=np.float64)
     j3_pair = np.asarray(j3_pair, dtype=np.float64)
     naux, npair = j3_pair.shape
@@ -3937,53 +4031,17 @@ def _metric_factorize_ri(
     else:
         block_size = max(1, int(block_size))
 
-    if solver in {"auto", "cholesky"}:
-        try:
-            chol = np.linalg.cholesky(metric)
-            factors = allocate(j3_pair.shape)
-            for start in range(0, npair, block_size):
-                stop = min(start + block_size, npair)
-                factors[:, start:stop] = solve_triangular(
-                    chol, j3_pair[:, start:stop], lower=True, check_finite=False
-                )
-            return factors, {
-                "metric_solver": "cholesky",
-                "metric_rank": int(naux),
-                "block_size": int(block_size),
-            }
-        except np.linalg.LinAlgError:
-            if solver == "cholesky":
-                raise
-
-    evals, evecs = np.linalg.eigh(metric)
-    keep = evals > float(tol)
-    if not np.any(keep):
-        raise ValueError(
-            "Auxiliary Coulomb metric has no eigenvalues above ri_metric_tol."
-        )
-    factors = allocate((int(np.count_nonzero(keep)), npair))
-    projector = evecs[:, keep].T / np.sqrt(evals[keep])[:, None]
+    operator, info = _ri_metric_operator(metric, tol, solver)
+    factors = allocate((info["metric_rank"], npair))
     for start in range(0, npair, block_size):
         stop = min(start + block_size, npair)
-        factors[:, start:stop] = projector @ j3_pair[:, start:stop]
-    return factors, {
-        "metric_solver": "eigh",
-        "metric_rank": int(np.count_nonzero(keep)),
-        "block_size": int(block_size),
-    }
+        block = np.array(j3_pair[:, start:stop], order="C", copy=True)
+        factors[:, start:stop] = _whiten_ri_block(operator, block, info["metric_solver"])
+    return factors, {**info, "block_size": int(block_size)}
 
 
 def _builtin_ri_worker_count(mol, nao, naux):
-    requested = getattr(mol, "builtin_eri_workers", getattr(mol, "native_eri_workers", None))
-    if requested is not None:
-        return max(1, int(requested))
-    workers = _builtin_worker_count(mol, nao)
-    if workers > 1:
-        return workers
-    work_size = int(nao) * int(nao) * int(naux)
-    if work_size < 50000:
-        return 1
-    return min(4, max(1, os.cpu_count() or 1))
+    return _builtin_worker_count(mol, nao)
 
 
 def _native_ri_cache_enabled(mol):
@@ -4032,6 +4090,11 @@ def _native_ri_cache_key(
 
 
 def _basis_file_fingerprint(basis_name):
+    if hasattr(basis_name, 'items'):
+        basis = load_basis_dict(basis_name, tuple(basis_name))
+        data = {key: [(int(l), np.asarray(e).tolist(), np.asarray(c).tolist())
+                      for l, e, c in shells] for key, shells in basis.items()}
+        return ('explicit', hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest())
     path = _basis_path(basis_name)
     stat = os.stat(path)
     return (os.path.basename(path), int(stat.st_size), int(stat.st_mtime_ns))
@@ -4138,7 +4201,7 @@ def _write_native_ri_factor_cache(mol, cache_key, factors_pair, info):
         with open(tmp_array, "wb") as handle:
             np.save(handle, np.asarray(factors_pair, dtype=np.float64), allow_pickle=False)
         with open(tmp_info, "w", encoding="utf-8") as handle:
-            json.dump(cache_info, handle, sort_keys=True)
+            json.dump(cache_info, handle, sort_keys=True, default=lambda value: np.asarray(value).tolist())
             handle.write("\n")
         os.replace(tmp_array, array_path)
         os.replace(tmp_info, info_path)
@@ -4261,7 +4324,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         return factors, info
 
     t0 = time.perf_counter()
-    aux_dict = parse_gbs(_basis_path(auxbasis))
+    aux_dict = load_basis_dict(auxbasis, atoms)
     try:
         aux_signatures = _make_contraction_signatures(aux_dict, atoms, atcoords, coord_types="c")
     except KeyError as exc:
@@ -4272,8 +4335,11 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     aux_transform = None
     if spherical:
         aux_transform, _ = _global_cartesian_to_spherical_transform(aux_signatures)
-    pair_bounds = _compute_pair_bounds(signatures)
     ri_timings["auxbasis_setup"] = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    pair_bounds = (_compute_pair_bounds(signatures) if ri_screen_tol > 0.0
+                   else np.zeros((len(signatures), len(signatures))))
+    ri_timings["pair_bounds"] = time.perf_counter() - t0
 
     legacy_cache_key = _native_ri_cache_key(
         mol,
@@ -4302,6 +4368,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
 
     tensors = None
     tensor_builder = None
+    spherical_output = False
     workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_signatures))
     t0 = time.perf_counter()
     if tensor_backend in {"auto", "cpp"}:
@@ -4310,9 +4377,16 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             aux_signatures,
             pair_bounds,
             ri_screen_tol,
+            primary_transform if spherical else None,
+            aux_transform if spherical else None,
+            factor_options={"tol": tol, "solver": metric_solver,
+                            "block_size": getattr(mol, "builtin_ri_block_size", None)},
         )
         if tensors is not None:
             tensor_builder = "cpp-kernel-packed"
+            spherical_output = spherical
+            if spherical_output:
+                tensor_builder = "shell-spherical-packed"
             effective_tensor_backend = "cpp"
             workers = 1
         elif tensor_backend == "cpp":
@@ -4358,7 +4432,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         if tensor_builder != "cython-kernel-packed-parallel":
             workers = 1
     ri_timings["tensor_build"] = time.perf_counter() - t0
-    if spherical:
+    if spherical and not spherical_output:
         t0 = time.perf_counter()
         metric, j3_pair = _transform_ri_tensors_to_spherical(
             metric,
@@ -4377,15 +4451,17 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         )
 
     t0 = time.perf_counter()
-    factors_pair, factor_info = _metric_factorize_ri(
-        metric,
-        j3_pair,
-        tol=tol,
-        solver=metric_solver,
-        disk_backed=True,
-        block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
-    )
-    ri_timings["metric_factorize"] = time.perf_counter() - t0
+    if kernel_info.get("streamed"):
+        factors_pair, factor_info = j3_pair, kernel_info["factor_info"]
+        ri_timings["metric_factorize"] = kernel_info["whitening_seconds"]
+        ri_timings["tensor_build"] -= ri_timings["metric_factorize"]
+    else:
+        factors_pair, factor_info = _metric_factorize_ri(
+            metric, j3_pair, tol=tol, solver=metric_solver,
+            block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
+            disk_backed=True,
+        )
+        ri_timings["metric_factorize"] = time.perf_counter() - t0
     del j3_pair
     factors = PackedRIFactors(factors_pair, primary_nao) if storage == "packed" else _pair_factors_to_full(factors_pair, primary_nao)
     info = {
@@ -4543,11 +4619,44 @@ def _pair_vector_to_symmetric_matrix(values, nao):
 
 def _pair_factors_to_full(pair_factors, nao):
     pair_factors = np.asarray(pair_factors)
+    if (pair_factors.dtype == np.float64 and _basis_cy is not None
+            and hasattr(_basis_cy, "unpack_pair_factors")):
+        return _basis_cy.unpack_pair_factors(np.ascontiguousarray(pair_factors), int(nao))
     rows, cols = _ao_pair_indices(nao)
     full = np.zeros((pair_factors.shape[0], nao, nao), dtype=pair_factors.dtype)
     full[:, rows, cols] = pair_factors
     full[:, cols, rows] = pair_factors
     return full
+
+
+def _factor_exchange(factors, dm, block_size=None):
+    """Contract symmetric real auxiliary factors in bounded real BLAS blocks."""
+    nao = dm.shape[0]
+    if block_size is None:
+        block_size = max(1, (16 * 1024 * 1024) // max(1, nao * nao * factors.dtype.itemsize))
+    else:
+        block_size = max(1, int(block_size))
+    result = np.zeros((nao, nao), dtype=np.result_type(factors, dm))
+    components = [(np.ascontiguousarray(dm.real), 1)]
+    if np.iscomplexobj(dm):
+        components.append((np.ascontiguousarray(dm.imag), 1j))
+    capacity = min(block_size, len(factors))
+    work = np.empty((nao * capacity, nao), dtype=np.result_type(factors, dm.real))
+    product = np.empty((nao, nao), dtype=work.dtype)
+    for start in range(0, len(factors), block_size):
+        block = factors[start:start + block_size]
+        naux = len(block)
+        # (i,P,j) @ (j,k), then (i,Pk) @ (Pk,j): two large GEMMs.
+        # The first output already has the layout needed by the second;
+        # reuse its buffer for the real and imaginary density components.
+        left = block.transpose(1, 0, 2).reshape(nao * naux, nao)
+        right = block.reshape(naux * nao, nao)
+        intermediate = work[:nao * naux]
+        for density, weight in components:
+            np.matmul(left, density, out=intermediate)
+            np.matmul(intermediate.reshape(nao, naux * nao), right, out=product)
+            result += weight * product
+    return result
 
 
 def _pair_factor_blocks_to_vk(pair_factors, dm, nao, block_size=None):
@@ -5779,6 +5888,13 @@ def build_builtin(mol):
     mol.eri_s4 = eri_s4
     mol.eri_s8 = eri_s8
     mol.eri_factors = factors
+    mol._cd_factor_data = None
+    if factors is not None and ri_info is None:
+        from .eri_response import _cholesky_data
+        source_transform = None
+        if factors_are_spherical and coord_type == 'spherical':
+            source_transform, _ = _global_cartesian_to_spherical_transform(signatures)
+        mol._cd_factor_data = _cholesky_data(factors, factors.shape[1], source_transform)
     mol._builtin_direct_jk_data = direct_jk_data
     mol.builtin_resolved_eri_representation = eri_representation
     mol.builtin_resolved_aosym = aosym

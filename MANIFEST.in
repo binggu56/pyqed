@@ -17,6 +17,7 @@ recursive-include pyqed/qchem/basis_set *.gbs *.txt
 recursive-include pyqed/qchem/H2 *.in
 
 include pyqed/_dop853.hpp
+include pyqed/qchem/ri_derivatives.hpp
 include pyqed/heom/_heom_cpp.cpp
 include pyqed/letta/_conditional_gauge_cpp.cpp
 include pyqed/letta/_copy_einsum_cpp.cpp

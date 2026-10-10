@@ -504,11 +504,13 @@ def _eri_second_derivative_value(centers, eval_orders, atom_a, axis_a, atom_b, a
 
 class CompactERIDerivatives:
     """
-    Pair-packed derivative ERIs in a Cartesian AO-pair basis.
+    Pair-packed derivative ERIs in a source AO-pair basis.
 
     ``data`` stores pair-pair matrices with shape ``(..., npair, npair)``.
-    If ``transform`` is not ``None``, it maps Cartesian AOs to the molecule AO
-    basis as ``T[cart, ao]``.
+    ``nao_cart`` counts source functions, normally Cartesian AOs. If
+    ``transform`` is present, it maps source functions to molecular AOs.
+    Already transformed derivative data use the final AO dimension and no
+    further transform.
     """
 
     def __init__(self, data, pairs, nao_cart, nao, transform=None):
@@ -532,7 +534,7 @@ def _transform_dm_to_cart(dm, transform):
     dm = np.asarray(dm, dtype=float)
     if transform is None:
         return dm
-    return np.einsum("pa,ab,qb->pq", transform, dm, transform, optimize=True)
+    return np.einsum("pa,...ab,qb->...pq", transform, dm, transform, optimize=True)
 
 
 def _transform_mat_from_cart(mat, transform):
@@ -970,6 +972,7 @@ def _directional_one_electron_derivatives_cpp(
     directions,
     kernel="hcore",
     order=1,
+    density=None,
 ):
     if _integrals_cpp is None or not hasattr(
         _integrals_cpp, "compute_directional_one_electron_derivatives"
@@ -986,6 +989,12 @@ def _directional_one_electron_derivatives_cpp(
     shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
     atom_ids = _atom_ids_for_basis(basis, coords)
     workers = _builtin_worker_count(mol, len(basis))
+    if density is not None:
+        density = np.asarray(density,dtype=float)
+        if density.shape != (mol.nao,mol.nao) or order != 2:
+            raise ValueError('Contracted curvature requires an AO density and order=2.')
+        if transform is not None:
+            density = transform@density@transform.T
     out = _integrals_cpp.compute_directional_one_electron_derivatives(
         np.ascontiguousarray(shells, dtype=np.int64),
         np.ascontiguousarray(origins, dtype=np.float64),
@@ -999,8 +1008,25 @@ def _directional_one_electron_derivatives_cpp(
         int(kernel_ids[kernel]),
         int(order),
         int(workers),
+        *(() if density is None else (np.ascontiguousarray(density),)),
     )
+    if density is not None:
+        return np.asarray(out,dtype=float)
     return _transform_one(np.asarray(out, dtype=float), transform)
+
+
+def contracted_one_electron_curvature(mol, density, kernel='hcore'):
+    """Exact Gaussian second derivatives contracted before AO tensor storage.
+
+    Adapts the same raising/lowering recurrence as
+    :func:`directional_one_electron_derivatives`, including moving nuclei.
+    See Obara and Saika, JCP 84, 3963 (1986), doi:10.1063/1.450106
+    for the Gaussian recurrence formulation; this is a contracted adaptation,
+    not a reproduction of their complete implementation.
+    No screening or finite differences; requires the compiled integral kernel.
+    """
+    return _directional_one_electron_derivatives_cpp(
+        mol,np.eye(3*mol.natom),kernel=kernel,order=2,density=density)
 
 
 def directional_one_electron_derivatives(
@@ -1264,6 +1290,32 @@ def _eri_center_coeff(atom, center_atom):
     return 1.0 if atom == center_atom else 0.0
 
 
+def eri_first_derivatives_packed(mol):
+    """Analytical first ERI derivatives assembled in compiled shell blocks.
+
+    Returns ``CompactERIDerivatives`` in the final AO basis, including its
+    Cartesian-to-spherical transformation. Uses the existing exact Gaussian
+    derivative-column kernel with every pair selected and no screening;
+    no CD approximation, pivot selection or four-index tensor is involved.
+    """
+    if _integrals_cpp is None or not hasattr(_integrals_cpp, 'compute_eri_derivative_columns'):
+        raise ImportError('Rebuild the Gaussian extension for packed ERI derivatives.')
+    basis, transform = _basis_and_transform(mol)
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    arrays = _pack_signatures_for_numba(signatures)
+    arrays = tuple(np.ascontiguousarray(a, dtype=dtype) for a, dtype in
+                   zip(arrays, (np.int64, float, float, float, np.int64)))
+    owners = np.ascontiguousarray(_atom_ids_for_basis(basis, mol.atom_coords()), dtype=np.int64)
+    transform = np.ascontiguousarray(np.eye(len(basis)) if transform is None else transform)
+    nao = transform.shape[1]
+    pairs = _ao_pair_indices(nao)
+    directions = np.eye(3*mol.natom).reshape(-1, mol.natom, 3)
+    data = _integrals_cpp.compute_eri_derivative_columns(
+        *arrays, owners, directions, transform, np.arange(len(pairs), dtype=np.int64),
+        _builtin_worker_count(mol, len(basis)))
+    return CompactERIDerivatives(data, pairs, nao, nao)
+
+
 def _eri_derivatives_compact(mol, order=1):
     basis, transform = _basis_and_transform(mol)
     coords = np.asarray(mol.atom_coords(), dtype=float)
@@ -1380,6 +1432,7 @@ def _directional_eri_derivative_scalar_cpp(
     dm_right,
     order=2,
     workers=None,
+    exchange_fraction=0.5,
 ):
     if _integrals_cpp is None or not hasattr(
         _integrals_cpp,
@@ -1413,6 +1466,7 @@ def _directional_eri_derivative_scalar_cpp(
             ),
             int(order),
             int(workers),
+            float(exchange_fraction),
         ),
         dtype=float,
     )

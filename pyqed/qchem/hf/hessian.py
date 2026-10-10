@@ -5,6 +5,7 @@ Native RHF analytic Hessian from builtin derivative integrals.
 """
 
 import numpy as np
+from copy import deepcopy
 from scipy.optimize import linear_sum_assignment
 
 from pyqed.qchem.basis_derivatives import (
@@ -13,9 +14,44 @@ from pyqed.qchem.basis_derivatives import (
     eri_derivative_veff_scalar,
     eri_derivatives,
     one_electron_derivatives,
+    contracted_one_electron_curvature,
     position_derivatives,
 )
 from pyqed.units import amu_to_au
+
+
+def _rhf_gradient(mf):
+    """Stationary RHF gradient, retaining the reference ERI representation."""
+    from pyqed.qchem.eri_response import CoulombIntegrals
+    mol = mf.mol
+    dm = mf.make_rdm1()
+    weighted = (mf.mo_coeff * (mf.mo_occ * mf.mo_energy)) @ mf.mo_coeff.T
+    gradient = np.einsum('axij,ij->ax',
+        one_electron_derivatives(mol, 'hcore', order=1), dm)
+    gradient -= np.einsum('axij,ij->ax',
+        one_electron_derivatives(mol, 'overlap', order=1), weighted)
+    gradient += CoulombIntegrals(mol).contract_derivatives(
+        [[(0.5, dm, dm)]], exchange_fraction=0.5)[0]
+    coords, charges = mol.atom_coords(), mol.atom_charges()
+    for a in range(mol.natom):
+        for b in range(mol.natom):
+            if a != b:
+                delta = coords[a] - coords[b]
+                gradient[a] -= charges[a]*charges[b]*delta/np.linalg.norm(delta)**3
+    return gradient
+
+
+def _displaced_rhf_gradient(reference, coords):
+    # Each displacement starts from the same density; never mutate the caller.
+    scanner = deepcopy(reference).as_scanner()
+    scanner(coords)
+    if not scanner.mf.converged:
+        raise RuntimeError('Displaced RHF did not converge; Hessian discarded.')
+    original = getattr(reference.mol, 'eri_factors', None)
+    displaced = getattr(scanner.mol, 'eri_factors', None)
+    if original is not None and (displaced is None or len(original) != len(displaced)):
+        raise RuntimeError('RI/CD rank changed across a Hessian displacement.')
+    return _rhf_gradient(scanner.mf)
 
 
 def _nuclear_hessian(mol):
@@ -59,11 +95,13 @@ def _eri_veff(eri, dm, *index):
 
 class RHFHessian:
     """
-    Analytic Cartesian Hessian for native ``pyqed.qchem.hf.RHF``.
+    Cartesian Hessian for native ``pyqed.qchem.hf.RHF``.
 
     The implementation uses PyQED's builtin derivative integral layer for all
     explicit one- and two-electron nuclear derivatives.  The CPHF equations are
     solved as a dense occupied-virtual linear system.
+    RI/CD references support analytic fixed-auxiliary curvature; see
+    :mod:`.factor_curvature` for references and screening/rank restrictions.
     """
 
     def __init__(self, mf):
@@ -85,9 +123,11 @@ class RHFHessian:
             raise NotImplementedError(
                 "Native RHF Hessian requires a builtin RHF reference, not density_fit=True."
             )
-        if getattr(self.base, "low_rank_jk", False) or getattr(self.base, "cholesky_jk", False):
+        factor_jk = (getattr(self.base, 'low_rank_jk', False)
+                     or getattr(self.base, 'cholesky_jk', False))
+        if factor_jk and getattr(self.mol, 'eri_factors', None) is None:
             raise NotImplementedError(
-                "Native RHF Hessian currently requires the exact builtin J/K reference."
+                'Factorized RHF Hessians require molecule RI/CD factor provenance.'
             )
 
     @property
@@ -145,11 +185,72 @@ class RHFHessian:
         v1 = self.base.get_veff(dm1)
         return mo_coeff.T @ v1 @ cocc, dm1, v1
 
+    def _occupied_response(self, u, mo_coeff, cocc, factors, occidx):
+        """Apply RHF response in MO space using reusable three-index factors."""
+        if factors is None:
+            v, dm, _ = self._response_veff_mo(u,mo_coeff,cocc)
+            return v,dm
+        v = np.zeros_like(u)
+        for start in range(0,len(factors),32):
+            b = factors[start:start+32]
+            bo = b[:,:,occidx]
+            bu = b@u
+            rho = 4*np.einsum('Ppi,pi->P',bo,u)
+            v += np.einsum('P,Ppi->pi',rho,bo)
+            v -= np.einsum('Ppi,Pij->pj',bu,b[:,occidx][:,:,occidx],optimize=True)
+            v -= np.einsum('Ppi,Pji->pj',bo,bu[:,occidx],optimize=True)
+        c1 = mo_coeff@u
+        return v,2*(c1@cocc.T+cocc@c1.T)
+
+    def _occupied_responses(self, amplitudes, mo_coeff, cocc, factors, occidx):
+        """Batch perturbations with a bounded 32 MiB contraction workspace."""
+        if factors is None:
+            pairs = [self._occupied_response(u,mo_coeff,cocc,factors,occidx)
+                     for u in amplitudes]
+            return tuple(np.asarray(a) for a in zip(*pairs))
+        result = np.zeros_like(amplitudes)
+        nmo,nocc = amplitudes.shape[1:]
+        batch = max(1,min(8,32*1024**2//max(1,3*32*nmo*nocc*8)))
+        for start in range(0,len(factors),32):
+            b = factors[start:start+32]
+            bo = b[:,:,occidx]
+            boo = bo[:,occidx]
+            for x in range(0,len(amplitudes),batch):
+                u = amplitudes[x:x+batch]
+                bu = b[None]@u[:,None]
+                rho = 4*np.einsum('Ppi,xpi->xP',bo,u,optimize=True)
+                v = np.einsum('xP,Ppi->xpi',rho,bo,optimize=True)
+                v -= np.einsum('xPpi,Pij->xpj',bu,boo,optimize=True)
+                v -= np.einsum('Ppi,xPji->xpj',bo,bu[:,:,occidx],optimize=True)
+                result[x:x+batch] += v
+        c1 = mo_coeff@amplitudes
+        dm = 2*(c1@cocc.T+cocc@c1.transpose(0,2,1))
+        return result,dm
+
     def _build_cphf_matrix(self, mo_coeff, cocc, occidx, viridx, e_occ, e_vir):
         nocc = occidx.size
         nvir = viridx.size
         nvar = nvir * nocc
         amat = np.zeros((nvar, nvar), dtype=float)
+        factors = getattr(self.base, 'eri_factors', None)
+        if factors is None:
+            factors = getattr(self.mol, 'eri_factors', None)
+        if factors is not None:
+            from ..basis import PackedRIFactors, mo_pair_factors
+            cv = mo_coeff[:, viridx]
+            matrix = amat.reshape(nvir,nocc,nvir,nocc)
+            for start in range(0,len(factors),32):
+                block = (factors.pair_factors[start:start+32]
+                         if isinstance(factors,PackedRIFactors) else factors[start:start+32])
+                vo = mo_pair_factors(block,cv,cocc)
+                vv = mo_pair_factors(block,cv,cv)
+                oo = mo_pair_factors(block,cocc,cocc)
+                pairs = vo.reshape(len(vo),nvar)
+                amat -= 4*(pairs.T@pairs)
+                matrix += np.einsum('Pab,Pij->aibj',vv,oo,optimize=True)
+                matrix += np.einsum('Paj,Pbi->aibj',vo,vo,optimize=True)
+            amat.flat[::nvar+1] += (e_occ[None,:]-e_vir[:,None]).ravel()
+            return amat
         for col, (bpos, j) in enumerate(np.ndindex(nvir, nocc)):
             trial = np.zeros((mo_coeff.shape[1], nocc), dtype=float)
             trial[viridx[bpos], j] = 1.0
@@ -190,6 +291,11 @@ class RHFHessian:
         s1_mo_all = np.empty((npert, nmo, nmo), dtype=float)
         rhs_all = np.zeros((npert, nvir, nocc), dtype=float)
         u_fixed_all = np.zeros_like(u_all)
+        from ..basis import mo_pair_factors
+        factors = getattr(self.base,'eri_factors',None)
+        if factors is None:
+            factors = getattr(self.mol,'eri_factors',None)
+        response_factors = None if factors is None else mo_pair_factors(factors,mo_coeff)
         amat = self._build_cphf_matrix(
             mo_coeff, cocc, occidx, viridx, e_occ, e_vir
         )
@@ -201,14 +307,14 @@ class RHFHessian:
 
             u_fixed = np.zeros((nmo, nocc), dtype=float)
             u_fixed[occidx, :] = -0.5 * s1_mo[np.ix_(occidx, occidx)]
-            v_fixed, _dm_fixed, _ = self._response_veff_mo(
-                u_fixed, mo_coeff, cocc
-            )
-            rhs_all[x] = h_vo[viridx] + v_fixed[viridx]
+            rhs_all[x] = h_vo[viridx]
             u_fixed_all[x] = u_fixed
             h_vo_all[x] = h_vo
             s1_mo_all[x] = s1_mo
 
+        fixed_response, _ = self._occupied_responses(
+            u_fixed_all,mo_coeff,cocc,response_factors,occidx)
+        rhs_all += fixed_response[:,viridx]
         if nvir:
             u_vo_all = np.linalg.solve(
                 amat, rhs_all.reshape(npert, -1).T
@@ -228,6 +334,7 @@ class RHFHessian:
             "occidx": occidx,
             "viridx": viridx,
             "e_occ": e_occ,
+            "response_factors": response_factors,
         }
 
     def solve_mo_response(self, fock_derivatives, overlap_derivatives):
@@ -575,12 +682,14 @@ class RHFHessian:
         e1_all = np.zeros((npert, nocc, nocc), dtype=float)
         dm1_all = np.zeros((npert, self.mol.nao, self.mol.nao), dtype=float)
         w1_all = np.zeros_like(dm1_all)
+        total_response,total_density = self._occupied_responses(
+            u_all,mo_coeff,cocc,response['response_factors'],occidx)
 
         for x in range(npert):
             h_vo = h_vo_all[x]
             u = u_all[x]
 
-            v_total, dm1, _ = self._response_veff_mo(u, mo_coeff, cocc)
+            v_total, dm1 = total_response[x],total_density[x]
             hs = h_vo + v_total
             e1 = hs[occidx] + u[occidx] * (e_occ[:, None] - e_occ[None, :])
 
@@ -609,7 +718,63 @@ class RHFHessian:
         symmetrize=True,
         max_compact_eri2_bytes=512 * 1024**2,
         workers=None,
+        *,
+        method='analytic',
+        step=1e-3,
     ):
+        """Compute analytic curvature or explicit ``finite_difference``.
+
+        Analytic RI/CD differentiates auxiliary metrics and integral columns
+        twice, followed by CPHF relaxation. See :mod:`.factor_curvature` for
+        fidelity and restrictions. RI uses direct metric response and
+        contracted shell curvature;
+        CD second integral derivatives still use scalar evaluation.
+
+        The numerical route differences analytic stationary RHF gradients,
+        including moving RI auxiliary/metric response and local CD response.
+        It adapts the first-derivative formulations of Aquilante et al.,
+        JCP 129, 034106 (2008), doi:10.1063/1.2955755, and Dunlap,
+        PCCP 2, 2113 (2000), doi:10.1039/B000027M. This is not an analytic
+        second derivative: it has O(step**2) error and requires stable
+        CD pivot/rank and RI metric-rank choices across displacements.
+        ``workers`` parallelizes displacements on this route.
+        """
+        if method not in ('analytic', 'finite_difference'):
+            raise ValueError('Unknown Hessian method.')
+        if method == 'finite_difference':
+            self.hess = self.hess4 = None
+            self.cphf_amplitudes = self.first_order_density = None
+            self.first_order_energy_weighted_density = None
+            self.first_order_orbital_energy = self.dipole_derivative = None
+            if not getattr(self.base, 'converged', False):
+                raise ValueError('A converged RHF reference is required.')
+            if getattr(self.base, '_pyscf_mf', None) is not None or self.base.density_fit:
+                raise NotImplementedError('Use native molecule RI/CD factors, not external density fitting.')
+            if self.base.cholesky_jk and getattr(self.mol, 'eri_factors', None) is None:
+                raise NotImplementedError('Build the molecule with eri="cd" for factor-consistent response.')
+            count = 1 if workers is None else workers
+            if not np.isfinite(step) or step <= 0 or int(count) != count or count < 1:
+                raise ValueError('step must be positive and workers a positive integer.')
+            self.coords = np.asarray(self.mol.atom_coords(), dtype=float)
+            points = []
+            for x in range(self._npert):
+                delta = np.zeros_like(self.coords)
+                delta.flat[x] = step
+                points.extend((self.coords + delta, self.coords - delta))
+            if count == 1:
+                gradients = [_displaced_rhf_gradient(self.base, q) for q in points]
+            else:
+                from joblib import Parallel, delayed, parallel_config
+                with parallel_config(backend='loky', inner_max_num_threads=1):
+                    gradients = Parallel(n_jobs=int(count))(
+                        delayed(_displaced_rhf_gradient)(self.base, q) for q in points)
+            raw = np.column_stack([(gradients[2*x]-gradients[2*x+1]).ravel()/(2*step)
+                                   for x in range(self._npert)])
+            self.asymmetry = float(np.max(abs(raw-raw.T)))
+            self.hess = (raw+raw.T)/2 if symmetrize else raw
+            self.hess4 = self.hess.reshape(self.mol.natom, 3, self.mol.natom, 3)
+            self.method = method
+            return self.hess
         self._require_scf()
 
         dm0 = np.asarray(self.base.make_rdm1(), dtype=float)
@@ -627,46 +792,40 @@ class RHFHessian:
 
         s1 = one_electron_derivatives(self.mol, "overlap", order=1)
         h1 = one_electron_derivatives(self.mol, "hcore", order=1)
-        g1 = eri_derivatives(self.mol, order=1, compact=True)
-        s2 = one_electron_derivatives(self.mol, "overlap", order=2)
-        h2 = one_electron_derivatives(self.mol, "hcore", order=2)
-        g2_scalar = self._second_derivative_veff_scalar(
-            dm0,
-            max_compact_eri2_bytes,
-            workers=workers,
-        )
-
-        f1 = self._explicit_fock_derivatives(h1, g1, dm0)
+        factorized = getattr(self.mol, 'eri_factors', None) is not None
+        if factorized:
+            from .factor_curvature import FactorCurvature, RICurvature
+            if self.mol._builtin_build_info.get('ri') is not None:
+                g1_dm0,g2_scalar = RICurvature(self.mol).response(cocc*np.sqrt(mo_occ[occidx]))
+            else:
+                g1_dm0, g2_scalar = FactorCurvature(self.mol).response(dm0)
+        else:
+            g1 = eri_derivatives(self.mol, order=1, compact=True)
+        s2 = contracted_one_electron_curvature(self.mol,w0,"overlap")
+        h2 = contracted_one_electron_curvature(self.mol,dm0,"hcore")
+        if not factorized:
+            g2_scalar = self._second_derivative_veff_scalar(
+                dm0, max_compact_eri2_bytes, workers=workers)
+            g1_dm0 = compact_eri_veff_many(g1, dm0).reshape(self._npert,self.mol.nao,self.mol.nao)
+        f1 = h1 + g1_dm0.reshape(h1.shape)
         dm1, w1 = self._solve_cphf(f1, s1)
 
         natm = self.mol.natom
         npert = self._npert
         s1f = s1.reshape(npert, self.mol.nao, self.mol.nao)
         h1f = h1.reshape(npert, self.mol.nao, self.mol.nao)
-        s2f = s2.reshape(npert, npert, self.mol.nao, self.mol.nao)
-        h2f = h2.reshape(npert, npert, self.mol.nao, self.mol.nao)
         hnuc = _nuclear_hessian(self.mol).reshape(npert, npert)
-        g1_dm0 = compact_eri_veff_many(g1, dm0).reshape(npert, self.mol.nao, self.mol.nao)
-        g1_dm1 = np.asarray(
-            [
-                compact_eri_veff_many(g1, dm1_y).reshape(npert, self.mol.nao, self.mol.nao)
-                for dm1_y in dm1
-            ]
-        )
 
         hess = np.zeros((npert, npert), dtype=float)
         for x in range(npert):
             for y in range(npert):
-                value = np.einsum("pq,pq->", dm0, h2f[x, y], optimize=True)
+                value = h2[x,y]
                 value += np.einsum("pq,pq->", dm1[y], h1f[x], optimize=True)
                 value += 0.5 * g2_scalar[x, y]
-                value += 0.5 * np.einsum(
+                value += np.einsum(
                     "pq,pq->", dm1[y], g1_dm0[x], optimize=True
                 )
-                value += 0.5 * np.einsum(
-                    "pq,pq->", dm0, g1_dm1[y, x], optimize=True
-                )
-                value -= np.einsum("pq,pq->", w0, s2f[x, y], optimize=True)
+                value -= s2[x,y]
                 value -= np.einsum("pq,pq->", w1[y], s1f[x], optimize=True)
                 hess[x, y] = value + hnuc[x, y]
 
@@ -732,7 +891,13 @@ class RHFHessian:
         remove_translation_rotation=True,
         negative_imaginary=True,
         zero_tol=1e-7,
+        exclude=None,
     ):
+        """Analyze curvature; ``exclude`` removes mass-weighted reaction tangents.
+
+        See :func:`pyqed.qchem.dft.hessian.analyze_cartesian_hessian` for
+        mode units, the transverse projection reference and its limitations.
+        """
         if self.hess is None:
             raise ValueError("Run the Hessian calculation before requesting vibrational analysis.")
         try:
@@ -749,6 +914,7 @@ class RHFHessian:
             remove_translation_rotation=remove_translation_rotation,
             negative_imaginary=negative_imaginary,
             zero_tol=zero_tol,
+            exclude=exclude,
         )
 
     def frequencies(self, unit="cm^-1", **kwargs):
