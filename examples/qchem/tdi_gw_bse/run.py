@@ -1,7 +1,9 @@
 """TDI: density-fitted RHF → full-space GW → ten singlet BSE excitations."""
-import argparse
 import os
 from pathlib import Path
+
+THREADS = 16
+OUTPUT = Path('tdi-results')  # Relative to the working directory; or set an absolute path.
 
 for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
              'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
@@ -15,19 +17,13 @@ from pyqed.gw.bse import BSE, _bse_contractions
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--threads', type=int, default=16)
-    args = parser.parse_args()
-    if args.threads < 1:
-        parser.error('--threads must be positive')
-    if args.threads > 1 and (_bse_contractions is None or not _bse_contractions.openmp_available()):
+    if THREADS > 1 and (_bse_contractions is None or not _bse_contractions.openmp_available()):
         raise RuntimeError('Build PyQED with PYQED_BSE_OPENMP=required')
-    out = args.output.resolve()
+    out = OUTPUT.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise FileExistsError('Choose an empty output directory')
-    lib.num_threads(args.threads)
+    lib.num_threads(THREADS)
 
     xyz = Path(__file__).with_name('tdi.xyz').read_text()
     mol = gto.M(atom='\n'.join(xyz.splitlines()[2:]), unit='Angstrom',
@@ -36,14 +32,14 @@ def main():
     mf.chkfile = str(out/'scf.chk')
     mf.with_df._cderi_to_save = str(out/'df.h5')
     mf.conv_tol, mf.max_cycle = 1e-10, 100
-    with threadpool_limits(limits=args.threads):
+    with threadpool_limits(limits=THREADS):
         mf.kernel()
     if not mf.converged:
         raise RuntimeError('RHF did not converge')
 
     # Default Padé GW, all orbitals, with stability checks enabled.
-    with threadpool_limits(limits=args.threads):
-        gw = GW(mf, threads=args.threads)
+    with threadpool_limits(limits=THREADS):
+        gw = GW(mf, threads=THREADS)
         try:
             gw.run()
         finally:
@@ -55,8 +51,8 @@ def main():
         raise RuntimeError('BSE requires a converged full GW spectrum')
 
     # Full BSE with QP-gap screening; no orbital window or TDA.
-    with threadpool_limits(limits=args.threads):
-        bse = BSE(gw, threads=args.threads, screening_energies='qp')
+    with threadpool_limits(limits=THREADS):
+        bse = BSE(gw, threads=THREADS, screening_energies='qp')
     with threadpool_limits(limits=1, user_api='blas'):
         bse.run(nroots=10, eigensolver='response', return_vectors=True)
     if not np.all(bse.info['converged']):

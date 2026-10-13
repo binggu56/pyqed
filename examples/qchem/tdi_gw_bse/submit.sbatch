@@ -19,6 +19,5 @@ export PYTHONPATH="$TDI_REPO${PYTHONPATH:+:$PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 OMP_DYNAMIC=FALSE
-cd "$TDI_REPO"
-srun --cpu-bind=cores "$TDI_PYTHON" examples/qchem/tdi_gw_bse/run.py \
-    --output "$TDI_JOB_DIR/results" --threads "$SLURM_CPUS_PER_TASK"
+cd "$TDI_JOB_DIR"
+srun --cpu-bind=cores "$TDI_PYTHON" "$TDI_REPO/examples/qchem/tdi_gw_bse/run.py"

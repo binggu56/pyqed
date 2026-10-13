@@ -18,9 +18,13 @@ cluster's partition/account options as needed)::
     export TDI_RUN_ROOT=/scratch/your-user/pyqed-runs
     sbatch examples/qchem/tdi_gw_bse/submit.sbatch
 
+Set THREADS and OUTPUT at the top of run.py. THREADS defaults to 16;
+OUTPUT defaults to tdi-results beneath the working directory (the job scratch
+directory when using the launcher). An absolute OUTPUT path is also accepted.
+
 Or run inside an existing 16-CPU allocation::
 
-    PYTHONPATH=. python examples/qchem/tdi_gw_bse/run.py --output /scratch/your-user/tdi-results
+    PYTHONPATH=. python examples/qchem/tdi_gw_bse/run.py
 
 The output directory must be empty. The launcher requests 128 GB RAM and
 24 hours; allow at least 150 GB scratch. The 64 GB working-array budget in
