@@ -21,5 +21,4 @@ export OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
 export VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 OMP_DYNAMIC=FALSE
 cd "$TDI_REPO"
 srun --cpu-bind=cores "$TDI_PYTHON" examples/qchem/tdi_gw_bse/run.py \
-    --output "$TDI_JOB_DIR/results" --threads "$SLURM_CPUS_PER_TASK" \
-    --max-memory 64000 --on-unstable "${TDI_ON_UNSTABLE:-raise}"
+    --output "$TDI_JOB_DIR/results" --threads "$SLURM_CPUS_PER_TASK"

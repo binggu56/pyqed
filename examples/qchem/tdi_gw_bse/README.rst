@@ -1,79 +1,40 @@
-TDI full-space GW/BSE on a cluster
-================================
+TDI GW/BSE — 16 threads
+======================
 
-Submit from the repository root, using a Linux environment with PySCF 2.14,
-NumPy, SciPy, threadpoolctl, matplotlib and the current compiled PyQED.
-The supplied Slurm job requests one node, 16 CPUs, 128 GB RAM and 24 hours.
-Select your cluster's partition/account on the sbatch command line. The time
-request is a scheduling budget, not a measured TDI runtime. Allow at least
-150 GB free scratch for factors, temporary arrays and checkpoints.
+The script reads the included tdi.xyz and runs density-fitted RHF, full-space
+Padé G0W0, and ten singlet full-BSE excitations with QP-gap screening.
+It uses 6-31G / cc-pVDZ-JKFIT, all 798 orbitals, and the default GW/BSE
+convergence thresholds. Stability checks remain enabled: rejected GW roots
+stop the calculation rather than silently falling back or restricting the space.
 
-Build the OpenMP extensions in the activated environment on the cluster::
+On the cluster, activate an environment with PySCF 2.14 and matplotlib, then
+build the current PyQED from the repository root::
 
     PYQED_GW_OPENMP=required PYQED_BSE_OPENMP=required PYQED_CONTOUR_OPENMP=required python -m pip install -e .
-    PYTHONPATH=. python examples/qchem/tdi_gw_bse/run.py --check --output /tmp/unused
 
-Preflight checks the molecular basis, thread setting and required compiled
-extensions; it does not measure scaling or guarantee sufficient memory.
-Run a small end-to-end H2 smoke test before the production job::
-
-    PYTHONPATH=. python examples/qchem/tdi_gw_bse/run.py --smoke-test --threads 16 --output /scratch/your-user/tdi-smoke
-
-Set a persistent scratch destination and submit (replace the example path)::
+Submit from the repository root (replace the scratch path and supply your
+cluster's partition/account options as needed)::
 
     export TDI_RUN_ROOT=/scratch/your-user/pyqed-runs
     sbatch examples/qchem/tdi_gw_bse/submit.sbatch
 
-The launcher uses the activated ``python``; set TDI_PYTHON to an absolute
-environment interpreter if needed. TDI_REPO can override the repository path.
-Copy the complete updated repository and build its extensions on the cluster;
-do not copy macOS extension binaries. Results and temporary files remain in
-TDI_RUN_ROOT/tdi-JOBID; remove temporary files only after reviewing the results.
+Or run inside an existing 16-CPU allocation::
 
-Calculation definition
-----------------------
+    PYTHONPATH=. python examples/qchem/tdi_gw_bse/run.py --output /scratch/your-user/tdi-results
 
-Neutral singlet TDI, saved FC geometry in Angstrom (112 atoms), 6-31G orbital
-basis and explicit cc-pVDZ-JKFIT auxiliary basis. Expected dimensions are 798
-spatial orbitals, 271 occupied and 527 virtual. Density-fitted RHF converges to
-1e-10 Ha before one-shot GW. The basis and auxiliary basis preserve the saved
-TDI setup; these are explicit choices rather than universal PySCF defaults.
+The output directory must be empty. The launcher requests 128 GB RAM and
+24 hours; allow at least 150 GB scratch. The 64 GB working-array budget in
+run.py is not a hard memory cap, and the time request is not a runtime estimate.
+No automatic restart is implemented. TDI_PYTHON can select an interpreter;
+TDI_REPO can override the source path. Rebuild extensions on Linux rather
+than copying macOS binaries.
 
-GW uses the current default 100-point imaginary-axis Padé integration,
-18-point fit, 1e-6 Ha root tolerance and enabled stability/weight checks.
-All 798 QP energies are calculated. Singlet full BSE uses QP-gap static
-direct-RPA screening, all 142817 occupied-virtual pairs, the response Davidson
-solver, ten roots, tolerance 1e-4 and 100 iterations. There is no orbital
-window, frozen core, TDA or Lanczos approximation. See docs/source/gw_bse.rst
-for method references, fidelity and stability policies.
+Outputs: scf.chk and df.h5 preserve the reference; gw.npz stores available
+GW/continuation arrays even if GW fails; bse.npz contains converged excitation
+energies in eV and X/Y amplitudes. gw_bse_diagnostics.png plots the converged
+results. Failures exit nonzero and appear in the Slurm log. See
+../../../docs/source/gw_bse.rst for method references and fidelity.
 
-BLAS and PySCF use 16 threads in SCF and setup. GW manages its BLAS thread
-scope; BSE actions use 16 OpenMP workers with serial BLAS inside each worker.
-The memory setting is a working-array budget, not a hard resident-memory cap.
-
-Stability failures stop the default job, preserve GW arrays and report the
-rejected roots; missing QPs are never replaced with RHF energies. To explicitly
-enable checked contour repairs before full-space BSE, submit with::
-
-    TDI_ON_UNSTABLE=contour sbatch examples/qchem/tdi_gw_bse/submit.sbatch
-
-Contour repairs of deep core/high virtual states may be much more expensive
-than the Padé calculation and may still fail validation. Increase the walltime
-if appropriate. No automatic restart or unchecked fallback is implemented.
-
-Outputs
--------
-
-``results/report.json`` records versions, settings, stage timings, stability,
-convergence and BSE threading diagnostics. ``scf.chk``, ``df.h5`` and
-``orbitals.npz`` preserve the reference; ``gw.npz`` stores available QP and
-continuation arrays even on GW rejection. ``bse.npz`` stores excitation energies
-in Hartree/eV and X/Y amplitudes. ``gw_bse_diagnostics.png`` is generated by
-run.py on completion or a numerical failure with available orbitals. Output
-directories must be empty to prevent overwriting results. A failed calculation
-exits nonzero; check report status before treating energies as converged.
-
-Geometry provenance: FC frame 906, q38=0, q232=0, extracted without executing
-the saved input_script_snapshot.py from the 2026-10-12 TDI calculation.
-Original input SHA256:
+Geometry: 112-atom TDI FC frame 906, q38=0, q232=0, in Angstrom, extracted
+from the saved 2026-10-12 input. Original input SHA256:
 0f81ce7373b925632c381ae1e0e3a312bed34594bec7328313b5f1c3350271b0.
