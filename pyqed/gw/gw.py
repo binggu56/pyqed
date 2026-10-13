@@ -14,12 +14,17 @@ import numpy as np
 import scipy.linalg
 import sys
 import tempfile
-from scipy.optimize import brentq, newton
+from scipy.optimize import brentq
 
 from functools import reduce
 
 from pyqed.units import au2ev
 from pyqed.gw.screening import FactorizedCouplings
+
+try:
+    from pyqed.gw import _dyson
+except ImportError:
+    _dyson = None
 
 
 class _LoggerFallback:
@@ -42,11 +47,11 @@ _SUPPORTED_FREQ_INTEGRATION = {
     'contour': 'contour_deformation',
     'contour_deformation': 'contour_deformation',
     'cd': 'contour_deformation',
+    'ac': 'analytic_continuation',
+    'analytic_continuation': 'analytic_continuation',
 }
 
 _FREQ_INTEGRATION_TODO = {
-    'analytic_continuation': 'analytic_continuation',
-    'ac': 'analytic_continuation',
     'imaginary_axis': 'imaginary_axis',
 }
 
@@ -58,7 +63,7 @@ def _canonical_freq_int(freq_int):
     if key in _FREQ_INTEGRATION_TODO:
         raise NotImplementedError(
             f"GW frequency integration {freq_int!r} is not implemented yet. "
-            "Use exact spectral integration or contour_deformation."
+            "Use exact, contour_deformation or ac integration."
         )
     allowed = sorted(set(_SUPPORTED_FREQ_INTEGRATION) | set(_FREQ_INTEGRATION_TODO))
     raise ValueError(f"Unknown GW frequency integration {freq_int!r}. Expected one of {allowed}.")
@@ -198,6 +203,8 @@ def _build_spatial_eri_mo(gw, mo_coeff):
 
 
 def _get_ao_eri_factors(gw):
+    if getattr(gw, '_ao_eri_factors', None) is not None:
+        return gw._ao_eri_factors
     eri_factors = getattr(gw._scf, 'eri_factors', None)
     if eri_factors is None:
         eri_factors = getattr(gw.mol, 'eri_factors', None)
@@ -325,7 +332,7 @@ def _mo_operator_to_ao(gw, mo_coeff, op_mo):
     return overlap @ mo_coeff @ op_mo @ mo_coeff.T @ overlap
 
 
-def _set_rhf_orbitals(gw, mo_energy, mo_coeff, v_static_spatial=None):
+def _set_rhf_orbitals(gw, mo_energy, mo_coeff, v_static_spatial=None, pair_factors=None):
     gw.mo_coeff = np.asarray(mo_coeff, dtype=float)
     gw.e_mf = _spatial_to_spin_energy(gw, mo_energy)
 
@@ -333,7 +340,13 @@ def _set_rhf_orbitals(gw, mo_energy, mo_coeff, v_static_spatial=None):
         v_static_spatial = gw.v_mf[0::2, 0::2]
     gw.v_mf = _spin_matrix_from_spatial(v_static_spatial)
 
-    gw._pair_factors = _build_spatial_pair_factors_mo(gw, gw.mo_coeff)
+    if pair_factors is not None:
+        nmo = gw.mo_coeff.shape[1]
+        if (np.ndim(pair_factors) != 3 or np.shape(pair_factors)[1:] != (nmo, nmo)
+                or np.iscomplexobj(pair_factors) or len(pair_factors) == 0):
+            raise ValueError('Saved MO pair factors must be a real (naux, nmo, nmo) array')
+    gw._pair_factors = (_build_spatial_pair_factors_mo(gw, gw.mo_coeff)
+                       if pair_factors is None else pair_factors)
     gw._spin_pair_factors = None
     if gw._pair_factors is None:
         required = (2*gw.mo_coeff.shape[1])**4*8
@@ -348,6 +361,7 @@ def _set_rhf_orbitals(gw, mo_energy, mo_coeff, v_static_spatial=None):
     gw._M = None
     gw._charge_screening = None
     gw._sigma_x_matrix = None
+    gw._exchange_diagonal = None
     gw._qp_energy_so = gw.e_mf.copy()
 
 
@@ -637,6 +651,31 @@ def _sigma_x_matrix(gw):
     return sigma_x
 
 
+def _sigma_x_diagonal(gw, orbs):
+    """Selected spatial exchange diagonals without a full orbital-pair contraction."""
+    if getattr(gw, 'freq_int', None) == 'analytic_continuation' and not getattr(gw, 'vhf_df', True):
+        if getattr(gw, '_exchange_diagonal', None) is None:
+            mf = gw._scf
+            try:
+                from pyscf import dft, scf
+                if isinstance(mf, dft.rks.RKS):
+                    exchange = scf.RHF(mf.mol).get_k(dm=mf.make_rdm1())
+                else:
+                    exchange = _get_k(mf)
+            except ImportError:
+                exchange = _get_k(mf)
+            gw._exchange_diagonal = -.5*np.einsum('ip,ij,jp->p', gw.mo_coeff, exchange, gw.mo_coeff, optimize=True)
+        return gw._exchange_diagonal[np.asarray(orbs)]
+    if gw._pair_factors is None:
+        return np.diag(_sigma_x_matrix(gw))[2*np.asarray(orbs)]
+    values = np.zeros(len(orbs))
+    factors = gw._pair_factors
+    for first in range(0, len(factors), 64):
+        occupied = factors[first:first+64, orbs, :gw.nocc//2]
+        values -= np.einsum('Ppi,Ppi->p', occupied, occupied, optimize=True)
+    return values
+
+
 def sigma(gw, p, q, omegas, e_rpa=None, t_rpa=None, vir_sgn=1):
     '''
     self energy sigma_{pq} = i [GW]_{pq}
@@ -646,6 +685,17 @@ def sigma(gw, p, q, omegas, e_rpa=None, t_rpa=None, vir_sgn=1):
         omegas = [omegas]
     else:
         single_point = False
+
+    if getattr(gw, 'freq_int', 'exact') == 'analytic_continuation':
+        from .ac import evaluate_fit
+        if p != q or vir_sgn != 1:
+            raise NotImplementedError('AC GW provides diagonal self-energies only')
+        if not hasattr(gw, 'ac_coeff') or p//2 not in gw.orbital_indices:
+            raise ValueError('Run AC GW with this spatial orbital in orbs first')
+        j = list(gw.orbital_indices).index(p//2)
+        correlation = [evaluate_fit(gw, j, w)[0] for w in omegas]
+        exchange = [_sigma_x_diagonal(gw, [p//2])[0]]*len(correlation)
+        return (correlation[0], exchange[0]) if single_point else (correlation, exchange)
 
     if getattr(gw, 'freq_int', 'exact') == 'contour_deformation':
         if p != q or vir_sgn != 1:
@@ -707,8 +757,8 @@ def _continue_qp_root(correction, derivative, energy, tol=1e-9):
     Numerical continuation of Hedin's Dyson equation, Phys. Rev. 139,
     A796 (1965), doi:10.1103/PhysRev.139.A796. This is a branch-selection
     prescription, not a complete satellite solver or a guarantee of the
-    largest spectral weight. Failed Newton steps use nearby upward-crossing
-    brackets; a fold can lead to a neighboring positive-weight branch.
+    largest spectral weight. Every step searches outward for upward-crossing
+    brackets before solving; a fold can lead to a neighboring branch.
     Unresolved branches raise; no MF fallback.
     """
     root, coupling, increment = float(energy), 0., .125
@@ -716,17 +766,11 @@ def _continue_qp_root(correction, derivative, energy, tol=1e-9):
         target = min(1., coupling+increment)
         residual = lambda w: w-energy-target*correction(w).real
         slope = lambda w: 1-target*derivative(w).real
-        try:
-            candidate = float(newton(residual, root, fprime=slope, tol=tol, maxiter=100))
-            valid = (np.isfinite(candidate) and np.isfinite(slope(candidate))
-                     and slope(candidate) > 0 and abs(residual(candidate)) <= tol)
-        except (RuntimeError, OverflowError):
-            valid = False
+        valid = abs(residual(root)) <= tol and slope(root) > 0
+        candidate = root
         if not valid:
-            # Near a pole, Newton can leave the positive-weight branch.
-            # Search outward from the preceding root for an upward crossing.
             left = right = root
-            for radius in np.geomspace(1e-7, 2*max(1., abs(root)), 80):
+            for radius in np.geomspace(1e-7, 2*max(1., abs(root)), 120):
                 candidates = []
                 for lo, hi in ((root-radius, left), (right, root+radius)):
                     if residual(lo) <= 0 <= residual(hi):
@@ -765,6 +809,29 @@ def _solve_qp_energies(gw, e_rpa, t_rpa):
     egw = np.zeros(gw.nso//2)
     gw.qp_weights = np.full_like(egw, np.nan)
     gw.qp_residuals = np.full_like(egw, np.nan)
+    if _dyson is not None:
+        from threadpoolctl import threadpool_limits
+        batch = max(1, min(gw.threads, int(max(1e-6, gw.max_memory)*1e6/(16*len(centers)))))
+        actual_threads = 1
+        for first in range(0, len(egw), batch):
+            last = min(len(egw), first+batch)
+            with threadpool_limits(limits=1, user_api='blas'):
+                residues = np.stack([(2*couplings[:, p, :]**2 if charge
+                                      else gw._M[:, 2*p, :]**2).ravel()
+                                     for p in range(first, last)])
+            roots, weights, residuals, used = _dyson.solve(
+                centers, residues, gw.e_mf[2*first:2*last:2],
+                np.diag(exchange-gw.v_mf)[2*first:2*last:2], gw.eta, gw.threads)
+            egw[first:last], gw.qp_weights[first:last], gw.qp_residuals[first:last] = roots, weights, residuals
+            actual_threads = max(actual_threads, used)
+        gw.threading_info = dict(algorithm='orbital Dyson continuation',
+                                openmp=_dyson.openmp_available(), requested_threads=gw.threads,
+                                actual_threads=actual_threads, batch_orbitals=batch)
+        return egw
+    if gw.threads != 1:
+        raise RuntimeError('Build the GW Dyson extension with OpenMP to use threads > 1')
+    gw.threading_info = dict(algorithm='Python Dyson continuation', openmp=False,
+                            requested_threads=1, actual_threads=1, batch_orbitals=1)
     for p in range(0, gw.nso, 2):
         weights = (2*couplings[:, p//2, :]**2 if charge else gw._M[:, p, :]**2).ravel()
         active = weights != 0
@@ -998,18 +1065,18 @@ def is_positive_def(A):
 
 
 class GW(object):
-    """Restricted molecular GW with spectral or contour frequency integration.
+    """Restricted molecular GW with Padé, spectral or contour integration.
 
-    Default TDH/Casida screening uses the complete spatial charge block,
+    Explicit spectral TDH/Casida screening uses the complete spatial charge block,
     an exact spin adaptation of Stratmann, Scuseria and Frisch,
     J. Chem. Phys. 109, 8218 (1998). It omits only spin modes with zero
     Coulomb coupling, not charge poles. Orbital-gap scaling replaces a
     dense matrix square root. TDHF and explicit non-Casida RPA retain
     the full spin representation. Matching TDH screening can be reused
-    by BSE; QP roots are tracked by positive-weight coupling continuation
+    by BSE with screening_energies='hf'; spectral QP roots use coupling continuation
     (see :func:`_continue_qp_root`); frequency integration is unchanged.
     See :func:`rpa` for returned mode conventions.
-    Packed AO factors are transformed without full expansion. Default TDH
+    Packed AO factors are transformed without full expansion. Spectral TDH
     QP energies and self-energies use spatial couplings directly, avoiding
     the spin-expanded coupling tensor. Explicit get_m_rpa retains spin indices.
     Factorized charge screening retains auxiliary-to-pole coefficients and
@@ -1025,6 +1092,25 @@ class GW(object):
     These are algebraically exact storage changes; complete charge diagonalization
     still requires quadratic RAM in the number of occupied-virtual pairs.
 
+    ``threads`` controls spectral orbital Dyson solves or contour
+    contractions (default one). Spectral orbitals use bracket-first
+    coupling continuation
+    of Hedin's Dyson equation, Phys. Rev. 139, A796 (1965),
+    doi:10.1103/PhysRev.139.A796. This is a numerical branch-selection
+    adaptation, not a satellite solver or a largest-weight-root guarantee.
+    Brackets are searched on finite logarithmic shells; narrow crossings
+    can be missed, and branch folds can lead to neighboring branches.
+    Couplings are formed in memory-limited orbital batches with BLAS fixed
+    at one thread; OpenMP workers call no BLAS. Screening uses the caller's
+    BLAS settings. ``threading_info`` records observed worker counts.
+
+    The default is ``freq_int='ac'``: 100 integration points, 18-point Padé,
+    nonlinear tolerance 1e-6 Ha, and 100 iterations, matching PySCF 2.14.
+    Padé stability and positive-weight checks remain enabled. ``vhf_df=False``
+    uses reference exchange (exact AO exchange for a PySCF DFT reference);
+    set True to use the GW RI factors for exchange. Explicit ``freq_int='exact'``
+    selects the spectral solver described above.
+
     ``freq_int='contour_deformation'`` selects the auxiliary-basis molecular
     adaptation of Zhu and Chan, JCTC 17, 727–741 (2021),
     doi:10.1021/acs.jctc.0c00704. It avoids Casida diagonalization, using
@@ -1032,21 +1118,64 @@ class GW(object):
     to real CD/RI, TDH and diagonal G0W0; see ``ContourDeformation`` for
     convergence requirements and fidelity limits. ``run(nw=64, orbs=[...])``
     selects the quadrature size and spatial QP orbitals. Unrequested energies
-    are NaN. No analytic continuation is used.
+    are NaN. ``freq_int='ac'`` instead uses imaginary-axis integration and
+    Padé or the shared periodic two-pole fit; see :func:`pyqed.gw.ac.kernel` for
+    references, approximation limits and controls. AC threads control BLAS
+    teams. Contour integration does not use analytic continuation.
+    Contour threads parallelize dielectric and matrix-free contraction
+    tiles, not independent orbital Python callbacks; see
+    ``ContourDeformation`` for memory, hybrid serial-kernel and scaling limits.
     """
     __array_priority__ = 1000
 
     def __init__(self, mf, ao2mofn=None,
-                 screening='TDH', eta=None, freq_int='exact'):
+                 screening='TDH', eta=None, freq_int='ac', *, mo_pair_factors=None, threads=1, vhf_df=False):
+        """Initialize GW, optionally reusing spatial MO RI/CD pair factors.
 
+        ``mo_pair_factors`` must use precisely this reference's coefficients,
+        basis and auxiliary metric; callers must verify checkpoint provenance.
+        A read-only memory map is accepted without copying or transforming it.
+        """
+
+        if isinstance(threads, bool) or not isinstance(threads, (int, np.integer)) or threads < 1:
+            raise ValueError('threads must be a positive integer')
+        integration = _canonical_freq_int(freq_int)
+        if threads > 1 and integration != 'analytic_continuation':
+            if integration == 'contour_deformation':
+                from .contour import _contour_contractions
+                available = _contour_contractions is not None and _contour_contractions.openmp_available()
+                capability = 'contour contractions'
+            else:
+                available = _dyson is not None and _dyson.openmp_available()
+                capability = 'GW Dyson extension'
+            if not available:
+                raise RuntimeError(f'Build {capability} with OpenMP to use threads > 1')
+        self.threads = int(threads)
         assert screening in ('TDH', 'TDHF', 'TDDFT')
 
         self.mol = mf.mol
         self._scf = mf
         self._ao2mofn = ao2mofn
-        self.freq_int = _canonical_freq_int(freq_int)
-        if self.freq_int == 'contour_deformation':
-            if screening != 'TDH' or _get_ao_eri_factors(self) is None:
+        self.freq_int = integration
+        self.vhf_df = bool(vhf_df)
+        if self.freq_int == 'analytic_continuation' and mo_pair_factors is None and _get_ao_eri_factors(self) is None:
+            # PySCF GW builds MP2-fit auxiliary integrals for an ordinary SCF reference.
+            try:
+                from pyscf import df, gto
+            except ImportError:
+                gto = None
+            if gto is not None and isinstance(self.mol, gto.Mole):
+                from pyqed.qchem.basis import PackedRIFactors
+                fitted = getattr(mf, 'with_df', None)
+                if fitted is None:
+                    fitted = df.DF(self.mol)
+                    try:
+                        fitted.auxbasis = df.make_auxbasis(self.mol, mp2fit=True)
+                    except RuntimeError:
+                        fitted.auxbasis = df.make_auxbasis(self.mol, mp2fit=False)
+                self._ao_eri_factors = PackedRIFactors(np.concatenate(list(fitted.loop())), self.mol.nao)
+        if self.freq_int in ('contour_deformation', 'analytic_continuation'):
+            if screening != 'TDH' or (_get_ao_eri_factors(self) is None and mo_pair_factors is None):
                 raise NotImplementedError('Contour GW requires TDH screening and CD/RI factors')
             if np.iscomplexobj(mf.mo_coeff):
                 raise NotImplementedError('Contour GW requires real restricted orbitals')
@@ -1078,7 +1207,8 @@ class GW(object):
             self._pair_factors = None
             self._spin_pair_factors = None
 
-            _set_rhf_orbitals(self, mf.mo_energy, mf.mo_coeff, self.v_mf[0::2, 0::2])
+            _set_rhf_orbitals(self, mf.mo_energy, mf.mo_coeff, self.v_mf[0::2, 0::2],
+                              pair_factors=mo_pair_factors)
             if self.eri is not None:
                 print("Imag part of ERIs =", np.linalg.norm(self.eri.imag))
             else:
@@ -1103,8 +1233,9 @@ class GW(object):
         print("There are %d spin-orbitals"%(self.nso))
 
         self.screening = screening
-        self.eta = (1e-6 if self.freq_int == 'contour_deformation' else 1e-2) if eta is None else eta
+        self.eta = ({'contour_deformation': 1e-6, 'analytic_continuation': 5e-3}.get(self.freq_int, 1e-2)) if eta is None else eta
         self._M = None
+        self._ac_screening = None
         self._sigma_x_matrix = None
 
         self.e = None
@@ -1194,12 +1325,16 @@ class GW(object):
 
         self.converged = False
         method = method.lower()
-        if self.freq_int == 'contour_deformation' and method not in ('g0w0', 'gw', 'oneshot', 'one-shot'):
-            raise NotImplementedError('Contour integration currently supports G0W0 only')
+        if self.freq_int in ('contour_deformation', 'analytic_continuation') and method not in ('g0w0', 'gw', 'oneshot', 'one-shot'):
+            raise NotImplementedError('Imaginary-axis integration currently supports G0W0 only')
         if method in ('g0w0', 'gw', 'oneshot', 'one-shot'):
             if self.freq_int == 'contour_deformation':
+                self._ac_screening = None
                 from pyqed.gw.contour import kernel as contour_kernel
                 self.e_qp = contour_kernel(self, mo_energy, mo_coeff, **kwargs)
+            elif self.freq_int == 'analytic_continuation':
+                from pyqed.gw.ac import kernel as ac_kernel
+                self.e_qp = ac_kernel(self, mo_energy, mo_coeff, **kwargs)
             else:
                 self.e_qp = kernel(self, mo_energy, mo_coeff, verbose=self.verbose)
             self.converged = True

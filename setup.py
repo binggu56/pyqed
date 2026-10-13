@@ -47,20 +47,42 @@ class _CleanBuildPy(_build_py):
 
 
 class _LinkedBuildExt(_build_ext):
+    @staticmethod
+    def _openmp_runtime(ext):
+        return next((Path(arg) for arg in ext.extra_link_args or ()
+                     if Path(arg).is_absolute() and Path(arg).name == "libomp.dylib"), None)
+
+    def build_extensions(self):
+        force, compiler_force = self.force, self.compiler.force
+        try:
+            if sys.platform == "darwin":
+                for ext in self.extensions:
+                    runtime = self._openmp_runtime(ext)
+                    output = Path(self.get_ext_fullpath(ext.name))
+                    if runtime is None or not output.exists():
+                        continue
+                    linked = subprocess.run(["otool", "-L", str(output)], check=True,
+                                            capture_output=True, text=True).stdout
+                    libraries = [line.strip().split(" (", 1)[0] for line in linked.splitlines()[1:]]
+                    if str(runtime) not in libraries:
+                        # Decide before parallel compilation: timestamps do not
+                        # account for a changed OpenMP runtime or link flags.
+                        self.force = self.compiler.force = True
+                        break
+            super().build_extensions()
+        finally:
+            self.force, self.compiler.force = force, compiler_force
+
     def build_extension(self, ext):
         super().build_extension(ext)
-        if sys.platform != "darwin":
-            return
-        for argument in ext.extra_link_args or ():
-            runtime = Path(argument)
-            if runtime.is_absolute() and runtime.name == "libomp.dylib":
-                # libomp's install name is @rpath even when linked by full
-                # path. Conda's earlier RPATH can select an incompatible ABI.
-                subprocess.run(
-                    ["install_name_tool", "-change", "@rpath/libomp.dylib",
-                     str(runtime), self.get_ext_fullpath(ext.name)],
-                    check=True,
-                )
+        runtime = self._openmp_runtime(ext)
+        if sys.platform == "darwin" and runtime is not None:
+            # libomp's install name is @rpath even when linked by full path.
+            # Conda's earlier RPATH can select an incompatible ABI.
+            subprocess.run(
+                ["install_name_tool", "-change", "@rpath/libomp.dylib",
+                 str(runtime), self.get_ext_fullpath(ext.name)], check=True,
+            )
 
 
 class _CleanInstallEggInfo(_install_egg_info):
@@ -108,9 +130,9 @@ def _cpp_include_dirs(np):
     return include_dirs
 
 
-def _mps_openmp_flags():
+def _mps_openmp_flags(requested=None):
     """Return optional OpenMP compile and link flags for native MPS kernels."""
-    requested = os.environ.get("PYQED_MPS_OPENMP", "auto").strip().lower()
+    requested = (os.environ.get("PYQED_MPS_OPENMP", "auto") if requested is None else requested).strip().lower()
     if requested in {"0", "false", "no", "off"}:
         return [], []
     if sys.platform == "win32":
@@ -166,7 +188,7 @@ def _extensions_to_build():
         for item in os.environ.get("PYQED_EXTENSION_GROUPS", "qchem").split(",")
         if item.strip()
     }
-    valid_groups = {"all", "qchem", "heom", "mps", "letta", "ldr"}
+    valid_groups = {"all", "qchem", "gw", "heom", "mps", "letta", "ldr"}
     unknown_groups = groups.difference(valid_groups)
     if unknown_groups:
         names = ", ".join(sorted(unknown_groups))
@@ -174,6 +196,7 @@ def _extensions_to_build():
     if not groups:
         raise ValueError("PYQED_EXTENSION_GROUPS must not be empty.")
     groups.add("qchem")
+    groups.add("gw")
 
     extensions = []
     try:
@@ -213,6 +236,48 @@ def _extensions_to_build():
             ["-framework", "Accelerate"] if sys.platform == "darwin" else []
         )
         mps_openmp_compile_args, mps_openmp_link_args = _mps_openmp_flags()
+        gw_openmp_requested = os.environ.get("PYQED_GW_OPENMP", "auto").strip().lower()
+        gw_openmp_compile_args, gw_openmp_link_args = _mps_openmp_flags(gw_openmp_requested)
+        import pybind11
+        extensions.append(
+            Extension(
+                "pyqed.gw._dyson",
+                ["pyqed/gw/dyson.cpp"],
+                include_dirs=cpp_include_dirs + [pybind11.get_include()],
+                language="c++",
+                extra_compile_args=cpp_compile_args + gw_openmp_compile_args,
+                extra_link_args=gw_openmp_link_args,
+                optional=gw_openmp_requested not in {"required", "1", "true", "yes", "on"},
+            )
+        )
+        bse_openmp_requested = os.environ.get("PYQED_BSE_OPENMP", "auto").strip().lower()
+        bse_compile_args, bse_link_args = _mps_openmp_flags(bse_openmp_requested)
+        extensions.append(
+            Extension(
+                "pyqed.gw._bse_contractions",
+                ["pyqed/gw/bse_contractions.cpp"],
+                depends=["pyqed/linalg/row_product.hpp"],
+                include_dirs=cpp_include_dirs + [pybind11.get_include()],
+                language="c++",
+                extra_compile_args=cpp_compile_args + bse_compile_args,
+                extra_link_args=bse_link_args,
+                optional=bse_openmp_requested not in {"required", "1", "true", "yes", "on"},
+            )
+        )
+        contour_openmp_requested = os.environ.get("PYQED_CONTOUR_OPENMP", "auto").strip().lower()
+        contour_compile_args, contour_link_args = _mps_openmp_flags(contour_openmp_requested)
+        extensions.append(
+            Extension(
+                "pyqed.gw._contour_contractions",
+                ["pyqed/gw/contour_contractions.cpp"],
+                depends=["pyqed/linalg/row_product.hpp"],
+                include_dirs=cpp_include_dirs + [pybind11.get_include()],
+                language="c++",
+                extra_compile_args=cpp_compile_args + contour_compile_args,
+                extra_link_args=contour_link_args,
+                optional=contour_openmp_requested not in {"required", "1", "true", "yes", "on"},
+            )
+        )
         # Accelerate is available on macOS.  Generic Linux wheels must retain
         # the extension's internal fallback instead of assuming a system BLAS
         # development library is installed on the target machine.

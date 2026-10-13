@@ -51,3 +51,8 @@ recursive-exclude * __pycache__
 include pyqed/linalg/davidson.hpp
 include pyqed/linalg/nonsymmetric_davidson.hpp
 include pyqed/linalg/nonsymmetric_module.cpp
+
+include pyqed/gw/bse_contractions.cpp
+include pyqed/gw/contour_contractions.cpp
+include pyqed/gw/dyson.cpp
+include pyqed/linalg/row_product.hpp

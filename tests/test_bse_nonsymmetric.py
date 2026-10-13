@@ -18,6 +18,13 @@ def model(factorized=True):
         eri=None if factorized else np.einsum('Pij,Pkl->ijkl', factors, factors))
 
 
+def test_full_davidson_honors_workspace_budget():
+    gw = model()
+    gw.max_memory = 1e-6
+    with pytest.raises(MemoryError, match='workspace exceeds memory limit'):
+        bse.solve_bse(gw, nroots=1, eigensolver='davidson', max_space=16)
+
+
 @pytest.mark.parametrize('factorized', [False, True])
 def test_full_batched_complex_action_and_public_driver(factorized):
     gw = model(factorized)
@@ -149,7 +156,7 @@ def test_real_degenerate_subspace_from_complex_mixtures(monkeypatch, roots):
 
 
 @pytest.mark.parametrize('entry', ['function', 'method', 'run'])
-def test_default_full_bse_uses_davidson(entry):
+def test_default_full_bse_uses_response(entry):
     gw = model()
     solver = bse.BSE.__new__(bse.BSE)
     solver.__dict__.update(gw.__dict__)
@@ -160,7 +167,7 @@ def test_default_full_bse_uses_davidson(entry):
         solver.solve_bse(nroots=2)
     else:
         solver.run(nroots=2, use_qp=False)
-    assert solver.info['eigensolver'] == 'davidson'
+    assert solver.info['eigensolver'] == 'response'
     assert solver.info['converged']
     h = np.column_stack([bse._bse_full_matvec(solver, v) for v in np.eye(16)])
     expected = np.sort(np.linalg.eigvals(h).real)[8:10]

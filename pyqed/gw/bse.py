@@ -24,6 +24,11 @@ from pyqed import au2ev, is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 from pyqed.gw.screening import FactorizedCouplings, StaticScreening
 
+try:
+    from pyqed.gw import _bse_contractions
+except ImportError:
+    _bse_contractions = None
+
 
 class _LoggerFallback:
     NOTE = 3
@@ -38,6 +43,36 @@ logger = _LoggerFallback()
 
 
 def _ensure_bse_screening(gw):
+    if getattr(gw, 'screening_energies', 'hf') == 'qp':
+        energy = gw.e_mf if gw.e_qp is None else np.asarray(gw.e_qp)
+        if not np.array_equal(energy, getattr(gw, '_screening_qp', None)):
+            gw._static_screening = gw._M = gw.e_rpa = None
+            full_energy = gw._screening_reference_energy.copy()
+            if energy.shape == full_energy.shape:
+                full_energy[:] = energy
+            else:
+                full_energy[gw.orbital_indices] = energy
+            if not np.all(np.isfinite(full_energy)):
+                raise ValueError("QP-gap BSE screening requires all GW energies; use screening_energies='hf' explicitly for partial GW windows")
+            if np.any(full_energy[gw.full_nocc:, None] <= full_energy[None, :gw.full_nocc]):
+                raise ValueError('BSE screening requires positive occupied-virtual gaps')
+            if gw._screening_factors is not None and gw.screening == 'TDH':
+                from types import SimpleNamespace
+                from .contour import ContourDeformation
+                reference = SimpleNamespace(screening='TDH', _pair_factors=gw._screening_factors,
+                    mo_coeff=gw.mo_coeff, nocc=2*gw.full_nocc, eta=0., threads=1, max_memory=gw.max_memory)
+                response = ContourDeformation(reference, full_energy, [0], nw=8, prepare=False)
+                chol = scipy.linalg.cho_factor(response.dielectric(0., imaginary=True), lower=True, check_finite=False)
+                gw._static_screening = StaticScreening(gw._pair_factors, chol, gw.max_memory)
+            else:
+                previous = gw.e_mf
+                try:
+                    gw.e_mf = energy
+                    e_rpa, t_rpa = gw.rpa(method=gw.screening)
+                    gw._M = gw.get_m_rpa(e_rpa, t_rpa)
+                finally:
+                    gw.e_mf = previous
+            gw._screening_qp = energy.copy()
     if getattr(gw, '_static_screening', None) is not None:
         return
     if gw.e_rpa is None or gw._M is None:
@@ -289,13 +324,69 @@ def _full_bse_vectors_from_casida(A, B, nroots):
 class BSE(object):
     """Restricted static-screened BSE, with full A/B or TDA response.
 
-    Matching contour GW references reuse the zero-frequency auxiliary
-    dielectric factor. This is an exact reformulation of the static kernel,
+    Explicit HF-gap screening can reuse the matching contour GW reference's
+    zero-frequency auxiliary dielectric factor. This is an exact reformulation of the static kernel,
     not a dynamical BSE approximation; see :class:`StaticScreening` and
-    Bruneval, J. Chem. Phys. 136, 194107 (2012), doi:10.1063/1.4718428.
+    Bruneval, Hamed and Neaton, J. Chem. Phys. 142, 244101 (2015),
+    doi:10.1063/1.4922489.
+    By default, static direct-RPA screening uses GW quasiparticle gaps,
+    matching PySCF 2.14 BSE (auxiliary formulation doi:10.1002/jcc.24688).
+    This adaptation retains independent physical residual, metric and
+    reference-stability checks. ``screening_energies='hf'`` explicitly uses
+    reference gaps and permits reusing GW screening. QP screening requires
+    finite QPs for the complete screening space, even with an orbital window.
+    Default full BSE requests ten roots, 100 cycles and a 12*nroots subspace.
+    ``tol=1e-4`` bounds physical XY residuals and response residual norms
+    (the latter corresponds to PySCF's squared threshold 1e-8).
+
+    ``orbital_window=(occupied, virtual)`` projects only the electron-hole
+    excitation space onto frontier orbitals, retaining the reference's full
+    static screening. This is an orbital-window approximation to molecular
+    static BSE, not a reproduction of a converged complete-space calculation;
+    enlarge the window to converge energies and state characters. See also
+    Bruneval, Hamed and Neaton, J. Chem. Phys. 142, 244101 (2015),
+    doi:10.1063/1.4922489. Matching factorized contour or spectral GW is required.
+
+    ``threads`` controls auxiliary-tile OpenMP in factorized full-BSE and
+    TDA actions (default one), independently of GW's thread setting. This
+    exactly reassociates the static RI kernel of Bruneval, J. Chem. Phys.
+    136, 194107 (2012), doi:10.1063/1.4718428; it adds no screening-pole or
+    excitation-space truncation. Real double-precision factors and matching
+    auxiliary static screening are required for multiple threads. Complex
+    trials batch their real and imaginary components in the same action. Workers use
+    private bounded scratch and fixed-order tile reduction, without
+    transition matrices. Large matrix products use single-threaded SciPy BLAS
+    within each OpenMP worker; tiny products retain the row-loop kernel.
+    Full response batches X and Y together in each A/B factor product;
+    this reuses factors through wider BLAS products without changing the
+    operator. Final physical residual checks use the same column batching.
+    Exactly zero trial components are skipped. One-entry Davidson seeds
+    use direct RI columns in the same OpenMP team. This changes no screening
+    or BSE approximation. ``max_memory`` can reduce observed parallelism; at least one trial batch must fit even below that budget.
+    ``threading_info`` records requested/observed workers and action calls.
+    ``batch_columns='auto'`` defaults to a cap of eight trial columns,
+    reduced to fit estimated scratch at the requested thread count.
+    Auxiliary tiles supply parallelism independently of vector batch width.
+    Explicit integers override the cap; None selects scalar callbacks.
+    ``batch_columns`` and ``info['batch_columns']`` store the selected width.
+    This control does not parallelize screening preparation, projected
+    eigensolvers, or dense reference solves. Existing iterative convergence
+    and physical residual/metric gates remain applicable.
     """
     def __init__(self, gw_or_mf, ao2mofn=None,
-                 screening='TDH', eta=1e-2):
+                 screening='TDH', eta=1e-2, orbital_window=None, *, threads=1,
+                 screening_energies='qp'):
+
+        if screening_energies not in ('qp', 'hf'):
+            raise ValueError("screening_energies must be 'qp' or 'hf'")
+        self.screening_energies = screening_energies
+
+        if isinstance(threads, (bool, np.bool_)) or not isinstance(threads, (int, np.integer)) or threads < 1:
+            raise ValueError('threads must be a positive integer')
+        if threads > 1 and (_bse_contractions is None or not _bse_contractions.openmp_available()):
+            raise RuntimeError('Build BSE contractions with OpenMP to use threads > 1')
+        self.threads = int(threads)
+        self.threading_info = None
 
         gw_ref = gw_or_mf if _is_gw_reference(gw_or_mf) else None
         mf = gw_or_mf
@@ -316,6 +407,23 @@ class BSE(object):
                                   getattr(self.mol, 'max_memory', 4000))
 
         self.nocc = _nelectron(self.mol)//2
+        self.full_nocc = self.nocc
+        self.orbital_window = orbital_window
+        nmo = np.asarray(mf.mo_coeff).shape[1]
+        self.orbital_indices = np.arange(nmo)
+        if orbital_window is not None:
+            if gw_ref is None:
+                raise ValueError('An orbital window requires a GW reference with full screening')
+            if len(orbital_window) != 2 or any(
+                isinstance(v, (bool, np.bool_)) or int(v) != v or v < 1
+                for v in orbital_window
+            ):
+                raise ValueError('orbital_window requires positive occupied and virtual counts')
+            no, nv = map(int, orbital_window)
+            if no > self.nocc or nv > nmo-self.nocc:
+                raise ValueError('orbital_window exceeds the reference occupied/virtual space')
+            self.orbital_window = (no, nv)
+            self.orbital_indices = np.arange(self.nocc-no, self.nocc+nv)
         if gw_ref is not None:
             self.nso = np.asarray(gw_ref.mo_coeff).shape[1]
             self.e_mf = np.asarray(gw_ref.e_mf[0::2], dtype=float)
@@ -383,19 +491,21 @@ class BSE(object):
 
         self._e_qp = None
         if gw_ref is not None and gw_ref.e_qp is not None:
-            if not np.all(np.isfinite(gw_ref.e_qp)):
+            if not np.all(np.isfinite(np.asarray(gw_ref.e_qp)[self.orbital_indices])):
+                if orbital_window is not None:
+                    raise ValueError('BSE requires finite QP energies for every orbital in its window')
                 raise ValueError('BSE requires QP energies for all spatial orbitals; run GW without an orbs subset')
-            self.e_qp = gw_ref.e_qp
+            self.e_qp = np.array(gw_ref.e_qp, copy=True)
         self.e_rpa = None
         self._static_screening = None
-        contour = getattr(gw_ref, '_contour', None)
-        if (screening == 'TDH' and contour is not None
+        contour = getattr(gw_ref, '_ac_screening', None) or getattr(gw_ref, '_contour', None)
+        if (screening_energies == 'hf' and screening == 'TDH' and contour is not None
                 and contour.factors is self._pair_factors
                 and np.array_equal(contour.energy, self.e_mf)
                 and np.array_equal(contour.mo_coeff, self.mo_coeff)):
             self._static_screening = contour.static_screening
         charge = getattr(gw_ref, '_charge_screening', None)
-        if (screening == 'TDH' and charge is not None
+        if (screening_energies == 'hf' and screening == 'TDH' and charge is not None
                 and np.array_equal(charge['energy'], self.e_mf)
                 and np.array_equal(charge['mo_coeff'], self.mo_coeff)):
             self.e_rpa = charge['poles'].copy()
@@ -408,6 +518,32 @@ class BSE(object):
         self._x = None
         self._y = None
         self.bse_metric = None
+        self._screening_mf_energy = self.e_mf.copy()
+        self._screening_factors = self._pair_factors
+        self._screening_reference_energy = np.asarray(self.e_mf if self.e_qp is None else self.e_qp).copy()
+        self._screening_qp = None
+        if screening_energies == 'qp':
+            _ensure_bse_screening(self)
+        if self.orbital_window is not None:
+            if self._pair_factors is None or (self._static_screening is None
+                                             and not isinstance(self._M, FactorizedCouplings)):
+                raise NotImplementedError('Orbital windows require matching full factorized GW screening')
+            first, stop = self.orbital_indices[0], self.orbital_indices[-1]+1
+            self._pair_factors = self._pair_factors[:, first:stop, first:stop]
+            if self._static_screening is not None:
+                self._static_screening = StaticScreening(
+                    self._pair_factors, self._static_screening.cholesky, self.max_memory)
+            else:
+                self._M = FactorizedCouplings(self._pair_factors, self._M.projection, self._M.poles)
+            self.mo_coeff = self.mo_coeff[:, first:stop]
+            self.e_mf = self.e_mf[first:stop]
+            self.v_mf = self.v_mf[first:stop, first:stop]
+            if self.e_qp is not None:
+                self.e_qp = np.asarray(self.e_qp)[first:stop]
+            self.nocc, nv = self.orbital_window
+            self.nso = self.nocc+nv
+            if self._screening_qp is not None:
+                self._screening_qp = self._screening_qp[first:stop].copy()
 
     @property
     def e_qp(self):
@@ -521,8 +657,8 @@ class BSE(object):
     def g0(self, omega):
         return g0(self, omega)
 
-    def get_m_rpa(self, e_rpa, t_rpa):
-        return get_m_rpa(self, e_rpa, t_rpa)
+    def get_m_rpa(self, e_rpa, t_rpa, *, factorized=True):
+        return get_m_rpa(self, e_rpa, t_rpa, factorized=factorized)
 
     def rpa(self, using_tda=False, using_casida=True, method='TDH'):
         self.e_rpa, t = rpa(self, using_tda, using_casida, method)
@@ -547,10 +683,12 @@ class BSE(object):
         max_space=None,
         return_info=False,
         return_vectors=False,
-        batch_columns=None,
+        batch_columns='auto',
     ):
         if not use_qp or self.e_qp is None:
             self.e_qp = self.e_mf.copy()
+            if hasattr(self, "_screening_mf_energy"):
+                self._screening_reference_energy = self._screening_mf_energy.copy()
 
         use_low_rank = (
             low_rank is True
@@ -568,6 +706,10 @@ class BSE(object):
             )
             return self
 
+        if getattr(self, 'threads', 1) > 1:
+            raise ValueError('BSE threads require the factorized iterative path; set low_rank=True')
+        if batch_columns == 'auto':
+            batch_columns = None
         if batch_columns is not None:
             raise ValueError('batch_columns requires the iterative TDA path; set low_rank=True')
         self._ensure_screening()
@@ -580,16 +722,16 @@ class BSE(object):
 
     def run(
         self,
-        nroots=5,
+        nroots=10,
         low_rank='auto',
         use_qp=True,
-        tol=1e-8,
-        max_cycle=80,
+        tol=1e-4,
+        max_cycle=100,
         return_info=False,
         return_vectors=False,
         eigensolver=None,
         max_space=None,
-        batch_columns=None,
+        batch_columns='auto',
     ):
         '''Run full BSE excitations and return ``self`` for a chainable API.
 
@@ -598,14 +740,17 @@ class BSE(object):
         energies and stores them in ``.e``.  Full BSE amplitudes are stored in
         ``.xy`` with ``.x``/``.y`` views.  Use :class:`TDA` for the
         Tamm-Dancoff approximation. The matrix-free path defaults to
-        Davidson; select ``eigensolver="arpack"`` for SciPy Arnoldi. ``max_space``
+        real response Davidson; select ``eigensolver="davidson"`` for the
+        general nonsymmetric solver or ``eigensolver="arpack"`` for Arnoldi. ``max_space``
         and ``batch_columns`` are documented in :func:`solve_bse`, together
         with method references and limitations.
         '''
-        if eigensolver not in (None, "arpack", "davidson"):
-            raise ValueError("eigensolver must be arpack or davidson")
+        if eigensolver not in (None, "arpack", "davidson", "response", "lanczos"):
+            raise ValueError("eigensolver must be response, lanczos, arpack or davidson")
         if not use_qp or self.e_qp is None:
             self.e_qp = self.e_mf.copy()
+            if hasattr(self, "_screening_mf_energy"):
+                self._screening_reference_energy = self._screening_mf_energy.copy()
 
         use_low_rank = (
             low_rank is True
@@ -618,10 +763,16 @@ class BSE(object):
                 max_cycle=max_cycle,
                 return_info=return_info,
                 return_vectors=return_vectors,
-                eigensolver="davidson" if eigensolver is None else eigensolver,
+                eigensolver="response" if eigensolver is None else eigensolver,
                 max_space=max_space, batch_columns=batch_columns,
             )
             return self
+
+        if getattr(self, 'threads', 1) > 1:
+            raise ValueError('BSE threads require the factorized iterative path; set low_rank=True')
+
+        if batch_columns == 'auto':
+            batch_columns = None
 
         if eigensolver is not None or max_space is not None or batch_columns is not None:
             raise ValueError("Iterative full BSE options require low_rank=True")
@@ -634,14 +785,14 @@ class BSE(object):
 
     def solve_bse(
         self,
-        nroots=5,
-        tol=1e-8,
-        max_cycle=80,
+        nroots=10,
+        tol=1e-4,
+        max_cycle=100,
         return_info=False,
         return_vectors=True,
-        eigensolver="davidson",
+        eigensolver="response",
         max_space=None,
-        batch_columns=None,
+        batch_columns='auto',
     ):
         return solve_bse(
             self,
@@ -678,13 +829,13 @@ class BSE(object):
 
     def solve_tda(
         self,
-        nroots=5,
-        tol=1e-8,
-        max_cycle=80,
+        nroots=10,
+        tol=1e-4,
+        max_cycle=100,
         max_space=None,
         return_info=False,
         return_vectors=True,
-        batch_columns=None,
+        batch_columns='auto',
     ):
         return solve_tda(
             self,
@@ -737,15 +888,15 @@ class TDA(BSE):
 
     def run(
         self,
-        nroots=5,
+        nroots=10,
         low_rank='auto',
         use_qp=True,
-        tol=1e-8,
-        max_cycle=80,
+        tol=1e-4,
+        max_cycle=100,
         max_space=None,
         return_info=False,
         return_vectors=False,
-        batch_columns=None,
+        batch_columns='auto',
     ):
         """Solve TDA; ``batch_columns`` enables batched iterative actions.
 
@@ -836,8 +987,9 @@ class GWBSEScanner:
     def _run_gw(self, mf):
         from pyqed.gw.gw import GW
 
-        freq_int = getattr(self.gw, "freq_int", "exact") if self.gw is not None else "exact"
-        gw = GW(mf, screening=self.base.screening, eta=self.base.eta, freq_int=freq_int)
+        freq_int = getattr(self.gw, "freq_int", "ac") if self.gw is not None else "ac"
+        gw = GW(mf, screening=self.base.screening, eta=self.base.eta, freq_int=freq_int,
+                threads=getattr(self.gw, 'threads', 1), vhf_df=getattr(self.gw, 'vhf_df', False))
         gw.run(method=self.gw_method, **self.gw_kwargs)
         return gw
 
@@ -848,11 +1000,16 @@ class GWBSEScanner:
 
         nroots = self.nroots
         if nroots is None:
-            nroots = len(self.bse.e) if self.bse.e is not None else 5
+            nroots = len(self.bse.e) if self.bse.e is not None else 10
         run_kwargs = dict(self.run_kwargs)
         run_kwargs.setdefault("nroots", nroots)
 
-        bse = self.solver_cls(gw).run(**run_kwargs)
+        bse = self.solver_cls(
+            gw, screening=self.base.screening, eta=self.base.eta,
+            orbital_window=getattr(self.base, 'orbital_window', None),
+            threads=getattr(self.base, 'threads', 1),
+            screening_energies=self.base.screening_energies,
+        ).run(**run_kwargs)
 
         self.mol = mol
         self.mf = mf
@@ -951,7 +1108,7 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDHF'):
             return _casida_eigh(A, B)
 
 
-def get_m_rpa(gw, e_rpa, t_rpa):
+def get_m_rpa(gw, e_rpa, t_rpa, *, factorized=True):
     r'''
     Get the (intermediate) M_{pq,L} tensor.
     The M (or w) is needed to construct the screened Coulomb interaction W
@@ -959,6 +1116,11 @@ def get_m_rpa(gw, e_rpa, t_rpa):
     .. math::
         
         M_{pq,L} = \sum_{ia} ( (eps_a-eps_i)/erpa_L )^{1/2} T_{ai,L} (ai|pq)
+
+    RI/CD returns exact factorized couplings by default, reusing the
+    static RI reassociation of Bruneval, JCP 136, 194107 (2012),
+    doi:10.1063/1.4718428. No poles or auxiliary factors are discarded.
+    ``factorized=False`` materializes couplings for explicit references.
     '''
     nso = gw.nso
     nocc = gw.nocc
@@ -983,6 +1145,10 @@ def get_m_rpa(gw, e_rpa, t_rpa):
     if gw.eri is None:
         weighted_pairs = np.einsum('a,al,aP->Pl', sqrt_eps, t_by_e, pair_ai, optimize=True)
         from .gw import _screening_storage
+        if factorized:
+            projection = _screening_storage(gw, weighted_pairs.shape, weighted_pairs.dtype)
+            projection[:] = weighted_pairs
+            return FactorizedCouplings(gw._pair_factors, projection, e_rpa)
         M = _screening_storage(gw, (nso, nso, len(e_rpa)), gw._pair_factors.dtype)
         for p in range(nso):
             M[p] = gw._pair_factors[:, p, :].T @ weighted_pairs
@@ -1182,6 +1348,66 @@ def _bse_tda_matvec(gw, x):
     return _bse_tda_matmat(gw, np.asarray(x).reshape(-1, 1), 1)[:, 0]
 
 
+def _factorized_bse_action(gw, vectors, batch_columns, kind):
+    """Stream matching real RI/static factors without transition matrices."""
+    threads = getattr(gw, 'threads', 1)
+    factors, screened = getattr(gw, '_pair_factors', None), _bse_screening(gw)
+    supported = (factors is not None and factors.dtype == np.float64
+                 and isinstance(screened, (FactorizedCouplings, StaticScreening))
+                 and screened.factors is factors and screened.dtype == np.float64
+                 and factors.strides[2] == factors.itemsize
+                 and factors.strides[1] >= factors.shape[2]*factors.itemsize
+                 and factors.strides[0] >= factors.shape[1]*factors.strides[1])
+    if _bse_contractions is None or not supported:
+        if threads > 1:
+            raise NotImplementedError('BSE threads require compiled contractions and matching real factorized static screening with positive row-contiguous factors')
+        return None
+    from threadpoolctl import threadpool_limits
+    with threadpool_limits(limits=1, user_api='blas'):
+        occupied = screened.static_occupied(gw.nocc)
+        ov = screened.static_ov(gw.nocc) if kind != 'a' else None
+    no, nv = gw.nocc, gw.nso-gw.nocc
+    if ov is None:
+        # A ignores the ov data; a broadcast view avoids preparing B screening.
+        ov = np.broadcast_to(np.zeros((1, no, nv)), (len(factors), no, nv))
+    out = np.empty(vectors.shape, dtype=np.result_type(vectors, float))
+    info = getattr(gw, 'threading_info', None)
+    if (info is None or info.get('algorithm') != 'auxiliary-tile BSE contractions'
+            or info.get('requested_threads') != threads):
+        info = dict(algorithm='auxiliary-tile BSE contractions', openmp=_bse_contractions.openmp_available(),
+                    requested_threads=threads, actual_threads=0, action_calls=0)
+        gw.threading_info = info
+    for first in range(0, vectors.shape[1], batch_columns):
+        block = vectors[:, first:first+batch_columns]
+        columns = block.shape[1]
+        complex_block = np.iscomplexobj(block) and np.any(block.imag)
+        work_columns = columns*(2 if complex_block else 1)
+        products, buffers = (4, 18) if kind == 'full' else (2, 11)
+        scratch = 8*(work_columns*(products*no*max(no, nv)+buffers*no*nv)+no*max(no, nv))
+        workers = max(1, min(threads, int(max(1e-6, getattr(gw, 'max_memory', 4000))*1e6/scratch)))
+        def apply(values):
+            with threadpool_limits(limits=1, user_api='blas'):
+                result, used, tile = _bse_contractions.action(factors, occupied, ov,
+                    np.ascontiguousarray(values, dtype=float), no, kind, workers)
+            info.update(actual_threads=max(info['actual_threads'], used), auxiliary_tile=tile)
+            info['action_calls'] += 1
+            return result
+        if complex_block:
+            value = apply(np.concatenate((block.real, block.imag), axis=1))
+            value = value[:, :columns]+1j*value[:, columns:]
+        else:
+            value = apply(block.real)
+        out[:, first:first+columns] = value
+    diagonal = _bse_tda_diag(gw)[:, None]
+    if kind == 'a':
+        out += diagonal*vectors
+    elif kind == 'full':
+        dim = no*nv
+        out[:dim] += diagonal*vectors[:dim]
+        out[dim:] -= diagonal*vectors[dim:]
+    return out
+
+
 def _bse_tda_matmat(gw, vectors, batch_columns=8):
     """Exact column-batched version of the existing molecular TDA action.
 
@@ -1200,6 +1426,9 @@ def _bse_tda_matmat(gw, vectors, batch_columns=8):
     if vectors.ndim != 2 or vectors.shape[0] != nocc * nvir or batch_columns < 1:
         raise ValueError("Invalid TDA trial block or batch size")
     _ensure_bse_screening(gw)
+    compiled = _factorized_bse_action(gw, vectors, batch_columns, 'a')
+    if compiled is not None:
+        return compiled
     screened = _bse_screening(gw)
     factors = getattr(gw, "_pair_factors", None)
     out = np.empty(vectors.shape, dtype=np.result_type(vectors, screened.dtype, float))
@@ -1260,6 +1489,9 @@ def _bse_b_matmat(gw, vectors, batch_columns=8):
     if vectors.ndim != 2 or vectors.shape[0] != dim or batch_columns < 1:
         raise ValueError("Invalid BSE B trial block or batch size")
     _ensure_bse_screening(gw)
+    compiled = _factorized_bse_action(gw, vectors, batch_columns, 'b')
+    if compiled is not None:
+        return compiled
     screened = _bse_screening(gw)
     factors = getattr(gw, "_pair_factors", None)
     out = np.empty(vectors.shape, dtype=np.result_type(vectors, screened.dtype, float))
@@ -1323,6 +1555,9 @@ def _bse_full_matmat(gw, vectors, batch_columns=8):
     if vectors.ndim != 2 or vectors.shape[0] != 2 * dim or batch_columns < 1:
         raise ValueError("Invalid full BSE block or batch size")
     _ensure_bse_screening(gw)
+    compiled = _factorized_bse_action(gw, vectors, batch_columns, 'full')
+    if compiled is not None:
+        return compiled
     out = np.empty(
         vectors.shape, dtype=np.result_type(vectors, _bse_screening(gw).dtype, float)
     )
@@ -1339,30 +1574,50 @@ def _bse_full_matmat(gw, vectors, batch_columns=8):
     return out
 
 
+def _resolve_bse_batch(gw, batch_columns, eigensolver='davidson', full=True):
+    if batch_columns == 'auto':
+        if eigensolver == 'arpack':
+            batch_columns = None
+        else:
+            no, nv = gw.nocc, gw.nso-gw.nocc
+            if no < 1 or nv < 1:
+                raise ValueError('BSE requires a nonempty excitation space')
+            fixed = 8*no*max(no, nv)
+            products, buffers = (4, 18) if full else (2, 11)
+            per_column = 8*(products*no*max(no, nv)+buffers*no*nv)*(2 if full else 1)
+            budget = max(1e-6, getattr(gw, 'max_memory', 4000))*1e6/max(1, getattr(gw, 'threads', 1))-fixed
+            batch_columns = max(1, min(8, int(budget/per_column)))
+    if batch_columns is not None:
+        if (isinstance(batch_columns, (bool, np.bool_)) or int(batch_columns) != batch_columns
+                or batch_columns < 1):
+            raise ValueError('batch_columns must be auto, a positive integer, or None')
+        batch_columns = int(batch_columns)
+    gw.batch_columns = batch_columns
+    return batch_columns
+
+
 def solve_tda(
     gw,
-    nroots=5,
-    tol=1e-8,
-    max_cycle=80,
+    nroots=10,
+    tol=1e-4,
+    max_cycle=100,
     max_space=None,
     return_info=False,
     return_vectors=True,
-    batch_columns=None,
+    batch_columns='auto',
 ):
     '''Lowest TDA-BSE roots from a factorized/matrix-free Davidson solve.
 
-    ``batch_columns`` opts into exact column batching of the existing static
-    screened operator (for example, 8); None retains single-vector callbacks.
+    ``batch_columns='auto'`` uses a memory-limited cap of eight columns,
+    accounting for requested threads without equating columns with threads.
+    Explicit positive integers override it; None retains scalar callbacks.
     This changes contraction order only, not screening, orbital gaps or the
     Davidson formulation. The public Davidson docstring documents its method
     references and adaptation limits. No universal speedup is guaranteed.
     '''
     from pyqed.davidson import davidson
 
-    if batch_columns is not None and (isinstance(batch_columns,bool)
-            or int(batch_columns)!=batch_columns or batch_columns<1):
-        raise ValueError('batch_columns must be a positive integer or None')
-    if batch_columns is not None:batch_columns=int(batch_columns)
+    batch_columns = _resolve_bse_batch(gw, batch_columns, full=False)
 
     diag = _bse_tda_diag(gw)
     nroots = min(int(nroots), diag.size)
@@ -1384,6 +1639,7 @@ def solve_tda(
         dtype=np.result_type(diag, _bse_screening(gw).dtype),
     )
     gw._bse_tda_info = info
+    info['batch_columns'] = batch_columns
     gw.info = info
     if hasattr(gw, '_store_excitations'):
         gw._store_excitations(eigvals, eigvecs, 'tda')
@@ -1403,13 +1659,106 @@ def solve_tda(
     return eigvals, eigvecs
 
 
+def _response_davidson(action, diagonal, nroots, tol, max_cycle, max_space, memory):
+    """Real common-subspace Davidson for stable full response.
+
+    Adaptation of the projected (A+B)/(A-B) response formulation of
+    Stratmann, Scuseria and Frisch, JCP 109, 8218 (1998),
+    doi:10.1063/1.477483. Uses the existing Casida reconstruction, gap
+    preconditioning and thick restarts. Requires positive projected A-B
+    and A+B; this is not a global stability certificate. No TDA or
+    excitation-space truncation is introduced. Physical XY residuals
+    determine convergence, rather than squared-frequency residuals.
+    """
+    dim = len(diagonal)
+    space = min(dim, 12*nroots if max_space is None else int(max_space))
+    if space < nroots or (space == nroots and space < dim):
+        raise ValueError('Response subspace must exceed the requested roots')
+    estimate = 8*(5*dim*space+16*dim*nroots+12*space*space)
+    if estimate > memory:
+        raise MemoryError('Response workspace exceeds memory limit')
+    basis = np.zeros((dim, nroots))
+    basis[np.argsort(diagonal)[:nroots], np.arange(nroots)] = 1.
+    av = np.empty((dim, 0)); bv = av.copy()
+    info = dict(iterations=0, restarts=0, operator_columns=0,
+                estimated_workspace_bytes=estimate, history=[])
+
+    def orthogonalize(vectors, against):
+        for _ in range(2):
+            vectors = vectors-against@(against.T@vectors)
+        q, r, _ = scipy.linalg.qr(vectors, mode='economic', pivoting=True)
+        keep = np.abs(np.diag(r)) > 1e-11
+        return q[:, keep]
+
+    for cycle in range(max_cycle):
+        pending = basis[:, av.shape[1]:]
+        applied = action(np.vstack((pending, np.zeros_like(pending))))
+        if np.iscomplexobj(applied):
+            if np.any(applied.imag):
+                raise ValueError('Response solver requires a real operator')
+            applied = applied.real
+        av = np.column_stack((av, applied[:dim]))
+        bv = np.column_stack((bv, -applied[dim:]))
+        info['operator_columns'] += pending.shape[1]
+        a, b = basis.T@av, basis.T@bv
+        for matrix in (a, b):
+            if not np.allclose(matrix, matrix.T, atol=1e-10, rtol=1e-10):
+                raise RuntimeError('Response solver requires real symmetric A and B')
+        a, b = _symmetrize(a), _symmetrize(b)
+        if scipy.linalg.eigvalsh(a+b, subset_by_index=[0, 0])[0] <= 0:
+            raise RuntimeError('Response A+B is not positive definite; unstable reference')
+        roots, xy = _full_bse_vectors_from_casida(a, b, nroots)
+        size = basis.shape[1]
+        cx, cy = xy[:size], xy[size:]
+        x, y = basis@cx, basis@cy
+        rx = av@cx+bv@cy-x*roots
+        ry = -bv@cx-av@cy-y*roots
+        residual = np.sqrt(np.sum(rx*rx+ry*ry, axis=0))
+        info.update(iterations=cycle+1, residual_norms=residual, subspace=size)
+        info['history'].append(dict(iteration=cycle+1, subspace=size,
+                                    residual_norms=residual.tolist(), energies=roots.tolist()))
+        response_residual = np.maximum(np.linalg.norm(rx+ry, axis=0), np.linalg.norm(rx-ry, axis=0))
+        info["response_residual_squared"] = response_residual**2
+        if np.max(residual) <= .8*tol and np.max(response_residual) <= tol:
+            return roots, np.vstack((x, y)), info
+        active = (residual > .8*tol) | (response_residual > tol)
+        # Residuals in P=X+Y and Q=X-Y share the orbital-gap preconditioner.
+        denominator = roots[active][None, :]-diagonal[:, None]
+        denominator = np.where(abs(denominator)<1e-8,
+                               np.where(denominator<0, -1e-8, 1e-8), denominator)
+        corrections = np.column_stack(((rx[:, active]-ry[:, active])/denominator,
+                                       (rx[:, active]+ry[:, active])/denominator))
+        extra = orthogonalize(corrections, basis)
+        if not extra.shape[1]:
+            raise RuntimeError('Response Davidson stagnated before convergence')
+        if size+extra.shape[1] > space:
+            restart = orthogonalize(np.column_stack((x, y)), np.empty((dim, 0)))
+            if restart.shape[1] >= space:
+                restart = restart[:, :max(nroots, space//2)]
+            basis = restart
+            av = np.empty((dim, 0)); bv = av.copy()
+            info['restarts'] += 1
+            extra = orthogonalize(corrections, basis)
+        basis = np.column_stack((basis, extra[:, :space-basis.shape[1]]))
+    raise RuntimeError('Response Davidson did not converge')
+
+
 def solve_bse(
-    gw, nroots=5, tol=1e-8, max_cycle=80, return_info=False,
-    return_vectors=True, eigensolver="davidson", max_space=None, batch_columns=None,
+    gw, nroots=10, tol=1e-4, max_cycle=100, return_info=False,
+    return_vectors=True, eigensolver="response", max_space=None, batch_columns='auto',
 ):
     """Lowest positive molecular full-BSE roots from a matrix-free action.
 
-    ``eigensolver="arpack"`` uses SciPy Arnoldi; ``"davidson"`` (default)
+    ``eigensolver="response"`` (default) uses real common-subspace Davidson
+    for A+B and A-B, following Stratmann, Scuseria and Frisch, J. Chem.
+    Phys. 109, 8218–8224 (1998), doi:10.1063/1.477483. This adaptation uses
+    the existing Casida reconstruction, gap preconditioning and thick restarts.
+    Positive projected A+B and A-B are required; their positivity does not
+    certify global reference stability. Full XY residuals determine convergence.
+    This changes no screening kernel or excitation space. See
+    :func:`_response_davidson` for implementation details.
+
+    ``eigensolver="arpack"`` uses SciPy Arnoldi; ``"davidson"``
     uses :func:`pyqed.linalg.davidson_nonsymmetric` with positive-real harmonic
     Ritz selection and orbital-gap diagonal preconditioning. This adapts
     Davidson, J. Comput. Phys. 17, 87–94 (1975),
@@ -1425,21 +1774,26 @@ def solve_bse(
     is applied after that conversion. No partial
     solutions or silent solver fallback are accepted.
 
-    ``max_space`` controls Davidson space or ARPACK ncv. ``batch_columns``
-    enables bounded block actions for Davidson (ARPACK uses vector actions).
+    ``eigensolver="lanczos"`` uses the unrestarted, fully reorthogonalized
+    metric block Lanczos adaptation of Shao et al., SIAM J. Matrix Anal.
+    Appl. 39, 683–711 (2018), doi:10.1137/16M1102641. See
+    :func:`pyqed.gw.bse_lanczos.lanczos` for restrictions and fidelity.
+
+    ``max_space`` controls the stored iterative space or ARPACK ncv. ``batch_columns``
+    defaults to 'auto': a cap of eight reduced by estimated per-thread
+    scratch and max_memory. Explicit integers override this policy; None
+    selects scalar callbacks. ARPACK and dense paths use scalar/no batching
+    for 'auto'. The selected width is recorded in info and the solver.
     """
     from scipy.sparse.linalg import ArpackNoConvergence, LinearOperator, eigs
 
-    if eigensolver not in ("arpack", "davidson"):
-        raise ValueError("eigensolver must be arpack or davidson")
+    if eigensolver not in ("arpack", "davidson", "response", "lanczos"):
+        raise ValueError("eigensolver must be response, lanczos, arpack or davidson")
     if not np.isfinite(tol) or tol <= 0 or int(max_cycle) != max_cycle or max_cycle < 1:
         raise ValueError("Require positive tolerance and integer max_cycle")
-    if batch_columns is not None and (
-        isinstance(batch_columns, bool) or int(batch_columns) != batch_columns or batch_columns < 1
-    ):
-        raise ValueError("batch_columns must be a positive integer")
-    if batch_columns is not None and eigensolver != "davidson":
-        raise ValueError("batch_columns requires eigensolver='davidson'")
+    batch_columns = _resolve_bse_batch(gw, batch_columns, eigensolver)
+    if batch_columns is not None and eigensolver not in ("davidson", "response", "lanczos"):
+        raise ValueError("batch_columns requires eigensolver='davidson' or 'response'")
     dim = gw.nocc * (gw.nso - gw.nocc)
     if isinstance(nroots, bool) or int(nroots) != nroots or nroots < 1 or dim < 1:
         raise ValueError("nroots must be positive and the excitation space nonempty")
@@ -1451,7 +1805,7 @@ def solve_bse(
     _ensure_bse_screening(gw)
 
     info = dict(solver="low_rank_full_bse", eigensolver=eigensolver,
-                converged=False, nroots=nroots)
+                converged=False, nroots=nroots, batch_columns=batch_columns)
     gw.info = gw._bse_full_info = info
     calls = 0
     def action(vec):
@@ -1463,7 +1817,26 @@ def solve_bse(
         calls += vectors.shape[1]
         return _bse_full_matmat(gw, vectors, int(batch_columns))
     try:
-        if eigensolver == "davidson":
+        if eigensolver in ("response", "lanczos"):
+            from threadpoolctl import threadpool_limits
+            def response_action(vectors):
+                return (block_action(vectors) if batch_columns is not None else
+                        np.column_stack([action(v) for v in vectors.T]))
+            # Tall, narrow basis updates and small projected solves benefit
+            # from serial BLAS; factor contractions retain their OpenMP team.
+            with threadpool_limits(limits=1, user_api='blas'):
+                method = _response_davidson
+                extra = {}
+                if eigensolver == "lanczos":
+                    from .bse_lanczos import lanczos
+                    method = lanczos
+                    extra["info"] = info.setdefault("lanczos", {})
+                eigvals, eigvecs, diagnostics = method(
+                    response_action, _bse_tda_diag(gw), nroots, tol, max_cycle, max_space,
+                    int(max(1e-6, getattr(gw, 'max_memory', 4000))*1e6), **extra,
+                )
+            info[eigensolver] = diagnostics
+        elif eigensolver == "davidson":
             from pyqed.linalg import davidson_nonsymmetric
             diagonal = _bse_tda_diag(gw)
             eigvals, eigvecs, diagnostics = davidson_nonsymmetric(
@@ -1471,6 +1844,7 @@ def solve_bse(
                 matmat=block_action if batch_columns is not None else None,
                 selection="positive_real", tolerance=tol, iterations=max_cycle,
                 space=max_space,
+                memory_limit=int(max(1e-6, getattr(gw, 'max_memory', 4000))*1e6),
             )
             info["davidson"] = diagnostics
         else:
@@ -1513,7 +1887,9 @@ def solve_bse(
         if np.linalg.eigvalsh((gram+gram.T)/2)[0] <= 0:
             raise RuntimeError("Positive BSE roots have nonpositive metric; possible unstable reference")
         vectors = _metric_orthonormalize_full_bse_vectors(vectors, dim)
-        residuals = np.linalg.norm(np.column_stack([action(v) for v in vectors.T])-vectors*roots, axis=0)
+        applied = (block_action(vectors) if batch_columns is not None else
+                   np.column_stack([action(v) for v in vectors.T]))
+        residuals = np.linalg.norm(applied-vectors*roots, axis=0)
         metric_error = float(np.linalg.norm(vectors.T@(metric[:, None]*vectors)-np.eye(nroots), ord=np.inf))
         info.update(residual_norms=residuals, metric_error=metric_error, operator_columns=calls)
         if not np.all(np.isfinite(residuals)) or np.max(residuals) > tol or metric_error > 1e-8:
