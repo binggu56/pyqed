@@ -1,13 +1,16 @@
 TDI GW/BSE — 16 threads
 ======================
 
+All electronic-structure stages use PyQED: integrals, RHF, GW and BSE.
+PySCF is not required.
+
 The script reads the included tdi.xyz and runs density-fitted RHF, full-space
 Padé G0W0, and ten singlet full-BSE excitations with QP-gap screening.
 It uses 6-31G / cc-pVDZ-JKFIT, all 798 orbitals, and the default GW/BSE
 convergence thresholds. Stability checks remain enabled: rejected GW roots
 stop the calculation rather than silently falling back or restricting the space.
 
-On the cluster, activate an environment with PySCF 2.14 and matplotlib, then
+On the cluster, activate an environment with matplotlib, then
 build the current PyQED from the repository root::
 
     PYQED_GW_OPENMP=required PYQED_BSE_OPENMP=required PYQED_CONTOUR_OPENMP=required python -m pip install -e .
@@ -33,7 +36,7 @@ No automatic restart is implemented. TDI_PYTHON can select an interpreter;
 TDI_REPO can override the source path. Rebuild extensions on Linux rather
 than copying macOS binaries.
 
-Outputs: scf.chk and df.h5 preserve the reference; gw.npz stores available
+Outputs: rhf.npz preserves the RHF orbitals and energy; gw.npz stores available
 GW/continuation arrays even if GW fails; bse.npz contains converged excitation
 energies in eV and X/Y amplitudes. gw_bse_diagnostics.png plots the converged
 results. Failures exit nonzero and appear in the Slurm log. See

@@ -10,7 +10,8 @@ for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS',
     os.environ[name] = '1'
 
 import numpy as np
-from pyscf import gto, scf, lib
+from pyqed.qchem import Molecule
+from pyqed.qchem.hf.rhf import RHF
 from threadpoolctl import threadpool_limits
 from pyqed.gw.gw import GW
 from pyqed.gw.bse import BSE, _bse_contractions
@@ -23,17 +24,20 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise FileExistsError('Choose an empty output directory')
-    lib.num_threads(THREADS)
 
     xyz = Path(__file__).with_name('tdi.xyz').read_text()
-    mol = gto.M(atom='\n'.join(xyz.splitlines()[2:]), unit='Angstrom',
-                basis='6-31g', charge=0, spin=0, max_memory=64000, verbose=4)
-    mf = scf.RHF(mol).density_fit(auxbasis='cc-pvdz-jkfit')
-    mf.chkfile = str(out/'scf.chk')
-    mf.with_df._cderi_to_save = str(out/'df.h5')
-    mf.conv_tol, mf.max_cycle = 1e-10, 100
-    with threadpool_limits(limits=THREADS):
-        mf.kernel()
+    mol = Molecule(atom='\n'.join(xyz.splitlines()[2:]), unit='angstrom',
+                   basis='631g', charge=0, spin=0)
+    mol.max_memory = 64000
+    with threadpool_limits(limits=1):
+        mol.build(eri='ri', options=dict(
+            auxbasis='cc-pvdz-jkfit', ri_storage='packed',
+            parallel=True, eri_workers=THREADS, ri_cache=False))
+        mf = RHF(mol)
+        mf.max_memory = mol.max_memory
+        mf.run(tol=1e-10, max_cycle=100, verbose=1)
+    np.savez(out/'rhf.npz', mo_coeff=mf.mo_coeff, mo_energy=mf.mo_energy,
+             mo_occ=mf.mo_occ, e_tot=mf.e_tot, converged=mf.converged)
     if not mf.converged:
         raise RuntimeError('RHF did not converge')
 
