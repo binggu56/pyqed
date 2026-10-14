@@ -1,5 +1,5 @@
 RHF Hessians with RI/CD
-======================
+=======================
 
 Native RI/CD references support analytic fixed-auxiliary curvature::
 

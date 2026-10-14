@@ -107,6 +107,7 @@ dedicated guide for examples:
 .. toctree::
    :maxdepth: 1
 
+   rhf_factor_hessian
    guide/guide_qchem_mcscf
    guide/guide_qchem_om2_mrci
 

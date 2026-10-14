@@ -73,7 +73,7 @@ of active electrons, either as an integer for closed-shell active spaces or as
 ``(nalpha, nbeta)`` for explicit spin sectors.
 
 Constrained Orbital Optimization (COCAS)
----------------------------------------
+----------------------------------------
 
 ``COCAS`` alternates CASCI with orthonormality-constrained orbital
 minimization at fixed RDMs. The default ``diis_residual="step"`` pairs each
