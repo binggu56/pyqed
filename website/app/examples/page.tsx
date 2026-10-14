@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { CopyButton } from "../copy-button";
-import { links, release } from "../site-data";
+import { links, exampleRelease as release } from "../site-data";
 import { examples } from "./examples-data";
 import { PythonCode } from "./python-code";
 

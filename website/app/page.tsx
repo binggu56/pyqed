@@ -134,7 +134,7 @@ mol = Molecule(
     unit="angstrom",
     basis="sto-3g",
 )
-mol.build(driver="builtin", eri="auto")
+mol.build(eri="auto")
 
 mf = mol.RHF().run()
 print(f"RHF energy: {mf.e_tot:.8f} Ha")`;
@@ -154,7 +154,7 @@ const validationCards = [
     metric: `Python ${release.python}`,
     title: "One installable research release",
     description:
-      "The universal wheel and source archive are published on PyPI. Optional scientific backends are documented separately from the native core path.",
+      "Platform wheels and a source archive are published on PyPI. Optional scientific backends are documented separately from the native core path.",
     href: links.installation,
     action: "Review installation options",
   },
@@ -175,7 +175,7 @@ const projectLinks = [
   { label: "Contribute", href: links.contributing },
   { label: "Discussions", href: links.discussions },
   { label: "Contributors", href: links.contributors },
-  { label: "Software archive", href: softwareArchive.versionUrl },
+  { label: "Software archive", href: softwareArchive.conceptUrl },
 ] as const;
 
 const softwareJsonLd = {
@@ -197,9 +197,9 @@ const softwareJsonLd = {
   license: links.license,
   identifier: {
     "@type": "PropertyValue",
-    propertyID: "DOI",
-    value: softwareArchive.versionDoi,
-    url: softwareArchive.versionUrl,
+    propertyID: "GitHub release",
+    value: `v${release.version}`,
+    url: links.release,
   },
   isPartOf: {
     "@type": "CreativeWorkSeries",
