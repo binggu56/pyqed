@@ -52,7 +52,7 @@ test("exports the research-first PyQED homepage", async () => {
     html,
     /<h1[^>]*>[\s\S]*Electronic structure and[\s\S]*quantum dynamics in Python\./i,
   );
-  assert.match(html, /python -m pip install pyqed==0\.2\.0/i);
+  assert.match(html, /<code>pip install pyqed<\/code>/i);
   assert.match(html, /Open the User Guide/i);
   assert.match(
     html,
