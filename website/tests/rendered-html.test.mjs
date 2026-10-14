@@ -90,7 +90,6 @@ test("exports the research-first PyQED homepage", async () => {
   assert.match(html, /RHF energy: -1\.11675931 Ha/i);
   assert.match(html, /10\.1063\/1674-0068\/cjcp2510161/i);
   assert.match(html, /10\.5281\/zenodo\.21316543/i);
-  assert.match(html, /10\.5281\/zenodo\.21316544/i);
   assert.doesNotMatch(html, /chatgpt\.site|codex-preview|Your site is taking shape/i);
 
   const jsonLdMatch = html.match(
@@ -98,9 +97,11 @@ test("exports the research-first PyQED homepage", async () => {
   );
   assert.ok(jsonLdMatch, "software JSON-LD should be rendered");
   const jsonLd = JSON.parse(jsonLdMatch[1]);
-  assert.equal(jsonLd.softwareVersion, "0.2.0");
+  assert.equal(jsonLd.softwareVersion, "0.3.0");
+  assert.equal(jsonLd.downloadUrl, "https://pypi.org/project/pyqed/0.3.0/");
+  assert.equal(jsonLd.releaseNotes, "https://github.com/binggu56/pyqed/releases/tag/v0.3.0");
   assert.equal(jsonLd.maintainer.name, "Bing Gu");
-  assert.equal(jsonLd.identifier.value, "10.5281/zenodo.21316544");
+  assert.equal(jsonLd.identifier.value, "v0.3.0");
   assert.equal(jsonLd.isPartOf.identifier.value, "10.5281/zenodo.21316543");
 });
 

@@ -1,4 +1,10 @@
 export const release = {
+  version: "0.3.0",
+  python: "3.10–3.13",
+  installCommand: "pip install pyqed",
+} as const;
+
+export const exampleRelease = {
   version: "0.2.0",
   python: "3.10–3.13",
   installCommand: "python -m pip install pyqed==0.2.0",
@@ -75,8 +81,8 @@ export const links = {
     "https://github.com/binggu56/pyqed/blob/main/examples/namd/so2_3d_sine_legendre_linked_ldr.py",
   pyrazine24Source:
     "https://github.com/binggu56/pyqed/blob/main/examples/namd/pyrazine_24mode_ldrfg.py",
-  pypi: "https://pypi.org/project/pyqed/0.2.0/",
-  release: "https://github.com/binggu56/pyqed/releases/tag/v0.2.0",
+  pypi: "https://pypi.org/project/pyqed/0.3.0/",
+  release: "https://github.com/binggu56/pyqed/releases/tag/v0.3.0",
   citation: paper.url,
   contributing:
     "https://github.com/binggu56/pyqed/blob/main/CONTRIBUTING.md",
