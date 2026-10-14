@@ -69,11 +69,12 @@ test("exports the research-first PyQED homepage", async () => {
   );
 
   const workflows = section(html, "workflows");
-  assert.equal((workflows.match(/data-workflow=/gi) ?? []).length, 4);
+  assert.equal((workflows.match(/data-workflow=/gi) ?? []).length, 5);
   for (const slug of [
     "electronic-structure",
     "nonadiabatic-dynamics",
     "open-systems",
+    "nonlinear-spectroscopy",
     "tensor-networks",
   ]) {
     assert.match(workflows, new RegExp(`data-workflow="${slug}"`, "i"));
