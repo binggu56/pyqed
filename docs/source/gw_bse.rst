@@ -58,7 +58,7 @@ QP energies invalidates QP-gap screening. The archived anthracene/tetracene/
 pentacene HF-screening benchmark results are not new-default predictions.
 
 Molecular analytic-continuation G0W0
------------------------------------
+------------------------------------
 
 For a real, gapped restricted RI/CD reference, the molecular AC path is:
 
@@ -166,7 +166,7 @@ compares excitation energies with the supplied PySCF BSE log.
 
 
 Contour-deformation G0W0
------------------------
+------------------------
 
 For larger restricted molecules with native CD or RI integrals, select
 ``freq_int='contour_deformation'`` (aliases ``'contour'`` and ``'cd'``):
@@ -347,7 +347,7 @@ can limit scaling, so four concurrent solves are a starting point on the
 32 GiB local TDI machine, rather than a guarantee of fourfold speedup.
 
 Lanczos response reuse
-~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~
 
 ``residue_solver="lanczos"`` selects an experimental reusable inverse-Casida
 response for contour residues. It is an adaptation of J. Laflamme Janssen,
@@ -639,7 +639,7 @@ https://doi.org/10.1103/PhysRev.139.A796; it is not a complete satellite
 solver and does not guarantee the root with largest spectral weight.
 
 Spectral GW orbital OpenMP
-~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``GW(mf, threads=4).run()`` parallelizes independent diagonal Dyson solves
 using the compiled ``dyson`` algorithm. The default is one thread. This
@@ -694,7 +694,7 @@ are in ``/private/tmp/gw_charge_pyrazine_631g_final`` and
 ``/private/tmp/gw_charge_pyrazine_631gstar_bracket``.
 
 Molecular BSE/TDA OpenMP
------------------------
+------------------------
 
 ``BSE(gw, threads=8).run(nroots=5, batch_columns=8)`` and
 ``TDA(gw, threads=8).run(nroots=5, batch_columns=8)`` distribute fixed
@@ -1678,7 +1678,7 @@ coupling preparation, quasiparticle solve and BSE stages, with a corresponding
 resident-memory diagnostic figure.
 
 Matched PySCF 2.14 anthracene benchmark
--------------------------------------
+---------------------------------------
 
 ``benchmarks/gw_bse_matched_scaling.py`` compares independent RI-G0W0 and
 full singlet BSE calculations starting from a single saved RI-HF reference.
@@ -1810,7 +1810,7 @@ Related Examples
 * :doc:`examples`
 
 Experimental structure-preserving BSE Lanczos
---------------------------------------------
+---------------------------------------------
 
 ``BSE.run(eigensolver='lanczos', max_space=1000, max_cycle=200)`` selects
 an optional real, stable full-BSE metric block Lanczos solver. The default
@@ -1842,7 +1842,7 @@ this eigenpair implementation. The separate GW screening Lanczos
 resolvent implementation is unchanged.
 
 Larger matched benchmark: tetracene at eight threads
---------------------------------------------------
+----------------------------------------------------
 
 The 2026-10-13 tetracene cc-pVDZ/cc-pVDZ-RI comparison uses 312 orbitals,
 1176 auxiliary functions and a full BSE dimension of 30240. With the
@@ -1867,7 +1867,7 @@ are in ``benchmarks/tetracene-gw-bse-pyscf/REPORT.rst``. This benchmark
 does not use the experimental Lanczos eigensolver.
 
 Continuation accuracy checks and explicit contour repair
--------------------------------------------------------
+--------------------------------------------------------
 
 A small nonlinear QP residual establishes convergence to a fitted function,
 not accuracy of its analytic continuation. Molecular Padé now checks the
@@ -1932,7 +1932,7 @@ installed PySCF package. Correcting that evaluator alone does not remove
 ill-conditioning of the fits.
 
 Saving BSE results and restarting
---------------------------------
+---------------------------------
 
 ``bse.save('bse.npz')`` exports available excitation results without pickle.
 ``excitation_energy`` and ``e_qp`` are in Hartree (``energy_unit='hartree'``),
@@ -1966,7 +1966,7 @@ QP energies after loading triggers the usual screening rebuild from saved
 full-space factors. The storage layer introduces no method approximation.
 
 Saving GW results and AC checkpoints
------------------------------------
+------------------------------------
 
 GW and BSE use the same public naming: ``save(path)`` exports results,
 ``checkpoint(directory)`` writes restart state, and the class method

@@ -11,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -11368,7 +11369,7 @@ bool compute_directional_shell_quartet_derivatives(
         if (second_contracted) {
             for (int a = 0; a < 9; ++a) for (int b = 0; b <= a; ++b) {
                 if (!derivative_active[a] || !derivative_active[b]) continue;
-                double values[4][batch_width] = {};
+                std::array<std::array<double, DerivativePrimitiveBatch::width>, 4> values{};
                 for (int k = 0; k < 4; ++k)
                     for (const auto& term : second_terms[(a*9+b)*4+k]) {
                         const double* row = batch_table.data()+term.index*batch_width;
@@ -11388,7 +11389,7 @@ bool compute_directional_shell_quartet_derivatives(
         for (npy_intp obs = 0; obs < nobservable; ++obs)
             for (int d = 0; d < 9; ++d) {
                 if (!derivative_active[d]) continue;
-                double high[batch_width] = {}, low[batch_width] = {};
+                std::array<double, DerivativePrimitiveBatch::width> high{}, low{};
                 for (const auto& term : contracted_high[obs*9+d]) {
                     if (term.coefficient == 0.) continue;
                     const double* values = batch_table.data()+term.index*batch_width;
