@@ -30,7 +30,7 @@ export const links = {
   docs: "https://docs.pyqed.org/en/stable/",
   userGuide: "https://docs.pyqed.org/en/latest/guide/guide.html",
   installation: "https://docs.pyqed.org/en/stable/installation.html",
-  quickstart: "https://docs.pyqed.org/en/stable/quickstart.html",
+  quickstart: "https://docs.pyqed.org/en/latest/quickstart.html",
   qchem: "https://docs.pyqed.org/en/stable/qchem.html",
   namd: "https://docs.pyqed.org/en/stable/pyqed.namd.html",
   heom: "https://docs.pyqed.org/en/stable/heom.html",
@@ -54,7 +54,7 @@ export const links = {
   quickstartSource:
     "https://github.com/binggu56/pyqed/blob/main/examples/quickstart.py",
   quickstartReleaseSource:
-    "https://github.com/binggu56/pyqed/blob/v0.2.0/examples/quickstart.py",
+    "https://github.com/binggu56/pyqed/blob/v0.3.0/examples/quickstart.py",
   sineDvrReleaseSource:
     "https://github.com/binggu56/pyqed/blob/v0.2.0/examples/dvr/fedvr_vs_sine_quartic.py",
   heomReleaseSource:

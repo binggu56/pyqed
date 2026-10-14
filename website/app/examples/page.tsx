@@ -119,10 +119,10 @@ export default function ExamplesPage() {
             </div>
 
             <aside className="examples-release-note" aria-label="Example provenance">
-              <p>Curated release</p>
-              <strong>{`PyQED ${release.version}`}</strong>
+              <p>Source versions</p>
+              <strong>H₂ quickstart · PyQED 0.3.0</strong>
               <span>{`Python ${release.python}`}</span>
-              <span>{`Source links pinned to tag v${release.version}`}</span>
+              <span>{`Other examples · PyQED ${release.version}`}</span>
               <span>Development branch may differ</span>
             </aside>
           </div>
@@ -149,7 +149,8 @@ export default function ExamplesPage() {
               <h2 id="library-heading">Small programs, clear outcomes.</h2>
             </div>
             <p>
-              The code below is taken from the tagged {release.version} source.
+              The H₂ quickstart uses PyQED 0.3.0; the other examples retain their
+              documented 0.2.0 source.
               Copy it for a quick inspection, or open the full file when you
               need its repository context.
             </p>
@@ -191,7 +192,7 @@ export default function ExamplesPage() {
 
                   <div className="example-actions">
                     <a href={example.sourceHref}>
-                      {`Full source · v${release.version}`} <span aria-hidden="true">↗</span>
+                      {`Full source · v${"version" in example ? example.version : release.version}`} <span aria-hidden="true">↗</span>
                     </a>
                     <a href={example.guideHref}>
                       {example.guideLabel} <span aria-hidden="true">→</span>
@@ -244,8 +245,9 @@ export default function ExamplesPage() {
                 <div>
                   <strong>Pin the software.</strong>
                   <p>
-                    Install <code>{release.installCommand}</code> or work from
-                    the v{release.version} source tag.
+                    For the H₂ quickstart, install <code>pip install pyqed==0.3.0</code>.
+                    For the other examples, install <code>{release.installCommand}</code>
+                    or work from the v{release.version} source tag.
                   </p>
                 </div>
               </li>
