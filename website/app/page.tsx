@@ -23,7 +23,7 @@ const workflows = [
     slug: "nonadiabatic-dynamics",
     index: "02",
     title: "Nonadiabatic dynamics",
-    status: "Experimental",
+    status: "",
     duration: "Starter model",
     task: "Propagate a two-state avoided crossing with LDRFG.",
     description:
@@ -38,7 +38,7 @@ const workflows = [
     slug: "open-systems",
     index: "03",
     title: "Open quantum systems",
-    status: "Experimental",
+    status: "",
     duration: "Starter model",
     task: "Follow dissipation and environmental memory in a spin–boson HEOM model.",
     description:
@@ -53,7 +53,7 @@ const workflows = [
     slug: "nonlinear-spectroscopy",
     index: "04",
     title: "Nonlinear molecular spectroscopy",
-    status: "Experimental",
+    status: "",
     duration: "Response functions",
     task: "Explore two-photon absorption and multidimensional optical signals.",
     description:
@@ -68,7 +68,7 @@ const workflows = [
     slug: "tensor-networks",
     index: "05",
     title: "MPS & DMRG",
-    status: "Experimental",
+    status: "",
     duration: "Starter MPO",
     task: "Construct a fermionic MPO with automatic Jordan–Wigner strings.",
     description:
@@ -389,7 +389,7 @@ export default function Home() {
               >
                 <div className="capability-topline">
                   <span>{workflow.index}</span>
-                  <span>{workflow.status}</span>
+                  {workflow.status && <span>{workflow.status}</span>}
                 </div>
                 <h3>{workflow.title}</h3>
                 <p className="workflow-task">{workflow.task}</p>
