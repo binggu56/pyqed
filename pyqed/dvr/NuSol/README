@@ -58,3 +58,21 @@ To use the optional FEAST solver specify the INTEL MKL and FEAST paths
 build the NuSol_FEAST binary using
 > cd ./lib/;
 > make NuSol_FEAST;
+
+
+=== FEAST input and output validation ===
+The POSIX FEAST driver validates finite numbers, bounded allocations, one-based
+indices, and matrix entries sorted by row then column with no duplicates. It
+rejects excess data, symbolic links, nonregular files, hardlinked outputs, and
+outputs aliasing the matrix or each other. Existing result files are truncated
+only after both output paths validate and are restricted to owner read/write
+permissions (0600). Allocation limits are 50 million rows, 100 million nonzeros,
+100 thousand subspace vectors, and 100 million eigenvector elements.
+
+The launcher passes filenames as literal process arguments without a shell.
+The external FEAST/MKL libraries and the legacy Python launcher requirements
+above are unchanged. Build the executable locally; compiled binaries are not
+stored in Git. Run the regression checks from the repository root with:
+> PYTHONPATH=. python -m pytest -q tests/test_nusol_feast_security.py
+These checks compile a small FEAST API stub in normal and ASan/UBSan builds.
+They validate the driver boundary, not numerical FEAST accuracy.
