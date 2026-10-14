@@ -236,18 +236,44 @@ imaginary dielectric products remain separate, and complex symmetric
 matrices are mirrored without Hermitian conjugation. The GMRES residual
 gate and Lanczos error controls are unchanged.
 
-Threads operate on auxiliary/transition tiles, not orbital Python
-callbacks. Cholesky factorization, direct residue solves, preconditioning,
-GMRES/Lanczos control and root continuation retain their existing SciPy
-implementations and numerical-library thread controls. Workers call no
-BLAS. Serial large products retain optimized NumPy BLAS; small compiled
+Screening preparation uses auxiliary/transition tiles. For direct residues
+with multiple requested QP orbitals, the same thread budget then runs
+independent orbital solves sharing immutable prepared screening. Each worker
+owns its counters and caches and uses one contraction/BLAS thread, avoiding
+nested pools. The existing TDI independent-orbital helper is shared with this
+public path. Root continuation and numerical controls are unchanged.
+Cholesky factorization, preconditioning and GMRES/Lanczos retain their
+existing numerical-library thread controls. Dielectric construction
+keeps one OpenMP team alive across transition blocks and packs the shared
+right-hand tile in parallel. Each output tile retains the same transition
+block order. On macOS its worker-local products use Accelerate DGEMM, with
+BLAS threads fixed to one; other platforms retain the generic row-product
+kernel. This changes floating-point evaluation inside each small product,
+so agreement with older builds is numerical rather than bitwise. Serial
+large products retain optimized NumPy BLAS; small compiled
 tasks use one worker. Consequently complete direct solves may scale only
 modestly, especially for small molecules. Keep BLAS thread limits at one
 when measuring contraction scaling.
 
+Direct residue results (screened value and derivative) are reused only for
+identical frequency, orbital, intermediate state, regulator and tolerance.
+No interpolation or approximate frequency matching is used. The per-worker
+LRU cache is bounded by 4096 entries and an estimated response-cache budget.
+The pivoted complex-symmetric LAPACK solve is unchanged, but its workspace
+query is cached and the additional condition-number estimate in the general
+SciPy wrapper is skipped. Singular-pivot, finite-solution and original
+dielectric backward-error checks remain; RHS-relative residuals are recorded.
+This does not introduce a stronger forward-error guarantee near poles.
+Prepared reference factors and orbital energies must remain immutable.
+
+``benchmarks/benchmark_gw_residue_reuse.py`` compares a saved pre-change
+``contour.py`` with the current implementation for two- and four-orbital
+water/cc-pVDZ calculations. It checks QP energies, weights, self-energies,
+derivatives and residuals and saves an automatically generated timing plot.
+
 Parallel kernels require row-contiguous real double-precision transition
 factors. ``max_memory`` limits estimated temporary contraction storage and
-may reduce observed teams; it does not cap RSS, factors, caches or mandatory
+may reduce observed teams and independent orbital workers; it does not cap RSS, factors, caches or mandatory
 direct auxiliary matrices, and a minimum serial workspace remains.
 ``gw.threading_info`` and ``gw._contour.threading_info`` record requested
 threads, maximum observed teams, per-kernel teams and calls. Reusing prepared
@@ -260,6 +286,14 @@ for multiple threads. ``benchmarks/contour_thread_scaling.py`` benchmarks
 HOMO/LUMO QP roots with full screening, NumPy references, warm-up, repeated
 timings, residual/weight/energy checks, profiles and diagnostic figures.
 Fixed nw and eta establish thread agreement, not quadrature convergence.
+``benchmarks/gw_openmp_phases.py`` separates inclusive dielectric,
+screening-element, residue, and self-energy timings for water/cc-pVDZ with
+complete screening and selected HOMO/LUMO roots. Nested times must not be
+summed. Its ``--baseline`` option loads a saved contraction extension for
+interleaved before/after comparisons in one process. Larger synthetic
+factor matrices isolate kernel scaling; they are not molecular runtime
+predictions. Quasiparticle weights, root residuals, self-energy values and
+derivatives accompany the timing records.
 When using the independent TDI ``--qp-workers`` driver described below,
 keep inner contraction and BLAS thread counts at one to avoid nested fanout.
 
@@ -1896,3 +1930,75 @@ and ``--correct-pyscf-pade`` explicitly applies and labels the reference
 PySCF 2.14 evaluator correction described above. It does not modify the
 installed PySCF package. Correcting that evaluator alone does not remove
 ill-conditioning of the fits.
+
+Saving BSE results and restarting
+--------------------------------
+
+``bse.save('bse.npz')`` exports available excitation results without pickle.
+``excitation_energy`` and ``e_qp`` are in Hartree (``energy_unit='hartree'``),
+with ``x`` and ``y`` amplitudes when available, orbital indices, the response
+metric, and solver diagnostics in the JSON string ``info_json``. TDA omits
+``y``. Saving requires excitation energies, but does not require convergence;
+inspect the saved diagnostics before using unconverged results.
+
+For a self-contained restart of a factorized static dielectric BSE problem::
+
+    bse.checkpoint('bse-checkpoint')
+    restarted = BSE.from_checkpoint('bse-checkpoint', threads=8)
+    restarted.run(nroots=10, return_vectors=True)
+
+The destination directory must not exist. The checkpoint stores QP/reference
+energies, orbital indices and coefficients, RI factors, the static dielectric
+Cholesky factor, any prepared occupied/occupied-virtual screening caches, and
+available excitation results. Arrays are separate NPY files loaded read-only
+with memory mapping; no pickle or external cache paths are used. Identical
+factor objects are saved only once. Allow disk space for the RI factors and
+screening caches. The manifest is written last, so interrupted saves without
+a manifest cannot be loaded as complete checkpoints.
+
+This restarts the eigensolve from the saved operator, without RHF, GW, or
+static screening recomputation. It does not resume Davidson iteration history
+or reconstruct molecular scanners, integrals, or a GW driver. Solver settings
+are supplied to ``run`` again; loading defaults to one thread and optionally
+accepts ``max_memory``. TDA checkpoints restore a TDA object. Dense and
+spectral-coupling screening checkpoints are currently unsupported. Changing
+QP energies after loading triggers the usual screening rebuild from saved
+full-space factors. The storage layer introduces no method approximation.
+
+Saving GW results and AC checkpoints
+-----------------------------------
+
+GW and BSE use the same public naming: ``save(path)`` exports results,
+``checkpoint(directory)`` writes restart state, and the class method
+``from_checkpoint(directory)`` creates a solver from it. The latter is a
+constructor, rather than a mutation of an existing solver.
+
+``gw.save('gw.npz')`` stores available QP energies, weights, residuals,
+orbital indices, AC self-energy samples/frequencies, static corrections,
+and continuation coefficients/nodes. Energies use Hartree and
+``metadata_json`` records convergence, method and diagnostics. Partial or
+empty results can be exported after failure; inspect the metadata.
+
+For molecular factorized AC GW::
+
+    gw.checkpoint('gw-checkpoint')
+    gw = GW.from_checkpoint('gw-checkpoint', threads=8)
+    gw.refit(ac='pade')       # reuse saved self-energy; no integration
+    # gw.refit(ac='twopole') # alternate continuation of the same samples
+    bse = BSE(gw, threads=8)
+
+The checkpoint includes MO RI factors, reference orbital data, available
+static screening, sampled self-energy and fit/QP results. It reuses the
+pickle-free directory format and memory-mapped arrays used by BSE. The
+original SCF/molecule driver and active quadrature iteration are not restored;
+``run()`` on a restored GW object raises with instructions to use ``refit()``
+or construct a fresh GW driver. Refitting retains the existing AC method's
+stability checks and approximations; it introduces no new approximation.
+
+Default QP-gap BSE builds its own static screening from the restored QPs.
+Explicit ``screening_energies='hf'`` can reuse the saved matching GW static
+screening without rebuilding it. Contour-deformation, spectral GW and
+contour-repaired AC checkpoints are currently unsupported; their available
+QP results can still be exported with ``save()``. Checkpoint creation requires
+saved AC samples and static corrections, and does not claim to resume an
+interrupted integration.

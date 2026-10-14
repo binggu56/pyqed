@@ -29,16 +29,24 @@ Or run inside an existing 16-CPU allocation::
 
     PYTHONPATH=. python examples/qchem/tdi_gw_bse/run.py
 
-The output directory must be empty. The launcher requests 128 GB RAM and
+For a fresh calculation the output directory must be empty. The launcher requests 128 GB RAM and
 24 hours; allow at least 150 GB scratch. The 64 GB working-array budget in
 run.py is not a hard memory cap, and the time request is not a runtime estimate.
-No automatic restart is implemented. TDI_PYTHON can select an interpreter;
+RHF and GW use 16 BLAS threads. Full BSE uses compiled contractions with
+16 OpenMP threads, single-threaded inner BLAS, response Davidson and automatic
+column batching. This example starts a fresh calculation and exports results;
+it does not automatically write or load restart checkpoints.
+TDI_PYTHON can select an interpreter;
 TDI_REPO can override the source path. Rebuild extensions on Linux rather
 than copying macOS binaries.
 
-Outputs: rhf.npz preserves the RHF orbitals and energy; gw.npz stores available
-GW/continuation arrays even if GW fails; bse.npz contains converged excitation
-energies in eV and X/Y amplitudes. gw_bse_diagnostics.png plots the converged
+Outputs: rhf.npz stores a losslessly compressed RHF result snapshot
+(orbitals, energy, convergence and molecular metadata; no integral tensors); gw.npz stores available
+GW/continuation arrays even if GW fails; bse.npz contains excitation
+energies in Hartree, available X/Y amplitudes and convergence diagnostics,
+written by bse.save(). To save the static operator for a later eigensolve,
+call bse.checkpoint(out/'bse-checkpoint'); this also copies the large RI
+and screening arrays. gw_bse_diagnostics.png plots the available
 results. Failures exit nonzero and appear in the Slurm log. See
 ../../../docs/source/gw_bse.rst for method references and fidelity.
 

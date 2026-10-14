@@ -65,13 +65,13 @@ def test_molecular_qp_and_screening_reuse(monkeypatch, method, factorized):
         return g._casida_eigh(*g.rpa_AB_matrices(obj, method=kwargs.get('method', 'TDH')))
     monkeypatch.setattr(g, 'rpa', full_spin)
     controls = dict(max_cycle=2) if method == 'evgw' else {}
-    old = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=1e-3).run(method=method, **controls)
+    old = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=1e-3, freq_int='exact').run(method=method, **controls)
     monkeypatch.setattr(g, 'rpa', original)
-    new = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=1e-3).run(method=method, **controls)
+    new = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=1e-3, freq_int='exact').run(method=method, **controls)
     np.testing.assert_allclose(new.e_qp, old.e_qp, atol=1e-9, rtol=0)
     assert np.all(new.qp_weights > 0)
     assert np.max(new.qp_residuals) <= 1e-9
-    bse = BSE(new)
+    bse = BSE(new, screening_energies='hf')
     if method == 'evgw':
         # Updated-energy screening must not replace BSE's MF-energy screening.
         assert bse._M is None
@@ -94,13 +94,13 @@ def test_molecular_qp_and_screening_reuse(monkeypatch, method, factorized):
         raise AssertionError('Matching screening should be reused')
     bse.rpa = unexpected_rebuild
     bse.run(nroots=3, low_rank=True, batch_columns=8, tol=1e-9)
-    reference = BSE(old).run(nroots=3, low_rank=False)
+    reference = BSE(old, screening_energies='hf').run(nroots=3, low_rank=False)
     np.testing.assert_allclose(bse.e, reference.e, atol=1e-9)
     new._charge_screening['mo_coeff'][0, 0] += .1
-    assert BSE(new)._M is None
+    assert BSE(new, screening_energies='hf')._M is None
     new._charge_screening['mo_coeff'] = new.mo_coeff.copy()
     new._charge_screening['energy'][0] += .1
-    assert BSE(new)._M is None
+    assert BSE(new, screening_energies='hf')._M is None
 
 
 def test_charge_screening_rejects_nonpositive_gaps():
@@ -171,8 +171,12 @@ def test_packed_transform_and_disk_couplings(monkeypatch):
     spatial = SimpleNamespace(nso=5, nocc=2, e_mf=obj.e_mf[::2],
         eri=None, _pair_factors=f, max_memory=.0001)
     actual = bse_couplings(spatial, poles, vectors)
-    assert isinstance(actual, np.memmap)
+    assert isinstance(actual, g.FactorizedCouplings)
+    assert isinstance(actual.projection, np.memmap)
     np.testing.assert_allclose(actual, obj._charge_screening['couplings'], atol=1e-14)
+    dense = bse_couplings(spatial, poles, vectors, factorized=False)
+    assert isinstance(dense, np.memmap)
+    np.testing.assert_allclose(actual, dense, atol=1e-14)
 
 
 def test_dense_integral_budget_checked_before_transform(monkeypatch):
@@ -222,13 +226,12 @@ def test_qp_continuation_constant_and_failure():
         g._continue_qp_root(lambda w: np.nan, lambda w: np.nan, 0.)
 
 
-def test_qp_bracket_recovers_when_newton_fails(monkeypatch):
-    def fail(*args, **kwargs):
-        raise RuntimeError('force bracketed solve')
-    monkeypatch.setattr(g, 'newton', fail)
+def test_qp_bracket_is_stable_under_small_self_energy_perturbation():
     correction = lambda w: 1/(w+.1j)
     derivative = lambda w: -1/(w+.1j)**2
     root = g._continue_qp_root(correction, derivative, .2)
+    perturbed = g._continue_qp_root(lambda w: correction(w)+1e-14, derivative, .2)
+    assert abs(root-perturbed) < 1e-10
     assert root > 1.
     assert abs(root-.2-correction(root).real) < 1e-9
     assert 1-derivative(root).real > 0

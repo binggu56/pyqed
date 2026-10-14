@@ -15,6 +15,27 @@ except ImportError:
     _contour_contractions = None
 
 
+@lru_cache(maxsize=32)
+def _symmetric_driver(size, dtype):
+    solve, workspace = la.lapack.get_lapack_funcs(('sysv', 'sysv_lwork'), dtype=dtype)
+    work, info = workspace(size, lower=0)
+    if info:
+        raise ValueError(f"Symmetric solve workspace query failed: info={info}")
+    return solve, int(work.real)
+
+
+def _symmetric_solve(matrix, rhs):
+    """Use the same pivoted symmetric driver; the caller checks the residual."""
+    solve, lwork = _symmetric_driver(len(matrix), matrix.dtype.char)
+    _, _, solution, info = solve(matrix, rhs, lower=0, lwork=lwork,
+                                 overwrite_a=True, overwrite_b=False)
+    if info > 0:
+        raise np.linalg.LinAlgError(f"Singular dielectric matrix: pivot {info}")
+    if info < 0:
+        raise ValueError(f"Invalid symmetric solve argument {-info}")
+    return solution
+
+
 class ContourDeformation:
     """Restricted direct-RPA contour integration with real CD/RI factors.
 
@@ -39,6 +60,11 @@ class ContourDeformation:
     + ||rhs||_2, against screening_tol. This backward-error check tolerates
     cancellation at independent-particle poles; it does not bound forward
     error. The unscaled RHS-relative residual is also recorded.
+    Direct residues cache only identical frequency/orbital requests after
+    validation, bounded to 4096 entries and the response cache budget. The
+    LAPACK complex-symmetric pivoted solve and workspace query are reused;
+    the extra condition-number estimate from scipy.linalg.solve is omitted,
+    while singular-pivot, finite-solution and residual checks remain.
     A small linear
     residual alone does not guarantee self-energy accuracy near a pole.
     The zero-frequency Cholesky factor is retained for exact reuse by static
@@ -58,10 +84,16 @@ class ContourDeformation:
     and the same regulator, root continuation and residual gates. Native
     tiles have fixed summation order; complex matrices are mirrored without
     conjugation. Serial large products retain NumPy BLAS; small tasks use
-    one worker. Workers call no BLAS. SciPy Cholesky, direct solves,
-    preconditioning, GMRES/Lanczos control and orbital root continuation
-    retain their existing implementations and thread controls. max_memory
-    bounds estimated contraction scratch, not total RSS or mandatory direct
+    one worker. Dielectric construction reuses one OpenMP team across
+    transition tiles and parallelizes packing. On macOS, its worker-local
+    products use Accelerate; keep BLAS threads at one to avoid nested fanout.
+    Other platforms retain the generic row-product kernel. With multiple
+    direct-QP targets, independent orbital solves instead share prepared
+    screening using a bounded thread pool, with one contraction thread per
+    worker. Each worker owns its caches and diagnostics; the root prescription
+    is unchanged. Cholesky, preconditioning and GMRES/Lanczos retain their
+    existing control. max_memory bounds estimated contraction and parallel
+    solve scratch, not total RSS or mandatory direct
     auxiliary matrices; a minimum serial workspace remains. threading_info
     records requested and observed teams per kernel. Parallel contractions
     require row-contiguous real double-precision transition factors. No
@@ -323,8 +355,7 @@ class ContourDeformation:
         if self.residue_solver == "direct":
             matrix = self.dielectric(frequency)
             matrix_norm = np.linalg.norm(matrix)
-            solution = la.solve(matrix, rhs, assume_a="sym",
-                                overwrite_a=True, check_finite=False)
+            solution = _symmetric_solve(matrix, rhs)
             residual = self.dielectric_action(frequency, solution)-rhs
             relative = np.linalg.norm(residual)/max(np.linalg.norm(rhs), np.finfo(float).tiny)
             # At independent-particle poles, large epsilon causes cancellation.
@@ -377,7 +408,26 @@ class ContourDeformation:
         return solution
 
     def residue(self, frequency, orbital, intermediate):
-        """Screened matrix element and its derivative at a positive real frequency."""
+        """Screened element and derivative, reusing only exact direct requests."""
+        if self.residue_solver != 'direct':
+            return self._residue(frequency, orbital, intermediate)
+        if not hasattr(self, '_direct_residues'):
+            self._direct_residues = OrderedDict()
+        key = (float(frequency), float(self.eta), float(self.screening_tol),
+               int(orbital), int(intermediate))
+        if key in self._direct_residues:
+            self._direct_residues.move_to_end(key)
+            self.screening_info['residue_cache_hits'] = self.screening_info.get('residue_cache_hits', 0)+1
+            return self._direct_residues[key]
+        result = self._residue(frequency, orbital, intermediate)
+        self._direct_residues[key] = result
+        limit = max(1, min(4096, int(self.response_cache_bytes)//512))
+        while len(self._direct_residues) > limit:
+            self._direct_residues.popitem(last=False)
+        return result
+
+    def _residue(self, frequency, orbital, intermediate):
+        """Evaluate and validate an uncached residue request."""
         rhs = self.factors[:, intermediate, orbital]
         if self.target_factors is not None and orbital in self.columns:
             rhs = self.target_factors[:, self.columns[orbital], intermediate]
@@ -488,24 +538,42 @@ def kernel(
                                      residue_solver, screening_tol, screening_maxiter, screening_restart)
     gw._contour = contour
     contour.threads = getattr(gw, 'threads', 1)
-    exchange = _sigma_x_diagonal(gw, orbs)
     previous = getattr(gw, 'e_qp', None) if reuse_screening else None
     energies = np.full(len(mo_energy), np.nan) if previous is None else np.array(previous, copy=True)
     if previous is None:
         gw.qp_weights = np.full_like(energies, np.nan)
         gw.qp_residuals = np.full_like(energies, np.nan)
-    for index, p in enumerate(orbs):
-        static = exchange[index] - gw.v_mf[2 * p, 2 * p]
-        evaluate = lru_cache(maxsize=4)(lambda w: contour.evaluate(int(p), w))
-        correction = lambda w: evaluate(float(w))[0] + static
-        derivative = lambda w: evaluate(float(w))[1]
-        energies[p] = _continue_qp_root(
-            correction, derivative, float(mo_energy[p]), tol=tol
-        )
-        gw.qp_weights[p] = 1 / (1 - derivative(energies[p]).real)
-        gw.qp_residuals[p] = abs(
-            energies[p] - mo_energy[p] - correction(energies[p]).real
-        )
+    # Separate orbital tasks share immutable screening, but own all solver state.
+    # Keep one inner thread and reserve conservative matrix scratch per worker.
+    scratch = max(1, 64*len(contour.factors)**2 + 32*len(contour.gaps))
+    workers = max(1, min(contour.threads, len(orbs), int(gw.max_memory*1e6/scratch)))
+    if residue_solver == 'direct' and workers > 1:
+        controls = dict(nw=nw, quadrature_scale=quadrature_scale, residue_solver=residue_solver,
+                        screening_tol=screening_tol, screening_maxiter=screening_maxiter,
+                        screening_restart=screening_restart)
+        for p, energy, weight, residual, info, _ in parallel_qp_orbitals(gw, orbs, controls, tol, workers):
+            energies[p], gw.qp_weights[p], gw.qp_residuals[p] = energy, weight, residual
+            for key, value in info.items():
+                if key == 'solver':
+                    continue
+                old = contour.screening_info.get(key, 0)
+                contour.screening_info[key] = max(old, value) if key.startswith('max_') else old+value
+        contour._record_threads('orbital_solves', workers)
+        contour.threading_info['orbital_workers'] = workers
+    else:
+        exchange = _sigma_x_diagonal(gw, orbs)
+        for index, p in enumerate(orbs):
+            static = exchange[index] - gw.v_mf[2 * p, 2 * p]
+            evaluate = lru_cache(maxsize=4)(lambda w: contour.evaluate(int(p), w))
+            correction = lambda w: evaluate(float(w))[0] + static
+            derivative = lambda w: evaluate(float(w))[1]
+            energies[p] = _continue_qp_root(
+                correction, derivative, float(mo_energy[p]), tol=tol
+            )
+            gw.qp_weights[p] = 1 / (1 - derivative(energies[p]).real)
+            gw.qp_residuals[p] = abs(
+                energies[p] - mo_energy[p] - correction(energies[p]).real
+            )
     gw.orbital_indices = (np.asarray(orbs, dtype=int) if not reuse_screening else
                           np.array([p for p in contour.orbs if np.isfinite(energies[p])]))
     gw.contour_info = dict(
@@ -524,3 +592,53 @@ def kernel(
     gw.threading_info = getattr(contour, 'threading_info', dict(
         algorithm='NumPy contour contractions', openmp=False, requested_threads=1, actual_threads=1))
     return energies
+
+
+def parallel_qp_orbitals(gw, orbs, controls, tol, workers):
+    """Yield independent G0W0 orbital solves sharing prepared read-only arrays.
+
+    Each worker owns its GW energy arrays, contour counters and warm guesses.
+    All calls use the serial GW kernel and its unchanged root prescription.
+    Only the caller merges results and writes checkpoints. BLAS threads must
+    be limited to one; the large transition factors are shared between threads.
+    """
+    import time
+    import copy
+    from collections import OrderedDict
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import numpy as np
+    template = copy.copy(gw)
+    for name in ('e_qp', 'qp_weights', 'qp_residuals'):
+        value = getattr(gw, name, None)
+        setattr(template, name, None if value is None else np.array(value, copy=True))
+
+    def solve(p):
+        local = copy.copy(template)
+        local.threads = 1
+        for name in ('qp_weights', 'qp_residuals'):
+            value = getattr(template, name)
+            if value is not None:
+                setattr(local, name, value.copy())
+        local._contour = copy.copy(gw._contour)
+        local._contour.threads = 1
+        local._contour.threading_info = None
+        local._contour.max_memory = gw.max_memory/workers
+        local._contour.response_cache_bytes = max(512, gw._contour.response_cache_bytes//workers)
+        local._contour._direct_residues = OrderedDict()
+        if hasattr(local._contour, '_lanczos_response'):
+            del local._contour._lanczos_response
+        local._contour._residue_guesses = OrderedDict()
+        local._contour.screening_info = dict(solver=controls['residue_solver'], solves=0,
+            iterations=0, max_iterations=0, max_relative_residual=0., failed_solves=0)
+        before = time.perf_counter()
+        local.run(mo_energy=local._contour.energy, mo_coeff=local._contour.mo_coeff,
+                  orbs=[int(p)], reuse_screening=True, tol=tol, **controls)
+        return (int(p), float(local.e_qp[p]), float(local.qp_weights[p]),
+                float(local.qp_residuals[p]), local._contour.screening_info.copy(),
+                time.perf_counter()-before)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(solve, p) for p in orbs]
+        for future in as_completed(futures):
+            yield future.result()
+

@@ -545,6 +545,51 @@ class BSE(object):
             if self._screening_qp is not None:
                 self._screening_qp = self._screening_qp[first:stop].copy()
 
+    def save(self, path):
+        """Export available results to NPZ (energies in Hartree, no pickle).
+
+        Missing amplitudes are omitted. This is a results export; use
+        :meth:`checkpoint` to save the static BSE operator for reruns.
+        """
+        import json
+        from pathlib import Path
+        from .checkpoint import json_value
+
+        if self.e is None:
+            raise ValueError('Run BSE before saving results')
+        arrays = dict(excitation_energy=self.e, energy_unit=np.asarray('hartree'),
+                      metric=np.asarray(self.bse_metric),
+                      info_json=np.asarray(json.dumps(json_value(self.info))))
+        for key in ('x', 'y', 'e_qp', 'orbital_indices'):
+            value = getattr(self, key, None)
+            if value is not None:
+                arrays[key] = value
+        path = Path(path)
+        with path.open('wb') as stream:
+            np.savez(stream, **arrays)
+        return path
+
+    def checkpoint(self, path):
+        """Save a self-contained factorized static-screening BSE directory.
+
+        Includes QPs, RI factors, static dielectric Cholesky factor and any
+        prepared screening caches/results. Restarts the eigensolve, not its
+        Davidson iteration history. Does not checkpoint RHF/GW or scanners.
+        The destination must not exist; large arrays are stored as NPY files.
+        """
+        from .checkpoint import save_checkpoint
+        return save_checkpoint(self, path)
+
+    @classmethod
+    def from_checkpoint(cls, path, *, threads=1, max_memory=None):
+        """Restore a static BSE problem with memory-mapped arrays, without SCF/GW.
+
+        Use ``run(...)`` to solve again with the desired solver settings.
+        Thread count defaults to one for portability across machines.
+        """
+        from .checkpoint import load_checkpoint
+        return load_checkpoint(cls, path, threads=threads, max_memory=max_memory)
+
     @property
     def e_qp(self):
         """Quasiparticle energies used by BSE/TDA.

@@ -13,6 +13,8 @@ from __future__ import print_function
 from __future__ import division
 
 # import math
+from pyqed.parallel import resolve_workers
+
 import os
 import sys
 import hashlib
@@ -73,16 +75,17 @@ PTR_COEFF  = 6
 BAS_SLOTS  = 8
 
 
+def _positive_workers(value):
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, (int, np.integer)) or value < 1:
+        raise ValueError('workers must be a positive integer.')
+    return int(value)
+
+
 _BUILTIN_OPTION_SPECS = (
     ("coord_type", "builtin_coord_type", "native_coord_type", str, "spherical"),
     ("derivative_screen_tol", "derivative_screen_tol", "derivative_screen_tol", float, 0.),
     ("derivative_kernel", "derivative_kernel", "derivative_kernel", str, "auto"),
-    ("parallel", "builtin_parallel", "native_parallel", bool, False),
-    (
-        "eri_workers", "builtin_eri_workers", "native_eri_workers",
-        lambda v: None if v is None else int(v), None,
-    ),
-    ("parallel_min_nao", "builtin_parallel_min_nao", "native_parallel_min_nao", int, 12),
+    ("workers", "workers", "workers", resolve_workers, None),
     ("eri_screen_tol", "builtin_eri_screen_tol", "native_eri_screen_tol", float, 1.0e-10),
     ("direct_scf_tol", "builtin_direct_scf_tol", "native_direct_scf_tol", float, 1.0e-13),
     ("eri_backend", "builtin_eri_backend", "native_eri_backend", str, "auto"),
@@ -1244,6 +1247,17 @@ class Molecule:
 
 
     @property
+    def workers(self):
+        """Worker budget shared by integral construction and derivatives."""
+        return self.builtin_options['workers']
+
+    @workers.setter
+    def workers(self, value):
+        self.builtin_options['workers'] = _positive_workers(value)
+        self.builtin_eri_workers = self.native_eri_workers = int(value)
+        self.builtin_parallel = self.native_parallel = value > 1
+
+    @property
     def atom(self):
         return self._atom
 
@@ -1282,9 +1296,10 @@ class Molecule:
         self.builtin_coord_type = self.builtin_options["coord_type"]
         self.derivative_screen_tol = self.builtin_options['derivative_screen_tol']
         self.derivative_kernel = self.builtin_options['derivative_kernel']
-        self.builtin_parallel = self.builtin_options["parallel"]
-        self.builtin_eri_workers = self.builtin_options["eri_workers"]
-        self.builtin_parallel_min_nao = self.builtin_options["parallel_min_nao"]
+        self.workers = self.builtin_options['workers']
+        self.builtin_parallel = self.workers > 1
+        self.builtin_eri_workers = self.workers
+        self.builtin_parallel_min_nao = 0
         self.builtin_eri_screen_tol = self.builtin_options["eri_screen_tol"]
         self.builtin_direct_scf_tol = self.builtin_options["direct_scf_tol"]
         self.builtin_eri_backend = self.builtin_options["eri_backend"]
@@ -1363,6 +1378,8 @@ class Molecule:
         symmetry=None,
         symmetry_axis='z',
         symmetry_tol=1.0e-8,
+        *,
+        workers=None,
     ):
         """
         build molecular integrals
@@ -1372,10 +1389,12 @@ class Molecule:
         options : dict, optional
             Native integral-build options. Use short keys such as
             ``eri_representation``, ``aosym``, ``low_rank_tol``,
-            ``eri_screen_tol``, ``direct_scf_tol``, ``parallel``, ``eri_workers``,
+            ``eri_screen_tol``, ``direct_scf_tol``, ``workers``,
             ``rys_cache_mib``, and ``rys_spherical_cache_mib``.
         eri : {'auto', 'dense', 's4', 's8', 'direct', 'factors', 'cd', 'ri'}, optional
             Short alias for the native ``eri_representation`` option.
+        workers : int, optional
+            Integral worker count; one selects serial execution.
         aosym : {'s1', 's4', 's8'}, optional
             AO ERI permutation symmetry for dense-like native storage. The
             default build uses ``eri='auto'``: compact exact ``s8``
@@ -1403,6 +1422,13 @@ class Molecule:
             This molecule, with its integral data populated.
 
         """
+        requested_options = {} if options is None else dict(options)
+        if workers is not None:
+            workers = _positive_workers(workers)
+            if options is not None and 'workers' in options and _positive_workers(options['workers']) != workers:
+                raise ValueError('Conflicting workers settings in build and options.')
+            options = {} if options is None else dict(options)
+            options['workers'] = workers
         if eri is not None:
             options = {} if options is None else dict(options)
             options["eri_representation"] = _normalize_eri_representation(eri)
@@ -1410,7 +1436,7 @@ class Molecule:
         if aosym is not None:
             options = {} if options is None else dict(options)
             requested_aosym = _normalize_aosym(aosym)
-            existing_aosym = _normalize_aosym(options.get("aosym", "s1"))
+            existing_aosym = _normalize_aosym(requested_options.get("aosym", "s1"))
             if existing_aosym != "s1" and existing_aosym != requested_aosym:
                 raise ValueError("Conflicting ERI symmetry requested by eri/options and aosym.")
             options["aosym"] = requested_aosym

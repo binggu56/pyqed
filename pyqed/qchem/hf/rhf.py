@@ -678,6 +678,38 @@ class RHF:
             self.orb_irrep_weights = weights
         return self
 
+    def save(self, filename):
+        """Save RHF results to a losslessly compressed NumPy archive.
+
+        Stores orbitals, occupations, total energy, convergence status and
+        molecular metadata; excludes integral tensors and runtime caches.
+        This is a result snapshot, not a complete restart checkpoint. Read
+        with ``np.load(filename, allow_pickle=False)``; ``metadata`` is JSON.
+        Returns the output Path. An existing file is overwritten.
+        """
+        import json
+        from pathlib import Path
+
+        if any(value is None for value in
+               (self.mo_coeff, self.mo_energy, self.mo_occ, self.e_tot)):
+            raise RuntimeError("Run RHF before saving results.")
+        metadata = dict(
+            format='pyqed.rhf', version=1, coordinate_unit='bohr',
+            basis=self.mol.basis, charge=self.mol.charge, spin=self.mol.spin,
+            cart=self.mol.cart,
+            auxbasis=getattr(self.mol, 'builtin_options', {}).get('auxbasis'),
+        )
+        metadata = json.dumps(metadata, default=lambda value: value.tolist())
+        path = Path(filename)
+        with path.open('wb') as stream:
+            np.savez_compressed(
+                stream, mo_coeff=self.mo_coeff, mo_energy=self.mo_energy,
+                mo_occ=self.mo_occ, e_tot=self.e_tot, converged=self.converged,
+                atom_symbols=np.asarray(self.mol.atom_symbols(), dtype=str),
+                atom_coords=self.mol.atom_coords(), metadata=metadata,
+            )
+        return path
+
     def as_scanner(self):
         """
         Return a lightweight scanner that reuses the previous density matrix and,

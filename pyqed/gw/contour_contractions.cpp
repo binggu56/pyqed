@@ -10,6 +10,10 @@
 #include <type_traits>
 #include <vector>
 #include "../linalg/row_product.hpp"
+#ifdef __APPLE__
+extern "C" void cblas_dgemm(int, int, int, int, int, int, double,
+    const double*, int, const double*, int, double, double*, int);
+#endif
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -132,15 +136,23 @@ static py::tuple dielectric(Real pairs, Array<Scalar> weights, int threads) {
         std::vector<double> right(size_t(transition_tile)*p.rows);
         std::vector<std::vector<double>> left(team, std::vector<double>(row_tile*transition_tile));
         std::vector<std::vector<double>> products(team, std::vector<double>(size_t(row_tile)*p.rows));
-        for (int first = 0; first < p.cols; first += transition_tile) {
-            const int count = std::min(transition_tile, p.cols-first);
-            for (int row = 0; row < p.rows; ++row)
-                for (int k = 0; k < count; ++k) right[size_t(k)*p.rows+row] = p.data[size_t(row)*p.stride+first+k];
 #ifdef _OPENMP
 #pragma omp parallel num_threads(team) if(team > 1)
-            {
+        {
 #pragma omp single
-                used = std::max(used, omp_get_num_threads());
+            used = omp_get_num_threads();
+#endif
+            // Keep one team alive; packing and contraction barriers protect
+            // the shared tile while preserving transition summation order.
+            for (int first = 0; first < p.cols; first += transition_tile) {
+                const int count = std::min(transition_tile, p.cols-first);
+#ifdef _OPENMP
+#pragma omp for schedule(static)
+#endif
+                for (int row = 0; row < p.rows; ++row)
+                    for (int k = 0; k < count; ++k)
+                        right[size_t(k)*p.rows+row] = p.data[size_t(row)*p.stride+first+k];
+#ifdef _OPENMP
 #pragma omp for schedule(dynamic, 1)
 #endif
                 for (int task = 0; task < tasks; ++task) {
@@ -160,7 +172,14 @@ static py::tuple dielectric(Real pairs, Array<Scalar> weights, int threads) {
                                 else w = weights.data()[first+k];
                                 a[i*count+k] = p.data[size_t(row+i)*p.stride+first+k]*w;
                             }
+#ifdef __APPLE__
+                        // BLAS threads must be one: OpenMP owns the CPU budget.
+                        cblas_dgemm(101, 111, 111, rows, width, count, 1.,
+                                    a.data(), count, right.data(), p.rows,
+                                    0., value.data(), width);
+#else
                         pyqed::linalg::row_product(a.data(), count, right.data(), value.data(), rows, width, count, p.rows);
+#endif
                         for (int i = 0; i < rows; ++i)
                             for (int j = 0; j <= row+i; ++j) {
                                 auto &target = out[size_t(j)*p.rows+row+i];
@@ -172,10 +191,10 @@ static py::tuple dielectric(Real pairs, Array<Scalar> weights, int threads) {
                             }
                     }
                 }
-#ifdef _OPENMP
             }
-#endif
+#ifdef _OPENMP
         }
+#endif
         // Complex symmetric, not Hermitian: mirror without conjugation.
         for (int i = 0; i < p.rows; ++i)
             for (int j = 0; j < i; ++j) out[size_t(i)*p.rows+j] = out[size_t(j)*p.rows+i];

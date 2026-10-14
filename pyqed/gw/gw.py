@@ -1253,6 +1253,50 @@ class GW(object):
         self.info = None
         self.method = None
 
+    def save(self, path):
+        """Export available QP/self-energy results as pickle-free NPZ.
+
+        Energies are in Hartree. Partial results after a failed run can be
+        exported; convergence and AC diagnostics are included as JSON.
+        """
+        from .checkpoint import save_gw_results
+        return save_gw_results(self, path)
+
+    def checkpoint(self, path):
+        """Save molecular AC state for refitting and BSE without rescreening.
+
+        Stores sampled self-energy, fits, QPs, MO RI factors and available
+        static screening. Does not resume quadrature iterations or serialize
+        the molecular SCF driver. Contour/spectral GW checkpoints are not
+        supported. See :meth:`from_checkpoint` and :meth:`refit`.
+        """
+        from .checkpoint import save_gw_checkpoint
+        return save_gw_checkpoint(self, path)
+
+    @classmethod
+    def from_checkpoint(cls, path, *, threads=1, max_memory=None):
+        """Restore a molecular AC checkpoint with memory-mapped RI factors.
+
+        Call ``refit`` to recompute QPs from saved self-energy without screening,
+        or pass the restored GW object to BSE. A fresh ``run`` is unsupported
+        because a checkpoint does not reconstruct the original SCF driver.
+        """
+        from .checkpoint import load_gw_checkpoint
+        return load_gw_checkpoint(cls, path, threads=threads, max_memory=max_memory)
+
+    def refit(self, **kwargs):
+        """Refit saved AC self-energy and return self, without recomputing screening.
+
+        Uses :func:`pyqed.gw.ac.refit` unchanged, including its Padé stability
+        checks and limitations (Vidberg and Serene, J. Low Temp. Phys. 29,
+        179–192, 1977, doi:10.1007/BF00655090).
+        """
+        from .ac import refit
+        if self.freq_int != 'analytic_continuation':
+            raise ValueError('refit requires analytic-continuation GW')
+        refit(self, self.e_mf[::2], **kwargs)
+        return self
+
     @property
     def e_qp(self):
         """GW quasiparticle energies.
@@ -1317,6 +1361,8 @@ class GW(object):
         return -self._as_energy_array()
 
     def run(self, mo_energy=None, mo_coeff=None, method='g0w0', **kwargs):
+        if getattr(self, '_checkpoint_restored', False):
+            raise RuntimeError('Use refit() for saved AC self-energy or construct GW with an SCF reference for a fresh run')
         
         if mo_coeff is None:
             mo_coeff = self._scf.mo_coeff

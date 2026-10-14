@@ -13,33 +13,27 @@ import numpy as np
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf.rhf import RHF
 from threadpoolctl import threadpool_limits
-from pyqed.gw.gw import GW
-from pyqed.gw.bse import BSE, _bse_contractions
+from pyqed.gw import GW, BSE
 
 
 def main():
-    if THREADS > 1 and (_bse_contractions is None or not _bse_contractions.openmp_available()):
-        raise RuntimeError('Build PyQED with PYQED_BSE_OPENMP=required')
     out = OUTPUT.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if any(out.iterdir()):
         raise FileExistsError('Choose an empty output directory')
 
-    xyz = Path(__file__).with_name('tdi.xyz').read_text()
-    mol = Molecule(atom='\n'.join(xyz.splitlines()[2:]), unit='angstrom',
+    xyz = Path(__file__).with_name('tdi.xyz')
+    mol = Molecule(atom=str(xyz), unit='angstrom',
                    basis='631g', charge=0, spin=0)
     mol.max_memory = 64000
     with threadpool_limits(limits=1):
-        mol.build(eri='ri', options=dict(
-            auxbasis='cc-pvdz-jkfit', ri_storage='packed',
-            parallel=True, eri_workers=THREADS, ri_cache=False))
+        mol.build(eri='ri', auxbasis='cc-pvdz-jkfit', workers=THREADS,
+                  options=dict(ri_storage='packed', ri_cache=False))
+    with threadpool_limits(limits=THREADS):
         mf = RHF(mol)
         mf.max_memory = mol.max_memory
         mf.run(tol=1e-10, max_cycle=100, verbose=1)
-    np.savez(out/'rhf.npz', mo_coeff=mf.mo_coeff, mo_energy=mf.mo_energy,
-             mo_occ=mf.mo_occ, e_tot=mf.e_tot, converged=mf.converged)
-    if not mf.converged:
-        raise RuntimeError('RHF did not converge')
+    mf.save(out/'rhf.npz')
 
     # Default Padé GW, all orbitals, with stability checks enabled.
     with threadpool_limits(limits=THREADS):
@@ -47,22 +41,16 @@ def main():
         try:
             gw.run()
         finally:
-            arrays = {key: getattr(gw, key) for key in
-                      ('e_qp', 'qp_weights', 'ac_sigma', 'ac_omega', 'ac_static')
-                      if getattr(gw, key, None) is not None}
-            np.savez(out/'gw.npz', **arrays)
-    if not gw.converged or not np.all(np.isfinite(gw.e_qp)):
-        raise RuntimeError('BSE requires a converged full GW spectrum')
+            gw.save(out/'gw.npz')
 
     # Full BSE with QP-gap screening; no orbital window or TDA.
     with threadpool_limits(limits=THREADS):
         bse = BSE(gw, threads=THREADS, screening_energies='qp')
     with threadpool_limits(limits=1, user_api='blas'):
-        bse.run(nroots=10, eigensolver='response', return_vectors=True)
-    if not np.all(bse.info['converged']):
-        raise RuntimeError('BSE did not converge')
+        bse.run(nroots=10, low_rank=True, eigensolver='response',
+                batch_columns='auto', return_vectors=True)
     energies = np.asarray(bse.e)*27.211386245988
-    np.savez(out/'bse.npz', excitation_ev=energies, x=bse.x, y=bse.y)
+    bse.save(out/'bse.npz')
     print('BSE excitation energies (eV):', energies, flush=True)
 
     import matplotlib
