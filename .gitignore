@@ -81,3 +81,5 @@ Scan_Results_Nz_32
 # A separately versioned site checkout and local benchmark run output.
 /website/
 /examples/mps/results/*.json
+
+/pyqed/dvr/NuSol/lib/NuSol_FEAST

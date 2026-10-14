@@ -185,3 +185,16 @@ jobs:
           PYQED_BUILD_EXTENSIONS=0 python -m pip install -e ".[docs]"
       - name: Build documentation without warnings
         run: sphinx-build -W --keep-going -b html docs/source /tmp/pyqed-docs
+
+  security-regressions:
+    name: NuSol security regressions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install regression test tools
+        run: python -m pip install pytest
+      - name: Test FEAST input handling and command invocation
+        run: PYTHONPATH=. python -m pytest -q tests/test_nusol_feast_security.py

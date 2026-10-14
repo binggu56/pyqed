@@ -47,11 +47,20 @@ class numerov():
         A,M = NuSolM.Numerov_Matrix_3D()
       if cfg.USE_FEAST == 'true' :
         # test if shared libraries for numerov are loaded
-        if os.path.exists("%s/NuSol_FEAST"%(cfg.FEAST_PATH)):
-          n = subprocess.Popen('ldd %s/NuSol_FEAST| grep "not found" | wc -l'% (cfg.FEAST_PATH),shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT) 
-          libsloaded = int( n.stdout.readlines()[0].strip('\n') )
-          if libsloaded == 0: # run FEAST NUMEROV solver
-            p = subprocess.Popen('%s/NuSol_FEAST %f %f %d %s %s %s' % (cfg.FEAST_PATH,cfg.FEAST_E_MIN,cfg.FEAST_E_MAX,cfg.FEAST_M,cfg.FEAST_MATRIX_OUT_PATH,cfg.EIGENVALUES_OUT,cfg.EIGENVECTORS_OUT),shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        feast_binary = os.path.join(cfg.FEAST_PATH, "NuSol_FEAST")
+        if os.path.isfile(feast_binary) and os.access(feast_binary, os.X_OK):
+          n = subprocess.Popen(["ldd", feast_binary], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+          dependency_output = n.communicate()[0]
+          if n.returncode == 0 and b"not found" not in dependency_output: # run FEAST NUMEROV solver
+            p = subprocess.Popen([
+                feast_binary,
+                str(cfg.FEAST_E_MIN),
+                str(cfg.FEAST_E_MAX),
+                str(cfg.FEAST_M),
+                cfg.FEAST_MATRIX_OUT_PATH,
+                cfg.EIGENVALUES_OUT,
+                cfg.EIGENVECTORS_OUT,
+            ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             for line in p.stdout.readlines():
                 print (line,)
             retval = p.wait()
