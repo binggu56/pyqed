@@ -38,9 +38,9 @@ export const links = {
   geometricDynamics:
     "https://docs.pyqed.org/en/stable/geometric_quantum_dynamics.html",
   openDynamicsGuide:
-    "https://docs.pyqed.org/en/stable/guide/guide_open_dynamics.html",
+    "https://docs.pyqed.org/en/latest/guide/guide_open_dynamics.html",
   spectroscopyGuide:
-    "https://docs.pyqed.org/en/stable/guide/guide_spectroscopy.html",
+    "https://docs.pyqed.org/en/latest/guide/guide_spectroscopy.html",
   developmentDocs: "https://docs.pyqed.org/en/latest/",
   benchmarks: "https://github.com/binggu56/pyqed/tree/main/benchmarks",
   benchmarkCatalog:
@@ -67,6 +67,8 @@ export const links = {
     "https://github.com/binggu56/pyqed/blob/main/examples/namd/ldrfg_avoided_crossing.py",
   heomSource:
     "https://github.com/binggu56/pyqed/blob/main/examples/heom.py",
+  nonlinearResponseSource:
+    "https://github.com/binggu56/pyqed/blob/main/pyqed/signal/sos.py",
   absorptionSource:
     "https://github.com/binggu56/pyqed/blob/main/examples/signals/absorption.py",
   autompoSource:

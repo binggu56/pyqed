@@ -2878,7 +2878,7 @@ footer {
 }
 
 .home .section-heading > p { font-size: 0.87rem; line-height: 1.6; }
-.home .capability-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; padding: 0; background: transparent; }
+.home .capability-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; padding: 0; background: transparent; }
 .home .capability-card { min-height: 270px; padding: 1.2rem; border: 1px solid var(--rule-dark); border-radius: 4px; }
 .home .capability-topline { margin-bottom: 0.8rem; font-size: 0.65rem; }
 .home .capability-card h3 { margin-bottom: 0.7rem; font-family: var(--sans); font-size: 1.15rem; font-weight: 600; line-height: 1.35; }
