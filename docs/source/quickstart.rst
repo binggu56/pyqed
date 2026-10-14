@@ -11,34 +11,30 @@ not require PySCF.
 Install
 -------
 
-Install a release or development checkout as described in
-:doc:`installation`.  For a source checkout, the minimal command is:
+Install the latest published release (currently PyQED 0.3.0):
 
 .. code-block:: bash
 
-   python -m pip install -e .
+   pip install pyqed
+
+If PyQED is already installed, use ``pip install --upgrade pyqed`` to update it.
+PyQED 0.3.0 provides prebuilt platform wheels for Python 3.10–3.13. Check the
+compiled installation before continuing:
+
+.. code-block:: bash
+
+   python -m pyqed.qchem.check_install
+
+For development checkouts and optional dependencies, see :doc:`installation`.
 
 Run one complete script
 -----------------------
 
 Save the following as ``quickstart.py``:
 
-.. code-block:: python
-
-   from pyqed.qchem import Molecule
-
-   mol = Molecule(
-       atom="H 0 0 0; H 0 0 0.74",
-       unit="angstrom",
-       basis="sto-3g",
-   )
-
-   # Build one- and two-electron data before constructing a solver.
-   mol.build(driver="builtin", eri="auto")
-
-   mf = mol.RHF().run()
-   print("converged:", mf.converged)
-   print("RHF energy (Hartree):", mf.e_tot)
+.. literalinclude:: ../../examples/quickstart.py
+   :language: python
+   :start-at: from pyqed.qchem import Molecule
 
 Then run:
 
@@ -46,33 +42,28 @@ Then run:
 
    python quickstart.py
 
-The calculation should report ``converged: True`` and a finite total energy.
-The exact printed precision can vary by platform.  Do not copy an energy from
-this page as a reference value; preserve the installed version, input, and
-output together.
+The script requires convergence and should print approximately:
+
+.. code-block:: text
+
+   RHF energy: -1.116759307480 Eh
+
+``Eh`` denotes Hartree. The last digits can vary by platform; preserve the
+installed version, input, and output together when recording a calculation.
 
 What each step means
 --------------------
 
 ``Molecule`` records the geometry, units, charge/spin defaults, and basis.
-``mol.build(...)`` constructs the data required by the selected backend.
-``driver="builtin"`` requests the native path, while ``eri="auto"`` lets the
-builder select an appropriate supported electron-repulsion representation for
-the problem.  ``mol.RHF().run()`` constructs and executes the closed-shell
+``mol.build(...)`` constructs native AO integrals. ``eri="auto"`` lets the
+builder select an appropriate electron-repulsion representation for the
+problem. ``mol.RHF().run()`` constructs and executes the closed-shell
 mean-field solver.
 
 Continue to correlated and active-space methods
 -----------------------------------------------
 
-Once RHF converges, the mean-field object can seed other solvers.  The current
-CASSCF implementation uses the optional Numba accelerator stack, so install it
-before running the active-space example:
-
-.. code-block:: bash
-
-   python -m pip install "pyqed[accelerators]"
-
-Then, for example:
+Once RHF converges, the mean-field object can seed other solvers. For example:
 
 .. code-block:: python
 

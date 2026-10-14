@@ -7,7 +7,7 @@ mol = Molecule(
     unit="angstrom",
     basis="sto-3g",
 )
-mol.build(driver="builtin", eri="auto")
+mol.build(eri="auto")
 
 mf = mol.RHF().run()
 if not mf.converged:
@@ -96,7 +96,8 @@ export const examples = [
     fileName: "examples/quickstart.py",
     code: h2Rhf,
     runCommand: "PYTHONPATH=. python examples/quickstart.py",
-    prerequisites: "PyQED 0.2.0 core install",
+    version: "0.3.0",
+    prerequisites: "PyQED 0.3.0 core install",
     runtime: "Usually seconds on a laptop CPU",
     expected: "RHF energy: -1.116759310293 Eh",
     expectedNote: "STO-3G · 0.74 Å bond length",

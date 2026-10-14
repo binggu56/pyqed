@@ -133,6 +133,8 @@ test("exports the release-pinned examples library", async () => {
   assert.match(html, /Copy code/i);
   assert.match(html, /Copy run command/i);
   assert.match(html, /Full source · v0\.2\.0/i);
+  assert.match(html, /Full source · v0\.3\.0/i);
+  assert.match(html, /blob\/v0\.3\.0\/examples\/quickstart\.py/i);
   assert.doesNotMatch(html, /chatgpt\.site/i);
 });
 
