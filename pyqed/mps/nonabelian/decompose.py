@@ -14,6 +14,7 @@ from .contraction import split_legs
 from .coupling import normalize_coupling_scheme, reduced_bond_space
 from .linalg import (
     ReducedProjectedSVD,
+    ReducedProjectedSector,
     ReducedTruncation,
     normalize_max_bond_mode,
     project_reduced_sector,
@@ -613,13 +614,16 @@ def svd_two_site(
     metric_factor_routes=None,
     retain_sector_topology=False,
     sweep_engine=None,
+    sector_factors=None,
 ):
     """
     Reduced SVD/truncation helper for a merged two-site tensor.
 
     ``max_truncation_error`` selects the smallest retained reduced rank whose
     relative discarded squared norm meets the requested bound. ``max_bond``
-    remains a hard ceiling when both are provided.
+    remains a hard ceiling when both are provided. ``sector_factors`` supplies
+    canonical site factors for CBE; the merged tensor then provides layout
+    metadata only, and the compiled workspace performs QR/core-SVD updates.
     """
     if not isinstance(two_site, IrrepTensor) or two_site.rank != 4:
         raise ValueError("svd_two_site expects a rank-4 IrrepTensor.")
@@ -659,6 +663,9 @@ def svd_two_site(
             for q_mid in q_mids:
                 blocks_by_mid.setdefault(q_mid, []).append((key, block))
 
+    if sector_factors is not None:
+        blocks_by_mid = {q: entries for q, entries in blocks_by_mid.items()
+                         if next(iter(sector_factors[q][0].values())).shape[1] > 0}
     sector_svds = {}
     sector_projections = {}
     left_source_layouts = _get_site_bond_layout(two_site, side="left", axis=1)
@@ -672,6 +679,8 @@ def svd_two_site(
         metric_factor_routes,
     )
     used_factor_metric = False
+    if sector_factors is not None and (metric_factor_maps is not None or max_truncation_error is not None):
+        raise ValueError("Site-factor updates require the canonical metric and a bond cap")
 
     for q_mid, entries in blocks_by_mid.items():
         left_pipe, left_basis_map, _left_channel_map = _build_side_pipe(
@@ -698,14 +707,12 @@ def svd_two_site(
             "basis_map": right_basis_map,
             "channel_map": _right_channel_map,
         }
-        reduced_sector = project_reduced_sector(
-            entries,
-            q_mid,
-            left_pipe,
-            right_pipe,
-            left_basis_map,
-            right_basis_map,
-        )
+        if sector_factors is None:
+            reduced_sector = project_reduced_sector(
+                entries, q_mid, left_pipe, right_pipe, left_basis_map, right_basis_map)
+        else:
+            reduced_sector = ReducedProjectedSector(q_mid, left_pipe, right_pipe,
+                left_basis_map, right_basis_map, {}, np.dtype(complex))
         sector_projections[q_mid] = reduced_sector
 
     cpp_blockwise_svd = (
@@ -713,6 +720,8 @@ def svd_two_site(
         if sweep_engine is None
         else getattr(sweep_engine, "blockwise_svd", None)
     )
+    if sector_factors is not None and cpp_blockwise_svd is None:
+        raise RuntimeError('CBE site updates require the compiled blockwise SVD engine')
     if (
         cpp_blockwise_svd is not None
         and metric_factor_maps is None
@@ -721,16 +730,23 @@ def svd_two_site(
         ordered_sectors = list(sector_projections)
         matrices = []
         inverse_right_scales = []
+        right_factors = []
         for q_mid in ordered_sectors:
             projection = sector_projections[q_mid]
-            matrix = projection.as_matrix()
+            matrix = projection.as_matrix() if sector_factors is None else None
             inverse_scale = None
             if use_reduced_right_metric:
                 right_metric = _right_reduced_physical_metric(projection)
                 if not np.allclose(right_metric, 1.0):
                     sqrt_metric = np.sqrt(right_metric)
-                    matrix = matrix * sqrt_metric[None, :]
+                    if matrix is not None:
+                        matrix = matrix * sqrt_metric[None, :]
                     inverse_scale = 1.0 / sqrt_metric
+            if sector_factors is not None:
+                from .cbe_selection import projected_site_factors
+                matrix, right = projected_site_factors(
+                    projection, sector_factors[q_mid], inverse_scale)
+                right_factors.append(right)
             matrices.append(matrix)
             inverse_right_scales.append(inverse_scale)
         cpp_result = cpp_blockwise_svd(
@@ -740,9 +756,11 @@ def svd_two_site(
             max_bond=max_bond,
             max_bond_mode=max_bond_mode,
             retain_sector_topology=retain_sector_topology,
+            **({"right_factors": right_factors} if sector_factors is not None else {}),
         )
         kept_indices_by_sector = {}
         for index, q_mid in enumerate(ordered_sectors):
+            U = np.asarray(cpp_result["left"][index])
             Vh = np.asarray(cpp_result["right"][index])
             inverse_scale = inverse_right_scales[index]
             if inverse_scale is not None:
@@ -753,7 +771,7 @@ def svd_two_site(
                     cpp_result["singular_values"][index],
                     dtype=float,
                 ),
-                U=np.asarray(cpp_result["left"][index]),
+                U=U,
                 Vh=Vh,
             )
             indices = tuple(

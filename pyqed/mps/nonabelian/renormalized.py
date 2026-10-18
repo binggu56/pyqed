@@ -2599,8 +2599,12 @@ def symbolic_mpo_core_transitions(core):
 
     cache_key = id(core)
     cached = _SYMBOLIC_MPO_TRANSITION_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0]() is core:
+        return cached[1]
+    try:
+        core_ref = weakref.ref(core)
+    except TypeError:
+        core_ref = None
     records = tuple(getattr(core, "symbolic_transitions", ()) or ())
     if records:
         result = (
@@ -2617,7 +2621,8 @@ def symbolic_mpo_core_transitions(core):
         )
         if len(_SYMBOLIC_MPO_TRANSITION_CACHE) > 512:
             _SYMBOLIC_MPO_TRANSITION_CACHE.clear()
-        _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = result
+        if core_ref is not None:
+            _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = (core_ref, result)
         return result
     transitions = {}
     dense_blocks = getattr(core, "dense_blocks", None)
@@ -2660,7 +2665,8 @@ def symbolic_mpo_core_transitions(core):
     result = (tuple(transitions.values()), False)
     if len(_SYMBOLIC_MPO_TRANSITION_CACHE) > 512:
         _SYMBOLIC_MPO_TRANSITION_CACHE.clear()
-    _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = result
+    if core_ref is not None:
+        _SYMBOLIC_MPO_TRANSITION_CACHE[cache_key] = (core_ref, result)
     return result
 
 
@@ -2694,8 +2700,8 @@ def _symbolic_transition_summary(transitions, direction):
 
     key = (id(transitions), str(direction))
     cached = _SYMBOLIC_TRANSITION_SUMMARY_CACHE.get(key)
-    if cached is not None:
-        return cached
+    if cached is not None and cached[0] is transitions:
+        return cached[1]
     summary = []
     for transition in transitions:
         if direction == "left":
@@ -2714,7 +2720,7 @@ def _symbolic_transition_summary(transitions, direction):
     out = tuple(summary)
     if len(_SYMBOLIC_TRANSITION_SUMMARY_CACHE) > 512:
         _SYMBOLIC_TRANSITION_SUMMARY_CACHE.clear()
-    _SYMBOLIC_TRANSITION_SUMMARY_CACHE[key] = out
+    _SYMBOLIC_TRANSITION_SUMMARY_CACHE[key] = (transitions, out)
     return out
 
 
@@ -4506,7 +4512,10 @@ class RenormalizedBlockStack:
                 packed_table = None
         if symbolic_table is not None:
             return (
-                symbolic_table.group_boundary_blocks(representation=representation),
+                symbolic_table.group_boundary_blocks(
+                    None if symbolic_table.numeric_payloads else entry.block,
+                    representation=representation,
+                ),
                 True,
                 None,
             )

@@ -118,7 +118,7 @@ def main():
         init_guess="hf",
         site=args.site,
         spatial_abelian_mpo=args.spatial_abelian_mpo,
-        orb_sym=orb_sym,
+        orbsym=orb_sym,
         symmetry=args.symmetry,
         spin=0,
         verbose=args.verbose,
@@ -129,6 +129,7 @@ def main():
 
     t0 = time.perf_counter()
     mc.run(
+        algorithm="constrained",
         nstates=args.nstates,
         nsweeps=args.sweeps,
         symmetry=args.symmetry,

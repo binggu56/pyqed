@@ -235,6 +235,11 @@ def merge_mps_sites(A, B):
     A = normalize_site_tensor_layout(A)
     B = normalize_site_tensor_layout(B)
     merged = tensordot(A, B, axes=([2], [0]))
+    if (
+        A.metadata.get("physical_basis") == "fully_reduced_su2"
+        and B.metadata.get("physical_basis") == "fully_reduced_su2"
+    ):
+        merged.metadata["physical_basis"] = "fully_reduced_su2"
     channel_blocks = {}
     for (q_left, q_phys1, q_mid), left_block in A.data.items():
         for (q_mid_right, q_phys2, q_right), right_block in B.data.items():
@@ -279,7 +284,7 @@ def merge_mps_sites_from_packed(A, B, packed):
     _validate_contraction_metadata(A, B, [2], [0])
 
     def sector_label(sector):
-        charge = getattr(sector, "charge", None)
+        charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
         irrep = getattr(sector, "irrep", None)
         two_j = getattr(irrep, "two_j", None)
         if two_j is None:
@@ -335,7 +340,7 @@ def merge_mps_sites_from_packed(A, B, packed):
                 )
                 sector = sectors.get(label)
                 if sector is None:
-                    sector = SpinChargeSector(label[0], SU2Irrep(label[1]))
+                    sector = SpinChargeSector.from_packed(label[0], label[1])
                     sectors[label] = sector
                 key.append(sector)
             key = tuple(key)
@@ -445,7 +450,7 @@ def split_mps_sites_from_packed(A, B, packed):
     B = normalize_site_tensor_layout(B)
 
     def sector_label(sector):
-        return int(sector.charge), int(sector.irrep.two_j)
+        return int(sector.packed_charge), int(sector.irrep.two_j)
 
     sectors = {}
     for leg in A.qns + B.qns:
@@ -461,7 +466,7 @@ def split_mps_sites_from_packed(A, B, packed):
         bond_sectors.append(
             sectors.setdefault(
                 label,
-                SpinChargeSector(label[0], SU2Irrep(label[1])),
+                SpinChargeSector.from_packed(label[0], label[1]),
             )
         )
     bond_qns = [
@@ -499,10 +504,7 @@ def split_mps_sites_from_packed(A, B, packed):
                         int(labels[block, 2 * axis]),
                         int(labels[block, 2 * axis + 1]),
                     ),
-                    SpinChargeSector(
-                        int(labels[block, 2 * axis]),
-                        SU2Irrep(int(labels[block, 2 * axis + 1])),
-                    ),
+                    SpinChargeSector.from_packed(labels[block, 2 * axis], labels[block, 2 * axis + 1]),
                 )
                 for axis in range(3)
             )
@@ -623,7 +625,7 @@ def mps_site_from_packed(
     template = normalize_site_tensor_layout(template)
 
     def label(sector):
-        return int(sector.charge), int(sector.irrep.two_j)
+        return int(sector.packed_charge), int(sector.irrep.two_j)
 
     sectors = {}
     for leg in template.qns:
@@ -655,10 +657,7 @@ def mps_site_from_packed(
                     int(labels[block, 2 * axis]),
                     int(labels[block, 2 * axis + 1]),
                 ),
-                SpinChargeSector(
-                    int(labels[block, 2 * axis]),
-                    SU2Irrep(int(labels[block, 2 * axis + 1])),
-                ),
+                SpinChargeSector.from_packed(labels[block, 2 * axis], labels[block, 2 * axis + 1]),
             )
             for axis in range(3)
         )
@@ -683,7 +682,7 @@ def mps_site_from_packed(
         bond_sectors = [
             sectors.setdefault(
                 (int(charge), int(two_j)),
-                SpinChargeSector(int(charge), SU2Irrep(int(two_j))),
+                SpinChargeSector.from_packed(charge, two_j),
             )
             for charge, two_j in bond_labels
         ]

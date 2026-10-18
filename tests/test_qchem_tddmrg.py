@@ -217,11 +217,18 @@ def test_tddmrg_su2_driven_four_orbital_uses_normal_complementary_engine():
     assert td.observables.shape == (1, 2)
     assert td.tdvp_moving_environment_stats["persistent"] is True
     assert td.tdvp_moving_environment_stats["hamiltonian_numeric_refreshes"] > 0
-    assert {
+    backends = {
         backend
         for step_backends in td.tdvp_propagation_backends
         for backend in step_backends
-    } == {"cpp"}
+    }
+    # Matrix-free local operators use Python Lanczos; compiled tables use C++.
+    assert backends and backends <= {"python", "cpp"}
+    reversal = td.time_reversal_error(
+        dt=0.001, steps=1, field=field, integrator="tdvp2", D=12,
+    )
+    assert reversal["native_reduced"] is True
+    np.testing.assert_allclose(reversal["fidelity"], 1.0, atol=1.0e-12, rtol=0.0)
     for site, expected in enumerate(coefficients_before):
         np.testing.assert_allclose(
             owner.normal_complementary_plan(site)["coefficient"],
@@ -438,3 +445,25 @@ def test_gaussian_pulse_omega_alias_matches_frequency():
 
     np.testing.assert_allclose(pulse_omega(0.5), pulse_frequency(0.5))
     assert pulse_omega.omega == pulse_omega.frequency == 0.7
+
+
+def test_bond_dim_uses_tensor_layout_not_physical_site_metadata():
+    state = MPS([np.zeros((1, 5, 3)), np.zeros((3, 7, 1))])
+    assert TDDMRG._mps_bond_dim(state) == 3
+    assert TDDMRG._mps_bond_dim(state.to_order(["lv", "rv", "p"])) == 3
+    assert [site.dim for site in state.sites] == [5, 7]
+
+
+def test_dense_initial_state_preserves_values_and_normalizes_layout():
+    # Exercise the shared tensor carrier without constructing molecular integrals.
+    td = object.__new__(TDDMRG)
+    state = MPS([
+        np.arange(6.0).reshape(1, 2, 3),
+        np.arange(12.0).reshape(3, 4, 1),
+    ])
+    expected = tt_to_tensor(state.tensors)
+    assert not td._is_quantum_number_state(state)
+    for layout in (["lv", "p", "rv"], ["lv", "rv", "p"]):
+        dense = td._ensure_dense_mps(state.to_order(layout))
+        assert dense.labels == ["lv", "p", "rv"]
+        np.testing.assert_array_equal(tt_to_tensor(dense.tensors), expected)

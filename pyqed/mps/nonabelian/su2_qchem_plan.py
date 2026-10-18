@@ -1285,7 +1285,9 @@ def pack_rank_coupled_factor_table_from_boundary(
     rep = str(representation)
     family_side = "right" if rep == "rank_coupled_left_factor_by_ket" else "left"
     metadata_key = (id(W), rep, str(family_side))
-    metadata = _RANK_COUPLED_FACTOR_METADATA_CACHE.get(metadata_key)
+    cached_metadata = _RANK_COUPLED_FACTOR_METADATA_CACHE.get(metadata_key)
+    metadata = (cached_metadata[1] if cached_metadata is not None
+                and cached_metadata[0] is W else None)
     if metadata is None:
         w_blocks_by_in = group_rank_coupled_reduced_blocks_by_input(W)
         family_by_middle = _symbolic_transition_families_by_channel(W, side=family_side)
@@ -1330,7 +1332,7 @@ def pack_rank_coupled_factor_table_from_boundary(
             family_labels,
             family_index,
         )
-        _RANK_COUPLED_FACTOR_METADATA_CACHE[metadata_key] = metadata
+        _RANK_COUPLED_FACTOR_METADATA_CACHE[metadata_key] = (W, metadata)
         if len(_RANK_COUPLED_FACTOR_METADATA_CACHE) > 128:
             _RANK_COUPLED_FACTOR_METADATA_CACHE.clear()
     if len(metadata) == 2:
@@ -4700,7 +4702,7 @@ def _build_cpp_reduced_metric_terms(
             )
 
     def sector_pair(sector):
-        charge = getattr(sector, "charge", None)
+        charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
         if charge is None and hasattr(sector, "labels"):
             labels = tuple(str(label).lower() for label in sector.labels)
             for label in ("charge", "n", "particle_number"):
@@ -4807,6 +4809,7 @@ def build_contextual_channel_compiled_terms(
     *,
     bond,
     moving_environment,
+    retain_half_factors=False,
 ):
     """Compile fusion-channel-resolved NC factors into raw C++ routes."""
 
@@ -4853,6 +4856,7 @@ def build_contextual_channel_compiled_terms(
     )
     if (
         cpp_route_builder is not None
+        and not retain_half_factors
         and not fully_reduced_metric
         and not np.iscomplexobj(left_boundary.block_pool.data)
         and not np.iscomplexobj(right_boundary.block_pool.data)
@@ -4954,7 +4958,7 @@ def build_contextual_channel_compiled_terms(
                 return compiled
 
         def sector_pair(sector):
-            charge = getattr(sector, "charge", None)
+            charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
             if charge is None and hasattr(sector, "labels"):
                 labels = tuple(str(label).lower() for label in sector.labels)
                 for label in ("charge", "n", "particle_number"):
@@ -5092,6 +5096,9 @@ def build_contextual_channel_compiled_terms(
                 family_term_counts=family_counts,
             )
             compiled.contextual_channel_resolved = True
+            compiled.one_sided_factors = lambda: build_contextual_channel_compiled_terms(
+                basis, W1, W2, left_boundary, right_boundary, bond=bond,
+                moving_environment=moving_environment, retain_half_factors=True)
             return compiled
 
     def boundary_lookup(table):
@@ -5117,6 +5124,8 @@ def build_contextual_channel_compiled_terms(
 
     left_lookup = boundary_lookup(left_boundary)
     right_lookup = boundary_lookup(right_boundary)
+    left_sector_pairs = {(bra, ket) for bra, ket, _channel in left_lookup}
+    right_sector_pairs = {(bra, ket) for bra, ket, _channel in right_lookup}
     def owned_core_cache(W):
         cache = getattr(W, "_contextual_angular_core_cache", None)
         if cache is None:
@@ -5132,6 +5141,7 @@ def build_contextual_channel_compiled_terms(
     left_factor_ids, right_factor_ids = {}, {}
     left_factor_families, right_factor_families = [], []
     in_indices, out_indices, left_indices, right_indices = [], [], [], []
+    middle_channels = []
 
     def contextual_families_by_channel(W, *, side):
         families = _symbolic_transition_families_by_channel(W, side=side)
@@ -5288,63 +5298,59 @@ def build_contextual_channel_compiled_terms(
         family_sets[int(found)].update(str(name) for name in families)
         return int(found)
 
+    # A half depends on its three sector pairs, not on the opposite site.
+    # Resolve its boundary/core factors once before joining the MPO channel.
+    half_routes = {}, {}
+
+    def half_route(sectors, *, left):
+        cache = half_routes[0 if left else 1]
+        if sectors in cache:
+            return cache[sectors]
+        W, site = (W1, bond) if left else (W2, bond + 1)
+        core_cache = left_core_cache if left else right_core_cache
+        key = angular_core_key(sectors, left=left)
+        cores = core_cache.get(key)
+        if cores is None:
+            cores = build_core(W, site, sectors, left=left)
+            core_cache[key] = cores
+        lookup = left_lookup if left else right_lookup
+        arrays, ids = (left_w_arrays, left_w_ids) if left else (right_w_arrays, right_w_ids)
+        pairs, pair_ids, families = ((left_factor_pairs, left_factor_ids, left_factor_families)
+                                    if left else (right_factor_pairs, right_factor_ids, right_factor_families))
+        family_map = left_family_by_middle if left else right_family_by_middle
+        bra, ket = sectors[:2] if left else sectors[-2:]
+        grouped = {}
+        for (source, target), block in cores.items():
+            boundary_channel, middle = (source, target) if left else (target, source)
+            boundary_id = lookup.get((bra, ket, int(boundary_channel)))
+            if boundary_id is None:
+                continue
+            w_id = core_id(block, arrays, ids)
+            fid = factor_id((int(boundary_id), w_id), pairs, pair_ids, families,
+                            family_map.get(int(middle), ()))
+            grouped.setdefault(int(middle), []).append(fid)
+        cache[sectors] = grouped
+        return grouped
+
     for in_idx, in_entry in enumerate(basis):
         q_lk, q_p1k, q_mk, q_p2k, q_rk = in_entry.key
         for out_idx, out_entry in enumerate(basis):
             q_lb, q_p1b, q_mb, q_p2b, q_rb = out_entry.key
-            left_key = (q_lb, q_lk, q_p1b, q_p1k, q_mb, q_mk)
-            left_cache_key = angular_core_key(left_key, left=True)
-            left_cores = left_core_cache.get(left_cache_key)
-            if left_cores is None:
-                left_cores = build_core(W1, bond, left_key, left=True)
-                left_core_cache[left_cache_key] = left_cores
-            if not left_cores:
+            if ((q_lb, q_lk) not in left_sector_pairs
+                    or (q_rb, q_rk) not in right_sector_pairs):
                 continue
-            right_key = (q_mb, q_mk, q_p2b, q_p2k, q_rb, q_rk)
-            right_cache_key = angular_core_key(right_key, left=False)
-            right_cores = right_core_cache.get(right_cache_key)
-            if right_cores is None:
-                right_cores = build_core(W2, bond + 1, right_key, left=False)
-                right_core_cache[right_cache_key] = right_cores
-            if not right_cores:
+            left = half_route((q_lb, q_lk, q_p1b, q_p1k, q_mb, q_mk), left=True)
+            if not left:
                 continue
-
-            right_by_middle = {}
-            for (middle, right_channel), block in right_cores.items():
-                boundary_id = right_lookup.get(
-                    (q_rb, q_rk, int(right_channel))
-                )
-                if boundary_id is None:
-                    continue
-                w_id = core_id(block, right_w_arrays, right_w_ids)
-                rid = factor_id(
-                    (int(boundary_id), w_id),
-                    right_factor_pairs,
-                    right_factor_ids,
-                    right_factor_families,
-                    right_family_by_middle.get(int(middle), ()),
-                )
-                right_by_middle.setdefault(int(middle), []).append(rid)
-            for (left_channel, middle), block in left_cores.items():
-                boundary_id = left_lookup.get(
-                    (q_lb, q_lk, int(left_channel))
-                )
-                matching_right = right_by_middle.get(int(middle), ())
-                if boundary_id is None or not matching_right:
-                    continue
-                w_id = core_id(block, left_w_arrays, left_w_ids)
-                lid = factor_id(
-                    (int(boundary_id), w_id),
-                    left_factor_pairs,
-                    left_factor_ids,
-                    left_factor_families,
-                    left_family_by_middle.get(int(middle), ()),
-                )
-                for rid in matching_right:
-                    in_indices.append(int(in_idx))
-                    out_indices.append(int(out_idx))
-                    left_indices.append(int(lid))
-                    right_indices.append(int(rid))
+            right = half_route((q_mb, q_mk, q_p2b, q_p2k, q_rb, q_rk), left=False)
+            for middle, lids in left.items():
+                for lid in lids:
+                    for rid in right.get(middle, ()):
+                        in_indices.append(in_idx)
+                        out_indices.append(out_idx)
+                        left_indices.append(lid)
+                        right_indices.append(rid)
+                        middle_channels.append(middle)
 
     # An empty route table is a valid zero operator in the requested reduced
     # sector, not a failed contextual compilation.  This occurs, for example,
@@ -5433,7 +5439,7 @@ def build_contextual_channel_compiled_terms(
         right_factor_families,
     )
     fallback_owner = (
-        None if fully_reduced_metric else moving_environment
+        None if fully_reduced_metric or retain_half_factors else moving_environment
     )
     plan = SU2QChemSweepPlan(
         bond=int(bond),
@@ -5454,5 +5460,6 @@ def build_contextual_channel_compiled_terms(
         su2_moving_environment=fallback_owner,
         hermitianize_routes=fallback_owner is not None,
     )
+    compiled.middle_channels = np.asarray(middle_channels, dtype=np.int64)
     compiled.contextual_channel_resolved = True
     return compiled

@@ -11,13 +11,12 @@ from pyqed.mps.autompo.Operator import Op
 from pyqed.mps.autompo.basis import BasisSimpleElectron
 from pyqed.mps.autompo.light_automatic_mpo import Mpo
 from pyqed.mps.autompo.model import Model
+from pyqed.qchem.mcscf.biorthogonal_ci import counter_transform_ci
 from pyqed.qchem.mcscf.casci import (
     _as_state_ci_matrix,
     _factorized_ci_overlap,
     _normalize_active_electrons,
     _prepare_biorthogonal_overlap,
-    _string_transform_matrix,
-    _transform_ci_tensors_to_biorthogonal_basis,
     _unique_rows_first,
     get_combos,
 )
@@ -136,14 +135,37 @@ def _normalize_state_ids(state_ids, nstates):
 
 
 def _state_to_dense_tensor(state):
-    dense_state = symmetric_to_dense(state) if hasattr(state.factors[0], "qns") else state
-    std_state = dense_state if dense_state.labels == ["lv", "p", "rv"] else dense_state.to_order(["lv", "p", "rv"])
-    return np.asarray(tt_to_tensor(std_state.factors))
+    dense = _state_to_dense_mps(state)
+    return np.asarray(tt_to_tensor([np.asarray(factor) for factor in dense.factors]))
 
 
 def _state_to_dense_mps(state):
-    dense_state = symmetric_to_dense(state) if hasattr(state.factors[0], "qns") else state
-    return dense_state if dense_state.labels == ["lv", "p", "rv"] else dense_state.to_order(["lv", "p", "rv"])
+    """Dense spin-site carrier for explicit overlap diagnostics and legacy MPOs.
+
+    Spatial sites use (empty, alpha, beta, double). Split each local tensor
+    exactly into adjacent alpha/beta sites without a global state expansion.
+    Already-dense IrrepTensor cores must not be expanded as Abelian blocks.
+    """
+    from pyqed.mps.mps import MPS
+
+    first = state.factors[0]
+    dense = (symmetric_to_dense(state)
+             if hasattr(first, "qns") and not getattr(first, "is_dense", False)
+             else state)
+    factors = [np.asarray(dense._get_std_B(i)) for i in range(dense.L)]
+    if all(factor.shape[1] == 2 for factor in factors):
+        return MPS(factors)
+    if not all(factor.shape[1] == 4 for factor in factors):
+        raise ValueError("Electronic overlap requires spin d=2 or spatial d=4 sites.")
+    split = []
+    for factor in factors:
+        left, _, right = factor.shape
+        pair = factor[:, [0, 2, 1, 3], :].reshape(left*2, 2*right)
+        u, singular, vh = np.linalg.svd(pair, full_matrices=False)
+        rank = len(singular)
+        split.extend((u.reshape(left, 2, rank),
+                      (singular[:, None]*vh).reshape(rank, 2, right)))
+    return MPS(split)
 
 
 def _reference_active_mo_occ(nelecas_spin, ncas):
@@ -588,9 +610,8 @@ def _ci_tensors_from_overlap_state(state):
 
 def _transformed_ci_tensors_from_overlap_state(state, orbital_transform, dtype):
     ci, alpha_strings, beta_strings = _ci_tensors_from_overlap_state(state)
-    g_alpha = _string_transform_matrix(orbital_transform, alpha_strings, dtype)
-    g_beta = _string_transform_matrix(orbital_transform, beta_strings, dtype)
-    return _transform_ci_tensors_to_biorthogonal_basis(ci, g_alpha, g_beta)
+    return counter_transform_ci(np.asarray(ci, dtype=dtype), orbital_transform,
+                                alpha_strings, beta_strings)
 
 
 def _coefficients_from_dense_states(states, binary):

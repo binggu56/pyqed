@@ -50,7 +50,10 @@ def to_native_abelian_site_tensor(tensor, *, copy=False):
 
     if isinstance(tensor, AbelianSiteTensorData):
         return tensor.copy() if copy else tensor
-    if is_legacy_abelian_tensor(tensor):
+    if is_legacy_abelian_tensor(tensor) or (
+        hasattr(tensor, "is_dense") and not tensor.is_dense
+        and not tensor.has_nonabelian_symmetry
+    ):
         return AbelianSiteTensorData(tensor.data, tensor.qns, tensor.dirs, copy=copy)
     return tensor
 

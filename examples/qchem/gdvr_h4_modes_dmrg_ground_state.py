@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from pyqed.parallel import num_workers
 from pyqed.qchem.gdvr import AtomicChain
 
 
@@ -251,7 +252,7 @@ def parse_args(argv=None):
     parser.add_argument("--sweeps", type=int, default=50)
     parser.add_argument("--dmrg-tol", type=float, default=1.0e-6)
     parser.add_argument("--symbolic-algo", default="qr")
-    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=num_workers())
     parser.add_argument("--outdir", type=Path, default=Path("/private/tmp/gdvr_h4_modes_dmrg"))
     parser.add_argument("--no-symmetry", action="store_true")
     parser.add_argument("--not-conv-err", action="store_true")

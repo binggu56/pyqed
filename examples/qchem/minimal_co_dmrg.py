@@ -25,7 +25,7 @@ mc = DMRGSCF(
     symmetry="su2",
 )
 mc.run(
-    orbital_driver="constrained",
+    algorithm="constrained",
     nsweeps=12,
     sweep_tol=1.0e-8,
     orb_grad_tol=1.0e-4,

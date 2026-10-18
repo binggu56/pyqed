@@ -22,7 +22,7 @@ from functools import lru_cache
 import math
 import numpy as np
 
-from pyqed.mps.su2 import SpinChargeSector, SU2Irrep
+from pyqed.mps.su2 import SpinChargeSector, SU2Irrep, fuse_charge_spin_sectors
 from pyqed.mps.symmetry import Sector
 
 
@@ -65,6 +65,8 @@ def _build_like_sector(template, charge, irrep):
 
 
 def _fuse_charge_spin_pair(left, right):
+    if isinstance(left, SpinChargeSector) and isinstance(right, SpinChargeSector):
+        return fuse_charge_spin_sectors(left, right)
     left_charge, left_irrep = _extract_charge_spin(left)
     right_charge, right_irrep = _extract_charge_spin(right)
     fused_charge = left_charge + right_charge

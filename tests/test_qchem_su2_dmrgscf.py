@@ -106,8 +106,7 @@ def test_su2_dmrgscf_keeps_factorized_orbital_integrals(monkeypatch):
     assert mc.integral_mode == "cholesky"
     assert mc.casci.integral_mode == "cholesky"
     assert mc.converged
-    assert mc.casci.build_info["su2_runtime_reused"] is False
-    assert mc.casci.build_info["final_su2_runtime_rebuilt"] is True
+    assert mc.micro_history
     np.testing.assert_allclose(mc.e_tot, -1.137275943783, atol=1.0e-8)
 
 
@@ -126,6 +125,7 @@ def test_abelian_spatial_dmrgscf_builds_rdms_from_mps_factors():
         verbose=0,
     )
     mc.run(
+        algorithm="constrained",
         nstates=1,
         nsweeps=2,
         symmetry="sz",
@@ -163,6 +163,7 @@ def test_state_averaged_su2_dmrgscf_requires_final_inner_convergence():
 
     with pytest.raises(RuntimeError, match="active-space DMRG did not converge"):
         mc.run(
+            algorithm="constrained",
             nstates=2,
             weights=[0.5, 0.5],
             nsweeps=1,
@@ -202,6 +203,7 @@ def test_su2_dmrgscf_separates_orbital_options_from_inner_sweeps(optimizer, gap_
 
     events = []
     mc.run(
+        algorithm="constrained",
         nstates=1,
         nsweeps=2,
         optimizer=optimizer,
@@ -239,7 +241,7 @@ def test_su2_co_macro_solver_drops_topology_owned_route_cache():
     assert trial.D == source.D
 
 
-def test_su2_dmrgscf_nonredundant_orbital_driver_runs():
+def test_su2_dmrgscf_nonredundant_algorithm_runs():
     mf = _h2_rhf()
     mc = DMRGSCF(
         mf,
@@ -255,7 +257,7 @@ def test_su2_dmrgscf_nonredundant_orbital_driver_runs():
     mc.run(
         nstates=1,
         nsweeps=4,
-        orbital_driver="nonredundant",
+        algorithm="nonredundant",
         optimizer="LBFGS",
         diis=False,
         mixer_zero_block_noise_scale=0.0,
@@ -267,7 +269,8 @@ def test_su2_dmrgscf_nonredundant_orbital_driver_runs():
     assert mc.macro_diagnostics
 
 
-def test_su2_dmrgscf_second_order_orbital_driver_runs():
+@pytest.mark.parametrize("driver_options", [{}, {"algorithm": "second_order"}], ids=["default", "explicit"])
+def test_su2_dmrgscf_second_order_algorithm_runs(driver_options):
     mf = _h2_rhf()
     mc = DMRGSCF(
         mf,
@@ -283,7 +286,7 @@ def test_su2_dmrgscf_second_order_orbital_driver_runs():
     mc.run(
         nstates=1,
         nsweeps=4,
-        orbital_driver="second_order",
+        **driver_options,
         optimizer_max_step_norm=0.05,
         mixer_zero_block_noise_scale=0.0,
     )
@@ -332,6 +335,106 @@ def test_dmrg_second_order_fixed_trials_contract_cached_rdms():
     assert factor.solver_backend == "fixed_dmrg_rdm_keyframe"
     assert factor._dmrgscf_root_rdms_occ is template._dmrgscf_root_rdms_occ
     assert driver.fixed_mps_trial_count == 2
+
+
+def test_dmrg_second_order_relaxation_has_nontrivial_orbital_steps(monkeypatch):
+    mol = Molecule(atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="6-31g")
+    mol.build(eri="factors", options={"eri_backend": "cpp", "low_rank_tol": 1e-12})
+    mf = RHF(mol, verbose=0).run()
+
+    def reject_dense(*args, **kwargs):
+        raise AssertionError("Relaxed DMRG-SCF must retain factorized integrals")
+
+    monkeypatch.setattr(mf, "get_eri_mo", reject_dense)
+    mc = DMRGSCF(mf, 2, 2, D=8, max_cycles=20, macro_tol=1e-9,
+                 dmrg_conv_tol=1e-9, verbose=0)
+    mc.run(micro_ci_mode="relaxed",
+           nsweeps=8, orb_grad_tol=1e-5, mixer_zero_block_noise_scale=0.0)
+    assert mc.converged
+    assert mc.dmrg.backend == "su2"
+    assert not mc.casci._dmrgscf_short_relaxation
+    assert mc.fixed_mps_trial_count == 0
+    assert mc.micro_history[0]["gradient_norm"] > 1e-3
+    assert mc.micro_history[-1]["gradient_norm"] < 1e-5
+    assert any(row["ci_reused"] for row in mc.micro_history)
+    micro_solves = [row for row in mc.dmrg_solve_history if row["kind"] == "micro"]
+    assert micro_solves and all(row["warm_start"] for row in micro_solves)
+    assert all(row["sweep_limit"] == 2 for row in micro_solves)
+    assert mc.dmrg_solve_history[-1]["kind"] == "keyframe"
+    assert mc.dmrg_solve_history[-1]["solver_converged"]
+    # Independent converged CASSCF reference for the optimized active subspace.
+    assert float(mc.e_tot) == pytest.approx(-1.1462478858806686, abs=2e-8)
+
+
+@pytest.mark.parametrize("budget,error", [(0, ValueError), (True, TypeError), (1.5, TypeError)])
+def test_dmrg_second_order_rejects_invalid_micro_sweep_budget(budget, error):
+    mc = DMRGSCF(_h2_factor_rhf(), 2, 2, D=8, verbose=0)
+    with pytest.raises(error):
+        mc.run(algorithm="second_order", micro_ci_mode="relaxed",
+               micro_dmrg_sweeps=budget)
+
+
+def test_dmrg_short_microstates_can_be_reused_but_cannot_certify_convergence():
+    driver = object.__new__(_SecondOrder)
+    driver.micro_ci_mode = "full"
+    driver.converged = True
+    state = SimpleNamespace(_dmrgscf_short_relaxation=True, converged=False,
+                            ci=[object()], e_tot=np.array([-1.0]))
+    assert driver._can_reuse_micro_ci(state, 1)
+    with pytest.raises(RuntimeError, match="converged inner CI"):
+        driver._require_converged_ci(state, 1)
+    assert not driver.converged
+    state.e_tot[0] = np.nan
+    assert not driver._can_reuse_micro_ci(state, 1)
+
+
+def test_dmrg_micro_budget_does_not_repeat_growth_or_initial_guess(monkeypatch):
+    import pyqed.qchem.dmrg.dmrgscf as module
+
+    driver = object.__new__(_SecondOrder)
+    driver.prototype = object()
+    driver.dmrg_options = dict(nsweeps=12, D_schedule=[4, 8],
+                               nsweeps_schedule=[2, 10], initial_guess="hf")
+    driver.micro_dmrg_sweeps = 2
+    driver.dmrg_solve_count = 0
+    driver.dmrg_solve_history = []
+    driver.weights = None
+    guess = object()
+    solver = SimpleNamespace(D=8, ncore=0, export_ground_state=lambda state: guess)
+    monkeypatch.setattr(module, "_fresh_casci_like", lambda *args, **kwargs: solver)
+    captured = {}
+
+    def run(mc, **kwargs):
+        captured.update(kwargs)
+        assert mc.init_guess is guess
+        mc.converged = True
+        mc.e_tot = -1.0
+
+    monkeypatch.setattr(QCDMRG, "run", run)
+    mf = SimpleNamespace(mol=object())
+    trial = driver._run_dmrg(mf, np.eye(2), 1, [guess], micro=True)
+    assert captured["nsweeps"] == 2
+    assert captured["D"] == 8
+    assert captured["davidson_tol"] == 1e-8
+    assert "initial_guess" not in captured
+    assert "D_schedule" not in captured
+    assert "nsweeps_schedule" not in captured
+    assert not trial.converged
+    assert driver.dmrg_solve_history[0]["solver_converged"]
+
+
+def test_dmrg_relaxed_microiterations_require_a_converged_keyframe():
+    mc = DMRGSCF(_h2_factor_rhf(), 2, 2, D=8, verbose=0)
+    with pytest.raises(RuntimeError, match="converged inner CI"):
+        mc.run(algorithm="second_order", micro_ci_mode="relaxed",
+               nsweeps=1, conv_tol=-1.0, mixer_zero_block_noise_scale=0.0)
+
+
+def test_dmrg_relaxed_microiterations_reject_unsupported_state_average():
+    mc = DMRGSCF(_h2_factor_rhf(), 2, 2, D=8, verbose=0)
+    with pytest.raises(NotImplementedError, match="one root"):
+        mc.run(nstates=2, weights=[0.5, 0.5], algorithm="second_order",
+               micro_ci_mode="relaxed")
 
 
 def test_dmrg_second_order_state_average_fixed_trial_uses_one_averaged_rdm():
@@ -397,6 +500,7 @@ def test_su2_dmrgscf_h6_rebuilds_final_runtime_after_bond_topology_changes():
         nsweeps=12,
         sweep_tol=1.0e-8,
         orb_grad_tol=1.0e-4,
+        algorithm="constrained",
         optimizer="RCG",
         optimizer_tol=1.0e-5,
         optimizer_max_steps=50,

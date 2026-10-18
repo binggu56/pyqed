@@ -698,8 +698,8 @@ class FunctionalTT:
             len(output_shape) != 2 or output_shape[0] != output_shape[1]
         ):
             raise ValueError("Hermitian output requires a square matrix shape")
-        mesh = np.meshgrid(*grids, indexing="ij")
-        coordinates = np.stack([axis.reshape(-1) for axis in mesh], axis=1)
+        coordinates = np.array([[grid.min() for grid in grids],
+                                [grid.max() for grid in grids]])
         self._configure(coordinates, output_shape)
         if any(
             basis_size > len(grid)
@@ -1313,6 +1313,42 @@ class FunctionalTT:
             result.append(core)
         result.append(np.concatenate((left_tt[-1], right_tt[-1]), axis=0))
         return result
+
+    def project_reflection(self, axis, left_parity, right_parity):
+        """Project polynomial coefficients onto matrix reflection parity.
+
+        This is the exact two-element group average in coefficient space,
+        not an additional sampled fit. TT ranks may double; no truncation is
+        applied here. Chebyshev/Legendre bounds must be symmetric about zero.
+        """
+        self._check_fit()
+        axis = int(axis)
+        if not 0 <= axis < self.ndim:
+            raise ValueError('reflection axis is outside the model')
+        if self.bases_[axis] not in ('chebyshev', 'legendre'):
+            raise ValueError('reflection projection requires a polynomial basis')
+        if not np.isclose(sum(self.bounds_[axis]), 0., atol=1e-12):
+            raise ValueError('reflection bounds must be symmetric about zero')
+        left, right = np.asarray(left_parity), np.asarray(right_parity)
+        if self.output_shape_ != (len(left), len(right)) or not all(
+                np.all(np.isin(v, [-1, 1])) for v in (left, right)):
+            raise ValueError('parities must match the matrix output shape')
+        signs = left[:, None] * right[None, :]
+        if self.hermitian_:
+            basis = hermitian_basis(len(left)).reshape(-1,len(left),len(left))
+            channel_signs = np.einsum('kij,ij,kij->k',basis.conj(),signs,basis).real
+        else:
+            channel_signs = signs.ravel()
+        reflected = [core.copy() for core in self.cores]
+        reflected[axis] *= (-1.)**np.arange(reflected[axis].shape[1])[None,:,None]
+        original = self.cores + [self.output_core[:,:,None]]
+        reflected += [(self.output_core*channel_signs[None,:])[:,:,None]]
+        total = self._sum_tensor_trains(original,reflected)
+        self.cores = total[:-1]
+        self.output_core = .5*total[-1][:,:,0]
+        self.offset_ = np.asarray(self.offset_) * .5*(1+channel_signs)
+        self.ranks_ = tuple([self.cores[0].shape[0]]+[c.shape[-1] for c in self.cores])
+        return self
 
     def tensor_cores(self, grids):
         """Evaluate a tensor-valued model as a discrete TT with an output site."""

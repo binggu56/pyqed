@@ -127,6 +127,7 @@ def main():
     )
     started = time.perf_counter()
     calculation.run(
+        algorithm="constrained",
         nstates=1,
         nsweeps=args.sweeps,
         sweep_tol=1.0e-8,

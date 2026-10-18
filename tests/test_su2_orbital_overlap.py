@@ -326,3 +326,17 @@ def test_cross_geometry_su2_overlap_is_exact_and_determinant_free(monkeypatch):
     assert info["sector_preserving"] is True
     assert info["determinant_expansion"] is False
     assert info["component_expansion"] is False
+
+
+def test_orbital_gate_plan_reuse_tracks_matrix_values():
+    angle = 0.37
+    matrix = np.array([[np.cos(angle), -np.sin(angle)],
+                       [np.sin(angle), np.cos(angle)]])
+    first, info = _orbital_circuit(matrix, return_info=True)
+    second, second_info = _orbital_circuit(matrix.copy(), return_info=True)
+    assert second is first
+    assert all(not operation[-1].flags.writeable for operation in first)
+    info['factorization'] = 'changed by caller'
+    assert second_info['factorization'] == 'unitary_givens'
+    matrix[:] = np.eye(2)
+    assert _orbital_circuit(matrix) is not first

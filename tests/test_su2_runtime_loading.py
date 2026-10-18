@@ -49,3 +49,53 @@ def test_macos_build_pins_selected_openmp_runtime(monkeypatch):
         "install_name_tool", "-change", "@rpath/libomp.dylib",
         "/selected/lib/libomp.dylib", "/tmp/kernel.so",
     ],), {"check": True})]
+
+
+@pytest.mark.parametrize('reverse_imports', [False, True])
+def test_installed_openmp_kernels_coexist_in_fresh_process(reverse_imports):
+    """Exercise a real OpenMP team after loading integral and SU(2) kernels.
+
+    Keep this in a subprocess: mismatched runtimes can segfault in a barrier
+    even when each extension imports and its serial contractions work.
+    """
+    import importlib.util
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    modules = ['pyqed.qchem._integrals_cpp',
+               'pyqed.qchem._casscf_cpp',
+               'pyqed.mps.nonabelian._su2_kernel']
+    for module in modules:
+        if importlib.util.find_spec(module) is None:
+            pytest.skip(f'{module} is not built')
+    if reverse_imports:
+        modules.reverse()
+    script = f'import importlib\nfor name in {modules!r}: importlib.import_module(name)\n'
+    script += textwrap.dedent('''
+        import numpy as np
+        from pyqed.qchem import _casscf_cpp
+        # 96 rows exceeds the parallel kernel's 64-row threshold.
+        rows = np.tile(np.array([[2, 0, 0]], dtype=np.uint64), (96, 1))
+        refs = np.array([[1, 0, 0]], dtype=np.uint64)
+        ci = np.ones(1)
+        h1 = np.ones((2, 2))
+        offsets = np.array([0, 1], dtype=np.intp)
+        indices = np.array([0], dtype=np.int32)
+        groups = np.zeros(96, dtype=np.int32)
+        for eri in (np.zeros((2, 2, 2, 2)), np.zeros((1, 2, 2))):
+            for workers in (1, 2, 4):
+                for repeat in range(3):
+                    result = _casscf_cpp.caspt2_direct_couplings_words(
+                        rows, refs, ci, h1, eri, 2,
+                        offsets, indices, groups, workers)
+                    np.testing.assert_allclose(result, 1., atol=1e-14)
+    ''')
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).parents[1]))
+    for variable in ('OPENBLAS_NUM_THREADS', 'OMP_NUM_THREADS',
+                     'VECLIB_MAXIMUM_THREADS', 'NUMEXPR_NUM_THREADS'):
+        env[variable] = '1'
+    completed = subprocess.run([sys.executable, '-X', 'faulthandler', '-c', script],
+                               env=env, capture_output=True, text=True, timeout=60)
+    assert completed.returncode == 0, completed.stdout + completed.stderr

@@ -38,6 +38,7 @@ from .coupling import (
     reduced_bond_space,
     recoupling_matrix,
 )
+from .fusion import TensorFusionMap, irrep_coupling, fusion_recoupling, move_multiplet_center
 from .mpo import (
     SiteOperator,
     MPOCore,

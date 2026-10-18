@@ -2016,3 +2016,51 @@ def scale_mpo_chain(chain, coefficient, *, site=0):
         symbolic_transitions=core.symbolic_transitions,
     )
     return chain
+
+
+def prepare_hamiltonian_factors(factors, *, materialize=False):
+    """Prepare either direct complementary or explicit reduced MPO cores."""
+    factors = tuple(factors)
+    if not factors:
+        return factors
+    owner = getattr(factors[0], "normal_complementary_owner", None)
+    if owner is None or not all(
+        getattr(factor, "normal_complementary_plan", None) is not None
+        and not tuple(getattr(factor, "reduced_terms", ()))
+        for factor in factors
+    ):
+        return factors
+    if not materialize:
+        for factor in factors:
+            object.__setattr__(factor, "normal_complementary_right_dual", True)
+            object.__setattr__(
+                factor,
+                "normal_complementary_force_contextual_routes",
+                False,
+            )
+        return factors
+
+    from pyqed.qchem.dmrg.backends.reduced import build_su2_normal_complementary_mpo
+
+    materialized = tuple(
+        build_su2_normal_complementary_mpo(
+            owner,
+            fully_reduced=bool(
+                getattr(factors[0], "normal_complementary_fully_reduced", False)
+            ),
+            materialize_reduced_terms=True,
+        )
+    )
+    for factor in materialized:
+        # Right-to-left cached contractions use the dual reduced carrier.
+        # Do not retain the C++ owner on every materialized core.  The solver
+        # state keeps one transient runtime reference, while checkpoints and
+        # deep copies remain free of the non-pickleable object.
+        object.__setattr__(factor, "normal_complementary_right_dual", True)
+        object.__setattr__(factor, "normal_complementary_owner", None)
+        object.__setattr__(
+            factor,
+            "normal_complementary_force_contextual_routes",
+            True,
+        )
+    return materialized

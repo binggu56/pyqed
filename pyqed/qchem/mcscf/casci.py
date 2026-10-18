@@ -13,7 +13,7 @@ import copy
 from functools import lru_cache, reduce
 import importlib
 import numpy as np
-from scipy.linalg import eigh, lu_factor, lu_solve
+from scipy.linalg import eigh
 from scipy.optimize import linear_sum_assignment
 from scipy.sparse.linalg import eigsh
 
@@ -36,6 +36,7 @@ from pyqed.qchem.ci.fci import (
     SlaterCondon,
     CI_H,
 )
+from pyqed.qchem.mcscf.string_minors import string_minor_matrix
 from pyqed.qchem.jordan_wigner.spinful import jordan_wigner_one_body, annihilate, \
             create, Is #, jordan_wigner_two_body
 
@@ -83,6 +84,16 @@ class _AOBasisFrame:
     _bas_cart: object
     _ao_cart2sph: object
 
+    def _cart_basis(self):
+        basis = self._bas_cart if self._bas_cart is not None else self._bas
+        if basis is None:
+            raise ValueError("the compact CASCI frame has no AO basis")
+        return list(basis), self._ao_cart2sph
+
+    def overlap(self, other):
+        from pyqed.qchem.basis import cross_overlap
+
+        return cross_overlap(self, other)
 
 
 @dataclass(frozen=True)
@@ -125,9 +136,29 @@ class CASCIFrame:
             ncas=int(mc.ncas),
         )
 
-    def overlap(self, other):
-        return overlap(self, other)
+    def overlap(self, other, *, method="auto", workers=None):
+        return overlap(self, other, method=method, workers=workers)
 
+    def project_orbitals(self, molecule):
+        """Project a restart into new AOs, preserving core/active/virtual blocks."""
+        metric = np.asarray(molecule.overlap)
+        cross = _cross_ao_overlap_matrix(molecule, self.mol)
+        projected = np.linalg.solve(metric, cross @ self.mo_coeff)
+        blocks = []
+        for start, stop in ((0, self.ncore), (self.ncore, self.ncore+self.ncas),
+                            (self.ncore+self.ncas, projected.shape[1])):
+            if start == stop:
+                continue
+            block = projected[:, start:stop].copy()
+            if blocks:
+                previous = np.concatenate(blocks, axis=1)
+                block -= previous @ (previous.conj().T @ metric @ block)
+            gram = block.conj().T @ metric @ block
+            values, vectors = np.linalg.eigh((gram+gram.conj().T)/2)
+            if np.min(values) <= 1e-12:
+                raise ValueError('Nearby orbital projection lost block rank')
+            blocks.append(block @ ((vectors/np.sqrt(values)) @ vectors.conj().T))
+        return np.concatenate(blocks, axis=1)
 
 
 def _cpp_attr(*names):
@@ -899,8 +930,8 @@ class CASCI:
         self.use_cholesky = False
         self._property_operator_cache = {}
         self.active_symmetry = None
-        self.active_orb_irrep_labels = None
-        self.active_orb_sym = None
+        self.active_orbsym = None
+        self.active_orb_irrep_ids = None
         self.active_irrep_counts = None
         self.det_irrep_labels = None
         self.det_irrep_ids = None
@@ -918,8 +949,8 @@ class CASCI:
 
     def _clear_symmetry_metadata(self):
         self.active_symmetry = None
-        self.active_orb_irrep_labels = None
-        self.active_orb_sym = None
+        self.active_orbsym = None
+        self.active_orb_irrep_ids = None
         self.active_irrep_counts = None
         self.det_irrep_labels = None
         self.det_irrep_ids = None
@@ -930,7 +961,9 @@ class CASCI:
         self.spin0_pair_indices = None
 
     def _update_symmetry_metadata(self, binary=None):
-        if getattr(self.mol, "symmetry_info", None) is None:
+        symmetry = getattr(self.mol, "symmetry_info", None)
+        # C1 has no spatial sectors; retain molecular metadata, not CI labels.
+        if symmetry is None or symmetry.groupname == "C1":
             self._clear_symmetry_metadata()
             return None
         try:
@@ -947,17 +980,21 @@ class CASCI:
             self._clear_symmetry_metadata()
             return None
 
+        return self._set_symmetry_metadata(info)
+
+    def _set_symmetry_metadata(self, info):
+        """Install immutable metadata for the current orbital representation."""
         self.active_symmetry = info
-        self.active_orb_irrep_labels = info.orbital_labels
-        self.active_orb_sym = info.orbital_ids
+        self.active_orbsym = info.orbital_labels
+        self.active_orb_irrep_ids = info.orbital_ids
         self.active_irrep_counts = info.orbital_counts
         self.det_irrep_labels = info.determinant_labels
         self.det_irrep_ids = info.determinant_ids
         self.det_irrep_counts = info.determinant_counts
         return info
 
-    def _filter_binary_by_irrep(self, binary, target_irrep=None, wfnsym=None):
-        target = target_irrep if target_irrep is not None else wfnsym
+    def _filter_binary_by_irrep(self, binary, wfnsym=None):
+        target = wfnsym
         if target is None:
             self.det_irrep_filter_indices = None
             self.wfnsym = None
@@ -965,6 +1002,12 @@ class CASCI:
             return binary
 
         info = self._update_symmetry_metadata(binary)
+        if info is not None and not info.group.abelian:
+            raise NotImplementedError(
+                "Non-Abelian wavefunctions require coupled multiplets; scalar determinant filtering "
+                "cannot target non-Abelian irreps. Use run(wfnsym=...) to invoke "
+                "the coupled matrix-element targeting path."
+            )
         if info is None or info.determinant_ids is None:
             raise ValueError("Wavefunction symmetry filtering requires molecular symmetry metadata.")
         group = info.group
@@ -1585,10 +1628,17 @@ class CASCI:
         spin_root_cushion=None,
         spin_selection_tol=None,
         wfnsym=None,
-        target_irrep=None,
     ):
         """
-        solve the full CI in the active space, more efficient than the JW solver
+        Solve the full CI in the active space.
+
+        For D3h and D6h, wfnsym selects a complete spatial multiplet using
+        matrix-element projectors and symmetry-constrained Davidson. nstates
+        then counts multiplets: an E target returns 2*nstates partner roots.
+        See pyqed.qchem.spatial_symmetry.run_spatial_ci for the exact character
+        construction (Cotton, Chemical Applications of Group Theory, 3rd ed.,
+        Wiley, 1990, ISBN 9780471510949). Restricted invariant orbital spaces
+        only; solvent response is not included in this targeting path.
 
         Parameters
         ----------
@@ -1616,6 +1666,15 @@ class CASCI:
         # print('------------------------------')
         # print("             CASCI              ")
         # print('------------------------------\n')
+        symmetry_info = getattr(self.mol, "symmetry_info", None)
+        if (symmetry_info is not None and not symmetry_info.group.abelian
+                and wfnsym is not None):
+            from pyqed.qchem.spatial_symmetry import run_spatial_ci
+            return run_spatial_ci(
+                self, nstates=nstates, mo_coeff=mo_coeff, ci0=ci0, method=method,
+                use_cholesky=use_cholesky, wfnsym=wfnsym,
+                spin_root_cushion=spin_root_cushion, spin_selection_tol=spin_selection_tol, solvent_response=solvent_response)
+
         self.converged = False
         solvent_response_model = None
         if solvent_response is not None:
@@ -1657,7 +1716,7 @@ class CASCI:
             self.binary = binary
         else:
             binary = self.binary
-        binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
+        binary = self._filter_binary_by_irrep(binary, wfnsym=wfnsym)
         solve_nstates = self._spin_selected_nstates(
             nstates,
             binary.shape[0],
@@ -1719,7 +1778,6 @@ class CASCI:
                 spin_root_cushion=spin_root_cushion,
                 spin_selection_tol=spin_selection_tol,
                 wfnsym=wfnsym,
-                target_irrep=target_irrep,
             )
 
             self.mo_coeff = direct_solver.mo_coeff
@@ -1734,11 +1792,12 @@ class CASCI:
             self.h2e_cas = getattr(direct_solver, 'h2e_cas', None)
             self.SC1 = getattr(direct_solver, 'SC1', None)
             self.SC2 = getattr(direct_solver, 'SC2', None)
+            self.state_irreps = getattr(direct_solver, 'state_irreps', None)
             self.active_symmetry = getattr(direct_solver, 'active_symmetry', self.active_symmetry)
-            self.active_orb_irrep_labels = getattr(
-                direct_solver, 'active_orb_irrep_labels', self.active_orb_irrep_labels
+            self.active_orbsym = getattr(
+                direct_solver, 'active_orbsym', self.active_orbsym
             )
-            self.active_orb_sym = getattr(direct_solver, 'active_orb_sym', self.active_orb_sym)
+            self.active_orb_irrep_ids = getattr(direct_solver, 'active_orb_irrep_ids', self.active_orb_irrep_ids)
             self.active_irrep_counts = getattr(
                 direct_solver, 'active_irrep_counts', self.active_irrep_counts
             )
@@ -1858,6 +1917,9 @@ class CASCI:
                 ss = spin_square(*self.make_rdm12(i))
                 print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
 
+        from pyqed.qchem.symmetry import report_ci_symmetry
+        report_ci_symmetry(self)
+
         return self
 
     def exact_diag(self, nstates=1, mo_coeff=None, ci0=None):
@@ -1907,6 +1969,13 @@ class CASCI:
         c_cas = contract_with_rdm1(ci, self.binary, self.SC1, h1e=h1e)
 
         return c_core + c_cas
+
+    def canonicalize(self, root=0):
+        """Return root-specific (orbitals, CI, orbital energies) without mutation.
+
+        See :func:`canonicalize` for conventions and supported references.
+        """
+        return canonicalize(self, root=root)
 
     def contract_with_rdm1(self, state_id, h1e=None, representation='ao'):
         return self.make_rdm1_contract(state_id, h1e=h1e, representation=representation)
@@ -2098,8 +2167,8 @@ class CASCI:
             pickle.dump(self, outp, pickle.HIGHEST_PROTOCOL)
         return
 
-    def overlap(self, other):
-        return overlap(self, other)
+    def overlap(self, other, *, method="auto", workers=None):
+        return overlap(self, other, method=method, workers=workers)
 
     def frame(self):
         """Return a compact state retaining only electronic-overlap data."""
@@ -2322,7 +2391,7 @@ class CASCI:
         self,
         state_ids=None,
         modes=None,
-        moving_basis="symmetric",
+        frame="symmetric",
         projected_only=None,
         return_terms=False,
         backend="auto",
@@ -2336,7 +2405,7 @@ class CASCI:
             self,
             state_ids=state_ids,
             mode_vectors=modes,
-            moving_basis=moving_basis,
+            frame=frame,
             projected_only=projected_only,
             derivative_order=1,
             backend=backend,
@@ -2359,7 +2428,7 @@ class CASCI:
         self,
         state_ids=None,
         modes=None,
-        moving_basis="symmetric",
+        frame="symmetric",
         projected_only=None,
         return_terms=False,
         backend="auto",
@@ -2376,8 +2445,10 @@ class CASCI:
             Normal-mode or other collective-coordinate vectors with shape
             ``(nmodes, natom, 3)``, ``(nmodes, 3*natom)``, or
             ``(3*natom, nmodes)``.
-        moving_basis : {False, True, 'symmetric'}, optional
+        frame : {False, True, 'fixed', 'symmetric'}, optional
             Include symmetric AO-overlap/Pulay transport in the local MO frame.
+            ``'fixed'`` instead differentiates only the Hamiltonian operator
+            with real-space states fixed (no ERI derivatives or 2-RDMs).
         projected_only : bool, optional
             If true and ``modes`` is supplied, avoid building full Cartesian
             derivative tensors and compute only the requested mode derivatives.
@@ -2405,7 +2476,7 @@ class CASCI:
             self,
             state_ids=state_ids,
             mode_vectors=modes,
-            moving_basis=moving_basis,
+            frame=frame,
             projected_only=projected_only,
             backend=backend,
         )
@@ -2431,6 +2502,11 @@ class CASCI:
         if return_terms:
             return f, g, terms
         return f, g
+
+    def Hessian(self):
+        """Return the RHF-reference analytic CASCI nuclear Hessian driver."""
+        from pyqed.qchem.mcscf.hessian import CASCIHessian
+        return CASCIHessian(self)
 
     def make_tdm1s(self, bra_id, ket_id=0):
         """
@@ -3468,10 +3544,15 @@ def _as_state_ci_matrix(ci, ndet):
 
 
 def _unique_rows_first(rows):
+    """Unique binary occupation rows in order of first occurrence."""
     rows = np.asarray(rows, dtype=np.int8)
     if rows.shape[0] == 0:
         return rows
-    _, first_idx = np.unique(rows, axis=0, return_index=True)
+    keys = FCIStringBasis._pack_strings(rows)
+    if keys is None:
+        _, first_idx = np.unique(rows, axis=0, return_index=True)
+    else:
+        _, first_idx = np.unique(keys, return_index=True)
     return rows[np.sort(first_idx)]
 
 
@@ -3489,54 +3570,80 @@ def _occupation_lists(strings):
 
 
 def _string_overlap_matrix(saa_eff, bra_occ, ket_occ, dtype):
-    """Exact string minors in bounded batches (no determinant-pair Python loop)."""
-    out = np.empty((len(bra_occ), len(ket_occ)), dtype=dtype)
-    if not out.size:
-        return out
-    bra = np.asarray(bra_occ, dtype=int)
-    ket = np.asarray(ket_occ, dtype=int)
-    # Bound the gathered minor tensor to about 32 MiB; LAPACK may copy it.
-    row_bytes = max(1, len(ket)*bra.shape[1]*ket.shape[1]*np.asarray(saa_eff).dtype.itemsize)
-    batch = max(1, (32*1024**2)//row_bytes)
-    for start in range(0, len(bra), batch):
-        minors = saa_eff[bra[start:start+batch, None, :, None], ket[None, :, None, :]]
-        out[start:start+batch] = np.linalg.det(minors)
-    return out
+    """Exact spin-string metric with shared cofactors or batched determinants."""
+    return string_minor_matrix(saa_eff, bra_occ, ket_occ, dtype)
+
+
+def canonicalize(mc, root=0):
+    """Semicanonical core/virtual and natural active orbitals for one CAS root.
+
+    Return ``(mo_coeff, ci, mo_energy)`` without changing the reference or
+    other roots. The CI uses the original determinant ordering. The effective
+    Fock matrix uses the selected root's density, not the SA density or RHF
+    orbital energies. Integral fitting follows the reference mean field.
+
+    This implements the restricted-real preparation for state-specific
+    SC-NEVPT2 (Angeli et al., JCP 117, 9138, 2002,
+    doi:10.1063/1.1515317), with an exact determinant-minor CI rotation.
+    Complete fixed-(Nalpha,Nbeta) CAS spaces only; no selected-CI, tensor-network,
+    unrestricted, frozen-orbital, or symmetry-label-preserving implementation.
+    No new CI diagonalization or conventional-integral transformation is used.
+    """
+    from math import comb
+
+    if getattr(mc, 'ci', None) is None or getattr(mc, 'mo_coeff', None) is None:
+        raise ValueError('Run CASCI/CASSCF before canonicalization.')
+    if _is_uhf_reference(mc.mo_coeff) or np.iscomplexobj(mc.mo_coeff):
+        raise NotImplementedError('Canonicalization requires restricted real orbitals.')
+    if getattr(mc, 'frozen', None) is not None:
+        raise NotImplementedError('Frozen-orbital canonicalization is not implemented.')
+    if root < 0 or root >= len(mc.ci):
+        raise IndexError('CAS root index out of range.')
+    ci = np.asarray(mc.ci[root])
+    if ci.ndim != 1 or np.iscomplexobj(ci):
+        raise NotImplementedError('Canonicalization requires a real determinant CI vector.')
+    owner = getattr(mc, 'casci', None) or mc
+    binary = owner.binary
+    alpha, beta, matrix = _ci_to_spin_string_matrix(ci, binary)
+    n = int(mc.ncas)
+    if (len(alpha) != comb(n, int(alpha[0].sum()))
+            or len(beta) != comb(n, int(beta[0].sum()))
+            or len(alpha)*len(beta) != ci.size):
+        raise NotImplementedError('Canonicalization requires a complete CAS determinant basis.')
+    dm = sum(_make_tdm1s_link_contractions(ci, ci, binary))
+    coeff = np.asarray(mc.mo_coeff)
+    nc = int(mc.ncore)
+    no = nc + n
+    core, active = coeff[:, :nc], coeff[:, nc:no]
+    density = 2 * core @ core.T + active @ dm @ active.T
+    fock = mc.mf.get_hcore() + _get_veff_for_dm(mc.mf, density)
+    fock = (fock + fock.T) * 0.5
+    occupations, rotation = np.linalg.eigh((dm + dm.T) * 0.5)
+    rotation = rotation[:, np.argsort(-occupations, kind='stable')]
+    out = coeff.copy()
+    out[:, nc:no] = active @ rotation
+    for region in (slice(0, nc), slice(no, coeff.shape[1])):
+        space = coeff[:, region]
+        if space.shape[1]:
+            _, vectors = np.linalg.eigh(space.T @ fock @ space)
+            out[:, region] = space @ vectors
+    wa = _string_transform_matrix(rotation, alpha, float)
+    wb = _string_transform_matrix(rotation, beta, float)
+    rotated = wa.T @ matrix @ wb
+    if isinstance(binary, FCIStringBasis):
+        state = rotated.reshape(-1)
+    else:
+        _, _, ia, ib = _cached_spin_string_basis(
+            tuple(binary.shape), np.ascontiguousarray(binary, dtype=np.int8).tobytes())
+        state = rotated[ia, ib]
+    energies = np.einsum('pi,pi->i', out, fock @ out)
+    return out, state, energies
 
 
 def _string_transform_matrix(orbital_transform, occ_strings, dtype):
     """Induced determinant-space transform for an active-orbital rotation."""
     occ_lists = _occupation_lists(occ_strings)
     return _string_overlap_matrix(orbital_transform, occ_lists, occ_lists, dtype)
-
-
-def _string_singular_weights(sigma, occ_strings):
-    """Diagonal singular-value weights in the determinant/string representation."""
-    occ_lists = _occupation_lists(occ_strings)
-    if len(occ_lists) == 0:
-        return np.empty((0,), dtype=sigma.dtype)
-    out = np.empty((len(occ_lists),), dtype=sigma.dtype)
-    for i, occ in enumerate(occ_lists):
-        out[i] = np.prod(sigma[occ]) if len(occ) > 0 else 1.0
-    return out
-
-
-def _reconstruct_string_overlap_from_svd(u, sigma, right_vh, occ_strings, dtype):
-    """Exact determinant-space reconstruction from the orbital-space SVD.
-
-    For a fixed-electron string basis built from all combinations of occupied
-    orbitals in a given one-particle space, Cauchy-Binet gives
-
-    ``W(S) = W(U) @ diag(w(sigma)) @ W(Vh)``
-
-    where ``S = U diag(sigma) Vh`` and ``W`` denotes the induced transform in
-    determinant/string space. The right factor must be passed in ``Vh``
-    orientation; using ``V`` instead gives the wrong determinant-space map.
-    """
-    left = _string_transform_matrix(u, occ_strings, dtype)
-    right = _string_transform_matrix(right_vh, occ_strings, dtype)
-    weights = np.diag(_string_singular_weights(sigma, occ_strings))
-    return left @ weights @ right
 
 
 def _biorthogonalize_active_overlap(saa_eff):
@@ -3654,8 +3761,18 @@ def _effective_active_overlap(
     ncas_ket,
     dtype,
 ):
-    prep = _prepare_biorthogonal_overlap(s, ncore_bra, ncore_ket, ncas_bra, ncas_ket, dtype)
-    return prep.core_factor, prep.saa_eff
+    """Exact core Schur complement without inverting the active block."""
+    if ncore_bra != ncore_ket:
+        raise ValueError("Different numbers of core orbitals are not supported in overlap.")
+    bra_active, ket_active = _active_orbital_slices(ncore_bra, ncore_ket, ncas_bra, ncas_ket)
+    saa = np.asarray(s[bra_active, ket_active], dtype=dtype)
+    if ncore_bra == 0:
+        return dtype.type(1), saa
+    scc = np.asarray(s[:ncore_bra, :ncore_ket], dtype=dtype)
+    _, _, _, inverse = _svd_inverse(scc)
+    effective = saa - s[bra_active, :ncore_ket] @ inverse @ s[:ncore_bra, ket_active]
+    determinant = scc.item() if scc.shape == (1, 1) else np.linalg.det(scc)
+    return determinant**2, effective
 
 
 def _overlap_slow_from_mo_overlap(
@@ -3671,19 +3788,13 @@ def _overlap_slow_from_mo_overlap(
 
     ncore_bra = cibra.ncore
     ncore_ket = ciket.ncore
-    core_factor, saa_eff = _effective_active_overlap(
-        s,
-        ncore_bra,
-        ncore_ket,
-        cibra.ncas,
-        ciket.ncas,
-        dtype,
-    )
-
-    occ_bra_a = [np.flatnonzero(cibra.binary[I, 0]) for I in range(nsd_bra)]
-    occ_bra_b = [np.flatnonzero(cibra.binary[I, 1]) for I in range(nsd_bra)]
-    occ_ket_a = [np.flatnonzero(ciket.binary[J, 0]) for J in range(nsd_ket)]
-    occ_ket_b = [np.flatnonzero(ciket.binary[J, 1]) for J in range(nsd_ket)]
+    def occupied(binary, ncore, spin):
+        return [np.r_[np.arange(ncore), ncore+np.flatnonzero(binary[i, spin])]
+                for i in range(binary.shape[0])]
+    occ_bra_a = occupied(cibra.binary, ncore_bra, 0)
+    occ_bra_b = occupied(cibra.binary, ncore_bra, 1)
+    occ_ket_a = occupied(ciket.binary, ncore_ket, 0)
+    occ_ket_b = occupied(ciket.binary, ncore_ket, 1)
 
     for I in range(nsd_bra):
         occidx1_a = occ_bra_a[I]
@@ -3692,9 +3803,8 @@ def _overlap_slow_from_mo_overlap(
             occidx2_a = occ_ket_a[J]
             occidx2_b = occ_ket_b[J]
             S[I, J] = (
-                core_factor
-                * np.linalg.det(saa_eff[np.ix_(occidx1_a, occidx2_a)])
-                * np.linalg.det(saa_eff[np.ix_(occidx1_b, occidx2_b)])
+                np.linalg.det(s[np.ix_(occidx1_a, occidx2_a)])
+                * np.linalg.det(s[np.ix_(occidx1_b, occidx2_b)])
             )
 
     return contract(
@@ -3709,6 +3819,7 @@ def _factorized_ci_overlap(
     cibra,
     ciket,
     s=None,
+    *, minor_matrix=None,
 ):
     s = mo_overlap(cibra, ciket, s=s)
 
@@ -3716,160 +3827,114 @@ def _factorized_ci_overlap(
     nsd_ket = ciket.binary.shape[0]
     dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
 
-    ncore_bra = cibra.ncore
-    ncore_ket = ciket.ncore
-    prep = _prepare_biorthogonal_overlap(
-        s,
-        ncore_bra,
-        ncore_ket,
-        cibra.ncas,
-        ciket.ncas,
-        dtype,
-    )
-
-    bra_alpha, bra_beta = _basis_spin_strings(cibra.binary)
-    ket_alpha, ket_beta = _basis_spin_strings(ciket.binary)
-
-    nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
-    nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
-
-    if nalpha_bra * nbeta_bra != nsd_bra or nalpha_ket * nbeta_ket != nsd_ket:
-        return _overlap_slow_from_mo_overlap(
-            cibra,
-            ciket,
-            s,
-        )
-
-    if not np.array_equal(bra_alpha, ket_alpha) or not np.array_equal(bra_beta, ket_beta):
-        return _overlap_slow_from_mo_overlap(
-            cibra,
-            ciket,
-            s,
-        )
-
     try:
-        return _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype)
-    except (np.linalg.LinAlgError, ValueError):
-        ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, nalpha_bra, nbeta_bra))
-        ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
-
-        overlap_alpha = _string_overlap_matrix(
-            prep.saa_eff, _occupation_lists(bra_alpha), _occupation_lists(ket_alpha), dtype
-        )
-        overlap_beta = _string_overlap_matrix(
-            prep.saa_eff, _occupation_lists(bra_beta), _occupation_lists(ket_beta), dtype
-        )
-
-        return prep.core_factor * contract(
-            'Xab,ac,bd,Ycd->XY',
-            ci_bra.conj(),
-            overlap_alpha,
-            overlap_beta,
-            ci_ket,
-        )
-
-
-def _transform_ci_tensors_to_biorthogonal_basis(ci_tensors, alpha_transform, beta_transform):
-    """Apply exact inverse transforms with one factorization per spin space.
-
-    All roots share the factorizations. Identical alpha/beta transforms share
-    a factorization too. Transposes here are ordinary, not Hermitian.
-    """
-    states, na, nb = ci_tensors.shape
-    alpha_lu = lu_factor(alpha_transform)
-    beta_lu = alpha_lu if beta_transform is alpha_transform else lu_factor(beta_transform)
-    if np.any(np.diag(alpha_lu[0]) == 0) or np.any(np.diag(beta_lu[0]) == 0):
-        raise np.linalg.LinAlgError('Singular string-space biorthogonal transform')
-    rhs = ci_tensors.transpose(1, 0, 2).reshape(na, states*nb)
-    rotated = lu_solve(alpha_lu, rhs).reshape(na, states, nb).transpose(1, 0, 2)
-    rhs = rotated.transpose(2, 0, 1).reshape(nb, states*na)
-    return lu_solve(beta_lu, rhs).reshape(nb, states, na).transpose(1, 2, 0)
-
-
-def _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype):
-    """Biorthogonal CI overlap from precomputed active-space overlap prep."""
-    nsd_bra = cibra.binary.shape[0]
-    nsd_ket = ciket.binary.shape[0]
+        core_factor, saa_eff = _effective_active_overlap(
+            s, cibra.ncore, ciket.ncore, cibra.ncas, ciket.ncas, dtype)
+        core_bra = core_ket = 0
+    except np.linalg.LinAlgError:
+        # Singular cores cannot be eliminated. Retain them in unique string
+        # minors instead of forming the much larger determinant-pair metric.
+        core_factor, saa_eff = 1, s
+        core_bra, core_ket = cibra.ncore, ciket.ncore
+    def occupations(strings, core):
+        occupied = _occupation_lists(strings)
+        return ([np.r_[np.arange(core), core+occ] for occ in occupied]
+                if core else occupied)
     bra_alpha, bra_beta = _basis_spin_strings(cibra.binary)
     ket_alpha, ket_beta = _basis_spin_strings(ciket.binary)
+    na, nb = len(bra_alpha), len(bra_beta)
+    ka, kb = len(ket_alpha), len(ket_beta)
 
-    nalpha_bra, nbeta_bra = len(bra_alpha), len(bra_beta)
-    nalpha_ket, nbeta_ket = len(ket_alpha), len(ket_beta)
+    def product_order(binary, alpha, beta):
+        if isinstance(binary, FCIStringBasis):
+            return True
+        if len(alpha)*len(beta) != len(binary):
+            return False
+        grid = np.asarray(binary).reshape(len(alpha), len(beta), 2, -1)
+        return (np.all(grid[:, :, 0] == alpha[:, None, :])
+                and np.all(grid[:, :, 1] == beta[None, :, :]))
 
-    if nalpha_bra * nbeta_bra != nsd_bra or nalpha_ket * nbeta_ket != nsd_ket:
-        raise ValueError("Biorthogonal overlap candidate requires separable alpha/beta determinant grids.")
-    if not np.array_equal(bra_alpha, ket_alpha) or not np.array_equal(bra_beta, ket_beta):
-        raise ValueError("Biorthogonal overlap candidate requires matching alpha and beta string bases.")
+    if (not product_order(cibra.binary, bra_alpha, bra_beta)
+            or not product_order(ciket.binary, ket_alpha, ket_beta)):
+        return _overlap_slow_from_mo_overlap(cibra, ciket, s)
 
-    ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, nalpha_bra, nbeta_bra))
-    ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, nalpha_ket, nbeta_ket))
+    ci_bra = _as_state_ci_matrix(cibra.ci, nsd_bra).reshape((-1, na, nb))
+    ci_ket = _as_state_ci_matrix(ciket.ci, nsd_ket).reshape((-1, ka, kb))
+    minor_matrix = _string_overlap_matrix if minor_matrix is None else minor_matrix
+    wa = minor_matrix(
+        saa_eff, occupations(bra_alpha, core_bra), occupations(ket_alpha, core_ket), dtype)
+    wb = (wa if np.array_equal(bra_alpha, bra_beta) and np.array_equal(ket_alpha, ket_beta)
+          else minor_matrix(
+              saa_eff, occupations(bra_beta, core_bra), occupations(ket_beta, core_ket), dtype))
+    # Apply both spin metrics on the side with fewer roots. Transpose, not adjoint: s
+    # already includes bra orbital conjugation. Never form a full CI metric.
+    if len(ci_bra) < len(ci_ket):
+        transported = np.matmul(np.matmul(wa.T, ci_bra.conj()), wb)
+        return core_factor * (transported.reshape(len(ci_bra), -1)
+                              @ ci_ket.reshape(len(ci_ket), -1).T)
+    transported = np.matmul(np.matmul(wa, ci_ket), wb.T)
+    return core_factor * (ci_bra.conj().reshape(len(ci_bra), -1)
+                          @ transported.reshape(len(ci_ket), -1).T)
 
-    g_left_alpha = _string_transform_matrix(prep.x_left, bra_alpha, dtype)
-    g_left_beta = (g_left_alpha if np.array_equal(bra_alpha, bra_beta)
-                   else _string_transform_matrix(prep.x_left, bra_beta, dtype))
-    g_right_alpha = _string_transform_matrix(prep.x_right, ket_alpha, dtype)
-    g_right_beta = (g_right_alpha if np.array_equal(ket_alpha, ket_beta)
-                    else _string_transform_matrix(prep.x_right, ket_beta, dtype))
 
-    ci_bra_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_bra, g_left_alpha, g_left_beta)
-    ci_ket_bio = _transform_ci_tensors_to_biorthogonal_basis(ci_ket, g_right_alpha, g_right_beta)
+def overlap(cibra, ciket, s=None, *, method="auto", workers=None):
+    """Exact restricted CASCI electronic overlap matrix between all CI roots.
 
-    return prep.core_factor * contract('Xab,Yab->XY', ci_bra_bio.conj(), ci_ket_bio)
+    ``s``, if supplied, is the cross-geometry spatial MO overlap; otherwise
+    native AO cross overlaps and the stored MO coefficients build it. Inactive
+    cores contribute their squared determinant and exact Schur complement.
+    Complete spin-string grids up to half filling reuse lower-order minors
+    by exact cofactor expansion; other grids use bounded batched determinants.
+    Alpha/beta string minors act directly on CI tensors, sharing equal
+    spin metrics across roots without a full determinant-pair metric or
+    determinant-space inverse transformations. Singular active blocks are
+    supported; singular inactive cores use full core-plus-active minors.
+    Non-product determinant lists use the explicit determinant reference.
 
+    ``method='plasser'`` adapts the unique-spin-factor and one-level LU/cofactor
+    algorithm of Plasser et al., JCTC 12, 1207–1219 (2016),
+    doi:10.1021/acs.jctc.5b01148. It shares the exact core treatment and CI
+    tensor contraction above; its group cost rule and batching are adaptations.
+    Non-product determinant lists retain the explicit determinant reference.
+    No optional truncation or orthogonalization from that paper is applied.
 
-def _biorthogonal_ci_overlap_candidate(cibra, ciket, s=None):
-    """Private candidate overlap using active-space biorthogonal CI transforms."""
-    s = mo_overlap(cibra, ciket, s=s)
+    ``method='auto'`` (default) uses Malmqvist when supported and falls back
+    to exact direct minors for unsupported CI bases/spaces or numerically
+    singular orbital factors. Singular cores are retained inside the minors.
+    Invalid input and worker settings still raise rather than triggering fallback.
+    Explicit ``method='direct'`` always uses direct minors. The production biorthogonal
+    CASCI path, ``method='malmqvist'``, uses
+    complete-CAS single-orbital CI counter-transformations, with ``workers``
+    defaulting to the central budget. It requires nonsingular active metrics.
+    See :func:`pyqed.qchem.mcscf.biorthogonal_ci.counter_transform_ci` for the
+    Malmqvist (1986) formulation, references and implementation restrictions.
 
-    dtype = np.result_type(s, np.asarray(cibra.ci), np.asarray(ciket.ci))
-
-    prep = _prepare_biorthogonal_overlap(
-        s,
-        cibra.ncore,
-        ciket.ncore,
-        cibra.ncas,
-        ciket.ncas,
-        dtype,
-    )
-    return _biorthogonal_ci_overlap_from_prep(cibra, ciket, prep, dtype)
-
-def overlap(cibra, ciket, s=None):
+    Exact algebraic adaptation of P.-O. Lowdin, Phys. Rev. 97, 1474-1489
+    (1955), doi:10.1103/PhysRev.97.1474. This evaluates represented CI states
+    without screening, orbital-space truncation, or a small-displacement
+    expansion. It is not the TLF approximation of Lee et al., JCTC 15,
+    882-891 (2019), doi:10.1021/acs.jctc.8b01049. Reduced tensor-network
+    biorthogonal transformations remain separate.
     """
-    CASCI electronic overlap matrix
-
-    The MO overlap is a block matrix
-
-    for Restricted calculation only! (spin unpolarized.)
-
-    TODO: unrestricted HF.
-
-    S = [S_CC, S_CA]
-        [S_AC, S_AA]
-
-
-
-    Compute the overlap between Slater determinants first
-    and contract with CI coefficients
-
-    Parameters
-    ----------
-    cibra : TYPE
-        DESCRIPTION.
-    binary1 : TYPE
-        DESCRIPTION.
-    ciket : TYPE
-        DESCRIPTION.
-    binary2 : TYPE
-        DESCRIPTION.
-    s : ndarray, optional
-        MO overlap. If omitted, it is built from the cross-geometry AO
-        overlap and the orbitals stored by ``cibra`` and ``ciket``.
-
-    Returns
-    -------
-    None.
-
-    """
+    if method == "auto":
+        from .biorthogonal_ci import malmqvist_overlap, UnsupportedMalmqvistError
+        from pyqed.parallel import resolve_workers
+        workers = resolve_workers(workers)
+        s = mo_overlap(cibra, ciket, s=s)
+        if not all(np.all(np.isfinite(value)) for value in (s, cibra.ci, ciket.ci)):
+            raise ValueError('Orbital overlaps and CI coefficients must be finite.')
+        try:
+            return malmqvist_overlap(cibra, ciket, s=s, workers=workers)
+        except (UnsupportedMalmqvistError, np.linalg.LinAlgError):
+            return _factorized_ci_overlap(cibra, ciket, s=s)
+    if method == "malmqvist":
+        from .biorthogonal_ci import malmqvist_overlap
+        return malmqvist_overlap(cibra, ciket, s=s, workers=workers)
+    if method == "plasser":
+        from .string_minors import plasser_minor_matrix
+        return _factorized_ci_overlap(cibra, ciket, s=s, minor_matrix=plasser_minor_matrix)
+    if method != "direct":
+        raise ValueError("overlap method must be 'auto', 'direct', 'plasser' or 'malmqvist'.")
     return _factorized_ci_overlap(
         cibra,
         ciket,
@@ -3906,9 +3971,14 @@ class CASCIScanner:
         self.root_homing_cushion = max(0, int(root_homing_cushion))
         self.last_result = None
         self.last_frame = None
+        self.guess_frame = None
         self.root_tracking_overlaps = None
         self.root_tracking_permutation = None
         self._mf_scanner = self.mf.as_scanner() if hasattr(self.mf, "as_scanner") else None
+
+    def set_guess(self, frame):
+        """Use a saved frame as an orbital restart; None clears the restart."""
+        self.guess_frame = frame
 
     def __call__(self, mol_or_geom):
         if self._mf_scanner is not None:
@@ -3944,6 +4014,8 @@ class CASCIScanner:
                 setattr(scanner_mc, name, getattr(self.template, name))
 
         options = dict(self.run_kwargs)
+        if self.guess_frame is not None:
+            options['mo_coeff'] = self.guess_frame.project_orbitals(mf.mol)
         method = options.pop("method", self.method)
         ci0 = options.pop("ci0", None)
         if ci0 is None and self.reuse_ci and self.last_result is not None:

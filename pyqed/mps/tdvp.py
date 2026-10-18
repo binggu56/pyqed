@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pyqed.parallel import resolve_workers
+
 from collections import OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 import os
@@ -43,6 +45,36 @@ from pyqed.mps.symmetry import AbelianSector, zero_like_sector
 
 _tdvp_cpp = None
 _tdvp_cpp_tried = False
+
+
+def expand_tdvp_basis(state, directions, *, direction_bond=None):
+    """Add right-block bases from supplied MPS directions without changing psi.
+
+    Direct-sum zero-amplitude branches retain the directions' right-block
+    spaces, followed by an untruncated right canonicalization. This is a
+    dense-MPS algebraic initialization helper, not a complete global Krylov
+    expansion algorithm or an accuracy guarantee. A useful direction is
+    H|psi>; compressing that direction limits the added space but does not
+    truncate the input state. Do not SVD-compress the returned state before
+    propagation: doing so discards the zero-weight enrichment immediately.
+
+    Intended for projector-splitting TDVP (Haegeman et al., Physical Review B
+    94, 165116, 2016, doi:10.1103/PhysRevB.94.165116). This supplied-direction
+    adaptation does not provide adaptive Krylov convergence control.
+    """
+    if not isinstance(state, MPS) or state.has_nonabelian_symmetry:
+        raise TypeError('Basis expansion requires a dense MPS')
+    state_norm = np.sqrt(float(np.real(state.norm_squared())))
+    result = state.copy()
+    for direction in directions:
+        branch = direction.compress(direction_bond) if direction_bond is not None else direction.copy()
+        branch.factors[0] = np.zeros_like(branch.factors[0])
+        result = result + branch
+    result.right_canonicalize()
+    # MPS canonicalization normalizes; enrichment must preserve the amplitude
+    # so that preceding compression losses remain visible to the caller.
+    result.factors[0] *= state_norm
+    return result
 _dense_tdvp_cpp = None
 _dense_tdvp_cpp_tried = False
 _dense_tdvp_cpp_last_error = None
@@ -240,7 +272,16 @@ def _arnoldi_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-1
     return evolved.reshape(shape)
 
 
-def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-13):
+def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-13,
+                       _subdivision=0):
+    """Finite Lanczos action with bounded, projection-reusing local subdivision.
+
+    Implementation adaptation of Krylov exponential projection (Saad, SIAM
+    J. Numer. Anal. 29, 209, 1992, doi:10.1137/0729014). Successive projected
+    actions provide a heuristic convergence test, not a rigorous error bound.
+    Subdivision shares the tolerance budget and leaves outer TDVP splitting
+    unchanged. No unconverged capped action is silently accepted.
+    """
     vec = np.asarray(vec, dtype=complex).reshape(-1)
     norm = np.linalg.norm(vec)
     if norm <= tol:
@@ -258,6 +299,7 @@ def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-1
     beta_prev = 0.0
     previous_action = None
     small_action = None
+    converged = False
     for j in range(mmax):
         q = basis[:, j]
         trial = apply_heff(q.reshape(shape)).reshape(-1)
@@ -289,18 +331,46 @@ def _lanczos_expm_apply(vec, shape, apply_heff, dt, *, krylov_dim=12, tol=1.0e-1
             )
             if action_delta <= tol * max(1.0, norm):
                 small_action = current_action
+                converged = True
                 break
         previous_action = current_action
         if beta_j <= tol or j + 1 == mmax:
+            converged = beta_j <= tol or actual_dim == size
             break
         beta[j] = beta_j
         q_prev = q
         beta_prev = beta_j
         basis[:, j + 1] = trial / beta_j
 
+    pieces = 1
+    if tol > 0 and not converged:
+        if mmax < 2 or _subdivision >= 10:
+            raise RuntimeError('Lanczos action did not converge after local subdivision; '
+                               'increase krylov_dim or reduce the time step')
+        def projection(dimension, interval):
+            if dimension == 1:
+                return np.array([norm*np.exp(-1j*interval*alpha[0])])
+            eigenvalues,eigenvectors = eigh_tridiagonal(
+                alpha[:dimension],beta[:dimension-1])
+            return eigenvectors @ (norm*np.exp(-1j*interval*eigenvalues)*eigenvectors[0])
+        for level in range(10):
+            pieces *= 2
+            small_action = projection(actual_dim,dt/pieces)
+            shorter = projection(actual_dim-1,dt/pieces)
+            if np.linalg.norm(small_action-np.pad(shorter,(0,1))) <= tol*max(1.,norm)/pieces:
+                converged = True
+                break
+        if not converged:
+            raise RuntimeError('Lanczos action did not converge after local subdivision; '
+                               'increase krylov_dim or reduce the time step')
     if small_action is None:
         small_action = previous_action
     evolved = basis[:, :actual_dim] @ small_action
+    if pieces > 1:
+        del basis,trial,q,q_prev
+        for _ in range(1,pieces):
+            evolved = _lanczos_expm_apply(evolved,shape,apply_heff,dt/pieces,
+                krylov_dim=krylov_dim,tol=tol/pieces,_subdivision=_subdivision+1).reshape(-1)
     return evolved.reshape(shape)
 
 
@@ -348,6 +418,16 @@ def _copy_mpo_factor_for_tdvp(factor):
 
 def _standard_mps_factors(psi):
     return [np.asarray(psi._get_std_B(i), dtype=complex).copy() for i in range(psi.L)]
+
+
+def _right_canonical_factors(psi, canonicalize):
+    """Canonicalize the copied dense factors without changing their norm."""
+    factors = _standard_mps_factors(psi)
+    if canonicalize:
+        for site in range(len(factors)-1, 0, -1):
+            center, factors[site] = _right_rq(factors[site])
+            factors[site-1] = np.tensordot(factors[site-1], center, axes=(2, 0))
+    return factors
 
 
 def _mps_factors_norm2(factors):
@@ -618,7 +698,13 @@ def _update_left_env(left, A, W, *, dense_cpp=False):
             except Exception:
                 pass
     tmp = np.einsum("amb,bqs->amqs", left, A, optimize=True)
-    tmp = np.einsum("mnpq,amqs->anps", W, tmp, optimize=True)
+    diagonal = _physical_diagonal(W)
+    if diagonal is None:
+        tmp = np.einsum("mnpq,amqs->anps", W, tmp, optimize=True)
+    else:
+        a, m, q, s = tmp.shape
+        product = diagonal.transpose(2, 1, 0) @ tmp.transpose(2, 1, 0, 3).reshape(q, m, a*s)
+        tmp = product.reshape(q, W.shape[1], a, s).transpose(2, 1, 0, 3)
     return np.einsum("apr,anps->rns", A.conj(), tmp, optimize=True)
 
 
@@ -642,7 +728,13 @@ def _update_right_env(right, A, W, *, dense_cpp=False):
             except Exception:
                 pass
     tmp = np.einsum("bqs,rns->bqrn", A, right, optimize=True)
-    tmp = np.einsum("mnpq,bqrn->bmpr", W, tmp, optimize=True)
+    diagonal = _physical_diagonal(W)
+    if diagonal is None:
+        tmp = np.einsum("mnpq,bqrn->bmpr", W, tmp, optimize=True)
+    else:
+        b, q, r, n = tmp.shape
+        product = diagonal.transpose(2, 0, 1) @ tmp.transpose(1, 3, 0, 2).reshape(q, n, b*r)
+        tmp = product.reshape(q, W.shape[0], b, r).transpose(2, 1, 0, 3)
     return np.einsum("apr,bmpr->amb", A.conj(), tmp, optimize=True)
 
 
@@ -710,7 +802,7 @@ def _block_sparse_phys_dims(psi):
     dims = []
     for site in range(psi.L):
         tensor = psi.factors[site]
-        if hasattr(tensor, "qns"):
+        if hasattr(tensor, "qns") and not getattr(tensor, "is_dense", False):
             dims.append(len(tensor.qns[2]))
         else:
             dims.append(int(np.asarray(psi._get_std_B(site)).shape[1]))
@@ -720,7 +812,7 @@ def _block_sparse_phys_dims(psi):
 def _as_block_sparse_factors(psi, site_qn_maps, *, copy=True):
     if not isinstance(psi, MPS):
         raise TypeError("block-sparse TDVP expects an MPS initial state.")
-    if psi.factors and hasattr(psi.factors[0], "qns"):
+    if psi.factors and not psi.factors[0].is_dense:
         return [to_native_abelian_site_tensor(site, copy=copy) for site in psi.factors]
     phys_qns = _block_sparse_uniform_phys_qns(site_qn_maps)
     dense_factors = _standard_mps_factors(psi)
@@ -943,7 +1035,7 @@ def _as_block_sparse_mpo(H, site_qn_maps):
     if affine is not None:
         return affine
     factors = _mpo_factors(H)
-    if factors and hasattr(factors[0], "qns"):
+    if factors and hasattr(factors[0], "qns") and not getattr(factors[0], "is_dense", False):
         return [to_native_abelian_site_tensor(site, copy=True) for site in factors]
     cache_key = (
         _stable_mpo_cache_key(H, factors),
@@ -2596,9 +2688,7 @@ def one_site_tdvp_step(
         raise ValueError("MPS and MPO lengths must match.")
 
     work = psi.copy().to_order(["lv", "p", "rv"])
-    if canonicalize:
-        work = work.right_canonicalize()
-    factors = _standard_mps_factors(work)
+    factors = _right_canonical_factors(work, canonicalize)
     nsites = len(factors)
     if nsites == 0:
         raise ValueError("Cannot propagate an empty MPS.")
@@ -3142,9 +3232,7 @@ def two_site_tdvp_step(
         raise ValueError("MPS and MPO lengths must match.")
 
     work = psi.copy().to_order(["lv", "p", "rv"])
-    if canonicalize:
-        work = work.right_canonicalize()
-    factors = _standard_mps_factors(work)
+    factors = _right_canonical_factors(work, canonicalize)
     nsites = len(factors)
     if nsites == 0:
         raise ValueError("Cannot propagate an empty MPS.")
@@ -3267,248 +3355,106 @@ def two_site_tdvp_step(
     return (out, info) if return_info else out
 
 
-def _evolve_site_sum(
-    theta,
-    environments,
-    dt,
-    *,
-    krylov_dim,
-    krylov_tol,
-    krylov_method,
-    executor=None,
-):
-    shape = theta.shape
+def _expanded_operator(W):
+    if W.ndim == 4:
+        return W
+    return W[..., :, None] * np.eye(W.shape[2])
+
+def _full_right_basis(left, right):
+    """Absorb a complete right-boundary frame, without changing the state."""
+    size, physical, boundary = right.shape
+    if boundary != 1 or size != physical:
+        return left, right
+    frame = right[:, :, 0]
+    if not np.allclose(frame @ frame.conj().T, np.eye(size), rtol=0, atol=2e-12):
+        return left, right
+    return left @ frame, np.eye(size, dtype=right.dtype)[:, :, None]
+
+def _physical_diagonal(W):
+    if W.ndim == 3:
+        return W
+    if W.shape[2] != W.shape[3]:
+        return None
+    diagonal = np.diagonal(W, axis1=2, axis2=3)
+    return diagonal if np.count_nonzero(W) == np.count_nonzero(diagonal) else None
+
+def _sum_mpo_factors(operators, *, diagonal=False):
+    """Materialize shared cores once; optionally retain exact spectator diagonals."""
+    arrays = {}
+    result = []
+    for operator in operators:
+        factors = []
+        for site, factor in enumerate(operator.factors):
+            compact = diagonal and site > 0
+            key = (id(factor), compact)
+            if key not in arrays:
+                arrays[key] = np.asarray(factor)
+                if compact:
+                    values = _physical_diagonal(arrays[key])
+                    if values is not None:
+                        arrays[key] = np.ascontiguousarray(values)
+            factors.append(arrays[key])
+        result.append(factors)
+    return result
+
+def _sum_kernel(name, method):
+    """Require optimized compiled contractions for sum-of-MPO propagation."""
+    if not _is_lanczos_method(method):
+        raise ValueError("Sum-of-MPO TDVP requires Hermitian Lanczos")
+    if not _cpp_tdvp_available() or getattr(_tdvp_cpp, name, None) is None:
+        raise RuntimeError("Optimized BLAS TDVP sum kernels are required; "
+                           "rebuild the extension before propagation")
+    return getattr(_tdvp_cpp, name)
+
+
+
+
+def _evolve_site_sum(theta, environments, dt, *, krylov_dim, krylov_tol,
+                     krylov_method, executor=None, spectator_factors=None):
     environments = tuple(environments)
-    native = (
-        _tdvp_cpp
-        if _cpp_tdvp_available()
-        and _is_lanczos_method(krylov_method)
-        and getattr(_tdvp_cpp, "site_lanczos_sum", None) is not None
-        else None
-    )
-    if native is not None:
-        try:
-            result = native.site_lanczos_sum(
-                np.asarray(theta, dtype=complex),
-                [np.asarray(item[0], dtype=complex) for item in environments],
-                [np.asarray(item[1], dtype=complex) for item in environments],
-                [np.asarray(item[2], dtype=complex) for item in environments],
-                float(dt),
-                int(krylov_dim),
-                float(krylov_tol),
-                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
-                int(getattr(executor, "_max_workers", 1)),
-            )
-            _release_free_numeric_pages()
-            if os.environ.get("PYQED_TDVP_MEMORY_PROFILE"):
-                try:
-                    import platform
-                    import psutil
-                    import resource
-
-                    stats = dict(native.kernel_stats())
-                    rss = psutil.Process().memory_info().rss / 2**30
-                    peak_scale = 1.0 if platform.system() == "Darwin" else 1024.0
-                    peak = (
-                        resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                        * peak_scale / 2**30
-                    )
-                    print(
-                        "[sum-TDVP memory] site "
-                        f"shape={shape} rss={rss:.4f} GiB peak={peak:.4f} GiB "
-                        f"stats={stats}",
-                        flush=True,
-                    )
-                except Exception:
-                    pass
-            return result
-        except Exception as exc:
-            if os.environ.get("PYQED_TDVP_MEMORY_PROFILE"):
-                print(
-                    f"[sum-TDVP native fallback] shape={shape}: {exc}",
-                    flush=True,
-                )
-
-    def build_kernel(environment):
-        left, operator, right = environment
-        return (
-            np.einsum("amb,mnpq->abnpq", left, operator, optimize=True),
-            right,
-        )
-
-    kernels = list(map(build_kernel, environments)) if executor is None else list(
-        executor.map(build_kernel, environments)
-    )
-
-    def apply_kernel(kernel, local):
-        left_kernel, right = kernel
-        tmp = np.tensordot(local, right, axes=([2], [2]))
-        return np.tensordot(
-            left_kernel,
-            tmp,
-            axes=([1, 2, 4], [0, 3, 1]),
-        )
-
-    def apply_heff(local):
-        if executor is None:
-            values = iter(apply_kernel(kernel, local) for kernel in kernels)
-        else:
-            values = iter(
-                executor.map(
-                    apply_kernel,
-                    kernels,
-                    (local,) * len(kernels),
-                )
-            )
-        result = next(values)
-        for value in values:
-            result += value
-        return result
-
-    return _krylov_expm_apply(
-        theta,
-        shape,
-        apply_heff,
-        dt,
-        krylov_dim=krylov_dim,
-        tol=krylov_tol,
-        method=krylov_method,
-    )
+    arrays = {}
+    def coefficient(value):
+        key = id(value)
+        if key not in arrays:
+            arrays[key] = np.ascontiguousarray(value, dtype=complex)
+        return arrays[key]
+    return _sum_kernel("site_lanczos_sum", krylov_method)(
+        np.asarray(theta, dtype=complex),
+        *[[coefficient(item[k]) for item in environments] for k in range(3)],
+        float(dt), int(krylov_dim), float(krylov_tol),
+        int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+        int(getattr(executor, "_max_workers", 1)), False,
+        [] if spectator_factors is None else spectator_factors)
 
 
-def _evolve_two_site_sum(
-    theta,
-    environments,
-    dt,
-    *,
-    krylov_dim,
-    krylov_tol,
-    krylov_method,
-    executor=None,
-):
-    shape = theta.shape
+def _evolve_two_site_sum(theta, environments, dt, *, krylov_dim, krylov_tol,
+                         krylov_method, executor=None, prefix_factors=None,
+                         midpoint=None, spectator_factors=None):
     environments = tuple(environments)
-    native = (
-        _tdvp_cpp
-        if _cpp_tdvp_available()
-        and _is_lanczos_method(krylov_method)
-        and getattr(_tdvp_cpp, "two_site_lanczos_sum", None) is not None
-        else None
-    )
-    if native is not None:
-        try:
-            return native.two_site_lanczos_sum(
-                np.asarray(theta, dtype=complex),
-                [np.asarray(item[0], dtype=complex) for item in environments],
-                [np.asarray(item[1], dtype=complex) for item in environments],
-                [np.asarray(item[2], dtype=complex) for item in environments],
-                [np.asarray(item[3], dtype=complex) for item in environments],
-                float(dt),
-                int(krylov_dim),
-                float(krylov_tol),
-                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
-                int(getattr(executor, "_max_workers", 1)),
-            )
-        except Exception:
-            pass
-
-    def build_kernel(environment):
-        left, first, second, right = environment
-        return (
-            np.einsum("amb,mnpq->abnpq", left, first, optimize=True),
-            np.einsum("nors,cod->nrscd", second, right, optimize=True),
-        )
-
-    kernels = list(map(build_kernel, environments)) if executor is None else list(
-        executor.map(build_kernel, environments)
-    )
-
-    def apply_kernel(kernel, local):
-        left_kernel, right_kernel = kernel
-        tmp = np.tensordot(
-            left_kernel,
-            local,
-            axes=([1, 4], [0, 1]),
-        )
-        return np.tensordot(
-            tmp,
-            right_kernel,
-            axes=([1, 3, 4], [0, 2, 4]),
-        )
-
-    def apply_heff(local):
-        if executor is None:
-            values = iter(apply_kernel(kernel, local) for kernel in kernels)
-        else:
-            values = iter(
-                executor.map(
-                    apply_kernel,
-                    kernels,
-                    (local,) * len(kernels),
-                )
-            )
-        result = next(values)
-        for value in values:
-            result += value
-        return result
-
-    return _krylov_expm_apply(
-        theta,
-        shape,
-        apply_heff,
-        dt,
-        krylov_dim=krylov_dim,
-        tol=krylov_tol,
-        method=krylov_method,
-    )
+    arrays = {}
+    def coefficient(value):
+        key = id(value)
+        if key not in arrays:
+            arrays[key] = np.ascontiguousarray(value, dtype=complex)
+        return arrays[key]
+    return _sum_kernel("two_site_lanczos_sum", krylov_method)(
+        np.asarray(theta, dtype=complex),
+        *[[coefficient(item[k]) for item in environments] for k in range(4)],
+        float(dt), int(krylov_dim), float(krylov_tol),
+        int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+        int(getattr(executor, "_max_workers", 1)),
+        [] if prefix_factors is None else prefix_factors, midpoint,
+        [] if spectator_factors is None else spectator_factors)
 
 
-def _evolve_bond_sum(
-    center,
-    environments,
-    dt,
-    *,
-    krylov_dim,
-    krylov_tol,
-    krylov_method,
-):
+def _evolve_bond_sum(center, environments, dt, *, krylov_dim, krylov_tol,
+                     krylov_method):
     environments = tuple(environments)
-    native = (
-        _tdvp_cpp
-        if _cpp_tdvp_available()
-        and _is_lanczos_method(krylov_method)
-        and getattr(_tdvp_cpp, "bond_lanczos_sum", None) is not None
-        else None
-    )
-    if native is not None:
-        try:
-            return native.bond_lanczos_sum(
-                np.asarray(center, dtype=complex),
-                [np.asarray(item[0], dtype=complex) for item in environments],
-                [np.asarray(item[1], dtype=complex) for item in environments],
-                float(-dt),
-                int(krylov_dim),
-                float(krylov_tol),
-                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
-            )
-        except Exception:
-            pass
-
-    def apply_heff(local):
-        result = np.zeros_like(local, dtype=complex)
-        for left, right in environments:
-            result += _apply_bond_heff(local, left, right)
-        return result
-
-    return _krylov_expm_apply(
-        center,
-        center.shape,
-        apply_heff,
-        -dt,
-        krylov_dim=krylov_dim,
-        tol=krylov_tol,
-        method=krylov_method,
-    )
+    return _sum_kernel("bond_lanczos_sum", krylov_method)(
+        np.asarray(center, dtype=complex),
+        *[[np.asarray(item[k], dtype=complex) for item in environments] for k in range(2)],
+        float(-dt), int(krylov_dim), float(krylov_tol),
+        int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS))
 
 
 def one_site_tdvp_sum_step(
@@ -3533,22 +3479,30 @@ def one_site_tdvp_sum_step(
 
     Set ``imaginary_time=True`` to apply the normalized projector
     :math:`\exp(-H\,dt)` instead of real-time evolution.
+    The compiled local action may exactly aggregate redundant environment
+    channels in state-bond matrix units, without operator rank truncation
+    or a dense Hamiltonian. Its 128 MiB right-factor selection limit does
+    not bound total environment/setup memory or guarantee a speedup.
+
+    The low-memory action caches screened coefficient rows (streamed order)
+    or operator/right-environment products (projected order) within a separate
+    allowance of at most the scratch element budget (payload), reuses a worker
+    team within each local solve, and chooses contraction order accounting for
+    real-valued operator coefficients. These are algebraic implementation
+    optimizations, with unchanged screening and Lanczos tolerances; the
+    workspace budget is not a bound on total process memory.
     """
     if not isinstance(psi, MPS):
         raise TypeError("one_site_tdvp_sum_step expects an MPS initial state")
     operators = tuple(operators)
     if not operators or not all(isinstance(operator, MPO) for operator in operators):
         raise TypeError("operators must be a non-empty sequence of MPOs")
-    mpos = [
-        [np.asarray(factor) for factor in operator.factors] for operator in operators
-    ]
+    mpos = _sum_mpo_factors(operators)
     if any(len(mpo) != psi.L for mpo in mpos):
         raise ValueError("MPS and all MPO lengths must match")
 
     work = psi.copy().to_order(["lv", "p", "rv"])
-    if canonicalize:
-        work = work.right_canonicalize()
-    factors = _standard_mps_factors(work)
+    factors = _right_canonical_factors(work, canonicalize)
     nsites = len(factors)
     if nsites == 0:
         raise ValueError("sum TDVP requires at least one site")
@@ -3560,217 +3514,42 @@ def one_site_tdvp_sum_step(
             ):
                 raise ValueError(f"physical dimension mismatch at site {site}")
 
-    native_sweep = (
-        _tdvp_cpp
-        if _cpp_tdvp_available()
-        and _is_lanczos_method(krylov_method)
-        and getattr(_tdvp_cpp, "one_site_lanczos_sum_sweep", None) is not None
-        and _env_int("PYQED_SUM_TDVP_CPP_SWEEP", 1) != 0
-        else None
+    sweep = _sum_kernel("one_site_lanczos_sum_sweep", krylov_method)
+    result = sweep(
+        [np.asarray(factor, dtype=complex) for factor in factors],
+        [
+            [np.asarray(factor, dtype=complex) for factor in mpo]
+            for mpo in mpos
+        ],
+        [] if _right_environments is None else _right_environments,
+        float(dt),
+        int(krylov_dim),
+        float(krylov_tol),
+        int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
+        int(getattr(_executor, "_max_workers", 1)),
+        bool(normalize),
+        bool(imaginary_time),
     )
-    if native_sweep is not None:
-        try:
-            result = native_sweep.one_site_lanczos_sum_sweep(
-                [np.asarray(factor, dtype=complex) for factor in factors],
-                [
-                    [np.asarray(factor, dtype=complex) for factor in mpo]
-                    for mpo in mpos
-                ],
-                [] if _right_environments is None else _right_environments,
-                float(dt),
-                int(krylov_dim),
-                float(krylov_tol),
-                int(_SUM_TDVP_CPP_MAX_DIRECT_SUM_ELEMENTS),
-                int(getattr(_executor, "_max_workers", 1)),
-                bool(normalize),
-                bool(imaginary_time),
-            )
-            factors = [np.asarray(factor) for factor in result["factors"]]
-            norm2 = float(result["pre_normalization_norm2"])
-            out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
-            out.gauge = "right_canonical"
-            out.center = 0
-            info = {
-                "pre_normalization_norm2": norm2,
-                "pre_normalization_norm": float(np.sqrt(max(norm2, 0.0))),
-                "truncation_error": 0.0,
-                "components": len(mpos),
-                "integrator": "tdvp",
-                "backend": "compiled-sum-tdvp-sweep",
-                "imaginary_time": bool(imaginary_time),
-                "right_environments_reused": bool(
-                    result["reused_right_environments"]
-                ),
-            }
-            if _cache_right_environments:
-                info["_right_environments"] = result["right_environments"]
-            _release_free_numeric_pages()
-            return (out, info) if return_info else out
-        except Exception as exc:
-            if os.environ.get("PYQED_TDVP_MEMORY_PROFILE"):
-                print(f"[sum-TDVP compiled sweep fallback] {exc}", flush=True)
-
-    if imaginary_time:
-        dt = -1j * float(dt)
-
-    identity = np.ones((1, 1, 1), dtype=complex)
-    if nsites == 1:
-        factors[0] = _evolve_site_sum(
-            factors[0],
-            [(identity, mpo[0], identity) for mpo in mpos],
-            dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-            executor=_executor,
-        )
-    else:
-        half_dt = 0.5 * dt
-
-        def build_right_environments(mpo):
-            return _build_right_envs(factors, mpo)
-
-        right_envs = (
-            list(map(build_right_environments, mpos))
-            if _executor is None
-            else list(_executor.map(build_right_environments, mpos))
-        )
-        left_envs = [[None] * nsites for _ in mpos]
-        for storage in left_envs:
-            storage[0] = identity
-
-        for site in range(nsites - 1):
-            factors[site] = _evolve_site_sum(
-                factors[site],
-                [
-                    (
-                        left_envs[term][site],
-                        mpo[site],
-                        right_envs[term][site + 1],
-                    )
-                    for term, mpo in enumerate(mpos)
-                ],
-                half_dt,
-                krylov_dim=krylov_dim,
-                krylov_tol=krylov_tol,
-                krylov_method=krylov_method,
-                executor=_executor,
-            )
-            factors[site], center = _left_qr(factors[site])
-
-            def update_left_environment(item):
-                term, mpo = item
-                return term, _update_left_env(
-                    left_envs[term][site], factors[site], mpo[site]
-                )
-
-            updates = (
-                map(update_left_environment, enumerate(mpos))
-                if _executor is None
-                else _executor.map(update_left_environment, enumerate(mpos))
-            )
-            for term, environment in updates:
-                left_envs[term][site + 1] = environment
-            center = _evolve_bond_sum(
-                center,
-                [
-                    (
-                        left_envs[term][site + 1],
-                        right_envs[term][site + 1],
-                    )
-                    for term in range(len(mpos))
-                ],
-                half_dt,
-                krylov_dim=krylov_dim,
-                krylov_tol=krylov_tol,
-                krylov_method=krylov_method,
-            )
-            factors[site + 1] = np.tensordot(
-                center, factors[site + 1], axes=([1], [0])
-            )
-
-        factors[-1] = _evolve_site_sum(
-            factors[-1],
-            [
-                (left_envs[term][-1], mpo[-1], identity)
-                for term, mpo in enumerate(mpos)
-            ],
-            dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-            executor=_executor,
-        )
-
-        rights = [identity for _ in mpos]
-        for site in range(nsites - 1, 0, -1):
-            if site != nsites - 1:
-                factors[site] = _evolve_site_sum(
-                    factors[site],
-                    [
-                        (left_envs[term][site], mpo[site], rights[term])
-                        for term, mpo in enumerate(mpos)
-                    ],
-                    half_dt,
-                    krylov_dim=krylov_dim,
-                    krylov_tol=krylov_tol,
-                    krylov_method=krylov_method,
-                    executor=_executor,
-                )
-            center, factors[site] = _right_rq(factors[site])
-
-            def update_right_environment(item):
-                term, mpo = item
-                return term, _update_right_env(
-                    rights[term], factors[site], mpo[site]
-                )
-
-            updates = (
-                map(update_right_environment, enumerate(mpos))
-                if _executor is None
-                else _executor.map(update_right_environment, enumerate(mpos))
-            )
-            for term, environment in updates:
-                rights[term] = environment
-            center = _evolve_bond_sum(
-                center,
-                [
-                    (left_envs[term][site], rights[term])
-                    for term in range(len(mpos))
-                ],
-                half_dt,
-                krylov_dim=krylov_dim,
-                krylov_tol=krylov_tol,
-                krylov_method=krylov_method,
-            )
-            factors[site - 1] = np.tensordot(
-                factors[site - 1], center, axes=([2], [0])
-            )
-
-        factors[0] = _evolve_site_sum(
-            factors[0],
-            [(identity, mpo[0], rights[term]) for term, mpo in enumerate(mpos)],
-            half_dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-            executor=_executor,
-        )
-
+    factors = [np.asarray(factor) for factor in result["factors"]]
+    norm2 = float(result["pre_normalization_norm2"])
     out = MPS(factors, labels=["lv", "p", "rv"], sites=psi.sites)
     out.gauge = "right_canonical"
     out.center = 0
-    norm2 = float(np.real(out.norm_squared()))
-    if normalize:
-        out.normalize()
     info = {
         "pre_normalization_norm2": norm2,
         "pre_normalization_norm": float(np.sqrt(max(norm2, 0.0))),
         "truncation_error": 0.0,
         "components": len(mpos),
         "integrator": "tdvp",
+        "backend": "compiled-sum-tdvp-sweep",
         "imaginary_time": bool(imaginary_time),
+        "right_environments_reused": bool(
+            result["reused_right_environments"]
+        ),
     }
+    if _cache_right_environments:
+        info["_right_environments"] = result["right_environments"]
+    _release_free_numeric_pages()
     return (out, info) if return_info else out
 
 
@@ -3789,50 +3568,147 @@ def two_site_tdvp_sum_step(
     return_info=False,
     _executor=None,
 ):
-    """Propagate with a sum of MPOs without forming their direct-sum bonds."""
+    """Two-site projector-splitting TDVP with separate MPO components.
+
+    Adapts Haegeman et al., Phys. Rev. B 94, 165116 (2016),
+    https://doi.org/10.1103/PhysRevB.94.165116. Local SVD truncation grows
+    or shrinks ranks using an absolute singular-value cutoff and optional
+    cap. Finite local Krylov solves and truncation require convergence
+    checks; their tolerances do not imply a global trajectory error bound.
+    Canonicalization preserves the input norm; normalize=False never
+    compensates for norm lost to truncation. No direct-sum MPO is built.
+    Exact spectator diagonals and electronic prefix frames select bounded
+    compiled contractions, including factored low-memory site actions.
+    General right environments use tiled projected nuclear coefficients,
+    shared only on exact equality; electronic frames remain distinct.
+    Residual terms with identical nuclear cores and right environments
+    share their contraction through a local left-environment sum. Bounded
+    operator-on-state tiles handle eligible oversized fields without
+    constructing their full right-environment projections.
+    Active input rows and right-operator indices are both tiled when the
+    complete input-row bank exceeds the bounded scratch workspace.
+    Diagonal right environments stay compact even for non-diagonal prefixes.
+    An exactly diagonal first-coordinate prefix supplies its own spectator
+    frame; it does not require an electronic-first site ordering.
+    Exactly real residual cores use real coefficient tiles acting on
+    interleaved complex states; imaginary coefficients are never discarded.
+    These are execution adaptations of the same integrator; they neither
+    unitarize links nor provide a site-order-independent speed guarantee.
+    """
     if not isinstance(psi, MPS):
         raise TypeError("two_site_tdvp_sum_step expects an MPS initial state")
     operators = tuple(operators)
     if not operators or not all(isinstance(operator, MPO) for operator in operators):
         raise TypeError("operators must be a non-empty sequence of MPOs")
-    mpos = [
-        [np.asarray(factor) for factor in operator.factors] for operator in operators
-    ]
+    mpos = _sum_mpo_factors(operators,
+        diagonal=not os.getenv('PYQED_TDVP_EXPANDED_SPECTATORS'))
     if any(len(mpo) != psi.L for mpo in mpos):
         raise ValueError("MPS and all MPO lengths must match")
 
     work = psi.copy().to_order(["lv", "p", "rv"])
-    if canonicalize:
-        work = work.right_canonicalize()
-    factors = _standard_mps_factors(work)
+    factors = _right_canonical_factors(work, canonicalize)
     nsites = len(factors)
     if nsites < 2:
         raise ValueError("sum TDVP2 requires at least two sites")
+    fixed_right = not os.getenv('PYQED_TDVP_ROTATED_RIGHT_BASIS')
+    if fixed_right:
+        factors[-2], factors[-1] = _full_right_basis(factors[-2], factors[-1])
     for mpo in mpos:
         for site, (state_factor, operator_factor) in enumerate(zip(factors, mpo)):
             if (
                 state_factor.shape[1] != operator_factor.shape[2]
-                or state_factor.shape[1] != operator_factor.shape[3]
+                or state_factor.shape[1] != operator_factor.shape[-1]
             ):
                 raise ValueError(f"physical dimension mismatch at site {site}")
 
     half_dt = 0.5 * dt
     truncation_error = 0.0
 
+    def electronic_prefix_factors(site):
+        if site != 1:
+            return None
+        result = []
+        for mpo in mpos:
+            prefix = mpo[0]
+            entry = np.argwhere(prefix != 0)
+            if prefix.shape[:2] == (1, 1) and len(entry) == 1:
+                _, _, p, q = entry[0]
+                result.append(np.stack((prefix[0, 0, p, q] * factors[0][0, p].conj(),
+                                        factors[0][0, q])))
+            else:
+                result.append(np.empty((0, 0), dtype=complex))
+        return result
+
+    def spectator_prefix_factors(site, *, bounded=True):
+        if os.environ.get("PYQED_TDVP_SPECTATOR_FRAMES", "1") == "0":
+            return None
+        if site == 1:
+            if bounded:
+                return None
+            frame = factors[0][0]
+            result = []
+            for mpo in mpos:
+                prefix = mpo[0]
+                physical = prefix.shape[2]
+                if prefix.shape[0] == 1 and (prefix.ndim == 3 or not np.any(
+                        prefix[:, :, ~np.eye(physical, dtype=bool)])):
+                    result.append([np.ascontiguousarray(frame.conj()),
+                        np.ascontiguousarray(frame), np.ascontiguousarray(
+                            prefix[0] if prefix.ndim == 3 else
+                            np.diagonal(prefix[0], axis1=-2, axis2=-1))])
+                else:
+                    result.append([])
+            return result
+        if site != 2:
+            return None
+        frame = np.einsum('eb,bka->eka', factors[0][0], factors[1], optimize=True)
+        wide_pair = os.environ.get('PYQED_TDVP_WIDE_PAIR_SPECTATORS', '0') != '0'
+        pair_limit = (2 if wide_pair else 1) * frame.shape[2]
+        if bounded and (frame.shape[1] > pair_limit or (wide_pair and frame.shape[1] >= frame.shape[2] ** 2)):
+            return None
+        result = []
+        for mpo in mpos:
+            unit, spectator = mpo[:2]
+            entry = np.argwhere(unit != 0)
+            physical = spectator.shape[2]
+            if (unit.shape[:2] == (1, 1) and len(entry) == 1
+                    and spectator.shape[0] == 1
+                    and (spectator.ndim == 3 or (spectator.ndim == 4
+                         and not np.any(spectator[:, :, ~np.eye(physical, dtype=bool)])))):
+                _, _, p, q = entry[0]
+                result.append([np.ascontiguousarray(unit[0, 0, p, q] * frame[p].conj()),
+                               np.ascontiguousarray(frame[q]),
+                               np.ascontiguousarray(spectator[0] if spectator.ndim == 3 else
+                                   np.diagonal(spectator[0], axis1=-2, axis2=-1))])
+            else:
+                result.append([])
+        return result
+
+    def site_spectator_factors(site):
+        if os.environ.get('PYQED_TDVP_SITE_SPECTATORS', '1') == '0':
+            return None
+        return spectator_prefix_factors(site, bounded=False)
+
     def build_right_environments(mpo):
         return _build_right_envs(factors, mpo)
 
-    right_envs = (
-        list(map(build_right_environments, mpos))
-        if _executor is None
-        else list(_executor.map(build_right_environments, mpos))
-    )
+    right_envs = (list(map(build_right_environments, mpos)) if _executor is None
+                  else list(_executor.map(build_right_environments, mpos)))
     left_envs = [[None] * nsites for _ in mpos]
     for term, (mpo, storage) in enumerate(zip(mpos, left_envs)):
         storage[0] = np.ones(
             (1, 1, 1),
             dtype=np.result_type(*(factors + mpo), complex),
         )
+
+    turnaround_theta = None
+    reuse_turnaround = not os.environ.get("PYQED_TDVP_SEPARATE_TURNAROUND")
+    midpoint_discarded = 0.0
+    def turnaround_midpoint(local):
+        nonlocal midpoint_discarded
+        left, center, midpoint_discarded = _split_two_site_left(
+            local, max_bond=max_bond, cutoff=cutoff)
+        return _merge_two_site(left, center)
 
     for site in range(nsites - 1):
         theta = _merge_two_site(factors[site], factors[site + 1])
@@ -3852,7 +3728,14 @@ def two_site_tdvp_sum_step(
             krylov_tol=krylov_tol,
             krylov_method=krylov_method,
             executor=_executor,
+            prefix_factors=electronic_prefix_factors(site),
+            spectator_factors=spectator_prefix_factors(site),
+            midpoint=turnaround_midpoint if reuse_turnaround and site == nsites - 2 else None,
         )
+        if reuse_turnaround and site == nsites - 2:
+            turnaround_theta = theta
+            truncation_error += midpoint_discarded
+            break
         factors[site], center, discarded = _split_two_site_left(
             theta,
             max_bond=max_bond,
@@ -3862,17 +3745,12 @@ def two_site_tdvp_sum_step(
 
         def update_left_environment(item):
             term, mpo = item
-            return term, _update_left_env(
-                left_envs[term][site], factors[site], mpo[site]
-            )
+            return term, _update_left_env(left_envs[term][site], factors[site], mpo[site])
 
-        updates = (
-            map(update_left_environment, enumerate(mpos))
-            if _executor is None
-            else _executor.map(update_left_environment, enumerate(mpos))
-        )
+        updates = (map(update_left_environment, enumerate(mpos)) if _executor is None
+                   else _executor.map(update_left_environment, enumerate(mpos)))
         for term, environment in updates:
-            left_envs[term][site + 1] = environment
+            left_envs[term][site+1] = environment
         if site < nsites - 2:
             center = _evolve_site_sum(
                 center,
@@ -3889,6 +3767,7 @@ def two_site_tdvp_sum_step(
                 krylov_tol=krylov_tol,
                 krylov_method=krylov_method,
                 executor=_executor,
+                spectator_factors=site_spectator_factors(site + 1),
             )
         factors[site + 1] = center
 
@@ -3897,42 +3776,44 @@ def two_site_tdvp_sum_step(
         for mpo in mpos
     ]
     for site in range(nsites - 2, -1, -1):
-        theta = _merge_two_site(factors[site], factors[site + 1])
-        theta = _evolve_two_site_sum(
-            theta,
-            [
-                (
-                    left_envs[term][site],
-                    mpo[site],
-                    mpo[site + 1],
-                    right[term],
-                )
-                for term, mpo in enumerate(mpos)
-            ],
-            half_dt,
-            krylov_dim=krylov_dim,
-            krylov_tol=krylov_tol,
-            krylov_method=krylov_method,
-            executor=_executor,
+        if site == nsites - 2 and turnaround_theta is not None:
+            theta = turnaround_theta
+        else:
+            theta = _merge_two_site(factors[site], factors[site + 1])
+            theta = _evolve_two_site_sum(
+                theta,
+                [
+                    (
+                        left_envs[term][site],
+                        mpo[site],
+                        mpo[site + 1],
+                        right[term],
+                    )
+                    for term, mpo in enumerate(mpos)
+                ],
+                half_dt,
+                krylov_dim=krylov_dim,
+                krylov_tol=krylov_tol,
+                krylov_method=krylov_method,
+                executor=_executor,
+                prefix_factors=electronic_prefix_factors(site),
+                spectator_factors=spectator_prefix_factors(site),
         )
         center, factors[site + 1], discarded = _split_two_site_right(
             theta,
             max_bond=max_bond,
             cutoff=cutoff,
         )
+        if fixed_right and site == nsites-2:
+            center, factors[site+1] = _full_right_basis(center, factors[site+1])
         truncation_error += discarded
 
         def update_right_environment(item):
             term, mpo = item
-            return term, _update_right_env(
-                right[term], factors[site + 1], mpo[site + 1]
-            )
+            return term, _update_right_env(right[term], factors[site+1], mpo[site+1])
 
-        updates = (
-            map(update_right_environment, enumerate(mpos))
-            if _executor is None
-            else _executor.map(update_right_environment, enumerate(mpos))
-        )
+        updates = (map(update_right_environment, enumerate(mpos)) if _executor is None
+                   else _executor.map(update_right_environment, enumerate(mpos)))
         for term, environment in updates:
             right[term] = environment
         if site > 0:
@@ -3951,6 +3832,7 @@ def two_site_tdvp_sum_step(
                 krylov_tol=krylov_tol,
                 krylov_method=krylov_method,
                 executor=_executor,
+                spectator_factors=site_spectator_factors(site),
             )
         factors[site] = center
 
@@ -3997,8 +3879,9 @@ class TDVPEngine:
         canonicalize_first=True,
         canonicalize_each_step=False,
         dense_cpp_workspace="auto",
-        workers=1,
+        workers=None,
     ):
+        workers = resolve_workers(workers)
         global _dense_tdvp_cpp_last_error
         key = str(integrator).lower().replace("_", "-")
         if key in {"tdvp", "tdvp1", "1tdvp", "one-site-tdvp", "1site-tdvp"}:
@@ -4022,7 +3905,14 @@ class TDVPEngine:
                 raise TypeError(
                     "TDVPEngine requires an MPO or a non-empty sequence of MPOs."
                 )
-        self.operator_mode = "single" if len(self.components) == 1 else "sum"
+        compact=any(w.ndim==3 for op in self.components for w in op.factors)
+        if compact and self.integrator!='tdvp2':
+            raise ValueError('Compact diagonal MPO cores currently require two-site TDVP.')
+        self.operator_mode = "single" if len(self.components) == 1 and not compact else "sum"
+        if self.operator_mode == "sum":
+            for kernel in ("site_lanczos_sum", "two_site_lanczos_sum", "bond_lanczos_sum",
+                           "one_site_lanczos_sum_sweep"):
+                _sum_kernel(kernel, krylov_method)
         self.mpo = (
             [np.asarray(w) for w in _mpo_factors(self.components[0])]
             if self.operator_mode == "single"

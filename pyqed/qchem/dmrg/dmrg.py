@@ -600,7 +600,7 @@ def _spatial_rdm_dense_mps(state, site_qn_maps=None):
     # that genuinely do not carry standard MPS factors.
     if not getattr(state, "factors", None):
         return None
-    if hasattr(state.factors[0], "qns"):
+    if hasattr(state.factors[0], "qns") and not getattr(state.factors[0], "is_dense", False):
         from pyqed.mps.mps import symmetric_to_dense
 
         state = symmetric_to_dense(state, site_qn_maps=site_qn_maps)
@@ -1815,7 +1815,7 @@ def _normalize_dmrg_symmetry(symmetry=None, *, symmetry_list=None):
     for label in labels:
         if label == "s2":
             label = "su2"
-        if label in {"point_group", "abelianpg", "abelian_pg", "irrep", "orb_sym"}:
+        if label in {"point_group", "abelianpg", "abelian_pg", "irrep", "orbsym"}:
             label = "pg"
         if label not in {"charge", "sz", "su2", "pg"}:
             raise ValueError(
@@ -2204,7 +2204,7 @@ class DMRG(CASCI):
                  debug_complementary_action_check_tol=1.0e-10,
                  debug_complementary_action_check_limit=32,
                  debug_spatial_family_hamiltonian_check=False,
-                 orb_sym=None):
+                 orbsym=None):
         """
         DMRG sweeping algorithm directly using DVR set (without SCF calculations)
 
@@ -2369,7 +2369,7 @@ class DMRG(CASCI):
             mf,
             self.integral_backend_override,
         )
-        self.orb_sym = None if orb_sym is None else tuple(int(x) for x in orb_sym)
+        self.orbsym = None if orbsym is None else tuple(int(x) for x in orbsym)
         self.low_rank_mpo = bool(low_rank_mpo)
         self.low_rank_mpo_bond = low_rank_mpo_bond
         self.low_rank_mpo_batch_size = int(low_rank_mpo_batch_size)
@@ -2634,7 +2634,7 @@ class DMRG(CASCI):
 
         # Ensure Manager exists (created in run())
         if not hasattr(self, 'sym_mgr'):
-            self.sym_mgr = SymmetryManager(['charge', 'sz'], orb_sym=getattr(self, "orb_sym", None)) # Default fallback
+            self.sym_mgr = SymmetryManager(['charge', 'sz'], orb_sym=getattr(self, "orbsym", None)) # Default fallback
 
         self._log(f"  [InitGuess] Generating guess: '{method}' with {self.sym_mgr.sym_types}")
 
@@ -4083,7 +4083,7 @@ class DMRG(CASCI):
                         deepcopy(dict(cached["info"]))
                     )
                     return self
-                self._log("  Building spatial-orbital Hamiltonian MPO with reduced SU(2) channels...")
+                self._log("  Building reduced SU(2) complementary operators directly from integrals...")
                 from pyqed.qchem.dmrg.backends.reduced import build_spatial_reduced_hamiltonian_mpo
 
                 reduced_hamiltonian = build_spatial_reduced_hamiltonian_mpo(
@@ -4094,7 +4094,7 @@ class DMRG(CASCI):
                     n_elec=self.nelecas,
                     spin=self.spin,
                     ecore=self.e_core,
-                    orb_sym=self.orb_sym,
+                    orb_sym=(self.orbsym if getattr(self, "_spatial_charge_target", None) is not None else None),
                     reuse=self._su2_runtime,
                 )
                 self._spatial_operator_cache = None
@@ -4716,6 +4716,9 @@ class DMRG(CASCI):
         su2_kernel_backend="auto",
         n_threads=None,
         require_convergence=True,
+        wfnsym=None,
+        spatial_method=None,
+        spatial_contractions=None,
         **kwargs,
     ):
         """
@@ -4729,7 +4732,20 @@ class DMRG(CASCI):
         symmetry_list : list of strings or bool
             Backward-compatible explicit labels such as ``['charge', 'sz']``.
         nstates : int
-            Number of roots. Values larger than one run state-averaged DMRG.
+            Number of roots. With wfnsym, counts complete spatial multiplets;
+            otherwise values larger than one run state-averaged DMRG.
+        wfnsym : str or None
+            Target spatial irrep, retaining every partner of an E irrep.
+        spatial_method : {"complementary", "multiplet", "group_action"} or None
+            Finite Abelian groups default to compiled complementary-operator
+            sweeps with particle, spin, and spatial sectors (open boundaries).
+            D3h/D6h default
+            to complete orbital-multiplet sites with charge/spin/spatial Legs. "group_action" selects the earlier
+            regular-group solver for comparisons. All use pyqed.mps.
+        spatial_contractions : {"reduced", "components"} or None
+            Multiplet MPO/environment contractions; defaults to fully reduced
+            charge/spin/spatial channels. "components" selects the previous
+            implementation for validation and benchmarking.
         weights : array_like, optional
             Nonnegative state-average weights. They are normalized internally.
         su2_kernel_backend : {"auto", "cpp", "python"}
@@ -4737,7 +4753,8 @@ class DMRG(CASCI):
             ``"python"`` selects the slower reference implementation.
         n_threads : int or None
             Native shared-memory threads. For SU(2), this controls OpenMP in
-            reduced-sector contractions; ``None`` selects one thread.
+            reduced-sector contractions; ``None`` uses ``pyqed.num_workers()``.
+            The serial-only periodic SU(2) backend retains one thread.
         nsweeps : int
             Maximum number of complete sweeps. One complete sweep is a
             left-to-right pass followed by a right-to-left pass. The default
@@ -4808,6 +4825,125 @@ class DMRG(CASCI):
             self.D = self.m = max(int(x) for x in D_schedule)
             if self.m_warmup is None:
                 self.m_warmup = self.D
+        if "target_irrep" in kwargs:
+            raise TypeError("Use wfnsym; target_irrep has been removed.")
+        compiled_spatial_target = None
+        previous_spatial_charge = getattr(self, "_spatial_charge_target", None)
+        self._spatial_charge_target = None
+        if previous_spatial_charge is not None:
+            self._invalidate_hamiltonian_mpo()
+        info = getattr(self.mol, "symmetry_info", None)
+        if (wfnsym is not None and spatial_method is None and info is not None
+                and info.group.abelian and not info.group.linear):
+            spatial_method = "complementary"
+        if wfnsym is not None and spatial_method == "complementary":
+            from pyqed.qchem.spatial_symmetry import resolve_spatial_target
+            from pyqed.qchem.symmetry import mo_symmetry_representations
+            from pyqed.mps.nonabelian.multiplet_sites import orbital_multiplets
+            info = getattr(self.mol, "symmetry_info", None)
+            if info is None or info.group.linear or not info.group.abelian:
+                raise ValueError("Complementary spatial sweeps require a finite Abelian point group.")
+            if kwargs.get("virtual_boundary", "open") != "open":
+                raise NotImplementedError("Complementary spatial targeting currently requires open MPS boundaries.")
+            if su2_kernel_backend == "python" or spatial_contractions is not None:
+                raise ValueError("Complementary spatial sweeps require the compiled reduced engine.")
+            selected = _normalize_dmrg_symmetry(symmetry if symmetry is not None else self.symmetry)
+            if selected is None or "su2" not in selected:
+                raise ValueError("Complementary spatial sweeps require symmetry='su2'.")
+            target = resolve_spatial_target(info.group, wfnsym)
+            coeff = np.array(self.mf.mo_coeff if mo_coeff is None else mo_coeff, copy=True)
+            active = slice(self.ncore, self.ncore+self.ncas)
+            if self.ncore:
+                mo_symmetry_representations(self.mol, coeff[:, :self.ncore])
+            representations = mo_symmetry_representations(self.mol, coeff[:, active])
+            transform, labels, _ = orbital_multiplets(info.group.name, representations)
+            coeff[:, active] = coeff[:, active] @ transform
+            codes = {name: sum((int(character) < 0) << i for i, character in enumerate(chars))
+                     for name, chars in info.group.character_table.items()}
+            self.orbsym = tuple(codes[label] for label in labels)
+            self._spatial_charge_target = codes[target]
+            self._invalidate_hamiltonian_mpo()
+            compiled_spatial_target = target
+            mo_coeff = coeff
+            wfnsym = spatial_method = None
+        if wfnsym is None:
+            if spatial_method is not None or spatial_contractions is not None:
+                raise ValueError('spatial_method requires wfnsym.')
+            self.spatial_solver = None
+            self.spatial_method = None
+            self.spatial_contractions = None
+            self.wfnsym = None
+            self.state_irreps = None
+            self.nsites = self.L = self.ncas
+            self.site_dimensions = self.physical_site_dimensions = None
+        if wfnsym is not None:
+            from pyqed.qchem.spatial_symmetry import resolve_spatial_target
+            from pyqed.qchem.symmetry import mo_symmetry_representations
+            from pyqed.qchem.mcscf.direct_ci import transform_active_space_spatial_integrals
+            from pyqed.mps.nonabelian.spatial_symmetry import SpatialSymmetryDMRG
+            info = getattr(self.mol, "symmetry_info", None)
+            if info is None:
+                raise ValueError("Build molecular symmetry before spatially targeted DMRG.")
+            selected_spec = symmetry if symmetry is not None else self.symmetry
+            selected_symmetry = _normalize_dmrg_symmetry("su2" if selected_spec is None else selected_spec)
+            if selected_symmetry is None or "su2" not in selected_symmetry:
+                raise ValueError("Non-Abelian spatial DMRG requires symmetry='su2'.")
+            if D_schedule is not None:
+                raise ValueError("Spatial multiplet sweeps currently use a fixed seed D.")
+            if weights is not None:
+                raise ValueError("Spatial multiplets use equal partner weights and independent excited-multiplet optimization.")
+            target = resolve_spatial_target(info.group, wfnsym)
+            coeff = self.mf.mo_coeff if mo_coeff is None else mo_coeff
+            self.mo_coeff = coeff
+            mo_symmetry_representations(self.mol, coeff[:, :self.ncore])
+            representations = mo_symmetry_representations(self.mol, coeff[:, self.ncore:self.ncore+self.ncas])
+            h1, eri, ecore = transform_active_space_spatial_integrals(
+                self.mf, coeff, self.ncas, self.ncore, use_cholesky=getattr(self, "use_cholesky", False))
+            if spatial_method is None:
+                spatial_method = 'multiplet'
+            if spatial_method == 'multiplet':
+                from pyqed.mps.nonabelian.multiplet_dmrg import MultipletDMRG
+                spatial_type = MultipletDMRG
+            elif spatial_method == 'group_action':
+                spatial_type = SpatialSymmetryDMRG
+            else:
+                raise ValueError("spatial_method must be 'multiplet' or 'group_action'.")
+            if spatial_method != 'multiplet' and spatial_contractions is not None:
+                raise ValueError('spatial_contractions requires the multiplet method.')
+            contraction_options = ({'contractions': 'reduced' if spatial_contractions is None else spatial_contractions}
+                                   if spatial_method == 'multiplet' else {})
+            spatial = spatial_type.from_integrals(h1, eri, nelec=self.nelecas, spin=self.spin,
+                D=self.D, ecore=ecore, n_threads=n_threads,
+                point_group=info.group.name, orbital_representations=representations, wfnsym=target,
+                **contraction_options)
+            spatial.run(nsweeps=nsweeps, nstates=nstates, tol=self.tol, **kwargs)
+            self.symmetry = ["charge", "su2"]
+            self.site = self.site_basis = self.orbital_layout = "spatial"
+            self.spatial_site_basis, self.d = "fully_reduced", 3
+            self.nsites = self.L = self.ncas
+            self.site_dimensions = self.physical_site_dimensions = None
+            if spatial_method == 'multiplet':
+                self.nsites = self.L = spatial.nsites
+                self.site_dimensions = tuple(site.leg.dim for site in spatial.sites)
+                self.physical_site_dimensions = tuple(site.leg.full_dim for site in spatial.sites)
+                self.d = self.site_dimensions[0] if len(set(self.site_dimensions)) == 1 else None
+            self.e_tot, self.states, self.history = spatial.e_tot, spatial.states, spatial.history
+            self.nstates = len(spatial.states)
+            self.spatial_multiplet_count = nstates
+            self.state_irreps = spatial.state_irreps
+            self.spatial_partner_rows = tuple(range(spatial.partner_dimension)) * nstates
+            self.energy, self.state = spatial.energy, spatial.state
+            self.converged = self.success = spatial.success
+            self.message = spatial.message
+            self.spatial_symmetry = spatial.spatial_symmetry
+            self.spatial_solver = spatial
+            self.spatial_method = spatial_method
+            self.spatial_contractions = getattr(spatial,'contractions',None)
+            self.wfnsym = target
+            if require_convergence and not spatial.success:
+                raise RuntimeError(spatial.message)
+            return spatial
+
         self.nstates = nstates
         if weights is None:
             self.weights = np.ones(nstates) / nstates
@@ -4923,7 +5059,7 @@ class DMRG(CASCI):
             resolved_abelian_options.get("native_site_storage", False)
         )
         # Initialize Symmetry
-        self.sym_mgr = SymmetryManager(symmetry_list, orb_sym=getattr(self, "orb_sym", None))
+        self.sym_mgr = SymmetryManager(symmetry_list, orb_sym=getattr(self, "orbsym", None))
         if self.sym_mgr.enabled:
             if getattr(self.sym_mgr, "has_nonabelian", False):
                 if self.site != "spatial":
@@ -4947,17 +5083,26 @@ class DMRG(CASCI):
                     and not local_tol_explicit
                     and "local_solver_schedule" not in kwargs
                 ):
-                    tolerances = [1.0e-3] * 4 + [1.0e-5] * 4 + [1.0e-8]
+                    final_tolerance = min(1.0e-8, 0.1 * float(sweep_tol)) if sweep_tol is not None and sweep_tol > 0 else 1.0e-8
+                    early_sweeps = min(4, max(0, int(nsweeps) - 1))
+                    middle_sweeps = min(4, max(0, int(nsweeps) - early_sweeps - 1))
+                    tolerances = ([1.0e-3] * early_sweeps
+                                  + [1.0e-5] * middle_sweeps + [final_tolerance])
+                    # Owned complementary sweeps stop on the residual, not the
+                    # Ritz-energy tolerance. Schedule both unless the caller
+                    # explicitly fixed the residual threshold.
+                    residual_schedule = "tol_residual" not in local_solver_kwargs
                     if davidson_max_iter_explicit or local_itermax_explicit:
                         kwargs["local_solver_schedule"] = [
-                            {"tol": tolerance}
+                            {"tol": tolerance, **({"tol_residual": tolerance} if residual_schedule else {})}
                             for tolerance in tolerances
                             for _ in range(2)
                         ]
                     else:
-                        iterations = [30] * 4 + [60] * 4 + [100]
+                        iterations = [30] * early_sweeps + [60] * middle_sweeps + [100]
                         kwargs["local_solver_schedule"] = [
-                            {"tol": tolerance, "itermax": itermax}
+                            {"tol": tolerance, "itermax": itermax,
+                             **({"tol_residual": tolerance} if residual_schedule else {})}
                             for tolerance, itermax in zip(
                                 tolerances,
                                 iterations,
@@ -5033,6 +5178,11 @@ class DMRG(CASCI):
                     if compute_s2:
                         print(f"  <S^2> =             {self.s2:.6f}")
                     print(f"  Time:               {time.time()-t0:.2f} s")
+                if compiled_spatial_target is not None:
+                    self.wfnsym = compiled_spatial_target
+                    self.state_irreps = dmrg.state_irreps = (compiled_spatial_target,) * nstates
+                    self.spatial_method = "complementary"
+                    self.spatial_solver = dmrg
                 if require_convergence and not dmrg.converged:
                     raise RuntimeError(
                         "SU(2) DMRG did not converge within "
@@ -5600,6 +5750,8 @@ class DMRG(CASCI):
             print(f"    {label:<12} : Target={target_val:<8.4f} | Measured={measured:<8.4f} | Diff={diff:.2e} ")
 
     def _get_state_for_rdm(self, state_id):
+        if getattr(self, 'spatial_solver', None) is not None:
+            return self.states[state_id]
         if not hasattr(self, 'dmrg') or self.dmrg.ground_state is None:
             raise ValueError("Run DMRG first to generate a state.")
         if hasattr(self.dmrg, 'states') and isinstance(self.dmrg.states, list):
@@ -5844,7 +5996,9 @@ class DMRG(CASCI):
 
     def _make_fully_reduced_spatial_rdm1(self, state_id=0, spatial=False, with_core=False):
         state = self._get_state_for_rdm(state_id)
-        gamma = self._fully_reduced_component_rdm1(state)
+        gamma = (self.spatial_solver.make_rdm12(state_id)[0]
+                 if getattr(self, 'spatial_method', None) == 'multiplet'
+                 else self._fully_reduced_component_rdm1(state))
         if spatial or with_core:
             out = gamma
         else:
@@ -5863,7 +6017,9 @@ class DMRG(CASCI):
 
     def _make_fully_reduced_spatial_rdm2(self, state_id=0, spatial=False, with_core=False):
         state = self._get_state_for_rdm(state_id)
-        gamma2 = self._fully_reduced_component_rdm2(state)
+        gamma2 = (self.spatial_solver.make_rdm12(state_id)[1]
+                  if getattr(self, 'spatial_method', None) == 'multiplet'
+                  else self._fully_reduced_component_rdm2(state))
         if not (spatial or with_core):
             raise NotImplementedError(
                 "The fully reduced SU(2) backend exposes the spin-traced spatial 2-RDM only."

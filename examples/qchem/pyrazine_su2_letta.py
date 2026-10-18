@@ -10,6 +10,7 @@ import time
 import numpy as np
 from pyscf import ao2mo, gto, mcscf, scf
 
+from pyqed.parallel import num_workers
 from pyqed.letta import SU2LETTA
 
 
@@ -151,7 +152,7 @@ def run(args):
             truncation_tol=args.truncation_tol,
             consecutive_cycles=args.consecutive_cycles,
             max_local_parameters=args.max_local_parameters,
-            gauge=None if args.gauge == "none" else args.gauge,
+            gauge=args.gauge,
             reuse_environments=args.reuse_environments,
             verbose=args.verbose,
         )
@@ -224,7 +225,7 @@ def main():
         default="projected",
     )
     parser.add_argument("--workers", type=int, default=1)
-    parser.add_argument("--n-threads", type=int, default=1)
+    parser.add_argument("--n-threads", type=int, default=num_workers())
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--integral-cutoff", type=float, default=1.0e-10)
     parser.add_argument("--tol", type=float, default=1.0e-8)
@@ -234,7 +235,7 @@ def main():
     parser.add_argument("--max-local-parameters", type=int, default=4096)
     parser.add_argument("--route-memory", type=float, default=256.0)
     parser.add_argument(
-        "--gauge", choices=("conditional", "none"), default="conditional"
+        "--gauge", choices=("auto", "conditional", "none"), default="auto"
     )
     parser.add_argument(
         "--reuse-environments",

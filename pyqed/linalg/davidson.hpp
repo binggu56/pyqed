@@ -126,7 +126,11 @@ inline void cblas_dgemv(
 }
 #endif
 
+using ComplexSVDLapack = void (*)(char*, char*, int*, int*, Complex*, int*,
+    double*, Complex*, int*, Complex*, int*, Complex*, int*, double*, int*);
+
 struct ComplexThinSVDWorkspace {
+    ComplexSVDLapack lapack = nullptr;
     std::vector<Complex> matrix;
     std::vector<Complex> left;
     std::vector<Complex> right;
@@ -169,7 +173,11 @@ inline void complex_thin_svd(
     if (rows == 0 || cols == 0) {
         return;
     }
+    auto svd = workspace.lapack;
 #ifdef __APPLE__
+    if (svd == nullptr) svd = &zgesvd_;
+#endif
+    if (svd == nullptr) throw std::runtime_error("Thin SVD requires a LAPACK provider.");
     const int m = static_cast<int>(rows);
     const int n = static_cast<int>(cols);
     const int k = static_cast<int>(rank);
@@ -191,7 +199,7 @@ inline void complex_thin_svd(
     int info = 0;
     int lwork = -1;
     Complex work_query = 0.0;
-    zgesvd_(
+    svd(
         &jobu,
         &jobvt,
         &m_arg,
@@ -220,7 +228,7 @@ inline void complex_thin_svd(
     }
     workspace.work.resize(required_work);
     lwork = static_cast<int>(required_work);
-    zgesvd_(
+    svd(
         &jobu,
         &jobvt,
         &m_arg,
@@ -240,12 +248,6 @@ inline void complex_thin_svd(
     if (info != 0) {
         throw std::runtime_error("Thin SVD failed to converge.");
     }
-#else
-    (void)matrix;
-    throw std::runtime_error(
-        "Thin SVD currently requires an Accelerate LAPACK build."
-    );
-#endif
 }
 
 inline double norm2(const std::vector<Complex>& vector) {

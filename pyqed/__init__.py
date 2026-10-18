@@ -12,6 +12,7 @@ from importlib import import_module
 import numpy as np
 
 from ._version import __version__
+from .parallel import num_workers
 from .units import *  # noqa: F401,F403
 
 

@@ -7,6 +7,7 @@
 #include <complex>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -276,13 +277,13 @@ struct ComplexBoundaryBufferHandle {
 };
 
 struct NormalComplementaryBoundaryRoute {
-    std::uint16_t parent = 0;
-    std::uint16_t bra = 0;
-    std::uint16_t ket = 0;
-    std::uint16_t output = 0;
+    std::uint32_t parent = 0;
+    std::uint32_t bra = 0;
+    std::uint32_t ket = 0;
+    std::uint32_t output = 0;
     std::uint32_t core = 0;
 };
-static_assert(sizeof(NormalComplementaryBoundaryRoute) == 12);
+static_assert(sizeof(NormalComplementaryBoundaryRoute) == 20);
 
 struct NormalComplementaryBoundaryAction {
     std::string side;
@@ -299,6 +300,9 @@ struct NormalComplementaryBoundaryAction {
     std::uint64_t parent_structure_revision = 0;
     std::uint64_t site_structure_revision = 0;
     std::vector<NormalComplementaryBoundaryRoute> routes;
+    std::vector<std::size_t> output_route_offsets, output_route_order;
+    std::vector<std::uint32_t> route_product_ids;
+    std::size_t product_count = 0;
     std::vector<std::int64_t> output_offsets;
     std::vector<std::int64_t> output_shape_offsets;
     std::vector<std::int64_t> output_shapes;
@@ -317,6 +321,9 @@ struct NormalComplementaryBoundaryAction {
     std::size_t memory_bytes() const noexcept {
         std::size_t total =
             routes.capacity() * sizeof(NormalComplementaryBoundaryRoute)
+            + (output_route_offsets.capacity() + output_route_order.capacity())
+                * sizeof(std::size_t)
+            + route_product_ids.capacity() * sizeof(std::uint32_t)
             + mpo_values.capacity() * sizeof(double)
             + (
                 output_offsets.capacity()
@@ -336,6 +343,39 @@ struct NormalComplementaryBoundaryAction {
         total += mpo_block_dims.capacity()
             * sizeof(std::array<std::uint32_t, 4>);
         return total;
+    }
+};
+
+struct BoundaryProductWorkspace {
+    std::vector<double> values;
+    std::vector<std::size_t> offsets;
+    std::size_t limit = 0;
+    std::uint64_t hits = 0;
+
+    void reset(std::size_t products, std::size_t elements) {
+        limit = elements;
+        if (values.capacity() > limit) std::vector<double>().swap(values);
+        values.clear();
+        offsets.assign(limit ? products : 0, std::numeric_limits<std::size_t>::max());
+        hits = 0;
+    }
+    const double* find(std::uint32_t slot) {
+        if (slot >= offsets.size() || offsets[slot] == std::numeric_limits<std::size_t>::max())
+            return nullptr;
+        ++hits;
+        return values.data() + offsets[slot];
+    }
+    const double* retain(std::uint32_t slot, const double* source, std::size_t count) {
+        if (slot >= offsets.size() || count > limit - values.size()) return source;
+        const auto needed = values.size() + count;
+        if (needed > values.capacity())
+            values.reserve(std::min(limit, std::max(needed, 2 * values.capacity())));
+        offsets[slot] = values.size();
+        values.insert(values.end(), source, source + count);
+        return values.data() + offsets[slot];
+    }
+    std::size_t memory_bytes() const noexcept {
+        return values.capacity() * sizeof(double) + offsets.capacity() * sizeof(std::size_t);
     }
 };
 
@@ -1309,6 +1349,8 @@ struct RawPersistentOutputBinding {
 };
 
 struct RawPersistentOutputReference {
+    // Channel, source offset, destination offset, contiguous row width.
+    std::vector<std::array<std::int64_t, 4>> left_copies;
     std::uint32_t wave = 0;
     std::uint32_t group = 0;
     std::uint32_t binding_start = 0;
@@ -1364,7 +1406,8 @@ struct RawSharedRightBinding {
     std::int64_t source_k_offset = 0;
     std::int64_t panel_row_offset = 0;
     std::int64_t rows = 0;
-    double scale = 1.0;
+    // Numerical scales change when a cached schedule is refreshed.
+    std::int64_t scale_term = -1;
 };
 
 struct RawSharedRightPanel {
@@ -1430,6 +1473,25 @@ struct RawOutputFusionWave {
 };
 
 struct ReducedContextualExecutionSchedule {
+    std::vector<RawPersistentOutputGroup> persistent_output_groups;
+    std::vector<RawPersistentOutputReference> persistent_output_references;
+    std::vector<RawPersistentOutputBinding> persistent_output_bindings;
+    std::vector<RawPersistentOutputBundle> persistent_output_bundles;
+    std::vector<std::uint32_t> persistent_output_bundle_groups;
+    std::vector<RawPersistentOutputTask> persistent_output_tasks;
+    std::vector<RawPersistentProductCacheEntry> persistent_product_cache;
+    std::vector<std::int32_t> persistent_right_action_slots;
+    std::vector<RawPersistentRightCacheEntry> persistent_right_cache;
+    std::vector<std::array<std::size_t, 3>> complementary_pack_tasks;
+    std::size_t persistent_product_cache_elements = 0;
+    bool dynamic_persistent_output_right = 0;
+    long double complementary_pack_work = 0;
+    std::uint64_t persistent_right_pack_work = 0;
+    std::size_t slab_elements = 0;
+    std::size_t fusion_right_elements = 0;
+    std::size_t required_elements = 0;
+    std::string settings;
+
     std::vector<RawExecutionGroup> groups;
     std::vector<RawExecutionAction> actions;
     std::vector<std::uint32_t> combined_left_terms;
@@ -1455,6 +1517,19 @@ struct ReducedContextualExecutionSchedule {
             + local_terms.capacity() * sizeof(ComplementaryLocalTerm)
             + compact_right_panels.capacity()
                 * sizeof(RawCompactRightPanel);
+        total += persistent_output_groups.capacity() * sizeof(RawPersistentOutputGroup);
+        total += persistent_output_references.capacity() * sizeof(RawPersistentOutputReference);
+        for (const auto& reference : persistent_output_references) {
+            total += reference.left_copies.capacity() * sizeof(std::array<std::int64_t, 4>);
+        }
+        total += persistent_output_bindings.capacity() * sizeof(RawPersistentOutputBinding);
+        total += persistent_output_bundles.capacity() * sizeof(RawPersistentOutputBundle);
+        total += persistent_output_bundle_groups.capacity() * sizeof(std::uint32_t);
+        total += persistent_output_tasks.capacity() * sizeof(RawPersistentOutputTask);
+        total += persistent_product_cache.capacity() * sizeof(RawPersistentProductCacheEntry);
+        total += persistent_right_action_slots.capacity() * sizeof(std::int32_t);
+        total += persistent_right_cache.capacity() * sizeof(RawPersistentRightCacheEntry);
+        total += complementary_pack_tasks.capacity() * sizeof(std::array<std::size_t, 3>);
         for (const RawInputSuperchannel& channel : superchannels) {
             total +=
                 channel.tiles.capacity() * sizeof(RawExecutionTile)
@@ -1679,7 +1754,49 @@ using HalfSweepBondExecutor = bool (*)(
     std::int64_t bond
 );
 
-class MovingEnvironment {
+using ComplexSVDLapack = pyqed::linalg::ComplexSVDLapack;
+using ComplexQRLapack = void (*)(int*, int*, Complex*, int*, Complex*, Complex*, int*, int*);
+using ComplexGenerateQLapack = void (*)(int*, int*, int*, Complex*, int*, Complex*, Complex*, int*, int*);
+
+class SectorDecomposition {
+public:
+    void set_factorization_functions(pyqed::linalg::ComplexSVDLapack svd,
+        ComplexQRLapack qr, ComplexGenerateQLapack generate_q) noexcept {
+        block_svd_workspace_.lapack = svd;
+        qr_lapack_ = qr;
+        generate_q_lapack_ = generate_q;
+    }
+    BlockSVDResult factorized_blockwise_svd(
+        const Complex* left, std::size_t n_left, const std::int64_t* left_offsets,
+        const Complex* right, std::size_t n_right, const std::int64_t* right_offsets,
+        const std::int64_t* rows, const std::int64_t* bonds, const std::int64_t* cols,
+        const std::int64_t* state_weights, std::size_t n_blocks,
+        double cutoff, std::int64_t max_bond, const std::string& max_bond_mode,
+        bool retain_sector_topology
+    );
+    BlockSVDResult blockwise_svd(
+        const Complex* values,
+        std::size_t n_values,
+        const std::int64_t* value_offsets,
+        const std::int64_t* rows,
+        const std::int64_t* cols,
+        const std::int64_t* state_weights,
+        std::size_t n_blocks,
+        double cutoff,
+        std::int64_t max_bond,
+        const std::string& max_bond_mode,
+        bool retain_sector_topology
+    );
+protected:
+    ComplexQRLapack qr_lapack_ = nullptr;
+    ComplexGenerateQLapack generate_q_lapack_ = nullptr;
+    pyqed::linalg::ComplexThinSVDWorkspace block_svd_workspace_;
+    std::uint64_t block_svd_calls_ = 0;
+    std::uint64_t block_svd_blocks_ = 0;
+    double block_svd_seconds_ = 0.0;
+};
+
+class MovingEnvironment : public SectorDecomposition {
 public:
     explicit MovingEnvironment(const System* system);
 
@@ -2452,19 +2569,6 @@ public:
         int restart_dimension,
         bool accept_unconverged
     );
-    BlockSVDResult blockwise_svd(
-        const Complex* values,
-        std::size_t n_values,
-        const std::int64_t* value_offsets,
-        const std::int64_t* rows,
-        const std::int64_t* cols,
-        const std::int64_t* state_weights,
-        std::size_t n_blocks,
-        double cutoff,
-        std::int64_t max_bond,
-        const std::string& max_bond_mode,
-        bool retain_sector_topology
-    );
     ActiveBondSplitResult split_active_bond_solution(
         double cutoff,
         std::int64_t max_bond,
@@ -2552,7 +2656,13 @@ public:
     std::uint64_t boundary_update_topology_builds() const noexcept;
     std::uint64_t boundary_update_calls() const noexcept;
     std::uint64_t boundary_update_routes() const noexcept;
+    double boundary_prepare_seconds() const noexcept;
+    std::uint64_t boundary_recoupling_cache_hits() const noexcept;
     double boundary_update_seconds() const noexcept;
+    std::size_t boundary_update_workspace_bytes() const noexcept;
+    std::size_t preparation_cache_bytes() const noexcept;
+    std::uint64_t boundary_update_product_cache_hits() const noexcept;
+    std::size_t peak_boundary_product_cache_bytes() const noexcept;
     std::size_t normal_complementary_boundary_action_count() const noexcept;
     std::size_t normal_complementary_boundary_action_bytes() const noexcept;
     std::size_t metric_boundary_count() const noexcept;
@@ -2614,6 +2724,8 @@ public:
     double raw_batch_right_prepare_seconds() const noexcept;
     double raw_batch_fallback_prepare_seconds() const noexcept;
     double raw_channel_first_stage_seconds() const noexcept;
+    std::uint64_t channel_workspace_builds() const noexcept;
+    std::uint64_t channel_workspace_reuses() const noexcept;
     double raw_wave_batch_seconds() const noexcept;
     double raw_shared_left_output_seconds() const noexcept;
     double raw_grouped_output_seconds() const noexcept;
@@ -2686,6 +2798,12 @@ public:
     std::size_t peak_raw_output_fusion_workspace_bytes() const noexcept;
     std::uint64_t raw_output_fusion_gemm_calls() const noexcept;
     std::uint64_t raw_output_fusion_copied_elements() const noexcept;
+    std::size_t peak_output_panel_cache_bytes() const noexcept;
+    std::size_t peak_operator_panel_cache_bytes() const noexcept;
+    std::uint64_t operator_panel_cache_hits() const noexcept;
+    std::uint64_t direct_product_cache_hits() const noexcept;
+    std::size_t peak_direct_product_cache_bytes() const noexcept;
+    std::uint64_t output_schedule_reuses() const noexcept;
     std::size_t peak_persistent_output_batch_count() const noexcept;
     std::size_t peak_persistent_output_task_count() const noexcept;
     std::size_t peak_persistent_output_group_count() const noexcept;
@@ -2797,6 +2915,12 @@ public:
     double half_sweep_executor_seconds() const noexcept;
     std::uint64_t owned_half_sweep_calls() const noexcept;
     std::uint64_t owned_half_sweep_bonds() const noexcept;
+    double owned_prepare_seconds() const noexcept;
+    std::uint64_t boundary_update_parallel_calls() const noexcept;
+    std::uint64_t route_prepare_parallel_calls() const noexcept;
+    double owned_solve_seconds() const noexcept;
+    double owned_split_seconds() const noexcept;
+    double owned_environment_seconds() const noexcept;
     double owned_half_sweep_seconds() const noexcept;
     std::uint64_t aborted_half_sweeps() const noexcept;
     std::uint64_t bond_steps() const noexcept;
@@ -3014,6 +3138,7 @@ private:
     void select_direct_complementary_tiles();
     void build_persistent_output_group_schedule();
     void build_persistent_right_action_cache();
+    void refresh_persistent_right_action_cache();
     void build_persistent_output_bundles(int thread_count);
     void build_persistent_output_tasks();
     std::uint64_t apply_persistent_channel_fusion_task(
@@ -3225,7 +3350,8 @@ private:
         const double* packed_input,
         double* output,
         std::vector<double>& left_workspace,
-        std::vector<double>& temporary_workspace
+        std::vector<double>& temporary_workspace,
+        bool use_shared_products = false
     );
     void apply_raw_pointer_actions_real(
         const double* input,
@@ -3468,6 +3594,14 @@ private:
     std::vector<std::size_t> direct_execution_wave_offsets_;
     std::vector<std::size_t> direct_execution_wave_indices_;
     std::size_t direct_execution_max_wave_width_ = 0;
+    struct DirectProductPlan {
+        std::array<std::int64_t, 5> key;
+        std::size_t offset = 0;
+    };
+    void build_direct_product_plans();
+    std::vector<DirectProductPlan> direct_product_plans_;
+    std::vector<std::size_t> direct_product_offsets_;
+    std::vector<double> direct_product_values_;
     std::vector<std::vector<double>> direct_action_thread_left_;
     std::vector<std::vector<double>> direct_action_thread_temporary_;
     std::size_t raw_execution_actions_ = 0;
@@ -3488,6 +3622,12 @@ private:
     std::vector<RawPersistentProductCacheEntry>
         persistent_product_cache_;
     std::size_t persistent_product_cache_elements_ = 0;
+    std::size_t peak_operator_panel_cache_bytes_ = 0;
+    std::uint64_t operator_panel_cache_hits_ = 0;
+    std::uint64_t direct_product_cache_hits_ = 0;
+    std::size_t peak_direct_product_cache_bytes_ = 0;
+    std::unordered_map<std::uint32_t, std::array<std::size_t, 2>> combined_operator_offsets_;
+    std::vector<double> combined_operator_values_;
     std::vector<std::vector<double>> persistent_output_thread_products_;
     std::vector<std::vector<std::uint8_t>>
         persistent_output_thread_product_valid_;
@@ -3499,6 +3639,12 @@ private:
     std::vector<RawPersistentOutputTask> persistent_output_tasks_;
     std::vector<std::vector<double>> persistent_output_thread_outputs_;
     bool dynamic_persistent_output_right_ = false;
+    bool output_schedule_restored_ = false;
+    std::string output_schedule_settings_;
+    long double complementary_pack_work_ = 0;
+    std::uint64_t persistent_right_pack_work_ = 0;
+    std::uint64_t output_schedule_reuses_ = 0;
+    std::size_t peak_output_panel_cache_bytes_ = 0;
     std::vector<RawCompactRightPanel> compact_right_panels_;
     std::vector<double> compact_right_panel_values_;
     std::uint64_t compact_right_panel_registry_builds_ = 0;
@@ -3577,6 +3723,12 @@ private:
     std::vector<double> raw_shared_right_deferred_output_real_;
     std::vector<double> raw_shared_right_tile_output_real_;
     std::vector<double> raw_shared_left_output_real_;
+    std::uint64_t channel_workspace_revision_ = ~std::uint64_t{0};
+    std::size_t channel_workspace_count_ = 0;
+    long double channel_workspace_work_ = 0.0L;
+    std::uint64_t channel_output_work_ = 0;
+    std::uint64_t channel_workspace_builds_ = 0;
+    std::uint64_t channel_workspace_reuses_ = 0;
     std::vector<std::size_t> raw_channel_temporary_offsets_;
     std::vector<double> raw_channel_temporary_real_;
     std::vector<std::int32_t> grouped_output_transpose_left_;
@@ -3669,7 +3821,6 @@ private:
         generalized_davidson_workspace_;
     pyqed::linalg::RealGeneralizedDavidsonWorkspace
         real_generalized_davidson_workspace_;
-    pyqed::linalg::ComplexThinSVDWorkspace block_svd_workspace_;
     std::string metric_key_;
     std::vector<FactorizedMetricRoute> metric_routes_;
     std::size_t metric_dimension_ = 0;
@@ -3702,9 +3853,17 @@ private:
     std::uint64_t boundary_update_topology_builds_ = 0;
     std::uint64_t boundary_update_calls_ = 0;
     std::uint64_t boundary_update_routes_ = 0;
+    double boundary_prepare_seconds_ = 0.0;
+    std::uint64_t boundary_recoupling_cache_hits_ = 0;
     double boundary_update_seconds_ = 0.0;
     std::vector<double> boundary_update_temporary_;
     std::vector<double> boundary_update_product_;
+    std::vector<std::vector<double>> boundary_update_thread_temporary_;
+    std::vector<std::vector<double>> boundary_update_thread_product_;
+    BoundaryProductWorkspace boundary_update_cache_;
+    std::vector<BoundaryProductWorkspace> boundary_update_thread_cache_;
+    std::uint64_t boundary_update_product_cache_hits_ = 0;
+    std::size_t peak_boundary_product_cache_bytes_ = 0;
     std::uint64_t local_topology_builds_ = 0;
     std::uint64_t local_numeric_refreshes_ = 0;
     std::uint64_t local_matvec_calls_ = 0;
@@ -3729,9 +3888,6 @@ private:
     std::uint64_t canonical_projection_reuses_ = 0;
     std::uint64_t canonical_projection_davidson_calls_ = 0;
     double canonical_projection_build_seconds_ = 0.0;
-    std::uint64_t block_svd_calls_ = 0;
-    std::uint64_t block_svd_blocks_ = 0;
-    double block_svd_seconds_ = 0.0;
     std::size_t peak_borrowed_local_operator_bytes_ = 0;
     std::size_t peak_factor_route_table_bytes_ = 0;
     std::size_t peak_borrowed_factor_pool_bytes_ = 0;
@@ -3746,6 +3902,13 @@ private:
     double half_sweep_executor_seconds_ = 0.0;
     std::uint64_t owned_half_sweep_calls_ = 0;
     std::uint64_t owned_half_sweep_bonds_ = 0;
+    double active_eigensolve_seconds_ = 0.0;
+    double owned_prepare_seconds_ = 0.0;
+    std::uint64_t boundary_update_parallel_calls_ = 0;
+    std::uint64_t route_prepare_parallel_calls_ = 0;
+    double owned_solve_seconds_ = 0.0;
+    double owned_split_seconds_ = 0.0;
+    double owned_environment_seconds_ = 0.0;
     double owned_half_sweep_seconds_ = 0.0;
     std::uint64_t aborted_half_sweeps_ = 0;
     std::uint64_t bond_steps_ = 0;

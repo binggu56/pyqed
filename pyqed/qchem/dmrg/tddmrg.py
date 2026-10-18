@@ -173,6 +173,10 @@ class TDDMRG(DMRG):
     This class reuses the active-space Hamiltonian MPO construction from the
     static `DMRG` driver. Abelian calculations use ``TDMPS``; SU(2)
     calculations retain the non-Abelian reduced MPS and MPO throughout TDVP.
+    SU(2) local propagation uses compiled Lanczos when the local operator
+    supplies a compiled table, otherwise matrix-free Python Lanczos. The
+    ``tdvp_propagation_backends`` field records this choice independently of
+    the compiled moving-environment backend.
     """
 
     def __init__(
@@ -233,12 +237,12 @@ class TDDMRG(DMRG):
 
     @staticmethod
     def _mps_bond_dim(psi):
-        if isinstance(psi, NonabelianMPS):
+        if isinstance(psi, MPS) and any(not tensor.is_dense for tensor in psi.tensors):
             dims = [
                 int(block.shape[axis])
-                for site in psi.sites
+                for site in psi.tensors
                 for block in site.data.values()
-                for axis in (0, 2)
+                for axis in (0, 1)
             ]
             return max(dims, default=1)
         if not isinstance(psi, MPS) or not psi.factors:
@@ -248,7 +252,7 @@ class TDDMRG(DMRG):
             shape = getattr(factor, "shape", None)
             if shape is None or len(shape) < 3:
                 continue
-            dims.extend((int(shape[0]), int(shape[-1])))
+            dims.extend((int(shape[psi.lv_idx]), int(shape[psi.rv_idx])))
         return max(dims) if dims else None
 
     def _set_bond_dim(self, D=None, *, psi=None):
@@ -467,13 +471,14 @@ class TDDMRG(DMRG):
     def _ensure_dense_mps(self, psi, *, copy=True):
         if not isinstance(psi, MPS):
             raise TypeError(f"Expected an MPS initial state, got {type(psi)}.")
-        if hasattr(psi.factors[0], "qns"):
+        if self._is_quantum_number_state(psi):
             site_qn_maps = None
             if hasattr(self, "_dense_site_qn_maps"):
                 site_qn_maps = self._dense_site_qn_maps()
             elif getattr(self, "dmrg", None) is not None:
                 site_qn_maps = getattr(self.dmrg, "site_qn_maps", None)
             psi = symmetric_to_dense(psi, site_qn_maps=site_qn_maps)
+        psi = psi.to_order(["lv", "p", "rv"])
         return psi.copy() if copy else psi
 
     def _default_initial_state(self):
@@ -503,7 +508,7 @@ class TDDMRG(DMRG):
         if self._has_ground_state():
             return self.export_ground_state(dense=False)
         guess = self.init_guess
-        if isinstance(guess, MPS) and hasattr(guess.factors[0], "qns"):
+        if self._is_quantum_number_state(guess):
             return guess.copy()
         return self._default_initial_state()
 
@@ -520,7 +525,7 @@ class TDDMRG(DMRG):
             state is not None
             and isinstance(state, MPS)
             and state.factors
-            and hasattr(state.factors[0], "qns")
+            and not state.factors[0].is_dense
         )
 
     def default_initial_condition(self, D=None, *, projection=None):
@@ -893,10 +898,10 @@ class TDDMRG(DMRG):
 
     @staticmethod
     def _native_su2_expectation(state, operator, identity):
-        denominator = contract_chain_expectation(state.sites, identity)
+        denominator = contract_chain_expectation(state.tensors, identity)
         if abs(denominator) <= 1.0e-30:
             raise ValueError("Cannot measure an observable on a zero-norm SU(2) MPS.")
-        numerator = contract_chain_expectation(state.sites, operator)
+        numerator = contract_chain_expectation(state.tensors, operator)
         return numerator / denominator
 
     def _run_native_su2_tdvp(
@@ -959,7 +964,7 @@ class TDDMRG(DMRG):
                 )
             )
         observables = self._native_su2_observables(e_ops, hamiltonian)
-        identity = _identity_mpo_factors_for_sites_and_mpo(state.sites, hamiltonian)
+        identity = _identity_mpo_factors_for_sites_and_mpo(state.tensors, hamiltonian)
         checkpoints = [index for index in range(1, int(steps) + 1) if index % interval == 0]
         measured = []
         energies = []
@@ -978,7 +983,7 @@ class TDDMRG(DMRG):
                 max_bond_mode="reduced",
             )
             moving_environment = SU2MovingEnvironment(
-                work.sites,
+                work.tensors,
                 mpo_factors=propagation_hamiltonian,
                 su2_boundary_environment=boundary_environment,
             )
@@ -1029,7 +1034,7 @@ class TDDMRG(DMRG):
                     for update in half_sweep["updates"]
                 )
             )
-            identity = _identity_mpo_factors_for_sites_and_mpo(work.sites, hamiltonian)
+            identity = _identity_mpo_factors_for_sites_and_mpo(work.tensors, hamiltonian)
             if track_energy:
                 energies.append(self._native_su2_expectation(work, hamiltonian, identity))
             if step in checkpoint_set:
@@ -1490,7 +1495,7 @@ class TDDMRG(DMRG):
                     max_bond_mode="reduced",
                 )
                 moving_environment = SU2MovingEnvironment(
-                    returned.sites,
+                    returned.tensors,
                     mpo_factors=propagation_hamiltonian,
                     su2_boundary_environment=boundary_environment,
                 )
@@ -1562,21 +1567,21 @@ class TDDMRG(DMRG):
                     moving_environment=moving_environment,
                 )
             identity = _identity_mpo_factors_for_sites_and_mpo(
-                psi.sites,
+                psi.tensors,
                 hamiltonian,
             )
             overlap = contract_chain_expectation(
-                psi.sites,
+                psi.tensors,
                 identity,
-                bra_sites=returned.sites,
+                bra_sites=returned.tensors,
             )
-            norm_initial = contract_chain_expectation(psi.sites, identity)
+            norm_initial = contract_chain_expectation(psi.tensors, identity)
             returned_identity = _identity_mpo_factors_for_sites_and_mpo(
-                returned.sites,
+                returned.tensors,
                 hamiltonian,
             )
             norm_returned = contract_chain_expectation(
-                returned.sites,
+                returned.tensors,
                 returned_identity,
             )
             diagnostic = TDMPS.overlap_diagnostic(

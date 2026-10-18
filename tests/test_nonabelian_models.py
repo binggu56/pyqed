@@ -896,6 +896,7 @@ def test_cpp_contextual_right_core_matches_reduced_reference_orientation():
         outer_bra,
         outer_ket,
     )
+    object.__setattr__(factor, "normal_complementary_contextual_python_reference", True)
     reference = _right_reduced_rank_coupled_block(factor, *sectors)
     connected_reference = {}
     for (source, target), block in reference.items():

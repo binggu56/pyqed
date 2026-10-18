@@ -83,7 +83,7 @@ def run_dmrgscf(mf, args, weights, mo_coeff=None):
         nsweeps=args.sweeps,
         sweep_tol=args.sweep_tol,
         orb_grad_tol=args.orb_grad_tol,
-        orbital_driver="second_order",
+        algorithm="second_order",
         orbital_micro_cycles=args.orbital_micro_cycles,
         micro_ci_mode=args.micro_ci_mode,
         optimizer_max_step_norm=args.max_step,
@@ -118,7 +118,7 @@ def run_dmrgscf(mf, args, weights, mo_coeff=None):
             ),
             "maximum_resident_memory_mib": _rss_mib(),
             "reduced_root_bond_dimensions": [
-                max([1] + [len(site.qns[2]) for site in state.sites[:-1]])
+                max([1] + [len(site.qns[2]) for site in state.tensors[:-1]])
                 for state in calculation.dmrg.states
             ],
         }
@@ -328,7 +328,6 @@ def main():
                 "coord_type": "spherical",
                 "low_rank_tol": args.cd_tol,
                 "eri_screen_tol": 0.0,
-                "parallel": False,
                 "rys_cache_mib": 256,
             },
         )
@@ -371,7 +370,6 @@ def main():
                     "coord_type": "spherical",
                     "low_rank_tol": args.cd_tol,
                     "eri_screen_tol": 0.0,
-                    "parallel": False,
                     "rys_cache_mib": 256,
                 },
             )

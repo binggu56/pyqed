@@ -262,9 +262,14 @@ def _uses_channel_resolved_local_basis(two_site, W1, W2, *, rank_coupled):
             )
             for factor in normal_complementary
         )
-    return all(
-        bool(getattr(factor, "fully_reduced_identity", False))
-        for factor in factors
+    # Generic rank-coupled Hamiltonians need the same intermediate-spin
+    # channels as the identity metric, not only normal/complementary MPOs.
+    return (
+        two_site.metadata.get("physical_basis") == "fully_reduced_su2"
+        or all(
+            bool(getattr(factor, "fully_reduced_identity", False))
+            for factor in factors
+        )
     )
 
 
@@ -1490,6 +1495,34 @@ def _right_reduced_recoupling_coeff(
     return np.vdot(left_basis, projected) / norm
 
 
+def _contextual_environment_core(W, sectors, *, left):
+    """Reuse NC recoupling without changing the environment's metric convention."""
+    owner = getattr(W, "normal_complementary_owner", None)
+    if (owner is None or not getattr(W, "normal_complementary_fully_reduced", False)
+            or getattr(W, "normal_complementary_contextual_python_reference", False)):
+        return None
+    q_lb, q_lk, q_pb, q_pk, q_rb, q_rk = sectors
+    boundary = (q_lb, q_lk) if left else (q_rb, q_rk)
+    next_pair = (q_rb, q_rk) if left else (q_lb, q_lk)
+    blocks = owner.contextual_core(
+        W.normal_complementary_site, q_pb.charge, q_pk.charge,
+        *(_sector_irrep(q).two_j for q in boundary),
+        _sector_irrep(q_pb).two_j, _sector_irrep(q_pk).two_j,
+        *(_sector_irrep(q).two_j for q in next_pair), left,
+        bool(getattr(W, "normal_complementary_right_dual", False)))
+    if not left:
+        # Contextual right cores include the connection metric; environment
+        # transport applies it separately. Undo it only on supported rows.
+        for (source, target), block in blocks.items():
+            rank = W.left_channel_irreps[source]
+            weights = np.asarray([_component_basis_norm(q_lb, q_lk, rank, m)
+                                  for m in ordered_two_m_values(rank)])
+            if np.any(weights == 0):
+                return None
+            blocks[source, target] = block / weights[:, None, None, None]
+    return blocks
+
+
 def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     # Virtual charges constrain routing, not spin recoupling. Physical charges
     # must remain in the key because they select local fermionic operators.
@@ -1507,6 +1540,11 @@ def _left_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     cache = W._environment_reduced_block_cache
     if cache_key in cache:
         return cache[cache_key]
+    compiled = _contextual_environment_core(
+        W, (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk), left=True)
+    if compiled is not None:
+        cache[cache_key] = compiled
+        return compiled
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -1804,6 +1842,11 @@ def _right_reduced_rank_coupled_block(W, q_lb, q_lk, q_pb, q_pk, q_rb, q_rk):
     cache = W._environment_reduced_block_cache
     if cache_key in cache:
         return cache[cache_key]
+    compiled = _contextual_environment_core(
+        W, (q_lb, q_lk, q_pb, q_pk, q_rb, q_rk), left=False)
+    if compiled is not None:
+        cache[cache_key] = compiled
+        return compiled
     reduced = {}
     dense_block = W.dense_blocks.get((q_pb, q_pk))
     dtype = _mpo_dtype(W)
@@ -2531,7 +2574,7 @@ def _packed_boundary_labels(packed):
     header = np.asarray([array.size for array in topology_arrays], dtype=np.int64)
     sector_quantum_numbers = []
     for sector in packed.sector_codec.sectors:
-        charge = getattr(sector, "charge", None)
+        charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
         irrep = getattr(sector, "irrep", None)
         two_j = getattr(irrep, "two_j", None)
         if two_j is None:
@@ -5256,6 +5299,7 @@ class BlockSparseEnvironmentChain:
         sweep_direction=None,
         reuse_prebuilt_boundary_side=None,
         boundaries_only=False,
+        target_bond=None,
     ):
         """
         Build block-sparse renormalized environments for a chain.
@@ -5274,6 +5318,9 @@ class BlockSparseEnvironmentChain:
             ``renormalized_blocks`` from the previous sweep.  That side is not
             rebuilt here, making the sweep use the stack as a moving
             environment.
+        :param target_bond: For a standalone local solve, construct only the
+            left and right prefixes needed by this bond. Other entries are
+            unavailable; this chain must not be used for a sweep.
         :returns: :class:`BlockSparseEnvironmentChain`.
 
         ``boundaries_only=True`` initializes just the two endpoint blocks for
@@ -5305,6 +5352,13 @@ class BlockSparseEnvironmentChain:
                 raise ValueError("A left-to-right sweep can only reuse the right boundary side.")
             if sweep_direction == "rl" and reuse_prebuilt_boundary_side != "left":
                 raise ValueError("A right-to-left sweep can only reuse the left boundary side.")
+        if target_bond is not None:
+            if (renormalized_blocks is not None or boundaries_only
+                    or sweep_direction is not None):
+                raise ValueError("A target bond requires standalone boundary construction.")
+            if int(target_bond) != target_bond or not 0 <= target_bond < len(sites) - 1:
+                raise ValueError("target_bond is outside the chain.")
+            target_bond = int(target_bond)
         sites = [normalize_site_tensor_layout(site) for site in sites]
 
         site_layouts = [_tensor_dense_layout(site) for site in sites]
@@ -5358,6 +5412,8 @@ class BlockSparseEnvironmentChain:
 
         rank_coupled = _is_rank_coupled_chain(sparse_mpo_factors)
         nsites = len(sites)
+        left_stop = nsites - 1 if target_bond is None else target_bond
+        right_stop = 0 if target_bond is None else target_bond + 1
         build_left = sweep_direction is None or sweep_direction == "rl"
         build_right = sweep_direction is None or sweep_direction == "lr"
         if boundaries_only:
@@ -5411,7 +5467,7 @@ class BlockSparseEnvironmentChain:
                         ),
                     )
                 left_envs = [initial_left]
-                for i in range(nsites - 1):
+                for i in range(left_stop):
                     left_envs.append(
                         left_envs[-1].advance(
                             sparse_mpo_factors[i],
@@ -5444,7 +5500,7 @@ class BlockSparseEnvironmentChain:
                         ),
                     )
                 right_envs = [initial_right]
-                for i in range(nsites - 1, 0, -1):
+                for i in range(nsites - 1, right_stop, -1):
                     right_envs.append(
                         right_envs[-1].advance(
                             sparse_mpo_factors[i],
@@ -5466,7 +5522,7 @@ class BlockSparseEnvironmentChain:
             )
             if build_left:
                 left_envs = [initial_left]
-                for i in range(nsites - 1):
+                for i in range(left_stop):
                     left_envs.append(
                         left_envs[-1].advance(
                             sparse_mpo_factors[i],
@@ -5484,7 +5540,7 @@ class BlockSparseEnvironmentChain:
             )
             if build_right:
                 right_envs = [initial_right]
-                for i in range(nsites - 1, 0, -1):
+                for i in range(nsites - 1, right_stop, -1):
                     right_envs.append(
                         right_envs[-1].advance(
                             sparse_mpo_factors[i],
@@ -5496,6 +5552,9 @@ class BlockSparseEnvironmentChain:
                 right_envs = list(reversed(right_envs))
             else:
                 right_envs = [None] * (nsites - 1) + [initial_right]
+        if target_bond is not None:
+            left_envs.extend([None] * (nsites - len(left_envs)))
+            right_envs = [None] * (nsites - len(right_envs)) + right_envs
         chain = cls(
             list(sites),
             list(sparse_mpo_factors),
@@ -6440,7 +6499,10 @@ class LocalTransitionPlan:
     The fixed half of the chain is contracted once.  Each subsequent
     ``contract`` call only absorbs the varying bra/ket tensor and the shorter
     unfixed half.  Rank-coupled MPOCore cores remain in their reduced
-    Wigner--Eckart representation throughout.
+    Wigner--Eckart representation throughout. Optional ``ket_sites`` supplies
+    a distinct fixed ket chain for spatial-group transitions. An optional
+    ``boundary_cache`` shares contracted prefixes/suffixes across plans. It
+    must be scoped to immutable tensor/MPO snapshots and cleared after updates.
     """
 
     site: int
@@ -6450,9 +6512,11 @@ class LocalTransitionPlan:
     rank_coupled: bool
     direction: str
     anchor: object
+    ket_sites: tuple | None = None
 
     @classmethod
-    def build(cls, sites, mpo_factors, site, *, direction=None):
+    def build(cls, sites, mpo_factors, site, *, direction=None, ket_sites=None,
+              boundary_cache=None):
         if len(sites) != len(mpo_factors):
             raise ValueError(
                 "LocalTransitionPlan requires one MPOCore core per site tensor."
@@ -6463,8 +6527,30 @@ class LocalTransitionPlan:
         if site < 0 or site >= len(sites):
             raise IndexError(f"Site {site} is outside a chain of length {len(sites)}.")
 
-        sites = tuple(normalize_site_tensor_layout(tensor) for tensor in sites)
-        layouts = tuple(_tensor_dense_layout(tensor) for tensor in sites)
+        source_sites = tuple(sites)
+        source_ket = source_sites if ket_sites is None else tuple(ket_sites)
+        def prepare(tensor):
+            key = ("tensor_layout", id(tensor))
+            cached = None if boundary_cache is None else boundary_cache.get(key)
+            if cached is None:
+                normalized = normalize_site_tensor_layout(tensor)
+                cached = (tensor, normalized, _tensor_dense_layout(normalized))
+                if boundary_cache is not None:
+                    boundary_cache[key] = cached
+            return cached
+
+        if boundary_cache is None:
+            sites = tuple(normalize_site_tensor_layout(tensor) for tensor in source_sites)
+            ket_sites = sites if ket_sites is None else tuple(
+                normalize_site_tensor_layout(tensor) for tensor in source_ket)
+            layouts = tuple(_tensor_dense_layout(tensor) for tensor in ket_sites)
+        else:
+            sites = tuple(prepare(tensor)[1] for tensor in source_sites)
+            prepared_ket = tuple(prepare(tensor) for tensor in source_ket)
+            ket_sites = tuple(item[1] for item in prepared_ket)
+            layouts = tuple(item[2] for item in prepared_ket)
+        if len(ket_sites) != len(sites):
+            raise ValueError("Bra and ket chains must have equal lengths")
         factors = tuple(
             _normalize_block_sparse_mpo_factors(
                 mpo_factors,
@@ -6493,13 +6579,24 @@ class LocalTransitionPlan:
                     _initial_left_env_blocks(layouts[0], factors[0]),
                     rank_coupled=False,
                 )
+            prefix = ("lr", tuple(id(core) for core in mpo_factors))
+            dependencies = []
             for index in range(site):
+                dependencies.extend((source_sites[index], source_ket[index]))
+                prefix += (id(source_sites[index]), id(source_ket[index]))
+                cached = None if boundary_cache is None else boundary_cache.get(prefix)
+                if cached is not None:
+                    anchor = cached[0]
+                    continue
                 anchor = anchor.advance(
                     factors[index],
                     sites[index],
-                    sites[index],
+                    ket_sites[index],
                     phys_slices=None if rank_coupled else phys_slices[index],
                 )
+                if boundary_cache is not None:
+                    # Hold sources alive: tensor identities must not be recycled.
+                    boundary_cache[prefix] = (anchor, tuple(dependencies), tuple(mpo_factors))
         else:
             direction = "rl"
             if rank_coupled:
@@ -6512,13 +6609,24 @@ class LocalTransitionPlan:
                     _initial_right_env_blocks(layouts[-1], factors[-1]),
                     rank_coupled=False,
                 )
+            prefix = ("rl", tuple(id(core) for core in mpo_factors))
+            dependencies = []
             for index in range(len(sites) - 1, site, -1):
+                dependencies.extend((source_sites[index], source_ket[index]))
+                prefix += (id(source_sites[index]), id(source_ket[index]))
+                cached = None if boundary_cache is None else boundary_cache.get(prefix)
+                if cached is not None:
+                    anchor = cached[0]
+                    continue
                 anchor = anchor.advance(
                     factors[index],
                     sites[index],
-                    sites[index],
+                    ket_sites[index],
                     phys_slices=None if rank_coupled else phys_slices[index],
                 )
+                if boundary_cache is not None:
+                    # Hold sources alive: tensor identities must not be recycled.
+                    boundary_cache[prefix] = (anchor, tuple(dependencies), tuple(mpo_factors))
 
         return cls(
             site=site,
@@ -6528,6 +6636,7 @@ class LocalTransitionPlan:
             rank_coupled=rank_coupled,
             direction=direction,
             anchor=anchor,
+            ket_sites=ket_sites,
         )
 
     @property
@@ -6555,7 +6664,7 @@ class LocalTransitionPlan:
                 env = env.advance(
                     self.mpo_factors[index],
                     self.sites[index],
-                    self.sites[index],
+                    self.ket_sites[index] if self.ket_sites is not None else self.sites[index],
                     phys_slices=(
                         None if self.rank_coupled else self.phys_slices[index]
                     ),
@@ -6565,7 +6674,7 @@ class LocalTransitionPlan:
                 env = env.advance(
                     self.mpo_factors[index],
                     self.sites[index],
-                    self.sites[index],
+                    self.ket_sites[index] if self.ket_sites is not None else self.sites[index],
                     phys_slices=(
                         None if self.rank_coupled else self.phys_slices[index]
                     ),

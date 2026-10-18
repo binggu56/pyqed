@@ -7,6 +7,35 @@ import numpy as np
 from pyqed.mps.mps import MPO
 
 
+def local_sum_mpo(operators):
+    """Exact bond-two MPO for a sum of one-site operators.
+
+    Uses the finite-state MPO construction reviewed by Schollwoeck,
+    Annals of Physics 326, 96 (2011), doi:10.1016/j.aop.2010.09.012.
+    No fitting or truncation. Supply zero matrices on spectator sites,
+    or prepend/append bond-one identities to an active-site MPO.
+    """
+    terms = [np.asarray(t) for t in operators]
+    if not terms or any(t.ndim != 2 or t.shape[0] != t.shape[1] for t in terms):
+        raise ValueError("Expected a nonempty sequence of square local operators.")
+    if len(terms) == 1:
+        return MPO([terms[0][None, None].copy()])
+    dtype = np.result_type(*terms)
+    cores = []
+    for i, term in enumerate(terms):
+        identity = np.eye(len(term), dtype=dtype)
+        if i == 0:
+            core = np.stack((term, identity))[None]
+        elif i == len(terms) - 1:
+            core = np.stack((identity, term))[:, None]
+        else:
+            core = np.zeros((2, 2, len(term), len(term)), dtype=dtype)
+            core[0, 0] = core[1, 1] = identity
+            core[1, 0] = term
+        cores.append(core)
+    return MPO(cores)
+
+
 def nearest_neighbor_mpo(bond_hamiltonians, dims, *, check_hermitian=True):
     """Build an exact finite MPO for ``sum_i h[i, i+1]``."""
     dims = tuple(int(dim) for dim in dims)

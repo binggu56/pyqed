@@ -19,7 +19,53 @@ logger = logging.getLogger(__name__)
 OpTuple = namedtuple("OpTuple", ["symbol", "qn", "factor"])
 
 
-def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
+def operator_string_mpo(table, matrices, factors, *, workspace_bytes=512*2**20):
+    """Numerical-matrix adapter for the existing symbolic AutoMPO compiler.
+
+    ``matrices[site][symbol]`` supplies ordered local operators; table rows
+    are product strings. Bipartite matching shares symbolic prefixes/suffixes,
+    not numerical linear dependencies. No full Hilbert-space tensor is formed.
+    This adapts the graph construction of Ren et al., JCP 153, 084118 (2020),
+    doi:10.1063/5.0018149. Local dense MPO cores can still be large; the guard
+    bounds each allocated core and retained output, not total process RSS.
+    """
+    from pyqed.mps.mps import MPO
+    from pyqed.symmetry import IrrepTensor
+    table=np.asarray(table);factors=np.asarray(factors)
+    if table.ndim!=2 or table.shape[1]!=len(matrices) or factors.shape!=(len(table),):
+        raise ValueError('Operator strings and coefficient dimensions differ')
+    offsets=np.cumsum([0]+[len(x) for x in matrices])
+    if offsets[-1]>=np.iinfo(np.uint16).max:raise MemoryError('AutoMPO symbol index capacity exceeded')
+    if any(np.any((table[:,i]<0)|(table[:,i]>=len(values))) for i,values in enumerate(matrices)):
+        raise ValueError('Unknown local operator symbol')
+    encoded=(table+offsets[:-1]).astype(np.uint16)
+    encoded,factors=_deduplicate_table(encoded,factors)
+    primary=[Op(str(k),0,qn=0) for k in range(offsets[-1])]
+    def preflight(bonds):
+        sizes=[int(bonds[i])*int(bonds[i+1])*np.asarray(v[0]).shape[0]**2*16
+               for i,v in enumerate(matrices)]
+        if sum(sizes)>workspace_bytes:
+            raise MemoryError(f'AutoMPO preflight: bonds={bonds}, core_bytes={sizes}, '
+                              f'total={sum(sizes)} exceeds budget={workspace_bytes}')
+    symbolic=construct_symbolic_mpo(encoded,primary,factors,preflight=preflight)[0]
+    cores=[];retained=0
+    for site,mo in enumerate(symbolic):
+        values=matrices[site];n=np.asarray(values[0]).shape[0]
+        size=int(np.prod(mo.shape))*n*n*16
+        if retained+size>workspace_bytes:raise MemoryError(f'AutoMPO core {site} exceeds retained-core budget')
+        core=np.zeros((*mo.shape,n,n),complex)
+        for index in np.ndindex(mo.shape):
+            for term in mo[index]:
+                matrix=np.asarray(values[int(term.symbol)-offsets[site]])
+                if matrix.shape!=(n,n):raise ValueError('Local matrix dimensions differ')
+                core[index]+=term.factor*matrix
+        cores.append(IrrepTensor.from_dense_data(core,copy=False,
+            dirs=(-1,1,1,-1),names=('left','right','output','input')))
+        retained+=size
+    return MPO(cores)
+
+
+def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp", *, preflight=None):
     r"""
     A General Compact (Symbolic) MPO Construction Routine
 
@@ -106,6 +152,7 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
 
     # Simplest case. Cut to the chase
     if table.shape[0] == 1:
+        if preflight is not None: preflight([1]*(table.shape[1]+1))
         # The first layer: number of sites. The middle array: in and out virtual bond
         # the 4th layer: operator sums
         mpo: List[np.ndarray[List[Op]]] = []
@@ -142,6 +189,7 @@ def construct_symbolic_mpo(table, primary_ops, factor, algo="Hopcroft-Karp"):
     in_ops = [[OpTuple([0], qn=np.zeros(qn_size, dtype=int), factor=1)]]
 
     out_ops_list = _construct_symbolic_mpo(table, in_ops, factor, primary_ops, algo)
+    if preflight is not None: preflight([len(x) for x in out_ops_list])
     # number of sites + 1. Note that the table was expanded for convenience
     assert len(out_ops_list) == len(table[0]) - 1
     mpo = []

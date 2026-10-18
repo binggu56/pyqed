@@ -106,6 +106,7 @@ def main():
     )
     dmrgscf_start = time.perf_counter()
     mc.run(
+        algorithm="constrained",
         nstates=1,
         nsweeps=args.sweeps,
         symmetry="su2",

@@ -360,7 +360,14 @@ def _orbital_circuit(one_particle_map, *, return_info=False):
     matrix = np.asarray(one_particle_map, dtype=complex)
     if matrix.ndim != 2 or matrix.shape[0] != matrix.shape[1]:
         raise ValueError(f"Orbital map must be square, got {matrix.shape}.")
-    size = matrix.shape[0]
+    circuit, info = _cached_orbital_circuit(matrix.shape[0], matrix.tobytes())
+    return (circuit, dict(info)) if return_info else circuit
+
+
+@lru_cache(maxsize=128)
+def _cached_orbital_circuit(size, payload):
+    """Reuse immutable Gaussian gate plans for repeated exact orbital maps."""
+    matrix = np.frombuffer(payload, dtype=complex).reshape(size, size)
     identity = np.eye(size, dtype=complex)
     unitarity_residual = float(
         np.linalg.norm(matrix.conj().T @ matrix - identity, ord=2)
@@ -383,9 +390,9 @@ def _orbital_circuit(one_particle_map, *, return_info=False):
             + _adjacent_unitary_circuit(u)
         )
         factorization = "svd_givens"
-    if not return_info:
-        return circuit
-    return circuit, {
+    for operation in circuit:
+        operation[-1].setflags(write=False)
+    return tuple(circuit), {
         "factorization": factorization,
         "unitarity_residual": unitarity_residual,
         "unitarity_tolerance": unitarity_tolerance,

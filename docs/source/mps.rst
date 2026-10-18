@@ -160,6 +160,9 @@ consistent repeating tensor, so ``state`` is populated only when the candidate
 ``UniformMPS`` energy agrees with the growth estimate within the configured
 ``state_energy_tol``.
 
+:doc:`cbe_dmrg` describes reduced one-site controlled bond expansion,
+spatial multiplets, and the matched Hubbard benchmarks.
+
 Quantum Chemistry DMRG
 ----------------------
 

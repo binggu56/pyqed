@@ -567,6 +567,8 @@ def build_random_reduced_spatial_mps(
     seed=None,
     scale=1.0,
     dtype=float,
+    cap_multiplicity=False,
+    orbsym=None,
 ):
     """
     Build a random MPS in the fully reduced spatial-orbital convention.
@@ -577,12 +579,15 @@ def build_random_reduced_spatial_mps(
     block2-style Wigner-Eckart SU(2) sweep path.
 
     :param nsites: Number of spatial-orbital sites.
-    :param target_sector: Total charge-spin sector on the right boundary.
+    :param target_sector: Total particle-number, spin, and spatial sector.
     :param bond_multiplicity: Initial multiplicity copies per reachable
         intermediate sector.
     :param seed: Optional random seed.
     :param scale: Gaussian scale for initialized reduced blocks.
     :param dtype: Block dtype.
+    :param cap_multiplicity: Bound each bond-sector multiplicity by both
+        left-prefix and right-completion fusion-path counts (no state truncation).
+    :param orbsym: Optional real-Abelian XOR character labels, one per orbital.
     :returns: List of rank-3 fully reduced MPS site tensors.
     """
 
@@ -604,8 +609,24 @@ def build_random_reduced_spatial_mps(
         else:
             target_sector = spatial_target_sector(nsites, 1)
 
-    forward = _forward_reachable(phys_sectors, nsites, vacuum)
-    backward = _backward_reachable(phys_sectors, forward, target_sector)
+    orbital_irreps = [0]*nsites if orbsym is None else list(orbsym)
+    if len(orbital_irreps) != nsites:
+        raise ValueError("orbsym must contain one Abelian irrep per spatial orbital.")
+    physical_sectors = [tuple(SpinChargeSector(q.charge, q.irrep,
+        point_group=gamma if q.charge == 1 else 0) for q in phys_sectors)
+        for gamma in orbital_irreps]
+    forward = [{vacuum}]
+    for physical in physical_sectors:
+        forward.append({r for l in forward[-1] for p in physical
+                        for r in _fuse_spatial_sectors(l, p)})
+    if target_sector not in forward[-1]:
+        raise ValueError(f"Target sector {target_sector!r} is not reachable with these orbital irreps.")
+    backward = [set() for _ in range(nsites+1)]
+    backward[-1] = {target_sector}
+    for i in range(nsites-1, -1, -1):
+        backward[i] = {l for l in forward[i] if any(
+            r in backward[i+1] for p in physical_sectors[i]
+            for r in _fuse_spatial_sectors(l, p))}
     bond_sector_sets = [
         tuple(sorted(forward[i].intersection(backward[i])))
         for i in range(nsites + 1)
@@ -617,20 +638,48 @@ def build_random_reduced_spatial_mps(
             f"Target sector {target_sector!r} is not reachable with {nsites} reduced spatial sites."
         )
 
+    capacities = None
+    if cap_multiplicity:
+        left_counts = [{vacuum: 1}]
+        for bond in range(nsites):
+            counts = {}
+            for left, count in left_counts[-1].items():
+                for physical in physical_sectors[bond]:
+                    for right in _fuse_spatial_sectors(left, physical):
+                        if right in bond_sector_sets[bond + 1]:
+                            counts[right] = counts.get(right, 0) + count
+            left_counts.append(counts)
+        right_counts = [None] * (nsites + 1)
+        right_counts[-1] = {target_sector: 1}
+        for bond in range(nsites - 1, -1, -1):
+            right_counts[bond] = {
+                left: sum(right_counts[bond + 1].get(right, 0)
+                          for physical in physical_sectors[bond]
+                          for right in _fuse_spatial_sectors(left, physical))
+                for left in bond_sector_sets[bond]}
+        capacities = [{sector: min(bond_multiplicity, left_counts[bond][sector],
+                                  right_counts[bond][sector])
+                       for sector in sectors}
+                      for bond, sectors in enumerate(bond_sector_sets)]
+
     rng = np.random.default_rng(seed)
     tensors = []
     for site_index in range(nsites):
+        phys_sectors = physical_sectors[site_index]
+        phys_dims = {sector: 1 for sector in phys_sectors}
         left_sectors = bond_sector_sets[site_index]
         right_sectors = bond_sector_sets[site_index + 1]
         left_qns = (
             [left_sectors[0]]
             if site_index == 0
-            else [sector for sector in left_sectors for _ in range(bond_multiplicity)]
+            else [sector for sector in left_sectors for _ in range(
+                capacities[site_index][sector] if capacities is not None else bond_multiplicity)]
         )
         right_qns = (
             [right_sectors[0]]
             if site_index == nsites - 1
-            else [sector for sector in right_sectors for _ in range(bond_multiplicity)]
+            else [sector for sector in right_sectors for _ in range(
+                capacities[site_index + 1][sector] if capacities is not None else bond_multiplicity)]
         )
 
         data = {}

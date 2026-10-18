@@ -357,6 +357,8 @@ class Leg:
 
     @staticmethod
     def _irrep_dimension(symmetry, charge):
+        if hasattr(symmetry, 'dimension'):
+            return int(symmetry.dimension(charge))
         if isinstance(symmetry, SU2Symmetry):
             return int(charge) + 1
         if isinstance(symmetry, ProductSymmetry):
@@ -749,6 +751,8 @@ class IrrepTensor:
     @property
     def has_nonabelian_symmetry(self):
         for leg in self.legs:
+            if leg.symmetry is not None and leg.full_dim > leg.reduced_dim:
+                return True
             if isinstance(leg.symmetry, (SU2Symmetry, ProductSymmetry)):
                 return True
             for sector in leg.sectors:

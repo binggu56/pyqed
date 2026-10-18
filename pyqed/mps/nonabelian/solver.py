@@ -2072,8 +2072,6 @@ def _solve_packed_generalized_davidson(
             residual_norm <= tol_res
             and prev_theta is not None
             and de <= tol
-            and prev_ritz is not None
-            and 1.0 - min(last_root_overlap, 1.0) <= root_overlap_tolerance
             and Vp.shape[1] >= minimum_explored_dimension
         )
         convergence_streak = convergence_streak + 1 if convergence_candidate else 0
@@ -2118,6 +2116,20 @@ def _solve_packed_generalized_davidson(
                         break
                     trial = trial_n
                 if corr_p is None:
+                    # An exact Ritz vector has no residual direction. Explore
+                    # the remaining metric support before declaring exhaustion.
+                    for idx in seed_order:
+                        seed = np.zeros_like(guess_packed, dtype=complex)
+                        seed[int(idx)] = 1.0
+                        seed_n = np.asarray(N(seed), dtype=complex).reshape(-1)
+                        corr_p, corr_n = _metric_orthogonalize_packed_vector(
+                            seed, seed_n, Vp, BVp, tol=lindep,
+                            metric_floor=metric_floor, metric_operator=N,
+                        )
+                        if corr_p is not None:
+                            break
+                if corr_p is None:
+                    converged = residual_norm <= tol_res
                     break
         else:
             t0 = time.perf_counter() if profile else None
@@ -2127,6 +2139,7 @@ def _solve_packed_generalized_davidson(
             if corr_norm <= lindep:
                 corr_p = _next_seed_vector()
                 if corr_p is None:
+                    converged = residual_norm <= tol_res
                     break
             else:
                 corr_p = corr_p / corr_norm
@@ -3223,8 +3236,8 @@ def _solve_tensor_davidson(
                 "energy": float(theta),
                 "metric": residual,
                 "residual": residual,
-                "davidson_iterations": int(itermax),
-                "davidson_converged": False,
+                "davidson_iterations": 0,
+                "davidson_converged": bool(residual <= (np.sqrt(tol) if tol_residual is None else tol_residual)),
                 "subspace_dim": int(matrix.shape[0]),
                 "generalized_norm": True,
                 "tensor_davidson": True,
@@ -3237,12 +3250,13 @@ def _solve_tensor_davidson(
         else:
             eigvals, eigvecs = np.linalg.eigh(0.5 * (matrix + matrix.conj().T))
             vec_packed = _canonicalize_eigenvector(eigvecs[:, 0], reference=guess_packed)
+            residual = float(np.linalg.norm(matrix @ vec_packed - eigvals[0] * vec_packed))
             objective = {
                 "energy": float(np.real(eigvals[0])),
-                "metric": 0.0,
-                "residual": 0.0,
-                "davidson_iterations": int(itermax),
-                "davidson_converged": False,
+                "metric": residual,
+                "residual": residual,
+                "davidson_iterations": 0,
+                "davidson_converged": bool(residual <= (np.sqrt(tol) if tol_residual is None else tol_residual)),
                 "subspace_dim": int(matrix.shape[0]),
                 "generalized_norm": False,
                 "tensor_davidson": True,
@@ -8202,6 +8216,8 @@ def solve_local_two_site(
             or two_site_state_basis(two_site, layout=raw_layout)
         )
     layout = local_basis
+    if norm_preview is not None:
+        _operator_basis_for_layout(norm_preview, layout)
     if guess is None:
         guess_vec = vec0
     elif isinstance(guess, IrrepTensor):
@@ -8672,8 +8688,8 @@ def solve_local_two_site(
                         tol=max(tol, 1e-12),
                     )
                     solver_info = {
-                        "davidson_iterations": int(itermax),
-                        "davidson_converged": False,
+                        "davidson_iterations": 0,
+                        "davidson_converged": bool(np.max(residuals) <= (np.sqrt(tol) if tol_residual is None else tol_residual)),
                         "subspace_dim": int(dim),
                         "restarts": 0,
                         "generalized_dense_fallback": True,
@@ -8885,8 +8901,8 @@ def solve_local_two_site(
                     tol=max(tol, 1e-12),
                 )
                 solver_info = {
-                    "davidson_iterations": int(itermax),
-                    "davidson_converged": False,
+                    "davidson_iterations": 0,
+                    "davidson_converged": bool(np.max(residuals) <= (np.sqrt(tol) if tol_residual is None else tol_residual)),
                     "subspace_dim": int(dim),
                     "restarts": 0,
                     "generalized_dense_fallback": True,
@@ -9401,6 +9417,12 @@ def solve_local_two_site(
         )
         objective["dense_fallback"] = False
         objective["coupled_physical_used"] = False
+        if not allow_unconverged_roots and not objective.get("davidson_converged", False):
+            raise RuntimeError(
+                "Local Davidson did not converge: "
+                f"residual={objective.get('residual')}, iterations="
+                f"{objective.get('davidson_iterations')}."
+            )
         canonical_reduced_basis = bool(
             objective.get("canonical_reduced_basis", False)
         )
@@ -9535,6 +9557,15 @@ def solve_local_two_site(
                 "subspace_dim": int(dim),
             }
         fallback_used = True
+    if fallback_used:
+        metric_vector = norm_matrix @ vec if norm_resolved is not None else vec
+        residual = float(np.linalg.norm(matrix @ vec - objective["energy"] * metric_vector))
+        objective.update(
+            metric=residual, residual=residual, davidson_iterations=0,
+            davidson_converged=bool(
+                residual <= (np.sqrt(tol) if tol_residual is None else tol_residual)
+            ),
+        )
     objective["dense_fallback"] = fallback_used
     objective["coupled_physical_used"] = False
     objective["canonical_norm"] = canonical_norm

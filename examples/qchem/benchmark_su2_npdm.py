@@ -46,7 +46,7 @@ def run_benchmark(ncas, bond_dimension, sweeps, spacing):
 
     started = time.perf_counter()
     component = dmrg._su2_runtime.moving_environment.spatial_npdm(
-        dmrg.dmrg.ground_state.sites,
+        dmrg.dmrg.ground_state.tensors,
         spin_rotation_reduction=True,
         component_reference=True,
     )

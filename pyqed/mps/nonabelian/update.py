@@ -36,8 +36,7 @@ def _sector_dim_from_data(tensor, axis):
         if axis == 1 and (tensor.metadata or {}).get("physical_basis") == "fully_reduced_su2":
             dims[sector] = 1
             continue
-        dim = getattr(sector, "dim", None)
-        dims[sector] = int(dim) if dim is not None else 1
+        dims[sector] = int(tensor.legs[axis].dims[sector])
     return dims
 
 
@@ -926,6 +925,8 @@ def two_site_update(
         if profile:
             timing["optimized_expand"] += time.perf_counter() - t0
 
+    cbe_sector_factors = local_objective.pop('_cbe_sector_factors', None)
+    cbe_update_engine = local_objective.pop('_cbe_update_engine', None)
     optimized_roots = None
     if isinstance(local_objective, dict):
         optimized_roots = local_objective.pop("optimized_roots", None)
@@ -1030,8 +1031,9 @@ def two_site_update(
             cutoff=cutoff,
             retain_sector_topology=retain_sector_topology,
             absorb=absorb,
+            sector_factors=cbe_sector_factors,
             sweep_engine=(
-                None
+                cbe_update_engine
                 if lifecycle_owner is None
                 else getattr(lifecycle_owner, "su2_moving_environment", None)
             ),
@@ -1104,7 +1106,7 @@ def two_site_update(
             )
     if isinstance(local_objective, dict):
         local_objective = dict(local_objective)
-        if profile and optimized_roots is None:
+        if profile and optimized_roots is None and cbe_sector_factors is None:
             reconstructed = merge_mps_sites(left, right)
             optimized_blocks = (
                 optimized.metadata.get("contracted_channel_blocks", {})
@@ -1141,6 +1143,8 @@ def two_site_update(
             local_objective["split_relative_reconstruction_error"] = float(
                 np.sqrt(difference_sq / max(reference_sq, 1.0e-300))
             )
+        if cbe_sector_factors is not None:
+            local_objective["cbe_compiled_update"] = True
         local_objective.setdefault(
             "metric_weighted_split",
             bool(
@@ -1168,7 +1172,7 @@ def two_site_update(
         }
     return {
         "merged": merged,
-        "optimized": optimized,
+        "optimized": optimized if cbe_sector_factors is None else None,
         "optimized_roots": optimized_roots,
         "root_site_pairs": root_site_pairs,
         "left": left,

@@ -140,7 +140,7 @@ def run_dmrg(mf, mo_coeff, exact_energy, *, D, nsweeps):
         "runtime_memory_bytes": int(solver.dmrg.diagnostics.get("memory_bytes", 0)),
         "history": cycle_history,
     }
-    result.update(_state_size(solver.ground_state.sites))
+    result.update(_state_size(solver.ground_state.tensors))
     return result, np.asarray(solver.h1e[0]), np.asarray(solver.h2e[0, 0]), float(solver.e_core)
 
 
@@ -181,7 +181,7 @@ def run_letta(
             truncation_tol=1.0e-6,
             consecutive_cycles=2,
             max_local_parameters=4096,
-            gauge=None if gauge == "none" else gauge,
+            gauge=gauge,
             reuse_environments=reuse_environments,
             dense_dim=dense_dim,
         )
@@ -404,7 +404,9 @@ def main():
     parser.add_argument("--letta-cycles", type=int, default=6)
     parser.add_argument("--letta-dense-dim", type=int, default=0)
     parser.add_argument(
-        "--letta-gauge", choices=("conditional", "none"), default="conditional"
+        "--letta-gauge",
+        choices=("auto", "conditional", "none"),
+        default="conditional",
     )
     parser.add_argument(
         "--letta-reuse-environments",

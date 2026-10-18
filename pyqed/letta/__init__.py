@@ -139,6 +139,9 @@ from .adaptive_graph import (
 
 
 def __getattr__(name):
+    if name == "SpatialSymmetryLETTA":
+        from .spatial_symmetry import SpatialSymmetryLETTA
+        return SpatialSymmetryLETTA
     if name in {"NonAbelianFrontierLETTA", "SU2LETTA"}:
         from . import su2_qchem
 
@@ -168,6 +171,7 @@ __all__ = [
     "NonAbelianFrontierLETTA",
     "SequentialLETTA",
     "SU2LETTA",
+    "SpatialSymmetryLETTA",
     "NNNLETTA",
     "NNNLETTATDVPEngine",
     "CPBlockUpdate",

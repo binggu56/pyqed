@@ -298,7 +298,8 @@ def _identity_mpo_factors_for_sites_and_mpo(sites, mpo_factors):
 
     identity_factors = []
     for site, factor in zip(sites, mpo_factors):
-        if isinstance(factor, (MPOCore, IrreducibleMPO, RankCoupledMPO)):
+        if (isinstance(factor, (MPOCore, IrreducibleMPO, RankCoupledMPO))
+                and not any(getattr(q, "point_group", 0) for q in site.qns[1])):
             phys_leg = factor.phys_out_leg
         else:
             physical_slices = _tensor_dense_layout(site)["sector_slices"][1]
@@ -741,6 +742,10 @@ class MovingEnvironment:
 def sweep_once(
     sites,
     *,
+    algorithm="two_site",
+    cbe_expansion=8,
+    cbe_selection="shrewd",
+    cbe_preselection=None,
     direction="lr",
     solver=None,
     local_operator=None,
@@ -893,6 +898,29 @@ def sweep_once(
         Each bond update may include a ``local_objective`` payload reported by
         the solver callback.
     """
+    if algorithm not in {"two_site", "one_site_cbe"}:
+        raise ValueError("algorithm must be two_site or one_site_cbe")
+    if algorithm == "one_site_cbe":
+        if (local_solver is not None or solver is not None or post_split is not None
+                or int((local_solver_kwargs or {}).get("nstates", 1)) != 1
+                or root_target_mpo_factors is not None):
+            raise ValueError("CBE requires the single-root ground-state local solver")
+        if int(cbe_expansion) != cbe_expansion or cbe_expansion < 1:
+            raise ValueError("cbe_expansion must be a positive multiplet count")
+        if mixer_zero_block_noise_scale:
+            raise ValueError("CBE uses residual expansion rather than a zero-block noise mixer")
+        from .cbe import solve_cbe
+        from ._su2_kernel import SectorDecomposition
+        cbe_update_engine = SectorDecomposition()
+        def local_solver(bond, direction, merged, operator, **kwargs):
+            return solve_cbe(merged, operator, direction=direction,
+                             expansion_size=cbe_expansion, selection=cbe_selection,
+                             preselection_size=cbe_preselection,
+                             site_tensors=(updated_sites[bond], updated_sites[bond+1]),
+                             sweep_engine=cbe_update_engine,
+                             **kwargs)
+        store_orthonormal_renormalized_operators = False
+        canonical_local_norm = False
     input_mps = sites if isinstance(sites, MPS) else None
     sites = input_mps.tensors if input_mps is not None else sites
     if len(sites) < 2:
@@ -1177,7 +1205,9 @@ def sweep_once(
             max_component_elements=4 * 1024 * 1024,
             max_transform_elements=4 * 1024 * 1024,
             davidson_tolerance=float(
-                local_solver_kwargs.get("tol", 1.0e-8)
+                local_solver_kwargs.get("tol_residual")
+                if local_solver_kwargs.get("tol_residual") is not None
+                else np.sqrt(local_solver_kwargs.get("tol", 1.0e-8))
             ),
             max_iterations=int(
                 local_solver_kwargs.get("itermax", 100)
@@ -1187,7 +1217,9 @@ def sweep_once(
                 local_solver_kwargs.get("workspace_budget_bytes", 32 * 1024 * 1024)
             ),
             workspace_basis_arrays=3,
-            accept_unconverged=True,
+            accept_unconverged=bool(
+                local_solver_kwargs.get("allow_unconverged_roots", False)
+            ),
         )
         lifecycle_owner.cpp_state_owned = True
         for record_index, record in enumerate(records):
@@ -1461,7 +1493,7 @@ def sweep_once(
             else lifecycle_owner.su2_moving_environment
         )
         cpp_owned_bond_loop = bool(
-            getattr(lifecycle_owner, "cpp_owned_bond_loop", False)
+            local_solver is None and getattr(lifecycle_owner, "cpp_owned_bond_loop", False)
         )
         if (
             cpp_owned_bond_loop
@@ -1504,13 +1536,17 @@ def sweep_once(
                         1.0e-12,
                     ),
                     davidson_tolerance=float(
-                        bond_local_solver_kwargs.get("tol", 1.0e-8)
+                        bond_local_solver_kwargs.get("tol_residual")
+                        if bond_local_solver_kwargs.get("tol_residual") is not None
+                        else np.sqrt(bond_local_solver_kwargs.get("tol", 1.0e-8))
                     ),
                     max_iterations=int(
                         bond_local_solver_kwargs.get("itermax", 100)
                     ),
                     max_space=bond_local_solver_kwargs.get("max_space"),
-                    accept_unconverged=True,
+                    accept_unconverged=bool(
+                        bond_local_solver_kwargs.get("allow_unconverged_roots", False)
+                    ),
                 )
             except (RuntimeError, ValueError):
                 cpp_owned_solve = None
@@ -2681,6 +2717,10 @@ def _default_mpo_local_solver_schedule(*, sweep_idx, direction, history):
 def run_sweeps(
     sites,
     *,
+    algorithm="two_site",
+    cbe_expansion=8,
+    cbe_selection="shrewd",
+    cbe_preselection=None,
     nsweeps=1,
     start_direction="lr",
     alternate=True,
@@ -2724,6 +2764,16 @@ def run_sweeps(
 ):
     """
     Run repeated non-Abelian sweeps with simple history/convergence tracking.
+
+    ``algorithm="one_site_cbe"`` selects the reduced shrewd-selection adaptation
+    of Gleis, Li and von Delft, PRL 130, 246402 (2023),
+    doi:10.1103/PhysRevLett.130.246402, supplement Fig. S-2/Table I.
+    ``cbe_expansion`` adds at most this many reduced multiplets before final
+    truncation. ``cbe_preselection`` optionally sets the intermediate budget;
+    ``cbe_selection="exact"`` selects the full DD validation reference.
+    Only open, single-root, canonical-metric problems are supported. Orbital
+    solves use compiled one-site actions and factorized QR/SVD updates.
+    Pair layout/setup remains; full-sweep single-site scaling is not claimed.
 
     Parameters
     ----------
@@ -2789,6 +2839,14 @@ def run_sweeps(
         trace. Without ``mpo_factors``, ``energy`` falls back to the objective
         trace if available.
     """
+    if algorithm == "one_site_cbe":
+        if getattr(sites, "bc", "finite") != "finite":
+            raise ValueError("CBE currently requires open MPS boundaries")
+        # CBE uses the contextual operator path and compiled factor updates.
+        su2_moving_environment = None
+        canonical_local_norm = False
+        require_symbolic_renormalized_operators = False
+        store_orthonormal_renormalized_operators = False
     input_multiroot = sites if isinstance(sites, MultiRootMPS) else None
     input_mps = sites if isinstance(sites, MPS) else None
     if input_multiroot is not None:
@@ -2914,6 +2972,10 @@ def run_sweeps(
         try:
             sweep_result = sweep_once(
                 current_sites,
+                algorithm=algorithm,
+                cbe_expansion=cbe_expansion,
+                cbe_selection=cbe_selection,
+                cbe_preselection=cbe_preselection,
                 direction=direction,
                 solver=solver,
                 local_operator=local_operator,
@@ -2978,6 +3040,18 @@ def run_sweeps(
             current_sites = [site.copy() for site in last_root_sites[0]]
         else:
             current_sites = sweep_result["sites"]
+        if (
+            compute_final_expectation
+            and moving_environment is not None
+            and moving_environment.cpp_state_owned
+            and sweep_result.get("cpp_owned_half_sweep", False)
+            and int(getattr(moving_environment.su2_moving_environment,
+                            "state_average_roots", 0)) <= 1
+        ):
+            # Python templates are stale while the sweep owns its MPS in C++.
+            current_sites = moving_environment.export_owned_sites(
+                current_sites, direction,
+            )
         current_center = getattr(
             sweep_result.get("mps"),
             "center",
@@ -3026,6 +3100,13 @@ def run_sweeps(
                         break
                     raise ValueError("State norm is numerically zero while computing sweep energy.")
                 objective_summary["energy"] = float(np.real(numerator / denominator))
+                objective_summary["energy_source"] = "final_mpo_expectation"
+            elif compute_final_expectation:
+                objective_summary["energy"] = _compute_state_energy_from_mpo(
+                    current_sites,
+                    mpo_factors,
+                    identity_mpo_factors=identity_mpo_factors,
+                )
                 objective_summary["energy_source"] = "final_mpo_expectation"
             elif sweep_result.get("terminal_local_energy") is not None:
                 objective_summary["energy"] = float(

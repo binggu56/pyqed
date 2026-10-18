@@ -8,6 +8,8 @@ complete active space configuration interaction
 @author: Bing Gu (gubing@westlake.edu.cn)
 """
 
+from pyqed.parallel import resolve_workers
+
 import logging
 import os
 from functools import reduce
@@ -220,7 +222,8 @@ def _orthonormalize_columns(V, tol=1e-12):
     if V.size == 0:
         return np.zeros((V.shape[0], 0), dtype=V.dtype)
 
-    Q, R = np.linalg.qr(V, mode='reduced')
+    from scipy.linalg import qr
+    Q, R, _ = qr(V, mode='economic', pivoting=True)
     keep = np.abs(np.diag(R)) > tol
     if not np.any(keep):
         return np.zeros((V.shape[0], 0), dtype=V.dtype)
@@ -297,43 +300,15 @@ def _select_direct_ci_guess(casci, nstates, ci0=None, *, reuse=True):
 
 def _resolve_direct_ci_workers(casci, n_det):
     value = getattr(casci, "direct_ci_workers", None)
-    explicit = value is not None
     if value is None:
         value = os.environ.get("PYQED_DIRECT_CI_WORKERS")
-        explicit = value is not None
     if value is None:
         value = os.environ.get("PYQED_CI_THREADS")
-        explicit = value is not None
-
-    if value is None:
-        mol = getattr(getattr(casci, "mf", None), "mol", None)
-        parallel_min = int(getattr(casci, "direct_ci_parallel_min_ndet", DIRECT_CI_PARALLEL_MIN_NDETS))
-        if mol is not None and bool(getattr(mol, "builtin_parallel", False)) and n_det >= parallel_min:
-            value = getattr(mol, "builtin_eri_workers", None)
-            if value is None:
-                value = min(os.cpu_count() or 1, 4)
-
-    if value is None:
-        parallel_min = int(getattr(casci, "direct_ci_parallel_min_ndet", DIRECT_CI_PARALLEL_MIN_NDETS))
-        if n_det >= parallel_min:
-            return max(1, min(os.cpu_count() or 1, 4))
+    if value is False or (isinstance(value, str) and value.strip().lower() in {"", "false", "off", "none"}):
         return 1
-    if value is False:
-        return 1
-    if isinstance(value, str):
-        text = value.strip().lower()
-        if text in {"", "false", "off", "none"}:
-            return 1
-        if text == "auto":
-            return max(1, min(os.cpu_count() or 1, 4))
-        value = text
-    try:
-        workers = max(1, int(value))
-    except (TypeError, ValueError):
-        return 1
-    if not explicit and n_det >= 250_000:
-        workers = max(workers, min(os.cpu_count() or workers, 8))
-    return workers
+    if isinstance(value, str) and value.strip().lower() == "auto":
+        value = None
+    return resolve_workers(value)
 
 
 def _resolve_direct_ci_tolerances(casci):
@@ -471,7 +446,7 @@ def _project_spin0_guess(guess, left, right, same, ndet):
 
 def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
                     max_subspace=None, guess=None, matvec_block=None,
-                    trial_block_size=None, energy_tol=None, return_info=False):
+                    trial_block_size=None, energy_tol=None, return_info=False, projector=None):
     """
     Solve for the lowest ``nroots`` eigenpairs of a symmetric CI Hamiltonian.
 
@@ -516,6 +491,16 @@ def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
         energy_tol = tol
 
     V = _build_davidson_guess(diag, nroots, guess=guess, min_vectors=trial_block_size)
+    if projector is not None:
+        V = _orthonormalize_columns(projector(V))
+        rng = np.random.default_rng(104729)
+        attempts = 0
+        while V.shape[1] < nroots and attempts < 8:
+            trial = projector(rng.normal(size=(n, max(4, nroots))))
+            V = _orthonormalize_columns(np.column_stack((V, trial)))
+            attempts += 1
+        if V.shape[1] < nroots:
+            raise ValueError("The symmetry sector has fewer independent roots than requested.")
     AV = apply_block(V)
     previous_theta = None
     history = []
@@ -577,13 +562,22 @@ def davidson_lowest(matvec, diag, nroots=1, tol=1e-8, max_cycle=100,
             denom = theta_expand[root] - diag
             safe = np.where(np.abs(denom) > 1e-12, denom, np.where(denom >= 0, 1e-12, -1e-12))
             corr = resid_expand[:, root] / safe
+            if projector is not None:
+                corr = projector(corr)
 
+            original_norm = np.linalg.norm(corr)
             if V.shape[1] > 0:
                 corr -= V @ (V.conj().T @ corr)
             for prev in new_vecs:
                 corr -= prev * np.vdot(prev, corr)
-
             norm = np.linalg.norm(corr)
+            # Selective reorthogonalization prevents nearly dependent
+            # corrections from becoming spurious zero-norm Ritz roots.
+            if norm < .5*original_norm:
+                corr -= V @ (V.conj().T @ corr)
+                for prev in new_vecs:
+                    corr -= prev * np.vdot(prev, corr)
+                norm = np.linalg.norm(corr)
             if norm > 1e-12:
                 new_vecs.append(corr / norm)
 
@@ -2307,6 +2301,7 @@ def _sigma_compact_spin_string(
     beta_ordered_phase=None,
     workers=None,
 ):
+    workers = resolve_workers(workers)
     sigma_compact_spin_string = _cpp_attr("sigma_compact_spin_string")
     if (
         sigma_compact_spin_string is not None
@@ -2413,6 +2408,7 @@ def _sigma_compact_spin0_pair(
     beta_ordered_I, beta_ordered_J, beta_ordered_phase,
     workers=None,
 ):
+    workers = resolve_workers(workers)
     sigma_compact_spin0_pair = _cpp_attr("sigma_compact_spin0_pair")
     if (
         sigma_compact_spin0_pair is not None
@@ -2512,6 +2508,7 @@ def _make_sigma_compact_spin0_pair_cpp_matvec(
     beta_ordered_I, beta_ordered_J, beta_ordered_phase,
     workers=None,
 ):
+    workers = resolve_workers(workers)
     sigma_compact_spin0_pair = _cpp_attr("sigma_compact_spin0_pair")
     if (
         sigma_compact_spin0_pair is None
@@ -2601,6 +2598,7 @@ def _make_sigma_compact_rhf_blas_cpp_matvec(
     beta_ordered_I, beta_ordered_J, beta_ordered_phase,
     workers=None,
 ):
+    workers = resolve_workers(workers)
     create_workspace = _cpp_attr("create_spin0_pair_workspace")
     apply_workspace = _cpp_attr("apply_spin0_pair_workspace_det")
     if (
@@ -2780,6 +2778,7 @@ def _davidson_spin0_pair_cpp(
     max_subspace=None,
     spin_penalty=None,
 ):
+    workers = resolve_workers(workers)
     davidson_spin0_pair = _cpp_attr("davidson_spin0_pair")
     if (
         davidson_spin0_pair is None
@@ -4753,7 +4752,6 @@ class CASCI(mcscf.casci.CASCI):
         spin_root_cushion=None,
         spin_selection_tol=None,
         wfnsym=None,
-        target_irrep=None,
     ):
         """
         solve the full CI in the active space
@@ -4783,6 +4781,15 @@ class CASCI(mcscf.casci.CASCI):
         # print('------------------------------')
         # print("             CASCI              ")
         # print('------------------------------\n')
+        symmetry_info = getattr(self.mol, "symmetry_info", None)
+        if (symmetry_info is not None and not symmetry_info.group.abelian
+                and wfnsym is not None):
+            from pyqed.qchem.spatial_symmetry import run_spatial_ci
+            return run_spatial_ci(
+                self, nstates=nstates, mo_coeff=mo_coeff, ci0=ci0, method=method,
+                use_cholesky=use_cholesky, wfnsym=wfnsym,
+                spin_root_cushion=spin_root_cushion, spin_selection_tol=spin_selection_tol)
+
         self.nstates = nstates
         self._direct_rhf_blas_matvec = None
         self._direct_ci_used_native_davidson = False
@@ -4828,7 +4835,7 @@ class CASCI(mcscf.casci.CASCI):
                 self.binary = binary
             else:
                 binary = self.binary
-            binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
+            binary = self._filter_binary_by_irrep(binary, wfnsym=wfnsym)
             requested_nstates = int(requested_nstates)
             solve_nstates = requested_nstates
             E, X = self._direct_spin0_symm_solve(
@@ -4855,7 +4862,7 @@ class CASCI(mcscf.casci.CASCI):
             mo_occ = _reference_active_occupations(self.nelecas_spin, ncas)
             binary = get_fci_combos(mo_occ = mo_occ)
             self.binary = binary
-            binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
+            binary = self._filter_binary_by_irrep(binary, wfnsym=wfnsym)
             solve_nstates = self._spin_selected_nstates(
                 requested_nstates,
                 binary.shape[0],
@@ -4936,7 +4943,7 @@ class CASCI(mcscf.casci.CASCI):
 
             else:
                 binary = self.binary
-            binary = self._filter_binary_by_irrep(binary, target_irrep=target_irrep, wfnsym=wfnsym)
+            binary = self._filter_binary_by_irrep(binary, wfnsym=wfnsym)
             solve_nstates = self._spin_selected_nstates(
                 requested_nstates,
                 binary.shape[0],
@@ -5382,6 +5389,9 @@ class CASCI(mcscf.casci.CASCI):
             for i in range(requested_nstates):
                 ss = self.spin_square(i)
                 print("CASCI Root {}  E = {:.10f}  S^2 = {:.6f}".format(i, self.e_tot[i], ss))
+
+        from pyqed.qchem.symmetry import report_ci_symmetry
+        report_ci_symmetry(self)
 
         return self
 

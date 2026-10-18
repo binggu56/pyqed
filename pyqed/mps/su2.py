@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Lightweight SU(2) symmetry foundations for future spin-adapted MPS/DMRG work.
+SU(2) irreps and particle-number/spin/spatial sectors for reduced MPS DMRG.
 
-The current QC-DMRG implementation in :mod:`pyqed.qchem.dmrg` uses Abelian
-``charge``/``Sz`` sectors over interleaved spin-orbitals.  Exact SU(2) support
-instead wants spatial-orbital sites whose local basis decomposes into charge
-and total-spin irreps:
-
-    - |0>            : N = 0, S = 0
-    - |up>, |down>   : N = 1, S = 1/2
-    - |up down>      : N = 2, S = 0
-
-This module does not yet replace the active symmetry engine, but it provides a
-clean representation of SU(2) irreps, fused charge+spin sectors, and the local
-spatial-orbital sector structure that a later non-Abelian tensor layer can use.
+Spatial-orbital sites decompose into empty and doubly occupied spin singlets
+and a singly occupied spin doublet. Real Abelian point-group labels may be
+attached to these sectors; multidimensional spatial irreps use the general
+product-group fusion machinery.
 """
 
 from __future__ import annotations
@@ -72,14 +64,18 @@ def fuse_irreps(left: SU2Irrep, right: SU2Irrep) -> tuple[SU2Irrep, ...]:
 @dataclass(frozen=True, order=True, init=False)
 class SpinChargeSector:
     """
-    Product sector for particle number and total-spin SU(2) irrep.
+    Product sector for particle number, SU(2) spin, and a real-Abelian irrep.
+
+    ``point_group`` is an XOR character bit label; zero is the identity.
+    Spatial labels distinguish multiplicity blocks without changing spin CGs.
     """
 
     charge: int
     irrep: SU2Irrep
+    point_group: int
     _hash: int = field(init=False, repr=False, compare=False)
 
-    def __init__(self, charge: int, irrep: SU2Irrep, multiplicity: int | None = None):
+    def __init__(self, charge: int, irrep: SU2Irrep, multiplicity: int | None = None, *, point_group: int = 0):
         if multiplicity not in (None, 1):
             raise ValueError(
                 "SpinChargeSector multiplicity is implicit; repeat the sector "
@@ -87,16 +83,35 @@ class SpinChargeSector:
             )
         object.__setattr__(self, "charge", charge)
         object.__setattr__(self, "irrep", irrep)
+        if int(point_group) != point_group or not 0 <= point_group < 2**31:
+            raise ValueError("The Abelian spatial irrep must be a nonnegative bit label.")
+        object.__setattr__(self, "point_group", int(point_group))
         self.__post_init__()
         object.__setattr__(
             self,
             "_hash",
-            10000019 + 1315423911 * int(self.charge) + int(self.irrep.two_j),
+            hash((self.charge, self.irrep.two_j, self.point_group)),
         )
 
     def __post_init__(self):
         if int(self.charge) != self.charge or self.charge < 0:
             raise ValueError(f"Sector charge must be a non-negative integer, got {self.charge!r}.")
+
+    @property
+    def packed_charge(self) -> int:
+        """Lossless (N, spatial irrep) label for packed complementary sectors.
+
+        The low 32 bits contain N, the high bits the real-Abelian irrep bit
+        label. This is a storage key, never an additive particle number.
+        """
+        if self.charge >= 2**32:
+            raise OverflowError("Particle number exceeds the packed sector range.")
+        return int(self.charge) | (self.point_group << 32)
+
+    @classmethod
+    def from_packed(cls, charge, two_j):
+        return cls(int(charge) & 0xffffffff, SU2Irrep(int(two_j)),
+                   point_group=int(charge) >> 32)
 
     @property
     def two_j(self) -> int:
@@ -124,14 +139,15 @@ def fuse_charge_spin_sectors(
     left: SpinChargeSector, right: SpinChargeSector
 ) -> tuple[SpinChargeSector, ...]:
     """
-    Fuse two ``charge x SU(2)`` sectors.
+    Fuse two particle-number, SU(2), and real-Abelian sectors.
 
-    Charges add, while the spin irreps follow the Clebsch-Gordan rule.
+    Charges add, spatial labels combine by XOR, and spins follow the CG rule.
     Multiple copies of the same fused sector are represented implicitly by
     repeated sector entries on tensor legs, not by a field on the sector label.
     """
     charge = left.charge + right.charge
-    return tuple(SpinChargeSector(charge, irrep) for irrep in fuse_irreps(left.irrep, right.irrep))
+    return tuple(SpinChargeSector(charge, irrep, point_group=left.point_group ^ right.point_group)
+                 for irrep in fuse_irreps(left.irrep, right.irrep))
 
 
 @dataclass(frozen=True)

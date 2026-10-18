@@ -108,9 +108,16 @@ def _spin_adapted_dense_roots_from_matrix(
         raise ValueError(
             f"Dense Hamiltonian shape {h_dense.shape} does not match spatial dimension {full_dim}."
         )
+    s2_charge = _spin_square_in_charge_basis(labels)
+    # Select one magnetic component per spin multiplet, consistent with the
+    # charge/Sz string basis used by the reference RDM export.
+    magnetic = np.asarray([sum((state == 1) - (state == 2) for state in label)
+                           for label in labels])
+    selected = np.flatnonzero(magnetic == int(spin))
+    charge_indices = charge_indices[selected]
+    s2_charge = s2_charge[np.ix_(selected, selected)]
     h_charge = h_dense[np.ix_(charge_indices, charge_indices)]
     h_charge = 0.5 * (h_charge + h_charge.conj().T)
-    s2_charge = _spin_square_in_charge_basis(labels)
 
     evals, evecs = np.linalg.eigh(h_charge)
     target_s = 0.5 * abs(float(spin))

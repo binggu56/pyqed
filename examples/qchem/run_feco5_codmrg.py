@@ -103,7 +103,7 @@ def main():
     started = time.perf_counter()
     config = dict(basis="def2-svp", ncas=12, nelecas=12, D=args.D,
                   max_bond_mode="per_sector", atom_angstrom=ATOM,
-                  active_selection="RHF frontier", orbital_driver="constrained",
+                  active_selection="RHF frontier", algorithm="constrained",
                   max_macro=args.max_macro, dmrg_sweeps=args.dmrg_sweeps,
                   davidson_tol=args.davidson_tol, davidson_max_iter=args.davidson_iterations,
                   davidson_max_space=args.davidson_space,

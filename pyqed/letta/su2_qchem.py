@@ -19,6 +19,8 @@ regions.
 
 from __future__ import annotations
 
+from pyqed.parallel import resolve_workers as resolve_default_workers
+
 from concurrent.futures import ThreadPoolExecutor
 import copy
 from dataclasses import dataclass, replace
@@ -36,15 +38,18 @@ from pyqed.mps.nonabelian.contraction import merge_mps_sites
 from pyqed.mps.nonabelian.environment import (
     AdjacentPairTransitionPlan,
     BlockSparseEnvironmentChain,
+    iter_one_site_reduced_adjoint,
     LocalTransitionPlan,
     _apply_two_site_dense_factorized,
     _left_reduced_rank_coupled_block,
+    _component_basis_norm,
     _right_reduced_rank_coupled_block,
     _factorize_left_two_site_dense_term,
     _factorize_right_two_site_dense_term,
     contract_chain_expectation,
     contract_chain_transition,
 )
+from pyqed.mps.nonabelian.coupling import ordered_two_m_values
 from pyqed.mps.nonabelian.decompose import svd_two_site
 from pyqed.mps.nonabelian.solver import (
     _resolve_davidson_operator,
@@ -52,6 +57,7 @@ from pyqed.mps.nonabelian.solver import (
     pack_two_site_state,
     unpack_two_site_state,
 )
+from pyqed.mps.nonabelian.mpo import prepare_hamiltonian_factors
 from pyqed.mps.nonabelian.states import (
     FullyReducedSpatialOrbitalSite,
     build_random_reduced_spatial_mps,
@@ -66,6 +72,8 @@ from pyqed.symmetry import IrrepTensor
 
 def resolve_workers(workers, *, maximum=4):
     """Choose one parallel layer without oversubscribing threaded BLAS."""
+    if workers is None:
+        return resolve_default_workers()
     if isinstance(workers, str):
         if workers.strip().lower() != "auto":
             raise ValueError("workers must be a positive integer or 'auto'.")
@@ -82,7 +90,7 @@ def resolve_workers(workers, *, maximum=4):
             default=1,
         )
         return 1 if blas_threads > 1 else max(
-            1, min(int(maximum), int(os.cpu_count() or 1))
+            1, min(int(maximum), resolve_default_workers())
         )
     if isinstance(workers, (bool, np.bool_)):
         raise TypeError("workers must be a positive integer or 'auto'.")
@@ -90,54 +98,6 @@ def resolve_workers(workers, *, maximum=4):
     if workers < 1:
         raise ValueError("workers must be a positive integer or 'auto'.")
     return workers
-
-
-def _rank_coupled_hamiltonian_factors(factors, *, materialize=False):
-    """Prepare either direct complementary or explicit reduced MPO cores."""
-    factors = tuple(factors)
-    if not factors:
-        return factors
-    owner = getattr(factors[0], "normal_complementary_owner", None)
-    if owner is None or not all(
-        getattr(factor, "normal_complementary_plan", None) is not None
-        and not tuple(getattr(factor, "reduced_terms", ()))
-        for factor in factors
-    ):
-        return factors
-    if not materialize:
-        for factor in factors:
-            object.__setattr__(factor, "normal_complementary_right_dual", True)
-            object.__setattr__(
-                factor,
-                "normal_complementary_force_contextual_routes",
-                False,
-            )
-        return factors
-
-    from pyqed.qchem.dmrg.backends.reduced import build_su2_normal_complementary_mpo
-
-    materialized = tuple(
-        build_su2_normal_complementary_mpo(
-            owner,
-            fully_reduced=bool(
-                getattr(factors[0], "normal_complementary_fully_reduced", False)
-            ),
-            materialize_reduced_terms=True,
-        )
-    )
-    for factor in materialized:
-        # Right-to-left cached contractions use the dual reduced carrier.
-        # Do not retain the C++ owner on every materialized core.  The LETTA
-        # state keeps one transient runtime reference, while checkpoints and
-        # deep copies remain free of the non-pickleable object.
-        object.__setattr__(factor, "normal_complementary_right_dual", True)
-        object.__setattr__(factor, "normal_complementary_owner", None)
-        object.__setattr__(
-            factor,
-            "normal_complementary_force_contextual_routes",
-            True,
-        )
-    return materialized
 
 
 def _unique(values):
@@ -262,120 +222,6 @@ class _ChannelResolvedPairSpace:
         )
         return left, right
 
-
-class _ReducedMetricComponents:
-    """Connected projected-norm blocks in tied reduced coordinates."""
-
-    def __init__(self, dimension, components):
-        self.dimension = int(dimension)
-        self.components = tuple(
-            (
-                np.asarray(indices, dtype=np.int64),
-                np.asarray(block, dtype=complex),
-            )
-            for indices, block in components
-        )
-
-    def dense(self):
-        metric = np.zeros((self.dimension, self.dimension), dtype=complex)
-        for indices, block in self.components:
-            metric[np.ix_(indices, indices)] += block
-        return metric
-
-    def __array__(self, dtype=None, copy=None):
-        metric = self.dense()
-        if dtype is not None:
-            metric = metric.astype(dtype, copy=False)
-        return np.array(metric, copy=True) if copy else metric
-
-    @property
-    def diagonal(self):
-        diagonal = np.zeros(self.dimension, dtype=float)
-        for indices, block in self.components:
-            diagonal[indices] += np.real(np.diag(block))
-        return diagonal
-
-    @property
-    def nbytes(self):
-        return int(sum(indices.nbytes + block.nbytes for indices, block in self.components))
-
-    def matvec(self, vector):
-        vector = np.asarray(vector)
-        output = np.zeros_like(vector, dtype=np.result_type(vector, complex))
-        for indices, block in self.components:
-            output[indices] += block @ vector[indices]
-        return output
-
-    def restrict(self, support):
-        support = np.asarray(support, dtype=np.int64)
-        inverse = {int(old): new for new, old in enumerate(support)}
-        components = []
-        for indices, block in self.components:
-            keep = np.asarray(
-                [position for position, index in enumerate(indices) if int(index) in inverse],
-                dtype=np.int64,
-            )
-            if keep.size == 0:
-                continue
-            new_indices = np.asarray(
-                [inverse[int(indices[position])] for position in keep],
-                dtype=np.int64,
-            )
-            components.append((new_indices, block[np.ix_(keep, keep)]))
-        return type(self)(support.size, components)
-
-    def whitener(self, *, rtol):
-        scale = max(
-            (
-                float(np.max(np.abs(block), initial=0.0))
-                for _indices, block in self.components
-            ),
-            default=1.0,
-        )
-        scale = max(scale, 1.0)
-        threshold = float(rtol) * scale
-        columns = []
-        retained = []
-        backends = []
-        for indices, raw_block in self.components:
-            block = 0.5 * (raw_block + raw_block.conj().T)
-            diagonal = np.real(np.diag(block))
-            off_diagonal = block - np.diag(diagonal)
-            if np.linalg.norm(off_diagonal) <= threshold * max(
-                np.sqrt(indices.size), 1.0
-            ):
-                keep = diagonal > threshold
-                if not np.any(keep):
-                    continue
-                local = np.zeros((indices.size, np.count_nonzero(keep)), dtype=complex)
-                local[np.flatnonzero(keep), np.arange(np.count_nonzero(keep))] = (
-                    1.0 / np.sqrt(diagonal[keep])
-                )
-                values = diagonal[keep]
-                backends.append("diagonal")
-            else:
-                values, vectors = np.linalg.eigh(block)
-                keep = values > threshold
-                if not np.any(keep):
-                    continue
-                local = vectors[:, keep] / np.sqrt(values[keep])
-                values = values[keep]
-                backends.append("eigh")
-            lifted = np.zeros((self.dimension, local.shape[1]), dtype=complex)
-            lifted[indices] = local
-            columns.append(lifted)
-            retained.extend(map(float, values))
-        if not columns:
-            raise np.linalg.LinAlgError(
-                "the projected SU2LETTA parameter metric is singular."
-            )
-        backend = (
-            "conditional_identity"
-            if backends and all(value == "diagonal" for value in backends)
-            else "block_eigh"
-        )
-        return np.column_stack(columns), np.asarray(retained), backend
-
     @staticmethod
     def _clean_metadata(metadata):
         cleaned = dict(metadata or {})
@@ -475,6 +321,286 @@ class _ReducedMetricComponents:
         return left, right
 
 
+class _ReducedMetricComponents:
+    """Connected projected-norm blocks in tied reduced coordinates."""
+
+    def __init__(self, dimension, components):
+        self.dimension = int(dimension)
+        self.components = tuple(
+            (
+                np.asarray(indices, dtype=np.int64),
+                np.asarray(block, dtype=complex),
+            )
+            for indices, block in components
+        )
+
+    def dense(self):
+        metric = np.zeros((self.dimension, self.dimension), dtype=complex)
+        for indices, block in self.components:
+            metric[np.ix_(indices, indices)] += block
+        return metric
+
+    def __array__(self, dtype=None, copy=None):
+        metric = self.dense()
+        if dtype is not None:
+            metric = metric.astype(dtype, copy=False)
+        return np.array(metric, copy=True) if copy else metric
+
+    @property
+    def diagonal(self):
+        diagonal = np.zeros(self.dimension, dtype=float)
+        for indices, block in self.components:
+            diagonal[indices] += np.real(np.diag(block))
+        return diagonal
+
+    @property
+    def nbytes(self):
+        return int(sum(indices.nbytes + block.nbytes for indices, block in self.components))
+
+    def matvec(self, vector):
+        vector = np.asarray(vector)
+        output = np.zeros_like(vector, dtype=np.result_type(vector, complex))
+        for indices, block in self.components:
+            output[indices] += block @ vector[indices]
+        return output
+
+    def whitened_norm(self, vector, *, rtol):
+        """Apply the existing component whitening without its global zero panels."""
+        vector = np.asarray(vector).reshape(self.dimension)
+        scale = max((float(np.max(np.abs(block), initial=0.0))
+                     for _, block in self.components), default=0.0)
+        norm_squared = 0.0
+        retained = False
+        for indices, block in self.components:
+            result = self._whiten_component(indices, block, threshold=float(rtol)*scale)
+            if result is not None:
+                projected = result[0].conj().T @ vector[indices]
+                norm_squared += float(np.real(np.vdot(projected, projected)))
+                retained = True
+        if not retained:
+            raise np.linalg.LinAlgError("the local SU2 metric support is null")
+        return np.sqrt(norm_squared)
+
+    def restrict(self, support):
+        support = np.asarray(support, dtype=np.int64)
+        inverse = {int(old): new for new, old in enumerate(support)}
+        components = []
+        for indices, block in self.components:
+            keep = np.asarray(
+                [position for position, index in enumerate(indices) if int(index) in inverse],
+                dtype=np.int64,
+            )
+            if keep.size == 0:
+                continue
+            new_indices = np.asarray(
+                [inverse[int(indices[position])] for position in keep],
+                dtype=np.int64,
+            )
+            components.append((new_indices, block[np.ix_(keep, keep)]))
+        return type(self)(support.size, components)
+
+    @staticmethod
+    def _whiten_component(indices, raw_block, *, threshold):
+        block = 0.5 * (raw_block + raw_block.conj().T)
+        diagonal = np.real(np.diag(block))
+        off_diagonal = block - np.diag(diagonal)
+        if not np.any(off_diagonal):
+            keep = diagonal > threshold
+            if not np.any(keep):
+                return None
+            local = np.zeros(
+                (indices.size, np.count_nonzero(keep)), dtype=complex
+            )
+            local[np.flatnonzero(keep), np.arange(np.count_nonzero(keep))] = (
+                1.0 / np.sqrt(diagonal[keep])
+            )
+            return local, diagonal[keep], "diagonal"
+        values, vectors = np.linalg.eigh(block)
+        keep = values > threshold
+        if not np.any(keep):
+            return None
+        return vectors[:, keep] / np.sqrt(values[keep]), values[keep], "eigh"
+
+    def whitener(self, *, rtol, component_cache=None, revision=None, sparse=False):
+        """Whiten independent components using a relative metric cutoff.
+
+        ``sparse=True`` returns CSR coordinates assembled directly from local
+        blocks, avoiding full-height zero panels. The default remains dense.
+        """
+        scale = max(
+            (
+                float(np.max(np.abs(block), initial=0.0))
+                for _indices, block in self.components
+            ),
+            default=0.0,
+        )
+        threshold = float(rtol) * scale
+        columns = []
+        retained = []
+        backends = []
+        reused = 0
+        for component_index, (indices, raw_block) in enumerate(self.components):
+            cache_key = None
+            result = None
+            if component_cache is not None and revision is not None:
+                component_revision = int(revision(indices, raw_block))
+                cache_key = (component_index, float(threshold), component_revision)
+                result = component_cache.get(cache_key)
+                reused += result is not None
+            if result is None:
+                result = self._whiten_component(
+                    indices, raw_block, threshold=threshold
+                )
+                if component_cache is not None and cache_key is not None:
+                    component_cache[cache_key] = result
+            if result is None:
+                continue
+            local, values, component_backend = result
+            backends.append(component_backend)
+            if sparse:
+                rows, cols = np.nonzero(local)
+                columns.append((indices[rows], len(retained)+cols, local[rows, cols]))
+            else:
+                lifted = np.zeros((self.dimension, local.shape[1]), dtype=complex)
+                lifted[indices] = local
+                columns.append(lifted)
+            retained.extend(map(float, values))
+        if not columns:
+            raise np.linalg.LinAlgError(
+                "the projected SU2LETTA parameter metric is singular."
+            )
+        backend = (
+            "conditional_identity"
+            if backends and all(value == "diagonal" for value in backends)
+            else "block_eigh"
+        )
+        if sparse:
+            from scipy.sparse import coo_matrix
+            rows, cols, values = (np.concatenate([part[i] for part in columns]) for i in range(3))
+            transform = coo_matrix((values, (rows, cols)),
+                                   shape=(self.dimension, len(retained))).tocsr()
+        else:
+            transform = np.column_stack(columns)
+        return transform, np.asarray(retained), backend, int(reused)
+
+    def orthonormal_components(self, whitener):
+        """Return the retained coordinate columns belonging to each block."""
+        from scipy.sparse import issparse
+        sparse = issparse(whitener)
+        if not sparse:
+            whitener = np.asarray(whitener)
+        if whitener.shape[0] != self.dimension:
+            raise ValueError("Metric whitener has the wrong row dimension.")
+        groups = []
+        for indices, _block in self.components:
+            columns = np.flatnonzero((whitener[indices] != 0).getnnz(axis=0) if sparse else
+                                     np.any(whitener[indices] != 0.0, axis=0))
+            if columns.size:
+                groups.append(columns)
+        return tuple(groups)
+
+
+class _FactorizedPairWhitener:
+    """Spectral pair-metric support using small left/right boundary factors."""
+
+    def __init__(self, dimension, blocks, rtol):
+        decomposed = []
+        largest = 0.0
+        for entry, left, right in blocks:
+            lv, lu = np.linalg.eigh((left + left.conj().T) * .5)
+            rv, ru = np.linalg.eigh((right + right.conj().T) * .5)
+            positive_l, positive_r = lv > 0, rv > 0
+            lv, lu = lv[positive_l], lu[:, positive_l]
+            rv, ru = rv[positive_r], ru[:, positive_r]
+            values = lv[:, None] * rv[None, :]
+            largest = max(largest, float(values.max(initial=0.0)))
+            decomposed.append((entry, lv, lu, rv, ru, values))
+        self.dimension = int(dimension)
+        self.blocks = []
+        self.rank = 0
+        for entry, lv, lu, rv, ru, values in decomposed:
+            keep = values > float(rtol) * largest
+            count = int(keep.sum())
+            if count:
+                self.blocks.append((entry, lu/np.sqrt(lv), ru/np.sqrt(rv),
+                                    keep, self.rank, count))
+                self.rank += count
+        if not self.rank:
+            raise np.linalg.LinAlgError('Pair metric has no retained positive support')
+
+    def matvec(self, vector):
+        out = np.zeros(self.dimension, dtype=complex)
+        for entry, left, right, keep, offset, count in self.blocks:
+            core = np.zeros(keep.shape, dtype=complex)
+            core[keep] = vector[offset:offset+count]
+            out[entry.offset:entry.offset+entry.size] = (left @ core @ right.T).ravel()
+        return out
+
+    def rmatvec(self, vector):
+        out = np.empty(self.rank, dtype=complex)
+        for entry, left, right, keep, offset, count in self.blocks:
+            block = vector[entry.offset:entry.offset+entry.size].reshape(left.shape[0], right.shape[0])
+            out[offset:offset+count] = (left.conj().T @ block @ right.conj())[keep]
+        return out
+
+
+class _MatrixFreeProjectedMetric:
+    """Exact projected norm action without a dense tied-coordinate metric."""
+
+    def __init__(self, dimension, diagonal, action):
+        self.dimension = int(dimension)
+        self.diagonal = np.asarray(diagonal, dtype=float).reshape(self.dimension)
+        self._action = action
+
+    def matvec(self, vector):
+        return np.asarray(self._action(vector), dtype=complex).reshape(
+            self.dimension
+        )
+
+
+class _MetricPreconditioner:
+    """Bounded CG inverse of a diagonal-scaled regularized local metric.
+
+    Metric-informed adaptation of Davidson preconditioning, not an exact
+    inverse of H-E*S. Davidson, J. Comput. Phys. 17, 87 (1975),
+    doi:10.1016/0021-9991(75)90065-0. Never forms a dense metric.
+    """
+
+    def __init__(self, metric, diagonal, *, iterations=6, regularization=1e-3):
+        diagonal = np.asarray(diagonal, dtype=float)
+        floor = max(float(np.max(np.abs(diagonal))) * 1e-12, 1e-30)
+        self.scale = 1 / np.sqrt(np.maximum(diagonal, floor))
+        self.metric = metric
+        self.iterations = int(iterations)
+        self.regularization = float(regularization)
+        self.calls = self.matvecs = 0
+
+    def __call__(self, residual, theta, vector):
+        del theta, vector
+        rhs = self.scale * residual
+        r = rhs.copy()
+        p = r.copy()
+        x = np.zeros_like(rhs)
+        rr = float(np.vdot(r, r).real)
+        target = rr * 1e-4
+        self.calls += 1
+        for _ in range(self.iterations):
+            if rr <= max(target, 1e-30):
+                break
+            ap = self.scale * self.metric(self.scale * p) + self.regularization * p
+            self.matvecs += 1
+            pap = float(np.vdot(p, ap).real)
+            if not np.isfinite(pap) or pap <= 0:
+                break
+            alpha = rr / pap
+            x += alpha * p
+            r -= alpha * ap
+            next_rr = float(np.vdot(r, r).real)
+            p = r + (next_rr / rr) * p
+            rr = next_rr
+        return self.scale * x
+
+
 def _canonical_graph(nsites, graph):
     if graph is None:
         return ()
@@ -482,9 +608,12 @@ def _canonical_graph(nsites, graph):
         key = graph.lower().replace("-", "_")
         if key in {"nn", "nearest_neighbor"}:
             return _nearest_neighbor_graph(nsites)
-        raise ValueError(
-            "SU2LETTA graph strings must be 'nn' or 'nearest_neighbor'."
-        )
+        ranges = {"nnn": 2, "next_nearest_neighbor": 2,
+                  "nnnn": 3, "third_neighbor": 3}
+        if key in ranges:
+            return tuple((i, j) for i in range(nsites)
+                         for j in range(i + 1, min(nsites, i + ranges[key] + 1)))
+        raise ValueError("SU2LETTA graph strings must be 'nn', 'nnn', or 'nnnn' (or their long forms).")
     if hasattr(graph, "is_directed") and graph.is_directed():
         raise ValueError("SU2LETTA graph must be undirected.")
     if hasattr(graph, "edges"):
@@ -583,6 +712,20 @@ class _WignerEckartRoutePlan:
         blocks[indices] = np.asarray(matrix).reshape((-1,) + tuple(shape))
         return blocks
 
+    def active_block_basis(self, key, *, dtype=complex):
+        """Return only nonzero parameter directions and their global indices."""
+        record = self._group_by_key.get(key)
+        if record is None:
+            shape = np.asarray(self.template.data[key]).shape
+            return np.empty(0, dtype=np.int64), np.empty((0,) + shape, dtype=dtype)
+        indices, matrix, shape = record
+        order = np.argsort(indices)
+        rows = np.asarray(matrix)[order]
+        keep = np.any(rows != 0.0, axis=1)
+        return np.asarray(indices)[order][keep], np.asarray(
+            rows[keep], dtype=np.result_type(dtype, matrix.dtype)
+        ).reshape((-1,) + tuple(shape))
+
     @property
     def basis(self):
         """Materialize unit-direction tensors only for reference solvers."""
@@ -632,13 +775,365 @@ class _WignerEckartRoutePlan:
         return tensor
 
 
-class _NearestNeighborTieRoutePlan(_WignerEckartRoutePlan):
-    """Bounded-frontier reduced scatter plan for physical NN ties."""
+class _FrontierTieRoutePlan(_WignerEckartRoutePlan):
+    """Reduced scatter plan for arbitrary frontier ties."""
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.backend = "nearest-neighbor-block-scatter"
-        self.conditioned_frontier_width = 1
+    def __init__(self, *, template, groups, nparameters, nbytes):
+        self.template = template
+        self.groups = tuple(groups)
+        self.nparameters = int(nparameters)
+        self.nbytes = int(nbytes)
+        self.route_count = int(sum(parameters.size for _, parameters, _, _ in groups))
+        self.backend = "frontier-block-scatter"
+        self._group_by_key = {
+            key: (parameters, targets, shape)
+            for key, parameters, targets, shape in groups
+        }
+        self._basis = None
+
+    def block_basis(self, key, *, dtype=complex):
+        record = self._group_by_key.get(key)
+        shape = np.asarray(self.template.data[key]).shape
+        blocks = np.zeros((self.nparameters,) + shape, dtype=dtype)
+        if record is not None:
+            parameters, targets, _shape = record
+            np.add.at(blocks.reshape(self.nparameters, -1), (parameters, targets), 1.0)
+        return blocks
+
+    def active_block_basis(self, key, *, dtype=complex):
+        record = self._group_by_key.get(key)
+        shape = np.asarray(self.template.data[key]).shape
+        if record is None:
+            return np.empty(0, dtype=np.int64), np.empty((0,) + shape, dtype=dtype)
+        parameters, targets, _shape = record
+        active, rows = np.unique(parameters, return_inverse=True)
+        blocks = np.zeros((active.size,) + shape, dtype=dtype)
+        np.add.at(blocks.reshape(active.size, -1), (rows, targets), 1.0)
+        return active, blocks
+
+    @property
+    def basis(self):
+        """Materialize unit directions only for small reference problems."""
+        if self._basis is None:
+            basis_data = [dict() for _ in range(self.nparameters)]
+            for key, parameters, targets, shape in self.groups:
+                for parameter, target in zip(parameters, targets):
+                    block = basis_data[int(parameter)].get(key)
+                    if block is None:
+                        block = np.zeros(shape, dtype=complex)
+                        basis_data[int(parameter)][key] = block
+                    block.reshape(-1)[int(target)] += 1.0
+            self._basis = tuple(
+                IrrepTensor(
+                    data=data,
+                    qns=[list(values) for values in self.template.qns],
+                    dirs=list(self.template.dirs),
+                    fusion_legs=list(self.template.fusion_legs),
+                    metadata=dict(self.template.metadata),
+                )
+                for data in basis_data
+            )
+        return self._basis
+
+    def tensor(self, coefficients):
+        coefficients = np.asarray(coefficients).reshape(self.nparameters)
+        data = {}
+        for key, parameters, targets, shape in self.groups:
+            block = np.zeros(int(np.prod(shape)), dtype=coefficients.dtype)
+            np.add.at(block, targets, coefficients[parameters])
+            data[key] = block.reshape(shape)
+        return IrrepTensor(
+            data=data,
+            qns=[list(values) for values in self.template.qns],
+            dirs=list(self.template.dirs),
+            fusion_legs=list(self.template.fusion_legs),
+            metadata=dict(self.template.metadata),
+        )
+
+    def adjoint(self, blocks):
+        result = np.zeros(self.nparameters, dtype=complex)
+        items = blocks.items() if hasattr(blocks, 'items') else blocks
+        for key, block in items:
+            group = self._group_by_key.get(key)
+            if group is not None:
+                parameters, targets, _shape = group
+                np.add.at(result, parameters, np.asarray(block).reshape(-1)[targets])
+        return result
+
+    def apply_delta(self, tensor, coefficients):
+        delta = self.tensor(coefficients)
+        for key, block in delta.data.items():
+            tensor.data[key] = np.asarray(tensor.data[key]) + block
+        return tensor
+
+
+class _MatrixFreePairEmbedding:
+    """One-site tangent contraction backed by compact frontier scatter routes."""
+
+    def __init__(self, layout, routes, fixed_site, *, varied_left):
+        self.layout = layout
+        self.routes = routes
+        self.fixed_site = fixed_site
+        self.varied_left = bool(varied_left)
+        self.pair_dimension = int(layout.size)
+        self.parameter_dimension = int(routes.nparameters)
+        self._contractions = self._build_contractions()
+        self._contraction_batches = self._batch_contractions()
+
+    def _build_contractions(self):
+        """Compile fixed block reshapes used by every Krylov application."""
+        contractions = []
+        for entry in self.layout.entries:
+            q_l, q_p1, q_p2, q_r, q_mid = entry.key
+            varied_key = (
+                (q_l, q_p1, q_mid)
+                if self.varied_left
+                else (q_mid, q_p2, q_r)
+            )
+            route = self.routes._group_by_key.get(varied_key)
+            if route is None:
+                continue
+            parameters, targets, varied_shape = route
+            fixed_key = (
+                (q_mid, q_p2, q_r)
+                if self.varied_left
+                else (q_l, q_p1, q_mid)
+            )
+            fixed = self.fixed_site.data.get(fixed_key)
+            if fixed is None:
+                continue
+            varied_shape = tuple(map(int, varied_shape))
+            fixed = np.ascontiguousarray(fixed)
+            if self.varied_left:
+                rows = varied_shape[0] * varied_shape[1]
+                shared = varied_shape[2]
+                fixed_matrix = fixed.reshape(shared, -1)
+            else:
+                shared = varied_shape[0]
+                rows = int(fixed.shape[0] * fixed.shape[1])
+                fixed_matrix = fixed.reshape(rows, shared)
+            contractions.append(
+                (
+                    int(entry.offset),
+                    int(entry.size),
+                    np.asarray(parameters, dtype=np.int64),
+                    np.asarray(targets, dtype=np.int64),
+                    varied_shape,
+                    rows,
+                    shared,
+                    fixed_matrix,
+                    np.ascontiguousarray(fixed_matrix.conj().T),
+                )
+            )
+        return tuple(contractions)
+
+    def _batch_contractions(self):
+        """Group equal matrix shapes into batched BLAS operations."""
+        grouped = {}
+        for record in self._contractions:
+            fixed_matrix = record[-2]
+            key = (
+                int(record[5]),
+                int(record[6]),
+                int(fixed_matrix.shape[1]) if self.varied_left
+                else int(record[4][1] * record[4][2]),
+            )
+            grouped.setdefault(key, []).append(record)
+        batches = []
+        for (rows, shared, output_columns), records in grouped.items():
+            batches.append(
+                (
+                    rows,
+                    shared,
+                    output_columns,
+                    tuple(record[0] for record in records),
+                    tuple(record[1] for record in records),
+                    tuple(record[2] for record in records),
+                    tuple(record[3] for record in records),
+                    np.ascontiguousarray(np.stack([record[-2] for record in records])),
+                    np.ascontiguousarray(np.stack([record[-1] for record in records])),
+                )
+            )
+        return tuple(batches)
+
+    @property
+    def shape(self):
+        return self.pair_dimension, self.parameter_dimension
+
+    @property
+    def nbytes(self):
+        return int(
+            self.routes.nbytes
+            + sum(
+                fixed_adjoint.nbytes
+                for (
+                    _offset,
+                    _size,
+                    _parameters,
+                    _targets,
+                    _shape,
+                    _rows,
+                    _shared,
+                    _fixed_matrix,
+                    fixed_adjoint,
+                ) in self._contractions
+            )
+            + sum(
+                fixed_matrices.nbytes + fixed_adjoints.nbytes
+                for (
+                    _rows,
+                    _shared,
+                    _output_columns,
+                    _offsets,
+                    _sizes,
+                    _parameter_groups,
+                    _target_groups,
+                    fixed_matrices,
+                    fixed_adjoints,
+                ) in self._contraction_batches
+            )
+        )
+
+    def matvec(self, vector):
+        vector = np.asarray(vector).reshape(-1)
+        if vector.size != self.parameter_dimension:
+            raise ValueError("Tied coordinate vector has the wrong size.")
+        result = np.zeros(
+            self.pair_dimension,
+            dtype=np.result_type(vector.dtype, complex),
+        )
+        for (
+            rows,
+            shared,
+            output_columns,
+            offsets,
+            sizes,
+            parameter_groups,
+            target_groups,
+            fixed_matrices,
+            _fixed_adjoints,
+        ) in self._contraction_batches:
+            count = len(offsets)
+            varied_shape = (
+                (count, rows, shared)
+                if self.varied_left
+                else (count, shared, output_columns)
+            )
+            varied = np.zeros(varied_shape, dtype=result.dtype)
+            for block, parameters, targets in zip(
+                varied, parameter_groups, target_groups
+            ):
+                np.add.at(block.reshape(-1), targets, vector[parameters])
+            pairs = (
+                varied @ fixed_matrices
+                if self.varied_left
+                else fixed_matrices @ varied
+            )
+            for offset, size, pair in zip(offsets, sizes, pairs):
+                result[offset : offset + size] = pair.reshape(-1)
+        return result
+
+    def rmatvec(self, vector):
+        vector = np.asarray(vector).reshape(-1)
+        if vector.size != self.pair_dimension:
+            raise ValueError("Reduced pair vector has the wrong size.")
+        result = np.zeros(
+            self.parameter_dimension,
+            dtype=np.result_type(vector.dtype, complex),
+        )
+        for (
+            rows,
+            _shared,
+            output_columns,
+            offsets,
+            sizes,
+            parameter_groups,
+            target_groups,
+            _fixed_matrices,
+            fixed_adjoints,
+        ) in self._contraction_batches:
+            pairs = np.empty(
+                (len(offsets), rows, output_columns), dtype=result.dtype
+            )
+            for pair, offset, size in zip(pairs, offsets, sizes):
+                pair[:] = vector[offset : offset + size].reshape(
+                    rows, output_columns
+                )
+            gradients = (
+                pairs @ fixed_adjoints
+                if self.varied_left
+                else fixed_adjoints @ pairs
+            )
+            for gradient, parameters, targets in zip(
+                gradients, parameter_groups, target_groups
+            ):
+                np.add.at(result, parameters, gradient.reshape(-1)[targets])
+        return result
+
+    def restrict(self, support):
+        support = np.asarray(support, dtype=np.int64)
+        if np.array_equal(support, np.arange(self.parameter_dimension)):
+            return self
+        return _RestrictedMatrixFreePairEmbedding(self, support)
+
+    def projected_diagonal(self, parent_diagonal):
+        """Project a pair-space diagonal without forming the embedding."""
+        gradients = {}
+        for entry, pair_diagonal in zip(
+            self.layout.entries, self.layout.blocks(parent_diagonal)
+        ):
+            q_l, q_p1, q_p2, q_r, q_mid = entry.key
+            if self.varied_left:
+                fixed = self.fixed_site.data.get((q_mid, q_p2, q_r))
+                if fixed is None:
+                    continue
+                gradient = np.einsum(
+                    "abcr,mcr->abm",
+                    pair_diagonal,
+                    np.abs(np.asarray(fixed)) ** 2,
+                    optimize=True,
+                )
+                key = (q_l, q_p1, q_mid)
+            else:
+                fixed = self.fixed_site.data.get((q_l, q_p1, q_mid))
+                if fixed is None:
+                    continue
+                gradient = np.einsum(
+                    "abcr,abm->mcr",
+                    pair_diagonal,
+                    np.abs(np.asarray(fixed)) ** 2,
+                    optimize=True,
+                )
+                key = (q_mid, q_p2, q_r)
+            gradients[key] = gradients.get(key, 0.0) + gradient
+        return np.real(self.routes.adjoint(gradients))
+
+
+class _RestrictedMatrixFreePairEmbedding:
+    def __init__(self, parent, support):
+        self.parent = parent
+        self.support = np.asarray(support, dtype=np.int64)
+        self.pair_dimension = parent.pair_dimension
+        self.parameter_dimension = int(self.support.size)
+
+    @property
+    def shape(self):
+        return self.pair_dimension, self.parameter_dimension
+
+    @property
+    def nbytes(self):
+        return int(self.parent.nbytes + self.support.nbytes)
+
+    def matvec(self, vector):
+        lifted = np.zeros(self.parent.parameter_dimension, dtype=complex)
+        lifted[self.support] = vector
+        return self.parent.matvec(lifted)
+
+    def rmatvec(self, vector):
+        return self.parent.rmatvec(vector)[self.support]
+
+    def projected_diagonal(self, parent_diagonal):
+        return self.parent.projected_diagonal(parent_diagonal)[self.support]
 
 
 class _StructuredPairEmbedding:
@@ -759,6 +1254,31 @@ class _StructuredPairEmbedding:
             ))
         return diagonal
 
+    def projected_diagonal_blocks(self, parent_diagonal, groups):
+        """Project a parent diagonal into selected coordinate blocks."""
+        parent_diagonal = np.asarray(parent_diagonal)
+        groups = tuple(np.asarray(group, dtype=np.int64) for group in groups)
+        blocks = [
+            np.zeros((group.size, group.size), dtype=complex)
+            for group in groups
+        ]
+        for (offset, size), (columns, design) in self._records.items():
+            weights = parent_diagonal[offset : offset + size]
+            for block, group in zip(blocks, groups):
+                common, record_positions, group_positions = np.intersect1d(
+                    columns,
+                    group,
+                    assume_unique=True,
+                    return_indices=True,
+                )
+                if common.size == 0:
+                    continue
+                local = design[:, record_positions]
+                block[np.ix_(group_positions, group_positions)] += (
+                    local.conj().T @ (weights[:, None] * local)
+                )
+        return tuple(0.5 * (block + block.conj().T) for block in blocks)
+
 
 class NonAbelianFrontierLETTA:
     r"""Graph-tied reduced SU(2) frontier LETTA.
@@ -771,13 +1291,38 @@ class NonAbelianFrontierLETTA:
     ``D`` counts reduced multiplets per reachable virtual sector, not the
     magnetic-state dimension.
 
+    ``n_threads=None`` uses ``pyqed.num_workers()`` for the compiled OpenMP
+    team. Independent Python setup defaults to ``workers=1`` to keep one
+    parallel layer active. Explicit counts override these defaults.
+
+    ``virtual_boundary='periodic'`` closes a D-dimensional multiplicity index
+    with a spin-zero seam and a fixed total-particle-charge twist. An exact
+    spectator-index lift retains the raw closed-loop parameter constraints
+    while using reduced open environments (interior multiplicities grow by D).
+    This adapts the periodic trace ansatz of F. Verstraete, D. Porras and
+    J. I. Cirac, Phys. Rev. Lett. 93, 227205 (2004),
+    https://doi.org/10.1103/PhysRevLett.93.227205. It is not a reproduction of
+    their DMRG algorithm: only singlet targets, spin-zero seam sectors, reduced
+    MPO Hamiltonians and fixed-D ``algorithm='projected'`` one-site updates
+    are supported. General spin-carrying seams and periodic canonical gauges
+    are unsupported; no global convergence guarantee is provided.
+
+    ``compact_frontier=True`` removes closed-loop contraction coordinates
+    absent from every complete structural parameter path. This exact layout
+    reduction uses no numerical cutoff or Schmidt truncation and preserves
+    zero-valued parameter directions. ``False`` retains the unfolded reference
+    layout. Route compilation uses shape-only templates and selected seam
+    indices, avoiding dense intermediate site tensors.
+
     The reduced-tensor layer follows the Wigner--Eckart/non-Abelian tensor
     network formulation of A. Weichselbaum, Phys. Rev. B 86, 245124 (2012),
     https://doi.org/10.1103/PhysRevB.86.245124.  This is a PyQED adaptation to
     the project-specific LETTA graph-tied ansatz, not a reproduction of that
     paper's MPS/NRG algorithms.  The implementation currently supports fully
     reduced spatial-orbital SU(2) states and scalar rank-coupled Hamiltonians;
-    it does not provide general non-Abelian groups or arbitrary tensor ranks.
+    arbitrary tensor ranks are not provided. ``from_integrals`` additionally
+    supports finite spatial groups through SpatialSymmetryLETTA's structural
+    regular-representation leg; spatial rows are explicit, not CG-compressed.
     """
 
     def __init__(
@@ -796,15 +1341,32 @@ class NonAbelianFrontierLETTA:
         tie="auto",
         max_frontier_states=4096,
         workers=1,
-        n_threads=1,
+        n_threads=None,
         we_route_memory=256.0,
+        virtual_boundary="open",
+        compact_frontier=True,
+        _evaluate_initial_state=True,
     ):
+        if virtual_boundary not in {'open','periodic'}:
+            raise ValueError("virtual_boundary must be 'open' or 'periodic'")
+        self.virtual_boundary = virtual_boundary
+        self.compact_frontier = bool(compact_frontier)
+        self._frontier_compaction = None
+        state_only = mpo is None
+        self._state_only = state_only
+        if state_only:
+            if base_sites is None:
+                raise ValueError("State-only LETTA construction requires base_sites.")
+            base_sites = tuple(base_sites)
+            mpo = _identity_mpo_factors_for_sites_and_mpo(
+                base_sites, [None] * len(base_sites),
+            )
         factors = getattr(mpo, "factors", mpo)
         self._su2_moving_environment = getattr(mpo, "moving_environment", None)
         self._complementary_operators = getattr(
             mpo, "complementary_operators", None
         )
-        self.mpo = _rank_coupled_hamiltonian_factors(factors)
+        self.mpo = prepare_hamiltonian_factors(factors)
         self.hamiltonian_representation = (
             "complementary"
             if self.mpo
@@ -813,13 +1375,22 @@ class NonAbelianFrontierLETTA:
             else "mpo"
         )
         self._hamiltonian_spec = None
+        self._pair_hamiltonian_cache = None
+        self._hamiltonian_representation_policy = self.hamiltonian_representation
+        self._representation_decision = {
+            "policy": self.hamiltonian_representation,
+            "selected": self.hamiltonian_representation,
+            "reason": "explicit construction request",
+        }
         self.nsites = len(self.mpo)
         if self.nsites < 2:
             raise ValueError("NonAbelianFrontierLETTA requires at least two sites.")
         if not isinstance(D, Integral) or isinstance(D, (bool, np.bool_)) or int(D) < 1:
             raise ValueError("D must be a positive reduced multiplet dimension.")
         self.D = int(D)
-        self.workers = resolve_workers(workers)
+        self.workers = resolve_workers(1 if workers is None else workers)
+        if n_threads is None:
+            n_threads = resolve_default_workers()
         if isinstance(n_threads, (bool, np.bool_)) or not isinstance(
             n_threads, Integral
         ):
@@ -856,12 +1427,16 @@ class NonAbelianFrontierLETTA:
         self._embedding_active_columns_cache = {}
         self._projected_krylov_cache = {}
         self._metric_whitener_cache = {}
+        self._metric_whitener_component_cache = {}
         self._metric_whitener_cache_hits = 0
         self._metric_whitener_cache_misses = 0
+        self._metric_whitener_component_hits = 0
         self._metric_component_topology_cache = {}
         self._metric_component_cache_hits = 0
         self._metric_component_cache_misses = 0
         self._state_revision = 0
+        self._site_revisions = [0] * self.nsites
+        self._global_guard_bonds = set()
         self._stationary_certificate_cache = {}
         self._stationary_certificate_cache_hits = 0
         self._materialized_site_cache = {}
@@ -891,6 +1466,8 @@ class NonAbelianFrontierLETTA:
                 "or the right boundary of base_sites."
             )
         self.target_sector = target_sector
+        if virtual_boundary=='periodic' and int(target_sector.irrep.two_j)!=0:
+            raise ValueError("periodic SU2 multiplicity closure requires a singlet target")
         self.core_energy = float(getattr(mpo, "ecore", ecore))
         mpo_info = getattr(mpo, "info", {})
         self.mpo_includes_core_energy = bool(
@@ -918,6 +1495,18 @@ class NonAbelianFrontierLETTA:
                 bond_multiplicity=self.D,
                 seed=seed,
             )
+            if virtual_boundary=='periodic':
+                rng = np.random.default_rng(seed)
+                for index, tensor in enumerate(base_sites):
+                    qns = [list(q) for q in tensor.qns]
+                    # A cut loop has D incoming channels: open-chain path
+                    # counts must not cap multiplicities near either end.
+                    for axis in (0, 2):
+                        qns[axis] = [q for q in _unique(qns[axis]) for _ in range(self.D)]
+                    data = {key:rng.normal(size=(self.D, block.shape[1], self.D))
+                            for key, block in tensor.data.items()}
+                    base_sites[index] = IrrepTensor(data=data, qns=qns,
+                                                    dirs=tensor.dirs, metadata=tensor.metadata)
         self._base_sites = self._validate_base_sites(base_sites)
         self.physical_sectors_by_site = tuple(
             tuple(_unique(site.qns[1])) for site in self._base_sites
@@ -956,6 +1545,8 @@ class NonAbelianFrontierLETTA:
             )
             for frontier in self.frontiers
         )
+        self.max_frontier_states = int(max_frontier_states)
+        self.tie_history = []
         largest = max(len(values) for values in self._assignments)
         if largest > int(max_frontier_states):
             raise MemoryError(
@@ -967,7 +1558,8 @@ class NonAbelianFrontierLETTA:
             seed=seed,
         )
         self.history = []
-        self.energy = self.expectation()
+        self.energy = (self.expectation()
+                       if not state_only and _evaluate_initial_state else None)
         self.converged = False
         self.success = None
         self.message = "initialized reduced non-Abelian FrontierLETTA"
@@ -987,18 +1579,63 @@ class NonAbelianFrontierLETTA:
         D=1,
         ecore=0.0,
         cutoff=1.0e-10,
-        hamiltonian_representation="complementary",
+        hamiltonian_representation="auto",
+        point_group=None,
+        orbital_representations=None,
+        wfnsym=None,
         **kwargs,
     ):
         """Build a reduced qchem Hamiltonian and its SU(2)-LETTA state.
 
+        ``orbital_representations`` together with ``wfnsym`` selects a complete spatial multiplet and returns a
+        SpatialSymmetryLETTA driver. Its finite-group structural leg is kept
+        in every reduced local objective, including both E rows. See that
+        class for Singh/Malmqvist/Knecht references, fidelity, bond-dimension
+        conventions, and the fixed-D one-site sweep restrictions.
+
         The default LETTA tie graph is the nearest-neighbor orbital chain;
         ``graph="nn"`` selects it explicitly. Hamiltonian couplings remain
         complete in either representation; ``graph`` controls only variational
-        tensor ties. The default direct complementary representation carries
+        tensor ties. ``"nnn"`` and ``"nnnn"`` include all ties through the
+        second and third neighbors, respectively, using the general frontier
+        optimizer rather than the NN conditional canonical gauge.
+        The default direct complementary representation carries
         the reduced $S/R/A/P/B/Q$ operators without storing a Hamiltonian MPO;
         ``"mpo"`` remains an explicit reference option.
+
+        With ``virtual_boundary='periodic'``, auto selects the reduced MPO.
+        The spin-zero multiplicity seam and its restrictions are described
+        in :class:`NonAbelianFrontierLETTA`; optimize with ``algorithm='projected'``.
         """
+        if "target_irrep" in kwargs:
+            raise TypeError("Use wfnsym; target_irrep has been removed.")
+        if any(value is not None for value in (point_group, orbital_representations, wfnsym)):
+            from pyqed.qchem.symmetry import get_point_group
+            from pyqed.qchem.spatial_symmetry import resolve_spatial_target
+            from .spatial_symmetry import SpatialSymmetryLETTA
+            group = get_point_group(point_group or "D3h") if point_group is None or isinstance(point_group, str) else point_group
+            target = resolve_spatial_target(group, wfnsym)
+            if orbital_representations is None or target is None:
+                raise ValueError("Spatial symmetry requires orbital_representations and wfnsym.")
+            if hamiltonian_representation not in {"auto", "mpo"}:
+                raise ValueError("Spatial structural legs currently use reduced MPO Hamiltonians.")
+            from pyqed.qchem.spatial_symmetry import SpatialGroupAction
+            SpatialGroupAction(orbital_representations, target, point_group=group).validate_hamiltonian(h1e, eri)
+            options = dict(kwargs)
+            seed = cls.from_integrals(h1e, eri, nelec=nelec, spin=spin, graph=graph,
+                D=D, ecore=ecore, cutoff=cutoff, hamiltonian_representation="mpo", **options)
+            solver = SpatialSymmetryLETTA(seed, orbital_representations, target,
+                point_group=group)
+            def seed_factory(root, previous):
+                root_options = dict(options)
+                root_options["seed"] = int(options.get("seed") or 0) + root
+                next_seed = cls.from_integrals(h1e, eri, nelec=nelec, spin=spin, graph=graph,
+                    D=D, ecore=ecore, cutoff=cutoff, hamiltonian_representation="mpo", **root_options)
+                return SpatialSymmetryLETTA(next_seed, orbital_representations, target,
+                    point_group=group, orthogonal_to=previous)
+            solver._seed_factory = seed_factory
+            return solver
+
         from pyqed.qchem.dmrg.backends.reduced import (
             build_spatial_reduced_hamiltonian_mpo,
         )
@@ -1015,17 +1652,27 @@ class NonAbelianFrontierLETTA:
             spin=spin,
             ecore=ecore,
         )
-        representation = str(hamiltonian_representation).lower().replace("-", "_")
+        representation_policy = str(hamiltonian_representation).lower().replace(
+            "-", "_"
+        )
+        representation = representation_policy
         if representation in {"direct", "normal_complementary", "nc"}:
+            representation = "complementary"
+        if representation == "auto":
             representation = "complementary"
         if representation not in {"complementary", "mpo"}:
             raise ValueError(
-                "hamiltonian_representation must be 'complementary' or 'mpo'."
+                "hamiltonian_representation must be 'auto', 'complementary', "
+                "or 'mpo'."
             )
+        if kwargs.get('virtual_boundary','open')=='periodic':
+            if representation_policy in {'complementary','direct','normal_complementary','nc'}:
+                raise ValueError("closed SU2 multiplicity loops currently require a reduced MPO Hamiltonian")
+            representation = 'mpo'
         if representation == "complementary" and np.asarray(h1e).shape[-1] <= 2:
             representation = "mpo"
         if representation == "mpo":
-            factors = _rank_coupled_hamiltonian_factors(
+            factors = prepare_hamiltonian_factors(
                 hamiltonian.factors,
                 materialize=True,
             )
@@ -1066,6 +1713,12 @@ class NonAbelianFrontierLETTA:
             "ecore": float(ecore),
             "cutoff": float(cutoff),
             "hamiltonian_representation": representation,
+        }
+        state._hamiltonian_representation_policy = representation_policy
+        state._representation_decision = {
+            "policy": representation_policy,
+            "selected": representation,
+            "reason": "direct complementary has the lower cold-start cost",
         }
         return state
 
@@ -1141,7 +1794,40 @@ class NonAbelianFrontierLETTA:
                 or dict(left.legs[2].dims) != dict(right.legs[0].dims)
             ):
                 raise ValueError("neighboring base MPS bond-sector layouts do not match.")
+        if self.virtual_boundary=='periodic':
+            for endpoint,axis in [(sites[0],0),(sites[-1],2)]:
+                if len(endpoint.legs[axis].sectors)!=1 or next(iter(endpoint.legs[axis].dims.values()))!=self.D:
+                    raise ValueError("periodic seam endpoints must each have D multiplicity copies")
+            left_sector = sites[0].legs[0].sectors[0]
+            if left_sector.charge != 0 or left_sector.irrep.two_j != 0:
+                raise ValueError("periodic spin-zero charge-twisted seam starts in the vacuum sector")
         return tuple(site.copy() for site in sites)
+
+    def with_tie_graph(self, graph, *, max_frontier_states=None, evaluate_energy=True):
+        """Return an independent reduced state with additional invariant ties.
+
+        Existing conditioned blocks are copied to every new label slice;
+        magnetic projections and virtual-sector layouts are unchanged.
+        Removing ties is unsupported because it requires state compression.
+        Set ``evaluate_energy=False`` to prepare tensors without a frontier
+        contraction; the returned energy is then unset.
+        """
+        from .su2_adaptive_graph import with_tie_graph
+        return with_tie_graph(self, graph, max_frontier_states=max_frontier_states,
+                             evaluate_energy=evaluate_energy)
+
+    def adapt_ties(self, **options):
+        """Try cost-bounded additions and adopt a variationally improved graph.
+
+        Invariant-sector information shortlists candidates; relaxed energy
+        gains decide acceptance. This is a greedy adaptation inspired by
+        Kovyrshin and Reiher, JCP 147, 214111 (2017),
+        https://doi.org/10.1063/1.5004693, not their SATNS algorithm. Sector
+        information omits intra-sector quantum coherences; there is no global
+        graph-optimality or convergence guarantee. See su2_adaptive_graph.
+        """
+        from .su2_adaptive_graph import adapt_ties
+        return adapt_ties(self, **options)
 
     def _initialize_tensors(self, *, init, seed):
         init = str(init).lower().replace("-", "_")
@@ -1184,7 +1870,7 @@ class NonAbelianFrontierLETTA:
     def supports_conditional_canonical_gauge(self):
         """Whether every internal frontier is one nearest-neighbor condition."""
         return bool(
-            self.tie == "physical"
+            self.virtual_boundary == 'open' and self.tie == "physical"
             and all(
                 self.parent_sets[bond] == (bond + 1,)
                 and self.frontiers[bond + 1] == (bond + 1,)
@@ -1371,7 +2057,67 @@ class NonAbelianFrontierLETTA:
                 )
         if any(bool(update.get("applied", False)) for update in updates):
             self._state_revision += 1
+            self._site_revisions[bond] += 1
+            self._site_revisions[bond + 1] += 1
             self._invalidate_materialized_sites(bond, bond + 1)
+        return tuple(updates)
+
+    def balance_coefficients(self, *, conditional=True, rcond=1.0e-12):
+        """Balance internal reduced virtual bonds with sector-wise QR transfers.
+
+        Adaptation of QR gauge absorption in Schollwoeck, Ann. Phys. 326,
+        96--192 (2011), https://doi.org/10.1016/j.aop.2010.09.012. A transfer
+        may depend on the next physical label when both neighboring tensors
+        share it; other tie conditions are stacked. This preserves tensor
+        shapes and the represented state in exact arithmetic. It is coefficient
+        balancing, not a periodic canonical norm gauge or Schmidt truncation.
+        The closing bond is not transformed. Rank-deficient or relatively
+        ill-conditioned transfers are skipped at ``rcond`` without truncation.
+
+        No Hamiltonian or norm environments are built. The caller must audit
+        numerical preservation for ill-conditioned states before optimization.
+        Returns per-transfer diagnostics and invalidates changed site caches.
+        """
+        if not np.isfinite(rcond) or rcond < 0 or rcond >= 1:
+            raise ValueError('rcond must be finite and in [0, 1)')
+        updates = []
+        for bond in range(self.nsites-1):
+            left, right = dict(self.tensors[bond]), dict(self.tensors[bond+1])
+            conditioned = conditional and self.tie == 'physical' and bond+1 in self.parent_sets[bond]
+            slot = self.parent_sets[bond].index(bond+1) if conditioned else None
+            groups = enumerate(self.tie_domains[bond+1]) if conditioned else [(None, None)]
+            changed = False
+            for index, physical in groups:
+                for sector in self._base_sites[bond].legs[2].sectors:
+                    keys = [key for key in self._tensor_keys[bond] if key[2] == sector
+                            and (not conditioned or key[3][slot] == index)]
+                    targets = [key for key in self._tensor_keys[bond+1] if key[0] == sector
+                               and (not conditioned or key[1] == physical)]
+                    if not keys or not targets:
+                        continue
+                    rows = [left[key].reshape(-1, left[key].shape[-1]) for key in keys]
+                    matrix = np.concatenate(rows)
+                    singular = np.linalg.svd(matrix, compute_uv=False)
+                    applied = (matrix.shape[0] >= matrix.shape[1] and singular[0] > 0
+                               and singular[-1] > rcond*singular[0])
+                    updates.append(dict(bond=bond, condition=index, sector=sector,
+                                        applied=bool(applied),
+                                        relative_minimum_singular_value=float(singular[-1]/singular[0])
+                                        if singular[0] else 0.0))
+                    if not applied:
+                        continue
+                    q, transfer = np.linalg.qr(matrix, mode='reduced')
+                    offset = 0
+                    for key, row in zip(keys, rows):
+                        left[key] = q[offset:offset+row.shape[0]].reshape(left[key].shape)
+                        offset += row.shape[0]
+                    for key in targets:
+                        right[key] = np.einsum('ab,bpc->apc', transfer, right[key])
+                    changed = True
+            if changed:
+                for site, blocks in ((bond, left), (bond+1, right)):
+                    vector = np.concatenate([blocks[key].ravel() for key in self._tensor_keys[site]])
+                    self._set_site_vector(site, vector)
         return tuple(updates)
 
     def canonicalize_conditional_center(self, center, *, rcond=1.0e-12):
@@ -1413,6 +2159,15 @@ class NonAbelianFrontierLETTA:
             self._materialized_site_cache_hits += 1
             return cached
         self._materialized_site_cache_misses += 1
+        if self.virtual_boundary == 'periodic' and self.compact_frontier:
+            materialized = self._wigner_eckart_route_plan(site).tensor(self._pack_site(site))
+        else:
+            materialized = self._materialize_unfolded_site(site)
+        self._materialized_site_cache[site] = materialized
+        return materialized
+
+    def _materialize_unfolded_site(self, site):
+        """Explicit unfolded reference for validating the structural layout."""
         base = self._base_sites[site]
         left_frontier = self.frontiers[site]
         right_frontier = self.frontiers[site + 1]
@@ -1488,7 +2243,9 @@ class NonAbelianFrontierLETTA:
                 "letta_tie": self.tie,
             },
         )
-        self._materialized_site_cache[site] = materialized
+        if self.virtual_boundary=='periodic':
+            from .su2_closure import lift_closure
+            materialized = lift_closure(materialized,site,self.nsites,self.D)
         return materialized
 
     def materialize(self):
@@ -1503,6 +2260,7 @@ class NonAbelianFrontierLETTA:
 
     def close(self):
         """Release the bounded local-contraction worker pool."""
+        self._pair_hamiltonian_cache = None
         executor = getattr(self, "_solver_executor", None)
         self._solver_executor = None
         if executor is not None:
@@ -1516,12 +2274,15 @@ class NonAbelianFrontierLETTA:
                 **options,
                 graph=self.graph,
                 D=self.D,
+                virtual_boundary=self.virtual_boundary,
+                compact_frontier=self.compact_frontier,
                 base_sites=copy.deepcopy(self._base_sites, memo),
                 tie=self.tie,
                 init="mps",
                 workers=self.workers,
                 n_threads=self.n_threads,
                 we_route_memory=self.we_route_memory,
+                max_frontier_states=self.max_frontier_states,
             )
             memo[id(self)] = clone
             runtime_names = {
@@ -1531,6 +2292,7 @@ class NonAbelianFrontierLETTA:
                 "_su2_moving_environment",
                 "_complementary_operators",
                 "_solver_executor",
+                "_pair_hamiltonian_cache",
             }
             for name, value in self.__dict__.items():
                 if name not in runtime_names:
@@ -1540,7 +2302,7 @@ class NonAbelianFrontierLETTA:
         clone = type(self).__new__(type(self))
         memo[id(self)] = clone
         for name, value in self.__dict__.items():
-            if name in {"_su2_moving_environment", "_complementary_operators"}:
+            if name in {"_su2_moving_environment", "_complementary_operators", "_pair_hamiltonian_cache"}:
                 setattr(clone, name, None)
             elif name != "_solver_executor":
                 setattr(clone, name, copy.deepcopy(value, memo))
@@ -1559,13 +2321,76 @@ class NonAbelianFrontierLETTA:
         if executor is not None:
             executor.shutdown(wait=False)
 
+    def frontier_contractions(self, **options):
+        """Sparse reduced frontier energies and tied-parameter actions.
+
+        Avoids dense frontier site and pair tensors. See
+        :class:`pyqed.letta.su2_frontier.SU2FrontierContractions` for the
+        Weichselbaum (2012) adaptation, exactness, budgets and restrictions.
+        """
+        from .su2_frontier import SU2FrontierContractions
+        return SU2FrontierContractions(self, **options)
+
     def norm(self):
         sites = self.materialize()
         identity = _identity_mpo_factors_for_sites_and_mpo(sites, self.mpo)
         return _real_scalar(contract_chain_expectation(sites, identity))
 
+    def transform_orbitals(self, matrix, *, max_bond=128, cutoff=1e-12,
+                           memory_limit=2**24, return_info=False):
+        """Counter-transform reduced chain or NN LETTA coefficients by Γ(matrix).
+
+        See :func:`pyqed.letta.biorthogonal.transform_orbitals` for conventions,
+        Malmqvist/Knecht references, compression bounds, and restrictions.
+        """
+        if self.virtual_boundary == 'periodic':
+            raise NotImplementedError("orbital transformations of closed multiplicity loops are unsupported")
+        from .biorthogonal import transform_orbitals
+        return transform_orbitals(self, matrix, max_bond=max_bond, cutoff=cutoff,
+                                  memory_limit=memory_limit, return_info=return_info)
+
+    def biorthogonalize(self, other, s, *, max_bond=None,
+                        tol=1e-8, memory_limit=2**24, return_info=False):
+        """Return two reduced LETTA states biorthogonalized for orbital metric s.
+
+        See :func:`pyqed.letta.biorthogonal.biorthogonalize` for the explicit
+        basis maps, Malmqvist/Knecht adaptation, and current restrictions.
+        """
+        if self.virtual_boundary == 'periodic' or getattr(other, 'virtual_boundary', 'open') == 'periodic':
+            raise NotImplementedError("biorthogonalization of closed multiplicity loops is unsupported")
+        from .biorthogonal import biorthogonalize
+        return biorthogonalize(self, other, s, max_bond=max_bond,
+                               tol=tol, memory_limit=memory_limit,
+                               return_info=return_info)
+
+    def overlap(self, other, *, s=None,
+                      memory_limit=2**24, max_bond=None,
+                      tol=1e-8, return_info=False):
+        """Contract LETTA conditional tensors without materializing an MPS.
+
+        See :func:`pyqed.letta.overlap.overlap` for the spatial-orbital
+        metric, explicit biorthogonalization, state compression, and restrictions.
+        """
+        if self.virtual_boundary == 'periodic' or getattr(other, 'virtual_boundary', 'open') == 'periodic':
+            raise NotImplementedError("use reduced materialized-chain contractions for closed-loop overlaps")
+        from .overlap import overlap
+
+        return overlap(
+            self, other, s=s,
+            memory_limit=memory_limit, max_bond=max_bond,
+            tol=tol, return_info=return_info,
+        )
+
     def _complementary_rayleigh_quotient(self, sites):
         """Evaluate the state through one exact direct-complementary bond action."""
+        # Conditional gauges do not flatten the complete norm. Almost-null
+        # tied directions can leave huge cancelling reduced coefficients;
+        # using those directly also corrupts the global acceptance guard.
+        # Gauge a temporary unfolded reduced MPS, without truncation or any
+        # change to the variational LETTA tensors.
+        from pyqed.mps.nonabelian.canonical import left_qr_sites
+
+        sites = left_qr_sites(sites)
         for site in sites:
             metadata = getattr(site, "metadata", None)
             if isinstance(metadata, dict):
@@ -1590,11 +2415,13 @@ class NonAbelianFrontierLETTA:
             sites,
             self.mpo,
             renormalized_blocks=local_environment.hamiltonian_stack,
+            sweep_direction="lr",
         )
         n_chain = BlockSparseEnvironmentChain.build(
             sites,
             local_environment.identity_mpo_factors,
             renormalized_blocks=local_environment.norm_stack,
+            sweep_direction="lr",
         )
         merged = merge_mps_sites(sites[0], sites[1])
         layout = _ChannelResolvedPairSpace(sites[0], sites[1])
@@ -1607,6 +2434,7 @@ class NonAbelianFrontierLETTA:
                 h_chain.start_sweep("lr"),
                 n_chain.start_sweep("lr"),
             ),
+            materialize_metric_blocks=False,
         )
         vector = layout.pack_sites(sites[0], sites[1])
         metric_vector = np.asarray(n_action(vector))
@@ -1616,6 +2444,8 @@ class NonAbelianFrontierLETTA:
         return float(np.real(np.vdot(vector, h_action(vector))) / denominator)
 
     def expectation(self, mpo=None):
+        if mpo is None and self._state_only:
+            raise ValueError("This LETTA has no Hamiltonian; supply an explicit MPO.")
         factors = self.mpo if mpo is None else tuple(getattr(mpo, "factors", mpo))
         if mpo is None and self.hamiltonian_representation == "complementary":
             self._materialized_site_cache.clear()
@@ -1653,8 +2483,8 @@ class NonAbelianFrontierLETTA:
         )
         route_bytes = sum(plan.nbytes for plan in self._we_route_cache.values())
         embedding_bytes = sum(
-            np.asarray(blocks).nbytes
-            for blocks in self._embedding_basis_cache.values()
+            indices.nbytes + blocks.nbytes
+            for indices, blocks in self._embedding_basis_cache.values()
         )
         embedding_bytes += sum(
             int(record["embedding"].nbytes)
@@ -1686,6 +2516,13 @@ class NonAbelianFrontierLETTA:
                 reduced_block_bytes += sum(
                     np.asarray(block).nbytes for block in blocks.values()
                 )
+            plan = getattr(core, "normal_complementary_plan", None)
+            if plan is not None:
+                reduced_block_bytes += sum(
+                    record["routes"].nbytes
+                    for record in plan.get("_boundary_action_cache", {}).values()
+                    if record.get("routes") is not None
+                )
         return int(
             tensor_bytes
             + base_bytes
@@ -1698,6 +2535,301 @@ class NonAbelianFrontierLETTA:
             + reduced_block_bytes
         )
 
+    def _one_site_parameter_adjoint(self,site,bra,ket,core,left,right):
+        """Pull a channel-resolved reduced one-site contraction back to parameters."""
+        blocks=iter_one_site_reduced_adjoint(bra,ket,core,left,right)
+        return self._wigner_eckart_route_plan(site).adjoint(blocks)
+
+    def _parameter_chain_actions(self,sites,chain):
+        return [self._one_site_parameter_adjoint(site,tensor,tensor,chain.mpo_factors[site],
+                chain.left_envs[site].data,chain.right_envs[site].data)
+                for site,tensor in enumerate(sites)]
+
+    def _one_site_norm_components(self, site, core, left, right):
+        """Contract the reduced identity directly into tied parameter blocks.
+
+        Distinct physical/fusion paths and distinct future tie labels are
+        orthogonal in the norm. Each raw conditional tensor block therefore
+        supplies an independent metric component. Its virtual multiplicities
+        remain fully coupled, including the closed seam. Structural routes,
+        rather than current nonzero coefficients, define every direction.
+        """
+        plan = self._wigner_eckart_route_plan(site)
+        components = []
+        offset = 0
+        for source_key in self._tensor_keys[site]:
+            size = self.tensors[site][source_key].size
+            start, offset = offset, offset + size
+            key = source_key[:3]
+            record = plan._group_by_key.get(key)
+            if record is None:
+                continue
+            parameters, targets, shape = record
+            selected = (parameters >= start) & (parameters < offset)
+            if not np.any(selected):
+                continue
+            local = parameters[selected] - start
+            l, p, r = np.unravel_index(targets[selected], shape)
+            ql, qp, qr = key
+            el, fr = left.get((ql, ql)), right.get((qr, qr))
+            if el is None or fr is None:
+                continue
+            terms = _left_reduced_rank_coupled_block(core, ql, ql, qp, qp, qr, qr)
+            block = np.zeros((size, size), dtype=complex)
+            for (lc, rc), w in (terms or {}).items():
+                e, f = el.get(int(lc)), fr.get(int(rc))
+                if e is None or f is None:
+                    continue
+                irrep = core.right_channel_irreps[int(rc)]
+                weights = [_component_basis_norm(qr, qr, irrep, m)
+                           for m in ordered_two_m_values(irrep)]
+                # Tile route pairs: no full lifted-site Gram matrix or unit tensors.
+                for begin in range(0, local.size, 256):
+                    a = slice(begin, begin + 256)
+                    for end in range(0, local.size, 256):
+                        b = slice(end, end + 256)
+                        values = np.zeros((local[a].size, local[b].size), dtype=complex)
+                        for x in range(w.shape[0]):
+                            for y in range(w.shape[1]):
+                                values += (e[x][np.ix_(l[a], l[b])]
+                                           * f[y][np.ix_(r[a], r[b])]
+                                           * w[x, y][np.ix_(p[a], p[b])] * weights[y])
+                        bins = (local[a, None]*size + local[None, b]).ravel()
+                        block += (np.bincount(bins, weights=values.real.ravel(), minlength=size*size)
+                                  + 1j*np.bincount(bins, weights=values.imag.ravel(),
+                                                  minlength=size*size)).reshape(size, size)
+            components.append((np.arange(start, offset), .5*(block + block.conj().T)))
+        return _ReducedMetricComponents(plan.nparameters, components)
+
+    def _stream_parameter_actions(self, sites, factors, *, norm_components=False,
+                                  sparse_boundaries=False, spill_directory=None,
+                                  checkpoint_stride=None, right_checkpoints=None, norm_consumer=None):
+        """Recompute right segments while carrying the current left boundary."""
+        if norm_consumer is not None and (not norm_components or sparse_boundaries):
+            raise ValueError('norm_consumer requires dense norm components')
+        chain = BlockSparseEnvironmentChain.build(
+            sites, factors, sweep_direction='lr', boundaries_only=True)
+        stride = int(np.ceil(np.sqrt(len(sites)))) if len(sites) >= 8 else 1
+        if checkpoint_stride is not None:
+            if not np.isfinite(checkpoint_stride) or checkpoint_stride < 1 or int(checkpoint_stride) != checkpoint_stride:
+                raise ValueError('checkpoint_stride must be a positive integer')
+            stride = int(checkpoint_stride)
+        if sparse_boundaries:
+            if norm_components:
+                raise NotImplementedError('Sparse identity-metric transport is unavailable')
+            from pyqed.mps.nonabelian.sparse_boundary import SparseBoundary, iter_right_boundaries
+            left = SparseBoundary.from_reduced(chain.left_envs[0], side='left', bond=0)
+            endpoint = SparseBoundary.from_reduced(
+                chain.right_envs[-1], side='right', bond=len(sites)-1)
+            boundaries = iter_right_boundaries(
+                sites, chain.mpo_factors, endpoint,
+                moving_environment=self._su2_moving_environment, stride=stride,
+                spill_directory=spill_directory, release_recoupling=True)
+            if right_checkpoints is not None:
+                boundaries = ((i, right_checkpoints[i][0]) for i in range(len(sites)))
+            actions = []
+            try:
+                for site, right in boundaries:
+                    tensor, core = sites[site], chain.mpo_factors[site]
+                    actions.append(self._one_site_parameter_adjoint(
+                        site, tensor, tensor, core, left, right))
+                    right.release_decoded()
+                    del right
+                    if site+1 < len(sites):
+                        left = left.advance(core, tensor,
+                            moving_environment=self._su2_moving_environment,
+                            spill_directory=spill_directory, release_recoupling=True)
+                    core._environment_reduced_block_cache.clear()
+            finally:
+                boundaries.close()
+                if right_checkpoints is not None:
+                    for boundary, _ in right_checkpoints.values():
+                        boundary.release_decoded()
+                for core in chain.mpo_factors:
+                    core._environment_reduced_block_cache.clear()
+            return actions, []
+        boundaries = chain.iter_right_boundaries(stride)
+        sweep = chain.start_sweep('lr')
+        actions, metrics = [], []
+        try:
+            for site, right in boundaries:
+                tensor = sites[site]
+                core = chain.mpo_factors[site]
+                action = self._one_site_parameter_adjoint(
+                    site, tensor, tensor, core, sweep.current_env.data, right.data)
+                metric = (self._one_site_norm_components(
+                    site, core, sweep.current_env.data, right.data) if norm_components else None)
+                if norm_consumer is not None:
+                    norm_consumer(site, action, metric)
+                else:
+                    actions.append(action)
+                    if norm_components:
+                        metrics.append(metric)
+                del action, metric
+                chain.right_envs[site] = None
+                del right
+                owner = getattr(core, 'normal_complementary_owner', None)
+                if owner is not None:
+                    owner.release_boundary('right', site)
+                if site + 1 < len(sites):
+                    sweep.advance_after_update(site, tensor, sites[site + 1])
+        finally:
+            boundaries.close()
+            chain.right_envs.clear()
+            for site, core in enumerate(chain.mpo_factors):
+                owner = getattr(core, 'normal_complementary_owner', None)
+                if owner is not None:
+                    owner.release_boundary('right', site)
+        return actions, metrics
+
+    def reduced_parameter_actions(self, *, sparse_hamiltonian=False, spill_directory=None,
+                                  checkpoint_stride=None):
+        """Return exact reduced ``H*c`` and ``N*c`` for every current site.
+
+        Direct Wigner--Eckart adjoints follow the reduced formulation of
+        Weichselbaum, PRB 86, 245124 (2012), doi:10.1103/PhysRevB.86.245124.
+        This is a LETTA adaptation with tied route pullbacks, not a separate
+        optimization algorithm. Only explicit reduced MPOs are supported;
+        no magnetic-state expansion or determinant projection is performed.
+        Avoids adjacent-pair embeddings and their extra cancellation near
+        stationarity. The returned actions omit the external core constant.
+        Singleton physical multiplicities use virtual matrix products before
+        summing operator components; other blocks retain tensor contractions.
+        Ket absorption is shared by terms with the same incoming channel.
+        One left boundary advances while right segments are reconstructed from
+        exact checkpoints. For eight or more sites this retains O(sqrt(n))
+        right blocks, with at most one extra right pass. This bounds the block
+        count, not bytes or the size of an individual contraction.
+        ``sparse_hamiltonian=True`` uses experimental real sparse Hamiltonian
+        boundaries throughout checkpoint construction and local actions. Norm
+        transport remains dense. Per-boundary storage is limited to 256 MiB,
+        gathered arenas to 16 MiB; exceeding either raises MemoryError.
+        With ``spill_directory`` each sparse Hamiltonian boundary instead uses
+        a temporary file (8 GiB limit), deleted when that boundary is released.
+        The directory must exist. This option requires ``sparse_hamiltonian``.
+        ``checkpoint_stride`` optionally controls sparse Hamiltonian checkpoint
+        spacing; 1 retains every right boundary and avoids recomputation.
+        Disk payloads stay on disk, but O(n) metadata remains in RAM. Norm
+        checkpoints retain their default spacing.
+        """
+        if self.hamiltonian_representation!='mpo':
+            raise NotImplementedError('direct parameter actions require an explicit reduced MPO')
+        if spill_directory is not None and not sparse_hamiltonian:
+            raise ValueError('spill_directory requires sparse_hamiltonian=True')
+        if checkpoint_stride is not None and not sparse_hamiltonian:
+            raise ValueError('checkpoint_stride requires sparse_hamiltonian=True')
+        sites=self.materialize()
+        identity=_identity_mpo_factors_for_sites_and_mpo(sites,self.mpo)
+        h, _ = self._stream_parameter_actions(
+            sites, self.mpo, sparse_boundaries=sparse_hamiltonian, spill_directory=spill_directory,
+            checkpoint_stride=checkpoint_stride)
+        n, _ = self._stream_parameter_actions(sites, identity)
+        return h, n
+
+    def local_tangent_residual(self, *, metric_rtol=1e-11, support_rtol=1e-13,
+                               max_parameters=4096, sparse_hamiltonian=False,
+                               spill_directory=None, checkpoint_stride=None, _checkpoint_cache=None):
+        """Audit one-site stationarity at the current reduced SU(2) state.
+
+        Unlike local eigensolver residuals collected during a sweep, this
+        computes every supported tangent residual with all other tensors fixed
+        at the final state. Uses the existing Wigner--Eckart reduced actions
+        and metric whitening, without determinant or magnetic-state projection.
+        The maximum certifies retained-metric one-site stationarity, not an
+        exact eigenstate or a global optimum. Materialized reduced metrics
+        are limited by ``max_parameters``; no matrix-free metric audit is
+        implemented here. Updates diagnostic fields, but does not change tensors.
+        Closed loops use direct one-site adjoints with a common total Rayleigh
+        quotient and conditional reduced norm blocks. Their audit consumes
+        boundary stacks sequentially and never assembles an adjacent-pair
+        Hamiltonian or a global whitening matrix. Norm blocks retain the
+        existing support and eigenvalue thresholds; this remains an adaptation
+        of the reduced Wigner--Eckart formulation cited in the class docstring.
+        For real closed states with an explicit reduced MPO,
+        ``sparse_hamiltonian=True`` uses sparse Hamiltonian checkpoints and
+        actions. ``spill_directory`` optionally keeps their payload on disk,
+        with the budgets documented in ``reduced_parameter_actions``. Norm
+        transport and conditional metric blocks retain their dense path.
+        Each site's metric is whitened and released before constructing the
+        next, so the audit does not retain the full set of local metrics.
+        ``checkpoint_stride`` controls only sparse Hamiltonian checkpoints,
+        as in ``reduced_parameter_actions``.
+        """
+        if not np.isfinite(metric_rtol) or metric_rtol<=0:
+            raise ValueError("metric_rtol must be finite and positive")
+        if spill_directory is not None and not sparse_hamiltonian:
+            raise ValueError('spill_directory requires sparse_hamiltonian=True')
+        if checkpoint_stride is not None and not sparse_hamiltonian:
+            raise ValueError('checkpoint_stride requires sparse_hamiltonian=True')
+        if sparse_hamiltonian and (self.virtual_boundary != 'periodic'
+                                   or self.hamiltonian_representation != 'mpo'):
+            raise NotImplementedError('Sparse stationarity requires a closed state and explicit reduced MPO')
+        right_checkpoints = None
+        if sparse_hamiltonian and _checkpoint_cache is not None:
+            signature = (id(self), self._state_revision, tuple(map(id, self.mpo)), 'lr')
+            if (_checkpoint_cache.get('signature') == signature
+                    and set(_checkpoint_cache.get('blocks', {})) == set(range(self.nsites))):
+                right_checkpoints = _checkpoint_cache['blocks']
+        sites = self.materialize()
+        identity = _identity_mpo_factors_for_sites_and_mpo(sites, self.mpo)
+        if self.virtual_boundary == 'periodic':
+            if any(self._pack_site(i).size > int(max_parameters) for i in range(self.nsites)):
+                raise MemoryError('stationarity audit exceeds max_parameters')
+            h, _ = self._stream_parameter_actions(
+                sites, self.mpo, sparse_boundaries=sparse_hamiltonian,
+                spill_directory=spill_directory, checkpoint_stride=checkpoint_stride,
+                right_checkpoints=right_checkpoints)
+            residuals = []
+            norm = energy = None
+            def consume_norm(site, nv, metric):
+                nonlocal norm, energy
+                if site == 0:
+                    anchor = self._pack_site(0)
+                    norm = float(np.real(np.vdot(anchor, nv)))
+                    if norm <= 0:
+                        raise np.linalg.LinAlgError('the local SU2 metric norm is null')
+                    energy = float(np.real(np.vdot(anchor, h[0])) / norm)
+                diagonal = metric.diagonal
+                scale = max(float(np.max(np.abs(diagonal), initial=0.0)), 1.0)
+                support = np.flatnonzero(diagonal > float(support_rtol)*scale)
+                if not support.size:
+                    raise np.linalg.LinAlgError('local SU2LETTA parameter support is null')
+                residuals.append(metric.restrict(support).whitened_norm(
+                    (h[site]-energy*nv)[support], rtol=metric_rtol) / np.sqrt(norm))
+                h[site] = None
+            self._stream_parameter_actions(sites, identity, norm_components=True,
+                                           norm_consumer=consume_norm)
+            self.tangent_residuals = tuple(map(float, residuals))
+            self.max_tangent_residual = max(self.tangent_residuals, default=0.0)
+            return self.max_tangent_residual
+        h_chain = BlockSparseEnvironmentChain.build(sites, self.mpo)
+        n_chain = BlockSparseEnvironmentChain.build(sites, identity)
+        sweeps = (h_chain, n_chain)
+        residuals = []
+        for site in range(self.nsites):
+            bond = min(site,self.nsites-2)
+            current,support,h_action,n_action,_,_,info = self._frontier_wigner_eckart_matrix_free_problem(
+                site,bond,support_rtol=support_rtol,max_parameters=max_parameters,
+                max_dense_metric_parameters=max_parameters,sites=sites,
+                environment_sweeps=sweeps)
+            metric = info['_projected_metric']
+            if isinstance(metric,_MatrixFreeProjectedMetric):
+                raise MemoryError("stationarity audit requires a materialized reduced metric")
+            if isinstance(metric,_ReducedMetricComponents):
+                whitener,_,_,_ = metric.whitener(rtol=metric_rtol)
+            else:
+                whitener,_,_ = self._metric_whitener(metric,rtol=metric_rtol)
+            vector = current[support]
+            nv,hv=n_action(vector),h_action(vector)
+            norm=float(np.real(np.vdot(vector,nv)))
+            if norm<=0:
+                raise np.linalg.LinAlgError("the local SU2 metric norm is null")
+            energy=float(np.real(np.vdot(vector,hv))/norm)
+            residuals.append(float(np.linalg.norm(whitener.conj().T@(hv-energy*nv))/np.sqrt(norm)))
+        self.tangent_residuals = tuple(residuals)
+        self.max_tangent_residual = max(residuals,default=0.)
+        return self.max_tangent_residual
+
     @property
     def convergence_summary(self):
         """Return the latest complete-cycle convergence diagnostics."""
@@ -1705,7 +2837,7 @@ class NonAbelianFrontierLETTA:
         return {
             "converged": bool(self.converged),
             "cycles": int(len(self.history)),
-            "energy": float(self.energy),
+            "energy": None if self.energy is None else float(self.energy),
             "energy_delta": latest.get("energy_delta"),
             "max_local_residual": latest.get("max_local_residual"),
             "max_truncation_error": latest.get("max_truncation_error"),
@@ -1721,8 +2853,8 @@ class NonAbelianFrontierLETTA:
         path.parent.mkdir(parents=True, exist_ok=True)
         checkpoint_mpo = None
         if self._hamiltonian_spec is None:
-            checkpoint_mpo = copy.deepcopy(self.mpo)
-            for core in checkpoint_mpo:
+            memo = {}
+            for core in self.mpo:
                 for name in (
                     "_reduced_block_cache",
                     "_environment_reduced_block_cache",
@@ -1730,7 +2862,8 @@ class NonAbelianFrontierLETTA:
                 ):
                     cache = getattr(core, name, None)
                     if cache is not None:
-                        cache.clear()
+                        memo[id(cache)] = {}
+            checkpoint_mpo = copy.deepcopy(self.mpo, memo)
         payload = {
             "format": "pyqed-nonabelian-frontier-letta",
             "version": 3,
@@ -1741,7 +2874,11 @@ class NonAbelianFrontierLETTA:
             "target_sector": self.target_sector,
             "tie": self.tie,
             "graph": self.graph,
+            "max_frontier_states": self.max_frontier_states,
+            "tie_history": self.tie_history,
             "D": self.D,
+            "virtual_boundary": self.virtual_boundary,
+            "compact_frontier": self.compact_frontier,
             "ecore": self.ecore,
             "core_energy": self.core_energy,
             "mpo_includes_core_energy": self.mpo_includes_core_energy,
@@ -1754,6 +2891,13 @@ class NonAbelianFrontierLETTA:
             "message": self.message,
             "we_route_memory": self.we_route_memory,
             "n_threads": self.n_threads,
+            "hamiltonian_representation_policy": (
+                self._hamiltonian_representation_policy
+            ),
+            "hamiltonian_representation": self.hamiltonian_representation,
+            "representation_decision": self._representation_decision,
+            "global_guard_bonds": tuple(sorted(self._global_guard_bonds)),
+            "projected_krylov": self._projected_krylov_cache,
         }
         temporary = path.with_name(path.name + ".tmp")
         with temporary.open("wb") as handle:
@@ -1764,8 +2908,17 @@ class NonAbelianFrontierLETTA:
         return path
 
     @classmethod
-    def load_checkpoint(cls, path, *, workers=1):
-        """Restore a checkpoint created by :meth:`save_checkpoint`."""
+    def load_checkpoint(cls, path, *, workers=1, n_threads=None):
+        """Restore saved tensors and diagnostics without evaluating a throwaway state.
+
+        The saved energy is restored as a diagnostic; call ``expectation()``
+        to recompute it. A checkpoint without energy is evaluated after its
+        tensors and Hamiltonian representation have been restored.
+        An explicitly unset saved energy stays unset, allowing sparse-frontier
+        evaluation without an implicit dense contraction on load.
+        Thread defaults resolve from the current runtime rather than the
+        checkpoint; Python setup defaults to one worker.
+        """
         path = Path(path)
         with path.open("rb") as handle:
             payload = pickle.load(handle)
@@ -1782,13 +2935,17 @@ class NonAbelianFrontierLETTA:
         hamiltonian_spec = payload.get("hamiltonian_spec")
         common = {
             "graph": payload["graph"],
+            "max_frontier_states": payload.get("max_frontier_states", 4096),
             "D": payload["D"],
+            "virtual_boundary": payload.get("virtual_boundary","open"),
+            "compact_frontier": payload.get("compact_frontier", True),
             "base_sites": payload["base_sites"],
             "tie": payload.get("tie", "physical"),
             "init": "mps",
             "workers": workers,
-            "n_threads": payload.get("n_threads", 1),
+            "n_threads": n_threads,
             "we_route_memory": payload.get("we_route_memory", 256.0),
+            "_evaluate_initial_state": False,
         }
         if hamiltonian_spec is not None:
             state = cls.from_integrals(**hamiltonian_spec, **common)
@@ -1802,6 +2959,7 @@ class NonAbelianFrontierLETTA:
                 **common,
             )
         state.core_energy = float(payload.get("core_energy", state.ecore))
+        state.ecore = float(payload["ecore"])
         state.mpo_includes_core_energy = bool(
             payload.get("mpo_includes_core_energy", False)
         )
@@ -1810,10 +2968,33 @@ class NonAbelianFrontierLETTA:
             for tensor in payload["tensors"]
         ]
         state._materialized_site_cache.clear()
-        state.history = list(payload.get("history", ()))
-        state.energy = float(
-            payload["energy"] if "energy" in payload else state.expectation()
+        state._hamiltonian_representation_policy = payload.get(
+            "hamiltonian_representation_policy",
+            state._hamiltonian_representation_policy,
         )
+        if (
+            payload.get("hamiltonian_representation") == "mpo"
+            and state.hamiltonian_representation == "complementary"
+        ):
+            state._materialize_explicit_hamiltonian()
+        state._representation_decision = dict(
+            payload.get("representation_decision", state._representation_decision)
+        )
+        state._global_guard_bonds = {
+            (str(direction), int(bond))
+            for direction, bond in payload.get("global_guard_bonds", ())
+        }
+        state.tie_history = list(payload.get("tie_history", ()))
+        state.history = list(payload.get("history", ()))
+        for key, vectors in payload.get("projected_krylov", {}).items():
+            site, bond = key
+            vectors = np.asarray(vectors)
+            if (vectors.ndim != 2 or vectors.shape[0] != state._pack_site(site).size
+                    or not np.all(np.isfinite(vectors))):
+                raise ValueError("Invalid checkpoint Krylov vectors")
+            state._projected_krylov_cache[(int(site), int(bond))] = vectors.copy()
+        saved_energy = payload["energy"] if "energy" in payload else state.expectation()
+        state.energy = None if saved_energy is None else float(saved_energy)
         state.converged = bool(payload.get("converged", False))
         state.success = payload.get("success")
         state.message = str(payload.get("message", "restored SU(2)-LETTA checkpoint"))
@@ -1844,6 +3025,7 @@ class NonAbelianFrontierLETTA:
         self.tensors[site] = updated
         if not np.array_equal(vector, previous):
             self._state_revision += 1
+            self._site_revisions[int(site)] += 1
         cached = self._materialized_site_cache.get(int(site))
         route = self._we_route_cache.get(int(site))
         if (
@@ -1851,9 +3033,22 @@ class NonAbelianFrontierLETTA:
             and cached is not None
             and route is not None
         ):
-            route.apply_delta(cached, vector - previous)
+            # Preserve references held by sweep environments, but overwrite the
+            # entries. Adding a large trial delta and then its inverse loses
+            # the incumbent to cancellation when an ill-conditioned solve fails.
+            cached.data = route.tensor(vector).data
+            cached.metadata.pop("_cpp_split_site", None)
         else:
             self._invalidate_materialized_sites(site)
+
+    def _stationary_dependency_signature(self, site):
+        """Return the exact tensor dependencies of a local effective problem."""
+        site = int(site)
+        return (
+            int(self._site_revisions[site]),
+            tuple(self._site_revisions[:site]),
+            tuple(self._site_revisions[site + 1 :]),
+        )
 
     def _quadratic_value(self, sites, site, vector, factors):
         self._set_site_vector(site, vector)
@@ -1953,11 +3148,50 @@ class NonAbelianFrontierLETTA:
         with threadpool_limits(limits=1):
             return list(executor.map(function, tasks))
 
+    def _frontier_route_template(self, site):
+        """Build reduced block shapes with scalar-backed, read-only placeholders."""
+        base = self._base_sites[site]
+        left_dims = self._bond_sector_dims(site, 0)
+        right_dims = self._bond_sector_dims(site, 2)
+        raw_shapes = {
+            key: (left_dims[key[0]] * len(self._assignments[site]), block.shape[1],
+                  right_dims[key[2]] * len(self._assignments[site + 1]))
+            for key, block in base.data.items()
+        }
+        qns = [[q for q, d in left_dims.items()
+                for _ in range(d * len(self._assignments[site]))],
+               list(self.physical_sectors_by_site[site]),
+               [q for q, d in right_dims.items()
+                for _ in range(d * len(self._assignments[site + 1]))]]
+        shapes = raw_shapes
+        metadata = dict(physical_basis='fully_reduced_su2',
+                        letta_frontier=self.frontiers[site + 1],
+                        letta_invariant_ties=True, letta_tie=self.tie)
+        if self.virtual_boundary == 'periodic':
+            shapes = {
+                key: (1 if site == 0 else self.D * left, physical,
+                      1 if site == self.nsites - 1 else self.D * right)
+                for key, (left, physical, right) in raw_shapes.items()
+            }
+            qns[0] = qns[0][:1] if site == 0 else qns[0] * self.D
+            qns[2] = qns[2][:1] if site == self.nsites - 1 else qns[2] * self.D
+            metadata.update(virtual_boundary='periodic', closure_spin=0,
+                            closure_dimension=self.D)
+        zero = np.zeros(())
+        template = IrrepTensor(
+            data={key: np.broadcast_to(zero, shape) for key, shape in shapes.items()},
+            qns=qns, dirs=[-1, 1, 1], metadata=metadata)
+        return template, raw_shapes
+
     def _compile_wigner_eckart_routes(self, site):
         """Compile the structural tied-parameter scatter map once."""
         site = int(site)
         current = self._pack_site(site)
-        template = self.materialize_site(site)
+        template, raw_shapes = self._frontier_route_template(site)
+        if self.virtual_boundary=='periodic':
+            # Compile ordinary frontier routes first, then carry the seam
+            # spectator through their target indices without adding parameters.
+            from .su2_closure import closure_scatter
         left_frontier = self.frontiers[site]
         right_frontier = self.frontiers[site + 1]
         left_maps = [
@@ -1979,87 +3213,145 @@ class NonAbelianFrontierLETTA:
             raise RuntimeError("Tied parameter offsets do not cover the site.")
         groups = []
         nbytes = 0
+        # Assignment compatibility depends on tie labels, not sector degeneracies.
+        # Compile it once and reuse it across every reduced parameter block.
+        assignment_pairs = {}
+        for left_index, left_values in enumerate(left_maps):
+            for right_index, right_values in enumerate(right_maps):
+                if any(left_values[value] != right_values[value]
+                       for value in left_frontier if value in right_values):
+                    continue
+                condition = tuple(right_values[parent]
+                                  for parent in self.parent_sets[site])
+                endpoint = left_values.get(site)
+                assignment_pairs.setdefault((endpoint, condition), []).append(
+                    (left_index, right_index)
+                )
         for block_key, target_block in template.data.items():
             q_left, q_phys, q_right = block_key
-            source_keys = [
-                key
-                for key in self._tensor_keys[site]
-                if key[:3] == block_key
-            ]
-            if not source_keys:
-                continue
             d_left = left_dims[q_left]
             d_right = right_dims[q_right]
             endpoint_value = self._tie_index_by_site[site][
                 q_phys if self.tie == "physical" else q_left
-            ]
-            indices = []
-            matrix_rows = []
-            for source_key in source_keys:
-                condition = source_key[3]
+            ] if site in left_frontier else None
+            indices, targets = [], []
+            target_shape = raw_shapes[block_key]
+            for source_key in self._tensor_keys[site]:
+                if source_key[:3] != block_key:
+                    continue
+                pairs = assignment_pairs.get((endpoint_value, source_key[3]))
+                if not pairs:
+                    continue
+                left_indices, right_indices = np.asarray(pairs, dtype=np.intp).T
                 source_shape = np.asarray(self.tensors[site][source_key]).shape
-                source_offset = parameter_offsets[source_key]
-                for local_index in range(int(np.prod(source_shape))):
-                    i_left, i_phys, i_right = np.unravel_index(
-                        local_index, source_shape
-                    )
-                    row = np.zeros(np.asarray(target_block).size, dtype=float)
-                    for left_index, left_values in enumerate(left_maps):
-                        if (
-                            site in left_values
-                            and left_values[site] != endpoint_value
-                        ):
-                            continue
-                        for right_index, right_values in enumerate(right_maps):
-                            common = set(left_values).intersection(right_values)
-                            if any(
-                                left_values[value] != right_values[value]
-                                for value in common
-                            ):
-                                continue
-                            if tuple(
-                                right_values[parent]
-                                for parent in self.parent_sets[site]
-                            ) != condition:
-                                continue
-                            target_index = np.ravel_multi_index(
-                                (
-                                    left_index * d_left + i_left,
-                                    i_phys,
-                                    right_index * d_right + i_right,
-                                ),
-                                np.asarray(target_block).shape,
-                            )
-                            row[target_index] = 1.0
-                    if np.any(row):
-                        indices.append(source_offset + local_index)
-                        matrix_rows.append(row)
+                local = np.arange(int(np.prod(source_shape)), dtype=np.intp)
+                i_left, i_phys, i_right = np.unravel_index(local, source_shape)
+                target = (
+                    ((left_indices[None, :] * d_left + i_left[:, None])
+                     * target_shape[1] + i_phys[:, None]) * target_shape[2]
+                    + right_indices[None, :] * d_right + i_right[:, None]
+                )
+                indices.append(np.repeat(parameter_offsets[source_key] + local,
+                                         len(pairs)))
+                targets.append(target.reshape(-1))
             if not indices:
                 continue
-            indices = np.asarray(indices, dtype=np.intp)
-            matrix = np.ascontiguousarray(np.stack(matrix_rows))
-            nbytes += int(indices.nbytes + matrix.nbytes)
+            indices = np.concatenate(indices)
+            targets = np.concatenate(targets)
+            if self.virtual_boundary=='periodic':
+                _,closed_targets,closed_shape = closure_scatter(
+                    target_shape,site,self.nsites,self.D,indices=targets)
+                # Each raw entry appears once at endpoints and D times inside.
+                copies = 1 if site in (0,self.nsites-1) else self.D
+                targets = closed_targets
+                indices = np.tile(indices,copies)
+                target_shape = closed_shape
+            nbytes += int(indices.nbytes + targets.nbytes)
             if nbytes > self._we_route_limit_bytes:
                 raise MemoryError(
                     "packed Wigner--Eckart routes require more than "
                     f"{self.we_route_memory:g} MiB; increase we_route_memory."
                 )
-            groups.append(
-                (block_key, indices, matrix, np.asarray(target_block).shape)
-            )
+            groups.append((block_key, indices, targets, target_shape))
         if not groups:
             raise np.linalg.LinAlgError("the local Wigner--Eckart route is empty.")
-        plan_type = (
-            _NearestNeighborTieRoutePlan
-            if self.supports_conditional_canonical_gauge
-            else _WignerEckartRoutePlan
-        )
-        return plan_type(
+        return _FrontierTieRoutePlan(
             template=template,
             groups=groups,
             nparameters=current.size,
             nbytes=nbytes,
         )
+
+    def _compact_frontier_routes(self):
+        """Keep coordinates on complete structural paths, regardless of values."""
+        plans = [self._compile_wigner_eckart_routes(i) for i in range(self.nsites)]
+        dimensions = [{q: p.template.legs[0].sector_dim(q)
+                       for q in p.template.legs[0].sectors} for p in plans]
+        last = plans[-1].template.legs[2]
+        dimensions.append({q: last.sector_dim(q) for q in last.sectors})
+
+        def edges(plan):
+            for key, _, targets, shape in plan.groups:
+                left, _, right = np.unravel_index(targets, shape)
+                yield key[0], key[2], left, right
+
+        forward = [{q: np.ones(d, dtype=bool) for q, d in dimensions[0].items()}]
+        for i, plan in enumerate(plans):
+            mask = {q: np.zeros(d, dtype=bool) for q, d in dimensions[i + 1].items()}
+            for lq, rq, left, right in edges(plan):
+                mask[rq][right[forward[i][lq][left]]] = True
+            forward.append(mask)
+        backward = [None] * (self.nsites + 1)
+        backward[-1] = {q: np.ones(d, dtype=bool) for q, d in dimensions[-1].items()}
+        for i in range(self.nsites - 1, -1, -1):
+            mask = {q: np.zeros(d, dtype=bool) for q, d in dimensions[i].items()}
+            for lq, rq, left, right in edges(plans[i]):
+                mask[lq][left[backward[i + 1][rq][right]]] = True
+            backward[i] = mask
+        retained, remaps, statistics = [], [], []
+        for bond, dims in enumerate(dimensions):
+            keep = {q: np.flatnonzero(forward[bond][q] & backward[bond][q]) for q in dims}
+            maps = {q: np.full(d, -1, dtype=np.intp) for q, d in dims.items()}
+            for q, indices in keep.items():
+                maps[q][indices] = np.arange(indices.size)
+            retained.append(keep)
+            remaps.append(maps)
+            statistics.append(dict(bond=bond, original=sum(dims.values()),
+                                   retained=sum(v.size for v in keep.values())))
+        compact_plans = {}
+        zero = np.zeros(())
+        for site, plan in enumerate(plans):
+            groups, data = [], {}
+            for key, parameters, targets, shape in plan.groups:
+                left, physical, right = np.unravel_index(targets, shape)
+                left = remaps[site][key[0]][left]
+                right = remaps[site + 1][key[2]][right]
+                keep = (left >= 0) & (right >= 0)
+                if not np.any(keep):
+                    continue
+                compact_shape = (retained[site][key[0]].size, shape[1],
+                                 retained[site + 1][key[2]].size)
+                compact_targets = np.ravel_multi_index(
+                    (left[keep], physical[keep], right[keep]), compact_shape)
+                groups.append((key, parameters[keep], compact_targets, compact_shape))
+                data[key] = np.broadcast_to(zero, compact_shape)
+            qns = [[q for q, indices in retained[site].items() for _ in indices],
+                   list(plan.template.qns[1]),
+                   [q for q, indices in retained[site + 1].items() for _ in indices]]
+            template = IrrepTensor(data=data, qns=qns, dirs=list(plan.template.dirs),
+                metadata={**plan.template.metadata, 'frontier_compacted': True})
+            compact_plans[site] = _FrontierTieRoutePlan(
+                template=template, groups=groups, nparameters=plan.nparameters,
+                nbytes=sum(p.nbytes + t.nbytes for _, p, t, _ in groups))
+        self._we_route_cache.update(compact_plans)
+        self._frontier_compaction = tuple(statistics)
+
+    @property
+    def frontier_compaction(self):
+        """Original and retained reduced multiplicities at each closed-loop cut."""
+        if self.virtual_boundary == 'periodic' and self.compact_frontier:
+            self._wigner_eckart_route_plan(0)
+        return self._frontier_compaction
 
     def _wigner_eckart_route_plan(self, site):
         site = int(site)
@@ -2068,6 +3360,9 @@ class NonAbelianFrontierLETTA:
             self._we_route_cache_hits += 1
             return plan
         self._we_route_cache_misses += 1
+        if self.virtual_boundary == 'periodic' and self.compact_frontier:
+            self._compact_frontier_routes()
+            return self._we_route_cache[site]
         plan = self._compile_wigner_eckart_routes(site)
         self._we_route_cache[site] = plan
         return plan
@@ -2083,7 +3378,7 @@ class NonAbelianFrontierLETTA:
             "routes": int(
                 sum(plan.route_count for plan in self._we_route_cache.values())
             ),
-            "backend": "block-grouped-gemm",
+            "backend": "frontier-block-scatter",
         }
 
     def _magnetic_expansion_factor(self, bond):
@@ -2175,7 +3470,9 @@ class NonAbelianFrontierLETTA:
             return np.zeros(shape, dtype=dtype)
         return np.asarray(block, dtype=dtype)
 
-    def _local_pair_embedding(self, site, sites, bond, layout):
+    def _local_pair_embedding(
+        self, site, sites, bond, layout, *, matrix_free=False
+    ):
         """Embed tied one-site parameters into a packed two-site tensor."""
         current = self._pack_site(site)
         dtype = np.result_type(current.dtype, complex)
@@ -2185,6 +3482,17 @@ class NonAbelianFrontierLETTA:
                 "Cached Wigner--Eckart basis does not match the local parameter space."
             )
         if isinstance(layout, _ChannelResolvedPairSpace):
+            if (
+                isinstance(routes, _FrontierTieRoutePlan)
+                and matrix_free
+            ):
+                fixed_site = sites[bond + 1] if site == bond else sites[bond]
+                return current, _MatrixFreePairEmbedding(
+                    layout,
+                    routes,
+                    fixed_site,
+                    varied_left=site == bond,
+                )
             layout_signature = tuple(
                 (entry.key, entry.shape, int(entry.offset), int(entry.size))
                 for entry in layout.entries
@@ -2206,22 +3514,14 @@ class NonAbelianFrontierLETTA:
                         else (q_l, q_p1, q_mid)
                     )
                     cache_key = (int(site), varied_key)
-                    varied_blocks = self._embedding_basis_cache.get(cache_key)
-                    if varied_blocks is None:
-                        varied_blocks = np.asarray(
-                            routes.block_basis(varied_key, dtype=dtype),
-                            dtype=dtype,
-                        )
-                        self._embedding_basis_cache[cache_key] = varied_blocks
+                    cached_basis = self._embedding_basis_cache.get(cache_key)
+                    if cached_basis is None:
+                        cached_basis = routes.active_block_basis(varied_key, dtype=dtype)
+                        self._embedding_basis_cache[cache_key] = cached_basis
                         self._embedding_basis_cache_misses += 1
                     else:
                         self._embedding_basis_cache_hits += 1
-                    active = np.flatnonzero(
-                        np.any(
-                            varied_blocks != 0.0,
-                            axis=tuple(range(1, varied_blocks.ndim)),
-                        )
-                    )
+                    active, varied_blocks = cached_basis
                     active_key = (
                         int(site), int(bond), int(entry.offset), int(entry.size)
                     )
@@ -2285,6 +3585,8 @@ class NonAbelianFrontierLETTA:
                 if changed is not None and fixed_key not in changed:
                     self._embedding_reused_blocks += 1
                     continue
+                if active.size == 0:
+                    continue
                 delta = deltas[fixed_key]
                 q_l, q_p1, q_p2, q_r, q_mid = entry.key
                 if site == bond:
@@ -2299,9 +3601,7 @@ class NonAbelianFrontierLETTA:
                         2,
                         0,
                     )
-                if active.size == 0:
-                    continue
-                contribution = pair_blocks[active].reshape(active.size, -1).T
+                contribution = pair_blocks.reshape(active.size, -1).T
                 embedding.add_block(
                     entry.offset,
                     entry.size,
@@ -2371,6 +3671,7 @@ class NonAbelianFrontierLETTA:
         *,
         site,
         bond,
+        factorized=False,
     ):
         """Project and assemble only connected tied-metric components."""
         structured = isinstance(embedding, _StructuredPairEmbedding)
@@ -2404,9 +3705,23 @@ class NonAbelianFrontierLETTA:
             in_columns, in_design = active_design(in_entry)
             if out_columns.size == 0 or in_columns.size == 0:
                 continue
-            contribution = out_design.conj().T @ (
-                np.asarray(block) @ in_design
-            )
+            if factorized:
+                panel = in_design.reshape(
+                    in_entry.shape[0] * in_entry.shape[1],
+                    in_entry.shape[2] * in_entry.shape[3],
+                    in_columns.size,
+                )
+                applied = sum(
+                    np.einsum("ab,bcn,dc->adn", left, panel, right, optimize=True)
+                    for left, right in block
+                )
+                contribution = out_design.conj().T @ applied.reshape(
+                    out_entry.size, in_columns.size
+                )
+            else:
+                contribution = out_design.conj().T @ (
+                    np.asarray(block) @ in_design
+                )
             records.append((out_columns, in_columns, contribution))
             topology_values.append(
                 (
@@ -2467,14 +3782,9 @@ class NonAbelianFrontierLETTA:
             positions[indices] = np.arange(indices.size)
             blocks.append(np.zeros((indices.size, indices.size), dtype=complex))
         for out_columns, in_columns, contribution in records:
-            for label in np.intersect1d(
-                labels[out_columns], labels[in_columns], assume_unique=False
-            ):
-                out_keep = np.flatnonzero(labels[out_columns] == label)
-                in_keep = np.flatnonzero(labels[in_columns] == label)
-                blocks[int(label)][
-                    np.ix_(positions[out_columns[out_keep]], positions[in_columns[in_keep]])
-                ] += contribution[np.ix_(out_keep, in_keep)]
+            # Every record was joined into one component when grouping its columns.
+            label = int(labels[out_columns[0]])
+            blocks[label][np.ix_(positions[out_columns], positions[in_columns])] += contribution
         components = []
         for indices, block in zip(groups, blocks):
             block = 0.5 * (block + block.conj().T)
@@ -2575,7 +3885,12 @@ class NonAbelianFrontierLETTA:
 
         from pyqed.mps.nonabelian import _su2_kernel
 
-        projection_blocks = projection_builder(orthonormal_design)
+        projection_blocks = tuple(
+            (rows, indices, np.ascontiguousarray(transform.real)
+             if np.iscomplexobj(transform) and not np.any(transform.imag)
+             else transform)
+            for rows, indices, transform in projection_builder(orthonormal_design)
+        )
         if not projection_blocks:
             return None
         topology_signature = tuple(
@@ -2636,6 +3951,7 @@ class NonAbelianFrontierLETTA:
             "owner": owner,
             "projection_key": projection_key,
             "projection_blocks": projection_blocks,
+            "real_projection": all(not np.iscomplexobj(block[2]) for block in projection_blocks),
             "topology_revision": topology_revision,
             "numeric_revision": numeric_revision,
         }
@@ -2836,6 +4152,7 @@ class NonAbelianFrontierLETTA:
         *,
         support_rtol=1.0e-13,
         max_parameters=4096,
+        max_dense_metric_parameters=4096,
         executor=None,
         sites=None,
         environment_sweeps=None,
@@ -2860,8 +4177,11 @@ class NonAbelianFrontierLETTA:
             )
         sites = self.materialize() if sites is None else list(sites)
         merged, layout = self._pair_coordinate_space(bond, sites)
+        matrix_free_metric = bool(
+            current.size > int(max_dense_metric_parameters)
+        )
         _embedded_current, embedding = self._local_pair_embedding(
-            site, sites, bond, layout
+            site, sites, bond, layout, matrix_free=matrix_free_metric
         )
         if embedding.shape[1] != current.size:
             raise RuntimeError("one-site frontier embedding has the wrong size.")
@@ -2871,10 +4191,27 @@ class NonAbelianFrontierLETTA:
             merged,
             layout,
             environment_sweeps=environment_sweeps,
+            materialize_metric_blocks=not matrix_free_metric,
+            compact_metric_blocks=True,
         )
 
         metric_blocks = getattr(n_pair, "metric_blocks", None)
-        if metric_blocks is None:
+        if matrix_free_metric:
+            parent_n_diagonal = np.asarray(
+                getattr(n_pair, "diag", np.ones(layout.size)), dtype=float
+            )
+            n_diagonal = (
+                embedding.projected_diagonal(parent_n_diagonal)
+                if hasattr(embedding, "projected_diagonal")
+                else np.real(np.sum(
+                    embedding.conj()
+                    * (parent_n_diagonal[:, None] * embedding),
+                    axis=0,
+                ))
+            )
+            projected_metric_full = None
+            metric_backend = "matrix_free_factorized_routes"
+        elif metric_blocks is None:
             dense_embedding = np.asarray(embedding)
             n_columns = self._apply_packed_columns(
                 n_pair, dense_embedding, executor=executor
@@ -2892,25 +4229,31 @@ class NonAbelianFrontierLETTA:
                 metric_blocks,
                 site=site,
                 bond=bond,
+                factorized=bool(getattr(n_pair, "compact_metric_blocks", False)),
             )
             metric_backend = "connected_reduced_blocks"
-        n_diagonal = projected_metric_full.diagonal
+        if projected_metric_full is not None:
+            n_diagonal = projected_metric_full.diagonal
         scale = max(float(np.max(np.abs(n_diagonal), initial=0.0)), 1.0)
         support = np.flatnonzero(n_diagonal > float(support_rtol) * scale)
         if support.size == 0:
             raise np.linalg.LinAlgError("local SU2LETTA parameter support is null.")
         design = (
             embedding.restrict(support)
-            if isinstance(embedding, _StructuredPairEmbedding)
+            if hasattr(embedding, "restrict")
             else np.asarray(embedding[:, support])
         )
-        projected_metric = projected_metric_full.restrict(support)
+        projected_metric = (
+            None
+            if projected_metric_full is None
+            else projected_metric_full.restrict(support)
+        )
         parent_h_diagonal = np.asarray(
             getattr(h_pair, "diag", np.zeros(layout.size)), dtype=float
         )
         h_diagonal = (
             design.projected_diagonal(parent_h_diagonal)
-            if isinstance(design, _StructuredPairEmbedding)
+            if hasattr(design, "projected_diagonal")
             else np.real(
                 np.sum(
                     design.conj()
@@ -2927,7 +4270,7 @@ class NonAbelianFrontierLETTA:
             if vector.size != support.size:
                 raise ValueError("frontier Wigner--Eckart vector has the wrong size.")
             matvec_counts["hamiltonian"] += 1
-            if isinstance(design, _StructuredPairEmbedding):
+            if hasattr(design, "matvec") and hasattr(design, "rmatvec"):
                 return design.rmatvec(h_pair(design.matvec(vector)))
             return design.conj().T @ h_pair(design @ vector)
 
@@ -2936,9 +4279,16 @@ class NonAbelianFrontierLETTA:
             if vector.size != support.size:
                 raise ValueError("frontier Wigner--Eckart vector has the wrong size.")
             matvec_counts["metric"] += 1
-            if isinstance(design, _StructuredPairEmbedding):
+            if hasattr(design, "matvec") and hasattr(design, "rmatvec"):
                 return design.rmatvec(n_pair(design.matvec(vector)))
             return design.conj().T @ n_pair(design @ vector)
+
+        if projected_metric is None:
+            projected_metric = _MatrixFreeProjectedMetric(
+                support.size,
+                n_diagonal,
+                n_action,
+            )
 
         routes = self._wigner_eckart_route_plan(site)
         diagnostics = dict(pair_diagnostics)
@@ -2951,7 +4301,9 @@ class NonAbelianFrontierLETTA:
                 "frontier_dimension": int(layout.size),
                 "embedding_bytes": int(embedding.nbytes),
                 "embedding_representation": (
-                    "block_scatter"
+                    "matrix_free_frontier_scatter"
+                    if isinstance(embedding, _MatrixFreePairEmbedding)
+                    else "block_scatter"
                     if isinstance(embedding, _StructuredPairEmbedding)
                     else "dense"
                 ),
@@ -3039,7 +4391,7 @@ class NonAbelianFrontierLETTA:
                 for offset, site in enumerate((bond, bond + 1)):
                     sites = self.materialize()
                     current, embedding = self._local_pair_embedding(
-                        site, sites, bond, layout
+                        site, sites, bond, layout, matrix_free=True
                     )
                     if current.size > int(max_parameters):
                         raise MemoryError(
@@ -3047,16 +4399,20 @@ class NonAbelianFrontierLETTA:
                             f"{current.size} parameters on site {site}; limit is "
                             f"{int(max_parameters)}."
                         )
-                    column_norms = np.sum(np.abs(embedding) ** 2, axis=0).real
+                    column_norms = embedding.projected_diagonal(np.ones(layout.size))
                     scale = max(float(np.max(column_norms, initial=0.0)), 1.0)
                     support = np.flatnonzero(column_norms > float(cutoff) * scale)
                     if support.size == 0:
                         continue
-                    coefficients, *_ = np.linalg.lstsq(
-                        embedding[:, support],
-                        target,
-                        rcond=float(cutoff),
-                    )
+                    from scipy.sparse.linalg import LinearOperator, lsmr
+                    design = embedding.restrict(support)
+                    operator = LinearOperator(design.shape, matvec=design.matvec,
+                                              rmatvec=design.rmatvec, dtype=complex)
+                    coefficients = lsmr(
+                        operator, target, atol=float(cutoff), btol=float(cutoff),
+                        maxiter=min(200, support.size),
+                        x0=np.asarray(current[support], dtype=complex),
+                    )[0]
                     candidate = np.zeros(
                         current.size,
                         dtype=np.result_type(current.dtype, coefficients.dtype),
@@ -3305,6 +4661,26 @@ class NonAbelianFrontierLETTA:
         metric = 0.5 * (metric + metric.conj().T)
         return hamiltonian, metric
 
+    def _pair_hamiltonian_factors(self):
+        """Reuse immutable reduced terms; environments remain state-dependent."""
+        owner = getattr(self.mpo[0], "normal_complementary_owner", None)
+        if owner is None:
+            return self.mpo
+        revision = owner.system_stats["revision"]
+        cached = self._pair_hamiltonian_cache
+        if cached is None or cached[0] is not self.mpo or cached[1] != revision:
+            from pyqed.qchem.dmrg.backends.reduced import build_su2_normal_complementary_mpo
+            factors = tuple(build_su2_normal_complementary_mpo(
+                owner,
+                fully_reduced=bool(getattr(self.mpo[0], "normal_complementary_fully_reduced", False)),
+                materialize_reduced_terms=True))
+            for factor in factors:
+                object.__setattr__(factor, "normal_complementary_right_dual",
+                                   bool(getattr(self.mpo[0], "normal_complementary_right_dual", False)))
+            cached = (self.mpo, revision, factors)
+            self._pair_hamiltonian_cache = cached
+        return cached[2]
+
     def _reduced_pair_transition_actions(
         self,
         bond,
@@ -3313,6 +4689,8 @@ class NonAbelianFrontierLETTA:
         layout,
         *,
         environment_sweeps=None,
+        materialize_metric_blocks=True,
+        compact_metric_blocks=False,
     ):
         """Return exact matrix-free actions with explicit intermediate channels.
 
@@ -3324,15 +4702,16 @@ class NonAbelianFrontierLETTA:
         dimension = int(getattr(layout, "size", sum(entry.size for entry in layout)))
         identity = _identity_mpo_factors_for_sites_and_mpo(sites, self.mpo)
         h_plan = n_plan = None
-        if environment_sweeps is None or not isinstance(
-            layout, _ChannelResolvedPairSpace
-        ):
+        if not isinstance(layout, _ChannelResolvedPairSpace):
             h_plan = AdjacentPairTransitionPlan.build(sites, self.mpo, bond)
             n_plan = AdjacentPairTransitionPlan.build(sites, identity, bond)
         if isinstance(layout, _ChannelResolvedPairSpace):
             def compiled_action(factors, sweep=None):
                 if sweep is None:
-                    chain = BlockSparseEnvironmentChain.build(sites, factors)
+                    if factors is self.mpo:
+                        factors = self._pair_hamiltonian_factors()
+                    chain = BlockSparseEnvironmentChain.build(
+                        sites, factors, target_bond=bond)
                     operator = chain.bond_operator(bond, merged)
                 else:
                     operator = sweep.bond_operator(bond, merged)
@@ -3389,12 +4768,12 @@ class NonAbelianFrontierLETTA:
                 ):
                     diagonal = compiled.diagonal()
                 if diagonal is None:
-                    diagonal = np.asarray(
-                        [
-                            packed_apply(np.eye(dimension)[:, index])[index]
-                            for index in range(dimension)
-                        ]
-                    )
+                    diagonal = np.empty(dimension, dtype=complex)
+                    unit = np.zeros(dimension, dtype=complex)
+                    for index in range(dimension):
+                        unit[index] = 1.0
+                        diagonal[index] = packed_apply(unit)[index]
+                        unit[index] = 0.0
                 diagonal = np.asarray(diagonal)
                 action.diag = np.empty(dimension, dtype=float)
                 for _own_index, own_entry, _op_index, op_entry in entry_map:
@@ -3503,62 +4882,123 @@ class NonAbelianFrontierLETTA:
                 for _own_index, own_entry, operator_index, _operator_entry
                 in n_entry_map
             }
-            metric_by_pair = {}
-            for (
-                in_index,
-                out_index,
-                _in_entry,
-                _out_entry,
-                left,
-                right,
-            ) in metric_routes:
-                in_entry = own_by_operator_index[int(in_index)]
-                out_entry = own_by_operator_index[int(out_index)]
-                key = (out_entry.key, in_entry.key)
-                block = metric_by_pair.get(key)
-                if block is None:
-                    block = np.zeros(
-                        (out_entry.size, in_entry.size),
-                        dtype=np.result_type(left, right, complex),
+            if not materialize_metric_blocks:
+                packed_metric_diagonal = np.asarray(n_action.diag, dtype=float)
+
+                def factorized_metric_action(vector):
+                    vector = np.asarray(vector)
+                    out = np.zeros(
+                        dimension,
+                        dtype=np.result_type(vector.dtype, complex),
                     )
-                    metric_by_pair[key] = block
-                block += np.kron(np.asarray(left), np.asarray(right))
-            entry_by_key = {entry.key: entry for entry in layout.entries}
-            metric_blocks = tuple(
-                (
-                    entry_by_key[out_key],
-                    entry_by_key[in_key],
-                    block,
+                    for (
+                        in_index,
+                        out_index,
+                        _in_entry,
+                        _out_entry,
+                        left,
+                        right,
+                    ) in metric_routes:
+                        in_entry = own_by_operator_index[int(in_index)]
+                        out_entry = own_by_operator_index[int(out_index)]
+                        in_rows = int(in_entry.shape[0] * in_entry.shape[1])
+                        in_cols = int(in_entry.shape[2] * in_entry.shape[3])
+                        block = vector[
+                            in_entry.offset : in_entry.offset + in_entry.size
+                        ].reshape(in_rows, in_cols)
+                        applied = np.asarray(left) @ block @ np.asarray(right).T
+                        out[
+                            out_entry.offset : out_entry.offset + out_entry.size
+                        ] += applied.reshape(-1)
+                    return out
+
+                factorized_metric_action.diag = packed_metric_diagonal
+                factorized_metric_action.transition_count = len(metric_routes)
+                factorized_metric_action.backend = "factorized-metric-routes"
+                factorized_metric_action.factorized_metric_routes = metric_routes
+                factorized_metric_action.metric_route_owner = n_action.metric_route_owner
+                factorized_metric_action.diagonal_factor_blocks = (
+                    tuple((own_by_operator_index[int(in_index)], left, right)
+                          for in_index, out_index, _, _, left, right in metric_routes)
+                    if all(in_index == out_index for in_index, out_index, *_ in metric_routes)
+                    and len({int(r[0]) for r in metric_routes}) == len(metric_routes)
+                    else None
                 )
-                for (out_key, in_key), block in metric_by_pair.items()
-                if np.linalg.norm(block) > 1.0e-14
-            )
-            n_action.metric_blocks = metric_blocks
-            n_action.transition_count = len(metric_blocks)
+                n_action = factorized_metric_action
+            metric_blocks = ()
+            if materialize_metric_blocks:
+                metric_by_pair = {}
+                for (
+                    in_index,
+                    out_index,
+                    _in_entry,
+                    _out_entry,
+                    left,
+                    right,
+                ) in metric_routes:
+                    in_entry = own_by_operator_index[int(in_index)]
+                    out_entry = own_by_operator_index[int(out_index)]
+                    key = (out_entry.key, in_entry.key)
+                    if compact_metric_blocks:
+                        metric_by_pair.setdefault(key, []).append(
+                            (np.asarray(left), np.asarray(right))
+                        )
+                        continue
+                    block = metric_by_pair.get(key)
+                    if block is None:
+                        block = np.zeros(
+                            (out_entry.size, in_entry.size),
+                            dtype=np.result_type(left, right, complex),
+                        )
+                        metric_by_pair[key] = block
+                    block += np.kron(np.asarray(left), np.asarray(right))
+                entry_by_key = {entry.key: entry for entry in layout.entries}
+                metric_blocks = tuple(
+                    (
+                        entry_by_key[out_key],
+                        entry_by_key[in_key],
+                        block,
+                    )
+                    for (out_key, in_key), block in metric_by_pair.items()
+                    if compact_metric_blocks or np.linalg.norm(block) > 1.0e-14
+                )
+                n_action.metric_blocks = metric_blocks
+                n_action.compact_metric_blocks = bool(compact_metric_blocks)
+                n_action.transition_count = len(metric_blocks)
 
             diagnostics = {
                 "backend": "compiled_contextual_channel_resolved",
                 "dimension": dimension,
                 "hamiltonian_direction": (
-                    h_plan.direction
+                    "full"
                     if h_sweep is None
                     else getattr(h_sweep, "direction", "full")
                 ),
                 "metric_direction": (
-                    n_plan.direction
+                    "full"
                     if n_sweep is None
                     else getattr(n_sweep, "direction", "full")
                 ),
                 "hamiltonian_cached_sites": (
-                    h_plan.cached_sites if h_sweep is None else self.nsites - 2
+                    self.nsites - 2
                 ),
                 "metric_cached_sites": (
-                    n_plan.cached_sites if n_sweep is None else self.nsites - 2
+                    self.nsites - 2
                 ),
                 "hamiltonian_transitions": h_action.transition_count,
                 "metric_transitions": n_action.transition_count,
                 "metric_blocks": len(metric_blocks),
-                "metric_nbytes": int(sum(block.nbytes for _, _, block in metric_blocks)),
+                "metric_nbytes": int(sum(
+                    sum(left.nbytes + right.nbytes for left, right in block)
+                    if compact_metric_blocks else block.nbytes
+                    for _, _, block in metric_blocks
+                )),
+                "metric_blocks_materialized": bool(
+                    materialize_metric_blocks and not compact_metric_blocks
+                ),
+                "metric_blocks_factorized": bool(
+                    materialize_metric_blocks and compact_metric_blocks
+                ),
                 "environment_reused": environment_sweeps is not None,
                 "hamiltonian_backend": h_action.backend,
                 "metric_backend": n_action.backend,
@@ -3677,7 +5117,7 @@ class NonAbelianFrontierLETTA:
             for site in (bond, bond + 1):
                 sites = self.materialize()
                 current, embedding = self._local_pair_embedding(
-                    site, sites, bond, layout
+                    site, sites, bond, layout, matrix_free=True
                 )
                 if current.size > int(max_parameters):
                     raise MemoryError(
@@ -3685,16 +5125,15 @@ class NonAbelianFrontierLETTA:
                         f"{current.size} parameters on site {site}; limit is "
                         f"{int(max_parameters)}."
                     )
-                column_norms = np.sum(np.abs(embedding) ** 2, axis=0).real
+                column_norms = embedding.projected_diagonal(np.ones(layout.size))
                 scale = max(float(np.max(column_norms, initial=0.0)), 1.0)
                 support = np.flatnonzero(column_norms > float(cutoff) * scale)
                 if support.size == 0:
                     continue
-                design = np.asarray(embedding[:, support])
-                n_columns = self._apply_packed_columns(
-                    n_action, design, executor=self._solver_executor
-                )
-                n_diagonal = np.real(np.sum(design.conj() * n_columns, axis=0))
+                design = embedding.restrict(support)
+                # Diagonal-only projections are preconditioners, not claims
+                # about the full factor metric; actions below retain all terms.
+                n_diagonal = embedding.projected_diagonal(n_action.diag)[support]
                 metric_scale = max(
                     float(np.max(np.abs(n_diagonal), initial=0.0)), 1.0
                 )
@@ -3704,19 +5143,16 @@ class NonAbelianFrontierLETTA:
                 if active.size == 0:
                     continue
                 support = support[active]
-                design = design[:, active]
+                design = embedding.restrict(support)
                 n_diagonal = n_diagonal[active]
-                h_columns = self._apply_packed_columns(
-                    h_action, design, executor=self._solver_executor
-                )
-                h_diagonal = np.real(np.sum(design.conj() * h_columns, axis=0))
+                h_diagonal = embedding.projected_diagonal(h_action.diag)[support]
                 initial = np.asarray(current[support], dtype=complex)
 
                 def local_h(vector):
-                    return design.conj().T @ h_action(design @ vector)
+                    return design.rmatvec(h_action(design.matvec(vector)))
 
                 def local_n(vector):
-                    return design.conj().T @ n_action(design @ vector)
+                    return design.rmatvec(n_action(design.matvec(vector)))
 
                 initial_metric_norm = float(
                     np.real(np.vdot(initial, local_n(initial)))
@@ -3784,11 +5220,23 @@ class NonAbelianFrontierLETTA:
         expansion.  Its root is then variationally retracted to the current
         tied fixed-``D`` manifold; ``truncation_error`` reports the relative
         error in the reduced pair metric, excluding gauge and null directions.
+
+        Factorized spectral whitening uses small boundary eigensystems when
+        the metric consists of diagonal channel products; other connectivity
+        uses generalized Davidson. Both paths have a bounded 128 MiB Krylov
+        workspace and never construct the full norm whitener. Fixed-D
+        retraction uses bounded LSMR coefficient fits, selected by pair-metric
+        error, followed by variational factor relaxation. This is an adaptation
+        of Davidson (1975), doi:10.1016/0021-9991(75)90065-0, and Fong & Saunders
+        (2011), doi:10.1137/10079687X; it is not an exact metric-optimal split.
+        Iteration limits and directional metric filtering can leave incomplete
+        local convergence; returned residuals and global energy checks matter.
         """
         bond = int(bond)
         if bond < 0 or bond >= self.nsites - 1:
             raise IndexError(f"bond {bond} is outside a chain of length {self.nsites}.")
         started = time.perf_counter()
+        global_before = float(self.expectation())
         sites = self.materialize() if sites is None else list(sites)
         original = (
             np.array(self._pack_site(bond), copy=True),
@@ -3806,6 +5254,7 @@ class NonAbelianFrontierLETTA:
                     merged,
                     layout,
                     environment_sweeps=environment_sweeps,
+                    materialize_metric_blocks=False,
                 )
             )
             hamiltonian = metric = None
@@ -3824,6 +5273,8 @@ class NonAbelianFrontierLETTA:
             def n_action(vector):
                 return metric @ vector
 
+            h_action.diag = np.diag(hamiltonian).real
+            n_action.diag = np.diag(metric).real
             pair_diagnostics = {
                 "backend": "channel_resolved_pair_transitions",
                 "dimension": int(initial.size),
@@ -3867,44 +5318,41 @@ class NonAbelianFrontierLETTA:
             }
         before = float(np.real(np.vdot(initial, initial_h)) / initial_norm + self.ecore)
         if pair_matrix_free:
-            metric_matrix = np.zeros(
-                (initial.size, initial.size), dtype=complex
-            )
-            for out_entry, in_entry, block in n_action.metric_blocks:
-                metric_matrix[
-                    out_entry.offset : out_entry.offset + out_entry.size,
-                    in_entry.offset : in_entry.offset + in_entry.size,
-                ] += block
-            metric_matrix = 0.5 * (metric_matrix + metric_matrix.conj().T)
-            metric_values, metric_vectors = np.linalg.eigh(metric_matrix)
-            metric_scale = max(
-                float(np.max(np.abs(metric_values), initial=0.0)), 1.0
-            )
-            metric_support = metric_values > float(cutoff) * metric_scale
-            if not np.any(metric_support):
-                raise np.linalg.LinAlgError(
-                    "Channel-resolved pair metric has no positive support."
-                )
-            whitener = metric_vectors[:, metric_support] / np.sqrt(
-                metric_values[metric_support]
-            )[None, :]
-            whitened_initial = whitener.conj().T @ initial_n
-
-            def whitened_h(vector):
-                return whitener.conj().T @ h_action(whitener @ vector)
-
-            local_energy, whitened_target, solver_info = _solve_packed_generalized_davidson(
-                whitened_initial,
-                whitened_h,
-                h_diag=np.zeros(whitener.shape[1], dtype=float),
+            factor_blocks = getattr(n_action, 'diagonal_factor_blocks', None)
+            whitening = (_FactorizedPairWhitener(initial.size, factor_blocks, cutoff)
+                         if factor_blocks is not None else None)
+            shift = before - self.ecore
+            if whitening is not None:
+                def solve_h(vector):
+                    physical = whitening.matvec(vector)
+                    return whitening.rmatvec(h_action(physical)) - shift * vector
+                solve_initial = whitening.rmatvec(initial_n)
+                solve_n, solve_n_diag = None, None
+                solve_h_diag = np.zeros(whitening.rank)
+            else:
+                solve_h = lambda vector: h_action(vector) - shift*n_action(vector)
+                solve_initial = initial / np.sqrt(initial_norm)
+                solve_n, solve_n_diag = n_action, n_action.diag
+                solve_h_diag = h_action.diag - shift*n_action.diag
+            local_energy, solved, solver_info = _solve_packed_generalized_davidson(
+                solve_initial,
+                solve_h,
+                h_diag=solve_h_diag,
+                N=solve_n,
+                n_diag=solve_n_diag,
                 tol=float(davidson_tol),
                 tol_residual=float(davidson_tol),
                 itermax=int(davidson_maxiter),
-                max_space=min(int(davidson_max_space), int(whitener.shape[1])),
+                max_space=min(int(davidson_max_space), int(initial.size)),
+                workspace_bytes=128 * 1024**2,
+                metric_rtol=float(cutoff),
             )
-            target = whitener @ whitened_target
-            solver_info["solver"] = "channel_resolved_whitened_pair_davidson"
-            solver_info["metric_rank"] = int(whitener.shape[1])
+            target = whitening.matvec(solved) if whitening is not None else solved
+            local_energy += shift
+            solver_info["metric_whitening"] = 'factorized_spectral' if whitening is not None else None
+            solver_info["energy_shift"] = float(shift)
+            solver_info["solver"] = "channel_resolved_generalized_pair_davidson"
+            solver_info["metric_rank"] = whitening.rank if whitening is not None else None
             solver_info["parent_dimension"] = int(initial.size)
         else:
             local_energy, target = _lowest_generalized_pair(
@@ -3927,19 +5375,26 @@ class NonAbelianFrontierLETTA:
             np.linalg.norm(target_h - local_energy * target_n)
             / max(np.linalg.norm(target_h), abs(local_energy) * np.linalg.norm(target_n), 1.0)
         )
-        if pair_matrix_free:
-            whitened_residual = whitener.conj().T @ (
-                target_h - local_energy * target_n
-            )
-            residual = float(
-                np.linalg.norm(whitened_residual)
-                / max(
-                    np.linalg.norm(whitener.conj().T @ target_h),
-                    abs(local_energy)
-                    * np.linalg.norm(whitener.conj().T @ target_n),
-                    1.0,
-                )
-            )
+        verified_residual = float(np.linalg.norm(
+            whitening.rmatvec(target_h - local_energy*target_n)
+            if pair_matrix_free and whitening is not None
+            else target_h - local_energy*target_n
+        ))
+        solver_info['verified_residual'] = verified_residual
+        root_valid = bool(np.isfinite(verified_residual)
+                          and verified_residual <= max(10*float(davidson_tol), 1e-10))
+        if not root_valid:
+            return dict(bond=bond, sites=(bond,bond+1), energy_before=global_before,
+                energy_after=global_before, local_energy=float(local_energy+self.ecore),
+                accepted=False, stationary=False, native_su2=True,
+                fully_wigner_eckart_reduced=True, matrix_free=pair_matrix_free,
+                solver='two_site_wigner_eckart', local_residual=verified_residual,
+                truncation_error=0.0, discarded_weight=0.0,
+                coefficient_retraction_error=0.0, retraction_iterations=0,
+                retraction_relax_sweeps=0, retraction_residual=verified_residual,
+                retraction_support=(0,0), fixed_reduced_bond_dim=int(self.D),
+                solver_info={'davidson':solver_info}, elapsed=time.perf_counter()-started,
+                message='Rejected unresolved pair root before retraction')
         retraction = self._retract_reduced_pair(
             bond,
             target,
@@ -3974,16 +5429,22 @@ class NonAbelianFrontierLETTA:
                 np.real(np.vdot(retracted, h_action(retracted))) / retracted_norm
                 + self.ecore
             )
-        accepted = after <= before + float(accept_tol)
+        locally_accepted = bool(np.isfinite(after) and after <= before + float(accept_tol))
+        global_after = float(self.expectation()) if locally_accepted else np.inf
+        accepted = bool(locally_accepted and np.isfinite(global_after)
+                        and global_after <= global_before + float(accept_tol))
         if not accepted:
             self._set_site_vector(bond, original[0])
             self._set_site_vector(bond + 1, original[1])
-            after = before
+            global_after = global_before
+        after = global_after
         return {
             "bond": bond,
             "sites": (bond, bond + 1),
-            "energy_before": float(before),
+            "energy_before": global_before,
             "energy_after": float(after),
+            "local_energy_before": float(before),
+            "global_variational_guard": True,
             "local_energy": float(local_energy + self.ecore),
             "accepted": bool(accepted),
             "native_su2": True,
@@ -4011,6 +5472,152 @@ class NonAbelianFrontierLETTA:
             "elapsed": float(time.perf_counter() - started),
         }
 
+    def _optimize_site_matrix_free_metric(
+        self,
+        site,
+        bond,
+        *,
+        current,
+        support,
+        current_reduced,
+        h_action,
+        projected_metric,
+        h_diag,
+        n_diag,
+        solver_info,
+        denominator,
+        before,
+        accept_tol,
+        davidson_tol,
+        davidson_maxiter,
+        davidson_max_space,
+        davidson_minimum_explored_dimension,
+        davidson_convergence_confirmations,
+        conditional_preconditioner,
+        davidson_workspace_mib,
+        metric_rtol,
+        solver,
+        requested_solver,
+        started,
+    ):
+        """Solve a large tied problem without materializing its norm matrix."""
+        guess = current_reduced / np.sqrt(float(denominator))
+        krylov_key = (int(site), int(bond))
+        cached = self._projected_krylov_cache.get(krylov_key)
+        recycled = None
+        if cached is not None and cached.shape[0] == current.size:
+            recycled = cached[support]
+        preconditioner = (_MetricPreconditioner(projected_metric.matvec, n_diag)
+                          if conditional_preconditioner else None)
+        local_energy, reduced, davidson = _solve_packed_generalized_davidson(
+            guess,
+            h_action,
+            h_diag=h_diag,
+            N=projected_metric.matvec,
+            n_diag=n_diag,
+            tol=float(davidson_tol),
+            tol_residual=float(davidson_tol),
+            itermax=int(davidson_maxiter),
+            max_space=min(int(davidson_max_space), int(support.size)),
+            initial_vectors=recycled,
+            return_recycle_space=True,
+            minimum_explored_dimension=davidson_minimum_explored_dimension,
+            convergence_confirmations=davidson_convergence_confirmations,
+            profile=True,
+            precond=preconditioner,
+            workspace_bytes=int(davidson_workspace_mib * 1024**2),
+            metric_rtol=metric_rtol,
+        )
+        recycle_space = davidson.pop("_recycle_space")
+        tied_recycle = np.zeros((current.size, recycle_space.shape[1]), dtype=complex)
+        tied_recycle[support] = recycle_space
+        self._projected_krylov_cache[krylov_key] = tied_recycle
+        candidate_h = h_action(reduced)
+        candidate_n = projected_metric.matvec(reduced)
+        candidate_norm = float(np.real(np.vdot(reduced, candidate_n)))
+        local_energy = float(np.real(np.vdot(reduced, candidate_h)) / candidate_norm)
+        true_residual = float(np.linalg.norm(candidate_h - local_energy * candidate_n))
+        davidson["residual"] = true_residual
+        davidson["metric"] = true_residual
+        davidson["davidson_converged"] = bool(
+            davidson.get("davidson_converged", False)
+            and true_residual <= float(davidson_tol)
+        )
+        overlap = np.vdot(current_reduced, candidate_n)
+        candidate = np.zeros(current.size, dtype=complex)
+        candidate[support] = reduced
+        if abs(overlap) > 0.0:
+            candidate *= np.conj(overlap) / abs(overlap)
+        step = candidate[support] - current_reduced
+        stationary_step = float(np.sqrt(max(
+            np.real(np.vdot(step, projected_metric.matvec(step)))
+            / max(float(denominator), np.finfo(float).tiny),
+            0.0,
+        )))
+        stationary = stationary_step <= max(1.0e-12, 0.01 * float(davidson_tol))
+        after = float(local_energy + self.ecore)
+        metric_direction_norm = candidate_norm / max(
+            float(np.vdot(reduced, reduced).real), np.finfo(float).tiny
+        )
+        metric_supported = bool(
+            metric_direction_norm > float(metric_rtol) * float(np.max(np.abs(n_diag)))
+        )
+        accepted = bool(
+            candidate_norm > 0.0
+            and np.isfinite(after)
+            and np.isfinite(true_residual)
+            and metric_supported
+            and after <= before + float(accept_tol)
+        )
+        accepted_inexact = bool(
+            accepted and not davidson.get("davidson_converged", False)
+        )
+        if accepted and not stationary:
+            self._set_site_vector(site, candidate)
+        if not accepted or stationary:
+            after = before
+        davidson.update({
+            "native_davidson": False,
+            "metric_rank": None,
+            "metric_nullity": None,
+            "metric_whitening_backend": "matrix_free_generalized",
+            "recycled_vectors": 0 if recycled is None else int(recycled.shape[1]),
+            "transported_ritz_vectors": 0 if recycled is None else int(recycled.shape[1]),
+            "preconditioner_mode": ("regularized_metric_cg" if preconditioner
+                                    else "generalized_diagonal"),
+            "preconditioner_metric_actions": (preconditioner.matvecs if preconditioner else 0),
+            "candidate_metric_supported": metric_supported,
+            "candidate_metric_direction_norm": metric_direction_norm,
+            "accepted_inexact_variational_step": accepted_inexact,
+        })
+        solver_info["projected_action_backend"] = "matrix_free_generalized"
+        solver_info["davidson"] = davidson
+        return {
+            "site": int(site),
+            "energy_before": float(before),
+            "energy_after": float(after),
+            "local_energy": float(local_energy + self.ecore),
+            "support": int(support.size),
+            "parameters": int(current.size),
+            "accepted": accepted,
+            "stationary": bool(stationary),
+            "stationary_step": stationary_step,
+            "norm_before": float(denominator),
+            "norm_after": float(candidate_norm if accepted and not stationary else denominator),
+            "native_su2": True,
+            "solver": solver,
+            "requested_solver": requested_solver,
+            "auto_selected": requested_solver == "auto",
+            "workers": int(self.workers),
+            "fully_wigner_eckart_reduced": True,
+            "matrix_free": True,
+            "local_linear_algebra": "matrix_free_generalized_davidson",
+            "solver_info": solver_info,
+            "magnetic_expansion_factor": float(self._magnetic_expansion_factor(bond)),
+            "environment_backend": self.local_environment_backend,
+            "elapsed": float(time.perf_counter() - started),
+        }
+
     def optimize_site(
         self,
         site,
@@ -4019,18 +5626,53 @@ class NonAbelianFrontierLETTA:
         support_rtol=1.0e-13,
         max_local_parameters=128,
         max_matrix_free_parameters=4096,
+        max_dense_metric_parameters=4096,
         accept_tol=1.0e-10,
         solver="auto",
         we_dense_dim=24,
         davidson_tol=1.0e-10,
         davidson_maxiter=80,
-        davidson_max_space=32,
+        davidson_max_space=None,
+        conditional_preconditioner=False,
+        davidson_workspace_mib=32,
+        conditional_preconditioner_max_block=64,
+        conditional_preconditioner_weight=0.1,
+        compiled_davidson="auto",
+        davidson_minimum_explored_dimension=2,
+        davidson_convergence_confirmations=2,
+        projected_diagonal_weight=0.0,
+        local_eigensolver="davidson",
         sites=None,
         bond=None,
         executor=None,
         environment_sweeps=None,
     ):
-        """Perform one exact reduced local Rayleigh--Ritz update."""
+        """Perform one reduced local Rayleigh--Ritz update.
+
+        Large matrix-free problems accept ``davidson_workspace_mib`` and
+        ``conditional_preconditioner`` (a bounded regularized metric-CG
+        correction). This is a Davidson adaptation, not an exact inverse
+        shifted Hamiltonian: Davidson, JCP 17, 87 (1975),
+        doi:10.1016/0021-9991(75)90065-0. Check the returned true residual;
+        a variationally accepted inexact step need not be converged.
+        ``metric_rtol`` also filters near-null matrix-free Krylov directions
+        by their norm Rayleigh quotient relative to the norm diagonal scale;
+        this is directional stabilization, not exact spectral whitening.
+        ``davidson_max_space=None`` allows 96 vectors for wider frontiers at
+        ``D >= 3`` and 32 otherwise, bounded by the supported coordinate dimension. This is
+        a restart-capacity heuristic; explicit values override it, and the
+        requested residual tolerance is unchanged.
+        ``local_eigensolver="dense"`` instead diagonalizes the small supported
+        reduced tensor-coordinate Hamiltonian, assembled with the same batched
+        actions. This is an exact local root within the retained metric support,
+        not a determinant-space projection or a guarantee of a global minimum.
+        """
+        if davidson_max_space is None:
+            davidson_max_space = 96 if self.max_frontier_width > 1 and self.D >= 3 else 32
+        local_eigensolver = str(local_eigensolver).lower()
+        if local_eigensolver not in {"davidson", "dense"}:
+            raise ValueError("local_eigensolver must be 'davidson' or 'dense'.")
+        started = time.perf_counter()
         site = int(site)
         if executor is None:
             executor = self._solver_executor
@@ -4038,11 +5680,13 @@ class NonAbelianFrontierLETTA:
         if bond is None:
             bond = site if site < self.nsites - 1 else site - 1
         cached_certificate = self._stationary_certificate_cache.get(site)
+        dependency_signature = self._stationary_dependency_signature(site)
         if (
             environment_sweeps is not None
+            and local_eigensolver == "davidson"
             and requested_solver in {"auto", "wigner_eckart"}
             and cached_certificate is not None
-            and int(cached_certificate[0]) == int(self._state_revision)
+            and cached_certificate[0] == dependency_signature
             and float(cached_certificate[1]) <= float(davidson_tol)
         ):
             update = copy.deepcopy(cached_certificate[2])
@@ -4057,6 +5701,7 @@ class NonAbelianFrontierLETTA:
                 cached_certificate[3]
             )
             update["solver_info"]["environment_reused"] = True
+            update["elapsed"] = float(time.perf_counter() - started)
             self._stationary_certificate_cache_hits += 1
             return update
         solver = self._select_local_solver(requested_solver)
@@ -4086,6 +5731,7 @@ class NonAbelianFrontierLETTA:
                     bond,
                     support_rtol=support_rtol,
                     max_parameters=max_matrix_free_parameters,
+                    max_dense_metric_parameters=max_dense_metric_parameters,
                     executor=executor,
                     sites=sites,
                     environment_sweeps=environment_sweeps,
@@ -4107,14 +5753,22 @@ class NonAbelianFrontierLETTA:
         current_reduced = current[support]
         if matrix_free:
             projected_metric = solver_info.pop("_projected_metric")
-            if not isinstance(projected_metric, _ReducedMetricComponents):
+            matrix_free_projected_metric = isinstance(
+                projected_metric, _MatrixFreeProjectedMetric
+            )
+            if not matrix_free_projected_metric and not isinstance(
+                projected_metric, _ReducedMetricComponents
+            ):
                 dense_metric = np.asarray(projected_metric, dtype=complex)
                 projected_metric = _ReducedMetricComponents(
                     dense_metric.shape[0],
                     ((np.arange(dense_metric.shape[0]), dense_metric),),
                 )
             projected_design = solver_info.pop("_projected_design")
-            if not isinstance(projected_design, _StructuredPairEmbedding):
+            if not (
+                hasattr(projected_design, "matvec")
+                and hasattr(projected_design, "rmatvec")
+            ):
                 projected_design = np.asarray(projected_design, dtype=complex)
             parent_h_diagonal = np.asarray(
                 solver_info.pop("_parent_h_diagonal"), dtype=float
@@ -4133,6 +5787,39 @@ class NonAbelianFrontierLETTA:
             current_h if matrix_free else hamiltonian @ current_reduced,
         )
         before = float(np.real(numerator) / denominator) + self.ecore
+        if matrix_free and matrix_free_projected_metric:
+            if local_eigensolver == "dense":
+                raise MemoryError("Dense local roots require a materialized reduced metric.")
+            return self._optimize_site_matrix_free_metric(
+                site,
+                bond,
+                current=current,
+                support=support,
+                current_reduced=current_reduced,
+                h_action=h_action,
+                projected_metric=projected_metric,
+                h_diag=h_diag,
+                n_diag=n_diag,
+                solver_info=solver_info,
+                denominator=denominator,
+                before=before,
+                accept_tol=accept_tol,
+                davidson_tol=davidson_tol,
+                davidson_maxiter=davidson_maxiter,
+                davidson_max_space=davidson_max_space,
+                davidson_minimum_explored_dimension=(
+                    davidson_minimum_explored_dimension
+                ),
+                davidson_convergence_confirmations=(
+                    davidson_convergence_confirmations
+                ),
+                conditional_preconditioner=conditional_preconditioner,
+                davidson_workspace_mib=davidson_workspace_mib,
+                metric_rtol=metric_rtol,
+                solver=solver,
+                requested_solver=requested_solver,
+                started=started,
+            )
         if matrix_free:
             from pyqed.mps.nonabelian import _su2_kernel
 
@@ -4163,9 +5850,25 @@ class NonAbelianFrontierLETTA:
                 ) = cached_whitener
                 self._metric_whitener_cache_hits += 1
             else:
-                whitener, retained_metric, whitening_backend = (
-                    projected_metric.whitener(rtol=metric_rtol)
+                component_cache = self._metric_whitener_component_cache.setdefault(
+                    metric_cache_key, {}
                 )
+                (
+                    whitener,
+                    retained_metric,
+                    whitening_backend,
+                    reused_components,
+                ) = projected_metric.whitener(
+                    rtol=metric_rtol,
+                    component_cache=component_cache,
+                    revision=lambda indices, block: _su2_kernel._cpp_array_revision(
+                        indices, block
+                    ),
+                )
+                self._metric_whitener_component_hits += int(reused_components)
+                cache_limit = max(4, 4 * len(projected_metric.components))
+                while len(component_cache) > cache_limit:
+                    component_cache.pop(next(iter(component_cache)))
                 self._metric_whitener_cache[metric_cache_key] = (
                     metric_revision,
                     whitener,
@@ -4211,7 +5914,7 @@ class NonAbelianFrontierLETTA:
                 and reconstruction_error
                 <= max(1.0e-11, 0.1 * float(davidson_tol))
             )
-            if stationary_certificate:
+            if stationary_certificate and local_eigensolver == "davidson":
                 cached_krylov = self._projected_krylov_cache.get(
                     (int(site), int(bond))
                 )
@@ -4280,9 +5983,10 @@ class NonAbelianFrontierLETTA:
                         self._magnetic_expansion_factor(bond)
                     ),
                     "environment_backend": self.local_environment_backend,
+                    "elapsed": float(time.perf_counter() - started),
                 }
                 self._stationary_certificate_cache[site] = (
-                    int(self._state_revision),
+                    dependency_signature,
                     current_residual,
                     copy.deepcopy(update),
                     int(bond),
@@ -4305,6 +6009,44 @@ class NonAbelianFrontierLETTA:
                     )
                 )
 
+            conditional_groups = projected_metric.orthonormal_components(
+                whitener
+            )
+            maximum_conditional_block = max(
+                (int(group.size) for group in conditional_groups),
+                default=0,
+            )
+            use_conditional_preconditioner = bool(
+                conditional_preconditioner
+                and conditional_groups
+                and whitener.shape[1] > 16
+                and maximum_conditional_block
+                <= int(conditional_preconditioner_max_block)
+            )
+            conditional_eigensystems = ()
+            if use_conditional_preconditioner:
+                if isinstance(orthonormal_design, _StructuredPairEmbedding):
+                    conditional_blocks = (
+                        orthonormal_design.projected_diagonal_blocks(
+                            parent_h_diagonal,
+                            conditional_groups,
+                        )
+                    )
+                else:
+                    conditional_blocks = []
+                    for group in conditional_groups:
+                        local = orthonormal_design[:, group]
+                        block = local.conj().T @ (
+                            parent_h_diagonal[:, None] * local
+                        )
+                        conditional_blocks.append(
+                            0.5 * (block + block.conj().T)
+                        )
+                    conditional_blocks = tuple(conditional_blocks)
+                conditional_eigensystems = tuple(
+                    np.linalg.eigh(block) for block in conditional_blocks
+                )
+
             def orthonormal_h_action(vector):
                 return whitener.conj().T @ h_action(whitener @ vector)
 
@@ -4320,9 +6062,29 @@ class NonAbelianFrontierLETTA:
             else:
                 owner = projected_route["owner"]
                 projection_key = projected_route["projection_key"]
-                projected_action = lambda vector: owner.factor_route_projected_matvec(
-                    projection_key, np.asarray(vector)
-                )
+                real_projection = projected_route["real_projection"]
+
+                def projected_action(vector):
+                    vector = np.asarray(vector)
+                    if not real_projection:
+                        return owner.factor_route_projected_matvec(projection_key, vector)
+                    result = owner.factor_route_projected_real_matvec(projection_key, vector.real)
+                    if np.iscomplexobj(vector) and np.any(vector.imag):
+                        result = result + 1j * owner.factor_route_projected_real_matvec(
+                            projection_key, vector.imag
+                        )
+                    return result
+
+                def projected_columns(vectors):
+                    vectors = np.asarray(vectors)
+                    if not real_projection:
+                        return owner.factor_route_projected_matmat(projection_key, vectors)
+                    if vectors.shape[1] == 0:
+                        return np.empty_like(vectors)
+                    return np.column_stack([projected_action(column) for column in vectors.T])
+
+                projected_action.matmat = projected_columns
+                solver_info["projected_action_real_arithmetic"] = real_projection
                 if os.environ.get("PYQED_VALIDATE_LETTA_PROJECTED_ROUTE"):
                     reference_probe = orthonormal_h_action(whitened_current)
                     compiled_probe = projected_action(whitened_current)
@@ -4340,19 +6102,67 @@ class NonAbelianFrontierLETTA:
             # preconditioner until the exact projected diagonal is installed.
             diagonal_center = float(np.median(projected_h_diagonal))
             davidson_diagonal = projected_h_diagonal
+            diagonal_weight = min(
+                1.0, max(0.0, float(projected_diagonal_weight))
+            )
+            diagonal_scale = max(
+                float(np.median(np.abs(projected_h_diagonal - diagonal_center))),
+                1.0e-10,
+            )
+            trusted_diagonal = np.clip(
+                projected_h_diagonal,
+                diagonal_center - 8.0 * diagonal_scale,
+                diagonal_center + 8.0 * diagonal_scale,
+            )
+            preconditioner_diagonal = (
+                (1.0 - diagonal_weight) * diagonal_center
+                + diagonal_weight * trusted_diagonal
+            )
 
             def projected_preconditioner(residual, theta, _vector):
-                denominator = theta - diagonal_center
-                floor = max(
+                denominator = theta - preconditioner_diagonal
+                floor = np.maximum(
                     1.0e-10,
-                    1.0e-6 * abs(float(denominator)),
+                    1.0e-6 * np.maximum(np.abs(preconditioner_diagonal), abs(theta)),
                 )
-                safe = (
-                    denominator
-                    if abs(denominator) > floor
-                    else (floor if denominator >= 0.0 else -floor)
+                safe = np.where(
+                    np.abs(denominator) > floor,
+                    denominator,
+                    np.where(denominator >= 0.0, floor, -floor),
                 )
-                return residual / safe
+                shifted = residual / safe
+                if conditional_eigensystems:
+                    corrected = np.zeros_like(residual, dtype=complex)
+                    for group, (values, vectors) in zip(
+                        conditional_groups,
+                        conditional_eigensystems,
+                    ):
+                        denominators = theta - values
+                        floor = np.maximum(
+                            1.0e-10,
+                            1.0e-6 * np.maximum(np.abs(values), abs(theta)),
+                        )
+                        safe = np.where(
+                            np.abs(denominators) > floor,
+                            denominators,
+                            np.where(denominators >= 0.0, floor, -floor),
+                        )
+                        corrected[group] = vectors @ (
+                            (vectors.conj().T @ residual[group]) / safe
+                        )
+                    if np.all(np.isfinite(corrected)) and np.linalg.norm(
+                        corrected
+                    ) > 1.0e-15:
+                        weight = min(
+                            1.0,
+                            max(0.0, float(conditional_preconditioner_weight)),
+                        )
+                        corrected *= np.linalg.norm(shifted) / max(
+                            np.linalg.norm(corrected),
+                            np.finfo(float).tiny,
+                        )
+                        return (1.0 - weight) * shifted + weight * corrected
+                return shifted
 
             krylov_key = (int(site), int(bond))
             cached_krylov = self._projected_krylov_cache.get(krylov_key)
@@ -4366,9 +6176,19 @@ class NonAbelianFrontierLETTA:
                     whitener.conj().T
                     @ projected_metric.matvec(recycled_reduced)
                 )
-
             native_result = None
-            if projected_route is not None and whitener.shape[1] <= 16:
+            use_compiled_davidson = bool(
+                projected_route is not None
+                and local_eigensolver == "davidson"
+                and (
+                    compiled_davidson is True
+                    or (
+                        str(compiled_davidson).lower() == "auto"
+                        and whitener.shape[1] <= 16
+                    )
+                )
+            )
+            if use_compiled_davidson:
                 trial = owner.factor_route_projected_davidson(
                     projection_key,
                     np.full(whitener.shape[1], diagonal_center, dtype=complex),
@@ -4384,7 +6204,21 @@ class NonAbelianFrontierLETTA:
                     <= float(davidson_tol)
                 ):
                     native_result = trial
-            if native_result is None:
+            if local_eigensolver == "dense":
+                columns = np.eye(whitener.shape[1], dtype=complex)
+                matmat = getattr(projected_action, "matmat", None)
+                matrix = (matmat(columns) if matmat is not None else
+                          self._apply_packed_columns(projected_action, columns, executor=executor))
+                values, vectors = np.linalg.eigh(0.5 * (matrix + matrix.conj().T))
+                local_energy, whitened_reduced = float(values[0]), vectors[:, 0]
+                residual = float(np.linalg.norm(
+                    projected_action(whitened_reduced) - local_energy * whitened_reduced))
+                recycle_space = whitened_reduced[:, None]
+                davidson_info = dict(metric=residual, residual=residual,
+                    davidson_iterations=0, davidson_converged=residual <= float(davidson_tol),
+                    subspace_dim=int(whitener.shape[1]), restarts=0,
+                    packed_dimension=int(whitener.shape[1]), dense_reduced_local=True)
+            elif native_result is None:
                 local_energy, whitened_reduced, davidson_info = (
                     _solve_packed_generalized_davidson(
                         whitened_current,
@@ -4401,6 +6235,12 @@ class NonAbelianFrontierLETTA:
                         precond=projected_preconditioner,
                         initial_vectors=recycled_vectors,
                         return_recycle_space=True,
+                        minimum_explored_dimension=(
+                            davidson_minimum_explored_dimension
+                        ),
+                        convergence_confirmations=(
+                            davidson_convergence_confirmations
+                        ),
                     )
                 )
                 recycle_space = davidson_info.pop("_recycle_space")
@@ -4433,10 +6273,25 @@ class NonAbelianFrontierLETTA:
             )
             davidson_info["fused_cpp_action"] = projected_route is not None
             davidson_info["preconditioner_mode"] = (
-                "native_constant_shift"
-                if native_result is not None
-                else "projected_diagonal_seed_constant_shift"
+                "none" if local_eigensolver == "dense" else "compiled_constant_shift"
+                if native_result is not None or local_eigensolver == "dense"
+                else (
+                    "conditional_block_jacobi_hybrid"
+                    if conditional_eigensystems
+                    else "projected_diagonal_seed_constant_shift"
+                )
             )
+            davidson_info["conditional_preconditioner_blocks"] = int(
+                len(conditional_eigensystems)
+            )
+            davidson_info["conditional_preconditioner_max_block"] = int(
+                maximum_conditional_block
+            )
+            davidson_info["conditional_preconditioner_weight"] = float(
+                conditional_preconditioner_weight
+            )
+            davidson_info["projected_diagonal_weight"] = float(diagonal_weight)
+            davidson_info["compiled_davidson_policy"] = str(compiled_davidson)
             reduced = whitener @ whitened_reduced
             candidate_h = projected_action(whitened_reduced)
             candidate_norm = float(np.real(np.vdot(
@@ -4547,6 +6402,7 @@ class NonAbelianFrontierLETTA:
             "fully_wigner_eckart_reduced": solver == "wigner_eckart",
             "matrix_free": bool(matrix_free),
             "local_linear_algebra": (
+                "metric_orthonormal_dense" if local_eigensolver == "dense" else
                 "metric_orthonormal_projected_davidson"
                 if matrix_free
                 else "dense_generalized_eigh"
@@ -4560,7 +6416,54 @@ class NonAbelianFrontierLETTA:
                 if solver == "wigner_eckart"
                 else "full_chain_polarization"
             ),
+            "elapsed": float(time.perf_counter() - started),
         }
+
+    def _materialize_explicit_hamiltonian(self):
+        """Switch a direct complementary state to the exact reduced MPO."""
+        if self.hamiltonian_representation != "complementary":
+            return False
+        factors = prepare_hamiltonian_factors(self.mpo, materialize=True)
+        self.mpo = list(factors)
+        self._complementary_operators = None
+        self.hamiltonian_representation = "mpo"
+        if hasattr(self, "hamiltonian"):
+            self.hamiltonian = replace(
+                self.hamiltonian,
+                factors=list(self.mpo),
+                complementary_operators=None,
+                moving_environment=None,
+            )
+        self._projected_route_cache.clear()
+        self._projected_krylov_cache.clear()
+        self._metric_whitener_cache.clear()
+        self._metric_whitener_component_cache.clear()
+        self._stationary_certificate_cache.clear()
+        return True
+
+    def sweep_parameter_blocks(self, *, spill_directory, **kwargs):
+        """Run one experimental disk-backed reduced-parameter pass.
+
+        ``direction='lr'`` or ``'rl'`` selects traversal. Updates the state
+        using moving reduced environments; returns per-site
+        diagnostics. See :func:`pyqed.letta.parameter_sweep.sweep_parameter_blocks`
+        for the Weichselbaum (2012) adaptation, budgets, and restricted-space
+        convergence limitations. This does not certify global convergence.
+        """
+        from .parameter_sweep import sweep_parameter_blocks
+        return sweep_parameter_blocks(self, spill_directory=spill_directory, **kwargs)
+
+    def run_parameter_blocks(self, *, spill_directory, **kwargs):
+        """Run LR/RL cycles with sparse local coordinates and boundary reuse.
+
+        Populates energy, history and success on this solver. Convergence
+        requires an independent final-state retained-metric stationarity audit,
+        not merely local roots during a pass. See
+        :func:`pyqed.letta.parameter_sweep.run_parameter_blocks` for the reduced
+        Weichselbaum (2012) adaptation, memory limits and fidelity restrictions.
+        """
+        from .parameter_sweep import run_parameter_blocks
+        return run_parameter_blocks(self, spill_directory=spill_directory, **kwargs)
 
     def run(
         self,
@@ -4582,15 +6485,79 @@ class NonAbelianFrontierLETTA:
         checkpoint=None,
         checkpoint_every=1,
         reset_history=True,
-        gauge=None,
+        gauge="auto",
         gauge_rcond=1.0e-12,
-        reuse_environments=False,
+        reuse_environments=None,
+        global_variational_guard="adaptive",
+        global_accept_tol=1.0e-10,
+        global_guard_trigger_tol=1.0e-8,
+        adaptive_davidson=False,
+        adaptive_ties=False,
+        tie_options=None,
+        representation_break_even_cycles=40,
         **kwargs,
     ):
-        """Optimize by complete left/right reduced SU(2) cycles."""
+        """Optimize by complete left/right reduced SU(2) cycles.
+
+        Projected sweeps reuse moving reduced environments by default.
+        ``reuse_environments=False`` selects explicit rebuilding for reference
+        checks on MPO states; complementary states always require reuse.
+
+        ``adaptive_ties=True`` alternates fixed-graph cycles with cost-bounded
+        graph additions; ``tie_options`` controls the interval and trial budget.
+        See :meth:`adapt_ties` for the selection heuristic and limitations.
+
+        ``adaptive_davidson`` loosens the requested Davidson tolerance using
+        the previous cycle energy change, capped at 1e-4. This is a heuristic
+        inexact-solve schedule, not a convergence guarantee; stopping criteria
+        and global variational checks are unchanged.
+        """
+        if adaptive_ties:
+            options = dict(locals())
+            from .su2_adaptive_graph import run_adaptive
+            options.pop("self")
+            options.pop("adaptive_ties")
+            options.pop("tie_options")
+            options.pop("nsweeps")
+            options.update(options.pop("kwargs"))
+            return run_adaptive(
+                self, nsweeps=nsweeps, tie_options=tie_options, run_options=options,
+            )
+        if tie_options is not None:
+            raise ValueError("tie_options requires adaptive_ties=True")
+        target_davidson_tol = float(kwargs.get("davidson_tol", 1.0e-10))
+        if not np.isfinite(target_davidson_tol) or target_davidson_tol <= 0:
+            raise ValueError("davidson_tol must be finite and positive")
         nsweeps = int(nsweeps)
         if nsweeps < 1:
             raise ValueError("nsweeps must be positive.")
+        representation_break_even_cycles = max(
+            1, int(representation_break_even_cycles)
+        )
+        if (
+            self._hamiltonian_representation_policy == "auto"
+            and self.hamiltonian_representation == "complementary"
+            and nsweeps >= representation_break_even_cycles
+        ):
+            switched = self._materialize_explicit_hamiltonian()
+            self._representation_decision = {
+                "policy": "auto",
+                "selected": self.hamiltonian_representation,
+                "reason": (
+                    "requested cycles exceed the measured direct/MPO "
+                    "cold-start break-even"
+                ),
+                "break_even_cycles": representation_break_even_cycles,
+                "switched": bool(switched),
+            }
+        elif self._hamiltonian_representation_policy == "auto":
+            self._representation_decision = {
+                "policy": "auto",
+                "selected": self.hamiltonian_representation,
+                "reason": "direct complementary wins below the cold-start break-even",
+                "break_even_cycles": representation_break_even_cycles,
+                "switched": False,
+            }
         algorithm = str(algorithm).lower().replace("-", "_")
         if algorithm in {"1site", "single_site"}:
             algorithm = "one_site"
@@ -4603,6 +6570,8 @@ class NonAbelianFrontierLETTA:
                 "SU2LETTA algorithm must be 'one_site', 'two_site', or "
                 "'projected'."
             )
+        if self.virtual_boundary=='periodic' and algorithm!='projected':
+            raise ValueError("closed multiplicity loops require algorithm='projected' one-site updates")
         consecutive_cycles = int(consecutive_cycles)
         if consecutive_cycles < 1:
             raise ValueError("consecutive_cycles must be positive.")
@@ -4622,19 +6591,49 @@ class NonAbelianFrontierLETTA:
         local_solver = self._select_local_solver(requested_solver)
         if gauge is not None:
             gauge = str(gauge).lower().replace("-", "_")
-        elif (
-            algorithm == "projected"
-            and self.hamiltonian_representation == "complementary"
-        ):
-            gauge = "conditional"
+        if gauge == "auto":
+            gauge = (
+                "conditional"
+                if algorithm == "projected"
+                and self.hamiltonian_representation == "complementary"
+                else None
+            )
+        elif gauge in {"none", "off"}:
+            gauge = None
         if gauge not in {None, "conditional"}:
-            raise ValueError("SU2LETTA gauge must be None or 'conditional'.")
+            raise ValueError(
+                "SU2LETTA gauge must be 'auto', None, or 'conditional'."
+            )
         conditional_gauge = bool(
             algorithm in {"two_site", "projected"}
             and gauge == "conditional"
             and self.supports_conditional_canonical_gauge
         )
-        reuse_environments = bool(reuse_environments)
+        if isinstance(global_variational_guard, (bool, np.bool_)):
+            global_guard_mode = (
+                "adaptive" if bool(global_variational_guard) else "off"
+            )
+        else:
+            global_guard_mode = str(global_variational_guard).lower().replace(
+                "-", "_"
+            )
+            if global_guard_mode in {"none", "false", "disabled"}:
+                global_guard_mode = "off"
+        if global_guard_mode not in {"off", "adaptive", "all"}:
+            raise ValueError(
+                "global_variational_guard must be 'adaptive', 'all', or False."
+            )
+        global_accept_tol = float(global_accept_tol)
+        global_guard_trigger_tol = float(global_guard_trigger_tol)
+        if global_accept_tol < 0.0 or global_guard_trigger_tol < 0.0:
+            raise ValueError("global guard tolerances must be nonnegative.")
+        use_global_guard = bool(
+            global_guard_mode != "off"
+            and algorithm == "projected"
+            and self.hamiltonian_representation == "complementary"
+        )
+        reuse_environments = (algorithm == "projected" if reuse_environments is None
+                              else bool(reuse_environments))
         if self.hamiltonian_representation == "complementary":
             reuse_environments = True
         moving_environment = None
@@ -4645,9 +6644,10 @@ class NonAbelianFrontierLETTA:
         cpp_boundary_environment = (
             self._su2_moving_environment if self.nsites >= 6 else None
         )
-        if algorithm in {"two_site", "projected"} and reuse_environments:
-            moving_environment = MovingEnvironment(
-                self.materialize(),
+
+        def new_moving_environment(sites):
+            environment = MovingEnvironment(
+                sites,
                 mpo_factors=self.mpo,
                 complementary_operator_families=self._complementary_operators,
                 materialize_complementary_family_operator_tables=False,
@@ -4655,9 +6655,13 @@ class NonAbelianFrontierLETTA:
                 su2_boundary_environment=cpp_boundary_environment,
             )
             # Keep explicit factorized norm boundary components available for
-            # connected whitening.  Their local pair action is still owned by
+            # connected whitening. Their local pair action is still owned by
             # the compiled reduced engine.
-            moving_environment.norm_stack.su2_boundary_environment = None
+            environment.norm_stack.su2_boundary_environment = None
+            return environment
+
+        if algorithm in {"two_site", "projected"} and reuse_environments:
+            moving_environment = new_moving_environment(self.materialize())
         previous = float(self.energy)
         if reset_history:
             self.history = []
@@ -4666,28 +6670,42 @@ class NonAbelianFrontierLETTA:
         canonical_center = None
         h_chain = n_chain = None
         for sweep in range(nsweeps):
+            cycle_kwargs = dict(kwargs)
+            cycle_davidson_tol = target_davidson_tol
+            if adaptive_davidson:
+                last_delta = (
+                    float(self.history[-1]["energy_delta"])
+                    if self.history else np.inf
+                )
+                if last_delta > float(tol):
+                    cycle_davidson_tol = max(
+                        target_davidson_tol, min(1.0e-4, 0.1 * last_delta)
+                    )
+                cycle_kwargs["davidson_tol"] = cycle_davidson_tol
             if (
                 sweep
                 and moving_environment is not None
                 and self.hamiltonian_representation == "complementary"
             ):
-                moving_environment = MovingEnvironment(
-                    self.materialize(),
-                    mpo_factors=self.mpo,
-                    complementary_operator_families=self._complementary_operators,
-                    materialize_complementary_family_operator_tables=False,
-                    su2_moving_environment=None,
-                    su2_boundary_environment=cpp_boundary_environment,
-                )
-                moving_environment.norm_stack.su2_boundary_environment = None
+                moving_environment = new_moving_environment(self.materialize())
                 h_chain = n_chain = None
             cycle_started = time.perf_counter()
+            cycle_vectors = (
+                tuple(self._pack_site(site).copy() for site in range(self.nsites))
+                if use_global_guard
+                else None
+            )
             updates = []
             gauge_updates = []
             environment_build_s = 0.0
             hamiltonian_environment_build_s = 0.0
             norm_environment_build_s = 0.0
             environment_chain_reuses = 0
+            carried_energy = float(previous)
+            global_guard_evaluations = 0
+            global_guard_rejections = 0
+            global_guard_estimates = 0
+            global_guard_s = 0.0
             for direction, bonds in (
                 ("lr", range(self.nsites - 1)),
                 ("rl", range(self.nsites - 2, -1, -1)),
@@ -4817,12 +6835,16 @@ class NonAbelianFrontierLETTA:
                                 max_retraction_parameters=max_retraction_parameters,
                                 sites=materialized,
                                 environment_sweeps=local_environment_sweeps,
-                                **kwargs,
+                                **cycle_kwargs,
                             )
                         finally:
                             if h_stack is not None:
                                 h_stack.su2_moving_environment = None
-                        if conditional_gauge and not update.get("stationary", False):
+                        if (
+                            conditional_gauge
+                            and update.get("accepted", False)
+                            and not update.get("stationary", False)
+                        ):
                             local_gauge_updates = self.canonicalize_conditional_bond(
                                 bond,
                                 direction=direction,
@@ -4863,6 +6885,7 @@ class NonAbelianFrontierLETTA:
                                 )
                     else:
                         site = bond if direction == "lr" else bond + 1
+                        site_vector_before = self._pack_site(site).copy()
                         h_stack = (
                             None
                             if moving_environment is None or algorithm == "projected"
@@ -4895,7 +6918,7 @@ class NonAbelianFrontierLETTA:
                                     if algorithm == "projected"
                                     else None
                                 ),
-                                **kwargs,
+                                **cycle_kwargs,
                             )
                         finally:
                             self._incremental_materialization_enabled = False
@@ -4903,7 +6926,85 @@ class NonAbelianFrontierLETTA:
                                 h_stack.su2_moving_environment = None
                         update["requested_solver"] = requested_solver
                         update["auto_selected"] = requested_solver == "auto"
-                        if conditional_gauge and not update.get("stationary", False):
+                        update["bond"] = int(bond)
+                        local_before = float(update["energy_before"])
+                        local_after = float(update["energy_after"])
+                        local_delta = local_after - local_before
+                        guard_key = (direction, int(bond))
+                        coordinate_offset = abs(local_before - carried_energy)
+                        update["local_energy_before"] = local_before
+                        update["local_energy_after"] = local_after
+                        update["local_energy_delta"] = float(local_delta)
+                        update["global_coordinate_offset"] = float(
+                            coordinate_offset
+                        )
+                        if (
+                            use_global_guard
+                            and update.get("accepted", False)
+                            and not update.get("stationary", False)
+                        ):
+                            check_global = bool(
+                                global_guard_mode == "all"
+                                or guard_key in self._global_guard_bonds
+                                or coordinate_offset > global_guard_trigger_tol
+                            )
+                            if check_global:
+                                guard_started = time.perf_counter()
+                                global_after = float(self.expectation())
+                                global_guard_s += (
+                                    time.perf_counter() - guard_started
+                                )
+                                global_guard_evaluations += 1
+                                global_delta = global_after - carried_energy
+                                if (
+                                    abs(global_delta - local_delta)
+                                    > global_guard_trigger_tol
+                                ):
+                                    self._global_guard_bonds.add(guard_key)
+                            else:
+                                global_after = carried_energy + local_delta
+                                global_guard_estimates += 1
+                            globally_accepted = bool(
+                                global_after <= carried_energy + global_accept_tol
+                            )
+                            if not globally_accepted:
+                                self._set_site_vector(site, site_vector_before)
+                                self._stationary_certificate_cache.pop(site, None)
+                                for key in tuple(self._projected_krylov_cache):
+                                    if key[0] == site:
+                                        del self._projected_krylov_cache[key]
+                                update["rejected_krylov_cleared"] = True
+                                global_after = carried_energy
+                                update["accepted"] = False
+                                update["stationary"] = False
+                                global_guard_rejections += 1
+                                self._global_guard_bonds.add(guard_key)
+                            update["globally_accepted"] = globally_accepted
+                            update["global_variational_guard"] = True
+                            update["global_guard_checked"] = check_global
+                            update["global_energy_estimated"] = not check_global
+                            update["energy_before"] = float(carried_energy)
+                            update["energy_after"] = float(global_after)
+                        elif use_global_guard:
+                            update["globally_accepted"] = bool(
+                                update.get("accepted", False)
+                            )
+                            update["global_variational_guard"] = True
+                            update["global_guard_checked"] = False
+                            update["global_energy_estimated"] = False
+                            update["energy_before"] = float(carried_energy)
+                            update["energy_after"] = float(carried_energy)
+                        if not update.get("accepted", False):
+                            for key in tuple(self._projected_krylov_cache):
+                                if key[0] == site:
+                                    del self._projected_krylov_cache[key]
+                            self._stationary_certificate_cache.pop(site, None)
+                            update["rejected_krylov_cleared"] = True
+                        if (
+                            conditional_gauge
+                            and update.get("accepted", False)
+                            and not update.get("stationary", False)
+                        ):
                             local_gauge_updates = self.canonicalize_conditional_bond(
                                 bond,
                                 direction=direction,
@@ -4931,9 +7032,26 @@ class NonAbelianFrontierLETTA:
                             }
                         materialized[site] = self.materialize_site(site)
                         if algorithm == "projected":
-                            self._invalidate_materialized_sites(bond, bond + 1)
-                            materialized[bond] = self.materialize_site(bond)
-                            materialized[bond + 1] = self.materialize_site(bond + 1)
+                            gauge_changed = bool(
+                                update.get("conditional_gauge", {}).get(
+                                    "applied", 0
+                                )
+                            )
+                            refresh_boundary_sites = bool(
+                                not update.get("stationary", False)
+                                or gauge_changed
+                            )
+                            if refresh_boundary_sites:
+                                self._invalidate_materialized_sites(
+                                    bond, bond + 1
+                                )
+                                materialized[bond] = self.materialize_site(bond)
+                                materialized[bond + 1] = self.materialize_site(
+                                    bond + 1
+                                )
+                            update["boundary_refresh_skipped"] = bool(
+                                not refresh_boundary_sites
+                            )
                             if environment_sweeps is not None:
                                 for environment_sweep in environment_sweeps:
                                     environment_sweep.advance_after_update(
@@ -4942,6 +7060,7 @@ class NonAbelianFrontierLETTA:
                                         materialized[bond + 1],
                                     )
                     update["direction"] = direction
+                    carried_energy = float(update.get("energy_after", carried_energy))
                     updates.append(update)
                     if direct_half_sweep:
                         self._su2_moving_environment.stage_bond_update(
@@ -4959,12 +7078,46 @@ class NonAbelianFrontierLETTA:
                     moving_environment.hamiltonian_stack.su2_moving_environment = None
             if self.hamiltonian_representation == "complementary":
                 energy = self.expectation()
-                cycle_norm = float(self.norm())
             elif algorithm == "projected" and updates:
                 energy = float(updates[-1]["energy_after"])
-                cycle_norm = float(updates[-1]["norm_after"])
             else:
                 energy = self.expectation()
+            candidate_energy = float(energy)
+            global_energy_closure = float(candidate_energy - carried_energy)
+            global_energy_closure_error = abs(global_energy_closure)
+            if use_global_guard and (
+                global_energy_closure_error > global_guard_trigger_tol
+            ):
+                inconsistent = max(
+                    updates,
+                    key=lambda item: item.get("global_coordinate_offset", 0.0),
+                    default=None,
+                )
+                if inconsistent is not None:
+                    self._global_guard_bonds.add(
+                        (
+                            str(inconsistent["direction"]),
+                            int(inconsistent["bond"]),
+                        )
+                    )
+            cycle_rolled_back = bool(
+                use_global_guard
+                and candidate_energy > previous + global_accept_tol
+            )
+            if cycle_rolled_back:
+                for site, vector in enumerate(cycle_vectors):
+                    self._set_site_vector(site, vector)
+                self._stationary_certificate_cache.clear()
+                self._projected_krylov_cache.clear()
+                canonical_center = None
+                h_chain = n_chain = None
+                energy = float(previous)
+                global_guard_rejections += 1
+            if self.hamiltonian_representation == "complementary":
+                cycle_norm = float(self.norm())
+            elif algorithm == "projected" and updates and not cycle_rolled_back:
+                cycle_norm = float(updates[-1]["norm_after"])
+            else:
                 cycle_norm = float(self.norm())
             delta = abs(energy - previous)
             residuals = []
@@ -4987,6 +7140,8 @@ class NonAbelianFrontierLETTA:
                 cycle_ok = cycle_ok and max_residual <= float(residual_tol)
             if truncation_tol is not None:
                 cycle_ok = cycle_ok and max_truncation <= float(truncation_tol)
+            if cycle_rolled_back:
+                cycle_ok = False
             stationary_fixed_point = bool(
                 algorithm == "projected"
                 and updates
@@ -5034,12 +7189,20 @@ class NonAbelianFrontierLETTA:
                 "stationary_updates": int(
                     sum(bool(update.get("stationary", False)) for update in updates)
                 ),
+                "boundary_refreshes_skipped": int(
+                    sum(
+                        bool(update.get("boundary_refresh_skipped", False))
+                        for update in updates
+                    )
+                ),
                 "stationary_fixed_point": stationary_fixed_point,
                 "consecutive_cycles": int(streak),
                 "updates": updates,
                 "complete_cycle": True,
                 "symmetry": "SU2",
                 "algorithm": algorithm,
+                "hamiltonian_representation": self.hamiltonian_representation,
+                "representation_decision": dict(self._representation_decision),
                 "norm": cycle_norm,
                 "storage_nbytes": int(self.storage_nbytes),
                 "gauge": "conditional" if conditional_gauge else None,
@@ -5067,6 +7230,22 @@ class NonAbelianFrontierLETTA:
                 ),
                 "norm_environment_build_s": float(norm_environment_build_s),
                 "environment_chain_reuses": int(environment_chain_reuses),
+                "global_variational_guard": use_global_guard,
+                "global_guard_mode": global_guard_mode,
+                "davidson_tolerance": cycle_davidson_tol,
+                "global_guard_evaluations": int(global_guard_evaluations),
+                "global_guard_estimates": int(global_guard_estimates),
+                "global_guard_rejections": int(global_guard_rejections),
+                "global_guard_learned_bonds": tuple(
+                    sorted(self._global_guard_bonds)
+                ),
+                "global_guard_s": float(global_guard_s),
+                "candidate_energy": candidate_energy,
+                "cycle_rolled_back": cycle_rolled_back,
+                "global_energy_closure": global_energy_closure,
+                "global_energy_closure_error": float(
+                    global_energy_closure_error
+                ),
                 "moving_environment_backend": (
                     (
                         "cpp_su2_local_boundaries_python_metric"
@@ -5114,6 +7293,9 @@ class NonAbelianFrontierLETTA:
                     "metric_whitener_hits": int(
                         self._metric_whitener_cache_hits
                     ),
+                    "metric_whitener_component_hits": int(
+                        self._metric_whitener_component_hits
+                    ),
                     "projected_route_hits": int(
                         self._projected_route_cache_hits
                     ),
@@ -5157,7 +7339,35 @@ class NonAbelianFrontierLETTA:
 
 
 class SU2LETTA(NonAbelianFrontierLETTA):
-    """Spatial-orbital qchem adapter for :class:`NonAbelianFrontierLETTA`."""
+    """Spatial-orbital qchem adapter for :class:`NonAbelianFrontierLETTA`.
+
+    Reduced algebra adapts Weichselbaum, PRB 86, 245124 (2012),
+    https://doi.org/10.1103/PhysRevB.86.245124. Periodic multiplicity traces
+    adapt Verstraete, Porras and Cirac, PRL 93, 227205 (2004),
+    https://doi.org/10.1103/PhysRevLett.93.227205. These are LETTA adaptations,
+    not reproductions of their solvers. Periodic support is restricted to a
+    spin-zero, fixed-charge seam and singlet targets, using exact spectator
+    lifting and reduced MPO one-site projected updates. General spin-carrying
+    seams, periodic canonical gauges and global convergence guarantees are
+    not provided. See the base class for the contraction and fidelity details.
+    """
+
+    @classmethod
+    def from_narg(cls, solver, state_ids=None):
+        """Read direct-reduced NARG truncation tensors as a LETTA root batch.
+
+        This exact conversion supports the sequential reduced chain. It does
+        not reconstruct determinants, fit a state vector, or construct an MPS.
+        Detached-frame chains require their own conditional-tensor exporter.
+        """
+        from pyqed.narg.qchem.su2_overlap import _root_tensors
+
+        sites, root_ids, target = _root_tensors(solver, state_ids)
+        dimension = max(int(dim) for site in sites[:-1] for dim in site.legs[2].dims.values())
+        state = cls(None, base_sites=sites, target_sector=target, graph=None,
+                    nelec=solver.target_irrep[0], spin=solver.target_irrep[1], D=dimension)
+        state.root_ids = tuple(root_ids)
+        return state
 
 
 __all__ = ["NonAbelianFrontierLETTA", "SU2LETTA"]

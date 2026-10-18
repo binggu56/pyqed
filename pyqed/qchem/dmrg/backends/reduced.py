@@ -111,8 +111,13 @@ def build_su2_normal_complementary_mpo(
     *,
     fully_reduced=False,
     materialize_reduced_terms=True,
+    physical_legs=None,
 ):
-    """Build lightweight MPO views over the persistent C++ NC route arenas."""
+    """Build MPO views over persistent normal/complementary route arenas.
+
+    ``physical_legs`` carries site-specific Abelian orbital labels into
+    materialized operator views used by reduced tensor-managed sweeps.
+    """
 
     site_descriptor = (
         FullyReducedSpatialOrbitalSite()
@@ -122,7 +127,12 @@ def build_su2_normal_complementary_mpo(
     phys_leg = physical_leg_from_spatial_orbital(site_descriptor)
     n_sites = int(moving_environment.system_stats["n_sites"])
     factors = []
+    channel_irreps = {}
+    if physical_legs is not None and len(physical_legs) != n_sites:
+        raise ValueError("Supply one physical Leg per orbital")
     for site in range(n_sites):
+        if physical_legs is not None:
+            phys_leg = physical_legs[site]
         plan = moving_environment.normal_complementary_plan(site)
         primitives = moving_environment.normal_complementary_primitives(site)
         plan["_primitive_nonzero"] = np.any(primitives != 0.0, axis=3)
@@ -135,16 +145,20 @@ def build_su2_normal_complementary_mpo(
             dtype=np.int64,
         )
         if fully_reduced and not materialize_reduced_terms:
+            # Immutable spin labels are shared across all virtual channels.
+            for two_j in set(left_qn[:, 1]) | set(right_qn[:, 1]):
+                if int(two_j) not in channel_irreps:
+                    channel_irreps[int(two_j)] = SU2Irrep(int(two_j))
             factors.append(
                 RankCoupledMPO(
                     dense_blocks={},
                     phys_out_leg=phys_leg,
                     phys_in_leg=phys_leg,
                     left_channel_irreps=tuple(
-                        SU2Irrep(int(two_j)) for two_j in left_qn[:, 1]
+                        channel_irreps[int(two_j)] for two_j in left_qn[:, 1]
                     ),
                     right_channel_irreps=tuple(
-                        SU2Irrep(int(two_j)) for two_j in right_qn[:, 1]
+                        channel_irreps[int(two_j)] for two_j in right_qn[:, 1]
                     ),
                     left_channel_charges=tuple(int(x) for x in left_qn[:, 0]),
                     right_channel_charges=tuple(int(x) for x in right_qn[:, 0]),
@@ -528,7 +542,7 @@ def refresh_su2_normal_complementary_mpo(moving_environment, factors):
         installed_plan["_primitive_nonzero"] = primitive_nonzero
         for key in numeric_plan_keys:
             value = refreshed_plan[key]
-            installed_plan[key] = value.copy() if hasattr(value, "copy") else value
+            installed_plan[key] = value
 
         for term in factor.reduced_terms:
             route_transitions = getattr(
@@ -554,6 +568,7 @@ def refresh_su2_normal_complementary_mpo(moving_environment, factors):
 
         factor._reduced_block_cache.clear()
         factor._block_cache.clear()
+        factor._environment_reduced_block_cache.clear()
         object.__setattr__(factor, "_reduced_action_cache", None)
     if not moving_environment.refresh_contextual_cores(factors):
         for factor in factors:
@@ -1250,11 +1265,13 @@ class SpatialReducedHamiltonianBuilder:
     """
     Build qchem active-space Hamiltonians as reduced spatial MPO chains.
 
-    This class is the chemistry-to-MPO ownership boundary.  It normalizes the
-    restricted active-space integrals and creates the persistent C++ SU(2)
-    system.  Canonical production builds derive their temporary reference
-    carrier from the C++ ``P/Q`` families; the Python
-    :class:`SpatialSpinFreeERIBuilder` remains the fallback/reference compiler.
+    This class owns the chemistry-to-reduced-operator boundary. It normalizes
+    the restricted integrals and builds the persistent SU(2) normal and
+    complementary operators directly. Production factors are MPO-interface
+    views over those route arenas, not a separately compiled Hamiltonian MPO.
+    Fully reduced production builds materialize neither dense MPO blocks nor
+    Python reduced terms. Reference builds without a target electron count
+    use the explicit MPO compiler.
 
     :param h1e: Spatial one-electron matrix or restricted spin-resolved array
         with shape ``(spin, n, n)``.
@@ -1392,11 +1409,11 @@ class SpatialReducedHamiltonianBuilder:
             if has_integrals:
                 family_actions = sum(
                     sum(
-                        moving_environment.normal_complementary_plan(site)[
+                        factor.normal_complementary_plan[
                             "family_transition_counts"
                         ].values()
                     )
-                    for site in range(int(h_spatial.shape[0]))
+                    for factor in factors
                 )
                 two_body_info.update(
                     total_terms=int(family_actions),
@@ -1592,12 +1609,12 @@ def build_spatial_reduced_hamiltonian_mpo(
         + 1/2 sum_pqrs,sigma,tau (pq|rs)
           c^dagger[p,sigma] c^dagger[r,tau] c[s,tau] c[q,sigma]
 
-    The one-electron part is generated with reduced rank-1/2 endpoint tensors.
-    The two-electron reference carrier is generated from the C++ ``P/Q``
-    family records representing ``E_pq E_rs - delta_qr E_ps``.  The final
-    Hamiltonian sum preserves visible reduced virtual-channel metadata by
-    direct-summing :class:`RankCoupledMPO` cores instead of expanding the
-    cores first.
+    With a target electron count and the compiled SU(2) engine, normal and
+    complementary operators are built directly from integrals. The returned
+    :class:`RankCoupledMPO` factors are views over that representation; they
+    do not require an intermediate symbolic or dense Hamiltonian MPO.
+    Fully reduced production builds also omit Python reduced-term objects.
+    The explicit MPO compiler remains available for reference builds.
 
     :param h1e: Spatial one-electron matrix or restricted spin-resolved
         one-electron integrals.

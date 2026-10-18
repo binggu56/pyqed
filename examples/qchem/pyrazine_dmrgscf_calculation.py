@@ -13,6 +13,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 
+from pyqed.parallel import num_workers
 from pyqed.qchem import Molecule
 from pyqed.qchem.dmrg import DMRGSCF
 
@@ -110,7 +111,7 @@ def main():
     parser.add_argument("--D", type=int, default=64)
     parser.add_argument("--sweeps", type=int, default=6)
     parser.add_argument("--macro-cycles", type=int, default=8)
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int, default=num_workers())
     parser.add_argument("--cd-tol", type=float, default=1.0e-8)
     parser.add_argument("--macro-tol", type=float, default=1.0e-6)
     parser.add_argument("--sweep-tol", type=float, default=1.0e-7)
@@ -134,9 +135,7 @@ def main():
             "coord_type": "spherical",
             "low_rank_tol": args.cd_tol,
             "eri_screen_tol": 0.0,
-            "parallel": True,
-            "eri_workers": args.workers,
-            "parallel_min_nao": 0,
+            "workers": args.workers,
             "rys_cache_mib": 256,
         },
     )
@@ -168,6 +167,7 @@ def main():
     )
     started = time.perf_counter()
     mc.run(
+        algorithm="constrained",
         nstates=1,
         nsweeps=args.sweeps,
         sweep_tol=args.sweep_tol,

@@ -6,6 +6,7 @@ import hashlib
 import numpy as np
 import mmap as _mmap
 cimport numpy as cnp
+from scipy.linalg.cython_lapack cimport zgesvd, zgeqrf, zungqr
 from cython.operator cimport dereference as deref
 from cpython.ref cimport PyObject
 from libc.stdint cimport int32_t, int64_t, uint64_t
@@ -18,6 +19,26 @@ from libcpp.map cimport map as cpp_map
 from libcpp.string cimport string
 from libcpp.vector cimport vector
 
+
+cdef void _factor_svd(char* jobu, char* jobv, int* m, int* n,
+                     cpp_complex[double]* a, int* lda, double* singular,
+                     cpp_complex[double]* u, int* ldu, cpp_complex[double]* vh, int* ldvh,
+                     cpp_complex[double]* work, int* lwork, double* rwork, int* info) noexcept nogil:
+    zgesvd(jobu, jobv, m, n, <double complex*>a, lda, singular,
+           <double complex*>u, ldu, <double complex*>vh, ldvh,
+           <double complex*>work, lwork, rwork, info)
+
+cdef void _factor_qr(int* m, int* n, cpp_complex[double]* a, int* lda,
+                    cpp_complex[double]* tau, cpp_complex[double]* work,
+                    int* lwork, int* info) noexcept nogil:
+    zgeqrf(m, n, <double complex*>a, lda, <double complex*>tau,
+           <double complex*>work, lwork, info)
+
+cdef void _factor_q(int* m, int* n, int* k, cpp_complex[double]* a, int* lda,
+                   cpp_complex[double]* tau, cpp_complex[double]* work,
+                   int* lwork, int* info) noexcept nogil:
+    zungqr(m, n, k, <double complex*>a, lda, <double complex*>tau,
+           <double complex*>work, lwork, info)
 
 cdef class _SU2RouteBuffers:
     """Lifetime owner for the direct NumPy route-construction buffers."""
@@ -740,7 +761,40 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         double rdm1_seconds
         double rdm2_seconds
 
-    cdef cppclass CppMovingEnvironment "pyqed::su2::MovingEnvironment":
+    ctypedef void (*ComplexSVDLapack)(char*, char*, int*, int*, cpp_complex[double]*, int*,
+        double*, cpp_complex[double]*, int*, cpp_complex[double]*, int*,
+        cpp_complex[double]*, int*, double*, int*) noexcept nogil
+    ctypedef void (*ComplexQRLapack)(int*, int*, cpp_complex[double]*, int*, cpp_complex[double]*,
+        cpp_complex[double]*, int*, int*) noexcept nogil
+    ctypedef void (*ComplexGenerateQLapack)(int*, int*, int*, cpp_complex[double]*, int*,
+        cpp_complex[double]*, cpp_complex[double]*, int*, int*) noexcept nogil
+
+    cdef cppclass SectorDecompositionCore "pyqed::su2::SectorDecomposition":
+        SectorDecompositionCore() except +
+        void set_factorization_functions(ComplexSVDLapack, ComplexQRLapack, ComplexGenerateQLapack) noexcept
+        CppBlockSVDResult factorized_blockwise_svd(
+            const cpp_complex[double]* left, size_t n_left, const int64_t* left_offsets,
+            const cpp_complex[double]* right, size_t n_right, const int64_t* right_offsets,
+            const int64_t* rows, const int64_t* bonds, const int64_t* cols,
+            const int64_t* state_weights, size_t n_blocks,
+            double cutoff, int64_t max_bond, const string& max_bond_mode,
+            cpp_bool retain_sector_topology,
+        ) except +
+        CppBlockSVDResult blockwise_svd(
+            const cpp_complex[double]* values,
+            size_t n_values,
+            const int64_t* value_offsets,
+            const int64_t* rows,
+            const int64_t* cols,
+            const int64_t* state_weights,
+            size_t n_blocks,
+            double cutoff,
+            int64_t max_bond,
+            const string& max_bond_mode,
+            cpp_bool retain_sector_topology,
+        ) except +
+
+    cdef cppclass CppMovingEnvironment "pyqed::su2::MovingEnvironment"(SectorDecompositionCore):
         CppMovingEnvironment(const CppSystem* system) except +
         void set_num_threads(int n_threads) except +
         int num_threads() noexcept
@@ -1487,19 +1541,6 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             int restart_dimension,
             cpp_bool accept_unconverged,
         ) except +
-        CppBlockSVDResult blockwise_svd(
-            const cpp_complex[double]* values,
-            size_t n_values,
-            const int64_t* value_offsets,
-            const int64_t* rows,
-            const int64_t* cols,
-            const int64_t* state_weights,
-            size_t n_blocks,
-            double cutoff,
-            int64_t max_bond,
-            const string& max_bond_mode,
-            cpp_bool retain_sector_topology,
-        ) except +
         CppActiveBondSplitResult split_active_bond_solution(
             double cutoff,
             int64_t max_bond,
@@ -1589,6 +1630,8 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         uint64_t boundary_update_topology_builds() noexcept
         uint64_t boundary_update_calls() noexcept
         uint64_t boundary_update_routes() noexcept
+        double boundary_prepare_seconds() noexcept
+        uint64_t boundary_recoupling_cache_hits() noexcept
         double boundary_update_seconds() noexcept
         size_t normal_complementary_boundary_action_count() noexcept
         size_t normal_complementary_boundary_action_bytes() noexcept
@@ -1602,6 +1645,12 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         double half_sweep_executor_seconds() noexcept
         uint64_t owned_half_sweep_calls() noexcept
         uint64_t owned_half_sweep_bonds() noexcept
+        double owned_prepare_seconds() noexcept
+        uint64_t boundary_update_parallel_calls() noexcept
+        uint64_t route_prepare_parallel_calls() noexcept
+        double owned_solve_seconds() noexcept
+        double owned_split_seconds() noexcept
+        double owned_environment_seconds() noexcept
         double owned_half_sweep_seconds() noexcept
         uint64_t aborted_half_sweeps() noexcept
         uint64_t bond_steps() noexcept
@@ -1665,6 +1714,10 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         uint64_t complementary_execution_graph_hits() noexcept
         size_t contextual_route_plan_count() noexcept
         size_t contextual_route_plan_bytes() noexcept
+        size_t preparation_cache_bytes() noexcept
+        size_t boundary_update_workspace_bytes() noexcept
+        uint64_t boundary_update_product_cache_hits() noexcept
+        size_t peak_boundary_product_cache_bytes() noexcept
         size_t contextual_route_index_bytes() noexcept
         size_t contextual_route_core_value_bytes() noexcept
         size_t contextual_compiled_schedule_bytes() noexcept
@@ -1698,6 +1751,8 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         double raw_batch_right_prepare_seconds() noexcept
         double raw_batch_fallback_prepare_seconds() noexcept
         double raw_channel_first_stage_seconds() noexcept
+        uint64_t channel_workspace_builds() noexcept
+        uint64_t channel_workspace_reuses() noexcept
         double raw_wave_batch_seconds() noexcept
         double raw_shared_left_output_seconds() noexcept
         double raw_grouped_output_seconds() noexcept
@@ -1768,6 +1823,12 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         size_t peak_raw_output_fusion_workspace_bytes() noexcept
         uint64_t raw_output_fusion_gemm_calls() noexcept
         uint64_t raw_output_fusion_copied_elements() noexcept
+        size_t peak_output_panel_cache_bytes() noexcept
+        size_t peak_operator_panel_cache_bytes() noexcept
+        uint64_t operator_panel_cache_hits() noexcept
+        uint64_t direct_product_cache_hits() noexcept
+        size_t peak_direct_product_cache_bytes() noexcept
+        uint64_t output_schedule_reuses() noexcept
         size_t peak_persistent_output_batch_count() noexcept
         size_t peak_persistent_output_task_count() noexcept
         size_t peak_persistent_output_group_count() noexcept
@@ -1940,8 +2001,208 @@ cdef class _SU2ComplexBoundaryBuffer:
             self._handle = NULL
 
 
+
+cdef object _sector_svd(
+    SectorDecompositionCore* engine,
+    object matrices,
+    object state_weights,
+    double cutoff=1.0e-10,
+    object max_bond=None,
+    object max_bond_mode="reduced",
+    bint retain_sector_topology=False,
+    object right_factors=None,
+):
+    """Split/truncate reduced sectors; optional site factors avoid their pair product."""
+
+    cdef list packed_matrices = []
+    cdef list packed_right = []
+    cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] right_input
+    cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] right_offsets, final_cols, bonds
+    cdef object value
+    cdef cnp.ndarray matrix
+    cdef Py_ssize_t n_blocks
+    cdef Py_ssize_t block
+    cdef Py_ssize_t cursor = 0
+    cdef Py_ssize_t size
+    cdef Py_ssize_t rank
+    cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] packed_values
+    cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] offsets
+    cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] rows
+    cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] cols
+    cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] weights
+    cdef int64_t max_bond_value
+    cdef string mode = str(max_bond_mode).encode()
+    cdef CppBlockSVDResult result
+    cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] left_values
+    cdef cnp.ndarray[cnp.double_t, ndim=1, mode="c"] singular_values
+    cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] right_values
+    cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] kept_indices
+    cdef list left = []
+    cdef list singular = []
+    cdef list right = []
+    cdef list kept = []
+    cdef Py_ssize_t begin
+    cdef Py_ssize_t end
+
+    # SciPy exposes its compiled LAPACK ABI on macOS, Linux, and Windows.
+    engine.set_factorization_functions(&_factor_svd, &_factor_qr, &_factor_q)
+    for value in matrices:
+        matrix = np.ascontiguousarray(value, dtype=np.complex128)
+        if matrix.ndim != 2 or matrix.shape[0] <= 0 or matrix.shape[1] <= 0:
+            raise ValueError("blockwise_svd expects nonempty rank-2 matrices.")
+        packed_matrices.append(matrix)
+    n_blocks = len(packed_matrices)
+    if n_blocks == 0:
+        raise ValueError("blockwise_svd requires at least one matrix.")
+    weights = np.ascontiguousarray(state_weights, dtype=np.int64).reshape(-1)
+    if weights.size != n_blocks or np.any(weights <= 0):
+        raise ValueError("state_weights must contain one positive value per block.")
+    rows = np.empty(n_blocks, dtype=np.int64)
+    cols = np.empty(n_blocks, dtype=np.int64)
+    offsets = np.empty(n_blocks + 1, dtype=np.int64)
+    offsets[0] = 0
+    for block in range(n_blocks):
+        matrix = packed_matrices[block]
+        rows[block] = matrix.shape[0]
+        cols[block] = matrix.shape[1]
+        cursor += matrix.size
+        offsets[block + 1] = cursor
+    packed_values = np.empty(cursor, dtype=np.complex128)
+    cursor = 0
+    for block in range(n_blocks):
+        matrix = packed_matrices[block]
+        size = matrix.size
+        memcpy(
+            <void*>(<cnp.complex128_t*>cnp.PyArray_DATA(packed_values) + cursor),
+            <const void*>cnp.PyArray_DATA(matrix),
+            size * sizeof(cpp_complex[double]),
+        )
+        cursor += size
+    max_bond_value = -1 if max_bond is None else int(max_bond)
+    if right_factors is None:
+        result = engine.blockwise_svd(
+            <const cpp_complex[double]*>cnp.PyArray_DATA(packed_values),
+            <size_t>packed_values.size,
+            <const int64_t*>cnp.PyArray_DATA(offsets),
+            <const int64_t*>cnp.PyArray_DATA(rows),
+            <const int64_t*>cnp.PyArray_DATA(cols),
+            <const int64_t*>cnp.PyArray_DATA(weights),
+            <size_t>n_blocks,
+            cutoff,
+            max_bond_value,
+            mode,
+            <cpp_bool>retain_sector_topology,
+        )
+    else:
+        if len(right_factors) != n_blocks:
+            raise ValueError('Site factor counts do not match')
+        right_offsets = np.zeros(n_blocks + 1, dtype=np.int64)
+        final_cols = np.empty(n_blocks, dtype=np.int64)
+        bonds = cols.copy()
+        for block in range(n_blocks):
+            matrix = np.ascontiguousarray(right_factors[block], dtype=np.complex128)
+            if matrix.ndim != 2 or matrix.shape[0] != bonds[block] or matrix.shape[1] <= 0:
+                raise ValueError('Invalid right site factor dimensions')
+            packed_right.append(matrix)
+            final_cols[block] = matrix.shape[1]
+            right_offsets[block + 1] = right_offsets[block] + matrix.size
+        right_input = np.concatenate([value.ravel() for value in packed_right])
+        result = engine.factorized_blockwise_svd(
+            <const cpp_complex[double]*>cnp.PyArray_DATA(packed_values),
+            <size_t>packed_values.size, <const int64_t*>cnp.PyArray_DATA(offsets),
+            <const cpp_complex[double]*>cnp.PyArray_DATA(right_input),
+            <size_t>right_input.size, <const int64_t*>cnp.PyArray_DATA(right_offsets),
+            <const int64_t*>cnp.PyArray_DATA(rows),
+            <const int64_t*>cnp.PyArray_DATA(bonds),
+            <const int64_t*>cnp.PyArray_DATA(final_cols),
+            <const int64_t*>cnp.PyArray_DATA(weights), <size_t>n_blocks,
+            cutoff, max_bond_value, mode, <cpp_bool>retain_sector_topology)
+        cols = final_cols
+    left_values = np.empty(result.left_values.size(), dtype=np.complex128)
+    singular_values = np.empty(result.singular_values.size(), dtype=np.float64)
+    right_values = np.empty(result.right_values.size(), dtype=np.complex128)
+    kept_indices = np.empty(result.kept_indices.size(), dtype=np.int64)
+    if result.left_values.size():
+        memcpy(
+            <void*>cnp.PyArray_DATA(left_values),
+            <const void*>result.left_values.data(),
+            result.left_values.size() * sizeof(cpp_complex[double]),
+        )
+    if result.singular_values.size():
+        memcpy(
+            <void*>cnp.PyArray_DATA(singular_values),
+            <const void*>result.singular_values.data(),
+            result.singular_values.size() * sizeof(double),
+        )
+    if result.right_values.size():
+        memcpy(
+            <void*>cnp.PyArray_DATA(right_values),
+            <const void*>result.right_values.data(),
+            result.right_values.size() * sizeof(cpp_complex[double]),
+        )
+    if result.kept_indices.size():
+        memcpy(
+            <void*>cnp.PyArray_DATA(kept_indices),
+            <const void*>result.kept_indices.data(),
+            result.kept_indices.size() * sizeof(int64_t),
+        )
+    for block in range(n_blocks):
+        rank = result.singular_offsets[block + 1] - result.singular_offsets[block]
+        begin = result.left_offsets[block]
+        end = result.left_offsets[block + 1]
+        left.append(left_values[begin:end].reshape((rows[block], rank)))
+        begin = result.singular_offsets[block]
+        end = result.singular_offsets[block + 1]
+        singular.append(singular_values[begin:end])
+        begin = result.right_offsets[block]
+        end = result.right_offsets[block + 1]
+        right.append(right_values[begin:end].reshape((rank, cols[block])))
+        begin = result.kept_offsets[block]
+        end = result.kept_offsets[block + 1]
+        kept.append(kept_indices[begin:end])
+    return {
+        "kind": "cpp_su2_blockwise_svd",
+        "left": left,
+        "singular_values": singular,
+        "right": right,
+        "kept_indices": kept,
+        "truncation_error": float(result.truncation_error),
+        "full_squared_norm": float(result.full_squared_norm),
+        "kept_squared_norm": float(result.kept_squared_norm),
+    }
+
+
+cdef class SectorDecomposition:
+    """Reusable compiled QR/SVD/truncation workspace for reduced site factors."""
+    cdef SectorDecompositionCore* _engine
+
+    def __cinit__(self):
+        self._engine = new SectorDecompositionCore()
+
+    def __dealloc__(self):
+        del self._engine
+
+    def blockwise_svd(self, matrices, state_weights, cutoff=1e-10, max_bond=None,
+                      max_bond_mode="reduced", retain_sector_topology=False, right_factors=None):
+        return _sector_svd(self._engine, matrices, state_weights, cutoff, max_bond,
+                           max_bond_mode, retain_sector_topology, right_factors)
+
+
 cdef class SU2MovingEnvironment:
-    """Persistent C++ owner for active integrals and packed SU(2) sweep state."""
+    """Persistent owner for active integrals and packed SU(2) sweep state.
+
+    ``PYQED_SU2_TASKED_OUTPUT=1`` opts into finer contraction tasks with
+    thread-private outputs when they outnumber output-affinity tasks by >2x.
+    This adapts the Tasked scheduling concept in H. Zhai et al., J. Chem.
+    Phys. 159, 234801 (2023), doi:10.1063/5.0180424, and block2's
+    https://github.com/block-hczhai/block2-preview/blob/master/src/core/threading.hpp.
+    It reuses PyQED's reduced contraction graph, not block2's implementation;
+    truncation and local solver tolerances are unchanged. Output reduction
+    can change floating-point summation order. This is experimental and does
+    not inherit block2's performance claims. The default remains output
+    affinity unless private buffers allow more threads; the existing private
+    workspace limit applies in either mode.
+    """
 
     cdef CppSystem* _system
     cdef CppMovingEnvironment* _engine
@@ -3258,7 +3519,7 @@ cdef class SU2MovingEnvironment:
         for axis in range(3):
             for index in range(len(leg_sectors[axis])):
                 sector = leg_sectors[axis][index]
-                charge = getattr(sector, "charge", None)
+                charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
                 irrep = getattr(sector, "irrep", None)
                 two_j = getattr(irrep, "two_j", None)
                 if two_j is None:
@@ -3277,7 +3538,7 @@ cdef class SU2MovingEnvironment:
                 return None
             for axis in range(3):
                 sector = key[axis]
-                charge = getattr(sector, "charge", None)
+                charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
                 irrep = getattr(sector, "irrep", None)
                 two_j = getattr(irrep, "two_j", None)
                 if two_j is None:
@@ -6026,142 +6287,10 @@ cdef class SU2MovingEnvironment:
             "norm_matvec_calls": int(result.norm_matvec_calls),
         }
 
-    def blockwise_svd(
-        self,
-        object matrices,
-        object state_weights,
-        double cutoff=1.0e-10,
-        object max_bond=None,
-        object max_bond_mode="reduced",
-        bint retain_sector_topology=False,
-    ):
-        """Split all reduced bond sectors and truncate them in one C++ call."""
-
-        cdef list packed_matrices = []
-        cdef object value
-        cdef cnp.ndarray matrix
-        cdef Py_ssize_t n_blocks
-        cdef Py_ssize_t block
-        cdef Py_ssize_t cursor = 0
-        cdef Py_ssize_t size
-        cdef Py_ssize_t rank
-        cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] packed_values
-        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] offsets
-        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] rows
-        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] cols
-        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] weights
-        cdef int64_t max_bond_value
-        cdef string mode = str(max_bond_mode).encode()
-        cdef CppBlockSVDResult result
-        cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] left_values
-        cdef cnp.ndarray[cnp.double_t, ndim=1, mode="c"] singular_values
-        cdef cnp.ndarray[cnp.complex128_t, ndim=1, mode="c"] right_values
-        cdef cnp.ndarray[cnp.int64_t, ndim=1, mode="c"] kept_indices
-        cdef list left = []
-        cdef list singular = []
-        cdef list right = []
-        cdef list kept = []
-        cdef Py_ssize_t begin
-        cdef Py_ssize_t end
-
-        for value in matrices:
-            matrix = np.ascontiguousarray(value, dtype=np.complex128)
-            if matrix.ndim != 2 or matrix.shape[0] <= 0 or matrix.shape[1] <= 0:
-                raise ValueError("blockwise_svd expects nonempty rank-2 matrices.")
-            packed_matrices.append(matrix)
-        n_blocks = len(packed_matrices)
-        if n_blocks == 0:
-            raise ValueError("blockwise_svd requires at least one matrix.")
-        weights = np.ascontiguousarray(state_weights, dtype=np.int64).reshape(-1)
-        if weights.size != n_blocks or np.any(weights <= 0):
-            raise ValueError("state_weights must contain one positive value per block.")
-        rows = np.empty(n_blocks, dtype=np.int64)
-        cols = np.empty(n_blocks, dtype=np.int64)
-        offsets = np.empty(n_blocks + 1, dtype=np.int64)
-        offsets[0] = 0
-        for block in range(n_blocks):
-            matrix = packed_matrices[block]
-            rows[block] = matrix.shape[0]
-            cols[block] = matrix.shape[1]
-            cursor += matrix.size
-            offsets[block + 1] = cursor
-        packed_values = np.empty(cursor, dtype=np.complex128)
-        cursor = 0
-        for block in range(n_blocks):
-            matrix = packed_matrices[block]
-            size = matrix.size
-            memcpy(
-                <void*>(<cnp.complex128_t*>cnp.PyArray_DATA(packed_values) + cursor),
-                <const void*>cnp.PyArray_DATA(matrix),
-                size * sizeof(cpp_complex[double]),
-            )
-            cursor += size
-        max_bond_value = -1 if max_bond is None else int(max_bond)
-        result = self._engine.blockwise_svd(
-            <const cpp_complex[double]*>cnp.PyArray_DATA(packed_values),
-            <size_t>packed_values.size,
-            <const int64_t*>cnp.PyArray_DATA(offsets),
-            <const int64_t*>cnp.PyArray_DATA(rows),
-            <const int64_t*>cnp.PyArray_DATA(cols),
-            <const int64_t*>cnp.PyArray_DATA(weights),
-            <size_t>n_blocks,
-            cutoff,
-            max_bond_value,
-            mode,
-            <cpp_bool>retain_sector_topology,
-        )
-        left_values = np.empty(result.left_values.size(), dtype=np.complex128)
-        singular_values = np.empty(result.singular_values.size(), dtype=np.float64)
-        right_values = np.empty(result.right_values.size(), dtype=np.complex128)
-        kept_indices = np.empty(result.kept_indices.size(), dtype=np.int64)
-        if result.left_values.size():
-            memcpy(
-                <void*>cnp.PyArray_DATA(left_values),
-                <const void*>result.left_values.data(),
-                result.left_values.size() * sizeof(cpp_complex[double]),
-            )
-        if result.singular_values.size():
-            memcpy(
-                <void*>cnp.PyArray_DATA(singular_values),
-                <const void*>result.singular_values.data(),
-                result.singular_values.size() * sizeof(double),
-            )
-        if result.right_values.size():
-            memcpy(
-                <void*>cnp.PyArray_DATA(right_values),
-                <const void*>result.right_values.data(),
-                result.right_values.size() * sizeof(cpp_complex[double]),
-            )
-        if result.kept_indices.size():
-            memcpy(
-                <void*>cnp.PyArray_DATA(kept_indices),
-                <const void*>result.kept_indices.data(),
-                result.kept_indices.size() * sizeof(int64_t),
-            )
-        for block in range(n_blocks):
-            rank = min(rows[block], cols[block])
-            begin = result.left_offsets[block]
-            end = result.left_offsets[block + 1]
-            left.append(left_values[begin:end].reshape((rows[block], rank)))
-            begin = result.singular_offsets[block]
-            end = result.singular_offsets[block + 1]
-            singular.append(singular_values[begin:end])
-            begin = result.right_offsets[block]
-            end = result.right_offsets[block + 1]
-            right.append(right_values[begin:end].reshape((rank, cols[block])))
-            begin = result.kept_offsets[block]
-            end = result.kept_offsets[block + 1]
-            kept.append(kept_indices[begin:end])
-        return {
-            "kind": "cpp_su2_blockwise_svd",
-            "left": left,
-            "singular_values": singular,
-            "right": right,
-            "kept_indices": kept,
-            "truncation_error": float(result.truncation_error),
-            "full_squared_norm": float(result.full_squared_norm),
-            "kept_squared_norm": float(result.kept_squared_norm),
-        }
+    def blockwise_svd(self, matrices, state_weights, cutoff=1e-10, max_bond=None,
+                      max_bond_mode="reduced", retain_sector_topology=False, right_factors=None):
+        return _sector_svd(self._engine, matrices, state_weights, cutoff, max_bond,
+                           max_bond_mode, retain_sector_topology, right_factors)
 
     def active_bond_solution_ready(self):
         return bool(self._engine.active_bond_solution_ready())
@@ -6790,6 +6919,10 @@ cdef class SU2MovingEnvironment:
             "contextual_route_plan_shape_refreshes": int(
                 self._engine.contextual_route_plan_shape_refreshes()
             ),
+            "preparation_cache_bytes": int(self._engine.preparation_cache_bytes()),
+            "boundary_update_workspace_bytes": int(self._engine.boundary_update_workspace_bytes()),
+            "boundary_update_product_cache_hits": int(self._engine.boundary_update_product_cache_hits()),
+            "peak_boundary_product_cache_bytes": int(self._engine.peak_boundary_product_cache_bytes()),
             "decomposed_action_plan_builds": int(
                 self._engine.decomposed_action_plan_builds()
             ),
@@ -6910,6 +7043,8 @@ cdef class SU2MovingEnvironment:
             "raw_batch_fallback_prepare_seconds": float(
                 self._engine.raw_batch_fallback_prepare_seconds()
             ),
+            "channel_workspace_builds": int(self._engine.channel_workspace_builds()),
+            "channel_workspace_reuses": int(self._engine.channel_workspace_reuses()),
             "raw_channel_first_stage_seconds": float(
                 self._engine.raw_channel_first_stage_seconds()
             ),
@@ -7229,6 +7364,12 @@ cdef class SU2MovingEnvironment:
             "raw_output_fusion_copied_elements": int(
                 self._engine.raw_output_fusion_copied_elements()
             ),
+            "peak_output_panel_cache_bytes": int(self._engine.peak_output_panel_cache_bytes()),
+            "peak_operator_panel_cache_bytes": int(self._engine.peak_operator_panel_cache_bytes()),
+            "operator_panel_cache_hits": int(self._engine.operator_panel_cache_hits()),
+            "direct_product_cache_hits": int(self._engine.direct_product_cache_hits()),
+            "peak_direct_product_cache_bytes": int(self._engine.peak_direct_product_cache_bytes()),
+            "output_schedule_reuses": int(self._engine.output_schedule_reuses()),
             "peak_persistent_output_batch_count": int(
                 self._engine.peak_persistent_output_batch_count()
             ),
@@ -7535,6 +7676,8 @@ cdef class SU2MovingEnvironment:
             "boundary_update_routes": int(
                 self._engine.boundary_update_routes()
             ),
+            "boundary_prepare_seconds": float(self._engine.boundary_prepare_seconds()),
+            "boundary_recoupling_cache_hits": int(self._engine.boundary_recoupling_cache_hits()),
             "boundary_update_seconds": float(
                 self._engine.boundary_update_seconds()
             ),
@@ -7572,6 +7715,12 @@ cdef class SU2MovingEnvironment:
             "owned_half_sweep_bonds": int(
                 self._engine.owned_half_sweep_bonds()
             ),
+            "owned_prepare_seconds": self._engine.owned_prepare_seconds(),
+            "boundary_update_parallel_calls": self._engine.boundary_update_parallel_calls(),
+            "route_prepare_parallel_calls": self._engine.route_prepare_parallel_calls(),
+            "owned_solve_seconds": self._engine.owned_solve_seconds(),
+            "owned_split_seconds": self._engine.owned_split_seconds(),
+            "owned_environment_seconds": self._engine.owned_environment_seconds(),
             "owned_half_sweep_seconds": float(
                 self._engine.owned_half_sweep_seconds()
             ),
@@ -10071,3 +10220,182 @@ def accumulate_parameter_routes(
                     updated = output[bra[u, 0], ket[v, 0]]+adjusted
                     correction[bra[u, 0], ket[v, 0]] = (updated-output[bra[u, 0], ket[v, 0]])-adjusted
                     output[bra[u, 0], ket[v, 0]] = updated
+
+
+cdef class MultipletLocalAction:
+    """Owned reduced factors for product-irrep local assembly and application.
+
+    Routes contain (output offset, input offset, left, operator, right,
+    structural weight). Factors have multiplicity axes only. Reuses the
+    rank-coupled SU(2) factorization with the product-group structural weights.
+    """
+    cdef list entries
+    cdef list matrix_entries
+    cdef Py_ssize_t count
+
+    def __init__(self, Py_ssize_t count, routes):
+        cdef object ao, bo, left, op, right, weight, factor, key
+        cdef dict factors = {}
+        cdef dict packed = {}
+        cdef object right_matrix
+        cdef Py_ssize_t A,B,Y,P,Q,C,D,work,packed_elements=0
+        cdef Py_ssize_t elements = 0, size
+        if count < 1:
+            raise ValueError('Local dimension must be positive')
+        self.count = count
+        self.entries = []
+        self.matrix_entries = []
+        for ao,bo,left,op,right,weight in routes:
+            left = np.asarray(left)
+            op = np.asarray(op)
+            right = np.asarray(right)
+            if left.ndim != 3 or op.ndim != 4 or right.ndim != 3:
+                raise ValueError('Local route requires rank 3/4/3 arrays')
+            if left.shape[1] != op.shape[0] or right.shape[1] != op.shape[1]:
+                raise ValueError('Incompatible operator multiplicities')
+            if (ao < 0 or bo < 0 or ao+left.shape[0]*op.shape[2]*right.shape[0] > count
+                    or bo+left.shape[2]*op.shape[3]*right.shape[2] > count):
+                raise ValueError('Local route exceeds parameter layout')
+            if left.shape[2]*op.shape[3]*right.shape[0]*op.shape[1]*16 > 64*1024**2:
+                raise MemoryError('Reduced action workspace exceeds 64 MiB')
+            key = (id(left),id(op))
+            if key not in factors:
+                size = left.shape[0]*left.shape[2]*op.shape[1]*op.shape[2]*op.shape[3]
+                elements += size
+                if (elements+packed_elements)*16 > 64*1024**2:
+                    raise MemoryError('Reduced factor workspace exceeds 64 MiB')
+                factor = _factorize_rank_coupled_left_complex(left.transpose(1,0,2),op)
+                factors[key] = (left,op,factor)
+            self.entries.append((int(ao),int(bo),factors[key][2],
+                np.array(right,dtype=np.complex128,order='C',copy=True),complex(weight)))
+            factor = factors[key][2]
+            A,B,Y,P,Q = factor.shape
+            C,D = right.shape[0],right.shape[2]
+            work = B*Q*C*Y*D + A*P*C*B*Q*Y
+            if work > 32768:
+                if key not in packed:
+                    packed_elements += factor.size
+                    if (elements+packed_elements)*16 > 64*1024**2:
+                        raise MemoryError('Reduced packed factor workspace exceeds 64 MiB')
+                    packed[key] = np.ascontiguousarray(factor.transpose(0,3,1,4,2)).reshape(A*P,B*Q*Y)
+                packed_elements += right.size
+                if (elements+packed_elements)*16 > 64*1024**2:
+                    raise MemoryError('Reduced packed factor workspace exceeds 64 MiB')
+                right_matrix = np.array(right.transpose(2,0,1),dtype=np.complex128,order='C',copy=True).reshape(D,C*Y)
+                self.matrix_entries.append((packed[key],right_matrix))
+            else:
+                self.matrix_entries.append(None)
+
+    def assemble(self):
+        cdef cnp.complex128_t[:,::1] out = np.zeros((self.count,self.count),complex)
+        cdef const cnp.complex128_t[:,:,:,:,::1] f
+        cdef const cnp.complex128_t[:,:,::1] r
+        cdef Py_ssize_t ao,bo,a,b,y,p,q,c,d,A,B,Y,P,Q,C,D
+        cdef cnp.complex128_t weight,value
+        for ao,bo,f,r,weight in self.entries:
+            A,B,Y,P,Q = f.shape[0],f.shape[1],f.shape[2],f.shape[3],f.shape[4]
+            C,D = r.shape[0],r.shape[2]
+            with nogil:
+                for a in range(A):
+                    for p in range(P):
+                        for c in range(C):
+                            for b in range(B):
+                                for q in range(Q):
+                                    for d in range(D):
+                                        value = 0
+                                        for y in range(Y):
+                                            value += f[a,b,y,p,q]*r[c,y,d]
+                                        out[ao+(a*P+p)*C+c,bo+(b*Q+q)*D+d] += weight*value
+        return np.asarray(out)
+
+    def __call__(self, vector):
+        cdef const cnp.complex128_t[::1] v = np.ascontiguousarray(vector,dtype=np.complex128)
+        cdef cnp.complex128_t[::1] out = np.zeros(self.count,complex)
+        cdef const cnp.complex128_t[:,:,:,:,::1] f
+        cdef const cnp.complex128_t[:,:,::1] r
+        cdef cnp.complex128_t[:,:,:,::1] tmp
+        cdef Py_ssize_t ao,bo,a,b,y,p,q,c,d,A,B,Y,P,Q,C,D,index
+        cdef object matrices, product
+        cdef cnp.complex128_t weight,value
+        if v.shape[0] != self.count:
+            raise ValueError('Vector size differs from the reduced layout')
+        for index,(ao,bo,f,r,weight) in enumerate(self.entries):
+            A,B,Y,P,Q = f.shape[0],f.shape[1],f.shape[2],f.shape[3],f.shape[4]
+            C,D = r.shape[0],r.shape[2]
+            matrices = self.matrix_entries[index]
+            if matrices is not None:
+                product = np.asarray(v)[bo:bo+B*Q*D].reshape(B*Q,D) @ matrices[1]
+                product = matrices[0] @ product.reshape(B*Q,C,Y).transpose(0,2,1).reshape(B*Q*Y,C)
+                np.asarray(out)[ao:ao+A*P*C] += weight*product.ravel()
+                continue
+            if B*Q*C*Y*16 > 64*1024**2:
+                raise MemoryError('Reduced action workspace exceeds 64 MiB')
+            tmp = np.empty((B,Q,C,Y),complex)
+            with nogil:
+                for b in range(B):
+                    for q in range(Q):
+                        for c in range(C):
+                            for y in range(Y):
+                                value = 0
+                                for d in range(D):
+                                    value += v[bo+(b*Q+q)*D+d]*r[c,y,d]
+                                tmp[b,q,c,y] = value
+                for a in range(A):
+                    for p in range(P):
+                        for c in range(C):
+                            value = 0
+                            for b in range(B):
+                                for q in range(Q):
+                                    for y in range(Y):
+                                        value += f[a,b,y,p,q]*tmp[b,q,c,y]
+                            out[ao+(a*P+p)*C+c] += weight*value
+        return np.asarray(out)
+
+
+    def diagonal(self):
+        """Exact action diagonal without assembling the local Hamiltonian."""
+        cdef cnp.complex128_t[::1] out = np.zeros(self.count,complex)
+        cdef const cnp.complex128_t[:,:,:,:,::1] f
+        cdef const cnp.complex128_t[:,:,::1] r
+        cdef Py_ssize_t ao,bo,a,b,y,p,q,c,d,A,B,Y,P,Q,C,D,index,relative
+        cdef cnp.complex128_t weight,value
+        for ao,bo,f,r,weight in self.entries:
+            A,B,Y,P,Q = f.shape[0],f.shape[1],f.shape[2],f.shape[3],f.shape[4]
+            C,D = r.shape[0],r.shape[2]
+            with nogil:
+                for a in range(A):
+                    for p in range(P):
+                        for c in range(C):
+                            index = ao+(a*P+p)*C+c
+                            relative = index-bo
+                            if relative < 0 or relative >= B*Q*D:
+                                continue
+                            b,q,d = relative//(Q*D),(relative//D)%Q,relative%D
+                            value = 0
+                            for y in range(Y):
+                                value += f[a,b,y,p,q]*r[c,y,d]
+                            out[index] += weight*value
+        return np.asarray(out)
+
+
+def reduce_operator_channel(block, coupling):
+    """Contract local MPO rows with CG coefficients, keeping every partner."""
+    cdef const cnp.complex128_t[:,:,:,:,::1] b = np.ascontiguousarray(block,dtype=np.complex128)
+    cdef const cnp.complex128_t[:,:,::1] cg = np.ascontiguousarray(coupling,dtype=np.complex128)
+    cdef Py_ssize_t I=b.shape[0],X=b.shape[1],J=b.shape[2],K=b.shape[3],Y=b.shape[4]
+    cdef Py_ssize_t R=cg.shape[2],i,x,j,k,y,r
+    cdef cnp.complex128_t coeff
+    if cg.shape[0] != X or cg.shape[1] != K:
+        raise ValueError('CG dimensions differ from local MPO rows')
+    cdef cnp.complex128_t[:,:,:,::1] out = np.zeros((I,J,R,Y),complex)
+    with nogil:
+        for x in range(X):
+            for k in range(K):
+                for r in range(R):
+                    coeff = cg[x,k,r].conjugate()
+                    if coeff != 0:
+                        for i in range(I):
+                            for j in range(J):
+                                for y in range(Y):
+                                    out[i,j,r,y] += b[i,x,j,k,y]*coeff
+    return np.asarray(out)

@@ -438,7 +438,7 @@ class DMRG:
             Weights for state averaging.
         n_threads : int or None
             Shared-memory threads for native OpenMP and Numba contraction
-            kernels. ``None`` preserves the process-wide runtime settings.
+            kernels. ``None`` uses ``pyqed.num_workers()``.
         """
 
         if not isinstance(H, MPO):
@@ -472,7 +472,8 @@ class DMRG:
         self.performance = str(performance or "auto")
         if n_threads is not None and int(n_threads) < 1:
             raise ValueError("n_threads must be positive or None.")
-        self.n_threads = None if n_threads is None else int(n_threads)
+        from pyqed.parallel import resolve_workers
+        self.n_threads = resolve_workers(n_threads)
         self.threading_info = {}
         policy_key = self.performance.strip().lower().replace("_", "-")
         if policy_key in {"auto", "default"}:

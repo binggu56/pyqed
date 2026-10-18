@@ -182,7 +182,7 @@ def _run_u1(hamiltonian, graph, args, *, D=None):
     initial_energy = float(state.energy)
     started = perf_counter()
     try:
-        state.run_two_site(
+        state.run(opt="2site",
             nsweeps=args.u1_sweeps,
             tol=args.tol,
             solver="verified",

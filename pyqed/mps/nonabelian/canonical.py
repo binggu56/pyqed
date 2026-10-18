@@ -51,6 +51,52 @@ def left_qr_sites(sites):
     return current
 
 
+def right_qr_sites(sites):
+    """Exactly right-orthogonalize reduced SU(2) sites without bond growth.
+
+    The QR uses the spin-dimension weights of the right canonical metric.
+    Absorbing its triangular factor into the preceding site preserves the
+    complete state, including complex phases and Abelian spatial sectors.
+    """
+    current = [site.copy() for site in sites]
+    for i in range(len(current)-1, 0, -1):
+        left, right = current[i-1:i+1]
+        if right.metadata.get('physical_basis') != 'fully_reduced_su2':
+            raise ValueError('right_qr_sites requires fully reduced SU2 tensors')
+        ld, rd = dict(left.data), dict(right.data)
+        qns = []
+        for sector in dict.fromkeys(right.qns[0]):
+            keys = [key for key in rd if key[0] == sector]
+            if not keys:
+                continue
+            weights = [np.sqrt(_irrep_dim(key[2]) / _irrep_dim(sector)) for key in keys]
+            matrix = np.concatenate([weight*rd[key].reshape(rd[key].shape[0], -1)
+                                     for key, weight in zip(keys, weights)], axis=1)
+            q, r = np.linalg.qr(matrix.conj().T, mode='reduced')
+            rank = q.shape[1]
+            qns.extend([sector]*rank)
+            offset = 0
+            for key, weight in zip(keys, weights):
+                shape = rd[key].shape
+                cols = shape[1]*shape[2]
+                rd[key] = (q[offset:offset+cols].conj().T/weight).reshape(rank,shape[1],shape[2])
+                offset += cols
+            for key in ld:
+                if key[2] == sector:
+                    ld[key] = np.einsum('lpa,ab->lpb',ld[key],r.conj().T,optimize=True)
+        current[i-1] = IrrepTensor(data=ld,qns=[left.qns[0],left.qns[1],qns],
+                                    dirs=left.dirs,metadata=dict(left.metadata))
+        current[i] = IrrepTensor(data=rd,qns=[qns,right.qns[1],right.qns[2]],
+                                  dirs=right.dirs,metadata=dict(right.metadata))
+    return current
+
+
+def _exact_reduced_gauge(sites, cutoff, max_bond):
+    return (max_bond is None and cutoff == 0
+            and all(site.metadata.get('physical_basis') == 'fully_reduced_su2'
+                    and all(block.shape[1] == 1 for block in site.data.values()) for site in sites))
+
+
 def _site_dense_matrix(site, *, mode):
     if not isinstance(site, IrrepTensor) or site.rank != 3:
         raise ValueError("_site_dense_matrix expects a rank-3 IrrepTensor site tensor.")
@@ -241,8 +287,13 @@ def left_canonicalize_sites(
     retain_sector_topology=False,
 ):
     """
-    Put a chain into left-canonical form by exact two-site gauge moves.
+    Put a chain into left-canonical form by exact gauge moves.
+
+    Untruncated fully reduced SU(2) chains use sectorwise single-site QR,
+    preserving existing virtual spaces; other settings use two-site SVD.
     """
+    if _exact_reduced_gauge(sites, cutoff, max_bond):
+        return left_qr_sites(sites)
     if len(sites) < 2:
         return [site.copy() for site in sites]
     current = [site.copy() for site in sites]
@@ -273,8 +324,13 @@ def right_canonicalize_sites(
     retain_sector_topology=False,
 ):
     """
-    Put a chain into right-canonical form by exact two-site gauge moves.
+    Put a chain into right-canonical form by exact gauge moves.
+
+    Untruncated fully reduced SU(2) chains use weighted single-site QR,
+    preserving existing virtual spaces; other settings use two-site SVD.
     """
+    if _exact_reduced_gauge(sites, cutoff, max_bond):
+        return right_qr_sites(sites)
     if len(sites) < 2:
         return [site.copy() for site in sites]
     current = [site.copy() for site in sites]
@@ -307,9 +363,19 @@ def mixed_canonicalize_sites(
 ):
     """
     Put a chain into mixed canonical form with orthogonality center at ``center``.
+
+    Untruncated fully reduced SU(2) chains use single-site QR, so exact gauge
+    changes cannot inflate bond multiplicities by retaining null SVD vectors.
     """
     if not 0 <= int(center) < len(sites):
         raise IndexError(f"Center {center} out of range for chain length {len(sites)}.")
+    if _exact_reduced_gauge(sites, cutoff, max_bond):
+        # Two-site SVD at zero cutoff retains null singular directions and can
+        # inflate a restart bond far beyond its saved multiplicity. Single-site
+        # QR moves the gauge within the existing virtual spaces instead.
+        current = left_qr_sites(sites[:int(center)+1]) + [site.copy() for site in sites[int(center)+1:]]
+        current[int(center):] = right_qr_sites(current[int(center):])
+        return current
     current = [site.copy() for site in sites]
     for i in range(int(center)):
         merged = merge_mps_sites(current[i], current[i + 1])

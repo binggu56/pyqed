@@ -175,7 +175,10 @@ def test_qchem_dmrg_rejects_nonpositive_thread_count_before_build(value):
         dmrg.run(n_threads=value)
 
 
-def test_qchem_su2_threads_reach_native_moving_environment():
+@pytest.mark.parametrize("n_threads", [None, 2])
+def test_qchem_su2_threads_reach_native_moving_environment(monkeypatch, n_threads):
+    from pyqed import parallel
+    monkeypatch.setattr(parallel, "_workers", 3)
     molecule = Molecule(
         atom="H 0 0 0; H 0 0 1.4", unit="bohr", basis="sto-3g"
     )
@@ -191,33 +194,41 @@ def test_qchem_su2_threads_reach_native_moving_environment():
         verbose=0,
     )
 
-    dmrg.run(nsweeps=2, n_threads=2, require_convergence=False)
+    dmrg.run(nsweeps=2, n_threads=n_threads, require_convergence=False)
 
     np.testing.assert_allclose(dmrg.energy, -1.1372759437827158, atol=1.0e-10)
     threading = dmrg.dmrg.diagnostics["threading"]
-    assert threading["n_threads"] == (2 if threading["available"] else 1)
+    expected = 3 if n_threads is None else n_threads
+    assert threading["n_threads"] == (expected if threading["available"] else 1)
     assert dmrg.history[-1]["threading"] == threading
 
 
-def test_qchem_su2_fused_output_openmp_matches_serial():
-    atom = "; ".join(f"H 0 0 {1.6 * index}" for index in range(6))
+@pytest.mark.parametrize("tasked,budget", [(False, "134217728"),
+                                           (True, "134217728"), (True, "0")])
+def test_qchem_su2_fused_output_openmp_matches_serial(monkeypatch, tasked, budget):
+    monkeypatch.setenv("PYQED_SU2_OUTPUT_PANEL_CACHE_BYTES", str(64 << 20))
+    monkeypatch.setenv("PYQED_SU2_TASKED_OUTPUT", "1" if tasked else "0")
+    monkeypatch.setenv("PYQED_SU2_PRIVATE_OUTPUT_BYTES", budget)
+    # H10 provides enough work to exercise private buffers and budget fallback.
+    nsites = 10 if tasked else 6
+    atom = "; ".join(f"H 0 0 {1.8 * index}" for index in range(nsites))
     molecule = Molecule(atom=atom, unit="bohr", basis="sto-3g")
-    molecule.build(eri="dense", aosym="s1", options={"eri_backend": "cpp"})
+    molecule.build(eri="dense", aosym="s8", options={"eri_backend": "cpp"})
     mean_field = RHF(molecule).run()
 
     def run(n_threads):
         solver = QCDMRG(
             mean_field,
-            ncas=6,
-            nelecas=6,
-            D=32,
+            ncas=nsites,
+            nelecas=nsites,
+            D=256 if tasked else 32,
             init_guess="cid",
             symmetry="su2",
             spatial_site_basis="fully_reduced",
             verbose=0,
         )
         engine = solver.run(
-            nsweeps=1,
+            nsweeps=2,
             n_threads=n_threads,
             require_convergence=False,
             su2_kernel_backend="cpp",
@@ -241,9 +252,28 @@ def test_qchem_su2_fused_output_openmp_matches_serial():
 
     serial = run(1)
     parallel = run(4)
+    monkeypatch.setenv("PYQED_SU2_DISABLE_SCHEDULE_REUSE", "1")
+    monkeypatch.setenv("PYQED_SU2_OUTPUT_PANEL_CACHE_BYTES", "0")
+    rebuilt = run(4)
+    assert rebuilt[3]["peak_output_panel_cache_bytes"] == 0
+    if tasked:
+        assert 0 < parallel[3]["peak_output_panel_cache_bytes"] <= 64 << 20
+    np.testing.assert_allclose(parallel[1], rebuilt[1], rtol=0.0, atol=1.0e-11)
+    assert rebuilt[3]["output_schedule_reuses"] == 0
 
     np.testing.assert_allclose(parallel[0], serial[0], rtol=0.0, atol=1.0e-11)
     np.testing.assert_allclose(parallel[1], serial[1], rtol=0.0, atol=1.0e-11)
+    for result in (serial, parallel):
+        stats = result[3]
+        assert 0 < stats['channel_workspace_builds'] <= stats['factor_route_numeric_refreshes']
+        assert stats['channel_workspace_reuses'] > 0
+        assert stats['output_schedule_reuses'] > 0
+        assert stats['boundary_prepare_seconds'] > 0
+        phases = [stats[f'owned_{phase}_seconds']
+                  for phase in ('prepare', 'solve', 'split', 'environment')]
+        assert all(value > 0 for value in phases)
+        assert sum(phases) <= stats['owned_half_sweep_seconds']
+        assert stats['boundary_recoupling_cache_hits'] > 0
     for key in (
         "peak_persistent_output_batch_count",
         "peak_persistent_output_task_count",
@@ -254,6 +284,18 @@ def test_qchem_su2_fused_output_openmp_matches_serial():
         "peak_persistent_output_group_count"
     ]
     threading = parallel[2]["threading"]
+    assert serial[3]["boundary_update_parallel_calls"] == 0
+    assert serial[3]["route_prepare_parallel_calls"] == 0
+    if tasked and threading["available"]:
+        assert parallel[3]["boundary_update_parallel_calls"] > 0
+        assert parallel[3]["route_prepare_parallel_calls"] > 0
+    if tasked and threading["available"]:
+        if budget == "0":
+            assert parallel[3]["private_output_executor_calls"] == 0
+            assert parallel[3]["private_output_executor_fallbacks"] > 0
+        else:
+            assert parallel[3]["private_output_executor_calls"] > 0
+            assert parallel[3]["private_output_reduced_elements"] > 0
     assert threading["n_threads"] == (4 if threading["available"] else 1)
     assert (threading["parallel_regions"] == 0) == (
         threading["tasks"] == 0

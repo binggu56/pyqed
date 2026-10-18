@@ -33,6 +33,7 @@ from pyqed.mps._dense_ops import (
     apply_mpo_factors as _apply_mpo_factors,
     apply_mpo_uncompressed as _apply_mpo_uncompressed_factors,
     product_mpo_factors as _product_mpo_factors,
+    product_mpo_compressed as _product_mpo_compressed,
 )
 from pyqed.mps.dense_canonical import LeftCanonical, RightCanonical
 from pyqed.lattice.site import (
@@ -70,6 +71,8 @@ class _TensorCoreList(list):
     def _coerce(self, value):
         if not hasattr(self, "_dirs") or not hasattr(self, "_names"):
             return value
+        if len(self._dirs)==4 and getattr(value,'ndim',None)==3:
+            return _as_shared_tensor(value,dirs=(-1,1,1),names=('left','right','physical'))
         return _as_shared_tensor(value, dirs=self._dirs, names=self._names)
 
     def __setitem__(self, key, value):
@@ -27953,6 +27956,13 @@ class MPS:
             raise ValueError("MPS sites are incompatible with the MPO input sites.")
         if not sites_compatible(self.sites, operator.sites):
             raise ValueError("MPS sites are incompatible with the MPO output sites.")
+        if any(w.ndim==3 for w in operator.factors):
+            env=np.ones((1,1,1),complex)
+            for i,w in enumerate(operator.factors):
+                a=np.asarray(self._get_std_B(i));w=np.asarray(w)
+                env=np.einsum('awb,aic,wxij,bjd->cxd' if w.ndim==4 else
+                              'awb,aic,wxi,bid->cxd',env,a.conj(),w,a,optimize=True)
+            return env[0,0,0]
         factors = (
             self.factors
             if self.factors and _is_symmetry_reduced_tensor(self.factors[0])
@@ -29191,7 +29201,9 @@ def _round_dense_tensor_train(factors, max_bond, *, rtol=1.0e-8):
         threshold = float(rtol) * singular[0] if len(singular) else 0.0
         numerical_rank = max(1, int(np.sum(singular > threshold)))
         rank = min(max_bond, numerical_rank, len(singular))
-        result[site] = u[:, :rank].reshape(left, physical, rank)
+        # Own the retained columns: a view otherwise keeps the entire SVD U
+        # allocation alive for every core, including discarded columns.
+        result[site] = u[:, :rank].reshape(left, physical, rank).copy()
         transfer = singular[:rank, None] * vh[:rank]
         result[site + 1] = np.tensordot(
             transfer, result[site + 1], axes=([1], [0])
@@ -29531,6 +29543,10 @@ class MPO:
 
     ``sites`` and ``input_sites`` describe the output and input physical bases,
     respectively.  Square operators may supply only ``sites``.
+    Rank-three cores ``(left, right, physical)`` encode exact physical
+    diagonals. Application, expectation, dense reference conversion and
+    two-site sum TDVP preserve this storage; generic MPO algebra requires
+    four-index cores.
     """
 
     STANDARD_LABELS = ("left", "right", "up", "down")
@@ -29551,8 +29567,8 @@ class MPO:
             getattr(factor, "rank", getattr(factor, "ndim", None))
             for factor in factors
         ]
-        if any(rank != 4 for rank in ranks):
-            raise ValueError("Every MPO site tensor must have rank 4.")
+        if any(rank not in (3,4) for rank in ranks):
+            raise ValueError("MPO cores require rank 4, or rank 3 for physical diagonals.")
         labels = tuple(labels)
         if labels != self.STANDARD_LABELS:
             raise ValueError(
@@ -29570,7 +29586,7 @@ class MPO:
         self.nsites = self.L = len(factors)
         self.nbonds = self.L - 1
         self.dims = [int(tensor.shape[2]) for tensor in self.factors]
-        self.input_dims = [int(tensor.shape[3]) for tensor in self.factors]
+        self.input_dims = [int(tensor.shape[-1]) for tensor in self.factors]
         self.sites = normalize_sites(sites, self.dims)
         if input_sites is None and sites is not None and self.input_dims == self.dims:
             input_sites = sites
@@ -29586,7 +29602,7 @@ class MPO:
         """Return right bond dimensions for each site."""
         return [int(tensor.shape[1]) for tensor in self.factors]
 
-    def compress(self, max_bond):
+    def compress(self, max_bond, *, rtol=1.0e-8):
         """Return a scale-preserving MPO truncated by canonical TT rounding.
 
         Right-canonicalizing before the truncating sweep avoids materializing
@@ -29605,7 +29621,7 @@ class MPO:
                 W.reshape(left, right, d_out * d_in).transpose(0, 2, 1)
             )
 
-        compressed = _round_dense_tensor_train(mps_factors, max_bond)
+        compressed = _round_dense_tensor_train(mps_factors, max_bond, rtol=rtol)
         factors = []
         for B, (d_out, d_in) in zip(compressed, physical_dims):
             left, _, right = B.shape
@@ -29746,6 +29762,43 @@ class MPO:
         """Contract this MPO into a dense matrix."""
         return _mpo_to_dense_operator(self)
 
+    def matvec(self, vector):
+        """Apply the MPO exactly to a dense direct-product vector.
+
+        The virtual bonds are contracted successively while the global operator
+        matrix is never materialized.  Input and output use the same C-order
+        product-basis convention as :meth:`to_dense`.
+        """
+        vector = np.asarray(vector)
+        expected = int(np.prod(self.input_dims))
+        if vector.ndim != 1 or vector.size != expected:
+            raise ValueError(
+                f"MPO matvec expects a vector of length {expected}; "
+                f"got shape {vector.shape}."
+            )
+        return _mpo_dense_matmat(self, vector[:, None])[:, 0]
+
+    def matmat(self, vectors):
+        """Apply the MPO exactly to columns of dense product-basis vectors."""
+        vectors = np.asarray(vectors)
+        expected = int(np.prod(self.input_dims))
+        if vectors.ndim != 2 or vectors.shape[0] != expected:
+            raise ValueError(
+                f"MPO matmat expects shape ({expected}, n); "
+                f"got {vectors.shape}."
+            )
+        return _mpo_dense_matmat(self, vectors)
+
+    def trace(self):
+        """Return the exact trace by contracting only MPO virtual bonds."""
+        if self.dims != self.input_dims:
+            raise ValueError("MPO trace requires a square operator")
+        environment = np.ones(1, dtype=np.result_type(*self.factors))
+        for factor in self.factors:
+            local_trace = np.trace(np.asarray(factor), axis1=2, axis2=3)
+            environment = environment @ local_trace
+        return environment.item()
+
     def _output_sites_for(self, mps):
         if self.L != mps.L:
             raise ValueError(
@@ -29789,19 +29842,30 @@ class MPO:
             )
         return MPS(factors, sites=output_sites)
 
-    def compose(self, other, *, max_bond=None):
-        """Return ``self @ other``, optionally truncating MPO bonds."""
+    def compose(self, other, *, max_bond=None, rtol=0.):
+        """Compose MPOs; max_bond uses sequential local-SVD truncation.
+
+        Bounded composition first right-canonicalizes both operands without
+        truncation, preventing arbitrary virtual-bond scales from determining
+        which channels survive. It contracts the incoming truncated bond before each
+        local product. It avoids full product-rank cores but is not equivalent
+        to globally rounding an exact product; check rank convergence.
+        With bounded composition, rtol additionally drops small local singular
+        values relative to the largest; it is not a global error guarantee.
+        """
         if not isinstance(other, MPO):
             raise TypeError("MPO.compose expects another MPO.")
         if not sites_compatible(self.input_sites, other.sites):
             raise ValueError("MPO product requires compatible contracted sites.")
         output_sites, input_sites = self._product_sites(other)
         product = MPO(
-            _product_mpo_factors(self.factors, other.factors),
+            (_product_mpo_factors(self.factors, other.factors)
+             if max_bond is None else
+             _product_mpo_compressed(self.factors, other.factors, max_bond, rtol=rtol)),
             sites=output_sites,
             input_sites=input_sites,
         )
-        return product if max_bond is None else product.compress(max_bond)
+        return product
 
     def __matmul__(self, other):
         if isinstance(other, MPS):
@@ -30237,7 +30301,8 @@ def show(tt_in):
 
 def _mpo_to_dense_operator(mpo):
     """Contract a small MPO into a full dense operator matrix."""
-    cores = [np.asarray(core).transpose(0, 2, 3, 1) for core in mpo.factors]
+    arrays=[np.asarray(core) for core in mpo.factors]
+    cores = [(core if core.ndim==4 else core[..., :, None]*np.eye(core.shape[-1])).transpose(0,2,3,1) for core in arrays]
     tensor = cores[0]
     for core in cores[1:]:
         tensor = np.tensordot(tensor, core, axes=([-1], [0]))
@@ -30247,6 +30312,29 @@ def _mpo_to_dense_operator(mpo):
     tensor = np.transpose(tensor, axes=perm)
     dim = int(np.prod(mpo.dims))
     return tensor.reshape((dim, dim))
+
+
+def _mpo_dense_matmat(mpo, vectors):
+    """Contract an MPO with one or more dense vectors without a dense matrix."""
+    width = int(vectors.shape[1])
+    work = np.asarray(vectors).reshape(*mpo.input_dims, width)[None, ...]
+    for site, factor in enumerate(mpo.factors):
+        factor = np.asarray(factor)
+        work = np.tensordot(
+            factor,
+            work,
+            axes=([0, 3], [0, site + 1]),
+        )
+        permutation = (
+            [0]
+            + list(range(2, site + 2))
+            + [1]
+            + list(range(site + 2, work.ndim))
+        )
+        work = work.transpose(permutation)
+    if work.shape[0] != 1:
+        raise ValueError("MPO right boundary bond must have dimension one")
+    return work[0].reshape(int(np.prod(mpo.dims)), width)
 
 
 def _dense_operator_to_mpo(matrix, dims, *, sites=None):

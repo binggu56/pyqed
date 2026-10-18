@@ -205,6 +205,13 @@ def _make_initial_mps(
 ):
     guess = qcdmrg.init_guess if initial_guess is None else initial_guess
     if isinstance(guess, MPS):
+        if getattr(qcdmrg, "_spatial_charge_target", None) is not None:
+            if any(q != target_sector for q in guess.tensors[-1].qns[-1]):
+                raise ValueError("Initial MPS does not have the requested spatial target sector.")
+            for site, gamma in zip(guess.tensors, qcdmrg.orbsym):
+                if any(getattr(q, "point_group", 0) != (gamma if q.charge == 1 else 0)
+                       for q in site.qns[1]):
+                    raise ValueError("Initial MPS orbital irreps differ from orbsym.")
         mps = guess.copy()
         mps.target_sector = target_sector
         return mps
@@ -230,6 +237,7 @@ def _make_initial_mps(
                 target_sector=target_sector,
                 bond_multiplicity=bond_multiplicity,
                 seed=seed,
+                orbsym=(qcdmrg.orbsym if getattr(qcdmrg, "_spatial_charge_target", None) is not None else None),
             )
         else:
             sites = build_product_spatial_mps(
@@ -246,6 +254,7 @@ def _make_initial_mps(
                 target_sector=target_sector,
                 bond_multiplicity=bond_multiplicity,
                 seed=seed,
+                orbsym=(qcdmrg.orbsym if getattr(qcdmrg, "_spatial_charge_target", None) is not None else None),
             )
         else:
             sites = build_random_spatial_mps(
@@ -534,6 +543,8 @@ def _run_spatial_qchem_dmrg(
     virtual_boundary = sweep_kwargs.pop('virtual_boundary', 'open')
     if virtual_boundary not in {'open', 'periodic'}:
         raise ValueError("virtual_boundary must be 'open' or 'periodic'")
+    if virtual_boundary == 'periodic' and sweep_kwargs.get('algorithm') == 'one_site_cbe':
+        raise ValueError('CBE currently requires open MPS boundaries')
     if virtual_boundary == 'periodic':
         if n_threads not in {None,1}:
             raise NotImplementedError('periodic SU2DMRG currently supports n_threads=1')
@@ -542,6 +553,8 @@ def _run_spatial_qchem_dmrg(
                     bond_multiplicity=bond_multiplicity, seed=seed, conv_tol=conv_tol,
                     nstates=nstates, weights=weights, local_solver_kwargs=local_solver_kwargs,
                     verbose=verbose, **sweep_kwargs)
+    from pyqed.parallel import resolve_workers
+    n_threads = resolve_workers(n_threads)
     active_hamiltonian = getattr(qcdmrg, "_active_hamiltonian", None)
     mpo_factors = active_hamiltonian.mpo if active_hamiltonian is not None else qcdmrg.H
     complementary_operator_families = (
@@ -564,6 +577,8 @@ def _run_spatial_qchem_dmrg(
         "fully_reduced",
         "fully_reduced_su2",
     }
+    if sweep_kwargs.get("algorithm") == "one_site_cbe" and not fully_reduced_sites:
+        raise ValueError("CBE requires fully reduced SU(2) orbital sites")
     if normal_complementary_production and reference_complementary_families:
         from pyqed.qchem.dmrg.backends.reduced import (
             build_spatial_reduced_hamiltonian_mpo,
@@ -577,7 +592,7 @@ def _run_spatial_qchem_dmrg(
             n_elec=None,
             spin=int(qcdmrg.spin),
             ecore=0.0,
-            orb_sym=getattr(qcdmrg, "orb_sym", None),
+            orb_sym=getattr(qcdmrg, "orbsym", None),
         )
         mpo_factors = active_hamiltonian.mpo
         complementary_operator_families = (
@@ -622,6 +637,11 @@ def _run_spatial_qchem_dmrg(
         weights = weights / weight_sum
 
     target_sector = spatial_target_sector(qcdmrg.nelecas, int(qcdmrg.spin))
+    spatial_charge = getattr(qcdmrg, "_spatial_charge_target", None)
+    if spatial_charge is not None:
+        from pyqed.mps.su2 import SpinChargeSector
+        target_sector = SpinChargeSector(target_sector.charge, target_sector.irrep,
+                                         point_group=spatial_charge)
     if max_bond is None:
         max_bond = qcdmrg.D
 
@@ -740,6 +760,16 @@ def _run_spatial_qchem_dmrg(
         seed=seed,
         fully_reduced=fully_reduced_sites,
     )
+    if sweep_kwargs.get("algorithm") == "one_site_cbe" and normal_complementary_production:
+        # Python-managed expansion needs physical operator views, rather than
+        # the metadata-only views consumed by the owned two-site transaction.
+        from .reduced import build_su2_normal_complementary_mpo
+        mpo_factors = build_su2_normal_complementary_mpo(
+            active_hamiltonian.moving_environment, fully_reduced=True,
+            physical_legs=[site.legs[1] for site in mps0.tensors],
+        )
+        for factor in mpo_factors:
+            object.__setattr__(factor, "normal_complementary_right_dual", dual_right_environment)
     state_initialization_seconds = (
         time.perf_counter() - state_initialization_started
     )
@@ -795,7 +825,7 @@ def _run_spatial_qchem_dmrg(
         solver_kwargs = {
             "tol": 1.0e-8 if local_basis_policy == "orthonormalized_operator" else 1.0e-6,
             "tol_residual": (
-                1.0e-8
+                (min(1.0e-8, 0.1 * float(conv_tol)) if conv_tol is not None and conv_tol > 0 else 1.0e-8)
                 if local_basis_policy == "orthonormalized_operator"
                 else None
             ),
@@ -955,6 +985,11 @@ def _run_spatial_qchem_dmrg(
     su2_force_family_table = bool(
         sweep_kwargs.pop("su2_force_family_table", False)
     )
+    if sweep_kwargs.get("record_post_update_energy", False) and fully_reduced_sites and active_hamiltonian is not None:
+        raise NotImplementedError(
+            "Per-bond post-update energy is unavailable for reduced complementary sweeps; "
+            "use verify_returned_mps_energy=True for final-state verification."
+        )
     verify_returned_energy = bool(
         sweep_kwargs.pop("verify_returned_mps_energy", False)
     )
@@ -988,9 +1023,7 @@ def _run_spatial_qchem_dmrg(
         else None
     )
     if su2_moving_environment is not None:
-        su2_moving_environment.set_num_threads(
-            1 if n_threads is None else n_threads
-        )
+        su2_moving_environment.set_num_threads(n_threads)
     if (
         su2_kernel_active.get("actual") == "cpp"
         and su2_moving_environment is None
@@ -1091,7 +1124,7 @@ def _run_spatial_qchem_dmrg(
             ),
             mixer_zero_block_noise_scale=sweep_kwargs.pop(
                 "mixer_zero_block_noise_scale",
-                default_mixer_scale,
+                0.0 if sweep_kwargs.get("algorithm") == "one_site_cbe" else default_mixer_scale,
             ),
             mixer_zero_block_noise_seed=sweep_kwargs.pop("mixer_zero_block_noise_seed", seed + 4),
             mixer_nsweeps=2 * int(sweep_kwargs.pop("mixer_nsweeps", 2)),
@@ -1101,7 +1134,8 @@ def _run_spatial_qchem_dmrg(
             ),
             compute_final_expectation=sweep_kwargs.pop(
                 "compute_final_expectation",
-                not (normal_complementary_production and int(nstates) == 1),
+                sweep_kwargs.get("algorithm") == "one_site_cbe"
+                or not (normal_complementary_production and int(nstates) == 1),
             ),
             state_average_local_norm=sweep_kwargs.pop(
                 "state_average_local_norm",

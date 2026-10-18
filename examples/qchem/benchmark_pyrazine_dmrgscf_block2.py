@@ -51,7 +51,6 @@ def run_pyqed(args):
             "coord_type": "spherical",
             "low_rank_tol": args.cd_tol,
             "eri_screen_tol": 0.0,
-            "parallel": False,
             "rys_cache_mib": 256,
         },
     )
@@ -88,7 +87,7 @@ def run_pyqed(args):
         sweep_tol=args.sweep_tol,
         orb_grad_tol=args.orb_grad_tol,
         orb_grad_tol_relaxed=args.orb_grad_tol_relaxed,
-        orbital_driver=args.orbital_driver,
+        algorithm=args.algorithm,
         orbital_micro_cycles=args.orbital_micro_cycles,
         optimizer=args.optimizer,
         optimizer_tol=1.0e-5,
@@ -322,7 +321,7 @@ def main():
         default="RCG",
     )
     parser.add_argument(
-        "--orbital-driver",
+        "--algorithm",
         choices=("constrained", "nonredundant", "second_order"),
         default="constrained",
     )
@@ -365,9 +364,9 @@ def main():
             "macro_cycles": args.macro_cycles,
             "optimizer_steps": args.optimizer_steps,
             "pyqed_optimizer": (
-                "AH" if args.orbital_driver == "second_order" else args.optimizer
+                "AH" if args.algorithm == "second_order" else args.optimizer
             ),
-            "pyqed_orbital_driver": args.orbital_driver,
+            "pyqed_algorithm": args.algorithm,
             "pyqed_orbital_diis": args.orbital_diis,
             "pyqed_optimizer_max_step_norm": args.optimizer_max_step_norm,
             "pyqed_orbital_micro_cycles": args.orbital_micro_cycles,

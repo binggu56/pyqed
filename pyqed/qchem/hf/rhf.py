@@ -479,7 +479,7 @@ class RHF:
         self.symmetry = bool(getattr(mol, 'symmetry', False))
         self.groupname = getattr(mol, 'groupname', None)
         self.irrep_names = getattr(mol, 'irrep_names', None)
-        self.orb_irrep_labels = None
+        self.orbsym = None
         self.orb_sym = None
         self.orb_irrep_weights = None
 
@@ -673,7 +673,7 @@ class RHF:
             self.symmetry = True
             self.groupname = self.mol.groupname
             self.irrep_names = self.mol.irrep_names
-            self.orb_irrep_labels = labels
+            self.orbsym = labels
             self.orb_sym = ids
             self.orb_irrep_weights = weights
         return self

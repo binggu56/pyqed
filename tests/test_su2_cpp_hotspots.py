@@ -867,7 +867,9 @@ def test_sparse_rank_coupled_channels_support_inplace_fallback_accumulation():
     assert tuple(blocks.data) == (3,)
 
 
-def test_su2_system_builds_same_complementary_families_as_reference():
+@pytest.mark.parametrize("include_half", [False, True])
+@pytest.mark.parametrize("cutoff", [0.0, 1.0e-10])
+def test_su2_system_builds_same_complementary_families_as_reference(include_half, cutoff):
     engine_cls = _require_su2_cpp("SU2MovingEnvironment")
     from pyqed.mps.nonabelian import _su2_kernel
 
@@ -881,12 +883,14 @@ def test_su2_system_builds_same_complementary_families_as_reference():
     h1 = 0.5 * (h1 + h1.T)
     eri = rng.normal(size=(3, 3, 3, 3))
     eri[np.abs(eri) < 0.35] = 0.0
-    engine = engine_cls(h1, eri, 2, cutoff=1.0e-10)
-    expected = build_spatial_complementary_operator_families(h1, eri)
+    engine = engine_cls(h1, eri, 2, cutoff=cutoff, include_half=include_half)
+    expected = build_spatial_complementary_operator_families(h1, eri, cutoff=cutoff, include_half=include_half)
     actual = build_spatial_complementary_operator_families(
         h1,
         eri,
         moving_environment=engine,
+        cutoff=cutoff,
+        include_half=include_half,
     )
 
     assert engine.system_stats["backend"] == "cpp"
@@ -894,6 +898,21 @@ def test_su2_system_builds_same_complementary_families_as_reference():
     for name in expected.names:
         assert actual[name].rank == expected[name].rank
         assert actual[name].entries == expected[name].entries
+
+
+@pytest.mark.parametrize("include_half", [False, True])
+def test_su2_four_index_family_screening_and_order(include_half):
+    engine_cls = _require_su2_cpp("SU2MovingEnvironment")
+    rng = np.random.default_rng(219)
+    eri = rng.normal(size=(3, 3, 3, 3))
+    scale = 0.5 if include_half else 1.0
+    eri[0, 0, 0, 0] = 0.2 / scale
+    engine = engine_cls(np.zeros((3, 3)), eri, 2,
+                        cutoff=0.2, include_half=include_half)
+    family = engine.family("P")
+    indices = np.argwhere(np.abs(scale * eri) > 0.2)
+    np.testing.assert_array_equal(family["indices"], indices)
+    np.testing.assert_array_equal(family["values"], scale * eri[tuple(indices.T)])
 
 
 def test_su2_system_builds_direct_normal_complementary_routes():

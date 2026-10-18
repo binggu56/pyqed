@@ -144,7 +144,7 @@ def test_qchem_direct_complementary_energy_matches_explicit_mpo_reference():
     assert all(factor.reduced_terms for factor in explicit.mpo)
     np.testing.assert_allclose(direct.expectation(), explicit.expectation(), atol=2e-12)
     direct.run(
-        nsweeps=1,
+        nsweeps=2,
         algorithm="projected",
         tol=0.0,
         max_local_parameters=512,
@@ -153,6 +153,15 @@ def test_qchem_direct_complementary_energy_matches_explicit_mpo_reference():
     assert all(
         update["solver_info"]["environment_reused"]
         for update in direct.history[-1]["updates"]
+    )
+    first_routes = direct.history[0]["cpp_local_operator_stats"]
+    second_routes = direct.history[1]["cpp_local_operator_stats"]
+    # The stable global check canonicalizes a temporary MPS; its reduced
+    # shapes can change as rectangular QR shrinks bond dimensions. Sweep routes
+    # must still be reused, but the total plan count need not stay fixed.
+    assert (
+        second_routes["contextual_route_plan_hits"]
+        > first_routes["contextual_route_plan_hits"]
     )
     explicit.tensors = [
         {key: np.array(value, copy=True) for key, value in tensor.items()}
@@ -167,6 +176,83 @@ def test_qchem_direct_complementary_energy_matches_explicit_mpo_reference():
     )
     direct.close()
     explicit.close()
+
+
+def test_auto_hamiltonian_policy_switch_preserves_energy():
+    norb = 4
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    eri = np.zeros((norb, norb, norb, norb))
+    eri[np.arange(norb), np.arange(norb), np.arange(norb), np.arange(norb)] = 0.5
+    state = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=3,
+        hamiltonian_representation="auto",
+    )
+    before = state.expectation()
+
+    assert state.hamiltonian_representation == "complementary"
+    assert state._materialize_explicit_hamiltonian()
+    assert state.hamiltonian_representation == "mpo"
+    np.testing.assert_allclose(state.expectation(), before, atol=2.0e-12)
+    state.close()
+
+
+def test_projected_conditional_block_preconditioner_preserves_global_solution():
+    norb = 6
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    rng = np.random.default_rng(23)
+    cholesky = rng.normal(scale=0.1, size=(norb, norb, 4))
+    cholesky = 0.5 * (cholesky + cholesky.swapaxes(0, 1))
+    eri = np.einsum("pqL,rsL->pqrs", cholesky, cholesky)
+    options = dict(
+        nelec=6,
+        spin=0,
+        graph="nn",
+        D=3,
+        seed=5,
+        hamiltonian_representation="complementary",
+    )
+    reference = SU2LETTA.from_integrals(h1e, eri, **options)
+    hybrid = SU2LETTA.from_integrals(h1e, eri, **options)
+    run_options = dict(
+        nsweeps=1,
+        algorithm="projected",
+        tol=0.0,
+        max_local_parameters=4096,
+        max_matrix_free_parameters=4096,
+        gauge="conditional",
+        davidson_tol=1.0e-8,
+    )
+
+    reference.run(**run_options, conditional_preconditioner=False)
+    hybrid.run(
+        **run_options,
+        conditional_preconditioner=True,
+        conditional_preconditioner_weight=0.1,
+    )
+
+    np.testing.assert_allclose(hybrid.energy, reference.energy, atol=3.0e-11)
+    hybrid_davidson = [
+        update["solver_info"]["davidson"]
+        for update in hybrid.history[0]["updates"]
+    ]
+    conditional = [
+        info
+        for info in hybrid_davidson
+        if info["preconditioner_mode"] == "conditional_block_jacobi_hybrid"
+    ]
+    assert conditional
+    assert sum(info["conditional_preconditioner_blocks"] for info in conditional) > 0
+    assert max(info["residual"] for info in hybrid_davidson) <= 1.0e-8
+    reference.close()
+    hybrid.close()
 
 
 def _dense_vector_from_reduced_spatial_mps(sites):
@@ -375,6 +461,95 @@ def test_su2_letta_conditional_moving_environment_matches_rebuild_path():
         for plan in pair_plans
     )
     assert all(update["matrix_free"] for update in moving.history[0]["updates"])
+
+
+def test_projected_gauge_auto_is_distinct_from_explicit_none():
+    h1e = np.diag(np.linspace(-1.0, 1.0, 4))
+    h1e += np.diag(np.full(3, -0.2), 1)
+    h1e += np.diag(np.full(3, -0.2), -1)
+    initial = SU2LETTA.from_integrals(
+        h1e,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=1,
+        seed=3,
+        hamiltonian_representation="complementary",
+    )
+    automatic = copy.deepcopy(initial)
+    disabled = copy.deepcopy(initial)
+
+    automatic.run(
+        nsweeps=1,
+        algorithm="projected",
+        tol=0.0,
+        global_variational_guard=False,
+    )
+    disabled.run(
+        nsweeps=1,
+        algorithm="projected",
+        tol=0.0,
+        gauge=None,
+        global_variational_guard=False,
+    )
+
+    assert automatic.history[0]["gauge"] == "conditional"
+    assert disabled.history[0]["gauge"] is None
+    automatic.close()
+    disabled.close()
+    initial.close()
+
+
+def test_adaptive_global_guard_matches_full_guard_with_fewer_contractions():
+    norb = 8
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    eri = np.zeros((norb, norb, norb, norb))
+    indices = np.arange(norb)
+    eri[indices, indices, indices, indices] = 1.0
+    initial = SU2LETTA.from_integrals(
+        h1e,
+        eri,
+        nelec=8,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=3,
+        hamiltonian_representation="complementary",
+    )
+    adaptive = copy.deepcopy(initial)
+    exhaustive = copy.deepcopy(initial)
+    options = dict(
+        nsweeps=1,
+        algorithm="projected",
+        gauge="conditional",
+        tol=0.0,
+        max_local_parameters=4096,
+        max_matrix_free_parameters=4096,
+        davidson_tol=1.0e-8,
+        davidson_maxiter=40,
+        davidson_max_space=20,
+    )
+
+    adaptive.run(**options, global_variational_guard="adaptive")
+    exhaustive.run(**options, global_variational_guard="all")
+
+    adaptive_cycle = adaptive.history[0]
+    exhaustive_cycle = exhaustive.history[0]
+    np.testing.assert_allclose(adaptive.energy, exhaustive.energy, atol=2.0e-11)
+    assert not adaptive_cycle["cycle_rolled_back"]
+    assert adaptive_cycle["global_guard_evaluations"] > 0
+    assert adaptive_cycle["global_guard_rejections"] > 0
+    assert (
+        adaptive_cycle["global_guard_evaluations"]
+        < exhaustive_cycle["global_guard_evaluations"]
+    )
+    assert abs(adaptive_cycle["global_energy_closure"]) < 1.0e-10
+    assert adaptive_cycle["global_guard_learned_bonds"]
+    adaptive.close()
+    exhaustive.close()
+    initial.close()
 
 
 def test_su2_letta_cpp_boundaries_match_recursive_reduced_blocks():
@@ -618,7 +793,7 @@ def test_wigner_eckart_local_transition_plan_and_grouped_routes_are_exact():
         state._set_site_vector(0, current)
         state._incremental_materialization_enabled = False
     routed = routes.tensor(vector)
-    assert routes.backend == "nearest-neighbor-block-scatter"
+    assert routes.backend == "frontier-block-scatter"
     assert routes.nbytes > 0
     for key in reference.data:
         np.testing.assert_allclose(routed.data[key], reference.data[key], atol=1.0e-13)
@@ -626,6 +801,17 @@ def test_wigner_eckart_local_transition_plan_and_grouped_routes_are_exact():
     assert state.wigner_eckart_cache_stats["hits"] >= 1
 
     layout = _ChannelResolvedPairSpace(sites[0], sites[1])
+    pair_vector = layout.pack_sites(sites[0], sites[1])
+    split_left, split_right = layout.split(pair_vector)
+    np.testing.assert_allclose(
+        layout.pack_sites(split_left, split_right), pair_vector, atol=1.0e-13
+    )
+    basis_left, basis_right = layout.basis_pair(0)
+    expected_basis = np.zeros(layout.size)
+    expected_basis[0] = 1.0
+    np.testing.assert_allclose(
+        layout.pack_sites(basis_left, basis_right), expected_basis, atol=1.0e-13
+    )
     embedding_current, embedding = state._local_pair_embedding(
         0, sites, 0, layout
     )
@@ -698,7 +884,7 @@ def test_matrix_free_wigner_eckart_davidson_matches_dense_local_solve():
     )
     assert (
         matrix_free_update["solver_info"]["route_backend"]
-        == "nearest-neighbor-block-scatter"
+        == "frontier-block-scatter"
     )
 
 
@@ -792,7 +978,7 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
     assert state._embedding_basis_cache_hits > 0
     assert all(
         update["solver_info"]["route_backend"]
-        == "nearest-neighbor-block-scatter"
+        == "frontier-block-scatter"
         for update in cycle["updates"]
     )
     assert any(
@@ -809,6 +995,7 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
         in {
             "projected_diagonal_seed_constant_shift",
             "native_constant_shift",
+            "compiled_constant_shift",
             "stationary_residual_certificate",
         }
         for update in cycle["updates"]
@@ -830,14 +1017,14 @@ def test_projected_tied_space_sweep_reuses_dmrg_environments_at_d2(monkeypatch):
     state._set_site_vector(0, changed)
     assert state._state_revision > revision
     assert all(
-        int(record[0]) != state._state_revision
-        for record in state._stationary_certificate_cache.values()
+        record[0] != state._stationary_dependency_signature(site)
+        for site, record in state._stationary_certificate_cache.items()
     )
     state._set_site_vector(0, original)
 
 
-def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
-    norb = 4
+@pytest.mark.parametrize("norb", [4, 6])
+def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2(norb):
     h1e = np.diag(np.linspace(-1.0, 1.0, norb))
     h1e += np.diag(np.full(norb - 1, -0.2), 1)
     h1e += np.diag(np.full(norb - 1, -0.2), -1)
@@ -846,9 +1033,9 @@ def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
     state = SU2LETTA.from_integrals(
         h1e,
         eri,
-        nelec=4,
+        nelec=norb,
         spin=0,
-        graph=[(0, 1), (1, 2), (2, 3)],
+        graph=[(i, i + 1) for i in range(norb - 1)],
         D=2,
         seed=3,
         hamiltonian_representation="mpo",
@@ -883,6 +1070,110 @@ def test_frontier_one_site_actions_match_full_chain_wigner_eckart_at_d2():
     )
     assert frontier[-1]["local_action_backend"] == "frontier_projected_pair"
     assert frontier[-1]["backend"] == "compiled_contextual_channel_resolved"
+    state.close()
+
+
+@pytest.mark.parametrize("site", [1, 2])
+def test_nn_frontier_matrix_free_metric_matches_connected_reference(site):
+    norb = 4
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    state = SU2LETTA.from_integrals(
+        h1e,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=3,
+        hamiltonian_representation="mpo",
+    )
+    sites = state.materialize()
+    connected = state._frontier_wigner_eckart_matrix_free_problem(
+        site, 1, sites=sites
+    )
+    matrix_free = state._frontier_wigner_eckart_matrix_free_problem(
+        site,
+        1,
+        sites=sites,
+        max_dense_metric_parameters=0,
+    )
+    rng = np.random.default_rng(11)
+    vector = rng.normal(size=connected[1].size)
+
+    np.testing.assert_array_equal(matrix_free[1], connected[1])
+    np.testing.assert_allclose(
+        matrix_free[2](vector), connected[2](vector), atol=2e-12
+    )
+    np.testing.assert_allclose(
+        matrix_free[3](vector), connected[3](vector), atol=2e-12
+    )
+    np.testing.assert_allclose(
+        matrix_free[-1]["_projected_metric"].matvec(vector),
+        connected[3](vector),
+        atol=2e-12,
+    )
+    assert matrix_free[-1]["embedding_representation"] == "matrix_free_frontier_scatter"
+    assert matrix_free[-1]["projected_metric_backend"] == (
+        "matrix_free_factorized_routes"
+    )
+    assert not matrix_free[-1]["metric_blocks_materialized"]
+
+    if site == 1:
+        connected_state = copy.deepcopy(state)
+        matrix_free_state = copy.deepcopy(state)
+        connected_update = connected_state.optimize_site(
+            site, bond=1, solver="wigner_eckart", we_dense_dim=0
+        )
+        matrix_free_update = matrix_free_state.optimize_site(
+            site,
+            bond=1,
+            solver="wigner_eckart",
+            we_dense_dim=0,
+            max_dense_metric_parameters=0,
+        )
+        np.testing.assert_allclose(
+            matrix_free_update["energy_after"],
+            connected_update["energy_after"],
+            atol=2e-9,
+        )
+        assert matrix_free_update["local_linear_algebra"] == (
+            "matrix_free_generalized_davidson"
+        )
+        connected_state.close()
+        matrix_free_state.close()
+    state.close()
+
+
+def test_matrix_free_optimizer_accepts_inexact_energy_lowering_step():
+    norb = 4
+    h1e = np.diag(np.linspace(-1.0, 1.0, norb))
+    h1e += np.diag(np.full(norb - 1, -0.2), 1)
+    h1e += np.diag(np.full(norb - 1, -0.2), -1)
+    state = SU2LETTA.from_integrals(
+        h1e,
+        nelec=4,
+        spin=0,
+        graph="nn",
+        D=2,
+        seed=3,
+        hamiltonian_representation="mpo",
+    )
+    update = state.optimize_site(
+        1,
+        bond=1,
+        solver="wigner_eckart",
+        we_dense_dim=0,
+        max_dense_metric_parameters=0,
+        davidson_maxiter=1,
+        davidson_max_space=2,
+    )
+    davidson = update["solver_info"]["davidson"]
+
+    assert not davidson["davidson_converged"]
+    assert davidson["accepted_inexact_variational_step"]
+    assert update["accepted"]
+    assert update["energy_after"] < update["energy_before"]
     state.close()
 
 
@@ -1067,6 +1358,7 @@ def test_channel_resolved_d2_pair_kernel_is_exact_and_matrix_free():
     davidson = update["solver_info"]["davidson"]
     assert davidson["davidson_converged"]
     assert davidson["metric_rank"] < davidson["parent_dimension"]
+    assert not davidson["pair_transition_plan"]["metric_blocks_materialized"]
     assert davidson["pair_transition_plan"]["hamiltonian_transitions"] > 0
     assert update["local_residual"] < 1.0e-8
 
@@ -1082,6 +1374,7 @@ def test_su2_letta_checkpoint_resume_preserves_state_and_diagnostics(tmp_path):
         seed=4,
     )
     checkpoint = tmp_path / "su2-letta.chk"
+    state._global_guard_bonds.add(("rl", 0))
     state.run(
         nsweeps=1,
         algorithm="projected",
@@ -1092,6 +1385,7 @@ def test_su2_letta_checkpoint_resume_preserves_state_and_diagnostics(tmp_path):
 
     np.testing.assert_allclose(restored.expectation(), state.energy, atol=2.0e-12)
     assert restored.history == state.history
+    assert restored._global_guard_bonds == state._global_guard_bonds
     assert restored.convergence_summary["cycles"] == 1
     assert restored.convergence_summary["max_local_residual"] < 1.0e-9
     assert restored.storage_nbytes > 0
@@ -1307,3 +1601,89 @@ def test_su2_letta_rejects_magnetic_multiplicity_physical_sites():
             nelec=2,
             spin=0,
         )
+
+
+@pytest.mark.parametrize("algorithm", ["one_site", "two_site"])
+def test_run_complementary_factor_reuse_preserves_updates(algorithm):
+    from examples.qchem.benchmark_su2_letta_production import hubbard_chain
+    h, eri, graph = hubbard_chain(4, hopping=1, interaction=4, periodic=True)
+    states = [SU2LETTA.from_integrals(
+        h, eri, nelec=4, D=2, seed=9, graph=graph,
+        hamiltonian_representation="complementary", workers=1, n_threads=1)
+        for _ in range(2)]
+    try:
+        states[0]._pair_hamiltonian_factors = lambda: states[0].mpo
+        for state in states:
+            state.run(nsweeps=1, tol=0, algorithm=algorithm)
+        np.testing.assert_allclose(states[1].energy, states[0].energy, atol=1e-10, rtol=0)
+        for i in range(4):
+            np.testing.assert_allclose(states[1]._pack_site(i), states[0]._pack_site(i),
+                                       atol=1e-9, rtol=1e-9)
+    finally:
+        for state in states:
+            state.close()
+
+
+def test_complementary_pair_factors_refresh_with_integrals_and_release():
+    from examples.qchem.benchmark_su2_letta_production import hubbard_chain
+    from pyqed.qchem.dmrg.backends.reduced import build_su2_normal_complementary_mpo
+    h, eri, graph = hubbard_chain(4, hopping=1, interaction=4, periodic=True)
+    state = SU2LETTA.from_integrals(h, eri, nelec=4, D=2, seed=9,
+        graph=graph, hamiltonian_representation="complementary", workers=1, n_threads=1)
+    try:
+        first = state._pair_hamiltonian_factors()
+        state._set_site_vector(1, state._pack_site(1) * 1.1)
+        assert state._pair_hamiltonian_factors() is first
+        owner = state._su2_moving_environment
+        owner.update_integrals(np.ascontiguousarray(h + np.eye(4)*0.2),
+                               np.ascontiguousarray(eri), 0.0)
+        refreshed = state._pair_hamiltonian_factors()
+        assert refreshed is not first
+        reference = build_su2_normal_complementary_mpo(
+            owner, fully_reduced=True, materialize_reduced_terms=True)
+        for actual, expected in zip(refreshed, reference):
+            np.testing.assert_array_equal(actual.normal_complementary_plan["coefficient"],
+                                          expected.normal_complementary_plan["coefficient"])
+    finally:
+        state.close()
+    assert state._pair_hamiltonian_cache is None
+
+
+@pytest.mark.parametrize("representation", ["mpo", "complementary"])
+def test_target_bond_environments_match_full_chain(representation):
+    from examples.qchem.benchmark_su2_letta_production import hubbard_chain
+    h, eri, graph = hubbard_chain(4, hopping=1, interaction=4)
+    state = SU2LETTA.from_integrals(
+        h, eri, nelec=4, D=2, seed=9, graph=graph,
+        hamiltonian_representation=representation, workers=1, n_threads=1)
+    rng = np.random.default_rng(12)
+    try:
+        # Rebuilding after a changed tensor must use the new numerical state.
+        for changed in (False, True):
+            if changed:
+                vector = state._pack_site(1)
+                state._set_site_vector(1, vector + 0.05 * rng.normal(size=vector.size))
+            sites = state.materialize()
+            factors = state._pair_hamiltonian_factors()
+            for bond in range(3):
+                merged, _ = state._pair_coordinate_space(bond, sites)
+                full = BlockSparseEnvironmentChain.build(sites, factors)
+                reference = full.bond_operator(bond, merged)
+                probe = (rng.normal(size=reference.basis.size)
+                         + 1j * rng.normal(size=reference.basis.size))
+                expected = (reference.aux_packed_matvec or reference.packed_matvec)(probe)
+                local = BlockSparseEnvironmentChain.build(
+                    sites, factors, target_bond=bond)
+                assert all(x is None for x in local.left_envs[bond + 1:])
+                assert all(x is None for x in local.right_envs[:bond + 1])
+                actual = local.bond_operator(bond, merged)
+                np.testing.assert_allclose(
+                    (actual.aux_packed_matvec or actual.packed_matvec)(probe),
+                    expected, atol=2e-12, rtol=2e-12)
+        with pytest.raises(ValueError, match="outside"):
+            BlockSparseEnvironmentChain.build(sites, factors, target_bond=3)
+        with pytest.raises(ValueError, match="standalone"):
+            BlockSparseEnvironmentChain.build(
+                sites, factors, target_bond=0, sweep_direction="lr")
+    finally:
+        state.close()

@@ -195,10 +195,10 @@ def _mps_expectation_energy(qcdmrg):
     """Evaluate the final non-Abelian MPS energy from the Hamiltonian MPO."""
 
     state = qcdmrg.dmrg.ground_state
-    numerator = contract_chain_expectation(state.sites, qcdmrg.H)
+    numerator = contract_chain_expectation(state.tensors, qcdmrg.H)
     denominator = contract_chain_expectation(
-        state.sites,
-        _identity_mpo_factors_for_sites_and_mpo(state.sites, qcdmrg.H),
+        state.tensors,
+        _identity_mpo_factors_for_sites_and_mpo(state.tensors, qcdmrg.H),
     )
     denom = float(np.real(denominator))
     if abs(denom) < 1.0e-15:
@@ -293,8 +293,8 @@ def run_case(
     mps_energy_error = abs(mps_energy - exact_energy)
 
     state = qcdmrg.dmrg.ground_state
-    center = _infer_canonical_center(history, len(state.sites))
-    left_err, right_err = mixed_canonical_errors(state.sites, center)
+    center = _infer_canonical_center(history, len(state.tensors))
+    left_err, right_err = mixed_canonical_errors(state.tensors, center)
     target = qcdmrg.dmrg.target_sector
     family_diagnostics = _family_kernel_diagnostics(history)
 

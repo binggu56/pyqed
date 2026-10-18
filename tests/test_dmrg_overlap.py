@@ -194,3 +194,21 @@ def test_dmrg_auto_overlap_uses_polar_mode_for_displaced_h2():
     assert info["active_unitarity_error"] > info["unitary_tol"]
     np.testing.assert_allclose(auto, polar, atol=1e-8)
     assert 0.0 <= np.abs(auto[0, 0]) <= 1.0
+
+
+def test_spatial_overlap_adapter_preserves_complex_amplitudes(monkeypatch):
+    from pyqed.qchem.dmrg.overlap import _state_to_dense_tensor, _state_to_dense_mps
+    rng = np.random.default_rng(2016)
+    spatial = rng.normal(size=(4, 4, 4))+1j*rng.normal(size=(4, 4, 4))
+    state = MPS(decompose(spatial, rank=[1, 4, 4, 1]))
+    # Dense tensor wrappers also expose qns; never treat them as block storage.
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Dense tensors must not enter Abelian block expansion')
+    import importlib
+    overlap_module = importlib.import_module('pyqed.qchem.dmrg.overlap')
+    monkeypatch.setattr(overlap_module, 'symmetric_to_dense', forbidden)
+    split = _state_to_dense_mps(state)
+    expected = spatial[np.ix_([0, 2, 1, 3], [0, 2, 1, 3], [0, 2, 1, 3])].reshape((2,)*6)
+    np.testing.assert_allclose(_state_to_dense_tensor(split), expected, atol=1e-13)
+    np.testing.assert_allclose(_state_to_dense_tensor(state), expected, atol=1e-13)
+    np.testing.assert_allclose(split.norm_squared(), state.norm_squared(), atol=1e-12)

@@ -139,7 +139,7 @@ def test_su2_tdvp_reuses_cpp_dmrg_boundary_owner_for_complex_state():
     nsites = 4
     state = _normalized_random_state(nsites, seed=7)
     mpo = build_spatial_hubbard_mpo(
-        state.sites,
+        state.tensors,
         hopping_t=0.2,
         onsite_u=0.5,
     )
@@ -172,3 +172,51 @@ def test_su2_tdvp_reuses_cpp_dmrg_boundary_owner_for_complex_state():
     assert info["cpp_moving_environment"] is True
     assert owner.stats["boundary_update_calls"] > 0
     assert owner.stats["owned_boundary_bytes"] > 0
+
+
+def test_symbolic_operator_caches_reject_recycled_object_ids(monkeypatch):
+    from pyqed.mps.nonabelian import renormalized as operators
+
+    class Core:
+        def __init__(self, left, right):
+            self.symbolic_transitions = (("dense", left, right, ("dense", 0)),)
+
+    first, second = Core(0, 1), Core(3, 4)
+    first_transitions, _ = operators.symbolic_mpo_core_transitions(first)
+    # Model an allocator reusing an address while an old cache entry survives.
+    monkeypatch.setitem(operators._SYMBOLIC_MPO_TRANSITION_CACHE, id(second),
+                        operators._SYMBOLIC_MPO_TRANSITION_CACHE[id(first)])
+    second_transitions, _ = operators.symbolic_mpo_core_transitions(second)
+    assert second_transitions[0].left_channel == 3
+    assert second_transitions[0].right_channel == 4
+    operators._symbolic_transition_summary(first_transitions, 'left')
+    monkeypatch.setitem(operators._SYMBOLIC_TRANSITION_SUMMARY_CACHE,
+                        (id(second_transitions), 'left'),
+                        operators._SYMBOLIC_TRANSITION_SUMMARY_CACHE[(id(first_transitions), 'left')])
+    summary = operators._symbolic_transition_summary(second_transitions, 'left')
+    assert summary[0][:2] == (3, 4)
+
+
+def test_reduced_factor_metadata_rejects_recycled_object_ids(monkeypatch):
+    from pyqed.mps.nonabelian import renormalized, su2_qchem_plan as plans
+
+    calls = []
+
+    def blocks(core):
+        calls.append(core)
+        return {}
+
+    monkeypatch.setattr(renormalized, 'group_rank_coupled_reduced_blocks_by_input', blocks)
+    monkeypatch.setattr(renormalized, '_symbolic_transition_families_by_channel',
+                        lambda core, **kwargs: {})
+    monkeypatch.setattr(plans, '_RANK_COUPLED_FACTOR_METADATA_CACHE', {})
+    boundary = plans.PackedSU2BoundaryTable.from_rows(
+        [], [], side='left', bond=0, representation='rank_coupled_by_ket')
+    first, second = object(), object()
+    representation = 'rank_coupled_left_factor_by_ket'
+    kwargs = dict(side='left', bond=0, representation=representation)
+    plans.pack_rank_coupled_factor_table_from_boundary(boundary, first, **kwargs)
+    cache = plans._RANK_COUPLED_FACTOR_METADATA_CACHE
+    cache[(id(second), representation, 'right')] = cache[(id(first), representation, 'right')]
+    plans.pack_rank_coupled_factor_table_from_boundary(boundary, second, **kwargs)
+    assert calls == [first, second]

@@ -1,6 +1,8 @@
 """Density-matrix-renormalization-group self-consistent field."""
 
 import copy
+import operator
+import time
 
 import numpy as np
 
@@ -68,7 +70,7 @@ class _DMRGFirstOrderCASSCF(FirstOrderCASSCF):
 class _SecondOrder(SecondOrderCASSCF):
     """Keyframe augmented-Hessian CASSCF backed by reduced DMRG."""
 
-    def __init__(self, prototype, dmrg_options, **kwargs):
+    def __init__(self, prototype, dmrg_options, micro_dmrg_sweeps=None, **kwargs):
         super().__init__(prototype.mf, prototype.ncas, prototype.nelecas, **kwargs)
         self.prototype = prototype
         self.dmrg_options = dict(dmrg_options)
@@ -79,12 +81,15 @@ class _SecondOrder(SecondOrderCASSCF):
         self.dmrg_solve_count = 0
         self.rdm_build_count = 0
         self.fixed_mps_trial_count = 0
+        self.micro_dmrg_sweeps = micro_dmrg_sweeps
+        self.dmrg_solve_history = []
+        self._dmrg_macro_reference = None
 
     _copy_ci_guess = staticmethod(_DMRGFirstOrderCASSCF._copy_ci_guess)
     _objective_energy = _DMRGFirstOrderCASSCF._objective_energy
     _effective_rdms = _DMRGFirstOrderCASSCF._effective_rdms
 
-    def _run_dmrg(self, mean_field, mo_coeff, nstates, ci0):
+    def _run_dmrg(self, mean_field, mo_coeff, nstates, ci0, *, micro=False):
         self.dmrg_solve_count += 1
         mc = _fresh_casci_like(self.prototype, solver_cls=QCDMRG)
         mc.mf = mean_field
@@ -93,7 +98,25 @@ class _SecondOrder(SecondOrderCASSCF):
         if ci0:
             mc.init_guess = ci0[0]
         options = dict(self.dmrg_options)
+        if ci0:
+            options.pop("initial_guess", None)
         options["require_convergence"] = False
+        if micro and self.micro_dmrg_sweeps is not None:
+            schedule = options.pop("D_schedule", None)
+            sweep_schedule = options.pop("nsweeps_schedule", None)
+            if schedule is not None:
+                stages = QCDMRG._normalize_dmrg_schedule(
+                    options.get("D", mc.D), options.get("nsweeps", 50),
+                    D_schedule=schedule, nsweeps_schedule=sweep_schedule,
+                )
+                options["D"] = stages[-1][0]
+            options["nsweeps"] = self.micro_dmrg_sweeps
+            # A short warm-start relaxation must not restart the default
+            # loose-to-tight Davidson schedule on every trial Hamiltonian.
+            options.setdefault("davidson_tol", min(
+                1.0e-8, float(options.get("sweep_tol", 1.0e-7))
+            ))
+        start = time.perf_counter()
         QCDMRG.run(
             mc,
             nstates=int(nstates),
@@ -103,7 +126,39 @@ class _SecondOrder(SecondOrderCASSCF):
         )
         mc.ci = [mc.export_ground_state(state=root) for root in range(int(nstates))]
         self.ncore = mc.ncore
+        self.dmrg_solve_history.append({
+            "kind": "micro" if micro else "keyframe",
+            "sweep_limit": int(options.get("nsweeps", 50)),
+            "warm_start": bool(ci0),
+            "solver_converged": bool(mc.converged),
+            "seconds": time.perf_counter() - start,
+        })
+        mc._dmrgscf_short_relaxation = bool(micro and self.micro_dmrg_sweeps is not None)
+        if mc._dmrgscf_short_relaxation:
+            # Reuse accepted finite microstates, but certify convergence only
+            # at a full-budget keyframe, including the final public result.
+            mc.converged = False
+        elif self.micro_dmrg_sweeps is not None:
+            self.casci = mc
+            physical_coeff = (mo_coeff if mean_field is self.mf
+                              else self.mo_coeff_ref)
+            self.mo_coeff = np.array(physical_coeff, copy=True)
+            self._require_converged_ci(mc, nstates)
         return mc
+
+    def _micro_solve(self):
+        reference = self.mo_coeff_ref
+        first = reference is not self._dmrg_macro_reference
+        self._dmrg_macro_reference = reference
+        return not first
+
+    def _can_reuse_micro_ci(self, mc, nstates):
+        if getattr(mc, "_dmrgscf_short_relaxation", False):
+            return (self.micro_ci_mode == "full"
+                    and len(mc.ci) == nstates
+                    and np.size(mc.e_tot) == nstates
+                    and np.all(np.isfinite(mc.e_tot)))
+        return super()._can_reuse_micro_ci(mc, nstates)
 
     def _make_casci(self, mo_coeff, nstates, ci0=None):
         return self._run_dmrg(self.mf, mo_coeff, nstates, ci0)
@@ -112,13 +167,15 @@ class _SecondOrder(SecondOrderCASSCF):
         self, h1_mo, pair_factors, mo_coeff, nstates, ci0=None
     ):
         frozen = self._FrozenFactorRHF(self.mf, h1_mo, pair_factors, mo_coeff)
-        return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0)
+        return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0,
+                              micro=self._micro_solve())
 
     def _make_integral_casci(
         self, h1_mo, eri_mo, mo_coeff, nstates, ci0=None
     ):
         frozen = self._FrozenIntegralRHF(self.mf, h1_mo, eri_mo, mo_coeff)
-        return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0)
+        return self._run_dmrg(frozen, np.eye(self.nmo), nstates, ci0,
+                              micro=self._micro_solve())
 
     @staticmethod
     def _root_rdm_cache(mc):
@@ -315,7 +372,27 @@ def _complete_mo_basis(mf, mo_coeff):
 
 
 class DMRGSCF(QCDMRG):
-    """DMRG orbital optimization with fully reduced SU(2) DMRG by default."""
+    """Second-order orbital optimization with reduced SU(2) DMRG by default.
+
+    Orbital DIIS is disabled. With the constrained driver, pass ``diis=True``
+    to enable it explicitly.
+
+    The default ``algorithm='second_order'`` uses matrix-free
+    augmented-Hessian orbital steps and fixed-MPS keyframe microiterations.
+    Pass ``algorithm='constrained'`` for CO-DMRG.
+    ``micro_ci_mode='relaxed'`` adds short warm-start MPS
+    relaxations and BFGS coupling inferred from gradient secants; full-budget
+    DMRG keyframes certify convergence. Active-active rotations are omitted.
+
+    This is an adaptation of the macro/micro architecture in Ma, Knecht,
+    Keller and Reiher, JCTC 13, 2533-2549 (2017),
+    https://doi.org/10.1021/acs.jctc.6b01118, with BFGS updates (Broyden,
+    IMA J. Appl. Math. 6, 222-231 (1970),
+    https://doi.org/10.1093/imamat/6.3.222). It does not implement the coupled
+    WMK response equations or inherit their quadratic-convergence guarantee.
+    At finite bond dimension, omitting active-active rotations is approximate.
+    Budgeted relaxation currently supports a single root and real orbitals.
+    """
 
     def __init__(
         self,
@@ -356,9 +433,16 @@ class DMRGSCF(QCDMRG):
         self.dmrg_solve_count = 0
         self.rdm_build_count = 0
         self.fixed_mps_trial_count = 0
+        self.dmrg_solve_history = []
 
-    def run(self, nstates=1, weights=None, require_conv=True, mo_coeff=None, **kwargs):
+    def run(
+        self, nstates=1, weights=None, require_conv=True, mo_coeff=None,
+        *, algorithm="second_order", **kwargs,
+    ):
         """Optimize orbitals and the active MPS.
+
+        Defaults to ``algorithm='second_order'`` with
+        ``micro_ci_mode='keyframe'`` and four orbital microiterations.
 
         With the constrained driver, ``macro_callback(event)`` receives each
         completed accepted trial or failed active solve. The event contains
@@ -367,17 +451,18 @@ class DMRGSCF(QCDMRG):
         a checkpoint. ``local_solver_kwargs['workspace_budget_bytes']`` sets
         the owned SU(2) Davidson workspace limit (default 32 MiB).
         """
+        if "orbital_driver" in kwargs:
+            raise TypeError("Use algorithm instead of orbital_driver.")
         self.micro_history = []
         self.dmrg_solve_count = 0
         self.rdm_build_count = 0
         self.fixed_mps_trial_count = 0
+        self.dmrg_solve_history = []
         mf = self.mf
-        orbital_driver = str(kwargs.pop("orbital_driver", "constrained")).lower().replace(
-            "-", "_"
-        )
-        if orbital_driver not in {"constrained", "nonredundant", "second_order"}:
+        algorithm = str(algorithm).lower().replace("-", "_")
+        if algorithm not in {"constrained", "nonredundant", "second_order"}:
             raise ValueError(
-                "orbital_driver must be 'constrained', 'nonredundant', or "
+                "algorithm must be 'constrained', 'nonredundant', or "
                 "'second_order'."
             )
         orbital_options = {
@@ -387,22 +472,39 @@ class DMRGSCF(QCDMRG):
             "optimizer_max_steps": kwargs.pop("optimizer_max_steps", 200),
             "optimizer_max_step_norm": kwargs.pop("optimizer_max_step_norm", None),
             "isd_gap_floor": kwargs.pop("isd_gap_floor", None),
-            "diis": kwargs.pop("diis", True),
+            "diis": kwargs.pop("diis", False),
             "diis_space": kwargs.pop("diis_space", 6),
             "diis_start": kwargs.pop("diis_start", 2),
             "ci_method": kwargs.pop("ci_method", "direct_ci"),
             "macro_callback": kwargs.pop("macro_callback", None),
         }
-        if orbital_options["macro_callback"] is not None and orbital_driver != "constrained":
-            raise ValueError("macro_callback currently requires the constrained orbital driver.")
-        if orbital_options["isd_gap_floor"] is not None and orbital_driver != "constrained":
-            raise ValueError("ISD gap scaling requires the constrained orbital driver")
+        if orbital_options["macro_callback"] is not None and algorithm != "constrained":
+            raise ValueError("macro_callback currently requires algorithm='constrained'.")
+        if orbital_options["isd_gap_floor"] is not None and algorithm != "constrained":
+            raise ValueError("ISD gap scaling requires algorithm='constrained'.")
         # One exact DMRG keyframe followed by fixed-MPS AH steps amortizes the
         # sweep and 2-RDM costs while retaining an exact solve each macrocycle.
         orbital_micro_cycles = int(kwargs.pop("orbital_micro_cycles", 4))
         if orbital_micro_cycles < 1:
             raise ValueError("orbital_micro_cycles must be positive.")
         micro_ci_mode = str(kwargs.pop("micro_ci_mode", "keyframe")).lower()
+        micro_dmrg_sweeps = kwargs.pop("micro_dmrg_sweeps", None)
+        if micro_ci_mode == "relaxed":
+            if algorithm != "second_order":
+                raise ValueError("micro_ci_mode='relaxed' requires algorithm='second_order'.")
+            micro_ci_mode = "full"
+            if micro_dmrg_sweeps is None:
+                micro_dmrg_sweeps = 2
+        if micro_dmrg_sweeps is not None:
+            if algorithm != "second_order" or micro_ci_mode != "full":
+                raise ValueError("micro_dmrg_sweeps requires second_order with full/relaxed microiterations.")
+            if isinstance(micro_dmrg_sweeps, (bool, np.bool_)):
+                raise TypeError("micro_dmrg_sweeps must be a positive integer.")
+            micro_dmrg_sweeps = operator.index(micro_dmrg_sweeps)
+            if micro_dmrg_sweeps < 1:
+                raise ValueError("micro_dmrg_sweeps must be positive.")
+            if int(nstates or self.nstates) != 1:
+                raise NotImplementedError("Budgeted DMRG microiterations currently require one root.")
         rej = kwargs.pop("reject_macro_energy", True)
         rise = kwargs.pop("macro_energy_rise_tol", 1.0e-8)
         rmax = kwargs.pop("macro_reject_max", 8)
@@ -426,6 +528,8 @@ class DMRGSCF(QCDMRG):
         # is the HF MO basis; callers can pass a previous DMRGSCF ``mo_coeff``
         # to continue from optimized orbitals.
         C0 = _complete_mo_basis(mf, mo_coeff)
+        if micro_dmrg_sweeps is not None and np.iscomplexobj(C0):
+            raise NotImplementedError("Budgeted DMRG microiterations require real orbitals.")
 
         # CASCI roots
         if nstates is None:
@@ -452,7 +556,7 @@ class DMRGSCF(QCDMRG):
         kwargs.setdefault("local_dense_max_dim", ldense)
         kwargs["require_convergence"] = False
 
-        if orbital_driver in {"nonredundant", "second_order"}:
+        if algorithm in {"nonredundant", "second_order"}:
             orbital_use_cholesky = _resolve_use_cholesky(mf)
             self.use_cholesky = orbital_use_cholesky
             optimizer = orbital_options["optimizer"].upper()
@@ -472,10 +576,11 @@ class DMRGSCF(QCDMRG):
                 use_cholesky=orbital_use_cholesky,
                 verbose=getattr(self, "verbose", 0),
             )
-            if orbital_driver == "second_order":
+            if algorithm == "second_order":
                 driver = _SecondOrder(
                     self,
                     kwargs,
+                    micro_dmrg_sweeps=micro_dmrg_sweeps,
                     max_micro_cycle=orbital_micro_cycles,
                     coupling="qn",
                     micro_ci_mode=micro_ci_mode,
@@ -517,6 +622,7 @@ class DMRGSCF(QCDMRG):
             self.fixed_mps_trial_count = int(
                 getattr(driver, "fixed_mps_trial_count", 0)
             )
+            self.dmrg_solve_history = list(getattr(driver, "dmrg_solve_history", ()))
             self.macro_diagnostics = []
             previous = None
             for row in driver.history:

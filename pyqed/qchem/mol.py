@@ -1159,13 +1159,48 @@ def atom_mass_list(mol):
     '''
     A list of mass for all atoms in the molecule
     '''
-    return np.array([elements.isotope(mol.atom_symbol(i)).mass \
+    return np.array([0.0 if mol.atom_symbol(i).upper() == 'X' else elements.isotope(mol.atom_symbol(i)).mass \
                      for i in range(mol.natom)])
 
 
 
 class Molecule:
-    def __init__(self, atom, charge=0, spin=0, basis=None, unit='bohr', **kwargs):
+    def __init__(self, atom, charge=0, spin=0, basis=None, unit='bohr', *,
+                 symmetry=False, symmetry_axis='z', symmetry_tol=1.0e-8, **kwargs):
+        """Configure molecular geometry, basis, and optional point-group symmetry.
+
+        Parameters
+        ----------
+        atom : str or sequence
+            Geometry string, geometry-file path, or atom/coordinate sequence.
+        symmetry : bool or str, optional, default False
+            Build molecular point-group metadata after the AO integrals are
+            available. ``True`` detects the largest supported geometry group,
+            including D3h, D6h and linear Coov/Dooh, in any orientation; strings such as
+            ``'C2v'`` and ``'D2h'`` select a supported subgroup explicitly.
+            ``'D3h'`` and ``'D6h'`` retain the full group and both rows of
+            every two-dimensional E irrep. Its C3 axis is z, a C2 axis is x, and the symmetry
+            center is the origin for explicit group strings. Automatic detection
+            stores the center and body axes in ``symmetry_info.origin/axes``
+            without changing the input geometry. Unsupported higher groups
+            use a supported subgroup. Pass ``symmetry=False`` to disable
+            symmetry detection and metadata.
+        symmetry_axis : {'z'}, optional
+            Principal-axis convention for native symmetry. Only ``'z'`` is
+            currently implemented.
+        symmetry_tol : float, optional
+            Geometry tolerance, in bohr, used when validating symmetry
+            operations.
+
+        """
+        if 'atoms' in kwargs:
+            raise TypeError("Molecule() accepts 'atom', not 'atoms'.")
+        if not isinstance(symmetry, (bool, str)):
+            raise TypeError('symmetry must be False, True, or a point-group string.')
+        if isinstance(symmetry, str) and not symmetry.strip():
+            raise ValueError('An explicit symmetry group must not be empty.')
+        if not np.isfinite(symmetry_tol) or symmetry_tol <= 0:
+            raise ValueError('symmetry_tol must be a positive finite tolerance.')
 
         if isinstance(atom, str):
             # The input atom is a geometry file
@@ -1235,15 +1270,15 @@ class Molecule:
 
         self._native_build_info = self._builtin_build_info
 
-        self.symmetry = False
+        self.symmetry = symmetry
         self.symmetry_info = None
         self.groupname = None
         self.irrep_names = None
         self.symm_orb = None
         self.ao_irrep_labels = None
         self.ao_irrep_ids = None
-        self.symmetry_axis = None
-        self.symmetry_tol = None
+        self.symmetry_axis = symmetry_axis
+        self.symmetry_tol = float(symmetry_tol)
 
 
     @property
@@ -1375,14 +1410,11 @@ class Molecule:
         eri=None,
         aosym=None,
         auxbasis=None,
-        symmetry=None,
-        symmetry_axis='z',
-        symmetry_tol=1.0e-8,
         *,
         workers=None,
     ):
         """
-        build molecular integrals
+        Build molecular integrals and the symmetry configured on this molecule.
 
         Parameters
         ----------
@@ -1405,17 +1437,6 @@ class Molecule:
         auxbasis : str, optional
             Short alias for the native ``auxbasis`` option used by
             ``eri='ri'`` and ``eri='dense+ri'``.
-        symmetry : bool or str, optional
-            Build native Abelian point-group metadata after the AO integrals are
-            available. ``True`` currently selects ``C2v``; strings such as
-            ``'C2v'`` and ``'D2h'`` select a supported subgroup explicitly.
-        symmetry_axis : {'z'}, optional
-            Principal-axis convention for native symmetry. Only ``'z'`` is
-            currently implemented.
-        symmetry_tol : float, optional
-            Geometry tolerance, in bohr, used when validating symmetry
-            operations.
-
         Returns
         -------
         Molecule
@@ -1458,36 +1479,30 @@ class Molecule:
         self.native_resolved_aosym = None
         self._builtin_build_info = None
         self._native_build_info = None
-        self.symmetry = False
         self.symmetry_info = None
         self.groupname = None
         self.irrep_names = None
         self.symm_orb = None
         self.ao_irrep_labels = None
         self.ao_irrep_ids = None
-        self.symmetry_axis = None
-        self.symmetry_tol = None
 
         build_builtin(self)
 
-        if symmetry:
+        if self.symmetry:
             from pyqed.qchem.symmetry import build_molecular_symmetry
 
             info = build_molecular_symmetry(
                 self,
-                symmetry,
-                axis=symmetry_axis,
-                tol=float(symmetry_tol),
+                self.symmetry,
+                axis=self.symmetry_axis,
+                tol=self.symmetry_tol,
             )
-            self.symmetry = True
             self.symmetry_info = info
             self.groupname = info.groupname
             self.irrep_names = info.irrep_names
             self.symm_orb = info.symm_orb
             self.ao_irrep_labels = info.ao_irrep_labels
             self.ao_irrep_ids = info.ao_irrep_ids
-            self.symmetry_axis = symmetry_axis
-            self.symmetry_tol = float(symmetry_tol)
 
         return self
 

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <climits>
 #include <cstring>
 #include <cstdlib>
 #include <exception>
@@ -103,6 +104,20 @@ inline double cblas_ddot(
 #endif
 
 namespace pyqed::su2 {
+
+// Packed sector keys carry particle number and a real-Abelian irrep. Only
+// fuse_sector_charge performs group arithmetic; numerical kernels see N.
+inline std::int64_t sector_number(std::int64_t key) noexcept {
+    return key & 0xffffffffLL;
+}
+inline std::int64_t sector_irrep(std::int64_t key) noexcept {
+    return key >> 32;
+}
+inline std::int64_t fuse_sector_charge(std::int64_t left, std::int64_t right) noexcept {
+    return (sector_number(left)+sector_number(right))
+        | ((sector_irrep(left)^sector_irrep(right)) << 32);
+}
+
 namespace {
 
 using Matrix4 = std::array<double, 16>;
@@ -174,9 +189,10 @@ bool disable_grouped_output_products() noexcept {
 
 bool grouped_output_product_is_safe(std::int64_t work) noexcept {
 #ifdef __APPLE__
-    // OpenBLAS 0.3.30's VORTEX small-matrix batch kernel crashes for
-    // products at or below its 100^3 dispatch threshold.
-    if (grouped_dgemm_batch_is_openblas() && work <= 1'000'000) {
+    // The OpenBLAS VORTEX grouped kernel also gives incorrect products above
+    // its small-matrix crash threshold. Use ordinary compiled GEMMs instead;
+    // a work-size cutoff cannot qualify this dynamically loaded kernel.
+    if (grouped_dgemm_batch_is_openblas()) {
         return false;
     }
 #else
@@ -193,6 +209,41 @@ using Index4 = std::tuple<
     std::int64_t,
     std::int64_t
 >;
+
+inline void combine_complementary_left_panel(
+    const std::vector<ComplementaryLocalTerm>& terms,
+    const std::vector<ReducedContextualMatrix>& matrices,
+    const std::vector<std::uint32_t>& indices,
+    std::size_t start,
+    std::size_t stop,
+    double* target,
+    std::size_t count,
+    std::size_t row_width = 0,
+    std::size_t row_stride = 0
+) {
+    for (std::size_t i = start; i < stop; ++i) {
+        if (matrices.at(terms.at(indices.at(i)).left_matrix).size() != count)
+            throw std::logic_error("Combined complementary-left shape changed.");
+    }
+    // Keep a target tile hot while visiting all contributing operators.
+    // Streaming a large target once per term otherwise repeats memory traffic.
+    constexpr std::size_t tile_elements = 4096;
+    if (row_width == 0) row_width = count;
+    if (row_stride == 0) row_stride = row_width;
+    for (std::size_t offset = 0; offset < count;) {
+        const auto column = offset % row_width;
+        const auto length = std::min({tile_elements, count - offset, row_width - column});
+        double* tile = target + (offset / row_width) * row_stride + column;
+        std::fill_n(tile, length, 0.0);
+        for (std::size_t i = start; i < stop; ++i) {
+            const auto& term = terms[indices[i]];
+            const double* source = matrices[term.left_matrix].data() + offset;
+            for (std::size_t j = 0; j < length; ++j)
+                tile[j] += term.scale * source[j];
+        }
+        offset += length;
+    }
+}
 
 template<std::size_t N>
 inline void combine_fixed_complementary_right_panel(
@@ -499,6 +550,52 @@ bool compare_real_davidson() noexcept {
     return value != nullptr && value[0] != '\0' && value[0] != '0';
 }
 
+std::string output_schedule_settings(int threads) {
+    std::string result = std::to_string(threads);
+    for (const char* name : {
+        "PYQED_SU2_BATCH_TARGET_ELEMENTS",
+        "PYQED_SU2_COMPACT_PANEL_BATCH_TILES",
+        "PYQED_SU2_COMPACT_RIGHT_PANEL_ELEMENTS",
+        "PYQED_SU2_COMPARE_REAL_DAVIDSON",
+        "PYQED_SU2_COMPARE_SHARED_LEFT",
+        "PYQED_SU2_COMPARE_SHARED_RIGHT_PANELS",
+        "PYQED_SU2_CONTEXTUAL_CORE_CACHE_ELEMENTS",
+        "PYQED_SU2_DIRECT_ACTION_LIMIT",
+        "PYQED_SU2_DIRECT_CHANNEL_OUTPUT_FUSION",
+        "PYQED_SU2_DIRECT_COMPLEMENTARY_TERMS",
+        "PYQED_SU2_DIRECT_PRODUCT_CACHE_BYTES",
+        "PYQED_SU2_DIRECT_EXTRA_WORK_RATIO",
+        "PYQED_SU2_DISABLE_GROUPED_OUTPUT_PRODUCTS",
+        "PYQED_SU2_DISABLE_OUTPUT_FUSION",
+        "PYQED_SU2_DISABLE_PIVOT_BOUNDARY_REDUCTION",
+        "PYQED_SU2_DISABLE_SHARED_RIGHT_PANELS",
+        "PYQED_SU2_ENABLE_RIGHT_FIRST_ACTIONS",
+        "PYQED_SU2_EXECUTION_CACHE_ELEMENTS",
+        "PYQED_SU2_FACTORIZED_OUTPUT_WORK",
+        "PYQED_SU2_FORCE_COMPLEX_DAVIDSON",
+        "PYQED_SU2_GROUPED_SMALL_OUTPUT_WORK",
+        "PYQED_SU2_GROUP_CHANNEL_LEFT_OUTPUTS",
+        "PYQED_SU2_GROUP_PIVOT_OVERLAPS",
+        "PYQED_SU2_OUTPUT_FUSION_COPY_BUDGET",
+        "PYQED_SU2_POINTER_ACTIONS",
+        "PYQED_SU2_PRIVATE_OUTPUT_BYTES",
+        "PYQED_SU2_OUTPUT_PANEL_CACHE_BYTES",
+        "PYQED_SU2_OPERATOR_PANEL_CACHE_BYTES",
+        "PYQED_SU2_RELIEVE_HEAP_AT_HALF_SWEEP",
+        "PYQED_SU2_SHARED_RIGHT_COPY_BUDGET",
+        "PYQED_SU2_SPECIALIZE_PIVOT_SCALE_REFRESH",
+        "PYQED_SU2_TASKED_OUTPUT",
+        "PYQED_SU2_TINY_OUTPUT_KERNEL_WORK",
+        "PYQED_SU2_USE_REAL_DAVIDSON",
+    }) {
+        const char* value = std::getenv(name);
+        result += '\0';
+        result += value ? "1" : "0";
+        if (value) result += value;
+    }
+    return result;
+}
+
 bool force_pointer_actions() noexcept {
     const char* value = std::getenv("PYQED_SU2_POINTER_ACTIONS");
     return value != nullptr && value[0] != '\0' && value[0] != '0';
@@ -628,6 +725,11 @@ std::size_t complementary_execution_cache_elements(
     return static_cast<std::size_t>(parsed);
 }
 
+bool tasked_output_schedule() noexcept {
+    const char* value = std::getenv("PYQED_SU2_TASKED_OUTPUT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
 std::size_t private_output_workspace_budget_bytes() noexcept {
     const char* value =
         std::getenv("PYQED_SU2_PRIVATE_OUTPUT_BYTES");
@@ -639,6 +741,37 @@ std::size_t private_output_workspace_budget_bytes() noexcept {
     return end != value && end != nullptr && end[0] == '\0'
         ? static_cast<std::size_t>(parsed)
         : std::size_t{128} << 20;
+}
+
+std::size_t output_panel_cache_budget_bytes() noexcept {
+    const char* value =
+        std::getenv("PYQED_SU2_OUTPUT_PANEL_CACHE_BYTES");
+    if (value == nullptr || value[0] == '\0') {
+        return std::size_t{64} << 20;
+    }
+    char* end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    return end != value && end != nullptr && end[0] == '\0'
+        ? static_cast<std::size_t>(parsed)
+        : std::size_t{64} << 20;
+}
+
+std::size_t operator_panel_cache_budget_bytes() noexcept {
+    const char* value = std::getenv("PYQED_SU2_OPERATOR_PANEL_CACHE_BYTES");
+    if (value == nullptr || value[0] == '\0') return std::size_t{64} << 20;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && end != nullptr && *end == '\0'
+        ? static_cast<std::size_t>(parsed) : std::size_t{64} << 20;
+}
+
+std::size_t direct_product_cache_budget_bytes() noexcept {
+    const char* value = std::getenv("PYQED_SU2_DIRECT_PRODUCT_CACHE_BYTES");
+    if (value == nullptr || value[0] == '\0') return std::size_t{8} << 20;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && end != nullptr && *end == '\0'
+        ? static_cast<std::size_t>(parsed) : std::size_t{8} << 20;
 }
 
 int adaptive_openmp_thread_count(
@@ -675,6 +808,11 @@ int adaptive_openmp_thread_count(
             )),
         })
     );
+}
+
+bool combine_direct_right_panels() noexcept {
+    const char* value = std::getenv("PYQED_SU2_DIRECT_PANEL_SUM");
+    return value == nullptr || value[0] != '0';
 }
 
 std::size_t direct_complementary_term_limit() noexcept {
@@ -752,6 +890,26 @@ std::size_t compact_panel_batch_tile_limit() noexcept {
         ? static_cast<std::size_t>(parsed)
         : std::size_t{256}
     );
+}
+
+std::size_t preparation_cache_budget_bytes() noexcept {
+    constexpr std::size_t default_budget = 128 * 1024 * 1024;
+    const char* value = std::getenv("PYQED_SU2_PREPARATION_CACHE_BYTES");
+    if (value == nullptr || value[0] == '\0' || value[0] == '-') return default_budget;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && end[0] == '\0'
+        ? static_cast<std::size_t>(parsed) : default_budget;
+}
+
+std::size_t environment_product_cache_budget_bytes() noexcept {
+    constexpr std::size_t default_budget = 8 * 1024 * 1024;
+    const char* value = std::getenv("PYQED_SU2_ENVIRONMENT_CACHE_BYTES");
+    if (value == nullptr || value[0] == '\0' || value[0] == '-') return default_budget;
+    char* end = nullptr;
+    const auto parsed = std::strtoull(value, &end, 10);
+    return end != value && end[0] == '\0'
+        ? static_cast<std::size_t>(parsed) : default_budget;
 }
 
 bool relieve_heap_at_half_sweep() noexcept {
@@ -959,7 +1117,7 @@ std::int64_t local_operator_charge(NCOperator op) noexcept {
 }
 
 std::int32_t physical_two_j(std::int64_t charge) noexcept {
-    return charge == 1 ? 1 : 0;
+    return sector_number(charge) == 1 ? 1 : 0;
 }
 
 double physical_component_coefficient(
@@ -1152,6 +1310,9 @@ double reduced_environment_recoupling_impl(
     std::int32_t operator_two_m,
     bool dual_right_boundary
 ) noexcept {
+    physical_output_charge = sector_number(physical_output_charge);
+    physical_input_charge = sector_number(physical_input_charge);
+
     double numerator = 0.0;
     double denominator = 0.0;
     const double dual_phase = phase_from_doubled(
@@ -1708,7 +1869,14 @@ void System::build_families() {
     std::map<Index2, double> a_entries;
     std::map<Index2, double> b_entries;
     std::map<Index3, double> q_entries;
-    std::map<Index4, double> p_entries;
+    FamilyData p_family;
+    p_family.rank = 4;
+    const double scale = include_half_ ? 0.5 : 1.0;
+    const auto p_count = static_cast<std::size_t>(std::count_if(
+        eri_.begin(), eri_.end(),
+        [this, scale](double value) { return std::abs(scale * value) > cutoff_; }));
+    p_family.indices.reserve(4 * p_count);
+    p_family.values.reserve(p_count);
     std::set<std::int64_t> active_orbitals;
 
     for (std::size_t p = 0; p < n_sites_; ++p) {
@@ -1726,7 +1894,6 @@ void System::build_families() {
         }
     }
 
-    const double scale = include_half_ ? 0.5 : 1.0;
     for (std::size_t p = 0; p < n_sites_; ++p) {
         for (std::size_t q = 0; q < n_sites_; ++q) {
             for (std::size_t r = 0; r < n_sites_; ++r) {
@@ -1741,7 +1908,9 @@ void System::build_families() {
                     const auto qi = static_cast<std::int64_t>(q);
                     const auto ri = static_cast<std::int64_t>(r);
                     const auto si = static_cast<std::int64_t>(s);
-                    p_entries[Index4{pi, qi, ri, si}] = value;
+                    // Lexicographic traversal already supplies unique sorted keys.
+                    p_family.indices.insert(p_family.indices.end(), {pi, qi, ri, si});
+                    p_family.values.push_back(value);
                     a_entries[Index2{pi, qi}] = 1.0;
                     a_entries[Index2{ri, si}] = 1.0;
                     active_orbitals.insert(pi);
@@ -1769,11 +1938,9 @@ void System::build_families() {
         static_cast<void>(value);
         b_entries[key] = 1.0;
     }
-    for (const auto& [key, value] : p_entries) {
+    for (const auto& [key, value] : a_entries) {
         static_cast<void>(value);
-        const auto [p, q, r, s] = key;
-        b_entries[Index2{p, q}] = 1.0;
-        b_entries[Index2{r, s}] = 1.0;
+        b_entries[key] = 1.0;
     }
     for (const auto& [key, value] : r_entries) {
         static_cast<void>(value);
@@ -1803,9 +1970,6 @@ void System::build_families() {
     append_family(a_family, a_entries);
     families_[static_cast<std::int32_t>(Family::A)] = std::move(a_family);
 
-    FamilyData p_family;
-    p_family.rank = 4;
-    append_family(p_family, p_entries);
     families_[static_cast<std::int32_t>(Family::P)] = std::move(p_family);
 
     FamilyData b_family;
@@ -4011,6 +4175,20 @@ bool MovingEnvironment::advance_boundary(
         return result;
     };
 
+    const std::size_t product_count = compiled_action ? compiled_action->product_count : 0;
+    const std::size_t product_limit = environment_product_cache_budget_bytes()
+        / (static_cast<std::size_t>(n_threads_) + 1) / sizeof(double);
+    // Numeric values are valid only for this boundary update. Worker-local
+    // caches share products across destination blocks without output races.
+    boundary_update_cache_.reset(product_count, product_limit);
+    boundary_update_thread_cache_.resize(n_threads_);
+    for (auto& cache : boundary_update_thread_cache_) cache.reset(product_count, product_limit);
+
+    const auto contract_routes = [&](const std::size_t* order,
+                                     std::size_t begin, std::size_t end,
+                                     std::vector<double>& temporary,
+                                     std::vector<double>& product_scratch,
+                                     BoundaryProductWorkspace& workspace) {
     std::int64_t cached_first_parent = -1;
     std::int64_t cached_first_bra = -1;
     std::size_t cached_first_elements = 0;
@@ -4018,7 +4196,8 @@ bool MovingEnvironment::advance_boundary(
     std::int64_t cached_product_bra = -1;
     std::int64_t cached_product_ket = -1;
     std::size_t cached_product_elements = 0;
-    for (std::size_t route_index = 0; route_index < n_routes; ++route_index) {
+    for (std::size_t position = begin; position < end; ++position) {
+        const std::size_t route_index = order == nullptr ? position : order[position];
         const std::int64_t* route = (
             routes == nullptr
             ? nullptr
@@ -4172,70 +4351,77 @@ bool MovingEnvironment::advance_boundary(
                     x_dim * r_dim * i_dim * j_dim
                     + nonzero_coefficients * r_dim * j_dim * s_dim;
                 if (contraction_work >= 256) {
-                    const std::size_t first_elements =
-                        x_dim * r_dim * j_dim;
-                    if (
-                        cached_first_parent != parent_index
-                        || cached_first_bra != bra_index
-                        || cached_first_elements != first_elements
-                    ) {
-                        boundary_update_temporary_.resize(first_elements);
-                        for (std::size_t x = 0; x < x_dim; ++x) {
-                            cblas_dgemm(
-                                101, 112, 111,
-                                static_cast<int>(r_dim),
-                                static_cast<int>(j_dim),
-                                static_cast<int>(i_dim),
-                                1.0,
-                                bra,
-                                static_cast<int>(r_dim),
-                                boundary + x * i_dim * j_dim,
-                                static_cast<int>(j_dim),
-                                0.0,
-                                boundary_update_temporary_.data()
-                                    + x * r_dim * j_dim,
-                                static_cast<int>(j_dim)
-                            );
+                    const std::size_t product_elements = x_dim * r_dim * s_dim;
+                    const auto slot = compiled_action && !compiled_action->route_product_ids.empty()
+                        ? compiled_action->route_product_ids[route_index]
+                        : std::numeric_limits<std::uint32_t>::max();
+                    const double* shared_product = workspace.find(slot);
+                    if (shared_product == nullptr) {
+                        const std::size_t first_elements =
+                            x_dim * r_dim * j_dim;
+                        if (
+                            cached_first_parent != parent_index
+                            || cached_first_bra != bra_index
+                            || cached_first_elements != first_elements
+                        ) {
+                            temporary.resize(first_elements);
+                            for (std::size_t x = 0; x < x_dim; ++x) {
+                                cblas_dgemm(
+                                    101, 112, 111,
+                                    static_cast<int>(r_dim),
+                                    static_cast<int>(j_dim),
+                                    static_cast<int>(i_dim),
+                                    1.0,
+                                    bra,
+                                    static_cast<int>(r_dim),
+                                    boundary + x * i_dim * j_dim,
+                                    static_cast<int>(j_dim),
+                                    0.0,
+                                    temporary.data()
+                                        + x * r_dim * j_dim,
+                                    static_cast<int>(j_dim)
+                                );
+                            }
+                            cached_first_parent = parent_index;
+                            cached_first_bra = bra_index;
+                            cached_first_elements = first_elements;
                         }
-                        cached_first_parent = parent_index;
-                        cached_first_bra = bra_index;
-                        cached_first_elements = first_elements;
-                    }
-                    const std::size_t product_elements =
-                        x_dim * r_dim * s_dim;
-                    if (
-                        cached_product_parent != parent_index
-                        || cached_product_bra != bra_index
-                        || cached_product_ket != ket_index
-                        || cached_product_elements != product_elements
-                    ) {
-                        boundary_update_product_.resize(product_elements);
-                        for (std::size_t x = 0; x < x_dim; ++x) {
-                            cblas_dgemm(
-                                101, 111, 111,
-                                static_cast<int>(r_dim),
-                                static_cast<int>(s_dim),
-                                static_cast<int>(j_dim),
-                                1.0,
-                                boundary_update_temporary_.data()
-                                    + x * r_dim * j_dim,
-                                static_cast<int>(j_dim),
-                                ket,
-                                static_cast<int>(s_dim),
-                                0.0,
-                                boundary_update_product_.data()
-                                    + x * r_dim * s_dim,
-                                static_cast<int>(s_dim)
-                            );
+
+                        if (
+                            cached_product_parent != parent_index
+                            || cached_product_bra != bra_index
+                            || cached_product_ket != ket_index
+                            || cached_product_elements != product_elements
+                        ) {
+                            product_scratch.resize(product_elements);
+                            for (std::size_t x = 0; x < x_dim; ++x) {
+                                cblas_dgemm(
+                                    101, 111, 111,
+                                    static_cast<int>(r_dim),
+                                    static_cast<int>(s_dim),
+                                    static_cast<int>(j_dim),
+                                    1.0,
+                                    temporary.data()
+                                        + x * r_dim * j_dim,
+                                    static_cast<int>(j_dim),
+                                    ket,
+                                    static_cast<int>(s_dim),
+                                    0.0,
+                                    product_scratch.data()
+                                        + x * r_dim * s_dim,
+                                    static_cast<int>(s_dim)
+                                );
+                            }
+                            cached_product_parent = parent_index;
+                            cached_product_bra = bra_index;
+                            cached_product_ket = ket_index;
+                            cached_product_elements = product_elements;
                         }
-                        cached_product_parent = parent_index;
-                        cached_product_bra = bra_index;
-                        cached_product_ket = ket_index;
-                        cached_product_elements = product_elements;
+                        shared_product = workspace.retain(slot, product_scratch.data(), product_elements);
                     }
                     for (std::size_t x = 0; x < x_dim; ++x) {
                         const double* product =
-                            boundary_update_product_.data()
+                            shared_product
                             + x * r_dim * s_dim;
                         for (std::size_t y = 0; y < y_dim; ++y) {
                             const double coefficient =
@@ -4342,70 +4528,77 @@ bool MovingEnvironment::advance_boundary(
                     y_dim * i_dim * r_dim * s_dim
                     + nonzero_coefficients * i_dim * s_dim * j_dim;
                 if (contraction_work >= 256) {
-                    const std::size_t first_elements =
-                        y_dim * i_dim * s_dim;
-                    if (
-                        cached_first_parent != parent_index
-                        || cached_first_bra != bra_index
-                        || cached_first_elements != first_elements
-                    ) {
-                        boundary_update_temporary_.resize(first_elements);
-                        for (std::size_t y = 0; y < y_dim; ++y) {
-                            cblas_dgemm(
-                                101, 111, 111,
-                                static_cast<int>(i_dim),
-                                static_cast<int>(s_dim),
-                                static_cast<int>(r_dim),
-                                1.0,
-                                bra,
-                                static_cast<int>(r_dim),
-                                boundary + y * r_dim * s_dim,
-                                static_cast<int>(s_dim),
-                                0.0,
-                                boundary_update_temporary_.data()
-                                    + y * i_dim * s_dim,
-                                static_cast<int>(s_dim)
-                            );
+                    const std::size_t product_elements = y_dim * i_dim * j_dim;
+                    const auto slot = compiled_action && !compiled_action->route_product_ids.empty()
+                        ? compiled_action->route_product_ids[route_index]
+                        : std::numeric_limits<std::uint32_t>::max();
+                    const double* shared_product = workspace.find(slot);
+                    if (shared_product == nullptr) {
+                        const std::size_t first_elements =
+                            y_dim * i_dim * s_dim;
+                        if (
+                            cached_first_parent != parent_index
+                            || cached_first_bra != bra_index
+                            || cached_first_elements != first_elements
+                        ) {
+                            temporary.resize(first_elements);
+                            for (std::size_t y = 0; y < y_dim; ++y) {
+                                cblas_dgemm(
+                                    101, 111, 111,
+                                    static_cast<int>(i_dim),
+                                    static_cast<int>(s_dim),
+                                    static_cast<int>(r_dim),
+                                    1.0,
+                                    bra,
+                                    static_cast<int>(r_dim),
+                                    boundary + y * r_dim * s_dim,
+                                    static_cast<int>(s_dim),
+                                    0.0,
+                                    temporary.data()
+                                        + y * i_dim * s_dim,
+                                    static_cast<int>(s_dim)
+                                );
+                            }
+                            cached_first_parent = parent_index;
+                            cached_first_bra = bra_index;
+                            cached_first_elements = first_elements;
                         }
-                        cached_first_parent = parent_index;
-                        cached_first_bra = bra_index;
-                        cached_first_elements = first_elements;
-                    }
-                    const std::size_t product_elements =
-                        y_dim * i_dim * j_dim;
-                    if (
-                        cached_product_parent != parent_index
-                        || cached_product_bra != bra_index
-                        || cached_product_ket != ket_index
-                        || cached_product_elements != product_elements
-                    ) {
-                        boundary_update_product_.resize(product_elements);
-                        for (std::size_t y = 0; y < y_dim; ++y) {
-                            cblas_dgemm(
-                                101, 111, 112,
-                                static_cast<int>(i_dim),
-                                static_cast<int>(j_dim),
-                                static_cast<int>(s_dim),
-                                1.0,
-                                boundary_update_temporary_.data()
-                                    + y * i_dim * s_dim,
-                                static_cast<int>(s_dim),
-                                ket,
-                                static_cast<int>(s_dim),
-                                0.0,
-                                boundary_update_product_.data()
-                                    + y * i_dim * j_dim,
-                                static_cast<int>(j_dim)
-                            );
+
+                        if (
+                            cached_product_parent != parent_index
+                            || cached_product_bra != bra_index
+                            || cached_product_ket != ket_index
+                            || cached_product_elements != product_elements
+                        ) {
+                            product_scratch.resize(product_elements);
+                            for (std::size_t y = 0; y < y_dim; ++y) {
+                                cblas_dgemm(
+                                    101, 111, 112,
+                                    static_cast<int>(i_dim),
+                                    static_cast<int>(j_dim),
+                                    static_cast<int>(s_dim),
+                                    1.0,
+                                    temporary.data()
+                                        + y * i_dim * s_dim,
+                                    static_cast<int>(s_dim),
+                                    ket,
+                                    static_cast<int>(s_dim),
+                                    0.0,
+                                    product_scratch.data()
+                                        + y * i_dim * j_dim,
+                                    static_cast<int>(j_dim)
+                                );
+                            }
+                            cached_product_parent = parent_index;
+                            cached_product_bra = bra_index;
+                            cached_product_ket = ket_index;
+                            cached_product_elements = product_elements;
                         }
-                        cached_product_parent = parent_index;
-                        cached_product_bra = bra_index;
-                        cached_product_ket = ket_index;
-                        cached_product_elements = product_elements;
+                        shared_product = workspace.retain(slot, product_scratch.data(), product_elements);
                     }
                     for (std::size_t y = 0; y < y_dim; ++y) {
                         const double* product =
-                            boundary_update_product_.data()
+                            shared_product
                             + y * i_dim * j_dim;
                         for (std::size_t x = 0; x < x_dim; ++x) {
                             const double coefficient =
@@ -4476,6 +4669,70 @@ bool MovingEnvironment::advance_boundary(
             }
         }
     }
+    };
+#ifdef _OPENMP
+    const bool parallel = n_threads_ > 1 && n_routes >= 128
+        && compiled_action != nullptr
+        && compiled_action->output_route_offsets.size() > 2;
+    if (parallel) {
+        ++openmp_parallel_regions_;
+        ++boundary_update_parallel_calls_;
+        const auto& offsets = compiled_action->output_route_offsets;
+        openmp_tasks_ += offsets.size() - 1;
+        std::exception_ptr error;
+        boundary_update_thread_temporary_.resize(n_threads_);
+        boundary_update_thread_product_.resize(n_threads_);
+#pragma omp parallel num_threads(n_threads_)
+        {
+            const auto worker = static_cast<std::size_t>(omp_get_thread_num());
+            auto& temporary = boundary_update_thread_temporary_[worker];
+            auto& product = boundary_update_thread_product_[worker];
+#pragma omp for schedule(dynamic, 1)
+            for (std::int64_t block = 0;
+                 block < static_cast<std::int64_t>(offsets.size() - 1); ++block) {
+                try {
+                    contract_routes(compiled_action->output_route_order.data(),
+                                    offsets[block], offsets[block + 1], temporary, product,
+                                    boundary_update_thread_cache_[worker]);
+                } catch (...) {
+#pragma omp critical(pyqed_su2_boundary_update_error)
+                    { if (!error) error = std::current_exception(); }
+                }
+            }
+        }
+        std::size_t cache_bytes = boundary_update_cache_.values.capacity() * sizeof(double);
+        for (const auto& cache : boundary_update_thread_cache_)
+            cache_bytes += cache.values.capacity() * sizeof(double);
+        peak_boundary_product_cache_bytes_ = std::max(peak_boundary_product_cache_bytes_, cache_bytes);
+        // Retain small workspaces between updates; release oversized
+        // buffers so this reuse adds at most 16 MiB across all workers.
+        const std::size_t per_worker = 16 * 1024 * 1024 / n_threads_;
+        for (std::size_t worker = 0; worker < boundary_update_thread_temporary_.size(); ++worker) {
+            auto& temporary = boundary_update_thread_temporary_[worker];
+            auto& product = boundary_update_thread_product_[worker];
+            auto& cache = boundary_update_thread_cache_[worker];
+            if ((temporary.capacity() + product.capacity()) * sizeof(double)
+                    + cache.memory_bytes() > per_worker) {
+                std::vector<double>().swap(temporary);
+                std::vector<double>().swap(product);
+                boundary_update_product_cache_hits_ += cache.hits;
+                cache = BoundaryProductWorkspace{};
+            }
+        }
+        if (error) std::rethrow_exception(error);
+    } else
+#endif
+    {
+        contract_routes(nullptr, 0, n_routes,
+                        boundary_update_temporary_, boundary_update_product_, boundary_update_cache_);
+    }
+    std::size_t product_cache_bytes = boundary_update_cache_.values.capacity() * sizeof(double);
+    boundary_update_product_cache_hits_ += boundary_update_cache_.hits;
+    for (const auto& cache : boundary_update_thread_cache_) {
+        boundary_update_product_cache_hits_ += cache.hits;
+        product_cache_bytes += cache.values.capacity() * sizeof(double);
+    }
+    peak_boundary_product_cache_bytes_ = std::max(peak_boundary_product_cache_bytes_, product_cache_bytes);
     if (finalize_update) {
         ++boundary_numeric_refreshes_;
         ++boundary_update_calls_;
@@ -4873,6 +5130,8 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
     std::uint64_t numeric_revision,
     std::uint64_t route_topology_revision
 ) {
+    const double preparation_started = wall_seconds();
+    const auto recoupling_hits_started = contextual_recoupling_cache_hits_;
     constexpr std::size_t physical_charge_count =
         nc_physical_charge_count;
     constexpr std::size_t operator_count = nc_operator_count;
@@ -4960,13 +5219,13 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
                 const std::int64_t value = source[field];
                 if (
                     value < 0 ||
-                    value > std::numeric_limits<std::uint16_t>::max()
+                    value > std::numeric_limits<std::uint32_t>::max()
                 ) {
                     throw std::overflow_error(
-                        "Normal/complementary route index exceeds uint16."
+                        "Normal/complementary route index exceeds uint32."
                     );
                 }
-                return static_cast<std::uint16_t>(value);
+                return static_cast<std::uint32_t>(value);
             };
             auto compact_byte = [source](std::size_t field) {
                 const std::int64_t value = source[field];
@@ -5153,6 +5412,9 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
                 ) {
                     primitive_value = -primitive_value;
                 }
+                if (primitive_value == 0.0) {
+                    continue;
+                }
                 if (reduced_physical) {
                     const std::int32_t source_two_m =
                         source_channel.two_j -
@@ -5173,10 +5435,10 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
                         dual_factor = -1.0;
                     }
                     const double recoupling =
-                        reduced_environment_recoupling_impl(
-                            left,
-                            physical_out_charge,
-                            physical_in_charge,
+                        cached_contextual_recoupling(ContextualRecouplingKey{
+                            left ? 1 : 0,
+                            static_cast<std::int32_t>(physical_out_charge),
+                            static_cast<std::int32_t>(physical_in_charge),
                             source[7],
                             source[8],
                             source[9],
@@ -5189,8 +5451,8 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
                             source_two_m,
                             target_two_m,
                             action.local_two_m,
-                            !left && dual_right_boundary
-                        );
+                            !left && dual_right_boundary ? 1 : 0
+                        });
                     mpo_values[
                         core_start +
                         static_cast<std::size_t>(
@@ -5658,9 +5920,52 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
         mpo_offsets.shrink_to_fit();
         mpo_shape_offsets.shrink_to_fit();
         mpo_shapes.shrink_to_fit();
+        // Group by destination without changing the order of contributions
+        // within a block. Workers therefore never share an output element.
+        auto& offsets = boundary_action.output_route_offsets;
+        auto& order = boundary_action.output_route_order;
+        offsets.assign(boundary_action.output_block_dims.size() + 1, 0);
+        for (const auto& route : boundary_action.routes) {
+            if (static_cast<std::size_t>(route.output) + 1 >= offsets.size()) {
+                throw std::logic_error("Boundary route destination is invalid.");
+            }
+            ++offsets[route.output + 1];
+        }
+        std::partial_sum(offsets.begin(), offsets.end(), offsets.begin());
+        auto cursor = offsets;
+        order.resize(boundary_action.routes.size());
+        for (std::size_t index = 0; index < order.size(); ++index) {
+            order[cursor[boundary_action.routes[index].output]++] = index;
+        }
+        boundary_action.route_product_ids.assign(boundary_action.routes.size(),
+            std::numeric_limits<std::uint32_t>::max());
+        boundary_action.product_count = 0;
+        if (reduced_physical) {
+            for (std::size_t begin = 0; begin < boundary_action.routes.size();) {
+                const auto& first = boundary_action.routes[begin];
+                auto end = begin + 1;
+                while (end < boundary_action.routes.size()) {
+                    const auto& next = boundary_action.routes[end];
+                    if (std::tie(first.parent, first.bra, first.ket)
+                        != std::tie(next.parent, next.bra, next.ket)) break;
+                    ++end;
+                }
+                if (end - begin > 1) {
+                    if (boundary_action.product_count >= std::numeric_limits<std::uint32_t>::max())
+                        throw std::overflow_error("Boundary product plan exceeds uint32.");
+                    std::fill(boundary_action.route_product_ids.begin() + begin,
+                              boundary_action.route_product_ids.begin() + end,
+                              static_cast<std::uint32_t>(boundary_action.product_count++));
+                }
+                begin = end;
+            }
+        }
         boundary_action.compiled = true;
     }
 
+    boundary_prepare_seconds_ += wall_seconds() - preparation_started;
+    boundary_recoupling_cache_hits_ +=
+        contextual_recoupling_cache_hits_ - recoupling_hits_started;
     return advance_boundary(
         side,
         parent_bond,
@@ -6321,7 +6626,7 @@ void MovingEnvironment::merge_active_bond() {
         const SectorKey& q_left = left_item.first;
         const SectorKey& q_phys_left = physical_left_item.first;
         const std::int64_t middle_charge =
-            q_left[0] + q_phys_left[0];
+            fuse_sector_charge(q_left[0], q_phys_left[0]);
         const std::int64_t middle_min =
             std::llabs(q_left[1] - q_phys_left[1]);
         const std::int64_t middle_max =
@@ -6336,7 +6641,7 @@ void MovingEnvironment::merge_active_bond() {
             const SectorKey& q_phys_right = physical_right_item.first;
             const SectorKey& q_right = right_item.first;
             if (
-                q_right[0] != middle_charge + q_phys_right[0] ||
+                q_right[0] != fuse_sector_charge(middle_charge, q_phys_right[0]) ||
                 q_right[1] <
                     std::llabs(middle_two_j - q_phys_right[1]) ||
                 q_right[1] > middle_two_j + q_phys_right[1] ||
@@ -6829,7 +7134,7 @@ std::vector<OwnedBoundarySiteEntry> owned_boundary_site_entries(
                     label[left ? 4 : 0],
                     label[left ? 5 : 1],
                 },
-                label[2],
+                sector_number(label[2]),
                 label[3],
                 boundary[1],
                 label[left ? 5 : 1],
@@ -7243,6 +7548,8 @@ void MovingEnvironment::rebuild_normal_complementary_boundary_from_split_site(
                             const std::int64_t output_channel = left
                                 ? transition.target
                                 : transition.source;
+                            if ((sector_irrep(ket.next_sector[0]) ^ sector_irrep(bra.next_sector[0]))
+                                != output_channels[static_cast<std::size_t>(output_channel)].point_group) continue;
                             const OwnedBoundaryOutputKey output_key{
                                 ket.next_sector[0],
                                 ket.next_sector[1],
@@ -8221,6 +8528,9 @@ MovingEnvironment::contextual_core_view(
     bool dual_right_basis,
     std::vector<ContextualCoreBlock>& transient
 ) const {
+    physical_output_charge = sector_number(physical_output_charge);
+    physical_input_charge = sector_number(physical_input_charge);
+
     transient.clear();
     if (
         physical_output_charge < 0 ||
@@ -10618,11 +10928,7 @@ void MovingEnvironment::build_raw_execution_groups() {
                 }
                 start = stop;
             }
-            if (
-                compare_shared_left_actions()
-                || compare_shared_right_panels()
-                || rows.size() <= columns.size()
-            ) {
+            if (rows.size() <= columns.size()) {
                 return rows;
             }
             std::sort(columns.begin(), columns.end());
@@ -10830,8 +11136,9 @@ void MovingEnvironment::build_raw_execution_groups() {
                             complementary_local_terms_.at(
                                 static_cast<std::size_t>(action.factor)
                             );
-                        return std::array<std::int64_t, 4>{
-                            term.left_matrix,
+                        return std::array<std::int64_t, 5>{
+                            action.right_grouped ? 0 : 1,
+                            action.right_grouped ? term.right_matrix : term.left_matrix,
                             local.dims[2],
                             action.group,
                             action.factor,
@@ -11076,6 +11383,8 @@ void MovingEnvironment::build_direct_execution_waves() {
     direct_execution_wave_offsets_.clear();
     direct_execution_wave_indices_.clear();
     direct_execution_max_wave_width_ = 0;
+    direct_product_plans_.clear();
+    direct_product_offsets_.clear();
     if (raw_execution_groups_.empty()) {
         return;
     }
@@ -11138,6 +11447,81 @@ void MovingEnvironment::build_direct_execution_waves() {
             direct_execution_wave_indices_.size()
         );
     }
+    build_direct_product_plans();
+}
+
+void MovingEnvironment::build_direct_product_plans() {
+    constexpr auto absent = std::numeric_limits<std::size_t>::max();
+    direct_product_plans_.clear();
+    direct_product_offsets_.clear();
+    const auto budget = direct_product_cache_budget_bytes() / sizeof(double);
+    if (budget == 0 || complementary_local_actions_.empty() || n_threads_ <= 1) {
+        std::vector<double>().swap(direct_product_values_);
+        return;
+    }
+    using Key = std::array<std::int64_t, 5>;
+    struct Candidate {
+        Key key;
+        std::size_t uses = 0;
+        std::size_t offset = absent;
+    };
+    std::unordered_map<Key, std::size_t, IntegerArrayHash<5>> lookup;
+    std::vector<Candidate> candidates;
+    const auto key_for = [this](const RawExecutionGroup& execution,
+                               const RawExecutionAction& action) {
+        const auto& term = complementary_local_terms_.at(action.factor);
+        const auto w = complementary_local_actions_.at(action.group).dims[2];
+        return Key{term.left_matrix, execution.input_offset,
+            execution.dims[0] * execution.dims[2] * w,
+            execution.dims[1] * execution.dims[3],
+            execution.dims[5] * execution.dims[7]};
+    };
+    for (const auto& execution : raw_execution_groups_) {
+        Key previous{-1, -1, -1, -1, -1};
+        for (auto i = execution.action_start; i < execution.action_stop; ++i) {
+            const auto& action = raw_execution_action_arena_[i];
+            if (action.right_grouped) continue;
+            const auto key = key_for(execution, action);
+            if (key == previous) continue; // Already shared within this run.
+            previous = key;
+            const auto entry = lookup.emplace(key, candidates.size());
+            if (entry.second) candidates.push_back(Candidate{key});
+            ++candidates[entry.first->second].uses;
+        }
+    }
+    std::vector<std::size_t> order;
+    for (std::size_t i = 0; i < candidates.size(); ++i)
+        if (candidates[i].uses > 1) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [&candidates](auto a, auto b) {
+        // Saved multiply-adds per stored value, excluding the first product.
+        return (candidates[a].uses - 1) * candidates[a].key[3]
+            > (candidates[b].uses - 1) * candidates[b].key[3];
+    });
+    std::size_t elements = 0;
+    for (auto index : order) {
+        auto& candidate = candidates[index];
+        const auto count = static_cast<std::size_t>(candidate.key[2] * candidate.key[4]);
+        if (count > budget - elements) continue;
+        if (reduced_contextual_left_matrices_.at(candidate.key[0]).size()
+            != static_cast<std::size_t>(candidate.key[2] * candidate.key[3]))
+            throw std::logic_error("Shared direct left-product shape changed.");
+        candidate.offset = elements;
+        direct_product_plans_.push_back(DirectProductPlan{candidate.key, elements});
+        elements += count;
+    }
+    direct_product_offsets_.assign(raw_execution_action_arena_.size(), absent);
+    for (const auto& execution : raw_execution_groups_)
+        for (auto i = execution.action_start; i < execution.action_stop; ++i) {
+            const auto& action = raw_execution_action_arena_[i];
+            if (!action.right_grouped)
+                direct_product_offsets_[i] = candidates.at(lookup.at(key_for(execution, action))).offset;
+        }
+    if (elements > direct_product_values_.capacity() || direct_product_values_.capacity() > budget)
+        std::vector<double>(elements).swap(direct_product_values_);
+    else
+        direct_product_values_.resize(elements);
+    peak_direct_product_cache_bytes_ = std::max(peak_direct_product_cache_bytes_,
+        direct_product_values_.capacity() * sizeof(double));
 }
 
 void MovingEnvironment::build_raw_input_superchannels() {
@@ -11617,7 +12001,8 @@ void MovingEnvironment::build_compact_right_panel_registry() {
         }
     }
     const std::size_t budget = compact_right_panel_element_budget();
-    if (budget == 0 || complementary_local_actions_.empty()) {
+    if (budget == 0 || complementary_local_actions_.empty()
+        || (reduced_contextual_routes_ && raw_output_fusion_waves_.empty())) {
         return;
     }
     ++compact_right_panel_registry_builds_;
@@ -12187,6 +12572,18 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
     if (disable_output_fusion() || requested_output_copy_budget == 0) {
         return;
     }
+    // Shared-output execution requires a complete channel-left cache. Stream
+    // larger layouts through the ordinary reduced complementary executor;
+    // partially packed batches do not preserve changing sector routes.
+    const std::size_t cache_budget =
+        complementary_execution_cache_elements(raw_execution_actions_);
+    std::size_t channel_left_elements = 0;
+    for (const auto& channel : raw_input_superchannels_) {
+        const std::size_t elements = static_cast<std::size_t>(
+            channel.unique_left_rows * channel.kb);
+        if (elements > cache_budget - channel_left_elements) return;
+        channel_left_elements += elements;
+    }
     std::vector<BatchReference> references;
     references.reserve(raw_input_superchannel_batches_);
     for (
@@ -12457,7 +12854,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
             struct SharedRightReference {
                 std::uint32_t binding = 0;
                 std::int64_t source_k_offset = 0;
-                double scale = 0.0;
+                std::int64_t scale_term = -1;
                 std::size_t copied_elements = 0;
             };
             struct SharedRightCandidate {
@@ -12510,6 +12907,10 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                     }
                     const RawExecutionTile& tile =
                         channel.tiles.at(binding.tile);
+                    // Direct-preferred tiles own their output contribution.
+                    // A shared panel would suppress its right buffer and then
+                    // be skipped by the direct-only execution branch.
+                    if (tile.direct_preferred) continue;
                     bool eligible = output_group.dq > 0;
                     std::int64_t source_k_offset = 0;
                     for (
@@ -12594,7 +12995,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                                     binding_index
                                 ),
                                 source_k_offset,
-                                action.right_grouped ? 1.0 : term.scale,
+                                action.right_grouped ? -1 : action.factor,
                                 static_cast<std::size_t>(
                                     output_group.la
                                     * (inner + output_group.dq)
@@ -12813,7 +13214,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                             reference.source_k_offset,
                             panel.total_rows,
                             output_group.la,
-                            reference.scale,
+                            reference.scale_term,
                         }
                     );
                     tile_bindings[reference.binding].push_back(
@@ -13087,6 +13488,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                 }
                 const bool eligible =
                     shared_left_selected[binding_index] == 0
+                    && !tile.direct_preferred
                     &&
                     group.tile_count == 1
                     && group.temporary_offset ==
@@ -13218,6 +13620,31 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                         changed = true;
                     }
                 }
+                // A binding is consumed as a whole. Capacity rejection must
+                // participate in the same fixed point as profitability; dropping
+                // a group after selection silently loses part of that binding.
+                std::size_t planned_elements = wave.shared_left_right_elements
+                    + wave.shared_left_output_elements;
+                for (std::size_t index = 0; index < candidates.size(); ++index) {
+                    if (!candidate_active[index]) continue;
+                    const auto& candidate = candidates[index];
+                    std::size_t columns = 0;
+                    for (const auto& occurrence : candidate.occurrences) {
+                        if (binding_active[occurrence.binding]) {
+                            columns += wave.groups.at(
+                                wave.bindings.at(occurrence.binding).group
+                            ).dq;
+                        }
+                    }
+                    const std::size_t elements =
+                        (candidate.inner + candidate.rows) * columns;
+                    if (elements > target_shared_left_elements - planned_elements) {
+                        candidate_active[index] = false;
+                        changed = true;
+                    } else {
+                        planned_elements += elements;
+                    }
+                }
                 for (
                     std::size_t batch_schedule_index = scheduled_index;
                     batch_schedule_index < scheduled_stop;
@@ -13284,7 +13711,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
                         > target_shared_left_elements
                             - additional_elements
                 ) {
-                    continue;
+                    throw std::logic_error("Shared-left selection exceeded its planned budget.");
                 }
                 if (
                     wave.shared_left_groups.size()
@@ -13368,7 +13795,7 @@ void MovingEnvironment::build_raw_output_fusion_waves() {
             grouped_dgemm_batch_function() != nullptr
             && !disable_grouped_output_products();
         const std::size_t grouped_small_work_limit =
-            grouped_small_output_work_limit();
+            disable_grouped_output_products() ? 0 : grouped_small_output_work_limit();
         for (RawOutputFusionBatch& scheduled : wave.batches) {
             if (
                 !grouped_product_backend
@@ -13835,11 +14262,28 @@ void MovingEnvironment::stash_reduced_contextual_execution_schedule() {
     if (!active_reduced_contextual_execution_schedule_) {
         return;
     }
-    restore_planned_complementary_right_layout();
     const std::uint64_t topology_revision =
         reduced_contextual_action_topology_revision();
     ReducedContextualExecutionSchedule& schedule =
         *active_reduced_contextual_execution_schedule_;
+    schedule.persistent_output_groups = std::move(persistent_output_groups_);
+    schedule.persistent_output_references = std::move(persistent_output_references_);
+    schedule.persistent_output_bindings = std::move(persistent_output_bindings_);
+    schedule.persistent_output_bundles = std::move(persistent_output_bundles_);
+    schedule.persistent_output_bundle_groups = std::move(persistent_output_bundle_groups_);
+    schedule.persistent_output_tasks = std::move(persistent_output_tasks_);
+    schedule.persistent_product_cache = std::move(persistent_product_cache_);
+    schedule.persistent_right_action_slots = std::move(persistent_right_action_slots_);
+    schedule.persistent_right_cache = std::move(persistent_right_cache_);
+    schedule.complementary_pack_tasks = std::move(complementary_pack_tasks_);
+    schedule.persistent_product_cache_elements = persistent_product_cache_elements_;
+    schedule.dynamic_persistent_output_right = dynamic_persistent_output_right_;
+    schedule.complementary_pack_work = complementary_pack_work_;
+    schedule.persistent_right_pack_work = persistent_right_pack_work_;
+    schedule.slab_elements = complementary_execution_slab_.size();
+    schedule.fusion_right_elements = raw_persistent_output_right_.size();
+    schedule.required_elements = complementary_execution_slab_required_elements_;
+    schedule.settings = output_schedule_settings_;
     schedule.groups = std::move(raw_execution_groups_);
     schedule.actions = std::move(raw_execution_action_arena_);
     schedule.combined_left_terms =
@@ -13894,6 +14338,30 @@ bool MovingEnvironment::restore_reduced_contextual_execution_schedule(
         plan.execution.reset();
         return false;
     }
+    persistent_output_groups_ = std::move(schedule.persistent_output_groups);
+    persistent_output_references_ = std::move(schedule.persistent_output_references);
+    persistent_output_bindings_ = std::move(schedule.persistent_output_bindings);
+    persistent_output_bundles_ = std::move(schedule.persistent_output_bundles);
+    persistent_output_bundle_groups_ = std::move(schedule.persistent_output_bundle_groups);
+    persistent_output_tasks_ = std::move(schedule.persistent_output_tasks);
+    persistent_product_cache_ = std::move(schedule.persistent_product_cache);
+    persistent_right_action_slots_ = std::move(schedule.persistent_right_action_slots);
+    persistent_right_cache_ = std::move(schedule.persistent_right_cache);
+    complementary_pack_tasks_ = std::move(schedule.complementary_pack_tasks);
+    persistent_product_cache_elements_ = schedule.persistent_product_cache_elements;
+    dynamic_persistent_output_right_ = schedule.dynamic_persistent_output_right;
+    complementary_pack_work_ = schedule.complementary_pack_work;
+    persistent_right_pack_work_ = schedule.persistent_right_pack_work;
+    output_schedule_restored_ =
+        schedule.settings == output_schedule_settings(n_threads_);
+    const char* disable_reuse = std::getenv("PYQED_SU2_DISABLE_SCHEDULE_REUSE");
+    if (disable_reuse && disable_reuse[0] == '1') {
+        output_schedule_restored_ = false;
+    }
+    output_schedule_settings_ = schedule.settings;
+    complementary_execution_slab_.resize(schedule.slab_elements);
+    raw_persistent_output_right_.resize(schedule.fusion_right_elements);
+    complementary_execution_slab_required_elements_ = schedule.required_elements;
     raw_execution_groups_ = std::move(schedule.groups);
     raw_execution_action_arena_ = std::move(schedule.actions);
     raw_combined_left_terms_ =
@@ -13931,6 +14399,9 @@ bool MovingEnvironment::restore_reduced_contextual_execution_schedule(
         plan.execution.reset();
         return false;
     }
+    // Output schedules compact right-panel offsets in place. Replanning must
+    // start from the logical actions, not those already compacted buffers.
+    if (!output_schedule_restored_) build_raw_input_superchannels();
     build_direct_execution_waves();
     active_reduced_contextual_execution_schedule_ = plan.execution;
     ++complementary_execution_graph_hits_;
@@ -13942,61 +14413,63 @@ bool MovingEnvironment::restore_reduced_contextual_execution_schedule(
 void MovingEnvironment::pack_cached_complementary_execution_slab() {
     constexpr std::size_t no_offset =
         std::numeric_limits<std::size_t>::max();
-    complementary_pack_tasks_.clear();
-    long double pack_work = 0.0L;
-    for (
-        std::size_t channel_index = 0;
-        channel_index < raw_input_superchannels_.size();
-        ++channel_index
-    ) {
-        const RawInputSuperchannel& channel =
-            raw_input_superchannels_[channel_index];
-        if (channel.cached_unique_left_offset != no_offset) {
-            if (
-                channel.unique_left_actions.size()
-                    != channel.unique_left_row_offsets.size()
-            ) {
-                throw std::logic_error(
-                    "Channel unique-left schedule is inconsistent."
-                );
-            }
-            if (!channel.unique_left_actions.empty()) {
-                complementary_pack_tasks_.push_back({
-                    0,
-                    channel_index,
-                    0,
-                });
-                pack_work += static_cast<long double>(
-                    channel.unique_left_rows * channel.kb
-                );
-            }
-        }
+    if (!output_schedule_restored_) {
+        complementary_pack_tasks_.clear();
+        complementary_pack_work_ = 0.0L;
         for (
-            std::size_t batch_index = 0;
-            batch_index < channel.batches.size();
-            ++batch_index
+            std::size_t channel_index = 0;
+            channel_index < raw_input_superchannels_.size();
+            ++channel_index
         ) {
-            const RawExecutionBatch& batch = channel.batches[batch_index];
-            if (
-                batch.cached_left_offset == no_offset
-                && batch.cached_right_offset == no_offset
+            const RawInputSuperchannel& channel =
+                raw_input_superchannels_[channel_index];
+            if (channel.cached_unique_left_offset != no_offset) {
+                if (
+                    channel.unique_left_actions.size()
+                        != channel.unique_left_row_offsets.size()
+                ) {
+                    throw std::logic_error(
+                        "Channel unique-left schedule is inconsistent."
+                    );
+                }
+                if (!channel.unique_left_actions.empty()) {
+                    complementary_pack_tasks_.push_back({
+                        0,
+                        channel_index,
+                        0,
+                    });
+                    complementary_pack_work_ += static_cast<long double>(
+                        channel.unique_left_rows * channel.kb
+                    );
+                }
+            }
+            for (
+                std::size_t batch_index = 0;
+                batch_index < channel.batches.size();
+                ++batch_index
             ) {
-                continue;
-            }
-            complementary_pack_tasks_.push_back({
-                1,
-                channel_index,
-                batch_index,
-            });
-            if (batch.cached_left_offset != no_offset) {
-                pack_work += static_cast<long double>(
-                    batch.packed_left_rows * channel.kb
-                );
-            }
-            if (batch.cached_right_offset != no_offset) {
-                pack_work += static_cast<long double>(
-                    batch.total_right_elements
-                );
+                const RawExecutionBatch& batch = channel.batches[batch_index];
+                if (
+                    batch.cached_left_offset == no_offset
+                    && batch.cached_right_offset == no_offset
+                ) {
+                    continue;
+                }
+                complementary_pack_tasks_.push_back({
+                    1,
+                    channel_index,
+                    batch_index,
+                });
+                if (batch.cached_left_offset != no_offset) {
+                    complementary_pack_work_ += static_cast<long double>(
+                        batch.packed_left_rows * channel.kb
+                    );
+                }
+                if (batch.cached_right_offset != no_offset) {
+                    complementary_pack_work_ += static_cast<long double>(
+                        batch.total_right_elements
+                    );
+                }
             }
         }
     }
@@ -14006,7 +14479,7 @@ void MovingEnvironment::pack_cached_complementary_execution_slab() {
 #ifdef _OPENMP
     const std::uint64_t integral_pack_work = static_cast<std::uint64_t>(
         std::min<long double>(
-            pack_work,
+            complementary_pack_work_,
             static_cast<long double>(
                 std::numeric_limits<std::uint64_t>::max()
             )
@@ -14122,6 +14595,28 @@ void MovingEnvironment::pack_cached_complementary_execution_slab() {
 }
 
 void MovingEnvironment::refresh_complementary_execution_slab() {
+    combined_operator_offsets_.clear();
+    combined_operator_values_.clear();
+    if (reduced_contextual_routes_ && raw_output_fusion_waves_.empty()) {
+        prepare_output_fusion_right_slab();
+        return;
+    }
+    if (output_schedule_restored_) {
+        const double started = wall_seconds();
+        refresh_compact_right_panels();
+        refresh_persistent_right_action_cache();
+        pack_cached_complementary_execution_slab();
+        prepare_output_fusion_right_slab();
+        if (complementary_execution_slab_.size()
+            == complementary_execution_slab_required_elements_) {
+            ++complementary_execution_slab_full_prepares_;
+        } else {
+            ++complementary_execution_slab_partial_prepares_;
+        }
+        ++output_schedule_reuses_;
+        raw_execution_pack_seconds_ += wall_seconds() - started;
+        return;
+    }
     constexpr std::size_t no_offset =
         std::numeric_limits<std::size_t>::max();
     restore_planned_complementary_right_layout();
@@ -14540,35 +15035,106 @@ void MovingEnvironment::apply_persistent_output_groups_real(
 void MovingEnvironment::prepare_output_fusion_right_slab() {
     constexpr std::size_t no_offset =
         std::numeric_limits<std::size_t>::max();
-    std::size_t right_elements = 0;
-    for (RawOutputFusionWave& wave : raw_output_fusion_waves_) {
-        wave.persistent_right_offset = right_elements;
-        right_elements +=
-            wave.right_elements
-            + wave.shared_left_right_elements
-            + wave.grouped_product_right_elements;
+    // Column-grouped actions repeatedly form the same weighted left sum.
+    // Form it once for this numeric boundary revision, not per trial vector.
+    combined_operator_offsets_.clear();
+    combined_operator_values_.clear();
+    const auto panel_budget = operator_panel_cache_budget_bytes() / sizeof(double);
+    const auto remaining = panel_budget - std::min(panel_budget, persistent_right_cache_values_.capacity());
+    std::vector<std::uint32_t> uses(raw_execution_action_arena_.size(), 0);
+    for (const auto& binding : persistent_output_bindings_) {
+        const auto& wave = raw_output_fusion_waves_.at(binding.wave);
+        const auto& batch = wave.batches.at(binding.batch);
+        const auto& channel = raw_input_superchannels_.at(batch.channel);
+        if (channel.cached_unique_left_offset != no_offset) continue;
+        const auto& tile = channel.tiles.at(wave.bindings.at(binding.binding).tile);
+        for (auto i = tile.action_start; i < tile.action_stop; ++i) ++uses.at(i);
     }
-    for (RawPersistentOutputGroup& scheduled :
-         persistent_output_groups_) {
-        scheduled.right_offset = no_offset;
-        if (
-            !scheduled.combined
-            || dynamic_persistent_output_right_
-        ) {
-            continue;
+    // Direct actions also reuse weighted left sums on every Davidson vector.
+    // A missing fusion plan does not make these operator panels disposable.
+    if (raw_output_fusion_waves_.empty()) {
+        for (std::size_t i = 0; i < uses.size(); ++i) {
+            if (raw_execution_action_arena_[i].right_grouped) uses[i] = 1;
         }
-        const std::size_t elements = static_cast<std::size_t>(
-            scheduled.total_k * scheduled.dq
-        );
-        if (right_elements > no_offset - elements) {
-            throw std::overflow_error(
-                "Persistent output-group right slab is too large."
+    }
+    std::vector<std::pair<std::uint64_t, std::size_t>> candidates;
+    for (std::size_t i = 0; i < uses.size(); ++i) {
+        const auto& action = raw_execution_action_arena_[i];
+        const auto terms = action.combined_left_stop - action.combined_left_start;
+        if (uses[i] && terms > 1)
+            candidates.emplace_back(static_cast<std::uint64_t>(uses[i]) * terms, i);
+    }
+    // Retain repeated sums by arithmetic saved per stored element. Panels
+    // already supplied by the execution slab require no second copy.
+    std::stable_sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+        return a.first > b.first;
+    });
+    std::size_t selected_elements = 0;
+    for (const auto& candidate : candidates) {
+        const auto& action = raw_execution_action_arena_[candidate.second];
+        if (combined_operator_offsets_.count(action.combined_left_start)) continue;
+        const auto& first = complementary_local_terms_.at(
+            raw_combined_left_terms_.at(action.combined_left_start));
+        const auto elements = reduced_contextual_left_matrices_.at(first.left_matrix).size();
+        if (elements > remaining - selected_elements) continue;
+        combined_operator_offsets_.emplace(action.combined_left_start,
+            std::array<std::size_t, 2>{selected_elements, action.combined_left_stop});
+        selected_elements += elements;
+    }
+    // Allocate exactly when growing; vector geometric growth can exceed a
+    // panel budget even when its logical size fits.
+    if (selected_elements > combined_operator_values_.capacity()
+        || combined_operator_values_.capacity() > remaining)
+        std::vector<double>(selected_elements).swap(combined_operator_values_);
+    else
+        combined_operator_values_.assign(selected_elements, 0.);
+    for (const auto& [start, panel] : combined_operator_offsets_) {
+        const auto& first = complementary_local_terms_.at(raw_combined_left_terms_.at(start));
+        const auto elements = reduced_contextual_left_matrices_.at(first.left_matrix).size();
+        combine_complementary_left_panel(
+            complementary_local_terms_, reduced_contextual_left_matrices_,
+            raw_combined_left_terms_, start, panel[1],
+            combined_operator_values_.data() + panel[0], elements);
+    }
+    peak_operator_panel_cache_bytes_ = std::max(peak_operator_panel_cache_bytes_,
+        (combined_operator_values_.capacity() + persistent_right_cache_values_.capacity()) * sizeof(double));
+    if (!output_schedule_restored_) {
+        std::size_t right_elements = 0;
+        for (RawOutputFusionWave& wave : raw_output_fusion_waves_) {
+            wave.persistent_right_offset = right_elements;
+            right_elements +=
+                wave.right_elements
+                + wave.shared_left_right_elements
+                + wave.grouped_product_right_elements;
+        }
+        std::size_t panel_elements = 0;
+        const std::size_t panel_budget = output_panel_cache_budget_bytes() / sizeof(double);
+        for (RawPersistentOutputGroup& scheduled :
+             persistent_output_groups_) {
+            scheduled.right_offset = no_offset;
+            if (!scheduled.combined && !dynamic_persistent_output_right_) {
+                continue;
+            }
+            const std::size_t elements = static_cast<std::size_t>(
+                scheduled.total_k * scheduled.dq
             );
+            if (dynamic_persistent_output_right_) {
+                if (elements > panel_budget - panel_elements) continue;
+                panel_elements += elements;
+            }
+            if (right_elements > no_offset - elements) {
+                throw std::overflow_error(
+                    "Persistent output-group right slab is too large."
+                );
+            }
+            scheduled.right_offset = right_elements;
+            right_elements += elements;
         }
-        scheduled.right_offset = right_elements;
-        right_elements += elements;
+        peak_output_panel_cache_bytes_ = std::max(
+            peak_output_panel_cache_bytes_, panel_elements * sizeof(double)
+        );
+        raw_persistent_output_right_.resize(right_elements);
     }
-    raw_persistent_output_right_.resize(right_elements);
     for (const RawOutputFusionWave& wave : raw_output_fusion_waves_) {
         for (const RawOutputFusionBatch& scheduled : wave.batches) {
             const RawInputSuperchannel& channel =
@@ -14742,9 +15308,39 @@ void MovingEnvironment::prepare_output_fusion_right_slab() {
             }
         }
     }
-    for (const RawPersistentOutputGroup& scheduled :
-         persistent_output_groups_) {
-        if (!scheduled.combined || scheduled.right_offset == no_offset) {
+    std::uint64_t pack_work = 0;
+    for (const auto& group : persistent_output_groups_) {
+        if (group.right_offset != no_offset) pack_work += group.total_k * group.dq;
+    }
+#ifdef _OPENMP
+    const int pack_threads = adaptive_openmp_thread_count(
+        n_threads_, persistent_output_groups_.size(), pack_work
+    );
+#else
+    constexpr int pack_threads = 1;
+#endif
+    complementary_panel_thread_scratch_.resize(pack_threads);
+    std::atomic<bool> failed{false};
+    std::exception_ptr parallel_error;
+#ifdef _OPENMP
+    if (pack_threads > 1) {
+        ++openmp_parallel_regions_;
+        openmp_tasks_ += persistent_output_groups_.size();
+    }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(pack_threads) if(pack_threads > 1)
+#endif
+    for (std::int64_t group_index = 0;
+         group_index < static_cast<std::int64_t>(persistent_output_groups_.size());
+         ++group_index) {
+        if (failed.load(std::memory_order_relaxed)) continue;
+#ifdef _OPENMP
+        const std::size_t thread_index = static_cast<std::size_t>(omp_get_thread_num());
+#else
+        constexpr std::size_t thread_index = 0;
+#endif
+        try {
+        const auto& scheduled = persistent_output_groups_[group_index];
+        if (scheduled.right_offset == no_offset) {
             continue;
         }
         for (
@@ -14792,13 +15388,22 @@ void MovingEnvironment::prepare_output_fusion_right_slab() {
                 ) {
                     const RawExecutionAction& action =
                         raw_execution_action_arena_.at(action_index);
-                    pack_raw_execution_action_into(
-                        action,
-                        tile.total_w,
-                        w_offset,
-                        nullptr,
-                        target
-                    );
+                    const std::int32_t slot =
+                        action_index < persistent_right_action_slots_.size()
+                        ? persistent_right_action_slots_[action_index] : -1;
+                    if (slot >= 0) {
+                        const auto& entry = persistent_right_cache_.at(slot);
+                        std::copy_n(
+                            persistent_right_cache_values_.data() + entry.value_offset,
+                            static_cast<std::size_t>(entry.rows * entry.cols),
+                            target + w_offset * channel.cr * scheduled.dq
+                        );
+                    } else {
+                        pack_raw_execution_action_into(
+                            action, tile.total_w, w_offset, nullptr, target,
+                            false, 0, 0, &complementary_panel_thread_scratch_[thread_index]
+                        );
+                    }
                     w_offset += complementary_local_actions_.at(
                         action.group
                     ).dims[2];
@@ -14810,7 +15415,17 @@ void MovingEnvironment::prepare_output_fusion_right_slab() {
                 }
             }
         }
+        } catch (...) {
+#ifdef _OPENMP
+#pragma omp critical(pyqed_su2_output_panel_pack_error)
+#endif
+            {
+                if (!parallel_error) parallel_error = std::current_exception();
+            }
+            failed.store(true, std::memory_order_relaxed);
+        }
     }
+    if (parallel_error) std::rethrow_exception(parallel_error);
 }
 
 const double* MovingEnvironment::expand_raw_execution_batch_left_real(
@@ -14907,6 +15522,7 @@ MovingEnvironment::expand_raw_execution_batch_channel_left_real(
     const RawOutputFusionBatch& scheduled,
     bool skip_persistent_output
 ) {
+    const bool direct_fusion = direct_channel_output_fusion();
     const double expand_started = wall_seconds();
     raw_batch_temporary_real_.resize(
         static_cast<std::size_t>(
@@ -14937,7 +15553,7 @@ MovingEnvironment::expand_raw_execution_batch_channel_left_real(
         );
         const bool direct_to_fusion = !tile.direct_preferred && (
             (
-                direct_channel_output_fusion()
+                direct_fusion
                 && output_group.temporary_offset
                     != std::numeric_limits<std::size_t>::max()
             )
@@ -16645,6 +17261,13 @@ void MovingEnvironment::select_direct_complementary_tiles() {
 }
 
 void MovingEnvironment::build_persistent_output_group_schedule() {
+    combined_operator_offsets_.clear();
+    combined_operator_values_.clear();
+    const std::size_t copy_plan_budget = std::min<std::size_t>(
+        std::size_t{8} << 20, output_panel_cache_budget_bytes());
+    std::size_t copy_plan_bytes = 0;
+    output_schedule_restored_ = false;
+    output_schedule_settings_ = output_schedule_settings(n_threads_);
     constexpr std::size_t no_offset =
         std::numeric_limits<std::size_t>::max();
 #ifdef _OPENMP
@@ -16831,16 +17454,12 @@ void MovingEnvironment::build_persistent_output_group_schedule() {
                 if (
                     action_offset + action_count
                         <= batch.channel_left_indices.size()
-                    && (
-                        full_output_schedule
-                        || (
-                            !tile.direct_preferred
-                            && binding.shared_right_start
-                                == binding.shared_right_stop
-                            && !deferred
-                            && specialized_bindings.at(binding_index) == 0
-                        )
-                    )
+                    // Specialized executors already own these contributions,
+                    // including when all ordinary outputs run in parallel.
+                    && !tile.direct_preferred
+                    && binding.shared_right_start == binding.shared_right_stop
+                    && !deferred
+                    && specialized_bindings.at(binding_index) == 0
                 ) {
                     candidate_bindings.back().at(binding_index) = 1;
                 }
@@ -17001,7 +17620,46 @@ void MovingEnvironment::build_persistent_output_group_schedule() {
             reference.binding_stop = static_cast<std::uint32_t>(
                 persistent_output_bindings_.size()
             );
-            persistent_output_references_.push_back(reference);
+            bool cached_left = copy_plan_bytes < copy_plan_budget;
+            for (std::size_t index = reference.binding_start;
+                 cached_left && index < reference.binding_stop; ++index) {
+                const auto& selected = persistent_output_bindings_[index];
+                const auto& selected_batch = wave.batches[selected.batch];
+                const auto& channel = raw_input_superchannels_[selected_batch.channel];
+                if (channel.cached_unique_left_offset == no_offset) {
+                    cached_left = false;
+                    break;
+                }
+                const auto& batch = channel.batches[selected_batch.batch];
+                const auto& binding = wave.bindings[selected.binding];
+                const auto& tile = channel.tiles[binding.tile];
+                std::size_t channel_action = selected.channel_action_offset;
+                std::int64_t destination = binding.group_k_offset;
+                for (std::size_t action_index = tile.action_start;
+                     action_index < tile.action_stop; ++action_index, ++channel_action) {
+                    const auto& action = raw_execution_action_arena_[action_index];
+                    const auto w = complementary_local_actions_[action.group].dims[2];
+                    const auto unique = batch.channel_left_indices.at(channel_action);
+                    reference.left_copies.push_back({
+                        static_cast<std::int64_t>(selected_batch.channel),
+                        channel.unique_left_row_offsets.at(unique) * channel.cr,
+                        destination, w * channel.cr});
+                    destination += w * channel.cr;
+                    if (reference.left_copies.capacity()
+                        > (copy_plan_budget - copy_plan_bytes)
+                            / sizeof(std::array<std::int64_t, 4>)) {
+                        cached_left = false;
+                        break;
+                    }
+                }
+            }
+            if (cached_left) {
+                copy_plan_bytes += reference.left_copies.capacity()
+                    * sizeof(std::array<std::int64_t, 4>);
+            } else {
+                decltype(reference.left_copies)().swap(reference.left_copies);
+            }
+            persistent_output_references_.push_back(std::move(reference));
         }
         scheduled_group.reference_stop = static_cast<std::uint32_t>(
             persistent_output_references_.size()
@@ -17396,6 +18054,8 @@ void MovingEnvironment::build_persistent_right_action_cache() {
     persistent_right_cache_.clear();
     persistent_right_cache_values_.clear();
     if (!dynamic_persistent_output_right_) {
+        // Give the shared operator-panel budget back to active left sums.
+        std::vector<double>().swap(persistent_right_cache_values_);
         return;
     }
     std::vector<std::uint32_t> use_counts(
@@ -17497,7 +18157,7 @@ void MovingEnvironment::build_persistent_right_action_cache() {
             return first.elements < second.elements;
         }
     );
-    constexpr std::size_t right_cache_budget_elements = 2'000'000;
+    const std::size_t right_cache_budget_elements = operator_panel_cache_budget_bytes() / (2*sizeof(double));
     std::size_t selected_elements = 0;
     std::uint64_t pack_work = 0;
     for (const RightCandidate& candidate : candidates) {
@@ -17534,7 +18194,24 @@ void MovingEnvironment::build_persistent_right_action_cache() {
             )
         );
     }
-    persistent_right_cache_values_.resize(selected_elements);
+    persistent_right_pack_work_ = pack_work;
+    refresh_persistent_right_action_cache();
+}
+
+void MovingEnvironment::refresh_persistent_right_action_cache() {
+    std::size_t selected_elements = 0;
+    if (!persistent_right_cache_.empty()) {
+        const auto& last = persistent_right_cache_.back();
+        selected_elements = last.value_offset + last.rows * last.cols;
+    }
+    const auto budget = operator_panel_cache_budget_bytes() / (2*sizeof(double));
+    if (selected_elements > persistent_right_cache_values_.capacity()
+        || persistent_right_cache_values_.capacity() > budget)
+        std::vector<double>(selected_elements).swap(persistent_right_cache_values_);
+    else
+        persistent_right_cache_values_.resize(selected_elements);
+    peak_operator_panel_cache_bytes_ = std::max(
+        peak_operator_panel_cache_bytes_, persistent_right_cache_values_.capacity() * sizeof(double));
     if (persistent_right_cache_.empty()) {
         return;
     }
@@ -17542,7 +18219,7 @@ void MovingEnvironment::build_persistent_right_action_cache() {
     const int pack_threads = adaptive_openmp_thread_count(
         n_threads_,
         persistent_right_cache_.size(),
-        pack_work
+        persistent_right_pack_work_
     );
     const bool parallel_pack = pack_threads > 1;
 #else
@@ -17967,6 +18644,20 @@ std::uint64_t MovingEnvironment::apply_persistent_output_group(
         std::int64_t row_stride,
         std::int64_t reference_k_offset
     ) {
+        if (!reference.left_copies.empty()) {
+            for (const auto& copy : reference.left_copies) {
+                const double* source = raw_channel_temporary_real_.data()
+                    + raw_channel_temporary_offsets_.at(copy[0]) + copy[1];
+                double* target = left_workspace.data()
+                    + reference_k_offset + copy[2];
+                for (std::int64_t row = 0; row < group.la; ++row) {
+                    std::copy_n(source + row * copy[3], copy[3],
+                                target + row * row_stride);
+                }
+                copied_elements += static_cast<std::uint64_t>(group.la * copy[3]);
+            }
+            return;
+        }
         const RawOutputFusionWave& wave =
             raw_output_fusion_waves_.at(reference.wave);
         for (
@@ -18221,6 +18912,10 @@ std::uint64_t MovingEnvironment::apply_persistent_output_group(
                             "Persistent right-action cache changed."
                         );
                     }
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
+                    ++operator_panel_cache_hits_;
                     std::copy_n(
                         persistent_right_cache_values_.data()
                             + entry.value_offset,
@@ -18324,7 +19019,9 @@ std::uint64_t MovingEnvironment::apply_persistent_output_group(
             group.la * group.total_k
         ));
         fill_reference(reference, group, group.total_k, 0);
-        const bool dynamic_right =
+        const bool cached_group = scheduled.right_offset
+            != std::numeric_limits<std::size_t>::max();
+        const bool dynamic_right = !cached_group &&
             group.right_offset
                 == std::numeric_limits<std::size_t>::max();
         if (dynamic_right) {
@@ -18337,8 +19034,9 @@ std::uint64_t MovingEnvironment::apply_persistent_output_group(
             dynamic_right
             ? right_workspace.data()
             : raw_persistent_output_right_.data()
-                + wave.persistent_right_offset
-                + group.right_offset
+                + (cached_group
+                   ? scheduled.right_offset + reference.group_k_offset * scheduled.dq
+                   : wave.persistent_right_offset + group.right_offset)
         );
         raw_dgemm(
             false,
@@ -18464,6 +19162,18 @@ void MovingEnvironment::compact_selected_direct_right_layout() {
 }
 
 void MovingEnvironment::prepare_complementary_execution_slab() {
+    output_schedule_restored_ = false;
+    // The direct contextual executor reads the boundary operators themselves.
+    // Do not allocate or repack fusion panels when no fusion plan can use them.
+    if (reduced_contextual_routes_ && raw_output_fusion_waves_.empty()) {
+        complementary_execution_slab_.clear();
+        complementary_execution_slab_required_elements_ = 0;
+        complementary_pack_tasks_.clear();
+        complementary_pack_work_ = 0.0L;
+        build_persistent_output_group_schedule();
+        prepare_output_fusion_right_slab();
+        return;
+    }
     constexpr std::size_t no_offset =
         std::numeric_limits<std::size_t>::max();
     restore_planned_complementary_right_layout();
@@ -19021,64 +19731,36 @@ void MovingEnvironment::pack_raw_execution_action_into(
         if (left_target != nullptr) {
             const bool combined =
                 action.combined_left_start != action.combined_left_stop;
-            if (!combined) {
-                for (
-                    std::int64_t left_axis = 0;
-                    left_axis < la;
-                    ++left_axis
-                ) {
-                    const double* source =
-                        left.data() + left_axis * kb;
-                    double* target = left_target
-                        + (left_axis * total_w + w_offset) * kb;
-                    std::copy(source, source + kb, target);
+            const auto cached = combined_operator_offsets_.find(action.combined_left_start);
+            if (combined && cached != combined_operator_offsets_.end()) {
+                if (cached->second[1] != action.combined_left_stop)
+                    throw std::logic_error("Combined operator panel range changed.");
+                const auto* values = combined_operator_values_.data() + cached->second[0];
+                for (std::int64_t row = 0; row < la; ++row)
+                    std::copy_n(values + row*w*kb, w*kb,
+                        left_target + (row*total_w+w_offset)*kb);
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
+                ++operator_panel_cache_hits_;
+            } else if (!combined) {
+                if (total_w == w && w_offset == 0) {
+                    std::copy_n(left.data(), la * w * kb, left_target);
+                } else {
+                    for (std::int64_t row = 0; row < la; ++row)
+                        std::copy_n(left.data() + row * w * kb, w * kb,
+                            left_target + (row * total_w + w_offset) * kb);
                 }
             } else {
-                if (
-                    action.combined_left_stop
-                        > raw_combined_left_terms_.size()
-                ) {
-                    throw std::logic_error(
-                        "Combined complementary-left range is invalid."
-                    );
-                }
-                for (
-                    std::int64_t left_axis = 0;
-                    left_axis < la;
-                    ++left_axis
-                ) {
-                    double* target = left_target
-                        + (left_axis * total_w + w_offset) * kb;
-                    std::fill_n(target, static_cast<std::size_t>(kb), 0.0);
-                    for (
-                        std::size_t combined_index =
-                            action.combined_left_start;
-                        combined_index < action.combined_left_stop;
-                        ++combined_index
-                    ) {
-                        const ComplementaryLocalTerm& combined_term =
-                            complementary_local_terms_.at(
-                                raw_combined_left_terms_[combined_index]
-                            );
-                        const ReducedContextualMatrix& matrix =
-                            reduced_contextual_left_matrices_.at(
-                                static_cast<std::size_t>(
-                                    combined_term.left_matrix
-                                )
-                            );
-                        if (matrix.size() != left.size()) {
-                            throw std::logic_error(
-                                "Combined complementary-left shape changed."
-                            );
-                        }
-                        const double* source = matrix.data()
-                            + left_axis * kb;
-                        for (std::int64_t column = 0; column < kb; ++column) {
-                            target[column] +=
-                                combined_term.scale * source[column];
-                        }
-                    }
-                }
+                // Sum directly into each batch row, without a full temporary
+                // panel followed by a scatter copy.
+                combine_complementary_left_panel(
+                    complementary_local_terms_, reduced_contextual_left_matrices_,
+                    raw_combined_left_terms_, action.combined_left_start,
+                    action.combined_left_stop, left_target + w_offset * kb,
+                    static_cast<std::size_t>(la * w * kb),
+                    total_w == w ? 0 : static_cast<std::size_t>(w * kb),
+                    total_w == w ? 0 : static_cast<std::size_t>(total_w * kb));
             }
         }
         if (right_target != nullptr) {
@@ -20442,6 +21124,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
     const double* input,
     double* output
 ) {
+    const bool direct_fusion = direct_channel_output_fusion();
 #ifndef __APPLE__
     if (reduced_contextual_routes_) {
         for (
@@ -20732,6 +21415,23 @@ void MovingEnvironment::apply_raw_factor_groups_real(
         std::uint64_t action_calls = 0;
         std::uint64_t action_count = 0;
         double action_seconds = 0.0;
+        if (!direct_product_plans_.empty()) {
+            for (const auto& plan : direct_product_plans_)
+                if (plan.key[1] < 0 || static_cast<std::size_t>(plan.key[1]
+                    + plan.key[3] * plan.key[4]) > raw_packed_input_real_.size())
+                    throw std::logic_error("Shared direct input block changed.");
+#pragma omp parallel for num_threads(direct_threads) schedule(dynamic, 1)
+            for (std::int64_t i = 0; i < static_cast<std::int64_t>(direct_product_plans_.size()); ++i) {
+                const auto& plan = direct_product_plans_[i];
+                const auto& key = plan.key;
+                const auto& left = reduced_contextual_left_matrices_[key[0]];
+                raw_dgemm(false, false, key[2], key[4], key[3], 1.0,
+                    left.data(), key[3], raw_packed_input_real_.data() + key[1], key[4],
+                    0.0, direct_product_values_.data() + plan.offset, key[4]);
+            }
+            ++openmp_parallel_regions_;
+            openmp_tasks_ += direct_product_plans_.size();
+        }
 #pragma omp parallel num_threads(direct_threads) \
     reduction(+:source_factor_loads,action_calls,action_count,action_seconds)
         {
@@ -20778,7 +21478,8 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                                 raw_packed_input_real_.data(),
                                 output,
                                 left_workspace,
-                                temporary_workspace
+                                temporary_workspace,
+                                true
                             );
                         ++action_calls;
                         action_count +=
@@ -20852,45 +21553,63 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             }
         }
         const double channel_first_stage_started = wall_seconds();
-        raw_channel_temporary_offsets_.resize(
-            raw_input_superchannels_.size() + 1
-        );
-        std::size_t channel_temporary_elements = 0;
-        std::size_t eligible_channels = 0;
-        long double channel_first_stage_work = 0.0;
-        for (
-            std::size_t channel_index = 0;
-            channel_index < raw_input_superchannels_.size();
-            ++channel_index
-        ) {
-            raw_channel_temporary_offsets_[channel_index] =
-                channel_temporary_elements;
-            const RawInputSuperchannel& channel =
-                raw_input_superchannels_[channel_index];
-            const bool scheduled = std::any_of(
-                channel.batches.begin(),
-                channel.batches.end(),
-                [](const RawExecutionBatch& batch) {
-                    return !batch.right_first;
-                }
+        // Only offsets and cost estimates survive a Davidson vector. Numeric
+        // panels still refresh with every route revision; thread choice stays live.
+        if (channel_workspace_revision_ != factor_route_numeric_refreshes_
+            || raw_channel_temporary_offsets_.size()
+                != raw_input_superchannels_.size() + 1) {
+            raw_channel_temporary_offsets_.resize(
+                raw_input_superchannels_.size() + 1
             );
-            if (
-                scheduled
-                && channel.cached_unique_left_offset != no_offset
-                && channel.unique_left_rows > 0
+            std::size_t channel_temporary_elements = 0;
+            std::size_t eligible_channels = 0;
+            long double channel_first_stage_work = 0.0;
+            for (
+                std::size_t channel_index = 0;
+                channel_index < raw_input_superchannels_.size();
+                ++channel_index
             ) {
-                channel_temporary_elements += static_cast<std::size_t>(
-                    channel.unique_left_rows * channel.cr
+                raw_channel_temporary_offsets_[channel_index] =
+                    channel_temporary_elements;
+                const RawInputSuperchannel& channel =
+                    raw_input_superchannels_[channel_index];
+                const bool scheduled = std::any_of(
+                    channel.batches.begin(),
+                    channel.batches.end(),
+                    [](const RawExecutionBatch& batch) {
+                        return !batch.right_first;
+                    }
                 );
-                channel_first_stage_work +=
-                    static_cast<long double>(channel.unique_left_rows)
-                    * static_cast<long double>(channel.cr)
-                    * static_cast<long double>(channel.kb);
-                ++eligible_channels;
+                if (
+                    scheduled
+                    && channel.cached_unique_left_offset != no_offset
+                    && channel.unique_left_rows > 0
+                ) {
+                    channel_temporary_elements += static_cast<std::size_t>(
+                        channel.unique_left_rows * channel.cr
+                    );
+                    channel_first_stage_work +=
+                        static_cast<long double>(channel.unique_left_rows)
+                        * static_cast<long double>(channel.cr)
+                        * static_cast<long double>(channel.kb);
+                    ++eligible_channels;
+                }
             }
+            raw_channel_temporary_offsets_.back() = channel_temporary_elements;
+            raw_channel_temporary_real_.resize(channel_temporary_elements);
+            channel_workspace_revision_ = factor_route_numeric_refreshes_;
+            channel_workspace_count_ = eligible_channels;
+            channel_workspace_work_ = channel_first_stage_work;
+            channel_output_work_ = 0;
+            for (const RawPersistentOutputGroup& group : persistent_output_groups_) {
+                channel_output_work_ += group.work;
+            }
+            ++channel_workspace_builds_;
+        } else {
+            ++channel_workspace_reuses_;
         }
-        raw_channel_temporary_offsets_.back() = channel_temporary_elements;
-        raw_channel_temporary_real_.resize(channel_temporary_elements);
+        const std::size_t eligible_channels = channel_workspace_count_;
+        const long double channel_first_stage_work = channel_workspace_work_;
 #ifdef _OPENMP
         const std::uint64_t integral_channel_work =
             static_cast<std::uint64_t>(
@@ -20961,11 +21680,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             wall_seconds() - channel_first_stage_started;
         }
         }
-        std::uint64_t persistent_output_work = 0;
-        for (const RawPersistentOutputGroup& group :
-             persistent_output_groups_) {
-            persistent_output_work += group.work;
-        }
+        const std::uint64_t persistent_output_work = channel_output_work_;
         const std::size_t affinity_output_task_count =
             persistent_output_bundles_.empty()
             ? persistent_output_groups_.size()
@@ -20984,7 +21699,9 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 persistent_output_work
             );
         const bool private_output_candidate =
-            private_output_threads > affinity_output_threads;
+            private_output_threads > affinity_output_threads
+            || (tasked_output_schedule() && private_output_threads > 1
+                && persistent_output_tasks_.size() > 2 * affinity_output_task_count);
         const std::size_t private_output_vectors =
             private_output_candidate
             ? static_cast<std::size_t>(private_output_threads - 1)
@@ -21059,6 +21776,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             );
             const auto consume_batch = [
                 this,
+                direct_fusion,
                 &wave,
                 use_persistent_output_executor,
                 output
@@ -21118,8 +21836,10 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                     const double* temporary =
                         temporary_values
                         + binding.temporary_row_offset * channel.cr;
+                    // Packing is selective within a batch. An omitted panel
+                    // has no storage even when another tile supplies right_values.
                     const double* binding_right_values = (
-                        right_values == nullptr
+                        right_values == nullptr || !tile.requires_right
                         ? nullptr
                         : right_values
                             + static_cast<std::ptrdiff_t>(
@@ -21190,7 +21910,9 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                                     + shared.source_k_offset;
                                 double* target_row =
                                     target + row * panel.inner;
-                                if (shared.scale == 1.0) {
+                                const double scale = shared.scale_term < 0 ? 1.0
+                                    : complementary_local_terms_.at(shared.scale_term).scale;
+                                if (scale == 1.0) {
                                     std::copy_n(
                                         source,
                                         static_cast<std::size_t>(
@@ -21205,8 +21927,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                                         ++inner
                                     ) {
                                         target_row[inner] =
-                                            shared.scale
-                                            * source[inner];
+                                            scale * source[inner];
                                     }
                                 }
                             }
@@ -21285,7 +22006,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                         raw_output_fusion_temporary_real_.data()
                         + group.temporary_offset;
                     if (
-                        direct_channel_output_fusion()
+                        direct_fusion
                         &&
                         channel_temporary_values != nullptr
                         && !tile.direct_preferred
@@ -21430,6 +22151,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
             };
             const auto consume_channel_batch = [
                 this,
+                direct_fusion,
                 &wave,
                 &consume_batch,
                 use_persistent_output_executor,
@@ -21507,9 +22229,18 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                         && !scheduled.shared_right_panels
                         && !scheduled.deferred_outputs
                         // Direct channel-to-fusion leaves the ordinary
-                        // batch temporary sparse on purpose.  It cannot
+                        // batch temporary sparse on purpose. Persistent output
+                        // groups also skip their batch temporary. Neither may
                         // be consumed by the whole-batch direct fallback.
-                        && !direct_channel_output_fusion()
+                        && !direct_fusion
+                        && std::none_of(
+                            wave.bindings.begin() + scheduled.binding_start,
+                            wave.bindings.begin() + scheduled.binding_stop,
+                            [&wave, use_persistent_output_executor](const auto& binding) {
+                                return use_persistent_output_executor
+                                    && wave.groups.at(binding.group).persistent_output;
+                            }
+                        )
                         && apply_direct_complementary_temporary_batch_real(
                             channel,
                             batch,
@@ -22056,13 +22787,8 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                         std::vector<double>& operator_workspace =
                             persistent_output_thread_operator_[thread_index];
                         operator_workspace.resize(left_elements);
-                        pack_raw_execution_action_into(
-                            action,
-                            w,
-                            0,
-                            operator_workspace.data(),
-                            nullptr
-                        );
+                        pack_raw_execution_action_into(action, w, 0,
+                            operator_workspace.data(), nullptr);
                         raw_dgemm(
                             false,
                             false,
@@ -22124,47 +22850,22 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                                 task.combined
                             );
                     }
-                    for (
-                        std::size_t stride = 1;
-                        stride < thread_count;
-                        stride *= 2
-                    ) {
-                        const std::size_t pair_count =
-                            (thread_count + 2 * stride - 1)
-                            / (2 * stride);
+                    // Partition output elements, so every worker participates
+                    // in the reduction without a barrier at each tree level.
 #ifdef _OPENMP
 #pragma omp for schedule(static)
 #endif
-                        for (
-                            std::int64_t pair = 0;
-                            pair < static_cast<std::int64_t>(pair_count);
-                            ++pair
-                        ) {
-                            const std::size_t target_index =
-                                static_cast<std::size_t>(pair)
-                                * 2 * stride;
-                            const std::size_t source_index =
-                                target_index + stride;
-                            if (source_index >= thread_count) {
-                                continue;
-                            }
-                            double* target = target_index == 0
-                                ? output
-                                : persistent_output_thread_outputs_.at(
-                                    target_index - 1
-                                ).data();
-                            const double* source =
-                                persistent_output_thread_outputs_.at(
-                                    source_index - 1
-                                ).data();
-                            for (
-                                std::size_t index = 0;
-                                index < factor_route_dimension_;
-                                ++index
-                            ) {
-                                target[index] += source[index];
-                            }
+                    for (
+                        std::int64_t index = 0;
+                        index < static_cast<std::int64_t>(factor_route_dimension_);
+                        ++index
+                    ) {
+                        double value = output[index];
+                        for (const std::vector<double>& partial :
+                             persistent_output_thread_outputs_) {
+                            value += partial[index];
                         }
+                        output[index] = value;
                     }
                 }
             } else {
@@ -22513,7 +23214,7 @@ void MovingEnvironment::apply_raw_factor_groups_real(
                 << ", bond=" << active_bond_
                 << ", dimension=" << factor_route_dimension_
                 << ", waves=" << raw_output_fusion_waves_.size()
-                << ")";
+                << ", threads=" << n_threads_ << ")";
             throw std::runtime_error(message.str());
         }
     }
@@ -22557,8 +23258,12 @@ MovingEnvironment::apply_direct_complementary_actions_real_workspace(
     const double* packed_input,
     double* output,
     std::vector<double>& left_workspace,
-    std::vector<double>& temporary_workspace
+    std::vector<double>& temporary_workspace,
+    bool use_shared_products
 ) {
+    const bool sum_right_panels = combine_direct_right_panels();
+    const char* batching = std::getenv("PYQED_SU2_DIRECT_BLOCK_BATCH");
+    const bool batch_blocks = batching == nullptr || batching[0] != '0';
     std::uint64_t source_factor_loads = 0;
     const std::int64_t la =
         execution.dims[0] * execution.dims[2];
@@ -22578,6 +23283,68 @@ MovingEnvironment::apply_direct_complementary_actions_real_workspace(
             complementary_local_terms_.at(
                 static_cast<std::size_t>(first_action.factor)
             );
+        if (batch_blocks && (first_action.right_grouped || (sum_right_panels
+            && (la > 1 || first_action.factor_stop == first_action.factor + 1)))) {
+            // Stack small panels sharing X and the output block. The two
+            // ordinary GEMMs have disjoint packed inputs and a single writer;
+            // no grouped-BLAS or cross-execution output aliasing is involved.
+            constexpr std::int64_t panel_limit = 32768;
+            std::int64_t total_w = 0;
+            std::size_t batch_stop = action_index;
+            if (batch_blocks) {
+                while (batch_stop < action_stop && batch_stop - action_index < 16) {
+                    const auto& candidate = raw_execution_action_arena_[batch_stop];
+                    if (!candidate.right_grouped) {
+                        if (!sum_right_panels
+                            || (la <= 1 && candidate.factor_stop != candidate.factor + 1)) break;
+                        if (use_shared_products && !direct_product_offsets_.empty()
+                            && direct_product_offsets_[batch_stop] != std::numeric_limits<std::size_t>::max())
+                            break;
+                        // Retain the existing shared-left run rather than
+                        // duplicating its first-stage product inside a batch.
+                        if (batch_stop + 1 < action_stop) {
+                            const auto& next = raw_execution_action_arena_[batch_stop + 1];
+                            if (!next.right_grouped
+                                && complementary_local_terms_.at(candidate.factor).left_matrix
+                                    == complementary_local_terms_.at(next.factor).left_matrix
+                                && complementary_local_actions_.at(candidate.group).dims[2]
+                                    == complementary_local_actions_.at(next.group).dims[2]) break;
+                        }
+                    }
+                    const auto w = complementary_local_actions_.at(candidate.group).dims[2];
+                    if ((total_w + w) * (la * kb + cr * dq + la * cr)
+                        > panel_limit) break;
+                    total_w += w;
+                    ++batch_stop;
+                }
+            }
+            if (batch_stop > action_index + 1) {
+                const std::size_t left_count = la * total_w * kb;
+                const std::size_t right_count = total_w * cr * dq;
+                left_workspace.resize(left_count + right_count);
+                double* left = left_workspace.data();
+                double* right = left + left_count;
+                std::int64_t offset = 0;
+                for (auto i = action_index; i < batch_stop; ++i) {
+                    const auto& action = raw_execution_action_arena_[i];
+                    const auto w = complementary_local_actions_.at(action.group).dims[2];
+                    pack_raw_execution_action_into(action, total_w, offset,
+                        left, right, false, 0, 0, &temporary_workspace);
+                    offset += w;
+                    source_factor_loads += action.right_grouped ? 1
+                        : action.factor_stop - action.factor;
+                }
+                temporary_workspace.resize(la * total_w * cr);
+                raw_dgemm(false, false, la * total_w, cr, kb, 1.0,
+                    left, kb, packed_input + execution.input_offset, cr,
+                    0.0, temporary_workspace.data(), cr);
+                raw_dgemm(false, false, la, dq, total_w * cr, 1.0,
+                    temporary_workspace.data(), total_w * cr, right, dq,
+                    1.0, output + execution.output_offset, dq);
+                action_index = batch_stop;
+                continue;
+            }
+        }
         if (first_action.right_grouped) {
             const std::int64_t w = first_local.dims[2];
             left_workspace.resize(
@@ -22648,7 +23415,8 @@ MovingEnvironment::apply_direct_complementary_actions_real_workspace(
                     static_cast<std::size_t>(candidate_action.factor)
                 );
             if (
-                candidate_term.left_matrix != left_matrix
+                candidate_action.right_grouped
+                || candidate_term.left_matrix != left_matrix
                 || candidate_local.dims[2] != w
             ) {
                 break;
@@ -22667,24 +23435,33 @@ MovingEnvironment::apply_direct_complementary_actions_real_workspace(
                 "Direct complementary left shape changed."
             );
         }
-        temporary_workspace.resize(
-            static_cast<std::size_t>(la * w * cr)
-        );
-        raw_dgemm(
-            false,
-            false,
-            la * w,
-            cr,
-            kb,
-            1.0,
-            left.data(),
-            kb,
-            packed_input + execution.input_offset,
-            cr,
-            0.0,
-            temporary_workspace.data(),
-            cr
-        );
+        constexpr auto absent = std::numeric_limits<std::size_t>::max();
+        const auto cached_offset = !use_shared_products || direct_product_offsets_.empty() ? absent
+            : direct_product_offsets_[action_index];
+        // Plans are computed once per trial vector and then read by all workers.
+        if (cached_offset != absent) {
+#ifdef _OPENMP
+#pragma omp atomic update
+#endif
+            ++direct_product_cache_hits_;
+        } else {
+            temporary_workspace.resize(static_cast<std::size_t>(la * w * cr));
+            raw_dgemm(
+                false,
+                false,
+                la * w,
+                cr,
+                kb,
+                1.0,
+                left.data(),
+                kb,
+                packed_input + execution.input_offset,
+                cr,
+                0.0,
+                temporary_workspace.data(),
+                cr
+            );
+        }
         for (
             std::size_t run_index = action_index;
             run_index < run_stop;
@@ -22706,6 +23483,38 @@ MovingEnvironment::apply_direct_complementary_actions_real_workspace(
                 throw std::logic_error(
                     "Direct complementary action range is invalid."
                 );
+            }
+            // Apply a shared-left sum once: (L X) sum_t c_t R_t.
+            // The right panel is independent of the Davidson vector. Even
+            // without retention, summing it costs less than repeated GEMMs.
+            if (term_stop - term_start > 1 && la > 1 && sum_right_panels) {
+                const std::size_t product_elements =
+                    cached_offset == absent ? static_cast<std::size_t>(la * w * cr) : 0;
+                const std::size_t right_elements =
+                    static_cast<std::size_t>(w * cr * dq);
+                for (std::size_t i = term_start; i < term_stop; ++i) {
+                    const auto& term = complementary_local_terms_[i];
+                    const auto& right = reduced_contextual_right_matrices_.at(
+                        static_cast<std::size_t>(term.right_matrix));
+                    if (term.left_matrix != left_matrix
+                        || right.rows != w * cr || right.cols != dq) {
+                        throw std::logic_error("Direct complementary panel shape changed.");
+                    }
+                }
+                temporary_workspace.resize(product_elements + right_elements);
+                double* panel = temporary_workspace.data() + product_elements;
+                combine_complementary_right_panel(
+                    complementary_local_terms_, reduced_contextual_right_matrices_,
+                    static_cast<std::uint32_t>(term_start),
+                    static_cast<std::uint32_t>(term_stop), panel,
+                    right_elements, left_workspace);
+                raw_dgemm(false, false, la, dq, w * cr, 1.0,
+                    cached_offset == absent ? temporary_workspace.data()
+                        : direct_product_values_.data() + cached_offset,
+                    w * cr, panel, dq,
+                    1.0, output + execution.output_offset, dq);
+                source_factor_loads += term_stop - term_start;
+                continue;
             }
             for (
                 std::size_t term_index = term_start;
@@ -22736,7 +23545,8 @@ MovingEnvironment::apply_direct_complementary_actions_real_workspace(
                     dq,
                     w * cr,
                     term.scale,
-                    temporary_workspace.data(),
+                    cached_offset == absent ? temporary_workspace.data()
+                        : direct_product_values_.data() + cached_offset,
                     w * cr,
                     right,
                     output + execution.output_offset,
@@ -23709,6 +24519,9 @@ bool MovingEnvironment::install_factor_routes(
     std::vector<std::uint32_t>().swap(raw_combined_left_terms_);
     std::vector<std::size_t>().swap(direct_execution_wave_offsets_);
     std::vector<std::size_t>().swap(direct_execution_wave_indices_);
+    std::vector<DirectProductPlan>().swap(direct_product_plans_);
+    std::vector<std::size_t>().swap(direct_product_offsets_);
+    std::vector<double>().swap(direct_product_values_);
     std::vector<std::vector<double>>().swap(direct_action_thread_left_);
     std::vector<std::vector<double>>().swap(
         direct_action_thread_temporary_
@@ -23776,6 +24589,8 @@ bool MovingEnvironment::install_factor_routes(
         persistent_right_cache_
     );
     std::vector<double>().swap(persistent_right_cache_values_);
+    std::vector<double>().swap(combined_operator_values_);
+    decltype(combined_operator_offsets_)().swap(combined_operator_offsets_);
     dynamic_persistent_output_right_ = false;
     complementary_execution_slab_required_elements_ = 0;
     complementary_execution_slab_.clear();
@@ -24857,6 +25672,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
     const PackedArena& right_boundary,
     std::uint64_t numeric_revision
 ) {
+    const bool specialize_scales = specialize_pivot_scale_refresh();
     const double started = wall_seconds();
     auto fail = [this, started](std::int32_t reason) {
         reduced_contextual_routes_ = false;
@@ -25202,7 +26018,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
         cache.ready[static_cast<std::size_t>(block)] = 1;
         return &result;
     };
-    const auto pivot_decomposition = [&boundary_slice](
+    const auto pivot_decomposition = [&boundary_slice, specialize_scales](
         const PackedArena& arena,
         ContextualDecompositionWorkspace& cache,
         std::uint32_t block,
@@ -25271,7 +26087,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
             }
         }
         if (rank == components) {
-            if (!specialize_pivot_scale_refresh()) {
+            if (!specialize_scales) {
                 result.component_offset = cache.component_values.size();
                 cache.component_values.resize(
                     result.component_offset + components * rank,
@@ -25634,6 +26450,31 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
     struct LocalActionBuilder {
         ComplementaryLocalAction action;
         std::vector<ComplementaryLocalTerm> terms;
+        std::size_t merge_threshold = 64;
+
+        void merge_terms() {
+            // Equal keys retain their route order, including an already
+            // accumulated prefix from an earlier batch.
+            std::stable_sort(terms.begin(), terms.end(),
+                [](const auto& a, const auto& b) {
+                    return std::tie(a.left_matrix, a.right_matrix)
+                         < std::tie(b.left_matrix, b.right_matrix);
+                });
+            std::size_t count = 0;
+            for (const auto& term : terms) {
+                if (count && terms[count-1].left_matrix == term.left_matrix
+                          && terms[count-1].right_matrix == term.right_matrix) {
+                    terms[count-1].scale += term.scale;
+                    terms[count-1].family_mask |= term.family_mask;
+                } else {
+                    terms[count++] = term;
+                }
+            }
+            terms.resize(count);
+            // Geometric growth for distinct terms, bounded batches when
+            // repeated routes contribute to the same operator product.
+            merge_threshold = 2 * count + 64;
+        }
     };
     struct CachedRecipeSource {
         std::int64_t input = 0;
@@ -25940,12 +26781,12 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
             double scalar = 0.0;
             const bool fixed_left =
                 use_pivot_boundary_reduction
-                && specialize_pivot_scale_refresh()
+                && specialize_scales
                 && left_binding.expected_rank
                     == left_binding.expected_components;
             const bool fixed_right =
                 use_pivot_boundary_reduction
-                && specialize_pivot_scale_refresh()
+                && specialize_scales
                 && right_binding.expected_rank
                     == right_binding.expected_components;
             const std::size_t left_pivot_index =
@@ -26733,25 +27574,6 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                     group_index = group_found->second;
                     LocalActionBuilder& existing =
                         local_actions[group_index];
-                    const auto term = std::find_if(
-                        existing.terms.begin(),
-                        existing.terms.end(),
-                        [left_matrix_id, right_matrix_id](
-                            const ComplementaryLocalTerm& candidate
-                        ) {
-                            return
-                                candidate.left_matrix == left_matrix_id &&
-                                candidate.right_matrix == right_matrix_id;
-                        }
-                    );
-                    if (term != existing.terms.end()) {
-                        term->scale += scalar;
-                        term->family_mask |=
-                            static_cast<std::uint8_t>(family_mask);
-                        existing.action.family_mask |=
-                            static_cast<std::uint8_t>(family_mask);
-                        continue;
-                    }
                     existing.action.family_mask |=
                         static_cast<std::uint8_t>(family_mask);
                 }
@@ -26764,6 +27586,8 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                         static_cast<std::uint8_t>(family_mask),
                     }
                 );
+                if (builder.terms.size() >= builder.merge_threshold)
+                    builder.merge_terms();
             }
         }
     }
@@ -26772,6 +27596,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
     }
     if (!refreshed_decomposed_plan) {
         for (LocalActionBuilder& builder : local_actions) {
+            builder.merge_terms();
             auto& terms = builder.terms;
             terms.erase(
                 std::remove_if(
@@ -26782,20 +27607,6 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                     }
                 ),
                 terms.end()
-            );
-            std::sort(
-                terms.begin(),
-                terms.end(),
-                [](const ComplementaryLocalTerm& first,
-                   const ComplementaryLocalTerm& second) {
-                    return std::tie(
-                        first.left_matrix,
-                        first.right_matrix
-                    ) < std::tie(
-                        second.left_matrix,
-                        second.right_matrix
-                    );
-                }
             );
         }
         local_actions.erase(
@@ -26835,12 +27646,8 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
     clear_factor_routes();
     reduced_contextual_left_matrices_ = std::move(left_matrices);
     reduced_contextual_right_matrices_ = std::move(right_matrices);
-    if (refreshed_decomposed_plan) {
-        complementary_local_terms_ = plan.execution->local_terms;
-        if (!remapped_decomposed_plan) {
-            complementary_local_actions_ = plan.execution->local_actions;
-        }
-    }
+    // A refreshed plan transfers these arenas during schedule restoration;
+    // copying them here only to overwrite them there duplicates the work.
     if (borrows_left_boundary) {
         reduced_contextual_left_revision_source_ =
             &left_boundary.numeric_revision;
@@ -26895,16 +27702,15 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                 sizeof(ContextualDecomposedScaleRecipe) +
                 4 * sizeof(double)
             );
-    constexpr std::size_t decomposed_plan_budget_bytes =
-        32 * 1024 * 1024;
+    const std::size_t preparation_budget = preparation_cache_budget_bytes();
+    const std::size_t preparation_remaining = preparation_budget
+        - std::min(preparation_budget, preparation_cache_bytes());
+    // Admit plans by a shared bounded budget, rather than repeatedly
+    // rebuilding valid plans just because their source routes are smaller.
     if (
         !refreshed_decomposed_plan &&
-        decomposed_plan_estimated_bytes <= decomposed_plan_budget_bytes &&
-        (
-            decomposed_plan_estimated_bytes <= 4 * 1024 * 1024
-            || decomposed_plan_estimated_bytes
-                < plan.route_source_memory_bytes()
-        )
+        decomposed_plan_estimated_bytes <= std::min<std::size_t>(
+            32 * 1024 * 1024, preparation_remaining)
     ) {
         const auto left_boundary_identities =
             contextual_boundary_identities(left_boundary);
@@ -27633,7 +28439,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
         if (!plan.decomposed.scale_cores.empty()) {
             constexpr std::uint32_t invariant_scale_mask =
                 std::uint32_t{1} << 31;
-            if (specialize_pivot_scale_refresh()) {
+            if (specialize_scales) {
                 for (
                     ContextualDecomposedScaleRecipe& recipe :
                     plan.decomposed.scale_recipes
@@ -27799,6 +28605,11 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
             plan.decomposed.scale_cores =
                 std::move(dynamic_scale_cores);
         }
+        const auto retained_bytes = plan.decomposed.memory_bytes()
+            + complementary_local_terms_.capacity() * sizeof(ComplementaryLocalTerm)
+            + complementary_local_actions_.capacity() * sizeof(ComplementaryLocalAction);
+        if (retained_bytes > preparation_remaining)
+            plan.decomposed = ContextualDecomposedActionPlan{};
         ++decomposed_action_plan_builds_;
     }
     std::size_t reduced_matrix_elements = 0;
@@ -27938,7 +28749,9 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
                 restored_execution = false;
             }
         }
-        if (!raw_combined_left_schedule_valid()) {
+        // Restoration already validated unchanged shapes. Remapped actions
+        // need a second check against their new dimensions and offsets.
+        if (remapped_decomposed_plan && !raw_combined_left_schedule_valid()) {
             active_reduced_contextual_execution_schedule_.reset();
             plan.execution.reset();
             restored_execution = false;
@@ -27951,7 +28764,7 @@ bool MovingEnvironment::try_activate_reduced_contextual_factor_routes(
         peak_reduced_contextual_executions_,
         raw_execution_actions_
     );
-    if (restored_execution && !rebuilt_execution_shape) {
+    if (restored_execution && !rebuilt_execution_shape && output_schedule_restored_) {
         refresh_complementary_execution_slab();
     } else {
         prepare_complementary_execution_slab();
@@ -28669,6 +29482,11 @@ bool MovingEnvironment::install_contextual_factor_routes(
         std::vector<ContextualCoreReference> references;
         references.reserve(blocks->size());
         for (const ContextualCoreBlock& block : *blocks) {
+            const auto& spatial_plan = system_->normal_complementary_plan(bond + (left ? 0 : 1));
+            const auto spatial_change = sector_irrep(core_key[0]) ^ sector_irrep(core_key[1]);
+            if ((spatial_plan.left_channel_quantum_numbers[block.left_channel].point_group
+                 ^ spatial_plan.right_channel_quantum_numbers[block.right_channel].point_group)
+                != spatial_change) continue;
             if (
                 block.rows >
                 std::numeric_limits<std::uint16_t>::max() ||
@@ -28901,6 +29719,168 @@ bool MovingEnvironment::install_contextual_factor_routes(
         CorePairKeyHash
     > core_pair_join_cache;
     core_pair_join_cache.reserve(256);
+#ifdef _OPENMP
+    if (n_threads_ > 1 && n_basis >= 4 && !contextual_action_fragment_cache_enabled_) {
+        struct RouteJoin {
+            ContextualRouteSkeletonKey key;
+            const std::vector<ContextualCoreReference>* left;
+            const std::vector<ContextualCoreReference>* right;
+            std::vector<ContextualRouteSkeletonTerm> terms;
+            bool cached = false;
+        };
+        struct RouteMatch {
+            ContextualRouteSkeletonTerm term;
+            std::int64_t left_boundary, right_boundary;
+        };
+        struct RoutePair {
+            std::size_t input, output, join;
+            std::vector<RouteMatch> matches;
+        };
+        std::vector<RouteJoin> joins;
+        std::vector<RoutePair> pairs;
+        std::unordered_map<ContextualRouteSkeletonKey, std::size_t,
+                           IntegerArrayHash<16>> join_ids;
+        // Resolve mutable angular/core caches before workers read them.
+        // References to unordered_map elements survive its rehashes.
+        for (std::size_t input = 0; input < n_basis; ++input) {
+            for (std::size_t output = 0; output < n_basis; ++output) {
+                const ContextualRouteSkeletonKey key{
+                    bond, dual_right_basis ? std::int64_t{1} : std::int64_t{0},
+                    qn(output, 2), qn(input, 2), qn(output, 1), qn(input, 1),
+                    qn(output, 3), qn(input, 3), qn(output, 5), qn(input, 5),
+                    qn(output, 6), qn(input, 6), qn(output, 9), qn(input, 9),
+                    qn(output, 7), qn(input, 7),
+                };
+                auto found = join_ids.find(key);
+                if (found == join_ids.end()) {
+                    const auto cached = contextual_route_skeletons_.find(key);
+                    if (cached != contextual_route_skeletons_.end()
+                        && cached->second.terms.empty()) continue;
+                    const ContextualCoreKey left_key{
+                        qn(output, 2), qn(input, 2), qn(output, 1), qn(input, 1),
+                        qn(output, 3), qn(input, 3), qn(output, 5), qn(input, 5),
+                    };
+                    const auto& left_cores = cached_cores(
+                        left_core_cache, left_storage, left_key, true);
+                    if (left_cores.empty()) continue;
+                    const ContextualCoreKey right_key{
+                        qn(output, 6), qn(input, 6), qn(output, 9), qn(input, 9),
+                        qn(output, 7), qn(input, 7), qn(output, 5), qn(input, 5),
+                    };
+                    const auto& right_cores = cached_cores(
+                        right_core_cache, right_storage, right_key, false);
+                    if (right_cores.empty()) continue;
+                    RouteJoin join{key, &left_cores, &right_cores, {},
+                                   cached != contextual_route_skeletons_.end()};
+                    if (join.cached) join.terms = cached->second.terms;
+                    found = join_ids.emplace(key, joins.size()).first;
+                    joins.push_back(std::move(join));
+                }
+                if (joins[found->second].cached) ++contextual_route_skeleton_hits_;
+                pairs.push_back(RoutePair{input, output, found->second, {}});
+            }
+        }
+        std::exception_ptr error;
+        ++openmp_parallel_regions_;
+        ++route_prepare_parallel_calls_;
+        openmp_tasks_ += joins.size() + pairs.size();
+#pragma omp parallel num_threads(n_threads_)
+        {
+#pragma omp for schedule(dynamic, 1)
+            for (std::int64_t index = 0; index < static_cast<std::int64_t>(joins.size()); ++index) {
+                try {
+                    auto& join = joins[index];
+                    if (join.cached) continue;
+                    RightCoreBuckets buckets(right_middle_masks.size());
+                    for (const auto& core : *join.right) {
+                        if (core.left_channel >= 0
+                            && static_cast<std::size_t>(core.left_channel) < buckets.size()) {
+                            buckets[core.left_channel].push_back(&core);
+                        }
+                    }
+                    for (std::size_t li = 0; li < join.left->size(); ++li) {
+                        const auto channel = (*join.left)[li].right_channel;
+                        if (channel < 0 || static_cast<std::size_t>(channel) >= buckets.size()) continue;
+                        for (const auto* right : buckets[channel]) {
+                            const auto ri = static_cast<std::size_t>(right - join.right->data());
+                            if (li > std::numeric_limits<std::uint16_t>::max()
+                                || ri > std::numeric_limits<std::uint16_t>::max()) {
+                                throw std::overflow_error("Contextual core-pair join exceeds compact storage.");
+                            }
+                            join.terms.push_back({static_cast<std::uint16_t>(li),
+                                                  static_cast<std::uint16_t>(ri)});
+                        }
+                    }
+                } catch (...) {
+#pragma omp critical(pyqed_su2_route_prepare_error)
+                    { if (!error) error = std::current_exception(); }
+                }
+            }
+#pragma omp for schedule(dynamic, 8)
+            for (std::int64_t index = 0; index < static_cast<std::int64_t>(pairs.size()); ++index) {
+                try {
+                    auto& pair = pairs[index];
+                    const auto& join = joins[pair.join];
+                    for (const auto& term : join.terms) {
+                        const auto& lc = join.left->at(term.left_core);
+                        const auto& rc = join.right->at(term.right_core);
+                        if (lc.right_channel != rc.left_channel) {
+                            throw std::logic_error("Contextual route skeleton channel changed.");
+                        }
+                        const auto l = left_lookup.find(LookupKey{
+                            left_sector_ids[pair.output], left_sector_ids[pair.input], lc.left_channel});
+                        if (l == left_lookup.end()) continue;
+                        const auto r = right_lookup.find(LookupKey{
+                            right_sector_ids[pair.output], right_sector_ids[pair.input], rc.right_channel});
+                        if (r != right_lookup.end()) {
+                            pair.matches.push_back({term, l->second, r->second});
+                        }
+                    }
+                } catch (...) {
+#pragma omp critical(pyqed_su2_route_prepare_error)
+                    { if (!error) error = std::current_exception(); }
+                }
+            }
+        }
+        if (error) std::rethrow_exception(error);
+        // Assign shared factor IDs and append routes in the original order.
+        for (const auto& pair : pairs) {
+            const auto& join = joins[pair.join];
+            for (const auto& match : pair.matches) {
+                const auto& lc = (*join.left)[match.term.left_core];
+                const auto& rc = (*join.right)[match.term.right_core];
+                const auto lm = lc.right_channel >= 0
+                    && static_cast<std::size_t>(lc.right_channel) < left_middle_masks.size()
+                    ? left_middle_masks[lc.right_channel] : 0;
+                const auto rm = rc.left_channel >= 0
+                    && static_cast<std::size_t>(rc.left_channel) < right_middle_masks.size()
+                    ? right_middle_masks[rc.left_channel] : 0;
+                const auto lw = materialize_core(left_storage, left_core_lookup, lc);
+                const auto rw = materialize_core(right_storage, right_core_lookup, rc);
+                const auto li = factor_id(left_storage, left_factor_lookup,
+                    left_family_masks, match.left_boundary, lw, lm);
+                const auto ri = factor_id(right_storage, right_factor_lookup,
+                    right_family_masks, match.right_boundary, rw, rm);
+                in_indices.push_back(static_cast<std::uint16_t>(pair.input));
+                out_indices.push_back(static_cast<std::uint16_t>(pair.output));
+                left_indices.push_back(compact_factor(li));
+                right_indices.push_back(compact_factor(ri));
+            }
+        }
+        for (auto& join : joins) {
+            if (join.cached) continue;
+            ContextualRouteSkeleton skeleton;
+            skeleton.terms = std::move(join.terms);
+            const auto bytes = sizeof(ContextualRouteSkeletonKey) + skeleton.memory_bytes();
+            if (bytes <= route_skeleton_cache_limit
+                && contextual_route_skeleton_bytes_ <= route_skeleton_cache_limit - bytes) {
+                contextual_route_skeleton_bytes_ += bytes;
+                contextual_route_skeletons_.emplace(join.key, std::move(skeleton));
+            }
+        }
+    } else
+#endif
+    {
     for (std::size_t input = 0; input < n_basis; ++input) {
         for (std::size_t output = 0; output < n_basis; ++output) {
             ContextualActionFragmentKey pair_key{};
@@ -29342,6 +30322,7 @@ bool MovingEnvironment::install_contextual_factor_routes(
                 right_indices.push_back(compact_factor(right_index));
             }
         }
+    }
     }
     contextual_route_match_seconds_ += wall_seconds() - match_start;
     if (in_indices.empty() && cached_action_fragments.empty()) {
@@ -30619,6 +31600,7 @@ bool MovingEnvironment::install_raw_factor_routes(
 
 void MovingEnvironment::clear_factor_routes() {
     stash_reduced_contextual_execution_schedule();
+    output_schedule_restored_ = false;
     clear_factor_route_projection();
     clear_factorized_metric();
     factor_route_key_.clear();
@@ -30681,6 +31663,9 @@ void MovingEnvironment::clear_factor_routes() {
     std::vector<std::uint32_t>().swap(raw_combined_left_terms_);
     std::vector<std::size_t>().swap(direct_execution_wave_offsets_);
     std::vector<std::size_t>().swap(direct_execution_wave_indices_);
+    std::vector<DirectProductPlan>().swap(direct_product_plans_);
+    std::vector<std::size_t>().swap(direct_product_offsets_);
+    std::vector<double>().swap(direct_product_values_);
     std::vector<std::vector<double>>().swap(direct_action_thread_left_);
     std::vector<std::vector<double>>().swap(
         direct_action_thread_temporary_
@@ -30748,6 +31733,8 @@ void MovingEnvironment::clear_factor_routes() {
         persistent_right_cache_
     );
     std::vector<double>().swap(persistent_right_cache_values_);
+    std::vector<double>().swap(combined_operator_values_);
+    decltype(combined_operator_offsets_)().swap(combined_operator_offsets_);
     dynamic_persistent_output_right_ = false;
     raw_input_superchannel_tiles_ = 0;
     raw_input_superchannel_batches_ = 0;
@@ -31280,6 +32267,7 @@ MovingEnvironment::active_bond_complementary_davidson(
     ) {
         ++canonical_projection_davidson_calls_;
     }
+    const double eigensolve_started = wall_seconds();
     pyqed::linalg::DavidsonResult result = projected
         ? factor_route_projected_davidson(
             key,
@@ -31301,6 +32289,7 @@ MovingEnvironment::active_bond_complementary_davidson(
             restart_dimension,
             accept_unconverged
         );
+    active_eigensolve_seconds_ += wall_seconds() - eigensolve_started;
     if (result.accepted) {
         if (projected) {
             lift_projection(result.vector.data());
@@ -31737,6 +32726,7 @@ MovingEnvironment::prepare_and_solve_active_bond_state_average(
     }
     result.estimated_workspace_bytes = fixed_workspace_bytes
         + column_bytes * result.workspace_restart_dimension;
+    const double eigensolve_started = wall_seconds();
     result.davidson = pyqed::linalg::real_block_davidson(
         diagonal,
         guesses,
@@ -31759,6 +32749,7 @@ MovingEnvironment::prepare_and_solve_active_bond_state_average(
             );
         }
     );
+    active_eigensolve_seconds_ += wall_seconds() - eigensolve_started;
     active_bond_root_solutions_.clear();
     if (result.davidson.accepted) {
         active_bond_root_solutions_.resize(nroots);
@@ -36066,7 +37057,122 @@ MovingEnvironment::factor_route_projected_generalized_davidson(
     return result;
 }
 
-BlockSVDResult MovingEnvironment::blockwise_svd(
+
+namespace {
+#ifdef __APPLE__
+extern "C" void zgeqrf_(int*, int*, Complex*, int*, Complex*, Complex*, int*, int*);
+extern "C" void zungqr_(int*, int*, int*, Complex*, int*, Complex*, Complex*, int*, int*);
+#endif
+
+// Row-major thin factors; never materialize the two-site product.
+void cbe_product(const Complex* a, const Complex* b, Complex* c,
+                 std::size_t m, std::size_t n, std::size_t k) {
+#if defined(__APPLE__) && !defined(PYQED_DAVIDSON_PORTABLE)
+    pyqed::linalg::davidson_gemm(101, 111, 111, static_cast<int>(m),
+        static_cast<int>(n), static_cast<int>(k), 1., a, static_cast<int>(k),
+        b, static_cast<int>(n), 0., c, static_cast<int>(n));
+#else
+    std::fill(c, c + m*n, Complex{});
+    for (std::size_t i=0; i<m; ++i)
+        for (std::size_t j=0; j<k; ++j)
+            for (std::size_t l=0; l<n; ++l) c[i*n+l] += a[i*k+j]*b[j*n+l];
+#endif
+}
+std::vector<Complex> cbe_adjoint(const Complex* a, std::size_t m, std::size_t n) {
+    std::vector<Complex> out(m*n);
+    for (std::size_t i=0; i<m; ++i)
+        for (std::size_t j=0; j<n; ++j) out[j*m+i]=std::conj(a[i*n+j]);
+    return out;
+}
+void cbe_qr(const Complex* a, std::size_t m, std::size_t n,
+            std::vector<Complex>& q, std::vector<Complex>& r,
+            ComplexQRLapack qr, ComplexGenerateQLapack generate_q) {
+    const std::size_t k=std::min(m,n);
+    q.resize(m*k); r.assign(k*n, Complex{});
+#ifdef __APPLE__
+    if (qr == nullptr) qr = &zgeqrf_;
+    if (generate_q == nullptr) generate_q = &zungqr_;
+#endif
+    if (qr == nullptr || generate_q == nullptr)
+        throw std::runtime_error("Site-factor QR requires a LAPACK provider");
+    std::vector<Complex> f(m*n), tau(k);
+    for (std::size_t i=0; i<m; ++i)
+        for (std::size_t j=0; j<n; ++j) f[i+j*m]=a[i*n+j];
+    int rows=static_cast<int>(m), cols=static_cast<int>(n), rank=static_cast<int>(k);
+    int lwork=-1, info=0; Complex query;
+    qr(&rows,&cols,f.data(),&rows,tau.data(),&query,&lwork,&info);
+    if (info) throw std::runtime_error("CBE site QR query failed");
+    lwork=std::max(1,static_cast<int>(query.real())); std::vector<Complex> work(lwork);
+    qr(&rows,&cols,f.data(),&rows,tau.data(),work.data(),&lwork,&info);
+    if (info) throw std::runtime_error("CBE site QR failed");
+    for (std::size_t i=0; i<k; ++i)
+        for (std::size_t j=i; j<n; ++j) r[i*n+j]=f[i+j*m];
+    lwork=-1;
+    generate_q(&rows,&rank,&rank,f.data(),&rows,tau.data(),&query,&lwork,&info);
+    if (info) throw std::runtime_error("CBE site Q query failed");
+    lwork=std::max(1,static_cast<int>(query.real())); work.resize(lwork);
+    generate_q(&rows,&rank,&rank,f.data(),&rows,tau.data(),work.data(),&lwork,&info);
+    if (info) throw std::runtime_error("CBE site Q failed");
+    for (std::size_t i=0; i<m; ++i)
+        for (std::size_t j=0; j<k; ++j) q[i*k+j]=f[i+j*m];
+}
+}
+
+BlockSVDResult SectorDecomposition::factorized_blockwise_svd(
+    const Complex* left, std::size_t n_left, const std::int64_t* left_offsets,
+    const Complex* right, std::size_t n_right, const std::int64_t* right_offsets,
+    const std::int64_t* rows, const std::int64_t* bonds, const std::int64_t* cols,
+    const std::int64_t* state_weights, std::size_t n_blocks,
+    double cutoff, std::int64_t max_bond, const std::string& max_bond_mode,
+    bool retain_sector_topology
+) {
+    if (!n_blocks || !left || !right || !left_offsets || !right_offsets
+        || !rows || !bonds || !cols || !state_weights)
+        throw std::invalid_argument("Factorized SVD requires nonempty site factors");
+    std::vector<Complex> cores;
+    std::vector<std::int64_t> offsets{0}, core_rows, core_cols;
+    std::vector<std::vector<Complex>> qleft(n_blocks), qright(n_blocks);
+    for (std::size_t b=0; b<n_blocks; ++b) {
+        const auto m=rows[b], k=bonds[b], n=cols[b];
+        if (m<=0 || k<=0 || n<=0 || m>INT_MAX || k>INT_MAX || n>INT_MAX
+            || left_offsets[b]<0 || right_offsets[b]<0
+            || left_offsets[b+1]-left_offsets[b]!=m*k
+            || right_offsets[b+1]-right_offsets[b]!=k*n
+            || static_cast<std::size_t>(left_offsets[b+1])>n_left
+            || static_cast<std::size_t>(right_offsets[b+1])>n_right)
+            throw std::invalid_argument("Invalid factorized SVD block layout");
+        std::vector<Complex> rl, rr;
+        cbe_qr(left+left_offsets[b],m,k,qleft[b],rl,qr_lapack_,generate_q_lapack_);
+        auto adj=cbe_adjoint(right+right_offsets[b],k,n);
+        cbe_qr(adj.data(),n,k,qright[b],rr,qr_lapack_,generate_q_lapack_);
+        const auto kl=std::min(m,k), kr=std::min(n,k);
+        auto rrh=cbe_adjoint(rr.data(),kr,k);
+        const auto begin=cores.size(); cores.resize(begin+kl*kr);
+        cbe_product(rl.data(),rrh.data(),cores.data()+begin,kl,kr,k);
+        offsets.push_back(cores.size()); core_rows.push_back(kl); core_cols.push_back(kr);
+    }
+    auto result=blockwise_svd(cores.data(),cores.size(),offsets.data(),
+        core_rows.data(),core_cols.data(),state_weights,n_blocks,cutoff,max_bond,
+        max_bond_mode,retain_sector_topology);
+    std::vector<Complex> out_left, out_right;
+    std::vector<std::int64_t> lo{0}, ro{0};
+    for (std::size_t b=0; b<n_blocks; ++b) {
+        const auto rank=result.singular_offsets[b+1]-result.singular_offsets[b];
+        const auto lb=out_left.size(), rb=out_right.size();
+        out_left.resize(lb+rows[b]*rank); out_right.resize(rb+rank*cols[b]);
+        cbe_product(qleft[b].data(),result.left_values.data()+result.left_offsets[b],
+                    out_left.data()+lb,rows[b],rank,core_rows[b]);
+        auto qrh=cbe_adjoint(qright[b].data(),cols[b],core_cols[b]);
+        cbe_product(result.right_values.data()+result.right_offsets[b],qrh.data(),
+                    out_right.data()+rb,rank,cols[b],core_cols[b]);
+        lo.push_back(out_left.size()); ro.push_back(out_right.size());
+    }
+    result.left_values=std::move(out_left); result.right_values=std::move(out_right);
+    result.left_offsets=std::move(lo); result.right_offsets=std::move(ro);
+    return result;
+}
+
+BlockSVDResult SectorDecomposition::blockwise_svd(
     const Complex* values,
     std::size_t n_values,
     const std::int64_t* value_offsets,
@@ -37357,6 +38463,16 @@ void MovingEnvironment::prepare_owned_half_sweep() {
         ++boundary_numeric_refreshes_;
     };
     const std::int64_t right_edge = n_sites_ - 1;
+    const auto& last_site = split_sites_.at(right_edge);
+    const auto target_index = last_site.leg_sector_offsets.at(2);
+    if (last_site.leg_sector_offsets.at(3) != target_index + 1)
+        throw std::logic_error("The right MPS boundary must contain one target sector.");
+    const OwnedBoundarySector target_sector{
+        last_site.leg_sector_labels.at(2*target_index),
+        last_site.leg_sector_labels.at(2*target_index+1)};
+    if (sector_number(target_sector[0]) != system_->n_elec()
+        || target_sector[1] != system_->two_s())
+        throw std::logic_error("The MPS target differs from the complementary Hamiltonian.");
     install_scalar(
         boundaries_,
         "left",
@@ -37377,7 +38493,7 @@ void MovingEnvironment::prepare_owned_half_sweep() {
         boundaries_,
         "right",
         right_edge,
-        OwnedBoundarySector{system_->n_elec(), system_->two_s()},
+        target_sector,
         0,
         false
     );
@@ -37385,7 +38501,7 @@ void MovingEnvironment::prepare_owned_half_sweep() {
         metric_boundaries_,
         "right",
         right_edge,
-        OwnedBoundarySector{system_->n_elec(), system_->two_s()},
+        target_sector,
         0,
         true
     );
@@ -37545,6 +38661,8 @@ MovingEnvironment::execute_owned_half_sweep(
             const std::int64_t site = left ? bond : bond + 1;
             OwnedHalfSweepBondResult result;
             result.bond = bond;
+            double phase_started = wall_seconds();
+            const double eigensolve_before = active_eigensolve_seconds_;
             if (state_average_installed()) {
                 ActiveBondStateAverageSolveResult state_solve =
                     prepare_and_solve_active_bond_state_average(
@@ -37671,11 +38789,32 @@ MovingEnvironment::execute_owned_half_sweep(
                     << metric_is_real()
                     << ", davidson="
                     << result.solve.davidson.accepted
+                    << ", iterations=" << result.solve.davidson.iterations
+                    << ", restarts=" << result.solve.davidson.restarts
                     << ", residual="
                     << result.solve.davidson.residual_norm
                     << ").";
+                if (result.solve.projection.compatible && projection_is_real()
+                    && !result.solve.davidson.accepted) {
+                    const auto n = result.solve.projection.orthonormal_dimension;
+                    std::vector<double> x(n), y(n), hx(n), hy(n);
+                    for (std::size_t i=0; i<n; ++i) {
+                        x[i] = std::sin(double(i+1)) / std::sqrt(double(n));
+                        y[i] = std::cos(double(3*i+1)) / std::sqrt(double(n));
+                    }
+                    factor_route_projected_real_matvec(result.solve.projection.projection_key, x.data(), hx.data(), n);
+                    factor_route_projected_real_matvec(result.solve.projection.projection_key, y.data(), hy.data(), n);
+                    double defect=0., largest_diagonal=0.;
+                    for (std::size_t i=0; i<n; ++i) defect += x[i]*hy[i]-hx[i]*y[i];
+                    for (const auto& value: active_bond_h_diagonal_) largest_diagonal=std::max(largest_diagonal,std::abs(value));
+                    message << " Hermiticity probe=" << defect << ", largest diagonal=" << largest_diagonal;
+                }
                 throw std::runtime_error(message.str());
             }
+            const double eigensolve_elapsed = active_eigensolve_seconds_ - eigensolve_before;
+            owned_prepare_seconds_ += wall_seconds() - phase_started - eigensolve_elapsed;
+            owned_solve_seconds_ += eigensolve_elapsed;
+            phase_started = wall_seconds();
             ActiveBondSplitResult split = split_active_bond_solution(
                 cutoff,
                 max_bond,
@@ -37712,6 +38851,8 @@ MovingEnvironment::execute_owned_half_sweep(
             const std::uint64_t numeric_revision = left
                 ? result.split.left_numeric_revision
                 : result.split.right_numeric_revision;
+            owned_split_seconds_ += wall_seconds() - phase_started;
+            phase_started = wall_seconds();
             rebuild_normal_complementary_boundary_from_split_site(
                 moving_side,
                 parent_bond,
@@ -37727,6 +38868,7 @@ MovingEnvironment::execute_owned_half_sweep(
                     numeric_revision
                 );
             }
+            owned_environment_seconds_ += wall_seconds() - phase_started;
             const std::int64_t fixed_bond = left ? bond + 1 : bond;
             if (
                 (left && fixed_bond != n_sites_ - 1)
@@ -38699,6 +39841,7 @@ std::int32_t component_physical_index(
     std::int32_t two_j,
     std::int32_t two_m
 ) {
+    charge = sector_number(charge);
     if (charge == 0 && two_j == 0 && two_m == 0) return 0;
     if (charge == 1 && two_j == 1 && two_m == 1) return 1;
     if (charge == 1 && two_j == 1 && two_m == -1) return 2;
@@ -38756,7 +39899,7 @@ ComponentMPSSite expand_reduced_site_components(const PackedArena& arena) {
         const std::int32_t left_two_j = static_cast<std::int32_t>(
             arena.labels[6 * block + 1]
         );
-        const std::int64_t physical_charge = arena.labels[6 * block + 2];
+        const std::int64_t physical_charge = sector_number(arena.labels[6 * block + 2]);
         const std::int32_t physical_two_j = static_cast<std::int32_t>(
             arena.labels[6 * block + 3]
         );
@@ -39571,6 +40714,10 @@ void MovingEnvironment::release_workspaces() {
     block_svd_workspace_ = pyqed::linalg::ComplexThinSVDWorkspace{};
     std::vector<double>().swap(boundary_update_temporary_);
     std::vector<double>().swap(boundary_update_product_);
+    std::vector<std::vector<double>>().swap(boundary_update_thread_temporary_);
+    std::vector<std::vector<double>>().swap(boundary_update_thread_product_);
+    boundary_update_cache_ = BoundaryProductWorkspace{};
+    std::vector<BoundaryProductWorkspace>().swap(boundary_update_thread_cache_);
 #ifdef __APPLE__
     malloc_zone_pressure_relief(nullptr, 0);
 #endif
@@ -39861,6 +41008,13 @@ std::uint64_t MovingEnvironment::boundary_update_calls() const noexcept {
 std::uint64_t MovingEnvironment::boundary_update_routes() const noexcept {
     return boundary_update_routes_;
 }
+double MovingEnvironment::boundary_prepare_seconds() const noexcept {
+    return boundary_prepare_seconds_;
+}
+std::uint64_t MovingEnvironment::boundary_recoupling_cache_hits() const noexcept {
+    return boundary_recoupling_cache_hits_;
+}
+
 double MovingEnvironment::boundary_update_seconds() const noexcept {
     return boundary_update_seconds_;
 }
@@ -39982,6 +41136,42 @@ std::size_t
 MovingEnvironment::contextual_route_plan_count() const noexcept {
     return contextual_route_plans_.size();
 }
+std::size_t MovingEnvironment::preparation_cache_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const auto& [key, plan] : contextual_route_plans_) {
+        if (!plan.decomposed.ready) continue;
+        bytes += plan.decomposed.memory_bytes();
+        if (!plan.execution) continue;
+        if (plan.execution == active_reduced_contextual_execution_schedule_) {
+            bytes += complementary_local_terms_.capacity() * sizeof(ComplementaryLocalTerm)
+                + complementary_local_actions_.capacity() * sizeof(ComplementaryLocalAction);
+        } else {
+            bytes += plan.execution->local_terms.capacity() * sizeof(ComplementaryLocalTerm)
+                + plan.execution->local_actions.capacity() * sizeof(ComplementaryLocalAction);
+        }
+    }
+    return bytes;
+}
+
+std::uint64_t MovingEnvironment::boundary_update_product_cache_hits() const noexcept {
+    return boundary_update_product_cache_hits_;
+}
+std::size_t MovingEnvironment::peak_boundary_product_cache_bytes() const noexcept {
+    return peak_boundary_product_cache_bytes_;
+}
+
+std::size_t MovingEnvironment::boundary_update_workspace_bytes() const noexcept {
+    std::size_t bytes = (boundary_update_temporary_.capacity()
+        + boundary_update_product_.capacity()) * sizeof(double);
+    for (const auto& values : boundary_update_thread_temporary_)
+        bytes += values.capacity() * sizeof(double);
+    for (const auto& values : boundary_update_thread_product_)
+        bytes += values.capacity() * sizeof(double);
+    bytes += boundary_update_cache_.memory_bytes();
+    for (const auto& cache : boundary_update_thread_cache_) bytes += cache.memory_bytes();
+    return bytes;
+}
+
 std::size_t
 MovingEnvironment::contextual_route_plan_bytes() const noexcept {
     std::size_t total = 0;
@@ -40146,12 +41336,25 @@ double MovingEnvironment::raw_batch_right_prepare_seconds() const noexcept {
 double MovingEnvironment::raw_batch_fallback_prepare_seconds() const noexcept {
     return raw_batch_fallback_prepare_seconds_;
 }
+std::uint64_t MovingEnvironment::channel_workspace_builds() const noexcept {
+    return channel_workspace_builds_;
+}
+std::uint64_t MovingEnvironment::channel_workspace_reuses() const noexcept {
+    return channel_workspace_reuses_;
+}
 double MovingEnvironment::raw_channel_first_stage_seconds() const noexcept {
     return raw_channel_first_stage_seconds_;
 }
 double MovingEnvironment::raw_wave_batch_seconds() const noexcept {
     return raw_wave_batch_seconds_;
 }
+std::uint64_t MovingEnvironment::direct_product_cache_hits() const noexcept {
+    return direct_product_cache_hits_;
+}
+std::size_t MovingEnvironment::peak_direct_product_cache_bytes() const noexcept {
+    return peak_direct_product_cache_bytes_;
+}
+
 double MovingEnvironment::raw_shared_left_output_seconds() const noexcept {
     return raw_shared_left_output_seconds_;
 }
@@ -40436,6 +41639,22 @@ std::uint64_t
 MovingEnvironment::raw_output_fusion_copied_elements() const noexcept {
     return raw_output_fusion_copied_elements_;
 }
+std::size_t MovingEnvironment::peak_output_panel_cache_bytes() const noexcept {
+    return peak_output_panel_cache_bytes_;
+}
+
+std::size_t MovingEnvironment::peak_operator_panel_cache_bytes() const noexcept {
+    return peak_operator_panel_cache_bytes_;
+}
+
+std::uint64_t MovingEnvironment::operator_panel_cache_hits() const noexcept {
+    return operator_panel_cache_hits_;
+}
+
+std::uint64_t MovingEnvironment::output_schedule_reuses() const noexcept {
+    return output_schedule_reuses_;
+}
+
 std::size_t
 MovingEnvironment::peak_persistent_output_batch_count() const noexcept {
     return peak_persistent_output_batches_;
@@ -40908,6 +42127,25 @@ std::uint64_t MovingEnvironment::owned_half_sweep_calls() const noexcept {
 std::uint64_t MovingEnvironment::owned_half_sweep_bonds() const noexcept {
     return owned_half_sweep_bonds_;
 }
+double MovingEnvironment::owned_environment_seconds() const noexcept {
+    return owned_environment_seconds_;
+}
+double MovingEnvironment::owned_split_seconds() const noexcept {
+    return owned_split_seconds_;
+}
+double MovingEnvironment::owned_solve_seconds() const noexcept {
+    return owned_solve_seconds_;
+}
+std::uint64_t MovingEnvironment::boundary_update_parallel_calls() const noexcept {
+    return boundary_update_parallel_calls_;
+}
+std::uint64_t MovingEnvironment::route_prepare_parallel_calls() const noexcept {
+    return route_prepare_parallel_calls_;
+}
+
+double MovingEnvironment::owned_prepare_seconds() const noexcept {
+    return owned_prepare_seconds_;
+}
 double MovingEnvironment::owned_half_sweep_seconds() const noexcept {
     return owned_half_sweep_seconds_;
 }
@@ -41109,6 +42347,10 @@ std::size_t MovingEnvironment::factor_route_table_bytes() const noexcept {
         * sizeof(RawPersistentOutputGroup);
     total += persistent_output_references_.capacity()
         * sizeof(RawPersistentOutputReference);
+    for (const auto& reference : persistent_output_references_) {
+        total += reference.left_copies.capacity()
+            * sizeof(std::array<std::int64_t, 4>);
+    }
     total += persistent_output_bindings_.capacity()
         * sizeof(RawPersistentOutputBinding);
     total += persistent_output_bundles_.capacity()
@@ -41123,6 +42365,8 @@ std::size_t MovingEnvironment::factor_route_table_bytes() const noexcept {
         * sizeof(std::int32_t);
     total += persistent_right_cache_.capacity()
         * sizeof(RawPersistentRightCacheEntry);
+    total += combined_operator_offsets_.size() * sizeof(decltype(combined_operator_offsets_)::value_type)
+        + combined_operator_offsets_.bucket_count() * sizeof(void*);
     total += complementary_execution_slab_.capacity() * sizeof(double);
     total += dense_pair_executions_.capacity() * sizeof(DensePairExecution);
     total += (
@@ -41167,13 +42411,16 @@ std::size_t MovingEnvironment::borrowed_factor_pool_bytes() const noexcept {
         + borrowed_raw_factor_source_bytes();
 }
 std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
-    std::size_t thread_workspace_elements = 0;
+    std::size_t thread_workspace_elements = combined_operator_values_.capacity();
     for (const auto& workspace : dense_pair_thread_inputs_) {
         thread_workspace_elements += workspace.capacity();
     }
     for (const auto& workspace : dense_pair_thread_outputs_) {
         thread_workspace_elements += workspace.capacity();
     }
+    const auto direct_product_bytes = direct_product_values_.capacity() * sizeof(double)
+        + direct_product_offsets_.capacity() * sizeof(std::size_t)
+        + direct_product_plans_.capacity() * sizeof(DirectProductPlan);
     for (const auto& workspace : direct_action_thread_left_) {
         thread_workspace_elements += workspace.capacity();
     }
@@ -41209,6 +42456,7 @@ std::size_t MovingEnvironment::factor_route_scratch_bytes() const noexcept {
             + active_bond_solution_.capacity()
         ) * sizeof(Complex)
         + product_valid_bytes
+        + direct_product_bytes
         + (
             factor_route_real_scratch_.capacity()
             + real_matvec_input_.capacity()
@@ -41512,8 +42760,7 @@ std::size_t MovingEnvironment::memory_bytes() const noexcept {
     for (const auto& values : active_bond_root_solutions_) {
         total += values.capacity() * sizeof(Complex);
     }
-    total += boundary_update_temporary_.capacity() * sizeof(double);
-    total += boundary_update_product_.capacity() * sizeof(double);
+    total += boundary_update_workspace_bytes();
     return total;
 }
 const std::string& MovingEnvironment::direction() const noexcept {
