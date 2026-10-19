@@ -96,6 +96,9 @@ for the current faster RHF contraction path, supports ``ri_storage="packed"``
 for memory-sensitive runs, applies a Cholesky-first metric solve with an
 eigenvalue fallback, and supports optional three-center screening via
 ``ri_screen_tol``.
+With automatic RI backend selection, shell layouts rejected by the projected
+C++ kernel use the packed Cython RI kernel and blocked spherical transformation.
+Explicit ``ri_tensor_backend='cpp'`` requests still report that rejection.
 
 Multiconfigurational Methods
 ----------------------------

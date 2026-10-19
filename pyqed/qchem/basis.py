@@ -4372,16 +4372,22 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_signatures))
     t0 = time.perf_counter()
     if tensor_backend in {"auto", "cpp"}:
-        tensors = _compute_native_ri_pair_tensors_cpp(
-            signatures,
-            aux_signatures,
-            pair_bounds,
-            ri_screen_tol,
-            primary_transform if spherical else None,
-            aux_transform if spherical else None,
-            factor_options={"tol": tol, "solver": metric_solver,
-                            "block_size": getattr(mol, "builtin_ri_block_size", None)},
-        )
+        try:
+            tensors = _compute_native_ri_pair_tensors_cpp(
+                signatures,
+                aux_signatures,
+                pair_bounds,
+                ri_screen_tol,
+                primary_transform if spherical else None,
+                aux_transform if spherical else None,
+                factor_options={"tol": tol, "solver": metric_solver,
+                                "block_size": getattr(mol, "builtin_ri_block_size", None)},
+            )
+        except ValueError as exc:
+            # Unsupported projected shells can still use the packed AO kernel.
+            if (tensor_backend != "auto" or str(exc) !=
+                    "Projected RI output requires supported complete Cartesian shells."):
+                raise
         if tensors is not None:
             tensor_builder = "cpp-kernel-packed"
             spherical_output = spherical
