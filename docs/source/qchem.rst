@@ -247,3 +247,31 @@ Related Topics
 * :doc:`qchem_architecture`
 * :doc:`mps`
 * :doc:`nonabelian_dmrg_design`
+
+RHF symmetry and occupations
+----------------------------
+
+RHF diagonalizes symmetry blocks throughout the SCF iteration and in the final
+unshifted Fock solve. For non-Abelian groups, Schur reduction diagonalizes each
+multiplicity-space block and lifts its eigenvectors to every partner row.
+``mf.scf_info['symmetry_block_sizes']`` records the actual eigensolve sizes.
+The initial density is group-averaged. Occupation selection is separate from
+Fock diagonalization: an exact integer dynamic program minimizes the sum of
+occupied Fock energies at fixed electron count, filling complete partner
+multiplets. A Fermi boundary inside an E pair therefore need not abort SCF.
+An error is raised only when complete multiplets cannot hold the electron count.
+This is constrained integer filling, not fractional/ensemble RHF; it does not
+provide a stability guarantee or guarantee the global RHF minimum.
+
+SCF densities, J/K builds, virtual level shifts and frontier stability checks
+use explicit ``mo_occ`` masks. At the post-SCF boundary, orbitals are grouped
+occupied then virtual, retaining energy order within each group and permuting
+``mo_energy``, ``mo_coeff`` and ``mo_occ`` together. Thus the returned energies
+need not be globally increasing. Post-HF integral partitions retain their
+occupied/virtual block convention. ``mf.scf_info['occupation_policy']`` records
+``whole_multiplets`` or ``aufbau``; ``occupation_gap`` is the minimum virtual
+energy minus the maximum occupied energy (None for an empty subspace), and
+``non_aufbau`` flags a gap below -1e-8 hartree. Convergence alone does not
+establish stability toward symmetry breaking.
+Symmetry-breaking RHF solutions require ``symmetry=False``, which uses ordinary
+Aufbau filling. Integral and J/K construction are unchanged.

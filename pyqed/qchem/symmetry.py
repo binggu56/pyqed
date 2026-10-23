@@ -1755,7 +1755,12 @@ class SymmetryEigensolver:
                 out += row @ (reduced @ dual)
         return np.real_if_close(out)
 
-    def eigh(self, operator, nocc=None):
+    def eigh(self, operator):
+        """Return energy-ordered eigenpairs without assigning occupations.
+
+        ``orbital_multiplet_ids`` labels the partner sets in the returned
+        column order and is refreshed on every diagonalization.
+        """
         energies, orbitals = [], []
         for reduced, rows in zip(self._reduced_blocks(operator), self.partner_bases):
             count, dim = len(reduced), len(rows)
@@ -1769,7 +1774,5 @@ class SymmetryEigensolver:
                 partners[:, :, row] = basis @ vectors
             orbitals.append(partners.reshape(len(operator), -1))
         order = np.argsort(energies, kind='stable')
-        ids = self.multiplet_ids[order]
-        if nocc is not None and 0 < nocc < len(ids) and ids[nocc-1] == ids[nocc]:
-            raise ValueError('RHF occupation splits a symmetry multiplet; use a complete-shell occupation or symmetry=False.')
+        self.orbital_multiplet_ids = self.multiplet_ids[order]
         return np.asarray(energies)[order], np.column_stack(orbitals)[:, order]
