@@ -66,6 +66,42 @@ def test_darwin_openmp_prefers_homebrew_to_conda(monkeypatch, tmp_path):
     assert str(conda / "lib" / "libomp.dylib") not in link_args
 
 
+@pytest.mark.parametrize('install_name', ['@rpath/libomp.dylib', '/opt/llvm-openmp/lib/libomp.dylib'])
+@pytest.mark.parametrize('linked, rebuild', [
+    ('/old/conda/lib/libomp.dylib', True),
+    ('@rpath/libomp.dylib', True),
+    ('/selected/lib/libomp.dylib', False),
+])
+def test_openmp_runtime_change_rebuilds_timestamp_current_extension(monkeypatch, tmp_path, linked, rebuild, install_name):
+    from setuptools.command.build_ext import build_ext
+    namespace = _setup_namespace(monkeypatch)
+    monkeypatch.setattr(sys, 'platform', 'darwin')
+    output = tmp_path/'kernel.so'
+    output.touch()
+    command = namespace['_LinkedBuildExt'](setuptools.Distribution())
+    command.force = False
+    command.compiler = SimpleNamespace(force=False)
+    monkeypatch.setattr(command, 'get_ext_fullpath', lambda name: str(output))
+    builds, calls = [], []
+    monkeypatch.setattr(build_ext, 'build_extensions',
+                        lambda self: builds.append((self.force, self.compiler.force)))
+    monkeypatch.setattr(build_ext, 'build_extension', lambda self, ext: None)
+    def run(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ['otool', '-D']:
+            return SimpleNamespace(stdout=f'/selected/lib/libomp.dylib:\n{install_name}\n')
+        return SimpleNamespace(stdout=f'{output}:\n\t{linked} (compatibility version 5.0.0)\n')
+    monkeypatch.setattr(namespace['subprocess'], 'run', run)
+    ext = setuptools.Extension('kernel', [], extra_link_args=['/selected/lib/libomp.dylib'])
+    command.extensions = [ext]
+    command.build_extensions()
+    command.build_extension(ext)
+    assert builds == [(rebuild, rebuild)]
+    assert command.force is command.compiler.force is False
+    assert calls[-1] == ['install_name_tool', '-change', install_name,
+                         '/selected/lib/libomp.dylib', str(output)]
+
+
 def test_cpp_davidson_links_the_selected_runtime_by_path(monkeypatch, tmp_path):
     prefix = tmp_path / "libomp"
     (prefix / "include").mkdir(parents=True)
@@ -127,13 +163,18 @@ def test_qchem_extensions_are_required_by_default(monkeypatch):
     extensions = namespace["_extensions_to_build"]()
 
     assert {extension.name for extension in extensions} == {
+        "pyqed.gw._dyson",
+        "pyqed.gw._bse_contractions",
+        "pyqed.gw._contour_contractions",
+        "pyqed.qchem._ao2mo",
         "pyqed.qchem._basis_cy",
         "pyqed.qchem._casscf_cpp",
         "pyqed.qchem._gdf_cpp",
         "pyqed.qchem._integrals_cpp",
         "pyqed.qchem._rys_cy",
     }
-    assert all(not extension.optional for extension in extensions)
+    assert all(extension.optional == extension.name.startswith("pyqed.gw.")
+               for extension in extensions)
 
 
 def test_reference_only_install_can_disable_extensions(monkeypatch):
@@ -150,6 +191,10 @@ def test_extra_extension_groups_keep_qchem_required(monkeypatch):
     extensions = namespace["_extensions_to_build"]()
 
     assert {extension.name for extension in extensions} == {
+        "pyqed.gw._dyson",
+        "pyqed.gw._bse_contractions",
+        "pyqed.gw._contour_contractions",
+        "pyqed.qchem._ao2mo",
         "pyqed.qchem._basis_cy",
         "pyqed.qchem._casscf_cpp",
         "pyqed.qchem._gdf_cpp",
@@ -197,3 +242,25 @@ def test_darwin_cpp_headers_follow_the_active_sdk(monkeypatch, tmp_path):
     assert str(headers) in namespace["_cpp_include_dirs"](
         SimpleNamespace(get_include=lambda: "numpy/include")
     )
+
+
+def test_darwin_openmp_shares_torch_runtime(monkeypatch, tmp_path):
+    import importlib.util
+    prefix = tmp_path / "llvm"
+    (prefix / "include").mkdir(parents=True)
+    (prefix / "lib").mkdir()
+    (prefix / "include" / "omp.h").touch()
+    (prefix / "lib" / "libomp.dylib").touch()
+    torch = tmp_path / "torch"
+    (torch / "lib").mkdir(parents=True)
+    shared = torch / "lib" / "libomp.dylib"
+    shared.touch()
+    namespace = _setup_namespace(monkeypatch)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    monkeypatch.delenv("PYQED_OPENMP_PREFIX", raising=False)
+    monkeypatch.setattr(importlib.util, "find_spec",
+                        lambda name: SimpleNamespace(origin=str(torch / "__init__.py")))
+    compile_args, link_args = namespace["_mps_openmp_flags"]("required")
+    assert str(shared) in link_args
+    assert "-fopenmp" in compile_args

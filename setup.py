@@ -4,6 +4,7 @@
 """The setup script."""
 
 import glob
+import importlib.util
 import os
 from pathlib import Path
 import subprocess
@@ -77,10 +78,13 @@ class _LinkedBuildExt(_build_ext):
         super().build_extension(ext)
         runtime = self._openmp_runtime(ext)
         if sys.platform == "darwin" and runtime is not None:
-            # libomp's install name is @rpath even when linked by full path.
-            # Conda's earlier RPATH can select an incompatible ABI.
+            # Vendors use different install names, including build-machine
+            # absolute paths. Resolve the actual ID rather than assuming @rpath.
+            identity = subprocess.run(["otool", "-D", str(runtime)], check=True,
+                                      capture_output=True, text=True).stdout
+            install_name = identity.splitlines()[-1].strip()
             subprocess.run(
-                ["install_name_tool", "-change", "@rpath/libomp.dylib",
+                ["install_name_tool", "-change", install_name,
                  str(runtime), self.get_ext_fullpath(ext.name)], check=True,
             )
 
@@ -132,7 +136,8 @@ def _cpp_include_dirs(np):
 
 def _mps_openmp_flags(requested=None):
     """Return optional OpenMP compile and link flags for native MPS kernels."""
-    requested = (os.environ.get("PYQED_MPS_OPENMP", "auto") if requested is None else requested).strip().lower()
+    requested = (os.environ.get("PYQED_MPS_OPENMP", "auto") if requested is None
+                 else requested).strip().lower()
     if requested in {"0", "false", "no", "off"}:
         return [], []
     if sys.platform == "win32":
@@ -161,6 +166,15 @@ def _mps_openmp_flags(requested=None):
         archive = library / "libomp.a"
         runtime = dylib if dylib.exists() else archive
         if (include / "omp.h").exists() and runtime.exists():
+            # Share PyTorch's runtime when present; loading two libomp copies
+            # aborts as soon as both libraries enter a parallel region.
+            if not explicit:
+                torch_spec = importlib.util.find_spec("torch")
+                if torch_spec is not None and torch_spec.origin:
+                    shared = Path(torch_spec.origin).parent / "lib" / "libomp.dylib"
+                    if shared.exists():
+                        runtime = shared
+                        library = shared.parent
             link_args = [str(runtime)]
             if runtime.suffix == ".dylib":
                 link_args.append("-Wl,-rpath," + str(library))

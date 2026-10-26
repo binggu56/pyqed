@@ -15,12 +15,13 @@ Based on the PySCF implementation
 
 import numpy as np
 import scipy.linalg
+from scipy.linalg import eigh as eig
+from pyqed.phys import eig_asymm
 import sys
-from scipy.optimize import newton
 
 from functools import reduce
 
-from pyqed import au2ev, is_positive_def
+from pyqed import is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 from pyqed.gw.screening import FactorizedCouplings, StaticScreening
 
@@ -28,18 +29,6 @@ try:
     from pyqed.gw import _bse_contractions
 except ImportError:
     _bse_contractions = None
-
-
-class _LoggerFallback:
-    NOTE = 3
-
-    @staticmethod
-    def log(obj, message, *args):
-        if int(getattr(obj, "verbose", 0)) >= _LoggerFallback.NOTE:
-            print(message % args if args else message)
-
-
-logger = _LoggerFallback()
 
 
 def _ensure_bse_screening(gw):
@@ -389,6 +378,8 @@ class BSE(object):
         self.threading_info = None
 
         gw_ref = gw_or_mf if _is_gw_reference(gw_or_mf) else None
+        if gw_ref is not None and gw_ref.e_qp is None:
+            raise ValueError("Run GW before constructing BSE; use the SCF reference for direct BSE")
         mf = gw_or_mf
         if gw_ref is not None:
             mf = gw_ref._scf
@@ -686,22 +677,6 @@ class BSE(object):
     def y(self, value):
         self._y = value
 
-    def kernel(self, mo_energy=None, mo_coeff=None):
-        if mo_coeff is None:
-            mo_coeff = self._scf.mo_coeff
-        if mo_energy is None:
-            mo_energy = self._scf.mo_energy
-
-        self.e_qp = kernel(self, mo_energy, mo_coeff, verbose=self.verbose)
-        logger.log(self, 'GW bandgap = %.15g', self.e_qp[self.nocc//2]-self.e_qp[self.nocc//2-1])
-        return self.e_qp
-
-    def sigma(self, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
-        return sigma(self, p, q, omegas, e_rpa, t_rpa, vir_sgn)
-
-    def g0(self, omega):
-        return g0(self, omega)
-
     def get_m_rpa(self, e_rpa, t_rpa, *, factorized=True):
         return get_m_rpa(self, e_rpa, t_rpa, factorized=factorized)
 
@@ -780,9 +755,9 @@ class BSE(object):
     ):
         '''Run full BSE excitations and return ``self`` for a chainable API.
 
-        ``kernel()`` retains the historical meaning of computing GW
-        quasiparticle energies.  ``run()`` computes full BSE excitation
-        energies and stores them in ``.e``.  Full BSE amplitudes are stored in
+        Supply a completed ``GW(mf).run()`` calculation for quasiparticle
+        energies, or an SCF reference for direct BSE with mean-field gaps.
+        This method computes excitation energies and stores them in ``.e``.  Full BSE amplitudes are stored in
         ``.xy`` with ``.x``/``.y`` views.  Use :class:`TDA` for the
         Tamm-Dancoff approximation. The matrix-free path defaults to
         real response Davidson; select ``eigensolver="davidson"`` for the
@@ -1247,18 +1222,6 @@ class GWBSEScanner:
 
 
 
-def g0(gw, omega):
-    '''
-    Return the 0th order GF matrix [G0]_{pq} in the basis of single-particle
-    orbitals (MF eigenvectors).
-    '''
-    g0 = np.zeros((gw.nso,gw.nso), dtype=np.complex128)
-    for p in range(gw.nso):
-        if p < gw.nocc: sgn = -1
-        else: sgn = +1
-        g0[p,p] = 1.0/(omega - gw.e_mf[p] + 1j*sgn*gw.eta)
-    return g0
-
 def rpa_AB_matrices(gw, method='TDHF'):
     '''Get the RPA A and B matrices, using TDH, TDHF, or TDDFT.
     '''
@@ -1370,130 +1333,6 @@ def get_m_rpa(gw, e_rpa, t_rpa, *, factorized=True):
     return M
 
 
-
-def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
-    r'''
-    self energy 
-    .. math::
-        
-        \Sigma_{pq} = i [GW]_{pq}
-    '''
-    if not isinstance(omegas, (list,tuple,np.ndarray)):
-        single_point = True
-        omegas = [omegas]
-    else:
-        single_point = False
-
-    # This usually takes the longest:
-    if gw._M is None:
-        gw._M = get_m_rpa(gw, e_rpa, t_rpa)
-
-    nso = gw.nso
-    nocc = gw.nocc
-
-    sigma_c = []
-    sigma_x = []
-    for omega in omegas:
-        sigma_cw = 0.
-        sigma_xw = 0.
-        for L in range(len(e_rpa)):
-            for i in range(nocc):
-                sigma_cw += gw._M[i,q,L]*gw._M[i,p,L]/(
-                            omega - gw.e_mf[i] + e_rpa[L] - 1j*gw.eta )
-            for a in range(nocc, nso):
-                sigma_cw += gw._M[a,q,L]*gw._M[a,p,L]/(
-                            omega - gw.e_mf[a] - e_rpa[L] + vir_sgn*1j*gw.eta )
-        for i in range(nocc):
-            sigma_xw += -_eri(gw, p, i, i, q)
-
-        sigma_c.append(sigma_cw)
-        sigma_x.append(sigma_xw)
-
-    if single_point:
-        return sigma_c[0], sigma_x[0]
-    else:
-        return sigma_c, sigma_x
-
-#def sigma(gw, p, q, omegas, e_rpa, t_rpa, vir_sgn=1):
-#    '''
-#    self energy sigma_{pq} = i [GW]_{pq}
-#    '''
-#    if not isinstance(omegas, (list,tuple,np.ndarray)):
-#        single_point = True
-#        omegas = [omegas]
-#    else:
-#        single_point = False
-#
-#    # This usually takes the longest:
-#    if gw._M is None:
-#        gw._M = get_m_rpa(gw, e_rpa, t_rpa)
-#
-#    nso = gw.nso
-#    nocc = gw.nocc
-#
-#    sigma_c = []
-#    sigma_x = []
-#    for omega in omegas:
-#        sigma_cw = 0.
-#        sigma_xw = 0.
-#        for L in range(len(e_rpa)):
-#            for i in range(nocc):
-#                sigma_cw += gw._M[i,q,L]*gw._M[i,p,L]/(
-#                            omega - gw.e_mf[i] + e_rpa[L] - 1j*gw.eta )
-#            for a in range(nocc, nso):
-#                sigma_cw += gw._M[a,q,L]*gw._M[a,p,L]/(
-#                            omega - gw.e_mf[a] - e_rpa[L] + vir_sgn*1j*gw.eta )
-#        for i in range(nocc):
-#            sigma_xw += -gw.eri[p,i,i,q]
-#
-#        sigma_c.append(sigma_cw)
-#        sigma_x.append(sigma_xw)
-#
-#    if single_point:
-#        return sigma_c[0], sigma_x[0]
-#    else:
-#        return sigma_c, sigma_x
-
-def kernel(gw, so_energy, so_coeff, verbose=logger.NOTE):
-    '''Get the GW-corrected spatial orbital energies.
-
-    Note: Works in spin-orbitals but returns energies for spatial orbitals.
-
-    Args:
-        gw : instance of :class:`GW`
-        so_energy : (nso,) ndarray
-        so_coeff : (nso,nso) ndarray
-
-    Returns:
-        egw : (nso/2,) ndarray
-            The GW-corrected spatial orbital energies.
-    '''
-    print("# --- Performing RPA calculation ...")
-    e_rpa, t_rpa = rpa(gw, method=gw.screening)
-
-    print('RPA eigenvalues = ', e_rpa)
-
-
-    # store the RPA eigvalues for BSE calculations
-    gw.e_rpa = e_rpa
-
-    print("done.")
-    print("# --- Calculating GW QP corrections ...")
-    egw = np.zeros(int(gw.nso))
-    for p in range(0,gw.nso):
-        def quasiparticle(omega):
-            sigma_c_ppw, sigma_x_ppw = sigma(gw, p, p, omega, e_rpa, t_rpa)
-            sigma_ppw = sigma_c_ppw + sigma_x_ppw
-            return omega - gw.e_mf[p] - (2.*sigma_ppw.real - gw.v_mf[p,p])
-        try:
-            egw[p] = newton(quasiparticle, gw.e_mf[p], tol=1e-6, maxiter=100)
-        except RuntimeError:
-            print("Newton-Raphson unconverged, setting GW eval to MF eval.")
-            egw[p] = gw.e_mf[p]
-        print(egw[p])
-    print("done.")
-
-    return egw
 
 def bse_AB_matrices(gw):
     '''Get the BSE A and B matrices, using the quasiparticle energies computed
@@ -2285,182 +2124,3 @@ def bse(gw, using_tda=False, using_casida=True):
             return e, xy
         else:
             return _casida_eigh(A, B)
-
-
-def eig(h, s=None):
-    e, c = scipy.linalg.eigh(h,s)
-    return e, c
-
-
-def eig_asymm(h):
-    '''Diagonalize a real, *asymmetrix* matrix and return sorted results.
-
-    Return the eigenvalues and eigenvectors (column matrix)
-    sorted from lowest to highest eigenvalue.
-    '''
-    e, c = np.linalg.eig(h)
-    if np.allclose(e.imag, 0*e.imag):
-        e = np.real(e)
-    else:
-        print("WARNING: Eigenvalues are complex, will be returned as such.")
-
-    idx = e.argsort()
-    e = e[idx]
-    c = c[:,idx]
-
-    return e, c
-
-
-# def is_positive_def(A):
-#     try:
-#         np.linalg.cholesky(A)
-#         return True
-#     except np.linalg.LinAlgError:
-#         return False
-
-
-
-
-def pes():
-
-    mol = gto.Mole()
-    mol.verbose = 2
-    #mol.atom = [['Ne' , (0., 0., 0.)]]
-    #mol.basis = {'Ne': '3-21G'}
-    # This is from G2/97 i.e. MP2/6-31G*
-
-    R = np.linspace(0.2, 4, 10)
-    ex_energy = np.zeros(len(R))
-
-    f = open('excite_energy.dat','w')
-    for i in range(len(R)):
-
-        mol.atom = [['H' , (0.,  0., 0.)],
-                    ['H' , (R[i], 0., 0.)]]
-        mol.basis = '321g'
-        mol.build()
-        mf = scf.RHF(mol)
-
-        mf.kernel()
-
-        gw = BSE(mf, screening='TDHF')
-        egw = gw.kernel()
-
-        print('HF    vs.   GW ')
-        for emf, eqp in zip(mf.mo_energy, egw):
-            print("%0.6f %0.6f"%(emf, eqp))
-
-        nocc = mol.nelectron//2
-        ehomo = egw[nocc-1]
-        print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")
-
-
-        #print('GW  spacial orbital energies (eV) = ', gw.e_qp * au2ev)
-
-        ex = bse(gw, using_tda=True, using_casida=False)[0]
-        ex_energy[i] = ex[0]
-
-        print("BSE Excitation energy =", ex ) #* au2ev)
-        print("RPA eigenvalue = ", gw.e_rpa[0])
-        f.write('{} {} {} \n'.format(R[i], ex_energy[i], gw.e_rpa[0]))
-
-    f.close()
-
-    return
-
-
-if __name__ == '__main__':
-
-    from pyscf import scf, gto
-    from pyqed import au2ev
-
-    mol = gto.Mole()
-    mol.verbose = 2
-    mol_name = 'H2'
-
-#    if mol_name == 'H2':
-##    #mol.atom = [['Ne' , (0., 0., 0.)]]
-##    #mol.basis = {'Ne': '3-21G'}
-##    # This is from G2/97 i.e. MP2/6-31G*
-#        mol.atom = [['H' , (0.,  0., 0.)],
-#                ['H' , (1.6, 0., 0.)]]
-#    elif mol_name == 'benzene':
-#        mol.atom = '''
-#       C        0.70021        1.21284        0.00000
-#       C        1.40045       -0.00002       -0.00000
-#       C        0.70024       -1.21282        0.00000
-#       C       -0.70024       -1.21282        0.00000
-#       C       -1.40045       -0.00002        0.00000
-#       C       -0.70021        1.21284       -0.00000
-#       H       -1.24315        2.15309        0.00000
-#       H        1.24315        2.15309        0.00000
-#       H        2.48621        0.00006        0.00000
-#       H        1.24305       -2.15315       -0.00000
-#       H       -1.24305       -2.15315        0.00000
-#       H       -2.48621        0.00006        0.00000
-#       '''
-#    else:
-#        raise NotImplementedError
-
-    # mol.atom = [
-    #     [8 , (0. , 0.     , 0.)],
-    #     [1 , (0. , -0.757 , 0.587)],
-    #     [1 , (0. , 0.757  , 0.587)]]
-    
-    #!/usr/bin/env python
-
-
-    mol = gto.M(
-        atom = 'H 0 0 0; F 0 0 1.1',
-        basis = '631g')
-    
-    nocc = mol.nelectron//2
-    
-    # By default, GW is done with analytic continuation
-    # gw = gw.GW(mf)
-    # same as gw = gw.GW(mf, freq_int='ac')
-    # gw.kernel(orbs=range(nocc-3,nocc+3))
-
-    # mol.basis = 'cc-pvdz'
-#    mol.atom = '''
-#    H   0.000000   0.934473    -0.588078
-#    H   0.000000   -0.934473   -0.588078
-#    C   0.000000   0.000000    0.000000
-#    O   0.000000   0.000000    1.221104
-#    '''
-    # mol.basis = 'sto3g'
-    mol.build()
-
-    mf = scf.RHF(mol)
-    #print(mf.scf())
-    mf.kernel()
-
-    gw = BSE(mf, screening='TDH')
-    egw = gw.kernel()
-    print('HF    vs.   GW ')
-    for emf, eqp in zip(mf.mo_energy, egw):
-        print("%0.6f %0.6f"%(emf, eqp))
-
-    nocc = mol.nelectron//2
-    ehomo = egw[nocc-1]
-    elumo = egw[nocc]
-    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")
-    print("GW EA = GW LUMO =", elumo, "au =", elumo * au2ev, "eV")
-
-#
-#
-    # print('GW  spacial orbital energies (eV) = ', gw.e_qp * au2ev)
-
-    #excite = bse(gw, using_tda=True, using_casida=False)
-    #print("BSE Excitation energy =", excite[0] ) #* au2ev)
-
-    # pes()
-
-    import matplotlib.pyplot as plt
-
-    R,E, e_rpa = np.genfromtxt('excite_energy.dat', dtype=float, unpack=True)
-    #print(R,E)
-    #print(R, e_rpa)
-    # R /= au2angstrom
-    plt.plot(R, E)
-    # plt.plot(R, e_rpa)

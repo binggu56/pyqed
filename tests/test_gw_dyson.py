@@ -106,3 +106,28 @@ def test_missing_openmp_fails_before_molecular_preparation(monkeypatch, contour)
     monkeypatch.setattr(c, '_contour_contractions', None)
     with pytest.raises(RuntimeError, match='contour contractions'):
         g.GW(None, threads=2, freq_int=contour)
+
+
+@pytest.mark.parametrize('torch_first', [False, True])
+def test_torch_and_dyson_share_openmp_runtime(torch_first):
+    """Exercise both runtimes in a child process so an abort is a test failure."""
+    import importlib.util
+    import os
+    import subprocess
+    import sys
+    if importlib.util.find_spec('torch') is None:
+        pytest.skip('PyTorch is not installed')
+    pytest.importorskip('pyqed.gw._dyson', exc_type=ModuleNotFoundError)
+    torch_code = "import torch; torch.set_num_threads(2); torch.mm(torch.ones(128,128), torch.ones(128,128))"
+    dyson_code = '''import numpy as np
+from pyqed.gw import _dyson
+poles = np.array([-2., 2.])
+residues = np.full((2, 2), .01)
+result = _dyson.solve(poles, residues, np.array([-.5, .5]), np.zeros(2), .001, 2 if _dyson.openmp_available() else 1)
+assert np.all(np.isfinite(result[0]))'''
+    chunks = [torch_code, dyson_code] if torch_first else [dyson_code, torch_code]
+    env = dict(os.environ)
+    env.pop('KMP_DUPLICATE_LIB_OK', None)
+    result = subprocess.run([sys.executable, '-c', '\n'.join(chunks)],
+                            capture_output=True, text=True, env=env, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr

@@ -12,6 +12,8 @@ Refs
 
 import numpy as np
 import scipy.linalg
+from scipy.linalg import eigh as eig
+from pyqed.phys import eig_asymm, is_positive_def
 import sys
 import tempfile
 from scipy.optimize import brentq
@@ -1012,37 +1014,6 @@ def qsgw_kernel(
     return current_energy
 
 
-
-def eig(h, s=None):
-    e, c = scipy.linalg.eigh(h,s)
-    return e, c
-
-
-def eig_asymm(h):
-    '''Diagonalize a real, *asymmetrix* matrix and return sorted results.
-
-    Return the eigenvalues and eigenvectors (column matrix)
-    sorted from lowest to highest eigenvalue.
-    '''
-    e, c = np.linalg.eig(h)
-    if np.allclose(e.imag, 0*e.imag):
-        e = np.real(e)
-    else:
-        print("WARNING: Eigenvalues are complex, will be returned as such.")
-
-    idx = e.argsort()
-    e = e[idx]
-    c = c[:,idx]
-
-    return e, c
-
-
-def is_positive_def(A):
-    try:
-        np.linalg.cholesky(A)
-        return True
-    except np.linalg.LinAlgError:
-        return False
 
 
 class GW(object):

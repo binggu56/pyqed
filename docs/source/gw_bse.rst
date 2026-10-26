@@ -21,6 +21,26 @@ Mean-field, GW, and BSE have distinct roles:
 * ``GW`` computes quasiparticle energies and screening information.
 * ``BSE`` computes neutral excitation energies from the GW/RPA reference.
 
+``BSE`` and ``TDA`` expose ``run()`` for excitations and ``derivatives()`` for
+analytic derivatives. They do not provide a quasiparticle ``kernel()``,
+``sigma()``, or ``g0()``; use ``GW`` for self-energies and Green functions.
+Passing an unfinished GW object raises an error. For direct BSE with
+mean-field orbital gaps, pass the SCF object explicitly: ``BSE(mf).run()``.
+
+For the analytic spectral derivative path:
+
+.. code-block:: python
+
+   gw = GW(mf, freq_int='exact', eta=0.).run()
+   bse = BSE(gw, screening_energies='hf').run(nroots=2, tol=1e-10)
+   gradient, hessian = bse.derivatives(order=2, state_ids=[0], modes=modes)
+
+Here ``state_ids=[0]`` selects the first excited state. ``modes`` contains
+Cartesian displacements per requested coordinate; supply dimensionless
+mass- and frequency-weighted normal modes when derivatives with respect to
+those coordinates are wanted. The combined derivative call automatically
+releases its response workspace.
+
 Default settings and PySCF comparison
 -------------------------------------
 
@@ -4712,3 +4732,20 @@ Halving the first-column step reduced its error to 3.9e-9. This validates
 that three-mode block, not the full 22-mode Hessian. The reproducible driver
 is ``benchmarks/pyrazine_bath_adjoint_local.py``; its prepare stage generates
 the modes, and its plot stage writes derivative and validation figures.
+
+Package maintenance notes
+-------------------------
+
+The unfinished DMFT translation is preserved in
+``docs/reference/dmft_unfinished.txt`` as source material, not an available
+Python implementation. The experimental SCGW builder explicitly selects the
+exact integral path; this does not make its frequency quadrature exact.
+
+On macOS, source builds share PyTorch's bundled OpenMP runtime when PyTorch is
+visible to the build environment. This prevents duplicate-runtime aborts when
+GW kernels and PyTorch execute in the same process. Rebuild extensions after
+changing that runtime or installing PyTorch. An explicit
+``PYQED_OPENMP_PREFIX`` overrides automatic selection; its runtime must also be
+compatible with other libraries used in the process. For a pip source build alongside PyTorch, install the build dependencies in
+the target environment and use ``pip install --no-build-isolation .`` so runtime
+discovery sees that environment.

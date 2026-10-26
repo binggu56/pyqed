@@ -94,9 +94,10 @@ mol = Molecule(atom=atoms, unit='bohr', basis=basis).build(
     eri='cd', workers=workers, options={'eri_screen_tol': 0., 'low_rank_tol': 1e-10})
 mf = mol.RHF().run(tol=1e-13, conv_tol_grad=1e-12)
 assert mf.converged
-bse = BSE(GW(mf, screening='TDH', freq_int='exact', eta=0.,
-             threads=workers, vhf_df=True).run(),
-          screening_energies='hf', threads=workers).run(nroots=2, low_rank=True, tol=1e-10)
+gw = GW(mf, screening='TDH', freq_int='exact', eta=0.,
+        threads=workers, vhf_df=True).run()
+bse = BSE(gw, screening_energies='hf', threads=workers).run(
+    nroots=2, low_rank=True, tol=1e-10)
 options = dict(state_ids=[0], modes=modes[bath], method='adjoint',  # 0 = S1
                excitation_response='physical', gw_response='dense',
                storage='disk', response_tol=1e-11)
