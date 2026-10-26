@@ -795,56 +795,37 @@ def _continue_qp_root(correction, derivative, energy, tol=1e-9):
 def _solve_qp_energies(gw, e_rpa, t_rpa):
     charge = t_rpa.shape[0] == (gw.nocc//2)*((gw.nso-gw.nocc)//2)
     if charge:
-        couplings = _charge_spatial_couplings(gw, e_rpa, t_rpa)
-    elif gw._M is None:
+        from .quasiparticle import PoleSpectrum
+        gw._qp_spectrum = PoleSpectrum(gw, e_rpa, t_rpa)
+        return gw._qp_spectrum.solve(gw, range(gw.nso//2))
+    if _dyson is None or not hasattr(_dyson, 'dominant'):
+        raise RuntimeError('Build the GW Dyson kernel for dominant quasiparticle selection')
+    if gw._M is None:
         gw._M = get_m_rpa(gw, e_rpa, t_rpa)
     energy = _active_energy(gw)
-    nocc = gw.nocc
-    if charge:
-        energy, nocc = energy[::2], nocc//2
-    centers = np.concatenate((energy[:nocc, None]-e_rpa,
-                              energy[nocc:, None]+e_rpa)).ravel()
-    shifts = np.repeat(np.r_[-np.ones(nocc), np.ones(len(energy)-nocc)], len(e_rpa))*1j*gw.eta
-    exchange = _sigma_x_matrix(gw)
-    egw = np.zeros(gw.nso//2)
-    gw.qp_weights = np.full_like(egw, np.nan)
-    gw.qp_residuals = np.full_like(egw, np.nan)
-    if _dyson is not None:
-        from threadpoolctl import threadpool_limits
-        batch = max(1, min(gw.threads, int(max(1e-6, gw.max_memory)*1e6/(16*len(centers)))))
-        actual_threads = 1
-        for first in range(0, len(egw), batch):
-            last = min(len(egw), first+batch)
-            with threadpool_limits(limits=1, user_api='blas'):
-                residues = np.stack([(2*couplings[:, p, :]**2 if charge
-                                      else gw._M[:, 2*p, :]**2).ravel()
-                                     for p in range(first, last)])
-            roots, weights, residuals, used = _dyson.solve(
-                centers, residues, gw.e_mf[2*first:2*last:2],
-                np.diag(exchange-gw.v_mf)[2*first:2*last:2], gw.eta, gw.threads)
-            egw[first:last], gw.qp_weights[first:last], gw.qp_residuals[first:last] = roots, weights, residuals
-            actual_threads = max(actual_threads, used)
-        gw.threading_info = dict(algorithm='orbital Dyson continuation',
-                                openmp=_dyson.openmp_available(), requested_threads=gw.threads,
-                                actual_threads=actual_threads, batch_orbitals=batch)
-        return egw
-    if gw.threads != 1:
-        raise RuntimeError('Build the GW Dyson extension with OpenMP to use threads > 1')
-    gw.threading_info = dict(algorithm='Python Dyson continuation', openmp=False,
-                            requested_threads=1, actual_threads=1, batch_orbitals=1)
-    for p in range(0, gw.nso, 2):
-        weights = (2*couplings[:, p//2, :]**2 if charge else gw._M[:, p, :]**2).ravel()
-        active = weights != 0
-        poles, broadening, residue = centers[active], shifts[active], weights[active]
-        static = exchange[p, p]-gw.v_mf[p, p]
-        def correction(w):
-            return np.sum(residue/(w-poles+broadening))+static
-        def derivative(w):
-            return -np.sum(residue/(w-poles+broadening)**2)
-        egw[p//2] = _continue_qp_root(correction, derivative, gw.e_mf[p])
-        gw.qp_weights[p//2] = 1/(1-derivative(egw[p//2]).real)
-        gw.qp_residuals[p//2] = abs(egw[p//2]-gw.e_mf[p]-correction(egw[p//2]).real)
-        print(egw[p//2])
+    centers = np.concatenate((energy[:gw.nocc, None]-e_rpa,
+                              energy[gw.nocc:, None]+e_rpa)).ravel()
+    static = np.diag(_sigma_x_matrix(gw)-gw.v_mf)[::2]
+    egw = np.full(gw.nso//2, np.nan)
+    gw.qp_weights, gw.qp_residuals = egw.copy(), egw.copy()
+    bounds, searched = [], []
+    batch = max(1, min(gw.threads, int(max(1e-6, gw.max_memory)*1e6/(128*len(centers)))))
+    actual_threads = 1
+    for first in range(0, len(egw), batch):
+        last = min(len(egw), first+batch)
+        residues = np.stack([(gw._M[:, 2*p, :]**2).ravel() for p in range(first, last)])
+        roots, weights, residuals, used, upper, count, _ = _dyson.dominant(
+            centers, residues, gw.e_mf[2*first:2*last:2], static[first:last], gw.threads)
+        egw[first:last], gw.qp_weights[first:last], gw.qp_residuals[first:last] = roots, weights, residuals
+        bounds.extend(upper.tolist()); searched.extend(count.tolist())
+        actual_threads = max(actual_threads, used)
+    gw.qp_selection_info = dict(method='largest spectral weight', zero_broadening=True,
+        weight_bounds_checked=True, excluded_weight_bounds=bounds,
+        searched_intervals=searched, coupling_energy_error_bound_Ha=1e-10,
+        fragmented_orbitals=np.flatnonzero(gw.qp_weights<.5).tolist())
+    gw.threading_info = dict(algorithm='dominant Dyson poles',
+        openmp=_dyson.openmp_available(), requested_threads=gw.threads,
+        actual_threads=actual_threads, batch_orbitals=batch)
     return egw
 
 
@@ -1073,8 +1054,8 @@ class GW(object):
     Coulomb coupling, not charge poles. Orbital-gap scaling replaces a
     dense matrix square root. TDHF and explicit non-Casida RPA retain
     the full spin representation. Matching TDH screening can be reused
-    by BSE with screening_energies='hf'; spectral QP roots use coupling continuation
-    (see :func:`_continue_qp_root`); frequency integration is unchanged.
+    by BSE with screening_energies='hf'; exact QP roots use largest-weight
+    selection (see :class:`.quasiparticle.PoleSpectrum`).
     See :func:`rpa` for returned mode conventions.
     Packed AO factors are transformed without full expansion. Spectral TDH
     QP energies and self-energies use spatial couplings directly, avoiding
@@ -1092,17 +1073,14 @@ class GW(object):
     These are algebraically exact storage changes; complete charge diagonalization
     still requires quadratic RAM in the number of occupied-virtual pairs.
 
-    ``threads`` controls spectral orbital Dyson solves or contour
-    contractions (default one). Spectral orbitals use bracket-first
-    coupling continuation
-    of Hedin's Dyson equation, Phys. Rev. 139, A796 (1965),
-    doi:10.1103/PhysRev.139.A796. This is a numerical branch-selection
-    adaptation, not a satellite solver or a largest-weight-root guarantee.
-    Brackets are searched on finite logarithmic shells; narrow crossings
-    can be missed, and branch folds can lead to neighboring branches.
-    Couplings are formed in memory-limited orbital batches with BLAS fixed
-    at one thread; OpenMP workers call no BLAS. Screening uses the caller's
-    BLAS settings. ``threading_info`` records observed worker counts.
+    ``threads`` controls spectral orbital Dyson solves or contour contractions.
+    Exact spectral roots select the largest resolved spectral weight, adapting
+    the diagonal GW quasiparticle criterion discussed by Marie and Loos,
+    JCTC 19, 3943–3957 (2023), doi:10.1021/acs.jctc.3c00281. This is not
+    their SRG approximation. See :class:`.quasiparticle.PoleSpectrum` for
+    finite-resolution and fragmentation limits. Contour roots retain coupling
+    continuation. Orbital batches are memory bounded and OpenMP workers call
+    no BLAS; ``threading_info`` records observed worker counts.
 
     The default is ``freq_int='ac'``: 100 integration points, 18-point Padé,
     nonlinear tolerance 1e-6 Ha, and 100 iterations, matching PySCF 2.14.

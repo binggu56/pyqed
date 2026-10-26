@@ -38,7 +38,7 @@ from pyqed.models.phenol_coordinates import (
     PhenolReactiveChart,
     select_phenol_active_modes,
 )
-from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+from pyqed.qchem.dft.hessian import analyze_hessian
 from pyqed.units import au2angstrom, au2ev
 
 
@@ -96,7 +96,7 @@ def hessian_modes(args):
         raise RuntimeError("reference failed before the phenol Hessian calculation")
     raw = np.asarray(mf.Hessian().kernel())
     cartesian = raw.transpose(0, 2, 1, 3).reshape(3 * mol.natm, 3 * mol.natm)
-    analysis = analyze_cartesian_hessian(
+    analysis = analyze_hessian(
         cartesian, mol.atom_coords(), mol.atom_mass_list(),
         remove_translation_rotation=True,
     )

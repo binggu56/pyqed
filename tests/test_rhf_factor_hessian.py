@@ -238,3 +238,20 @@ def test_direct_metric_response_matches_factor_reference(monkeypatch):
     actual = direct.response(occupied)
     for a,b in zip(actual,expected):
         np.testing.assert_allclose(a,b,atol=2e-10,rtol=2e-10)
+
+
+@pytest.mark.parametrize('eri', ['cd', 'ri'])
+def test_factor_pullback_duality(eri):
+    from pyqed.qchem.hf.factor_curvature import FactorCurvature
+    fc = FactorCurvature(reference(eri).mol, prepare_first=False)
+    rng = np.random.default_rng(24)
+    bar = rng.normal(size=fc.molecular(fc.factors).shape)
+    dv = rng.normal(size=(len(fc.root), fc.factors[0].size))
+    dm = rng.normal(size=fc.root.shape)
+    dm = (dm+dm.T)/2
+    dl = fc.root_derivative(dm)
+    db = fc.solve(dv-dl@fc.factors.reshape(len(fc.root), -1))
+    u, metric = fc.pullback(bar)
+    actual = np.sum(u.reshape(dv.shape)*dv)+np.sum(metric*dm)
+    expected = np.sum(bar*fc.molecular(db.reshape(fc.factors.shape)))
+    np.testing.assert_allclose(actual, expected, atol=2e-9, rtol=1e-10)

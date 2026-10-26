@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from pyqed.qchem import IR, Molecule
 from pyqed.qchem.dft import AOGrid, RKS
-from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+from pyqed.qchem.dft.hessian import analyze_hessian
 
 
 ATOM = (
@@ -68,7 +68,7 @@ def pyscf_harmonic_analysis(mf):
     hess_4d = mf.Hessian().kernel()
     natom = mf.mol.natm
     hess = np.asarray(hess_4d).transpose(0, 2, 1, 3).reshape(3 * natom, 3 * natom)
-    return analyze_cartesian_hessian(
+    return analyze_hessian(
         hess,
         mf.mol.atom_coords(),
         mf.mol.atom_mass_list(isotope_avg=True),

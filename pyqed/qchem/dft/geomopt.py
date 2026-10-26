@@ -17,7 +17,7 @@ from scipy.optimize import minimize
 from pyqed.qchem.mol import Molecule
 
 from .grid import AOGrid, BOHR_TO_ANGSTROM
-from .hessian import analyze_cartesian_hessian
+from .hessian import analyze_hessian
 from .xc import needs_gradients
 
 
@@ -69,7 +69,7 @@ class GeometryOptimizationResult:
         """
         Analyze a Cartesian Hessian into vibrational frequencies and normal modes.
         """
-        return analyze_cartesian_hessian(
+        return analyze_hessian(
             self.hessian(exact=exact),
             self.coords,
             self.mf.mol.atom_mass_list(),

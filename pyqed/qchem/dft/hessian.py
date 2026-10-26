@@ -86,7 +86,8 @@ def _translation_rotation_vectors(coords, masses_au):
     return translations, rotations
 
 
-def _project_vibrational_subspace(mass_hess, coords, masses_au, zero_tol=1e-7):
+def _project_vibrational_subspace(mass_hess, coords, masses_au, zero_tol=1e-7,
+                                exclude=None):
     translations, rotations = _translation_rotation_vectors(coords, masses_au)
     tr_space = list(translations)
 
@@ -97,6 +98,27 @@ def _project_vibrational_subspace(mass_hess, coords, masses_au, zero_tol=1e-7):
         tr_space.extend(rotations)
 
     tr_space = np.asarray(tr_space, dtype=float)
+    if exclude is not None:
+        extra = np.asarray(exclude, dtype=float)
+        if extra.ndim == 2:
+            extra = extra[None]
+        if extra.ndim != 3 or extra.shape[1:] != coords.shape or not len(extra):
+            raise ValueError("exclude must have shape (nvectors, natoms, 3)")
+        extra = extra.reshape(len(extra), -1)
+        norms = np.linalg.norm(extra, axis=1)
+        if not np.all(np.isfinite(extra)) or np.any(norms == 0):
+            raise ValueError("exclude vectors must be finite and nonzero")
+        rigid_norms = np.linalg.norm(tr_space, axis=1)
+        active = rigid_norms > zero_tol * max(1., rigid_norms.max())
+        vectors = np.vstack((tr_space[active] / rigid_norms[active, None],
+                             extra / norms[:, None]))
+        left, singular, _ = np.linalg.svd(vectors.T, full_matrices=True)
+        rank = np.count_nonzero(singular > zero_tol * singular[0])
+        basis = left[:, rank:]
+        if not basis.shape[1]:
+            raise ValueError("exclude leaves no transverse vibrational directions")
+        values, modes = np.linalg.eigh(basis.T @ mass_hess @ basis)
+        return values, basis @ modes
     q, _ = np.linalg.qr(tr_space.T)
     projector = np.eye(mass_hess.shape[0]) - q.dot(q.T)
     eigvals, eigvecs = np.linalg.eigh(projector)
@@ -106,16 +128,28 @@ def _project_vibrational_subspace(mass_hess, coords, masses_au, zero_tol=1e-7):
     return force_const_au, basis.dot(mode)
 
 
-def analyze_cartesian_hessian(
+def analyze_hessian(
     hess,
     coords,
     masses_amu,
     remove_translation_rotation=True,
     negative_imaginary=True,
     zero_tol=1e-7,
+    exclude=None,
 ):
-    """
-    Analyze a Cartesian Hessian into vibrational frequencies and normal modes.
+    """Analyze Cartesian curvature into vibrational or transverse modes.
+
+    ``exclude`` supplies additional mass-weighted vectors with shape
+    ``(nvectors, natoms, 3)`` (or one ``(natoms, 3)`` vector), such as reaction
+    tangents sqrt(M) dR/dq. They are removed together with rigid motions.
+    ``mass_weighted_modes`` are unit eigenvectors L, whereas ``modes`` are
+    Cartesian displacements normalized using masses in amu.
+
+    The transverse projection adapts Miller, Handy and Adams, J. Chem. Phys.
+    72, 99-112 (1980), doi:10.1063/1.438959. At a prescribed nonstationary
+    path these are local projected Cartesian curvatures, not equilibrium
+    frequencies or a relaxed reaction-path Hamiltonian. The routine neither
+    optimizes the path nor adds curved-constraint gradient corrections.
     """
     masses_au = np.asarray(masses_amu, dtype=float) * amu_to_au
     coords = np.asarray(coords, dtype=float)
@@ -133,8 +167,11 @@ def analyze_cartesian_hessian(
             coords,
             masses_au,
             zero_tol=zero_tol,
+            exclude=exclude,
         )
     else:
+        if exclude is not None:
+            raise ValueError("exclude requires remove_translation_rotation=True")
         force_const_au, mode = np.linalg.eigh(mass_hess)
     freq_au = np.lib.scimath.sqrt(force_const_au)
     if negative_imaginary and np.iscomplexobj(freq_au):
@@ -158,6 +195,7 @@ def analyze_cartesian_hessian(
         'reduced_mass_amu': np.asarray(reduced_mass_amu),
         'reduced_mass': np.asarray(reduced_mass_amu),
         'force_constants_au': np.asarray(force_const_au),
+        'mass_weighted_modes': mode.T.reshape(-1, natm, 3),
     }
 
 
@@ -229,7 +267,7 @@ class Hessian:
     ):
         if self.hess is None:
             raise ValueError("Run the Hessian calculation before requesting vibrational analysis.")
-        return analyze_cartesian_hessian(
+        return analyze_hessian(
             self.hess,
             self.coords,
             self.mol.atom_mass_list(),

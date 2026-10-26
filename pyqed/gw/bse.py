@@ -923,6 +923,174 @@ class BSE(object):
         )
 
 
+    def clear_derivative_cache(self):
+        """Release the geometry-local adjoint workspace and its disk files."""
+        from .adjoint_workspace import clear
+        clear(self)
+        self._first_response_cache = None
+
+    def derivatives(self, state_ids=None, modes=None, *, order=2, **kwargs):
+        """Return a gradient (order=1) or (gradient, Hessian) (order=2).
+
+        Uses the methods, units and restrictions documented by gradient()
+        and hessian(). The second-order path computes both arrays in one
+        Hessian evaluation, without a separate gradient call. Existing
+        compatible intermediates may be reused; derivative caches and their
+        temporary files are released on return or failure. Output arrays
+        remain available as energy_gradient and energy_hessian. Selected
+        Hessian columns retain the gradient along all requested modes.
+        """
+        try:
+            if isinstance(order, (bool, np.bool_)) or order not in (1, 2):
+                raise ValueError('Derivative order must be 1 or 2.')
+            if order == 1:
+                return self.gradient(state_ids, modes, **kwargs)
+            hessian = self.hessian(state_ids, modes, **kwargs)
+            return self.energy_gradient, hessian
+        finally:
+            self.clear_derivative_cache()
+
+    def gradient(self, state_ids=None, modes=None, *, method="adjoint", **kwargs):
+        """Return relaxed total-energy gradients, shape (nstates, nmodes).
+
+        States index excitations from zero; energies are RHF plus excitation.
+        Modes are Cartesian dR/dQ in bohr. Without modes the final axis is
+        flattened Cartesian (3*natom). Results are stored in energy_gradient.
+        Uses the analytic response adaptation of Tölle, Kitsaras and
+        Loos, JPCL 16, 11134–11143 (2025), doi:10.1021/acs.jpclett.5c02219.
+        Exact spectral RHF-G0W0 and full orbital spaces are required. See
+        vibronic_couplings for reference fidelity and response restrictions.
+        Individual surface derivatives are NaN at electronic degeneracies.
+        The default method="adjoint" uses state-specific Z-vectors (optional PyTorch),
+        currently requiring nondegenerate HF orbitals; see gw.adjoint for
+        fidelity and limits. Geometry-local spectra, Z-vectors, orbital solver
+        and raw first integral derivatives are retained for an adjoint Hessian
+        with matching response settings. Directional electronic responses are
+        computed only by hessian(), never by gradient(). Reference/state or
+        response-setting changes invalidate the workspace; clear_derivative_cache()
+        releases it explicitly. Saved graph tensors use temporary disk storage;
+        storage="memory" retains them in RAM.
+        Explicit method="forward" computes only first derivatives.
+        Integral, RHF, GW and BSE first-order
+        responses are cached for subsequent gradient/hessian calls. Content checks
+        invalidate the cache when the reference or requested directions change.
+        Above the memory budget, directions are processed individually and
+        reusable first responses are stored in temporary disk files.
+        """
+        if method == 'adjoint':
+            from .adjoint import gradients
+            return gradients(self, state_ids, modes, **kwargs)
+        if method != 'forward':
+            raise ValueError("Gradient method must be forward or adjoint.")
+        from .response import energy_derivatives
+        return energy_derivatives(self, state_ids, modes, order=1, **kwargs)[0]
+
+    def hessian(self, state_ids=None, modes=None, *, method='adjoint', **kwargs):
+        """Return relaxed total-energy Hessians, shape (nstates, nmodes, nmodes).
+
+        Includes response through the complete excitation space. These are
+        surface curvatures, distinct from diagonal local-Hamiltonian G.
+        See gradient for units, method reference, and restrictions. Results
+        are stored in energy_hessian (energy_gradient is also computed).
+        The default method='adjoint' analytically differentiates the Z-vector gradient,
+        reusing first RHF response and mixed integral curvature; no second
+        electronic response tensors or finite differences. This extends the
+        gradient adaptation of Tölle, Kitsaras and Loos (2025),
+        doi:10.1021/acs.jpclett.5c02219; see gw.adjoint.hessians for fidelity
+        and restrictions. Saved tensors default to storage='disk'.
+        excitation_response='projected' uses the existing matrix-free BSE
+        actions and projected GMRES for eigenvector tangents; 'dense' remains
+        the default reference. GW screening and square-root derivatives remain
+        dense. excitation_response='physical' uses the stationary XY form
+        and exact static dielectric contractions to remove BSE square-root
+        derivatives; dynamic GW remains dense. See gw.adjoint.hessians for
+        references, fidelity, residual and degeneracy checks.
+        gw_response='spectral' replaces nested dynamic-GW root/inverse
+        derivatives with full-pole divided differences and one Sylvester
+        pullback. It retains the dense reference spectrum and response
+        contractions; it is not a matrix-free or truncated-pole method.
+        For adjoint response, columns=[...] selects direction indices and
+        returns shape (nstates, nmodes, nselected), retaining all rows.
+        For memory-bounded requests, method='polarization' uses summed
+        directional curvatures. method='mixed' propagates one direct mixed
+        second derivative from two disk-backed first responses and retains
+        Hessian-only first frequency responses after diagonal passes. Both
+        keep all mixed entries without finite differences. Small requests use
+        the full analytic response tensor with either selection.
+        """
+        if method == "adjoint":
+            from .adjoint import hessians
+            return hessians(self, state_ids, modes, **kwargs)
+        from .response import energy_derivatives
+        return energy_derivatives(self, state_ids, modes, hessian_method=method, **kwargs)[1]
+
+    def vibronic_couplings(self, state_ids=None, modes=None, frame='relaxed',
+                           *, backend='auto', max_memory=None, degeneracy_tol=1e-7):
+        r"""Analytic relaxed local Hamiltonian derivatives F and G.
+
+        Forward first/second differentiation of RHF CPHF, charge RPA,
+        zero-broadening diagonal G0W0 Dyson roots and static singlet BSE.
+        This adapts the fully relaxed gradient formulation of Tölle,
+        Kitsaras and Loos, JPCL 16, 11134–11143 (2025),
+        doi:10.1021/acs.jpclett.5c02219, using forward response instead of
+        their Lagrangian. Integral response reuses PyQED's analytic Gaussian
+        and fixed-rank RI/CD implementations. No finite differences.
+
+        Builtin real closed-shell RHF, exact spectral G0W0, TDH screening
+        and complete orbital spaces are required. Degenerate orbital blocks
+        use a parallel subspace gauge; repeated screening poles use analytic
+        matrix square roots/resolvents. ``degeneracy_tol`` groups reference
+        orbital energies in Hartree (default 1e-7). Occupied/virtual subspaces
+        must remain separated by a gap. RI requires an unscreened
+        Cholesky metric; CD retains fixed pivots/rank. Response is dense in
+        transition space, with an explicit memory gate; factors stay factored.
+
+        Inside a degenerate block, full self-energy response replaces the
+        basis-dependent diagonal-only derivative. The symmetry-protected QP
+        root and its frequency residue must be scalar within that block.
+        Second-order Hermitian Dyson partitioning adapts Löwdin, JCP 19,
+        1396 (1951), doi:10.1063/1.1748067; matrix-function response adapts
+        Higham and Relton, SIMAX 35, 1019 (2014), doi:10.1137/130945259.
+        Couplings between distinct reference orbital blocks are omitted.
+        This is a block extension of diagonal G0W0, not full matrix GW.
+
+        ``frame='relaxed'`` freezes reference exciton amplitudes in the
+        smoothly continued canonical excitation frame (TDA), or the
+        positive-frequency Hermitian Casida frame (full BSE). These are
+        effective-Hamiltonian derivatives, not fixed real-space many-electron
+        matrix elements or exact nonadiabatic couplings. The moving-frame
+        transverse kinetic connection is not included. Use in RSH/CGLDR is
+        the explicitly Q-independent-link approximation documented there.
+
+        F has shape (nstates,nstates,nmodes), G has shape
+        (nstates,nstates,nmodes,nmodes); without modes the trailing axes are
+        (natom,3) and (natom,3,natom,3). Modes are dR/dQ in bohr.
+        State indices are zero-based EXCITATIONS; no ground state is included.
+        Total energies use E_RHF + excitation energy, with the corresponding
+        common relaxed RHF derivatives. For isolated states diagonal F equals surface gradients;
+        diagonal G is not a surface Hessian. ``self.energy_gradient`` and
+        ``self.energy_hessian`` store mode-space surface derivatives, including
+        response through ALL excitation states. Surface gradients/Hessians are NaN at electronic
+        degeneracies (F/G remain defined); ``derivative_info`` records this.
+        ``subspace_gradient``/``subspace_hessian`` instead differentiate the
+        retained energy trace, including omitted-state response; these are
+        defined for complete multiplets separated from the discarded states.
+        F supplies LVC coefficients, G supplies QVC coefficients in this
+        effective frame. Keep entire electronic multiplets in a vibronic model.
+        """
+        from .response import vibronic_couplings
+        return vibronic_couplings(self, state_ids, modes, frame,
+                                  backend=backend, max_memory=max_memory,
+                                  degeneracy_tol=degeneracy_tol)
+
+    @property
+    def e_tot(self):
+        """RHF reference plus neutral excitation energies (excited roots only)."""
+        if self.e is None:
+            return None
+        return float(self._scf.e_tot) + np.asarray(self.e)
+
+
 class TDA(BSE):
     """Tamm-Dancoff approximation to BSE.
 

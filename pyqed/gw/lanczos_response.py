@@ -176,3 +176,15 @@ class LanczosResponse:
             c.screening_info['response_cache_evictions'] = c.screening_info.get('response_cache_evictions', 0)+1
         c.screening_info[timing] = c.screening_info.get(timing, 0.)+time.perf_counter()-started
         return value, slope
+
+
+def casida_action(gaps, pairs, vectors):
+    """Apply full closed-shell direct-RPA C=D²+4√D FᵀF√D, without forming C.
+
+    Shared RI Casida formulation used by contour response and Lanczos GW;
+    Bruneval, J. Chem. Phys. 136, 194107 (2012), doi:10.1063/1.4718428.
+    Accepts a vector or a batch of vectors. No transition truncation.
+    """
+    scale = np.sqrt(gaps) if vectors.ndim == 1 else np.sqrt(gaps)[:,None]
+    diagonal = gaps**2 if vectors.ndim == 1 else gaps[:,None]**2
+    return diagonal*vectors + 4*scale*(pairs.T@(pairs@(scale*vectors)))

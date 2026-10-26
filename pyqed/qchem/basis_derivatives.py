@@ -47,6 +47,15 @@ def _atom_ids_for_basis(basis, atom_coords, tol=1e-10):
     return np.asarray(ids, dtype=int)
 
 
+def _ao_atom_indices(mol):
+    """AO owners in the molecule's Cartesian or spherical ordering."""
+    basis, transform = _basis_and_transform(mol)
+    owners = _atom_ids_for_basis(basis, mol.atom_coords())
+    if transform is not None:
+        owners = owners[np.argmax(abs(transform), axis=0)]
+    return owners
+
+
 def _as_order(order):
     out = tuple(int(x) for x in order)
     if len(out) != 3 or any(x < 0 for x in out):
@@ -880,6 +889,7 @@ def _directional_one_electron_derivatives_python(
     directions,
     kernel="hcore",
     order=1,
+    fixed_basis=False,
 ):
     """
     Return one-electron integral derivatives projected onto nuclear directions.
@@ -896,17 +906,18 @@ def _directional_one_electron_derivatives_python(
     if kernel == "hcore":
         return (
             _directional_one_electron_derivatives_python(
-                mol, directions, "kinetic", order=order
+                mol, directions, "kinetic", order=order, fixed_basis=fixed_basis
             )
             + _directional_one_electron_derivatives_python(
-                mol, directions, "nuclear", order=order
+                mol, directions, "nuclear", order=order, fixed_basis=fixed_basis
             )
         )
 
     basis, transform = _basis_and_transform(mol)
     coords = np.asarray(mol.atom_coords(), dtype=float)
     charges = np.asarray(mol.atom_charges(), dtype=float)
-    atom_ids = _atom_ids_for_basis(basis, coords)
+    atom_ids = (np.full(len(basis), -1, dtype=int) if fixed_basis
+                else _atom_ids_for_basis(basis, coords))
     natm = coords.shape[0]
     nao_cart = len(basis)
     direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
@@ -973,6 +984,7 @@ def _directional_one_electron_derivatives_cpp(
     kernel="hcore",
     order=1,
     density=None,
+    fixed_basis=False,
 ):
     if _integrals_cpp is None or not hasattr(
         _integrals_cpp, "compute_directional_one_electron_derivatives"
@@ -987,7 +999,8 @@ def _directional_one_electron_derivatives_cpp(
     direction = _as_direction_matrix(directions, natm).reshape(-1, natm, 3)
     signatures = tuple(_basis_signature(fn) for fn in basis)
     shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
-    atom_ids = _atom_ids_for_basis(basis, coords)
+    atom_ids = (np.full(len(basis), -1, dtype=int) if fixed_basis
+                else _atom_ids_for_basis(basis, coords))
     workers = _builtin_worker_count(mol, len(basis))
     if density is not None:
         density = np.asarray(density,dtype=float)
@@ -1015,7 +1028,45 @@ def _directional_one_electron_derivatives_cpp(
     return _transform_one(np.asarray(out, dtype=float), transform)
 
 
-def contracted_one_electron_curvature(mol, density, kernel='hcore'):
+def electron_nuclear_derivatives(mol, directions, order=1, backend="auto"):
+    """Nuclear-attraction operator derivatives with fixed real-space AOs.
+
+    Only charge centers move. Reuses the Gaussian raising/lowering derivative
+    recurrence (Obara and Saika, JCP 84, 3963, 1986, doi:10.1063/1.450106),
+    adapted via translational invariance to charge derivatives. No orbital
+    response, AO motion, finite differences, or ECP derivatives are included.
+    Directions are Cartesian nuclear displacements, not mass-scaled modes
+    unless the caller supplies those displacements explicitly.
+    """
+    if getattr(mol, "ecp", None):
+        raise NotImplementedError("Fixed-state operator derivatives do not support ECPs.")
+    if order not in (1, 2):
+        raise ValueError("order must be 1 or 2.")
+    if backend not in {"auto", "native", "python", "pyscf"}:
+        raise ValueError("Unknown derivative backend.")
+    if backend == "pyscf":
+        from .geometric import _electron_nuclear_operator_derivatives_pyscf
+        tensors = _electron_nuclear_operator_derivatives_pyscf(mol)
+        if tensors is None:
+            raise ImportError("Fixed-basis libcint derivatives are unavailable.")
+        modes = _as_direction_matrix(directions, mol.natom)
+        if order == 1:
+            return np.einsum('ma,aij->mij', modes, tensors[0])
+        return np.einsum('ma,nb,abij->mnij', modes, modes, tensors[1])
+    if backend != "python":
+        try:
+            return _directional_one_electron_derivatives_cpp(
+                mol, directions, kernel="nuclear", order=order, fixed_basis=True,
+            )
+        except ImportError:
+            if backend == "native":
+                raise
+    return _directional_one_electron_derivatives_python(
+        mol, directions, kernel="nuclear", order=order, fixed_basis=True,
+    )
+
+
+def contracted_one_electron_curvature(mol, density, kernel='hcore', directions=None):
     """Exact Gaussian second derivatives contracted before AO tensor storage.
 
     Adapts the same raising/lowering recurrence as
@@ -1025,8 +1076,57 @@ def contracted_one_electron_curvature(mol, density, kernel='hcore'):
     not a reproduction of their complete implementation.
     No screening or finite differences; requires the compiled integral kernel.
     """
+    if directions is None:
+        directions = np.eye(3*mol.natom)
     return _directional_one_electron_derivatives_cpp(
-        mol,np.eye(3*mol.natom),kernel=kernel,order=2,density=density)
+        mol,directions,kernel=kernel,order=2,density=density)
+
+
+def contracted_eri_curvature(mol, density, directions=None):
+    """Contract analytic ERI curvature with an arbitrary AO four-index weight.
+
+    ``density[p,q,r,s]`` multiplies chemists' ``(pq|rs)`` without an implicit
+    factor of 1/2. Permutation-summed s8 weights are consumed inside each shell
+    quartet, before directional projection; no second-derivative ERI tensor is
+    allocated. Uses the same Obara--Saika raising/lowering derivative recurrence
+    as :func:`directional_eri_derivatives`, JCP 84, 3963 (1986),
+    doi:10.1063/1.450106. Exact unscreened contraction, not density fitting.
+    The input weight itself is dense; requires the compiled integral extension.
+    """
+    density = np.asarray(density)
+    if density.shape != (mol.nao,)*4 or np.iscomplexobj(density):
+        raise ValueError('Expected a real AO weight with shape (nao,)*4.')
+    basis, transform = _basis_and_transform(mol)
+    if transform is not None:
+        density = _transform_eri(density, transform.T)
+    nao = len(basis)
+    p, q = np.tril_indices(nao)
+    npair = len(p)
+    packed = np.empty(npair*(npair+1)//2)
+    for i, (a, b) in enumerate(zip(p, q)):
+        r, s = p[:i+1], q[:i+1]
+        sym = (density[a,b,r,s] + density[b,a,r,s]
+               + density[a,b,s,r] + density[b,a,s,r]
+               + density[r,s,a,b] + density[s,r,a,b]
+               + density[r,s,b,a] + density[s,r,b,a]) / 8
+        multiplicity = (2-int(a==b))*(2-(r==s).astype(int))*(2-(np.arange(i+1)==i).astype(int))
+        start = i*(i+1)//2
+        packed[start:start+i+1] = sym*multiplicity
+    coords = np.asarray(mol.atom_coords(), dtype=float)
+    if directions is None:
+        directions = np.eye(3*mol.natom)
+    directions = _as_direction_matrix(directions, mol.natom).reshape(-1, mol.natom, 3)
+    signatures = tuple(_basis_signature(fn) for fn in basis)
+    shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    return np.asarray(_integrals_cpp.compute_directional_eri_derivative_scalar(
+        np.ascontiguousarray(shells, dtype=np.int64),
+        np.ascontiguousarray(origins, dtype=float),
+        np.ascontiguousarray(exps, dtype=float),
+        np.ascontiguousarray(weights, dtype=float),
+        np.ascontiguousarray(nprim, dtype=np.int64),
+        np.ascontiguousarray(_atom_ids_for_basis(basis, coords), dtype=np.int64),
+        np.ascontiguousarray(directions), packed, np.empty(0), 2,
+        _builtin_worker_count(mol, nao), 0.), dtype=float)
 
 
 def directional_one_electron_derivatives(
@@ -1288,6 +1388,61 @@ def position_derivatives(mol, center=None):
 
 def _eri_center_coeff(atom, center_atom):
     return 1.0 if atom == center_atom else 0.0
+
+
+def iter_eri_first_derivative_columns(mol, *, max_memory_mb=256, block_size=32):
+    """Yield ``(start, stop, derivatives)`` for packed AO-pair columns.
+
+    Each derivative block has shape ``(3*natom, stop-start, npair)``.
+    Reuses the exact compiled shell-column kernel, including spherical AO
+    projection, without fitting or screening. The memory budget covers the
+    returned block and kernel worker copies, not shell caches or caller data.
+    No full pair-pair derivative array is constructed. Workers follow the
+    molecule/central worker budget; the outer iterator is serial.
+    """
+    if not np.isfinite(max_memory_mb) or max_memory_mb <= 0:
+        raise ValueError("max_memory_mb must be finite and positive.")
+    if not isinstance(block_size, (int, np.integer)) or block_size < 1:
+        raise ValueError("block_size must be a positive integer.")
+    if _integrals_cpp is None or not hasattr(
+        _integrals_cpp, "compute_eri_derivative_columns"
+    ):
+        raise ImportError("Rebuild the Gaussian extension for packed ERI derivatives.")
+    basis, transform = _basis_and_transform(mol)
+    arrays = _pack_signatures_for_numba(tuple(_basis_signature(fn) for fn in basis))
+    arrays = tuple(
+        np.ascontiguousarray(a, dtype=dtype)
+        for a, dtype in zip(arrays, (np.int64, float, float, float, np.int64))
+    )
+    owners = np.ascontiguousarray(
+        _atom_ids_for_basis(basis, mol.atom_coords()), dtype=np.int64
+    )
+    transform = np.ascontiguousarray(
+        np.eye(len(basis)) if transform is None else transform
+    )
+    nao = transform.shape[1]
+    npair = nao * (nao + 1) // 2
+    workers = _builtin_worker_count(mol, len(basis))
+    ncoord = 3 * mol.natom
+    capacity = int(max_memory_mb * 1024**2 // (8 * ncoord * npair * (workers + 1)))
+    if capacity < 1:
+        raise MemoryError(
+            "ERI derivative memory budget cannot hold one packed column and worker copies."
+        )
+    block_size = min(block_size, capacity)
+    directions = np.eye(ncoord).reshape(-1, mol.natom, 3)
+    for start in range(0, npair, block_size):
+        stop = min(start + block_size, npair)
+        block = _integrals_cpp.compute_eri_derivative_columns(
+            *arrays,
+            owners,
+            directions,
+            transform,
+            np.arange(start, stop, dtype=np.int64),
+            workers
+        )
+        yield start, stop, block
+        del block
 
 
 def eri_first_derivatives_packed(mol):
@@ -1710,6 +1865,58 @@ def _pyscf_ao_atoms(pmol):
 def _permute_eri_slots(tensor, permutation, component_axes):
     inverse = np.argsort(permutation)
     return tensor.transpose(*range(component_axes), *(component_axes + inverse))
+
+
+def prepare_eri_curvature(mol, *, backend='auto', max_bytes=512*1024**2):
+    """Prepare a bounded libcint curvature workspace for repeated pairs.
+
+    Reuses the slot-permutation formulation of directional_eri_derivatives.
+    Returns None when unavailable or too large; callers can stream instead.
+    Dense derivative kernels are confined to the existing conventional-CI
+    derivative path, not production coupled-cluster integral storage.
+    The returned callable is geometry-specific and must not be reused after
+    changing the molecule. No global or persistent geometry cache is used.
+    """
+    if backend not in ('auto','pyscf'):return None
+    try:pmol=mol.topyscf()
+    except (ImportError,ModuleNotFoundError,AttributeError):
+        if backend=='pyscf':raise
+        return None
+    nao=pmol.nao_nr();size=27*nao**4*8
+    if size>max_bytes:return None
+    specs=[('int2e_ipip1',[(i,i,p) for i,p in _ERI_SLOT_PERMUTATIONS.items()]),
+           ('int2e_ipvip1',[(i,j,p) for (i,j),p in _ERI_PAIR_PERMUTATIONS.items()]),
+           ('int2e_ip1ip2',[(i,j,p) for (i,j),p in _ERI_CROSS_PERMUTATIONS.items()])]
+    kernels=[]
+    for name,terms in specs:
+        kernel=pmol.intor(name,comp=9,aosym='s1').reshape(3,3,nao,nao,nao,nao)
+        kernel.flags.writeable=False;kernels.append((kernel,terms))
+    atoms=_pyscf_ao_atoms(pmol);permutation=mol.pyscf_ao_permutation(pmol)
+    def pair(left,right):
+        coefficients=_as_direction_matrix(np.asarray([left,right]),pmol.natm).reshape(2,pmol.natm,3)[:,atoms,:]
+        out=np.zeros((nao,)*4)
+        active=[np.flatnonzero(np.any(c!=0,axis=0)) for c in coefficients]
+        sparse=len(active[0])*len(active[1])<9
+        for base,terms in kernels:
+            for i,j,slots in terms:
+                kernel=_permute_eri_slots(base,slots,2)
+                if sparse:
+                    # Cartesian probes have only one nonzero axis. Avoid
+                    # contracting the eight identically zero kernel planes.
+                    shape_i=[1]*4;shape_i[i]=nao
+                    shape_j=[1]*4;shape_j[j]=nao
+                    for a in active[0]:
+                        for b in active[1]:
+                            out+=.5*kernel[a,b]*coefficients[0,:,a].reshape(shape_i)*coefficients[1,:,b].reshape(shape_j)
+                            out+=.5*kernel[b,a]*coefficients[1,:,b].reshape(shape_i)*coefficients[0,:,a].reshape(shape_j)
+                else:
+                    expression=f'{"pqrs"[i]}a,{"pqrs"[j]}b,abpqrs->pqrs'
+                    out+=.5*np.einsum(expression,coefficients[0],coefficients[1],kernel,optimize=True)
+                    out+=.5*np.einsum(expression,coefficients[1],coefficients[0],kernel,optimize=True)
+        for axis in range(4):out=np.take(out,permutation,axis=axis)
+        return out
+    pair.workspace_bytes=size
+    return pair
 
 
 def _directional_eri_derivatives_pyscf(mol, directions, order):

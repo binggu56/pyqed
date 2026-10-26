@@ -281,17 +281,24 @@ def _extensions_to_build():
         # Accelerate is available on macOS.  Generic Linux wheels must retain
         # the extension's internal fallback instead of assuming a system BLAS
         # development library is installed on the target machine.
+        qchem_openmp_compile, qchem_openmp_link = _mps_openmp_flags(
+            os.environ.get("PYQED_QCHEM_OPENMP", "auto"))
+        extensions.append(Extension(
+            "pyqed.qchem._ao2mo", ["pyqed/qchem/_ao2mo.cpp"],
+            include_dirs=cpp_include_dirs, language="c++",
+            extra_compile_args=cpp_compile_args,
+            extra_link_args=accelerate_link_args, optional=False))
         casscf_libraries = []
         casscf_macros = []
         extensions.append(
             Extension(
                 "pyqed.qchem._integrals_cpp",
                 ["pyqed/qchem/_integrals.cpp"],
-                depends=["pyqed/qchem/ri_derivatives.hpp"],
+                depends=["pyqed/qchem/_boys.hpp", "pyqed/qchem/ri_derivatives.hpp"],
                 include_dirs=cpp_include_dirs,
                 language="c++",
-                extra_compile_args=qchem_integral_compile_args,
-                extra_link_args=qchem_integral_link_args,
+                extra_compile_args=qchem_integral_compile_args + qchem_openmp_compile,
+                extra_link_args=qchem_integral_link_args + qchem_openmp_link,
                 optional=False,
             )
         )

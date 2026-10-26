@@ -4,9 +4,13 @@
 Native RHF analytic Hessian from builtin derivative integrals.
 """
 
+from pyqed.parallel import resolve_workers
+
 import numpy as np
 from copy import deepcopy
 from scipy.optimize import linear_sum_assignment
+from scipy.sparse.linalg import LinearOperator, gmres, gcrotmk
+from time import perf_counter
 
 from pyqed.qchem.basis_derivatives import (
     compact_eri_veff,
@@ -98,8 +102,16 @@ class RHFHessian:
     Cartesian Hessian for native ``pyqed.qchem.hf.RHF``.
 
     The implementation uses PyQED's builtin derivative integral layer for all
-    explicit one- and two-electron nuclear derivatives.  The CPHF equations are
-    solved as a dense occupied-virtual linear system.
+    explicit one- and two-electron nuclear derivatives. First-order CPHF equations are
+    solved matrix-free by default; a dense solve is an explicit reference.
+    Uses SciPy's gap-preconditioned GCROT(m,k), carrying response vectors and
+    their images across RHSs in one call (Hicken and Zingg, SIAM J. Sci.
+    Comput. 32, 1672--1694, 2010, doi:10.1137/090754674; Parks et al.,
+    SIAM J. Sci. Comput. 28, 1651--1674, 2006, doi:10.1137/040607277).
+    This adapts the solver to the existing RHF response operator. No response
+    terms are omitted. True residuals are checked; restarts do not guarantee
+    convergence and failure raises without a dense fallback.
+    Second-order orbital response retains its dense reference solve.
     RI/CD references support analytic fixed-auxiliary curvature; see
     :mod:`.factor_curvature` for references and screening/rank restrictions.
     """
@@ -260,7 +272,208 @@ class RHFHessian:
             amat[row, col] += e_occ[j] - e_vir[bpos]
         return amat
 
-    def _cphf_orbital_columns(self, f1, s1):
+    def _solve_orbital_system(
+        self,
+        rhs,
+        mo_coeff,
+        cocc,
+        occidx,
+        viridx,
+        e_occ,
+        e_vir,
+        factors,
+        *,
+        solver="matrix_free",
+        tolerance=1e-11,
+        maxiter=100,
+        restart=40,
+        recycle=20,
+        orbital_solver=None,
+    ):
+        """Bounded recycled Krylov solve for the unchanged RHF equations.
+
+        See class references for SciPy's flexible GCROT(m,k) adaptation.
+        Retains at most ``recycle`` pairs plus the latest solution; oldest
+        vectors are evicted. A*x from the true-residual check is reused.
+        The cache lives only for this RHS batch: never across geometries or
+        response operators. ``recycle=0`` uses independent SciPy GMRES
+        (Saad and Schultz, SIAM J. Sci. Stat. Comput. 7, 856--869, 1986,
+        doi:10.1137/0907058), as in molecular LDA/periodic response.
+        This adapts the linear solver, not the
+        response model: overlap driving and all RHF Coulomb/exchange terms are
+        retained. Restarts have no general convergence guarantee; failure or
+        a failed unpreconditioned residual check raises, without dense fallback.
+        RHSs are serial; integral actions use the molecule's worker budget.
+        """
+        if orbital_solver is not None:
+            # The caller fingerprints the reference before supplying this
+            # shared factorization. Its solve checks the physical residual.
+            value = orbital_solver.solve(rhs, transpose=False)
+            self.cphf_info = dict(converged=True, algorithm='shared orbital factorization',
+                                 max_residual=float(np.max(orbital_solver.residuals, initial=0.)))
+            return value
+        if solver not in ("matrix_free", "dense"):
+            raise ValueError("CPHF solver must be matrix_free or dense.")
+        if not np.isfinite(tolerance) or tolerance <= 0:
+            raise ValueError("CPHF tolerance must be finite and positive.")
+        if any(
+            isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v < 1
+            for v in (maxiter, restart)
+        ):
+            raise ValueError("CPHF maxiter and restart must be positive integers.")
+        if (
+            isinstance(recycle, bool)
+            or not isinstance(recycle, (int, np.integer))
+            or recycle < 0
+        ):
+            raise ValueError("CPHF recycle must be a nonnegative integer.")
+        started = perf_counter()
+        gap = (e_occ[None, :] - e_vir[:, None]).ravel()
+        size = gap.size
+        flat = rhs.reshape(len(rhs), size)
+        if not np.all(np.isfinite(flat)) or not np.all(np.isfinite(gap)):
+            raise ValueError("CPHF driving terms and orbital gaps must be finite.")
+        restart = min(restart, size)
+        recycle = min(recycle, size)
+        counts, residuals, actions_per_rhs = [], [], []
+        recycled = []
+        max_recycled = 0
+        calls = 0
+
+        def action(vector):
+            nonlocal calls
+            calls += 1
+            trial = np.zeros((mo_coeff.shape[1], len(occidx)))
+            trial[viridx] = vector.reshape(len(viridx), len(occidx))
+            response, _ = self._occupied_response(
+                trial, mo_coeff, cocc, factors, occidx
+            )
+            return gap * vector - response[viridx].ravel()
+
+        self.cphf_info = dict(
+            solver=solver,
+            converged=False,
+            dimension=size,
+            nrhs=len(rhs),
+            iterations=counts,
+            residual_norms=residuals,
+        )
+        if size == 0:
+            solution = np.zeros_like(flat)
+            counts.extend([0] * len(rhs))
+            residuals.extend([0.0] * len(rhs))
+        elif solver == "dense":
+            matrix = self._build_cphf_matrix(
+                mo_coeff, cocc, occidx, viridx, e_occ, e_vir
+            )
+            solution = np.linalg.solve(matrix, flat.T).T
+            counts.extend([0] * len(rhs))
+        else:
+            if np.min(abs(gap)) < 1e-12:
+                raise ValueError("Singular CPHF orbital-gap preconditioner.")
+            operator = LinearOperator((size, size), matvec=action, dtype=float)
+            preconditioner = LinearOperator(
+                (size, size), matvec=lambda v: v / gap, dtype=float
+            )
+            solution = np.empty_like(flat)
+            for index, b in enumerate(flat):
+                history = []
+                before = calls
+                if np.linalg.norm(b) <= 1e-13:
+                    value, status = np.zeros_like(b), 0
+                elif recycle:
+                    value, status = gcrotmk(
+                        operator,
+                        b,
+                        M=preconditioner,
+                        rtol=tolerance,
+                        atol=1e-13,
+                        m=restart,
+                        k=recycle,
+                        maxiter=maxiter,
+                        CU=recycled,
+                        callback=lambda _: history.append(None),
+                    )
+                    max_recycled = max(max_recycled, len(recycled))
+                else:
+                    value, status = gmres(
+                        operator,
+                        b,
+                        M=preconditioner,
+                        rtol=tolerance,
+                        atol=1e-13,
+                        restart=restart,
+                        maxiter=maxiter,
+                        callback=history.append,
+                        callback_type="pr_norm",
+                    )
+                counts.append(len(history))
+                image = action(value)
+                residual = float(np.linalg.norm(image - b))
+                # The true-residual check already supplies A*x for the saved solution.
+                for j, (cached_image, saved) in enumerate(recycled):
+                    if cached_image is None and np.array_equal(saved, value):
+                        recycled[j] = (image, saved)
+                # Zero cached columns make QR rank detection ill-defined (0/0).
+                recycled[:] = [
+                    (c, u)
+                    for c, u in recycled
+                    if np.linalg.norm(u) > 0 and (c is None or np.linalg.norm(c) > 0)
+                ]
+                residuals.append(residual)
+                actions_per_rhs.append(calls - before)
+                if (
+                    status
+                    or not np.all(np.isfinite(value))
+                    or not np.isfinite(residual)
+                    or residual > max(1e-13, tolerance * np.linalg.norm(b)) * 2
+                ):
+                    raise RuntimeError(
+                        f"CPHF iterative solve failed for RHS {index}: status={status}, residual={residual:g}."
+                    )
+                solution[index] = value
+        if solver == "dense" and size:
+            for value, b in zip(solution, flat):
+                residual = float(np.linalg.norm(action(value) - b))
+                residuals.append(residual)
+                if (
+                    not np.all(np.isfinite(value))
+                    or not np.isfinite(residual)
+                    or residual > max(1e-13, tolerance * np.linalg.norm(b)) * 2
+                ):
+                    raise RuntimeError(
+                        "Dense CPHF reference failed its residual check."
+                    )
+        self.cphf_info.update(
+            converged=True,
+            algorithm=(
+                "GCROT(m,k)"
+                if solver == "matrix_free" and recycle
+                else "GMRES" if solver == "matrix_free" else "dense"
+            ),
+            recycle=recycle if solver == "matrix_free" else 0,
+            recycled_vectors=max_recycled,
+            recycled_pair_bytes=2 * max_recycled * size * 8,
+            actions_per_rhs=actions_per_rhs,
+            iteration_kind=(
+                "direct"
+                if solver == "dense"
+                else "outer callbacks" if recycle else "inner iterations"
+            ),
+            operator_calls=calls,
+            seconds=perf_counter() - started,
+            restart=restart,
+            dense_matrix_bytes=size * size * 8,
+            krylov_basis_bytes=(
+                ((2 * (restart + recycle) + 1) if recycle else (restart + 1)) * size * 8
+                if solver == "matrix_free"
+                else 0
+            ),
+            max_residual=max(residuals, default=0.0),
+        )
+        return solution.reshape(rhs.shape)
+
+    def _cphf_orbital_columns(self, f1, s1, **solver_options):
         """Solve occupied MO response columns for arbitrary perturbations."""
         mo_coeff = np.asarray(self.base.mo_coeff, dtype=float)
         mo_energy = np.asarray(self.base.mo_energy, dtype=float)
@@ -296,9 +509,6 @@ class RHFHessian:
         if factors is None:
             factors = getattr(self.mol,'eri_factors',None)
         response_factors = None if factors is None else mo_pair_factors(factors,mo_coeff)
-        amat = self._build_cphf_matrix(
-            mo_coeff, cocc, occidx, viridx, e_occ, e_vir
-        )
 
         for x in range(npert):
             f1_mo = mo_coeff.T @ f1f[x] @ mo_coeff
@@ -315,12 +525,9 @@ class RHFHessian:
         fixed_response, _ = self._occupied_responses(
             u_fixed_all,mo_coeff,cocc,response_factors,occidx)
         rhs_all += fixed_response[:,viridx]
-        if nvir:
-            u_vo_all = np.linalg.solve(
-                amat, rhs_all.reshape(npert, -1).T
-            ).T.reshape(npert, nvir, nocc)
-        else:
-            u_vo_all = np.empty((npert, 0, nocc), dtype=float)
+        u_vo_all = self._solve_orbital_system(
+            rhs_all, mo_coeff, cocc, occidx, viridx, e_occ, e_vir,
+            response_factors, **solver_options)
         u_all[:] = u_fixed_all
         u_all[:, viridx, :] = u_vo_all
         return {
@@ -337,18 +544,25 @@ class RHFHessian:
             "response_factors": response_factors,
         }
 
-    def solve_mo_response(self, fock_derivatives, overlap_derivatives):
+    def solve_mo_response(self, fock_derivatives, overlap_derivatives, **solver_options):
         """Return full RHF MO coefficient derivatives in canonical MO gauge.
 
         CPHF first determines the occupied response and therefore the relaxed
         first-order Fock matrix. The response of every canonical MO then follows
         from the differentiated generalized Fock eigenproblem. This includes
         occupied-occupied and virtual-virtual rotations needed by truncated
-        active spaces.
+        active spaces. ``solver='matrix_free'`` uses recycled GCROT(m,k);
+        ``solver='dense'`` selects the small-system reference. Controls are
+        ``tolerance=1e-11``, ``maxiter=100`` outer cycles, ``restart=40``
+        inner steps, and ``recycle=20`` retained pairs. Set ``recycle=0``
+        for independent GMRES. Reuse is restricted to this call's fixed operator.
+        See :meth:`_solve_orbital_system` for reference and restrictions.
+        ``cphf_info`` records iterations and true residuals.
         """
         response = self._first_order_mo_response_data(
             fock_derivatives,
             overlap_derivatives,
+            **solver_options,
         )
         full = response["full_response"]
         return full.reshape(
@@ -357,10 +571,10 @@ class RHFHessian:
             full.shape[-1],
         )
 
-    def _first_order_mo_response_data(self, fock_derivatives, overlap_derivatives):
+    def _first_order_mo_response_data(self, fock_derivatives, overlap_derivatives, **solver_options):
         self._require_scf()
         response = self._cphf_orbital_columns(
-            fock_derivatives, overlap_derivatives
+            fock_derivatives, overlap_derivatives, **solver_options
         )
         amplitudes = response["amplitudes"]
         overlap_mo = response["overlap_mo"]
@@ -453,6 +667,8 @@ class RHFHessian:
         first,
         fock_second_explicit,
         overlap_second,
+        pair=None,
+        orbital_solver=None,
     ):
         mo_coeff = first["mo_coeff"]
         mo_energy = first["mo_energy"]
@@ -467,12 +683,17 @@ class RHFHessian:
         e1_occ = first["occupied_energy_response"]
         e1 = first["orbital_energy_response"]
         ncoord, nmo, nocc = u_occ.shape
+        shape = (ncoord,ncoord) if pair is None else (1,1)
+        entries = ([(a,b,a,b) for a in range(ncoord) for b in range(ncoord)]
+                   if pair is None else [(0,0,*pair)])
+        if pair is not None and (len(pair) != 2 or any(x < 0 or x >= ncoord for x in pair)):
+            raise ValueError('Second-response pair indices are outside the first-response batch.')
         nvir = len(viridx)
         f2_explicit = np.asarray(fock_second_explicit, dtype=float).reshape(
-            ncoord, ncoord, self.mol.nao, self.mol.nao
+            *shape, self.mol.nao, self.mol.nao
         )
         s2 = np.asarray(overlap_second, dtype=float).reshape(
-            ncoord, ncoord, self.mol.nao, self.mol.nao
+            *shape, self.mol.nao, self.mol.nao
         )
         s2_mo = np.einsum(
             "pi,xypq,qj->xyij",
@@ -482,115 +703,104 @@ class RHFHessian:
             optimize=True,
         )
         e0_occ = np.diag(e_occ)
-        fixed = np.zeros((ncoord, ncoord, nmo, nocc), dtype=float)
-        rhs = np.zeros((ncoord, ncoord, nvir, nocc), dtype=float)
+        fixed = np.zeros((*shape, nmo, nocc), dtype=float)
+        rhs = np.zeros((*shape, nvir, nocc), dtype=float)
 
-        for x in range(ncoord):
-            for y in range(ncoord):
-                normalization = self._second_normalization(
-                    u_occ[x],
-                    u_occ[y],
-                    s1_mo[x],
-                    s1_mo[y],
-                    s2_mo[x, y],
-                    columns=occidx,
-                )
-                fixed[x, y, occidx] = -0.5 * normalization
-                c1x = mo_coeff @ u_occ[x]
-                c1y = mo_coeff @ u_occ[y]
-                c2_fixed = mo_coeff @ fixed[x, y]
-                dm2_fixed = 2.0 * (
-                    c2_fixed @ cocc.T
-                    + cocc @ c2_fixed.T
-                    + c1x @ c1y.T
-                    + c1y @ c1x.T
-                )
-                f2_known = f2_explicit[x, y] + self.base.get_veff(dm2_fixed)
-                f2_known_mo = mo_coeff.T @ f2_known @ mo_coeff
-                known = (
-                    f2_known_mo[:, occidx]
-                    + f1_mo[x] @ u_occ[y]
-                    + f1_mo[y] @ u_occ[x]
-                    - s2_mo[x, y][:, occidx] @ e0_occ
-                    - s1_mo[x] @ u_occ[y] @ e0_occ
-                    - s1_mo[x][:, occidx] @ e1_occ[y]
-                    - s1_mo[y] @ u_occ[x] @ e0_occ
-                    - u_occ[x] @ e1_occ[y]
-                    - s1_mo[y][:, occidx] @ e1_occ[x]
-                    - u_occ[y] @ e1_occ[x]
-                )
-                rhs[x, y] = known[viridx]
+        for a,b,x,y in entries:
+            normalization = self._second_normalization(
+                u_occ[x],
+                u_occ[y],
+                s1_mo[x],
+                s1_mo[y],
+                s2_mo[a, b],
+                columns=occidx,
+            )
+            fixed[a, b, occidx] = -0.5 * normalization
+            c1x = mo_coeff @ u_occ[x]
+            c1y = mo_coeff @ u_occ[y]
+            c2_fixed = mo_coeff @ fixed[a, b]
+            dm2_fixed = 2.0 * (
+                c2_fixed @ cocc.T
+                + cocc @ c2_fixed.T
+                + c1x @ c1y.T
+                + c1y @ c1x.T
+            )
+            f2_known = f2_explicit[a, b] + self.base.get_veff(dm2_fixed)
+            f2_known_mo = mo_coeff.T @ f2_known @ mo_coeff
+            known = (
+                f2_known_mo[:, occidx]
+                + f1_mo[x] @ u_occ[y]
+                + f1_mo[y] @ u_occ[x]
+                - s2_mo[a, b][:, occidx] @ e0_occ
+                - s1_mo[x] @ u_occ[y] @ e0_occ
+                - s1_mo[x][:, occidx] @ e1_occ[y]
+                - s1_mo[y] @ u_occ[x] @ e0_occ
+                - u_occ[x] @ e1_occ[y]
+                - s1_mo[y][:, occidx] @ e1_occ[x]
+                - u_occ[y] @ e1_occ[x]
+            )
+            rhs[a, b] = known[viridx]
 
         if nvir:
-            amat = self._build_cphf_matrix(
-                mo_coeff,
-                cocc,
-                occidx,
-                viridx,
-                e_occ,
-                mo_energy[viridx],
-            )
-            solved = np.linalg.solve(
-                amat,
-                rhs.reshape(ncoord * ncoord, -1).T,
-            ).T.reshape(ncoord, ncoord, nvir, nocc)
+            if orbital_solver is None:
+                amat = self._build_cphf_matrix(mo_coeff,cocc,occidx,viridx,e_occ,mo_energy[viridx])
+                orbital_solver = lambda rhs: np.linalg.solve(amat,rhs)
+            solved = orbital_solver(rhs.reshape(int(np.prod(shape)),-1).T).T.reshape(*shape,nvir,nocc)
         else:
-            solved = np.empty((ncoord, ncoord, 0, nocc), dtype=float)
+            solved = np.empty((*shape, 0, nocc), dtype=float)
 
         u2_occ = fixed
         u2_occ[:, :, viridx] = solved
         dm2 = np.empty(
-            (ncoord, ncoord, self.mol.nao, self.mol.nao),
+            (*shape, self.mol.nao, self.mol.nao),
             dtype=float,
         )
-        f2_total_mo = np.empty((ncoord, ncoord, nmo, nmo), dtype=float)
-        for x in range(ncoord):
-            for y in range(ncoord):
-                c1x = mo_coeff @ u_occ[x]
-                c1y = mo_coeff @ u_occ[y]
-                c2 = mo_coeff @ u2_occ[x, y]
-                dm2[x, y] = 2.0 * (
-                    c2 @ cocc.T
-                    + cocc @ c2.T
-                    + c1x @ c1y.T
-                    + c1y @ c1x.T
-                )
-                f2_total = f2_explicit[x, y] + self.base.get_veff(dm2[x, y])
-                f2_total_mo[x, y] = mo_coeff.T @ f2_total @ mo_coeff
+        f2_total_mo = np.empty((*shape, nmo, nmo), dtype=float)
+        for a,b,x,y in entries:
+            c1x = mo_coeff @ u_occ[x]
+            c1y = mo_coeff @ u_occ[y]
+            c2 = mo_coeff @ u2_occ[a, b]
+            dm2[a, b] = 2.0 * (
+                c2 @ cocc.T
+                + cocc @ c2.T
+                + c1x @ c1y.T
+                + c1y @ c1x.T
+            )
+            f2_total = f2_explicit[a, b] + self.base.get_veff(dm2[a, b])
+            f2_total_mo[a, b] = mo_coeff.T @ f2_total @ mo_coeff
 
         e0 = np.diag(mo_energy)
-        u2_full = np.empty((ncoord, ncoord, nmo, nmo), dtype=float)
-        for x in range(ncoord):
-            for y in range(ncoord):
-                normalization = self._second_normalization(
-                    u_full[x],
-                    u_full[y],
-                    s1_mo[x],
-                    s1_mo[y],
-                    s2_mo[x, y],
-                )
-                response = -0.5 * normalization
-                known = (
-                    f2_total_mo[x, y]
-                    + f1_mo[x] @ u_full[y]
-                    + f1_mo[y] @ u_full[x]
-                    - s2_mo[x, y] @ e0
-                    - s1_mo[x] @ u_full[y] @ e0
-                    - s1_mo[x] @ np.diag(e1[y])
-                    - s1_mo[y] @ u_full[x] @ e0
-                    - u_full[x] @ np.diag(e1[y])
-                    - s1_mo[y] @ np.diag(e1[x])
-                    - u_full[y] @ np.diag(e1[x])
-                )
-                for column in range(nmo):
-                    for row in range(nmo):
-                        if row == column:
-                            continue
-                        denominator = mo_energy[column] - mo_energy[row]
-                        if abs(denominator) < 1.0e-10:
-                            continue
-                        response[row, column] = known[row, column] / denominator
-                u2_full[x, y] = response
+        u2_full = np.empty((*shape, nmo, nmo), dtype=float)
+        for a,b,x,y in entries:
+            normalization = self._second_normalization(
+                u_full[x],
+                u_full[y],
+                s1_mo[x],
+                s1_mo[y],
+                s2_mo[a, b],
+            )
+            response = -0.5 * normalization
+            known = (
+                f2_total_mo[a, b]
+                + f1_mo[x] @ u_full[y]
+                + f1_mo[y] @ u_full[x]
+                - s2_mo[a, b] @ e0
+                - s1_mo[x] @ u_full[y] @ e0
+                - s1_mo[x] @ np.diag(e1[y])
+                - s1_mo[y] @ u_full[x] @ e0
+                - u_full[x] @ np.diag(e1[y])
+                - s1_mo[y] @ np.diag(e1[x])
+                - u_full[y] @ np.diag(e1[x])
+            )
+            for column in range(nmo):
+                for row in range(nmo):
+                    if row == column:
+                        continue
+                    denominator = mo_energy[column] - mo_energy[row]
+                    if abs(denominator) < 1.0e-10:
+                        continue
+                    response[row, column] = known[row, column] / denominator
+            u2_full[a, b] = response
 
         u2_full = 0.5 * (u2_full + u2_full.swapaxes(0, 1))
         return {
@@ -752,7 +962,7 @@ class RHFHessian:
                 raise NotImplementedError('Use native molecule RI/CD factors, not external density fitting.')
             if self.base.cholesky_jk and getattr(self.mol, 'eri_factors', None) is None:
                 raise NotImplementedError('Build the molecule with eri="cd" for factor-consistent response.')
-            count = 1 if workers is None else workers
+            count = resolve_workers(workers)
             if not np.isfinite(step) or step <= 0 or int(count) != count or count < 1:
                 raise ValueError('step must be positive and workers a positive integer.')
             self.coords = np.asarray(self.mol.atom_coords(), dtype=float)
@@ -886,28 +1096,29 @@ class RHFHessian:
             optimize=True,
         )
 
-    def vibrational_analysis(
+    def harmonic_analysis(
         self,
         remove_translation_rotation=True,
         negative_imaginary=True,
         zero_tol=1e-7,
         exclude=None,
+        verbose=0,
     ):
         """Analyze curvature; ``exclude`` removes mass-weighted reaction tangents.
 
-        See :func:`pyqed.qchem.dft.hessian.analyze_cartesian_hessian` for
+        See :func:`pyqed.qchem.dft.hessian.analyze_hessian` for
         mode units, the transverse projection reference and its limitations.
         """
         if self.hess is None:
             raise ValueError("Run the Hessian calculation before requesting vibrational analysis.")
         try:
-            from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+            from pyqed.qchem.dft.hessian import analyze_hessian
         except ModuleNotFoundError as error:
             if error.name != "pyqed.qchem.dft":
                 raise
-            from pyqed.qchem.DFT.hessian import analyze_cartesian_hessian
+            from pyqed.qchem.DFT.hessian import analyze_hessian
 
-        return analyze_cartesian_hessian(
+        data = analyze_hessian(
             self.hess,
             self.coords,
             self.mol.atom_mass_list(),
@@ -916,9 +1127,17 @@ class RHFHessian:
             zero_tol=zero_tol,
             exclude=exclude,
         )
+        if getattr(self.mol, "symmetry_info", None) is not None:
+            from pyqed.qchem.symmetry import assign_mode_irreps, print_irrep_table
+            if not self.mol.symmetry_info.group.linear:
+                labels, weights = assign_mode_irreps(self.mol, data["modes"])
+                data["mode_irreps"], data["mode_irrep_weights"] = labels, weights
+                if verbose:
+                    print_irrep_table("Mode", data["freq_cm1"], labels, unit="cm^-1")
+        return data
 
     def frequencies(self, unit="cm^-1", **kwargs):
-        data = self.vibrational_analysis(**kwargs)
+        data = self.harmonic_analysis(**kwargs)
         unit = unit.lower()
         if unit in ("cm^-1", "cm-1", "wavenumber", "wavenumbers"):
             return data["freq_cm1"]
@@ -953,7 +1172,7 @@ class RHFHessian:
             Selected frequencies in atomic units and Cartesian mode vectors.
         """
 
-        data = self.vibrational_analysis(**kwargs)
+        data = self.harmonic_analysis(**kwargs)
         omega = np.asarray(data["freq_au"], dtype=float)
         modes = np.asarray(data["modes"], dtype=float)
         valid = np.flatnonzero(np.isfinite(omega) & (omega > 0.0))

@@ -321,9 +321,9 @@ class IR:
                 return hessian.vibrational_analysis(**self.hessian_kwargs)
 
         hess = self._finite_difference_energy_hessian(method, step=self.hessian_step)
-        from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+        from pyqed.qchem.dft.hessian import analyze_hessian
 
-        return analyze_cartesian_hessian(
+        return analyze_hessian(
             hess,
             method.mol.atom_coords(),
             method.mol.atom_mass_list(),

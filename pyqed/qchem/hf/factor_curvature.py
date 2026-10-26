@@ -16,6 +16,9 @@ Bounded signature caches reuse normalized shifts; grouped product-rule terms
 reuse common mapping intermediates without caching integral tensors.
 CD second integrals still use scalar evaluation. Fixed CD pivots, zero
 screening and untruncated Cholesky RI metrics only. No finite differences.
+CD pivot blocks use their mathematical lower triangle in both solves and
+products, excluding elimination roundoff above that triangle. This does not
+truncate auxiliary functions or change the stored integral factors.
 """
 from itertools import product, islice
 from functools import lru_cache
@@ -185,7 +188,9 @@ class FactorCurvature:
             self.pairs = list(zip(*np.tril_indices(data['nao'])))
             self.pivots = data['pivots']
             pair = g._as_ri_pair_factors(data['factors'], data['nao'])
-            self.root = pair[:, self.pivots].T
+            # Elimination leaves roundoff above the pivot triangle. Solves
+            # ignore it; products must use the same triangular factor.
+            self.root = np.tril(pair[:, self.pivots].T)
             self.factors = g._pair_factors_to_full(pair, data['nao'])
             self.final_transform = transform if data['transform'] is None else None
             self.cd = True
@@ -337,6 +342,24 @@ class FactorCurvature:
             return g.mo_pair_factors(factors,self.final_transform,self.final_transform)
         return factors
 
+    def pullback(self, bar):
+        """Pull a molecular factor covector back to three-center/metric data.
+
+        Exact transpose of B=L^-1 V and M=L L^T, with fixed CD pivots
+        or the unscreened RI metric. Reuses the curvature formulation cited
+        in this module; no integral or factor truncation is introduced.
+        """
+        if self.cd and self.final_transform is not None:
+            t = self.final_transform
+            bar = np.einsum('mi,Pij,nj->Pmn', t, bar, t, optimize=True)
+        b = self.factors.reshape(len(self.root), -1)
+        u = solve_triangular(self.root.T, np.asarray(bar).reshape(b.shape), lower=False)
+        root_bar = self.root.T@(u@b.T)
+        root_bar = np.tril(root_bar, -1)+.5*np.diag(np.diag(root_bar))
+        w = solve_triangular(self.root.T, root_bar, lower=False)
+        w = solve_triangular(self.root.T, w.T, lower=False).T
+        return u.reshape(self.factors.shape), -(w+w.T)/2
+
     def response(self, dm):
         if not self.cd:
             return self._ri_response(dm)
@@ -383,12 +406,9 @@ class FactorCurvature:
             return (np.einsum('P,ij->Pij',np.einsum('Pij,ij->P',factor,dm),dm)
                     -.5*np.einsum('ik,Pkl,lj->Pij',dm,factor,dm,optimize=True))
         bar = adjoint(b)
-        u = solve_triangular(self.root.T,bar.reshape(len(b),-1),lower=False)
-        root_bar = self.root.T@(u@b.reshape(len(b),-1).T)
-        root_bar = np.tril(root_bar,-1)+.5*np.diag(np.diag(root_bar))
-        w = solve_triangular(self.root.T,root_bar,lower=False)
-        w = solve_triangular(self.root.T,w.T,lower=False).T
-        w = (w+w.T)/2
+        u, metric_bar = self.pullback(bar)
+        u = u.reshape(len(b), -1)
+        w = -metric_bar
         scalar = self._contract_ri_curvature(2*u.reshape(b.shape),-2*w)
         correction = np.empty_like(scalar)
         f1 = []

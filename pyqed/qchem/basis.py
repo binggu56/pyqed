@@ -6,6 +6,8 @@ Created on Mon Oct 28 00:01:55 2024
 @author: bingg
 """
 
+from pyqed.parallel import resolve_workers
+
 import os
 import re
 import math
@@ -19,6 +21,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import lru_cache
 
 import numpy as np
+from scipy.linalg import cython_blas as _ri_blas
 import pyqed
 _CYTHON_COMPILED = False
 try:
@@ -180,6 +183,26 @@ def S(a,b):
                 overlap(a.exps[ia],a.shell,a.origin,
                 b.exps[ib],b.shell,b.origin)
     return s
+
+
+def cross_overlap(mol_bra, mol_ket):
+    """Contracted Gaussian cross-geometry overlap in each molecule's AO basis.
+
+    Bra and ket may have different geometries, basis sizes, and Cartesian/
+    spherical conventions. Primitive normalization is carried by the existing
+    contraction weights. No external integral engine is used.
+    """
+    basis_bra, transform_bra = mol_bra._cart_basis()
+    basis_ket, transform_ket = mol_ket._cart_basis()
+    matrix = np.empty((len(basis_bra), len(basis_ket)))
+    for i, bra in enumerate(basis_bra):
+        for j, ket in enumerate(basis_ket):
+            matrix[i, j] = S(bra, ket)
+    if transform_bra is not None:
+        matrix = transform_bra.T @ matrix
+    if transform_ket is not None:
+        matrix = matrix @ transform_ket
+    return matrix
 
 
 from scipy.special import factorial2
@@ -1038,8 +1061,9 @@ def _compute_dense_eri_serial_cpp_cartesian(
     pair_bounds,
     screen_tol,
     max_l=_CPP_CARTESIAN_MAX_L,
-    workers=1,
+    workers=None,
 ):
+    workers = resolve_workers(workers)
     if not _cpp_dense_eri_available():
         return None
     if _signatures_max_l(signatures) > int(max_l):
@@ -1068,8 +1092,9 @@ def _compute_eri_s8_cpp_cartesian(
     pair_bounds,
     screen_tol,
     max_l=_CPP_CARTESIAN_MAX_L,
-    workers=1,
+    workers=None,
 ):
+    workers = resolve_workers(workers)
     if _integrals_cpp is None or not hasattr(_integrals_cpp, "compute_eri_s8_cartesian"):
         return None
     if _signatures_max_l(signatures) > int(max_l):
@@ -1102,9 +1127,10 @@ def direct_jk_cartesian_cpp(
     pair_bounds,
     dm,
     screen_tol=0.0,
-    workers=1,
+    workers=None,
     max_l=_CPP_CARTESIAN_MAX_L,
 ):
+    workers = resolve_workers(workers)
     if (
         _integrals_cpp is None
         or not hasattr(_integrals_cpp, "direct_jk_cartesian")
@@ -1144,12 +1170,13 @@ def direct_jk_spherical_cpp(
     transform,
     dm,
     screen_tol=0.0,
-    workers=1,
+    workers=None,
     max_l=_CPP_CARTESIAN_MAX_L,
     rys_max_rank=-1,
     native_plan=None,
     symmetric_density=None,
 ):
+    workers = resolve_workers(workers)
     if (
         _integrals_cpp is None
         or not hasattr(_integrals_cpp, "direct_jk_spherical")
@@ -1221,9 +1248,10 @@ def direct_veff_cartesian_cpp(
     pair_bounds,
     dm,
     screen_tol=0.0,
-    workers=1,
+    workers=None,
     max_l=_CPP_CARTESIAN_MAX_L,
 ):
+    workers = resolve_workers(workers)
     if (
         _integrals_cpp is not None
         and hasattr(_integrals_cpp, "direct_veff_cartesian")
@@ -1596,10 +1624,35 @@ def _unique_ao_pairs(nao):
     return pairs
 
 
-def _compute_pair_bounds(signatures):
+def _assemble_symmetric_rows(nao, workers, kernel, packed, count=1):
+    """Finish independent lower-triangle batches before the next parallel stage."""
+    chunk = max(1, nao // (4*workers))
+    intervals = [(start, min(start+chunk, nao)) for start in range(0, nao, chunk)]
+    def compute_rows(interval):
+        start, stop = interval
+        return start, kernel(*packed, start, stop)
+    matrices = tuple(np.empty((nao, nao), dtype=np.float64) for _ in range(count))
+    with ThreadPoolExecutor(max_workers=min(workers, len(intervals))) as pool:
+        for start, blocks in pool.map(compute_rows, intervals):
+            if count == 1:
+                blocks = (blocks,)
+            for matrix, block in zip(matrices, blocks):
+                matrix[start:start+len(block)] = block
+    rows, cols = np.tril_indices(nao, -1)
+    for matrix in matrices:
+        matrix[cols, rows] = matrix[rows, cols]
+    return matrices
+
+
+def _compute_pair_bounds(signatures, workers=None):
+    workers = resolve_workers(workers)
     nao = len(signatures)
     if _basis_cy is not None and hasattr(_basis_cy, "compute_pair_bounds"):
         shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+        if workers > 1 and nao >= 64 and hasattr(_basis_cy, "compute_pair_bounds_rows"):
+            return _assemble_symmetric_rows(
+                nao, workers, _basis_cy.compute_pair_bounds_rows,
+                (shells, origins, exps, weights, nprim))[0]
         try:
             return np.asarray(
                 _basis_cy.compute_pair_bounds(
@@ -1751,10 +1804,17 @@ def _compute_one_electron_shellblocked(basis_cart, atcoords, atnums):
     return overlap_mat, kinetic_mat, vnuc_mat
 
 
-def _compute_one_electron_shellblocked_cython(signatures, atcoords, atnums):
+def _compute_one_electron_shellblocked_cython(signatures, atcoords, atnums, workers=None):
     if _basis_cy is None:
         return None
     shells, origins, exps, weights, nprim = _pack_signatures_for_numba(signatures)
+    workers = resolve_workers(workers)
+    if workers > 1 and len(signatures) >= 64 and hasattr(_basis_cy, "compute_one_electron_rows"):
+        return _assemble_symmetric_rows(
+            len(signatures), workers, _basis_cy.compute_one_electron_rows,
+            (shells, origins, exps, weights, nprim,
+             np.ascontiguousarray(atcoords, dtype=np.float64),
+             np.ascontiguousarray(atnums, dtype=np.float64)), count=3)
     try:
         overlap, kinetic, vnuc = _basis_cy.compute_one_electron(
             np.ascontiguousarray(shells, dtype=np.int64),
@@ -2039,9 +2099,11 @@ def _compute_dense_eri_spherical_shellblocked(
     screen_tol,
     *,
     backend="auto",
-    workers=1,
+    workers=None,
+    packed=False,
 ):
     """Build dense spherical ERIs without allocating a Cartesian AO tensor."""
+    workers = resolve_workers(workers)
     backend = _resolve_eri_backend(backend, signatures, operation="dense")
     shell_ranges = _contiguous_shell_blocks_from_signatures(signatures)
     shell_transforms = []
@@ -2083,13 +2145,15 @@ def _compute_dense_eri_spherical_shellblocked(
             int(_CPP_CARTESIAN_MAX_L),
             int(max(1, workers)),
             12,
+            bool(packed),
         )
         return (
             (np.asarray(eri, dtype=np.float64), int(computed), int(skipped)),
             f"cpp-rys-spherical-shellblocked-generated-hrr-sparse-transform-lmax{_CPP_CARTESIAN_MAX_L}",
         )
 
-    eri = np.zeros((spherical_stop,) * 4, dtype=float)
+    npair = spherical_stop * (spherical_stop + 1) // 2
+    eri = np.zeros(npair * (npair + 1) // 2 if packed else (spherical_stop,) * 4, dtype=float)
     nshell = len(shell_ranges)
     shell_transform_l1 = [
         float(np.max(np.sum(np.abs(transform), axis=0)))
@@ -2231,14 +2295,19 @@ def _compute_dense_eri_spherical_shellblocked(
                     b0, b1 = spherical_ranges[jsh]
                     c0, c1 = spherical_ranges[ksh]
                     d0, d1 = spherical_ranges[lsh]
-                    eri[a0:a1, b0:b1, c0:c1, d0:d1] = transformed
-                    eri[b0:b1, a0:a1, c0:c1, d0:d1] = transformed.transpose(1, 0, 2, 3)
-                    eri[a0:a1, b0:b1, d0:d1, c0:c1] = transformed.transpose(0, 1, 3, 2)
-                    eri[b0:b1, a0:a1, d0:d1, c0:c1] = transformed.transpose(1, 0, 3, 2)
-                    eri[c0:c1, d0:d1, a0:a1, b0:b1] = transformed.transpose(2, 3, 0, 1)
-                    eri[d0:d1, c0:c1, a0:a1, b0:b1] = transformed.transpose(3, 2, 0, 1)
-                    eri[c0:c1, d0:d1, b0:b1, a0:a1] = transformed.transpose(2, 3, 1, 0)
-                    eri[d0:d1, c0:c1, b0:b1, a0:a1] = transformed.transpose(3, 2, 1, 0)
+                    if packed:
+                        ab = _packed_pair_pair_indices(np.arange(a0, a1)[:, None], np.arange(b0, b1)[None, :])
+                        cd = _packed_pair_pair_indices(np.arange(c0, c1)[:, None], np.arange(d0, d1)[None, :])
+                        eri[_packed_pair_pair_indices(ab[:, :, None, None], cd[None, None, :, :])] = transformed
+                    else:
+                        eri[a0:a1, b0:b1, c0:c1, d0:d1] = transformed
+                        eri[b0:b1, a0:a1, c0:c1, d0:d1] = transformed.transpose(1, 0, 2, 3)
+                        eri[a0:a1, b0:b1, d0:d1, c0:c1] = transformed.transpose(0, 1, 3, 2)
+                        eri[b0:b1, a0:a1, d0:d1, c0:c1] = transformed.transpose(1, 0, 3, 2)
+                        eri[c0:c1, d0:d1, a0:a1, b0:b1] = transformed.transpose(2, 3, 0, 1)
+                        eri[d0:d1, c0:c1, a0:a1, b0:b1] = transformed.transpose(3, 2, 0, 1)
+                        eri[c0:c1, d0:d1, b0:b1, a0:a1] = transformed.transpose(2, 3, 1, 0)
+                        eri[d0:d1, c0:c1, b0:b1, a0:a1] = transformed.transpose(3, 2, 1, 0)
                     computed += unique_count
 
     source = "rys" if backend == "rys" else "python"
@@ -2299,10 +2368,25 @@ def _matrix_free_spherical_cd_factors(
     tol=1e-8,
     max_rank=None,
     screen_tol=0.0,
-    workers=1,
+    workers=None,
     rys_cache_mib=64,
     backend="auto",
+    fixed_pivots=None,
 ):
+    """Pivoted CD with selected ERI columns and unchanged residual threshold.
+
+    Shells through f use direct column extraction and a bounded integral-value
+    shell-block cache (``rys_cache_mib``, in addition to the
+    recurrence cache); overflow is recomputed, never expanded
+    into an unbounded dense ERI tensor. Higher shells retain the Coulomb-column
+    path. This is an algebraic reorganization of the existing CD algorithm,
+    not a new decomposition or a relaxed screening approximation.
+    Retain the accepted pivots for analytic response; symmetry-related maxima
+    in a Cholesky row need not reproduce the original pivot choice.
+    ``fixed_pivots`` rebuilds that same differentiable factor model at nearby
+    geometries, without reselecting pivots or applying a residual cutoff.
+    """
+    workers = resolve_workers(workers)
     backend = _resolve_eri_backend(backend, signatures, operation="factors")
     tol = float(tol)
     if tol <= 0.0:
@@ -2310,6 +2394,15 @@ def _matrix_free_spherical_cd_factors(
     nsph = int(primary_transform.shape[1])
     npair = nsph * (nsph + 1) // 2
     rank_limit = npair if max_rank is None else min(int(max_rank), npair)
+    if fixed_pivots is not None:
+        fixed_pivots = np.asarray(fixed_pivots)
+        if (fixed_pivots.ndim != 1 or fixed_pivots.dtype.kind not in 'iu'
+                or len(np.unique(fixed_pivots)) != len(fixed_pivots)
+                or np.any(fixed_pivots < 0) or np.any(fixed_pivots >= npair)):
+            raise ValueError('Fixed CD pivots must be unique AO-pair indices.')
+        if len(fixed_pivots) > rank_limit:
+            raise ValueError('Fixed CD pivots exceed the requested rank limit.')
+        rank_limit = len(fixed_pivots)
     if rank_limit < 0:
         raise ValueError("low_rank_max_rank must be nonnegative.")
 
@@ -2364,38 +2457,37 @@ def _matrix_free_spherical_cd_factors(
             rows, cols = np.tril_indices(nsph)
             capacity = min(rank_limit, 64)
             chol = np.empty((capacity, npair), dtype=np.float64)
-            dm = np.zeros((nsph, nsph), dtype=np.float64)
+            dm = None
             rank = 0
+            pivots = []
             computed_total = 0
             skipped_total = 0
             columns_started = time.perf_counter()
-            for _ in range(rank_limit):
-                pivot = int(np.argmax(diagonal))
-                if float(diagonal[pivot]) <= tol:
+            for step in range(rank_limit):
+                pivot = int(np.argmax(diagonal) if fixed_pivots is None else fixed_pivots[step])
+                if fixed_pivots is None and float(diagonal[pivot]) <= tol:
                     break
-                p = int(rows[pivot])
-                q = int(cols[pivot])
-                dm.fill(0.0)
-                if p == q:
-                    dm[p, p] = 1.0
+                selected = _integrals_cpp.eri_column_spherical_plan(
+                    native_plan, pivot, effective_screen_tol)
+                if selected is None:
+                    if dm is None:
+                        dm = np.zeros((nsph, nsph), dtype=np.float64)
+                    dm.fill(0.0)
+                    p, q = int(rows[pivot]), int(cols[pivot])
+                    dm[p, q] = dm[q, p] = 1.0 if p == q else 0.5
+                    vj, computed, skipped = _integrals_cpp.direct_j_spherical_plan(
+                        native_plan, dm, effective_screen_tol, max(1, int(workers)), 12, 1)
+                    column = np.asarray(vj, dtype=np.float64)[rows, cols].copy()
                 else:
-                    dm[p, q] = 0.5
-                    dm[q, p] = 0.5
-                vj, computed, skipped = _integrals_cpp.direct_j_spherical_plan(
-                    native_plan,
-                    dm,
-                    effective_screen_tol,
-                    max(1, int(workers)),
-                    12,
-                    1,
-                )
+                    column, computed, skipped = selected
                 computed_total += int(computed)
                 skipped_total += int(skipped)
-                column = np.asarray(vj, dtype=np.float64)[rows, cols].copy()
                 if rank:
                     column -= chol[:rank].T @ chol[:rank, pivot]
                 delta = float(column[pivot])
-                if delta <= tol:
+                if fixed_pivots is not None and delta <= 0:
+                    raise ValueError('Fixed CD pivot lost positive definiteness.')
+                if fixed_pivots is None and delta <= tol:
                     diagonal[pivot] = 0.0
                     continue
                 if rank == capacity:
@@ -2406,6 +2498,7 @@ def _matrix_free_spherical_cd_factors(
                     capacity = new_capacity
                 vector = column / math.sqrt(delta)
                 chol[rank] = vector
+                pivots.append(pivot)
                 rank += 1
                 diagonal -= vector * vector
                 np.maximum(diagonal, 0.0, out=diagonal)
@@ -2434,15 +2527,21 @@ def _matrix_free_spherical_cd_factors(
                 "plan_bytes": int(plan_stats.get("task_bytes", 0))
                 + int(plan_stats.get("recurrence_cache_bytes", 0))
                 + int(plan_stats.get("spherical_plan_cache_bytes", 0))
+                + int(plan_stats.get("column_cache_bytes", 0))
                 + int(plan_stats.get("coulomb_task_index_bytes", 0)),
+                "column_cache_bytes": int(plan_stats.get("column_cache_bytes", 0)),
                 "plan_build_seconds": float(plan_seconds),
                 "column_build_seconds": float(columns_seconds),
                 "computed_shell_quartets": int(computed_total),
                 "skipped_shell_quartets": int(skipped_total),
                 "allocated_dense_eri": False,
+                "_factor_data": dict(factors=factors, nao=nsph,
+                    pivots=np.asarray(pivots, dtype=int), transform=primary_transform),
             }
             return factors, info
 
+    if fixed_pivots is not None:
+        raise RuntimeError('Fixed CD pivots require the compiled spherical column kernel.')
     if backend == "cpp":
         raise _compiled_integral_error("spherical Cholesky-decomposition")
 
@@ -2491,6 +2590,7 @@ def _matrix_free_spherical_cd_factors(
         nonzero = np.any(spherical_pairs != 0.0, axis=1)
         spherical_pairs = np.ascontiguousarray(spherical_pairs[nonzero])
     factors = PackedRIFactors(spherical_pairs, primary_transform.shape[1])
+    from .eri_response import _cholesky_data
     info = {
         "algorithm": "matrix-free-pivoted-cholesky",
         "builder": f"{builder}-cartesian-to-spherical-pair",
@@ -2505,6 +2605,7 @@ def _matrix_free_spherical_cd_factors(
         "rank": int(factors.shape[0]),
         "factor_bytes": int(factors.pair_factors.nbytes),
         "allocated_dense_eri": False,
+        "_factor_data": _cholesky_data(cartesian, len(signatures)),
     }
     return factors, info
 
@@ -2570,8 +2671,9 @@ def _compute_dense_eri_with_backend(
     pair_bounds,
     screen_tol,
     backend="auto",
-    workers=1,
+    workers=None,
 ):
+    workers = resolve_workers(workers)
     backend = _resolve_eri_backend(backend, signatures, operation="dense")
     workers = max(1, int(workers))
 
@@ -3047,9 +3149,14 @@ def _compute_native_ri_tensors_cython(signatures, aux_signatures):
 
 def _compute_native_ri_pair_tensors_cpp(
     signatures, aux_signatures, pair_bounds, ri_screen_tol,
-    primary_transform=None, aux_transform=None, factor_options=None, pair_support=None,
+    primary_transform=None, aux_transform=None, factor_options=None, pair_support=None, workers=None,
 ):
     """Build packed integrals, or stream them into metric-whitened factors.
+
+    ``workers`` uses the shared integral thread pool for metric and shell-pair
+    work; streamed whitening callbacks run on the calling thread. Parallel
+    shell pairs are scheduled by estimated contraction cost within each
+    bounded streaming block, without changing primitive summation order.
 
     Streaming adapts PySCF's shell-block/whitening organization (Sun et al.,
     WIREs Comput. Mol. Sci. 8, e1340, 2018, doi:10.1002/wcms.1340), not its
@@ -3066,6 +3173,7 @@ def _compute_native_ri_pair_tensors_cpp(
         np.ascontiguousarray(primary_transform, dtype=np.float64),
         np.ascontiguousarray(aux_transform, dtype=np.float64),
     )
+    workers = resolve_workers(workers)
     factors = factor_info = operator = None
     whitening_seconds = block_seconds = 0.0
     blocks = peak_pairs = 0
@@ -3086,7 +3194,8 @@ def _compute_native_ri_pair_tensors_cpp(
                 factors = _ri_storage((factor_info["metric_rank"], npair))
                 factor_info["block_size"] = block_size
             else:
-                factors[:, start:stop] = _whiten_ri_block(operator, array, factor_info["metric_solver"])
+                _whiten_ri_block(operator, array, factor_info["metric_solver"],
+                                 out=factors[:, start:stop], workers=workers)
                 blocks += 1
                 peak_pairs = max(peak_pairs, stop-start)
                 block_seconds += time.perf_counter()-begin
@@ -3114,7 +3223,8 @@ def _compute_native_ri_pair_tensors_cpp(
             np.ascontiguousarray(aux_nprim, dtype=np.int64),
             np.ascontiguousarray(pair_bounds, dtype=np.float64),
             float(ri_screen_tol),
-            *transforms,
+            *(tuple(transforms) + (None, None, None, 0, None)[len(transforms):]),
+            int(workers),
         )
         metric, j3_pair, computed, skipped, shell_blocked, metric_seconds, triplet_seconds = result
     except Exception:
@@ -3123,11 +3233,13 @@ def _compute_native_ri_pair_tensors_cpp(
         return None
     if primary_transform is not None:
         metric = aux_transform.T @ metric @ aux_transform
+    ntask = len(_contiguous_shell_blocks_from_signatures(signatures)) if shell_blocked else len(signatures)
     _NATIVE_RI_LAST_KERNEL_INFO = {
         "tensor_kernel": "cpp-shell-block-vrr-hrr" if shell_blocked else "cpp-ao-loop-packed",
-        "parallel_mode": "serial",
+        "parallel_mode": "threads" if workers > 1 else "serial",
+        "workers": int(workers),
         "shell_blocked": bool(shell_blocked),
-        "task_count": 1,
+        "task_count": ntask*(ntask+1)//2,
         "spherical_output": primary_transform is not None,
         "metric_seconds": float(metric_seconds),
         "triplet_seconds": float(triplet_seconds-block_seconds),
@@ -3136,7 +3248,7 @@ def _compute_native_ri_pair_tensors_cpp(
         j3_pair = factors
         _NATIVE_RI_LAST_KERNEL_INFO.update(
             streamed=True, factor_info=factor_info, whitening_seconds=whitening_seconds,
-            block_count=blocks, peak_block_pairs=peak_pairs)
+            block_count=blocks, peak_block_pairs=peak_pairs, whitening_workers=int(workers))
     return (
         np.asarray(metric, dtype=np.float64),
         np.asarray(j3_pair, dtype=np.float64),
@@ -4004,16 +4116,30 @@ def _ri_metric_operator(metric, tol, solver):
         "metric_solver": "eigh", "metric_rank": int(np.count_nonzero(keep))}
 
 
-def _whiten_ri_block(operator, block, solver):
-    if solver == "cholesky":
+def _whiten_ri_block(operator, block, solver, *, out=None, workers=None):
+    """Solve independent pair columns into packed storage without an inverse.
+
+    The shared integral pool is reused sequentially after shell assembly.
+    BLAS threads must remain one; no full three-center tensor is introduced.
+    """
+    workers = resolve_workers(workers)
+    if out is None:
+        out = np.empty((operator.shape[0], block.shape[1]), dtype=np.float64)
+    if _integrals_cpp is not None and hasattr(_integrals_cpp, "whiten_ri_block"):
+        _integrals_cpp.whiten_ri_block(
+            operator, block, out, workers, solver == "cholesky",
+            _ri_blas.__pyx_capi__["dtrsm" if solver == "cholesky" else "dgemm"])
+    elif solver == "cholesky":
         from scipy.linalg.blas import dtrsm
-        return dtrsm(1.0, operator, block.T, lower=True, trans_a=1,
-                     side=1, overwrite_b=True).T
-    return operator @ block
+        out[:] = dtrsm(1.0, operator, block.T, lower=True, trans_a=1,
+                       side=1, overwrite_b=True).T
+    else:
+        out[:] = operator @ block
+    return out
 
 
 def _metric_factorize_ri(
-    metric, j3_pair, tol=1e-10, solver="auto", block_size=None, disk_backed=False
+    metric, j3_pair, tol=1e-10, solver="auto", block_size=None, disk_backed=False, workers=None
 ):
     """Whiten packed three-center factors in bounded pair blocks.
 
@@ -4036,7 +4162,8 @@ def _metric_factorize_ri(
     for start in range(0, npair, block_size):
         stop = min(start + block_size, npair)
         block = np.array(j3_pair[:, start:stop], order="C", copy=True)
-        factors[:, start:stop] = _whiten_ri_block(operator, block, info["metric_solver"])
+        _whiten_ri_block(operator, block, info["metric_solver"],
+                         out=factors[:, start:stop], workers=workers)
     return factors, {**info, "block_size": int(block_size)}
 
 
@@ -4337,7 +4464,8 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         aux_transform, _ = _global_cartesian_to_spherical_transform(aux_signatures)
     ri_timings["auxbasis_setup"] = time.perf_counter() - t0
     t0 = time.perf_counter()
-    pair_bounds = (_compute_pair_bounds(signatures) if ri_screen_tol > 0.0
+    workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_signatures))
+    pair_bounds = (_compute_pair_bounds(signatures, workers=workers) if ri_screen_tol > 0.0
                    else np.zeros((len(signatures), len(signatures))))
     ri_timings["pair_bounds"] = time.perf_counter() - t0
 
@@ -4369,7 +4497,6 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
     tensors = None
     tensor_builder = None
     spherical_output = False
-    workers = _builtin_ri_worker_count(mol, len(basis_cart), len(aux_signatures))
     t0 = time.perf_counter()
     if tensor_backend in {"auto", "cpp"}:
         try:
@@ -4382,6 +4509,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
                 aux_transform if spherical else None,
                 factor_options={"tol": tol, "solver": metric_solver,
                                 "block_size": getattr(mol, "builtin_ri_block_size", None)},
+                workers=workers,
             )
         except ValueError as exc:
             # Unsupported projected shells can still use the packed AO kernel.
@@ -4394,7 +4522,6 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
             if spherical_output:
                 tensor_builder = "shell-spherical-packed"
             effective_tensor_backend = "cpp"
-            workers = 1
         elif tensor_backend == "cpp":
             raise RuntimeError("The requested C++ RI tensor kernel is unavailable or failed.")
 
@@ -4435,7 +4562,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         effective_tensor_backend = "python"
     else:
         metric, j3_pair, ri_computed, ri_skipped = tensors
-        if tensor_builder != "cython-kernel-packed-parallel":
+        if effective_tensor_backend != "cpp" and tensor_builder != "cython-kernel-packed-parallel":
             workers = 1
     ri_timings["tensor_build"] = time.perf_counter() - t0
     if spherical and not spherical_output:
@@ -4465,7 +4592,7 @@ def _build_native_ri_factors(mol, atoms, atcoords, basis_cart):
         factors_pair, factor_info = _metric_factorize_ri(
             metric, j3_pair, tol=tol, solver=metric_solver,
             block_size=getattr(mol, "builtin_ri_block_size", getattr(mol, "native_ri_block_size", None)),
-            disk_backed=True,
+            disk_backed=True, workers=workers,
         )
         ri_timings["metric_factorize"] = time.perf_counter() - t0
     del j3_pair
@@ -4548,17 +4675,7 @@ def _reset_builtin_integral_caches():
 
 
 def _builtin_worker_count(mol, nao):
-    if not bool(getattr(mol, "builtin_parallel", getattr(mol, "native_parallel", False))):
-        return 1
-    min_nao = int(
-        getattr(mol, "builtin_parallel_min_nao", getattr(mol, "native_parallel_min_nao", 12))
-    )
-    if nao < min_nao:
-        return 1
-    requested = getattr(mol, "builtin_eri_workers", getattr(mol, "native_eri_workers", None))
-    if requested is None:
-        requested = min(4, max(1, os.cpu_count() or 1))
-    return max(1, int(requested))
+    return int(mol.workers)
 
 
 def _select_builtin_auto_eri_representation(mol, nao_cart):
@@ -4678,7 +4795,7 @@ def _pair_factor_blocks_to_vk(pair_factors, dm, nao, block_size=None):
     for start in range(0, pair_factors.shape[0], block_size):
         stop = min(start + block_size, pair_factors.shape[0])
         factors = _pair_factors_to_full(pair_factors[start:stop], nao)
-        vk += np.einsum("pil,lk,pkj->ij", factors, dm, factors, optimize=True)
+        vk += _factor_exchange(factors, dm)
     return vk
 
 
@@ -4692,12 +4809,13 @@ def _ri_occ_block_size(nao, nocc, naux=None, target_bytes=16 * 1024 * 1024):
     return block_size
 
 
-def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=None, workers=1):
+def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=None, workers=None):
+    workers = resolve_workers(workers)
     pair_factors = np.asarray(pair_factors, dtype=np.float64)
     mo_coeff = np.ascontiguousarray(mo_coeff, dtype=np.float64)
     mo_occ = np.asarray(mo_occ, dtype=np.float64)
     if (
-        _env_flag("PYQED_QCHEM_CPP_RI_JK", default=True)
+        _env_flag("PYQED_QCHEM_CPP_RI_JK", default=False)
         and _integrals_cpp is not None
         and hasattr(_integrals_cpp, "contract_jk_ri_occ_packed")
     ):
@@ -4843,11 +4961,8 @@ def pack_eri_s4(eri):
         raise ValueError("pack_eri_s4 expects a square rank-4 ERI tensor.")
     nao = eri.shape[0]
     pairs = _ao_unique_pairs(nao)
-    packed = np.empty((len(pairs), len(pairs)), dtype=eri.dtype)
-    for ij, (i, j) in enumerate(pairs):
-        for kl, (k, l) in enumerate(pairs):
-            packed[ij, kl] = eri[i, j, k, l]
-    return packed
+    i,j=np.asarray(pairs,dtype=int).reshape(-1,2).T
+    return eri[i[:,None],j[:,None],i[None,:],j[None,:]]
 
 
 def _packed_pair_index(i, j):
@@ -4893,15 +5008,10 @@ def unpack_eri_s4(eri_s4, nao):
     npair = len(pairs)
     if eri_s4.shape != (npair, npair):
         raise ValueError("eri_s4 shape is inconsistent with nao.")
-    eri = np.empty((nao, nao, nao, nao), dtype=eri_s4.dtype)
-    for ij, (i, j) in enumerate(pairs):
-        for kl, (k, l) in enumerate(pairs):
-            value = eri_s4[ij, kl]
-            eri[i, j, k, l] = value
-            eri[j, i, k, l] = value
-            eri[i, j, l, k] = value
-            eri[j, i, l, k] = value
-    return eri
+    pair_index=np.empty((nao,nao),dtype=int)
+    i,j=np.asarray(pairs,dtype=int).reshape(-1,2).T
+    pair_index[i,j]=pair_index[j,i]=np.arange(npair)
+    return eri_s4[pair_index[:,:,None,None],pair_index[None,None,:,:]]
 
 
 def unpack_eri_s8(eri_s8, nao):
@@ -5017,10 +5127,11 @@ def contract_jk_s4(eri_s4, dm, nao):
     return vj, vk
 
 
-def contract_jk_s8(eri_s8, dm, nao, workers=1):
+def contract_jk_s8(eri_s8, dm, nao, workers=None):
     """
-    Contract eight-fold packed AO-pair ERIs with a symmetric density matrix.
+    Contract real eight-fold packed AO ERIs with a real or complex density.
     """
+    workers = resolve_workers(workers)
     eri_s8 = np.asarray(eri_s8)
     dm = np.asarray(dm)
     nao = int(nao)
@@ -5069,6 +5180,21 @@ def contract_jk_s8(eri_s8, dm, nao, workers=1):
             return np.asarray(vj, dtype=np.float64), np.asarray(vk, dtype=np.float64)
         except Exception:
             pass
+    if (
+        prefer_cpp
+        and _integrals_cpp is not None
+        and hasattr(_integrals_cpp, "contract_jk_s8")
+        and not np.iscomplexobj(eri_s8)
+        and np.iscomplexobj(dm)
+    ):
+        # Linearity preserves imaginary antisymmetric coherences. The existing
+        # full-density compiled exchange kernel also handles nonsymmetric D.
+        eri = np.ascontiguousarray(eri_s8, dtype=np.float64)
+        jr, kr = _integrals_cpp.contract_jk_s8(
+            eri, np.ascontiguousarray(dm.real), nao, int(max(1, workers)))
+        ji, ki = _integrals_cpp.contract_jk_s8(
+            eri, np.ascontiguousarray(dm.imag), nao, int(max(1, workers)))
+        return jr + 1j * ji, kr + 1j * ki
     pair_index = _ao_pair_index_matrix(nao)
     npair = nao * (nao + 1) // 2
     if eri_s8.shape != ((npair * (npair + 1)) // 2,):
@@ -5090,11 +5216,12 @@ def contract_jk_s8(eri_s8, dm, nao, workers=1):
     return vj, vk
 
 
-def contract_veff_s8_mo(eri_s8, mo_coeff, mo_occ, nao, workers=1):
+def contract_veff_s8_mo(eri_s8, mo_coeff, mo_occ, nao, workers=None):
     """
     Contract eight-fold packed AO ERIs for an RHF MO density and return
     ``J - 0.5 K`` directly.
     """
+    workers = resolve_workers(workers)
     if (
         _env_flag("PYQED_QCHEM_CPP_JK", default=True)
         and _integrals_cpp is not None
@@ -5116,11 +5243,12 @@ def contract_veff_s8_mo(eri_s8, mo_coeff, mo_occ, nao, workers=1):
     return None
 
 
-def contract_veff_s8(eri_s8, dm, nao, workers=1):
+def contract_veff_s8(eri_s8, dm, nao, workers=None):
     """
     Contract eight-fold packed AO ERIs with an AO density and return
     ``J - 0.5 K`` directly.
     """
+    workers = resolve_workers(workers)
     if (
         _env_flag("PYQED_QCHEM_CPP_JK", default=True)
         and _integrals_cpp is not None
@@ -5141,14 +5269,18 @@ def contract_veff_s8(eri_s8, dm, nao, workers=1):
     return None
 
 
-def ao2mo_s8(eri_s8, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None):
+def ao2mo_s8(eri_s8, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None, *, workers=None):
     """
     Transform eight-fold packed AO ERIs to a dense chemist-notation MO tensor.
 
-    The packed tensor is first promoted to the AO-pair matrix and transformed as
-    ``P_left.T @ G @ P_right``.  This uses NumPy's BLAS-backed matrix products
-    and avoids expanding the packed ERIs to an ``nao**4`` tensor.
+    Equal real coefficient matrices use two packed half transformations,
+    with independent rows partitioned across ``workers``. Other broad target
+    spaces use four successive one-index contractions when the
+    dense AO tensor occupies at most 256 MiB (temporary arrays add overhead).
+    Otherwise transform the AO-pair matrix as ``P_left.T @ G @ P_right``
+    without expanding an ``nao**4`` tensor. All routes are exact.
     """
+    workers = resolve_workers(workers)
     eri_s8 = np.asarray(eri_s8)
     mo_left = np.asarray(mo_left)
     if mo_right is None:
@@ -5170,24 +5302,24 @@ def ao2mo_s8(eri_s8, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None):
     if eri_s8.shape != ((npair * (npair + 1)) // 2,):
         raise ValueError("eri_s8 shape is inconsistent with the MO coefficients.")
     same_coefficients = all(np.array_equal(coeff, mo_left) for coeff in coefficients[1:])
-    if (
-        _env_flag("PYQED_QCHEM_CPP_AO2MO_SCALAR", default=False)
-        and _integrals_cpp is not None
-        and hasattr(_integrals_cpp, "ao2mo_s8")
-        and not np.iscomplexobj(eri_s8)
-        and not np.iscomplexobj(mo_left)
-        and same_coefficients
-    ):
-        try:
-            eri_mo = _integrals_cpp.ao2mo_s8(
-                np.ascontiguousarray(eri_s8, dtype=np.float64),
-                np.ascontiguousarray(mo_left, dtype=np.float64),
-            )
-            return np.asarray(eri_mo, dtype=np.float64)
-        except Exception:
-            pass
-
+    if same_coefficients and not np.iscomplexobj(eri_s8) and not np.iscomplexobj(mo_left):
+        from .ao2mo import ao2mo_packed
+        return ao2mo_packed(eri_s8,mo_left,workers=workers)
     rows, cols = _ao_pair_indices(nao)
+
+    # For broad MO spaces, four one-index contractions cost O(n^5),
+    # whereas the packed pair-matrix products below cost O(n^6).
+    # Keep the packed route for small target spaces or large AO tensors.
+    if min(c.shape[1] for c in coefficients) >= nao // 2 and nao**4 * np.dtype(
+        np.result_type(eri_s8, *coefficients)
+    ).itemsize <= 256 * 1024**2:
+        ids = np.arange(nao)
+        pairs = _packed_pair_pair_indices(ids[:, None], ids[None, :])
+        dense = eri_s8[_packed_pair_pair_indices(
+            pairs[:, :, None, None], pairs[None, None, :, :]
+        )]
+        from .ao2mo import _transform_dense_general
+        return _transform_dense_general(dense, coefficients)
 
     def pair_transform(left, right):
         left = left.conj()
@@ -5209,6 +5341,27 @@ def ao2mo_s8(eri_s8, mo_left, mo_right=None, mo_left_2=None, mo_right_2=None):
     )
 
 
+def contract_j_ri(eri_factors, dm, nao):
+    """Coulomb-only contraction of packed or full CD/RI factors."""
+    dm = np.asarray(dm)
+    if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
+        factors = _as_ri_pair_factors(eri_factors, nao)
+        charges = factors @ _density_to_pair_vector(dm, nao)
+        return _pair_vector_to_symmetric_matrix(charges @ factors, nao)
+    factors = np.asarray(eri_factors)
+    charges = np.einsum('pkl,lk->p', factors, dm, optimize=True)
+    return np.einsum('p,pij->ij', charges, factors, optimize=True)
+
+
+def _factor_coulomb(factors, density):
+    """Apply the real factor Gram matrix without converting factors to complex."""
+    real = factors.T @ (factors @ np.ascontiguousarray(density.real))
+    if np.iscomplexobj(density):
+        imag = factors.T @ (factors @ np.ascontiguousarray(density.imag))
+        return real + 1j * imag
+    return real
+
+
 def contract_jk_ri(eri_factors, dm, nao):
     """
     Contract RI/DF factors with a symmetric AO density matrix.
@@ -5221,16 +5374,15 @@ def contract_jk_ri(eri_factors, dm, nao):
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, nao)
         pair_dm = _density_to_pair_vector(dm, nao)
-        coeff = pair_factors @ pair_dm
-        j_pairs = coeff @ pair_factors
+        j_pairs = _factor_coulomb(pair_factors, pair_dm)
         vj = _pair_vector_to_symmetric_matrix(j_pairs, nao)
         vk = _pair_factor_blocks_to_vk(pair_factors, dm, nao)
         return vj, vk
 
     eri_factors = np.ascontiguousarray(eri_factors, dtype=np.float64)
-    coeff = np.einsum('pkl,lk->p', eri_factors, dm, optimize=True)
-    vj = np.einsum('p,pij->ij', coeff, eri_factors, optimize=True)
-    vk = np.einsum('pil,lk,pkj->ij', eri_factors, dm, eri_factors, optimize=True)
+    vj = _factor_coulomb(eri_factors.reshape(len(eri_factors), nao * nao),
+                         dm.T.reshape(-1)).reshape(nao, nao)
+    vk = _factor_exchange(eri_factors, dm)
     return vj, vk
 
 
@@ -5242,13 +5394,19 @@ def contract_veff_ri(eri_factors, dm, nao):
     return vj - 0.5 * vk
 
 
-def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=1):
+def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=None):
     """
     Contract RI/DF factors for an idempotent MO density.
 
     This evaluates the same J/K matrices as ``contract_jk_ri`` for
     ``dm = C occ C.T`` but avoids the full-density exchange contraction.
+    Packed factors use auxiliary-blocked BLAS contractions by default, with
+    only one block expanded to symmetric AO matrices. This exact contraction
+    reordering leaves the RI approximation unchanged. BLAS controls threading;
+    ``workers`` applies only to the opt-in scalar integral-extension reference
+    (``PYQED_QCHEM_CPP_RI_JK=1``).
     """
+    workers = resolve_workers(workers)
     nao = int(nao)
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, nao)
@@ -5256,11 +5414,12 @@ def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=1):
     return _contract_jk_ri_occ_full(eri_factors, mo_coeff, mo_occ, nao)
 
 
-def contract_veff_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=1):
+def contract_veff_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=None):
     """
     Contract RI/DF factors for an RHF occupied MO density and return
     ``J - 0.5 K``.
     """
+    workers = resolve_workers(workers)
     vj, vk = contract_jk_ri_mo(
         eri_factors,
         mo_coeff,
@@ -5393,7 +5552,8 @@ def build_builtin(mol):
     else:
         timings["one_electron_cache_hit"] = 0.0
         t0 = time.perf_counter()
-        one_electron_result = _compute_one_electron_shellblocked_cython(signatures, atcoords, atnums)
+        one_electron_result = _compute_one_electron_shellblocked_cython(
+            signatures, atcoords, atnums, workers=mol.workers)
         if one_electron_result is not None:
             overlap_mat, kinetic_mat, vnuc_mat = one_electron_result
             one_electron_builder = "cython-shellblocked"
@@ -5494,7 +5654,7 @@ def build_builtin(mol):
     if eri_representation in {"dense", "dense+factors", "dense+ri", "direct"}:
         if screen_tol > 0.0:
             t0 = time.perf_counter()
-            pair_bounds = _compute_pair_bounds(signatures)
+            pair_bounds = _compute_pair_bounds(signatures, workers=workers)
             timings["pair_bounds"] = time.perf_counter() - t0
         else:
             pair_bounds = np.zeros((nao_cart, nao_cart), dtype=float)
@@ -5521,6 +5681,29 @@ def build_builtin(mol):
             dense_builder = f"cpp-cartesian-s8-lmax{_CPP_CARTESIAN_MAX_L}"
             dense_eri_working_basis = "cartesian"
             pack_s8 = False
+
+    if eri_representation in {"dense", "dense+factors"} and aosym == "s8" and coord_type == "spherical":
+        t0 = time.perf_counter()
+        (eri_s8, computed, skipped), dense_builder = _compute_dense_eri_spherical_shellblocked(
+            signatures, pair_bounds, screen_tol, backend=eri_backend, workers=workers, packed=True,
+        )
+        timings["packed_s8_eri"] = time.perf_counter() - t0
+        dense_eri_working_basis = "spherical"
+        pack_s8 = False
+        if eri_representation == "dense+factors" or bool(
+            getattr(mol, "builtin_build_factors", getattr(mol, "native_build_factors", False))
+        ):
+            t0 = time.perf_counter()
+            nsph = _global_cartesian_to_spherical_transform(signatures)[0].shape[1]
+            factors_pair = pivoted_cholesky_eri_s8(
+                eri_s8, nsph,
+                tol=float(getattr(mol, "builtin_low_rank_tol", 1e-8)),
+                max_rank=getattr(mol, "builtin_low_rank_max_rank", None),
+            )
+            factors = PackedRIFactors(factors_pair, nsph)
+            factors_are_spherical = True
+            timings["low_rank_factors"] = time.perf_counter() - t0
+            factor_builder = "s8-pair-pivoted-cholesky"
 
     if eri_representation in {"dense", "dense+factors", "dense+ri"} and eri_s8 is None:
         t0 = time.perf_counter()
@@ -5817,6 +6000,17 @@ def build_builtin(mol):
                 factor_builder = f"{eri_backend}-dense-pivoted-cholesky"
             timings["low_rank_factors"] = time.perf_counter() - t0
 
+    cd_factor_data = None
+    if factors is not None and ri_info is None:
+        from .eri_response import _cholesky_data
+        if cd_info is not None:
+            cd_factor_data = cd_info.pop('_factor_data', None)
+        if cd_factor_data is None:
+            source_transform = None
+            if factors_are_spherical and coord_type == 'spherical':
+                source_transform, _ = _global_cartesian_to_spherical_transform(signatures)
+            cd_factor_data = _cholesky_data(factors, factors.shape[1], source_transform)
+
     t0 = time.perf_counter()
     transform = None
     max_cartesian_shell_quartet_elements = None
@@ -5894,13 +6088,7 @@ def build_builtin(mol):
     mol.eri_s4 = eri_s4
     mol.eri_s8 = eri_s8
     mol.eri_factors = factors
-    mol._cd_factor_data = None
-    if factors is not None and ri_info is None:
-        from .eri_response import _cholesky_data
-        source_transform = None
-        if factors_are_spherical and coord_type == 'spherical':
-            source_transform, _ = _global_cartesian_to_spherical_transform(signatures)
-        mol._cd_factor_data = _cholesky_data(factors, factors.shape[1], source_transform)
+    mol._cd_factor_data = cd_factor_data
     mol._builtin_direct_jk_data = direct_jk_data
     mol.builtin_resolved_eri_representation = eri_representation
     mol.builtin_resolved_aosym = aosym
@@ -5986,6 +6174,7 @@ def build_native(mol):
     Backward-compatible alias for the builtin AO integral builder.
     """
     return build_builtin(mol)
+
 
 
 @lru_cache(maxsize=None)
@@ -6156,8 +6345,8 @@ def make_contractions(basis_dict, atoms, coords, coord_types):
             if coeffs.ndim == 1:
                 coeffs = coeffs[:, None]
             exps_tuple = tuple(float(x) for x in np.asarray(exps, dtype=float))
-            for shell in _shell(angmom):
-                for icontr in range(coeffs.shape[1]):
+            for icontr in range(coeffs.shape[1]):
+                for shell in _shell(angmom):
                     coefs_tuple = tuple(float(x) for x in coeffs[:, icontr])
                     tpl_exps, tpl_coefs, tpl_norm, tpl_prim_weights = (
                         _normalized_contracted_gaussian_template(
@@ -6202,9 +6391,9 @@ def _make_contraction_signatures(basis_dict, atoms, coords, coord_types="c"):
             if coeffs.ndim == 1:
                 coeffs = coeffs[:, None]
             exps_tuple = tuple(float(x) for x in np.asarray(exps, dtype=float))
-            for shell in _shell(int(angmom)):
-                shell_tuple = tuple(int(x) for x in shell)
-                for icontr in range(coeffs.shape[1]):
+            for icontr in range(coeffs.shape[1]):
+                for shell in _shell(int(angmom)):
+                    shell_tuple = tuple(int(x) for x in shell)
                     coefs_tuple = tuple(float(x) for x in coeffs[:, icontr])
                     tpl_exps, _tpl_coefs, _tpl_norm, tpl_prim_weights = (
                         _normalized_contracted_gaussian_template(

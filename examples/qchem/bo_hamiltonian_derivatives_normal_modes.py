@@ -14,7 +14,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from pyqed.qchem import CASCI, Molecule, bo_hamiltonian_derivatives
-from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+from pyqed.qchem.dft.hessian import analyze_hessian
 
 
 def parse_args():
@@ -47,7 +47,7 @@ def main():
 
     natom = mol.natom
     cart_hess = np.asarray(cart_hess_4d).transpose(0, 2, 1, 3).reshape(3 * natom, 3 * natom)
-    vib = analyze_cartesian_hessian(
+    vib = analyze_hessian(
         cart_hess,
         mol.atom_coords(),
         mol.atom_mass_list(),

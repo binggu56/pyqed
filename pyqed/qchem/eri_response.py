@@ -33,6 +33,7 @@ are not differentiated; converge screening along with CD/metric thresholds.
 
 import numpy as np
 from scipy.linalg import solve_triangular
+from scipy.linalg.blas import get_blas_funcs
 
 from . import basis as gaussian
 from .basis_derivatives import (
@@ -40,6 +41,26 @@ from .basis_derivatives import (
     _derivative_signatures_from_signature,
     directional_eri_derivatives,
 )
+
+
+def _cholesky_factor_response(root, factors, columns, metric):
+    """Exact differentiated triangular solve, sharing its lower connection.
+
+    For B=L^-1 V, form Phi=lower(L^-1 M' L^-T), with half diagonal,
+    then B'=L^-1 V'-Phi B. This is the fixed-auxiliary formulation cited
+    above; triangular BLAS skips only structural zeros, without screening.
+    Returns Phi and B'; callers needing L' can form L Phi.
+    """
+    if not len(root):
+        return metric.copy(), columns.copy()
+    connection = solve_triangular(root, metric, lower=True)
+    connection = solve_triangular(root, connection.T, lower=True).T
+    connection = np.tril(connection)
+    connection.flat[::len(connection)+1] *= .5
+    trmm = get_blas_funcs('trmm', (connection, factors))
+    derivative = solve_triangular(root, columns, lower=True)
+    derivative -= trmm(1., connection, factors, lower=True)
+    return connection, derivative
 
 
 def _cholesky_data(factors, nao, transform=None):
@@ -373,7 +394,45 @@ class CoulombIntegrals:
             len(observables), self.mol.natom, 3)
 
     def _cd_columns(self, directions, workers=None, sensitivities=None, *,
-                    early_contraction=True, screen_tol=0., kernel='auto'):
+                    early_contraction=True, screen_tol=0., kernel='auto', order=1, pair=-1, pairs=None):
+        """Selected analytic first/second columns; order two is unscreened.
+
+        ``pair=i*nmodes+j`` emits only that mixed block, with leading shape
+        (1,1); -1 emits all pairs. No summed-direction polarization is used.
+        ``pairs`` selects an integer (n,2) array of direction pairs in one
+        shell pass and returns shape (n,1,ncolumn,npair). It excludes ``pair``.
+        With sensitivities, second derivatives contract directly to
+        (n,1,nobservable), or (nmodes,nmodes,nobservable) without selection;
+        the exact unscreened shell recurrence is unchanged.
+        Early second contractions accumulate observable-weighted 9x9
+        center derivatives before projecting into the requested directions;
+        this avoids shell-target storage and repeated mode-pair projection.
+        ``early_contraction=False`` retains the late contraction reference.
+        First columns reuse the second-derivative dependency planner to
+        evaluate only ancestors of requested shifted HRR terms. Shared HRR
+        expansions are evaluated once per primitive quartet. First columns
+        also batch primitive quartets using the curvature recurrence kernel.
+        First columns use the existing compact dependency layout rather
+        than rectangular angular/moment workspaces. This is an
+        exact contraction/recurrence scheduling change, with the same
+        fixed-pivot formulation and restrictions cited in this module.
+        The Gaussian recurrence adapts Obara and Saika, JCP 84, 3963 (1986),
+        doi:10.1063/1.450106; dependency pruning drops no requested terms.
+        Uncontracted first columns share one output across workers, with
+        striped column locks protecting overlapping AO transformations.
+        Scalar contractions retain small private reductions. The diagnostic
+        private_output_bytes reports the aggregate private output allocation;
+        recurrence workspaces remain worker-local. Parallel addition order
+        may change roundoff, but no screening or derivative terms are changed.
+        Curvature retains a fixed scalar recurrence table and reuses one HRR
+        buffer for the mutually exclusive scalar/batched paths. Batched column
+        buffers share the existing 32 MiB per-worker allowance. Curvature tasks
+        group equal centers and angular classes; numerical HRR plans are
+        discarded after their group, while symbolic plans remain reusable.
+        ``recurrence_workspace_bytes`` sums worker peak allocations for scalar
+        and batched recurrence tables, index scratch, and batched HRR outputs; it excludes
+        recipe caches, Python arrays, and allocator overhead.
+        """
         if kernel not in ('auto', 'recurrence', 'rys'):
             raise ValueError('Derivative kernel must be auto, recurrence, or rys.')
         if not np.isfinite(screen_tol) or screen_tol < 0:
@@ -400,7 +459,7 @@ class CoulombIntegrals:
         directions = np.ascontiguousarray(directions, dtype=float).reshape(-1, self.mol.natom, 3)
         result, self.derivative_info = gaussian._integrals_cpp.compute_eri_derivative_columns(
             shells, origins, exps, weights, nprim, owners, directions, source, pivots, workers, sensitivities,
-            early_contraction, int(kernel == 'rys'), screen_tol, True)
+            early_contraction, int(kernel == 'rys'), screen_tol, True, order, pair, pairs)
         return result
 
     def _cd_derivative(self, direction):
@@ -412,10 +471,7 @@ class CoulombIntegrals:
         # The pivot submatrix is a Cholesky root. Differentiate its triangular
         # solve in blocks rather than updating every rank in a Python loop.
         root = pair[:, data['pivots']].T
-        connection = solve_triangular(root, columns[:, data['pivots']], lower=True)
-        connection = solve_triangular(root, connection.T, lower=True).T
-        connection = np.tril(connection, -1) + .5*np.diag(np.diag(connection))
-        dpair = solve_triangular(root, columns, lower=True) - connection @ pair
+        _, dpair = _cholesky_factor_response(root, pair, columns, columns[:, data['pivots']])
         factors = gaussian._pair_factors_to_full(pair, data['nao'])
         derivative = gaussian._pair_factors_to_full(dpair, data['nao'])
         if source_transform is None and ao_transform is not None:
@@ -429,7 +485,7 @@ class CoulombIntegrals:
         basis, transform = _basis_and_transform(mol)
         primary = tuple(_basis_signature(fn) for fn in basis)
         auxiliary = gaussian._make_contraction_signatures(
-            gaussian.load_basis_dict(info['auxbasis'], mol.atom_symbols()),
+            gaussian.parse_gbs(gaussian._basis_path(info['auxbasis'])),
             mol.atom_symbols(), mol.atom_coords(), coord_types='c')
         aux_transform = None
         if transform is not None:

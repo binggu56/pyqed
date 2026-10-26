@@ -198,7 +198,7 @@ def test_ir_rejects_casci_like_method_backend():
 def test_cartesian_hessian_analysis_matches_pyscf_projection():
     pyscf = pytest.importorskip("pyscf")
     from pyscf.hessian import thermo
-    from pyqed.qchem.dft.hessian import analyze_cartesian_hessian
+    from pyqed.qchem.dft.hessian import analyze_hessian
 
     mol = pyscf.M(
         atom="O 0 0 0; H 0 -1.43233673 1.10715266; H 0 1.43233673 1.10715266",
@@ -211,7 +211,7 @@ def test_cartesian_hessian_analysis_matches_pyscf_projection():
     hess = 0.5 * (hess + hess.T)
     hess4 = hess.reshape(3, 3, 3, 3).transpose(0, 2, 1, 3)
 
-    data = analyze_cartesian_hessian(
+    data = analyze_hessian(
         hess,
         mol.atom_coords(),
         mol.atom_mass_list(isotope_avg=True),

@@ -11,6 +11,10 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -25,6 +29,7 @@
 #include <utility>
 #include <vector>
 
+#include "_boys.hpp"
 
 namespace {
 
@@ -175,53 +180,6 @@ ReusableWorkerPool& native_integral_worker_pool() {
     return pool;
 }
 
-constexpr double BOYS0_MID_CHEB[3][17] = {
-    {3.69260892593684109e-01, -6.28317191907165201e-02, 7.78147807755485196e-03, -1.01824922931021138e-03, 1.30508527081563824e-04, -1.58459023097007741e-05, 1.79378499513903238e-06, -1.88060978338879438e-07, 1.82309276136738246e-08, -1.63602207972775239e-09, 1.36246942215674343e-10, -1.05627704833339070e-11, 7.64920512606895655e-13, -5.19020980460245112e-14, 3.10927261055600145e-15, -2.16717292100600925e-16, -1.91834944614729702e-17},
-    {2.82392962887930754e-01, -2.85562567876372145e-02, 2.16121319327928184e-03, -1.80974042560373282e-04, 1.57609803527738631e-05, -1.38719093334998265e-06, 1.21011061292869219e-07, -1.03077047929483520e-08, 8.47686398613829223e-10, -6.67675966377318255e-11, 5.01093146865571330e-12, -3.57236219061710461e-13, 2.43404256846936807e-14, -1.57750782602794538e-15, -4.30489072102299092e-17, -8.38146365290142540e-18, 1.80395600448499878e-16},
-    {2.37770624901000233e-01, -1.70820914178422857e-02, 9.19985072678147688e-04, -5.50362676255404418e-05, 3.45464478138237826e-06, -2.22644470115022074e-07, 1.45569210486204908e-08, -9.56969674338625626e-10, 6.27465433914607864e-11, -4.07166502220521936e-12, 2.59717592016691244e-13, -1.61581557658677476e-14, 1.13365440188229370e-15, -6.79821661128639535e-17, -7.01062679852013498e-17, 1.59364317989742982e-18, 1.86498993798541971e-16},
-};
-
-constexpr double BOYS0_SMALL_CHEB[19] = {
-    6.57186257657690676e-01, -2.66817291710163607e-01,
-    6.11450766743829172e-02, -1.23329742967011637e-02,
-    2.14537771790367093e-03, -3.24238500012818173e-04,
-    4.30892255459287019e-05, -5.09514596310239750e-06,
-    5.41772106229890224e-07, -5.22794262476461671e-08,
-    4.61459185483047427e-09, -3.75137727347970943e-10,
-    2.82540313420055434e-11, -1.98183387666075457e-12,
-    1.30438207295877616e-13, -8.22014661804220726e-15,
-    9.20457102772300290e-16, -1.65470754326506321e-16,
-    2.87011308337681401e-16,
-};
-
-inline double boys0_small_chebyshev(double T) {
-    const double x = 0.5 * T - 1.0;
-    double next = 0.0;
-    double next_next = 0.0;
-    for (int degree = 18; degree >= 1; --degree) {
-        const double current =
-            2.0 * x * next - next_next + BOYS0_SMALL_CHEB[degree];
-        next_next = next;
-        next = current;
-    }
-    return x * next - next_next + BOYS0_SMALL_CHEB[0];
-}
-
-inline double boys0_mid_chebyshev(double T) {
-    const int interval = T < 8.0 ? 0 : (T < 12.0 ? 1 : 2);
-    const double center = interval == 0 ? 6.0 : (interval == 1 ? 10.0 : 14.0);
-    const double x = 0.5 * (T - center);
-    const double* coefficients = BOYS0_MID_CHEB[interval];
-    double next = 0.0;
-    double next_next = 0.0;
-    for (int degree = 16; degree >= 1; --degree) {
-        const double current = 2.0 * x * next - next_next + coefficients[degree];
-        next_next = next;
-        next = current;
-    }
-    return x * next - next_next + coefficients[0];
-}
-
 struct ArrayRef {
     PyArrayObject* obj = nullptr;
 
@@ -252,30 +210,7 @@ struct PrimitivePair {
 };
 
 double boys0(double T) {
-    if (T < 1.0e-14) {
-        return 1.0;
-    }
-    if (T < 4.0) {
-        return boys0_small_chebyshev(T);
-    }
-    if (T >= 4.0 && T < 16.0) {
-        return boys0_mid_chebyshev(T);
-    }
-    const double root = std::sqrt(T);
-    if (T >= 16.0) {
-        double series = 1.0;
-        double term = 1.0;
-        double previous = std::numeric_limits<double>::infinity();
-        for (int order = 1; order < 40; ++order) {
-            term *= -(2.0 * order - 1.0) / (2.0 * T);
-            if (std::abs(term) >= previous) break;
-            series += term;
-            previous = std::abs(term);
-        }
-        const double erfc = std::exp(-T) * series / (std::sqrt(PI) * root);
-        return 0.5 * std::sqrt(PI / T) * (1.0 - erfc);
-    }
-    return 0.5 * std::sqrt(PI / T) * std::erf(root);
+    return pyqed::qchem::boys0(T);
 }
 
 double primitive_eri_ssss(
@@ -567,7 +502,7 @@ struct PrimaryShellPairGeomCache {
     ShellPairGeomData data;
 };
 
-PrimaryShellPairGeomCache primary_shell_pair_geom_cache;
+thread_local PrimaryShellPairGeomCache primary_shell_pair_geom_cache;
 
 inline std::uint64_t fnv1a_mix(std::uint64_t hash, const void* ptr, std::size_t nbytes) {
     const auto* bytes = static_cast<const unsigned char*>(ptr);
@@ -3396,6 +3331,7 @@ inline double one_direction_component(
     npy_intp atom,
     int axis
 ) {
+    if (atom == -1) return 0.0;  // Fixed real-space AO center.
     return directions[(mode * natm + atom) * 3 + axis];
 }
 
@@ -4321,9 +4257,9 @@ int precompute_primitive_pair_geom(
             const double pair_weight = weight_out != nullptr
                 ? weights[p * max_prim + ip] * weights[q * max_prim + iq]
                 : 1.0;
-            if (pair_decay == 0.0 || pair_weight == 0.0) {
-                continue;
-            }
+            // Consumers recover primitive indices as idx/nprim[q] and
+            // idx%nprim[q]. Keep this rectangular ordering even when a tight
+            // primitive pair underflows or has a zero contraction weight.
             a_out[idx] = a;
             b_out[idx] = b;
             p_out[idx] = pexp;
@@ -4576,6 +4512,7 @@ bool compute_shell_quartet_vrr_hrr_target_values(
     ) {
         return false;
     }
+
 
     const std::size_t vrr_table_size = os_vrr_table_size(max_a_l, max_c_l, max_m_l);
     if (vrr_table == nullptr || vrr_table_size > vrr_table_cap) {
@@ -5428,7 +5365,7 @@ public:
 
 bool auxiliary_metric_shells(const std::int64_t* shells, const double* origins,
     const double* exps, const double* weights, const std::int64_t* nprim,
-    npy_intp nao, npy_intp stride, double* metric) {
+    npy_intp nao, npy_intp stride, double* metric, int workers = 1) {
     std::vector<ShellBlock> blocks;
     if (!try_build_shell_blocks(shells, origins, exps, nprim, nao, stride, blocks)) return false;
     for (const auto& block : blocks)
@@ -5437,10 +5374,11 @@ bool auxiliary_metric_shells(const std::int64_t* shells, const double* origins,
         DerivativeRecurrencePlan recurrence;
         std::vector<std::size_t> outputs;
     };
+    auto evaluate = [&](int worker) {
     std::map<std::pair<int, int>, Plan> plans;
     std::vector<double> table;
     const double zero[3] = {};
-    for (std::size_t ipair = 0; ipair < blocks.size(); ++ipair) {
+    for (std::size_t ipair = worker; ipair < blocks.size(); ipair += workers) {
         const auto& a = blocks[ipair];
         for (std::size_t jpair = 0; jpair <= ipair; ++jpair) {
             const auto& b = blocks[jpair];
@@ -5487,6 +5425,8 @@ bool auxiliary_metric_shells(const std::int64_t* shells, const double* origins,
             }
         }
     }
+    };
+    native_integral_worker_pool().run(workers, evaluate);
     return true;
 }
 
@@ -6195,7 +6135,8 @@ bool compute_ri_j3_shell_blocked(
     npy_intp naux_sph = 0,
     PyObject* sink = nullptr,
     npy_intp block_size = 0,
-    const npy_bool* pair_support = nullptr
+    const npy_bool* pair_support = nullptr,
+    int workers = 1
 ) {
     std::vector<ShellBlock> shell_blocks;
     std::vector<ShellBlock> aux_shell_blocks;
@@ -6209,11 +6150,14 @@ bool compute_ri_j3_shell_blocked(
         return false;
     }
 
+    const char* scheduler = std::getenv("PYQED_RI_SCHEDULER");
+    const bool use_openmp = scheduler && std::strcmp(scheduler, "openmp") == 0;
+#ifndef _OPENMP
+    if (use_openmp) throw std::runtime_error("RI OpenMP scheduler requires an OpenMP build");
+#endif
     RIHRRCache recipes;
     const auto component_scales = shell_component_scales(shell_blocks, weights, nprim, nao, max_prim);
     const auto aux_component_scales = shell_component_scales(aux_shell_blocks, aux_weights, aux_nprim, naux, aux_max_prim);
-    std::vector<double> contracted_values;
-    std::vector<double> batch_table;
     RIGradientContraction prepared_response{};
     if (response) {
         prepared_response = *response;
@@ -6234,12 +6178,23 @@ bool compute_ri_j3_shell_blocked(
     );
     const npy_intp pair_cap = pair_geom.pair_cap;
 
-    const std::size_t vrr_table_cap = os_vrr_table_size(
-        OS_VRR_PAIR_MAX_L + (response ? response->order : 0),
-        OS_VRR_PAIR_MAX_L,
-        2 * OS_VRR_PAIR_MAX_L + (response ? response->order : 0)
-    );
-    std::vector<double> vrr_table(vrr_table_cap, 0.0);
+    int primary_l = 0, auxiliary_l = 0;
+    for (const auto& block : shell_blocks) primary_l = std::max(primary_l, block.l);
+    for (const auto& block : aux_shell_blocks) auxiliary_l = std::max(auxiliary_l, block.l);
+    const int order = response ? response->order : 0;
+    const bool reuse_workspace = !response && workers > 1;
+    const int max_a = (reuse_workspace ? std::min(2*primary_l, OS_VRR_PAIR_MAX_L)
+                                      : OS_VRR_PAIR_MAX_L) + order;
+    const int max_c = reuse_workspace ? std::min(auxiliary_l, OS_VRR_PAIR_MAX_L)
+                                     : OS_VRR_PAIR_MAX_L;
+    const std::size_t vrr_table_cap = os_vrr_table_size(max_a, max_c, max_a+max_c);
+    struct Workspace {
+        RIHRRCache recipes;
+        std::vector<double> vrr_table, shell_values, contracted_values, batch_table;
+    };
+    // Recipes and scratch belong to this build, never to a geometry-global cache.
+    std::vector<Workspace> workspaces(
+        reuse_workspace ? std::min<npy_intp>(workers, nshell*(nshell+1)/2) : 0);
     const npy_intp npair = nao * (nao + 1) / 2;
 
     // Sparse rows retain the established AO ordering and normalization.
@@ -6255,7 +6210,6 @@ bool compute_ri_j3_shell_blocked(
         return result;
     };
     std::vector<TransformRow> primary_rows, aux_rows;
-    std::vector<double> shell_values;
     struct PairProjection {
         npy_intp output;
         TransformRow terms;
@@ -6330,106 +6284,162 @@ bool compute_ri_j3_shell_blocked(
             if (!output_block) return false;
             j3 = static_cast<double*>(PyArray_DATA(output_block.obj));
         }
-        const ShellBlock& p_block = shell_blocks[ish];
-        for (npy_intp jsh = 0; jsh <= ish; ++jsh) {
-            const ShellBlock& q_block = shell_blocks[jsh];
-            if (pair_support) {
-                bool needed = false;
-                for (npy_intp i = p_block.start; i < p_block.stop; ++i)
-                    for (npy_intp j = q_block.start; j < q_block.stop; ++j)
-                        needed = needed || pair_support[i*nao+j];
-                if (!needed) continue;
+        const npy_intp row_stop = reuse_workspace && sink ? shell_stop : ish+1;
+        struct PairTask { npy_intp row, column; double cost; };
+        std::vector<PairTask> tasks;
+        if (reuse_workspace) {
+            for (npy_intp row = ish; row < row_stop; ++row) {
+                const auto& p = shell_blocks[row];
+                for (npy_intp column = 0; column <= row; ++column) {
+                    const auto& q = shell_blocks[column];
+                    const double cost = double(nprim[p.start])*nprim[q.start]
+                        * (p.stop-p.start)*(q.stop-q.start)*(1+p.l+q.l);
+                    tasks.push_back({row, column, cost});
+                }
             }
-            const npy_intp idx = ish * nshell + jsh;
-            const std::size_t off = static_cast<std::size_t>(idx) * static_cast<std::size_t>(pair_cap);
-            const auto np = p_block.stop - p_block.start;
-            const auto nq = q_block.stop - q_block.start;
-            for (const ShellBlock& aux_block : aux_shell_blocks) {
-                const auto na = aux_block.stop - aux_block.start;
-                if (response && response->first_three) {
-                    const int target=response->direction/3;
-                    if (response->primary_atoms[p_block.start]!=target &&
-                        response->primary_atoms[q_block.start]!=target &&
-                        response->auxiliary_atoms[aux_block.start]!=target) continue;
-                } else if (response) {
+            std::stable_sort(tasks.begin(), tasks.end(), [](const PairTask& a, const PairTask& b) {
+                return a.cost > b.cost;
+            });
+        }
+        const int nthread = reuse_workspace ? std::min<npy_intp>(workers, tasks.size()) : 1;
+        std::atomic<npy_intp> next{0};
+        std::atomic<bool> success{true};
+        auto evaluate = [&](int worker) {
+            Workspace serial_workspace;
+            auto& workspace = reuse_workspace ? workspaces[worker] : serial_workspace;
+            auto& recipes = workspace.recipes;
+            auto& vrr_table = workspace.vrr_table;
+            auto& shell_values = workspace.shell_values;
+            auto& contracted_values = workspace.contracted_values;
+            auto& batch_table = workspace.batch_table;
+            if (vrr_table.empty()) vrr_table.resize(vrr_table_cap);
+            const npy_intp count = reuse_workspace ? tasks.size() : ish+1;
+            for (npy_intp cursor = reuse_workspace ? next.fetch_add(1) : 0; cursor < count;
+                 cursor = reuse_workspace ? next.fetch_add(1) : cursor+1) {
+                const npy_intp row = reuse_workspace ? tasks[cursor].row : ish;
+                const npy_intp jsh = reuse_workspace ? tasks[cursor].column : cursor;
+                const ShellBlock& p_block = shell_blocks[row];
+                const ShellBlock& q_block = shell_blocks[jsh];
+                if (pair_support) {
                     bool needed = false;
-                    for (npy_intp a = aux_block.start; a < aux_block.stop && !needed; ++a)
-                        for (npy_intp i = p_block.start; i < p_block.stop && !needed; ++i)
-                            for (npy_intp j = q_block.start; j < q_block.stop && !needed; ++j) {
-                                if (i < j) continue;
-                                const auto pair = i*(i+1)/2+j;
-                                for (npy_intp o = 0; o < response->nobservable; ++o)
-                                    needed = needed || response->three_weights[(o*naux+a)*npair+pair] != 0.;
-                            }
+                    for (npy_intp i = p_block.start; i < p_block.stop; ++i)
+                        for (npy_intp j = q_block.start; j < q_block.stop; ++j)
+                            needed = needed || pair_support[i*nao+j];
                     if (!needed) continue;
                 }
-                if (projected_output) shell_values.assign(na * np * nq, 0.0);
-                const bool ok = compute_shell_triplet_vrr_hrr_into_j3(
-                    shells,
-                    origins,
-                    weights,
-                    nprim,
-                    max_prim,
-                    aux_shells,
-                    aux_origins,
-                    aux_exps,
-                    aux_weights,
-                    aux_nprim,
-                    aux_max_prim,
-                    pair_bounds,
-                    aux_diag,
-                    j3,
-                    nao,
-                    npair,
-                    naux,
-                    screen_tol,
-                    p_block.start,
-                    p_block.stop,
-                    q_block.start,
-                    q_block.stop,
-                    aux_block.start,
-                    aux_block.stop,
-                    pair_geom.a.data() + off,
-                    pair_geom.b.data() + off,
-                    pair_geom.p.data() + off,
-                    pair_geom.px.data() + off,
-                    pair_geom.py.data() + off,
-                    pair_geom.pz.data() + off,
-                    pair_geom.k.data() + off,
-                    pair_geom.n[static_cast<std::size_t>(idx)],
-                    vrr_table.data(),
-                    vrr_table.size(),
-                    response,
-                    projected_output ? shell_values.data() : nullptr,
-                    response ? nullptr : &recipes,
-                    component_scales.data(),
-                    aux_component_scales.data(),
-                    &contracted_values,
-                    &batch_table
-                );
-                if (!ok) {
-                    return false;
-                }
-                if (projected_output) {
-                    for (npy_intp a = 0; a < na; ++a) {
-                        const double* cartesian = shell_values.data()+a*np*nq;
-                        for (const auto& projection : pair_projections[idx]) {
-                            double value = 0.;
-                            for (const auto& [offset, coefficient] : projection.terms)
-                                value += coefficient*cartesian[offset];
-                            for (const auto& [k, ck] : aux_rows[aux_block.start+a])
-                                j3[k*(block_stop-block_start)+projection.output-block_start] += ck*value;
+                const npy_intp idx = row * nshell + jsh;
+                const std::size_t off = static_cast<std::size_t>(idx) * static_cast<std::size_t>(pair_cap);
+                const auto np = p_block.stop - p_block.start;
+                const auto nq = q_block.stop - q_block.start;
+                for (const ShellBlock& aux_block : aux_shell_blocks) {
+                    const auto na = aux_block.stop - aux_block.start;
+                    if (response && response->first_three) {
+                        const int target=response->direction/3;
+                        if (response->primary_atoms[p_block.start]!=target &&
+                            response->primary_atoms[q_block.start]!=target &&
+                            response->auxiliary_atoms[aux_block.start]!=target) continue;
+                    } else if (response) {
+                        bool needed = false;
+                        for (npy_intp a = aux_block.start; a < aux_block.stop && !needed; ++a)
+                            for (npy_intp i = p_block.start; i < p_block.stop && !needed; ++i)
+                                for (npy_intp j = q_block.start; j < q_block.stop && !needed; ++j) {
+                                    if (i < j) continue;
+                                    const auto pair = i*(i+1)/2+j;
+                                    for (npy_intp o = 0; o < response->nobservable; ++o)
+                                        needed = needed || response->three_weights[(o*naux+a)*npair+pair] != 0.;
+                                }
+                        if (!needed) continue;
+                    }
+                    if (projected_output) shell_values.assign(na * np * nq, 0.0);
+                    const bool ok = compute_shell_triplet_vrr_hrr_into_j3(
+                        shells,
+                        origins,
+                        weights,
+                        nprim,
+                        max_prim,
+                        aux_shells,
+                        aux_origins,
+                        aux_exps,
+                        aux_weights,
+                        aux_nprim,
+                        aux_max_prim,
+                        pair_bounds,
+                        aux_diag,
+                        j3,
+                        nao,
+                        npair,
+                        naux,
+                        screen_tol,
+                        p_block.start,
+                        p_block.stop,
+                        q_block.start,
+                        q_block.stop,
+                        aux_block.start,
+                        aux_block.stop,
+                        pair_geom.a.data() + off,
+                        pair_geom.b.data() + off,
+                        pair_geom.p.data() + off,
+                        pair_geom.px.data() + off,
+                        pair_geom.py.data() + off,
+                        pair_geom.pz.data() + off,
+                        pair_geom.k.data() + off,
+                        pair_geom.n[static_cast<std::size_t>(idx)],
+                        vrr_table.data(),
+                        vrr_table.size(),
+                        response,
+                        projected_output ? shell_values.data() : nullptr,
+                        response ? nullptr : &recipes,
+                        component_scales.data(),
+                        aux_component_scales.data(),
+                        &contracted_values,
+                        &batch_table
+                    );
+                    if (!ok) {
+                        success.store(false);
+                        return;
+                    }
+                    if (projected_output) {
+                        for (npy_intp a = 0; a < na; ++a) {
+                            const double* cartesian = shell_values.data()+a*np*nq;
+                            for (const auto& projection : pair_projections[idx]) {
+                                double value = 0.;
+                                for (const auto& [offset, coefficient] : projection.terms)
+                                    value += coefficient*cartesian[offset];
+                                for (const auto& [k, ck] : aux_rows[aux_block.start+a])
+                                    j3[k*(block_stop-block_start)+projection.output-block_start] += ck*value;
+                            }
                         }
                     }
                 }
             }
-        }
-        if (sink && ish+1 == shell_stop) {
+        };
+        PyThreadState* thread_state = nthread > 1 ? PyEval_SaveThread() : nullptr;
+        std::exception_ptr error;
+        try {
+#ifdef _OPENMP
+            if (use_openmp && nthread > 1) {
+#pragma omp parallel num_threads(nthread)
+                {
+                    try { evaluate(omp_get_thread_num()); }
+                    catch (...) {
+#pragma omp critical(ri_scheduler_error)
+                        { if (!error) error = std::current_exception(); }
+                    }
+                }
+            } else
+#endif
+                native_integral_worker_pool().run(nthread, evaluate);
+        } catch (...) { error = std::current_exception(); }
+        if (thread_state) PyEval_RestoreThread(thread_state);
+        if (error) std::rethrow_exception(error);
+        if (!success.load()) return false;
+        if (sink && row_stop == shell_stop) {
             PyObject* result = PyObject_CallFunction(sink, "Onn", output_block.obj,
                                                      block_start, block_stop);
             if (!result) return false;
             Py_DECREF(result);
         }
+        ish = row_stop-1;
     }
     return true;
 }
@@ -6655,7 +6665,8 @@ void fill_symmetric_eri(
     npy_intp q,
     npy_intp r,
     npy_intp s,
-    double value
+    double value,
+    bool packed = false
 );
 
 inline void direct_jk_add_unique_permutations(
@@ -7126,6 +7137,8 @@ bool build_rys_spherical_output_plan(
 }
 
 struct SphericalDirectJKPlan {
+    std::unordered_map<std::size_t, std::vector<double>> column_blocks;
+    std::size_t column_block_bytes = 0;
     std::array<PyArrayObject*, 7> arrays{};
     const std::int64_t* shells = nullptr;
     const double* origins = nullptr;
@@ -7928,7 +7941,8 @@ void consume_spherical_target_contraction_plan(
     npy_intp nsph,
     bool symmetric_density,
     long long& computed,
-    long long& skipped
+    long long& skipped,
+    bool packed = false
 ) {
     const bool build_direct = dm != nullptr && vj != nullptr;
     for (std::size_t output = 0; output < plan.outputs.size(); ++output) {
@@ -7953,7 +7967,7 @@ void consume_spherical_target_contraction_plan(
                 );
             }
         } else {
-            fill_symmetric_eri(eri, nsph, item.p, item.q, item.r, item.s, value);
+            fill_symmetric_eri(eri, nsph, item.p, item.q, item.r, item.s, value, packed);
         }
     }
 }
@@ -8555,7 +8569,8 @@ void consume_cartesian_shell_quartet_spherical_sparse_fused(
     bool symmetric_density,
     bool same_pair,
     long long& computed,
-    long long& skipped
+    long long& skipped,
+    bool packed = false
 ) {
     const bool build_direct = dm != nullptr && vj != nullptr;
     if (reusable_transform_plan != nullptr && !reusable_transform_plan->outputs.empty()) {
@@ -8591,7 +8606,7 @@ void consume_cartesian_shell_quartet_spherical_sparse_fused(
                     );
                 }
             } else {
-                fill_symmetric_eri(eri, nsph, ga, gb, gc, gd, value);
+                fill_symmetric_eri(eri, nsph, ga, gb, gc, gd, value, packed);
             }
         }
         return;
@@ -8657,7 +8672,7 @@ void consume_cartesian_shell_quartet_spherical_sparse_fused(
                             );
                         }
                     } else {
-                        fill_symmetric_eri(eri, nsph, ga, gb, gc, gd, value);
+                        fill_symmetric_eri(eri, nsph, ga, gb, gc, gd, value, packed);
                     }
                 }
             }
@@ -8817,7 +8832,8 @@ bool compute_dense_eri_spherical_blocked(
     int workers,
     int rys_max_rank = -1,
     const SphericalDirectJKPlan* reusable_plan = nullptr,
-    int symmetric_density_hint = -1
+    int symmetric_density_hint = -1,
+    bool packed = false
 ) {
     const bool build_direct = dm != nullptr && vj != nullptr;
     const bool build_exchange = build_direct && vk != nullptr;
@@ -9660,7 +9676,7 @@ bool compute_dense_eri_spherical_blocked(
                                     symmetric_density,
                                     task.ish == task.ksh && task.jsh == task.lsh,
                                     local_computed,
-                                    local_skipped
+                                    local_skipped, packed
                                 );
                             }
                             continue;
@@ -9761,7 +9777,7 @@ bool compute_dense_eri_spherical_blocked(
                                 nsph,
                                 symmetric_density,
                                 local_computed,
-                                local_skipped
+                                local_skipped, packed
                             );
                             continue;
                         }
@@ -9888,7 +9904,7 @@ bool compute_dense_eri_spherical_blocked(
                         symmetric_density,
                         task.ish == task.ksh && task.jsh == task.lsh,
                         local_computed,
-                        local_skipped
+                        local_skipped, packed
                     );
                 }
             } catch (...) {
@@ -10707,6 +10723,8 @@ inline double eri_scalar_weight_unique(
     const double* dm_right,
     double exchange_fraction
 ) {
+    // A null right density selects pre-summed, s8 quartet weights.
+    if (!dm_right) return dm_left[pair_pair_index(pair_index(p,q), pair_index(r,s))];
     const std::array<std::array<npy_intp, 4>, 8> permutations = {{
         {{p, q, r, s}},
         {{q, p, r, s}},
@@ -10863,10 +10881,10 @@ public:
 
     const DerivativeRecurrencePlan& get(int max_a, int max_c, int max_m,
             const std::vector<std::vector<HrrExpansionTerm>>& high,
-            const std::vector<std::vector<HrrExpansionTerm>>& low) {
+            const std::vector<std::vector<HrrExpansionTerm>>& low, bool compact = false) {
         const auto size = os_vrr_table_size(max_a, max_c, max_m);
         std::vector<std::uint64_t> key(3+(size+63)/64, 0);
-        key[0] = max_a; key[1] = max_c; key[2] = max_m;
+        key[0] = max_a; key[1] = max_c; key[2] = max_m + (compact ? 256 : 0);
         for (const auto* recipes : {&high, &low})
             for (const auto& terms : *recipes)
                 for (const auto& term : terms)
@@ -10879,7 +10897,7 @@ public:
         }
         ++misses;
         DerivativeRecurrencePlan plan;
-        plan.build(max_a, max_c, max_m, high, low);
+        plan.build(max_a, max_c, max_m, high, low, compact);
         const auto cost = key.capacity()*sizeof(std::uint64_t)
             +plan.steps.capacity()*sizeof(DerivativeRecurrenceStep)
             +(plan.targets.capacity()+plan.target_slots.capacity())*sizeof(std::size_t);
@@ -10929,6 +10947,8 @@ bool compute_directional_shell_quartet_derivatives(
     double* out,
     std::vector<double>& vrr_table,
     std::vector<double>& batch_table,
+    std::vector<double>& hrr_values,
+    std::vector<std::size_t>& compact_slots,
     DerivativeRecurrenceCache& recurrence_cache,
     std::vector<ShellQuartetTarget>& targets,
     std::vector<double>& derivative_block,
@@ -10947,7 +10967,10 @@ bool compute_directional_shell_quartet_derivatives(
     int derivative_kernel = 0,
     const std::vector<double>* pair_norms = nullptr,
     double screen_budget = 0.,
-    std::atomic<std::size_t>* screened = nullptr
+    std::atomic<std::size_t>* screened = nullptr,
+    npy_intp derivative_pair = -1,
+    const std::vector<npy_intp>* derivative_pairs = nullptr,
+    std::size_t* workspace_peak = nullptr
 ) {
     const int max_a_l = pblk.l + qblk.l + order;
     const int max_c_l = rblk.l + sblk.l + order;
@@ -11017,9 +11040,10 @@ bool compute_directional_shell_quartet_derivatives(
     constexpr int ncenter_derivatives = 9;
     const int nderiv = order == 1 ? ncenter_derivatives : ncenter_derivatives * ncenter_derivatives;
     const bool early = contraction && order == 1;
-    const bool scalar_second = order == 2 && dm_left && dm_right;
+    const bool early_second = contraction && order == 2;
+    const bool scalar_second = order == 2 && dm_left;
     std::vector<double> target_weights;
-    if (early) {
+    if (early || early_second) {
         target_weights.assign(targets.size()*nobservable, 0.);
         for (std::size_t it = 0; it < targets.size(); ++it)
             (*contraction)(targets[it], target_weights.data()+it*nobservable);
@@ -11032,7 +11056,7 @@ bool compute_directional_shell_quartet_derivatives(
                 dm_left,dm_right,exchange_fraction);
         }
     }
-    derivative_block.assign((early ? nobservable : scalar_second ? 1 : targets.size()) * static_cast<std::size_t>(nderiv), 0.0);
+    derivative_block.assign(((early || early_second) ? nobservable : scalar_second ? 1 : targets.size()) * static_cast<std::size_t>(nderiv), 0.0);
     mode_coeffs.assign(static_cast<std::size_t>(nmodes) * ncenter_derivatives, 0.0);
     bool derivative_active[ncenter_derivatives] = {};
     const npy_intp atom_slots[4] = {
@@ -11298,7 +11322,7 @@ bool compute_directional_shell_quartet_derivatives(
                 terms.resize(size);
             }
     }
-    bool second_contracted = order == 2 && use_vrr && dm_left && dm_right
+    bool second_contracted = order == 2 && use_vrr && dm_left
         && targets.size() > 1 && npq*nrs >= 4;
     for (const auto* block : {&pblk,&qblk,&rblk,&sblk})
         if (!std::isfinite(component_scales[block->start])) second_contracted = false;
@@ -11343,29 +11367,149 @@ bool compute_directional_shell_quartet_derivatives(
         }
         derivative_block.assign(81,0.);
     }
+    const bool first_columns = order == 1 && use_vrr && !use_rys && emit && !early;
+    std::vector<int> first_expansions;
     const DerivativeRecurrencePlan* recurrence = nullptr;
     if (contracted_recipes)
         recurrence = &recurrence_cache.get(max_a_l, max_c_l, max_m_l, contracted_high, contracted_low);
     else if (second_contracted)
         recurrence = &recurrence_cache.get(max_a_l,max_c_l,max_m_l,second_terms,{});
+    else if (first_columns) {
+        // Selected first-column targets share shifted HRR expansions. Reuse
+        // the second-derivative dependency planner for just their ancestors.
+        std::vector<unsigned char> needed(hrr_cache.expansions.size(), 0);
+        for (const auto& recipe : first_recipes) {
+            if (recipe.high >= 0) needed[recipe.high] = 1;
+            if (recipe.low >= 0) needed[recipe.low] = 1;
+        }
+        std::vector<std::vector<HrrExpansionTerm>> requested(1);
+        for (std::size_t e = 0; e < needed.size(); ++e) if (needed[e]) {
+            first_expansions.push_back(static_cast<int>(e));
+            const auto& expansion = hrr_cache.expansions[e];
+            requested[0].insert(requested[0].end(),
+                hrr_cache.terms.begin()+expansion.offset,
+                hrr_cache.terms.begin()+expansion.offset+expansion.size);
+        }
+        recurrence = &recurrence_cache.get(max_a_l,max_c_l,max_m_l,requested,{},true);
+    }
     else if (order == 2 && use_vrr) {
         // Second derivatives also need only the ancestors of requested HRR
         // terms, not the entire rectangular angular/moment recurrence table.
         const std::vector<std::vector<HrrExpansionTerm>> requested{hrr_cache.terms};
         recurrence = &recurrence_cache.get(max_a_l,max_c_l,max_m_l,requested,{});
     }
+    const bool compact_columns = first_columns;
+    if (compact_columns) {
+        // Reuse the compact recurrence layout already used by three-center
+        // derivatives. Cached HRR plans retain their geometry-local indices.
+        compact_slots.assign(os_vrr_table_size(max_a_l,max_c_l,max_m_l),0);
+        for (std::size_t i = 0; i < recurrence->targets.size(); ++i)
+            compact_slots[recurrence->targets[i]] = recurrence->target_slots[i];
+        for (auto& term : hrr_cache.terms) term.index = compact_slots[term.index];
+    }
     // Traverse each recurrence step once for a batch of primitive quartets.
     // The primitive axis is contiguous so the same arithmetic can vectorize.
     DerivativePrimitiveBatch batch;
     constexpr int batch_width = DerivativePrimitiveBatch::width;
-    const bool batched = (contracted_recipes || second_contracted) && npq*nrs >= batch_width;
+    // CD columns retain separate shell targets. Batch their primitive axis,
+    // reusing the same recurrence and HRR expansions with a fixed workspace cap.
+    const std::size_t table_size = recurrence ? recurrence->workspace_size
+        : os_vrr_table_size(max_a_l,max_c_l,max_m_l);
+    constexpr std::size_t second_batch_bytes = 32ULL*1024*1024;
+    bool second_columns = order == 2 && use_vrr && emit && !scalar_second
+        && (table_size+hrr_cache.expansions.size())*batch_width*sizeof(double) <= second_batch_bytes;
+    for (const auto* block : {&pblk,&qblk,&rblk,&sblk})
+        if (!std::isfinite(component_scales[block->start])) second_columns = false;
+    bool first_batched = first_columns
+        && (table_size+hrr_cache.expansions.size())*batch_width*sizeof(double) <= second_batch_bytes;
+    for (const auto* block : {&pblk,&qblk,&rblk,&sblk})
+        if (!std::isfinite(component_scales[block->start])) first_batched = false;
+    const bool column_batch = second_columns || first_batched;
+    const bool batched = (contracted_recipes || second_contracted || column_batch) && npq*nrs >= batch_width;
+    if (!batched && use_vrr && vrr_table.size() < table_size) vrr_table.resize(table_size);
+    // The scalar and batched paths are exclusive; reuse one worker-local
+    // HRR buffer instead of allocating both for every shell quartet.
+    const std::size_t expanded_size = ((order == 2 && use_vrr && !second_contracted) || first_columns)
+        ? hrr_cache.expansions.size()*(batched && column_batch ? batch_width : 1) : 0;
+    if (column_batch && (std::max(batch_table.capacity(),table_size*batch_width)
+            +std::max(hrr_values.capacity(),expanded_size))*sizeof(double) > second_batch_bytes) {
+        std::vector<double>().swap(batch_table);
+        std::vector<double>().swap(hrr_values);
+    }
+    if (hrr_values.capacity() < expanded_size) std::vector<double>().swap(hrr_values);
+    hrr_values.resize(expanded_size);
+    auto& expanded_batch = hrr_values;
     if (batched) {
-        const auto required = os_vrr_table_size(max_a_l, max_c_l, max_m_l)*batch_width;
+        const auto required = table_size*batch_width;
+        if (batch_table.capacity() < required) std::vector<double>().swap(batch_table);
         if (batch_table.size() < required) batch_table.resize(required);
     }
+    if (workspace_peak)
+        *workspace_peak = std::max(*workspace_peak,
+            (vrr_table.capacity()+batch_table.capacity()+expanded_batch.capacity())*sizeof(double)
+            +compact_slots.capacity()*sizeof(std::size_t));
     auto flush_batch = [&]() {
         if (!batch.size) return;
         recurrence->evaluate_batch(batch_table.data(), batch);
+        if (column_batch) {
+            std::fill(expanded_batch.begin(),expanded_batch.end(),0.);
+            const auto count = first_batched ? first_expansions.size() : hrr_cache.expansions.size();
+            for (std::size_t kexp = 0; kexp < count; ++kexp) {
+                const auto e = first_batched ? first_expansions[kexp] : kexp;
+                const auto& expansion = hrr_cache.expansions[e];
+                double* values = expanded_batch.data()+e*batch_width;
+                for (std::size_t k = 0; k < expansion.size; ++k) {
+                    const auto& term = hrr_cache.terms[expansion.offset+k];
+                    const double* row = batch_table.data()+term.index*batch_width;
+                    for (int i = 0; i < batch.size; ++i) values[i] += term.coefficient*row[i];
+                }
+            }
+            const double zero[batch_width] = {};
+            auto values = [&](int index) { return index < 0 ? zero : expanded_batch.data()+index*batch_width; };
+            for (std::size_t it = 0; it < targets.size(); ++it) {
+                const auto& t = targets[it];
+                const double scale = component_scales[t.ao_p]*component_scales[t.ao_q]
+                    *component_scales[t.ao_r]*component_scales[t.ao_s];
+                if (first_batched) {
+                    for (int d = 0; d < 9; ++d) {
+                        if (!derivative_active[d]) continue;
+                        const auto& recipe = first_recipes[it*9+d];
+                        const double *high = values(recipe.high), *low = values(recipe.low);
+                        double value = 0.;
+                        for (int i = 0; i < batch.size; ++i)
+                            value += batch.weight[d/3][i]*high[i]-recipe.power*batch.weight[3][i]*low[i];
+                        derivative_block[it*9+d] += scale*value;
+                    }
+                    continue;
+                }
+                for (int a = 0; a < 9; ++a) for (int b = 0; b <= a; ++b) {
+                    if (!derivative_active[a] || !derivative_active[b]) continue;
+                    const auto& recipe = second_recipes[it*second_count+second_pair[a*9+b]];
+                    const double *pp=values(recipe.pp), *pm=values(recipe.pm),
+                                 *mp=values(recipe.mp), *mm=values(recipe.mm);
+                    double value = 0.;
+                    for (int i = 0; i < batch.size; ++i) {
+                        const double ea=batch.weight[a/3][i], eb=batch.weight[b/3][i];
+                        const double derivative = recipe.same
+                            ? 4*ea*ea*pp[i]-2*ea*(2*recipe.power_a+1)*pm[i]+recipe.power_a*(recipe.power_a-1)*mm[i]
+                            : 4*ea*eb*pp[i]-2*ea*recipe.power_b*pm[i]-2*eb*recipe.power_a*mp[i]+recipe.power_a*recipe.power_b*mm[i];
+                        value += batch.weight[3][i]*derivative;
+                    }
+                    if (early_second) {
+                        for (npy_intp obs = 0; obs < nobservable; ++obs) {
+                            const double weighted = target_weights[it*nobservable+obs]*scale*value;
+                            derivative_block[(obs*9+a)*9+b] += weighted;
+                            if (a != b) derivative_block[(obs*9+b)*9+a] += weighted;
+                        }
+                    } else {
+                        derivative_block[(it*9+a)*9+b] += scale*value;
+                        if (a != b) derivative_block[(it*9+b)*9+a] += scale*value;
+                    }
+                }
+            }
+            batch.size = 0;
+            return;
+        }
         if (second_contracted) {
             for (int a = 0; a < 9; ++a) for (int b = 0; b <= a; ++b) {
                 if (!derivative_active[a] || !derivative_active[b]) continue;
@@ -11408,9 +11552,9 @@ bool compute_directional_shell_quartet_derivatives(
     const int nprim_q = static_cast<int>(nprim[qblk.start]);
     const int nprim_s = static_cast<int>(nprim[sblk.start]);
     std::vector<double> rys_values;
-    // Many second-derivative recipes share shifted HRR expansions. Evaluate
+    // Derivative recipes share shifted HRR expansions. Evaluate
     // each expansion once per primitive quartet rather than once per recipe.
-    std::vector<double> second_expanded(order == 2 && use_vrr && !second_contracted ? hrr_cache.expansions.size() : 0);
+    auto& second_expanded = hrr_values;
     for (int idx_pq = 0; idx_pq < npq; ++idx_pq) {
         if (pq_k[idx_pq] == 0.0) continue;
         const int ip = idx_pq / nprim_q;
@@ -11459,7 +11603,7 @@ bool compute_directional_shell_quartet_derivatives(
                 const double exponents[4] = {pq_a[idx_pq], pq_b[idx_pq], rs_a[idx_rs], rs_b[idx_rs]};
                 batch.weight[3][i] = prefac;
                 for (int slot = 0; slot < 3; ++slot)
-                    batch.weight[slot][i] = (second_contracted ? 1. : 2.*prefac)*exponents[derivative_slots[slot]];
+                    batch.weight[slot][i] = (second_contracted || second_columns ? 1. : 2.*prefac)*exponents[derivative_slots[slot]];
                 if (batch.size == batch_width) flush_batch();
                 continue;
             }
@@ -11521,8 +11665,13 @@ bool compute_directional_shell_quartet_derivatives(
                 continue;
             }
 
-            for (std::size_t e = 0; e < second_expanded.size(); ++e)
-                second_expanded[e] = evaluate_hrr_expansion(hrr_cache,static_cast<int>(e),vrr_table.data());
+            if (first_columns) {
+                for (int e : first_expansions)
+                    second_expanded[e] = evaluate_hrr_expansion(hrr_cache,e,vrr_table.data());
+            } else {
+                for (std::size_t e = 0; e < second_expanded.size(); ++e)
+                    second_expanded[e] = evaluate_hrr_expansion(hrr_cache,static_cast<int>(e),vrr_table.data());
+            }
 
             for (std::size_t it = 0; it < targets.size(); ++it) {
                 const ShellQuartetTarget& target = targets[it];
@@ -11539,7 +11688,12 @@ bool compute_directional_shell_quartet_derivatives(
                         }
                         const int slot = derivative_slots[derivative / 3];
                         const int axis = derivative % 3;
-                        const double derivative_value = use_rys ? rys_values[it*9+derivative] : use_vrr
+                        const auto& recipe = first_recipes.empty() ? HrrFirstDerivativeRecipe{}
+                            : first_recipes[it*ncenter_derivatives+derivative];
+                        const double derivative_value = first_columns
+                            ? 2.*exponents[slot]*second_expanded[recipe.high]
+                                -(recipe.low < 0 ? 0. : recipe.power*second_expanded[recipe.low])
+                            : use_rys ? rys_values[it*9+derivative] : use_vrr
                             ? evaluate_hrr_first_recipe(
                                 hrr_cache,
                                 first_recipes[it * ncenter_derivatives + derivative],
@@ -11591,13 +11745,17 @@ bool compute_directional_shell_quartet_derivatives(
                                     origins
                                 );
                             const double value = prefac * derivative_value;
-                            derivative_block[
-                                (component * ncenter_derivatives + derivative_a) * ncenter_derivatives + derivative_b
-                            ] += value;
-                            if (derivative_a != derivative_b) {
-                                derivative_block[
-                                    (component * ncenter_derivatives + derivative_b) * ncenter_derivatives + derivative_a
-                                ] += value;
+                            if (early_second) {
+                                for (npy_intp obs = 0; obs < nobservable; ++obs) {
+                                    const double weighted = target_weights[it*nobservable+obs]*value;
+                                    derivative_block[(obs*9+derivative_a)*9+derivative_b] += weighted;
+                                    if (derivative_a != derivative_b)
+                                        derivative_block[(obs*9+derivative_b)*9+derivative_a] += weighted;
+                                }
+                            } else {
+                                derivative_block[(component*9+derivative_a)*9+derivative_b] += value;
+                                if (derivative_a != derivative_b)
+                                    derivative_block[(component*9+derivative_b)*9+derivative_a] += value;
                             }
                         }
                     }
@@ -11617,7 +11775,7 @@ bool compute_directional_shell_quartet_derivatives(
     // Contract shell targets before projecting the nine center derivatives
     // into nuclear directions. This avoids repeating the mode transform for
     // every Cartesian quartet and keeps only a 9x9 contracted shell block.
-    if (order == 2 && dm_left && dm_right) {
+    if (order == 2 && dm_left) {
         const double* contracted = derivative_block.data();
         for (npy_intp a = 0; a < nmodes; ++a) {
             double row[9] = {};
@@ -11635,11 +11793,34 @@ bool compute_directional_shell_quartet_derivatives(
         }
         return true;
     }
+    if (early_second) {
+        // Only an observable-by-9-by-9 center Hessian is retained.
+        const auto& contracted = derivative_block;
+        std::vector<double> rows(nmodes*9,0.);
+        const npy_intp count = derivative_pairs ? derivative_pairs->size()
+            : (derivative_pair < 0 ? nmodes*nmodes : 1);
+        for (npy_intp obs = 0; obs < nobservable; ++obs) {
+            std::fill(rows.begin(),rows.end(),0.);
+            for (npy_intp mode = 0; mode < nmodes; ++mode)
+                for (int i = 0; i < 9; ++i)
+                    for (int j = 0; j < 9; ++j)
+                        rows[mode*9+j] += mode_coeffs[mode*9+i]*contracted[obs*81+i*9+j];
+            for (npy_intp entry = 0; entry < count; ++entry) {
+                const npy_intp flat = derivative_pairs ? (*derivative_pairs)[entry]
+                    : (derivative_pair < 0 ? entry : derivative_pair);
+                double value = 0.;
+                for (int j = 0; j < 9; ++j)
+                    value += rows[(flat/nmodes)*9+j]*mode_coeffs[(flat%nmodes)*9+j];
+                out[entry*nobservable+obs] += value;
+            }
+        }
+        return true;
+    }
     const std::size_t eri_size =
         static_cast<std::size_t>(nao) * nao * nao * nao;
     for (std::size_t it = 0; it < targets.size(); ++it) {
         const ShellQuartetTarget& target = targets[it];
-        const bool contract_scalar = dm_left != nullptr && dm_right != nullptr;
+        const bool contract_scalar = dm_left != nullptr;
         const double scalar_weight = contract_scalar
             ? eri_scalar_weight_unique(
                 nao,
@@ -11677,8 +11858,11 @@ bool compute_directional_shell_quartet_derivatives(
                 }
             }
         } else {
-            for (npy_intp mode_a = 0; mode_a < nmodes; ++mode_a) {
-                for (npy_intp mode_b = 0; mode_b < nmodes; ++mode_b) {
+            const npy_intp count = derivative_pairs ? derivative_pairs->size() : (derivative_pair < 0 ? nmodes*nmodes : 1);
+            for (npy_intp entry = 0; entry < count; ++entry) {
+                const npy_intp flat = derivative_pairs ? (*derivative_pairs)[entry] : (derivative_pair < 0 ? entry : derivative_pair);
+                const npy_intp mode_a = flat/nmodes, mode_b = flat%nmodes;
+                {
                     double value = 0.0;
                     for (int derivative_a = 0; derivative_a < ncenter_derivatives; ++derivative_a) {
                         const double coeff_a = mode_coeffs[
@@ -11695,7 +11879,9 @@ bool compute_directional_shell_quartet_derivatives(
                             ];
                         }
                     }
-                    if (contract_scalar) {
+                    if (emit) {
+                        (*emit)(entry, target, value);
+                    } else if (contract_scalar) {
                         out[static_cast<std::size_t>(mode_a) * nmodes + mode_b] +=
                             scalar_weight * value;
                     } else {
@@ -11721,6 +11907,8 @@ struct PairColumnProjection {
     std::vector<std::vector<Entry>> pairs;
     std::vector<std::vector<Entry>> columns;
     std::vector<unsigned char> selected;
+    npy_intp derivative_pair = -1;
+    const std::vector<npy_intp>* derivative_pairs = nullptr;
     npy_intp npair = 0;
     npy_intp ncolumn = 0;
     npy_intp nobservable = 0;
@@ -11736,10 +11924,13 @@ struct PairColumnProjection {
     std::size_t* task_count = nullptr;
     std::atomic<std::size_t>* plan_hits = nullptr;
     std::atomic<std::size_t>* plan_misses = nullptr;
+    std::size_t* private_output_bytes = nullptr;
+    std::atomic<std::size_t>* recurrence_workspace_bytes = nullptr;
 
     npy_intp output_size() const { return (sensitivities || density_left) ? nobservable : ncolumn * npair; }
 
-    void add(double* out, npy_intp mode, const ShellQuartetTarget& target, double value) const {
+    void add(double* out, npy_intp mode, const ShellQuartetTarget& target, double value,
+             std::mutex* column_locks = nullptr) const {
         if (value == 0.0) return;
         if (density_left) {
             for (npy_intp obs = 0; obs < nobservable; ++obs)
@@ -11759,13 +11950,19 @@ struct PairColumnProjection {
                     block[obs] += v * sensitivities[obs * ncolumn * npair + index];
             } else block[index] += v;
         };
-        for (const auto& column : columns[q])
+        for (const auto& column : columns[q]) {
+            std::unique_lock<std::mutex> lock;
+            if (column_locks) lock = std::unique_lock<std::mutex>(column_locks[column.first % 256]);
             for (const auto& row : pairs[p])
                 accumulate(column.first, row.first, value * column.second * row.second);
+        }
         if (p != q)
-            for (const auto& column : columns[p])
+            for (const auto& column : columns[p]) {
+                std::unique_lock<std::mutex> lock;
+                if (column_locks) lock = std::unique_lock<std::mutex>(column_locks[column.first % 256]);
                 for (const auto& row : pairs[q])
                     accumulate(column.first, row.first, value * column.second * row.second);
+            }
     }
 };
 
@@ -11843,12 +12040,12 @@ bool compute_directional_eri_derivatives_blocked(
             return shell_blocks[task.ish].l+8*shell_blocks[task.jsh].l
                 +64*shell_blocks[task.ksh].l+512*shell_blocks[task.lsh].l;
         };
-        // Serial work groups centers for radial-shell reuse. Parallel work
-        // keeps expensive quartets first within each angular class.
+        // Group curvature centers for bounded numerical HRR reuse. First
+        // columns retain cost ordering in parallel and center ordering in serial.
         std::stable_sort(tasks.begin(),tasks.end(),[&](const auto& a,const auto& b) {
             const int ac = angular_class(a), bc = angular_class(b);
             if (ac != bc) return ac > bc;
-            if (workers == 1) {
+            if (workers == 1 || order == 2) {
                 const int as[4] = {a.ish,a.jsh,a.ksh,a.lsh};
                 const int bs[4] = {b.ish,b.jsh,b.ksh,b.lsh};
                 for (int i = 0; i < 4; ++i) {
@@ -11859,43 +12056,54 @@ bool compute_directional_eri_derivatives_blocked(
             }
             return cost(a) > cost(b);
         });
-        const std::size_t vrr_table_cap = os_vrr_table_size(
-            OS_VRR_PAIR_MAX_L,
-            OS_VRR_PAIR_MAX_L,
-            2 * OS_VRR_PAIR_MAX_L
-        );
         const int nthread = std::min(
             std::max(1, workers),
             std::max(1, static_cast<int>(tasks.size()))
         );
         std::atomic<std::size_t> next_task{0};
         std::atomic<bool> failed{false};
-        const bool contract_scalar = dm_left != nullptr && dm_right != nullptr;
+        const bool contract_scalar = dm_left != nullptr;
         const std::size_t scalar_size = projection
-            ? static_cast<std::size_t>(nmodes) * projection->output_size()
+            ? (projection->derivative_pairs ? projection->derivative_pairs->size() : (projection->derivative_pair < 0 ? static_cast<std::size_t>(nmodes) * (order == 2 ? nmodes : 1) : 1)) * projection->output_size()
             : (order == 1 ? static_cast<std::size_t>(nmodes)
                           : static_cast<std::size_t>(nmodes) * nmodes);
 
+        // Uncontracted first columns share their output. Lock one column
+        // stripe at a time; spherical Cartesian contributions may overlap.
+        const bool shared_first = projection && order == 1 && nthread > 1
+            && !projection->sensitivities && !projection->density_left;
+        const bool direct_first = projection && order == 1 && (nthread == 1 || shared_first);
+        std::array<std::mutex, 256> column_locks;
+        if (projection && projection->private_output_bytes)
+            *projection->private_output_bytes = direct_first ? 0 : scalar_size*nthread*sizeof(double);
         std::vector<std::vector<double>> worker_outputs(nthread);
         auto run_worker = [&](int tid) {
-            std::vector<double> vrr_table(vrr_table_cap, 0.0);
+            // Preserve the curvature path's fixed scalar workspace. First
+            // columns retain their compact, demand-sized recurrence storage.
+            std::vector<double> vrr_table(order == 2 ? os_vrr_table_size(
+                OS_VRR_PAIR_MAX_L,OS_VRR_PAIR_MAX_L,2*OS_VRR_PAIR_MAX_L) : 0);
             std::vector<ShellQuartetTarget> targets;
             std::vector<double> derivative_block;
-            std::vector<double> batch_table;
+            std::vector<double> batch_table, hrr_values;
+            std::vector<std::size_t> compact_slots;
             DerivativeRecurrenceCache recurrence_cache;
+            std::size_t workspace_peak = 0;
             std::vector<double> mode_coeffs;
             HrrExpansionCache hrr_cache;
             HrrRecipeCache recipe_cache;
             std::vector<HrrFirstDerivativeRecipe> first_recipes;
             std::vector<HrrSecondDerivativeRecipe> second_recipes;
+            std::array<npy_intp,8> geometry_group{};
+            bool have_geometry_group = false;
             auto& scalar_output = worker_outputs[tid];
-            scalar_output.assign((contract_scalar || projection) ? scalar_size : 0, 0.);
-            double* worker_output = (contract_scalar || projection) ? scalar_output.data() : out;
+            scalar_output.assign((contract_scalar || projection) && !direct_first ? scalar_size : 0, 0.);
+            double* worker_output = (contract_scalar || projection) && !direct_first ? scalar_output.data() : out;
             std::function<void(npy_intp, const ShellQuartetTarget&, double)> emit;
             std::function<void(const ShellQuartetTarget&, double*)> contraction;
             if (projection) {
                 emit = [&](npy_intp mode, const ShellQuartetTarget& target, double value) {
-                    projection->add(worker_output, mode, target, value);
+                    projection->add(worker_output, mode, target, value,
+                                    shared_first ? column_locks.data() : nullptr);
                 };
                 if (projection->early_contraction && projection->sensitivities)
                     contraction = [&](const ShellQuartetTarget& target, double* values) {
@@ -11909,6 +12117,23 @@ bool compute_directional_eri_derivatives_blocked(
                         break;
                     }
                     const ShellQuartetTask& task = tasks[task_index];
+                    if (order == 2) {
+                        std::array<npy_intp,8> group;
+                        int k = 0;
+                        for (int shell : {task.ish,task.jsh,task.ksh,task.lsh}) {
+                            group[k] = shell_blocks[shell].l;
+                            group[k+4] = atom_ids[shell_blocks[shell].start];
+                            ++k;
+                        }
+                        if (!have_geometry_group || group != geometry_group) {
+                            // Bound numerical HRR plans to the current sorted
+                            // center group; symbolic and recurrence plans survive.
+                            recipe_cache.second_geometry_plans.clear();
+                            recipe_cache.second_geometry_bytes = 0;
+                            geometry_group = group;
+                            have_geometry_group = true;
+                        }
+                    }
                     const std::size_t pq_pair_idx = static_cast<std::size_t>(task.ish) * nshell + task.jsh;
                     const std::size_t rs_pair_idx = static_cast<std::size_t>(task.ksh) * nshell + task.lsh;
                     const std::size_t pq_offset = pq_pair_idx * pair_cap;
@@ -11950,6 +12175,8 @@ bool compute_directional_eri_derivatives_blocked(
                             worker_output,
                             vrr_table,
                             batch_table,
+                            hrr_values,
+                            compact_slots,
                             recurrence_cache,
                             targets,
                             derivative_block,
@@ -11967,7 +12194,10 @@ bool compute_directional_eri_derivatives_blocked(
                             projection ? projection->nobservable : 0,
                             projection ? projection->derivative_kernel : 0,
                             pair_norms.empty() ? nullptr : &pair_norms,
-                            screen_budget, projection ? projection->screened : nullptr
+                            screen_budget, projection ? projection->screened : nullptr,
+                            projection ? projection->derivative_pair : -1,
+                            projection ? projection->derivative_pairs : nullptr,
+                            &workspace_peak
                         )) {
                         failed.store(true, std::memory_order_relaxed);
                         break;
@@ -11976,6 +12206,8 @@ bool compute_directional_eri_derivatives_blocked(
             } catch (...) {
                 failed.store(true, std::memory_order_relaxed);
             }
+            if (projection && projection->recurrence_workspace_bytes)
+                projection->recurrence_workspace_bytes->fetch_add(workspace_peak,std::memory_order_relaxed);
             if (projection && projection->plan_hits) {
                 projection->plan_hits->fetch_add(recurrence_cache.hits, std::memory_order_relaxed);
                 projection->plan_misses->fetch_add(recurrence_cache.misses, std::memory_order_relaxed);
@@ -12000,7 +12232,7 @@ bool compute_directional_eri_derivatives_blocked(
                 }
             }
         }
-        if ((contract_scalar || projection) && !failed.load(std::memory_order_relaxed))
+        if ((contract_scalar || projection) && !direct_first && !failed.load(std::memory_order_relaxed))
             for (const auto& values : worker_outputs)
                 for (std::size_t index = 0; index < scalar_size; ++index) out[index] += values[index];
         return !failed.load(std::memory_order_relaxed);
@@ -12016,8 +12248,13 @@ void fill_symmetric_eri(
     npy_intp q,
     npy_intp r,
     npy_intp s,
-    double value
+    double value,
+    bool packed
 ) {
+    if (packed) {
+        eri[pair_pair_index(pair_index(p, q), pair_index(r, s))] = value;
+        return;
+    }
     eri[dense_index(nao, p, q, r, s)] = value;
     eri[dense_index(nao, q, p, r, s)] = value;
     eri[dense_index(nao, p, q, s, r)] = value;
@@ -12104,7 +12341,8 @@ bool validate_directional_eri_inputs(
     PyArrayObject* weights,
     PyArrayObject* nprim,
     PyArrayObject* atom_ids,
-    PyArrayObject* directions
+    PyArrayObject* directions,
+    bool allow_fixed_centers = false
 ) {
     if (
         PyArray_NDIM(shells) != 2 ||
@@ -12151,7 +12389,7 @@ bool validate_directional_eri_inputs(
 
     const auto* atom_data = static_cast<const std::int64_t*>(PyArray_DATA(atom_ids));
     for (npy_intp ao = 0; ao < nao; ++ao) {
-        if (atom_data[ao] < 0 || atom_data[ao] >= natm) {
+        if (atom_data[ao] < (allow_fixed_centers ? -1 : 0) || atom_data[ao] >= natm) {
             PyErr_SetString(PyExc_ValueError, "atom_ids entries must index the directions atom axis.");
             return false;
         }
@@ -12477,9 +12715,10 @@ PyObject* compute_dense_eri_spherical(PyObject*, PyObject* args) {
     int max_l = CARTESIAN_SCALAR_MAX_L;
     int workers = 1;
     int rys_max_rank = -1;
+    int packed = 0;
     if (!PyArg_ParseTuple(
             args,
-            "OOOOOOOdi|ii",
+            "OOOOOOOdi|iip",
             &shells_obj,
             &origins_obj,
             &exps_obj,
@@ -12490,7 +12729,8 @@ PyObject* compute_dense_eri_spherical(PyObject*, PyObject* args) {
             &screen_tol,
             &max_l,
             &workers,
-            &rys_max_rank
+            &rys_max_rank,
+            &packed
         )) {
         return nullptr;
     }
@@ -12523,7 +12763,11 @@ PyObject* compute_dense_eri_spherical(PyObject*, PyObject* args) {
     const npy_intp nsph = PyArray_DIM(transform.obj, 1);
     const npy_intp max_prim = PyArray_DIM(exps.obj, 1);
     npy_intp dims[4] = {nsph, nsph, nsph, nsph};
-    PyObject* eri_obj = PyArray_ZEROS(4, dims, NPY_DOUBLE, 0);
+    const npy_intp pairs = nsph * (nsph + 1) / 2;
+    npy_intp packed_size = pairs * (pairs + 1) / 2;
+    PyObject* eri_obj = packed
+        ? PyArray_ZEROS(1, &packed_size, NPY_DOUBLE, 0)
+        : PyArray_ZEROS(4, dims, NPY_DOUBLE, 0);
     if (eri_obj == nullptr) {
         return nullptr;
     }
@@ -12549,7 +12793,7 @@ PyObject* compute_dense_eri_spherical(PyObject*, PyObject* args) {
         computed,
         skipped,
         std::max(1, workers),
-        rys_max_rank
+        rys_max_rank, nullptr, -1, packed != 0
     );
     if (!ok) {
         Py_DECREF(eri_obj);
@@ -12818,7 +13062,7 @@ PyObject* spherical_direct_jk_plan_stats(PyObject*, PyObject* args) {
         return nullptr;
     }
     PyObject* result = Py_BuildValue(
-        "{sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sN,sN,sN}",
+        "{sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sK,sN,sN,sN}",
         "tasks", static_cast<unsigned long long>(plan->tasks.size()),
         "task_entry_bytes", static_cast<unsigned long long>(sizeof(ShellQuartetTask)),
         "task_bytes", static_cast<unsigned long long>(
@@ -12827,6 +13071,7 @@ PyObject* spherical_direct_jk_plan_stats(PyObject*, PyObject* args) {
         "recurrence_cache_max_bytes", static_cast<unsigned long long>(plan->rys_recurrence_cache_max_bytes),
         "recurrence_cache_bytes", static_cast<unsigned long long>(plan->rys_recurrence_cache_bytes),
         "spherical_plan_cache_bytes", static_cast<unsigned long long>(plan->rys_spherical_plan_cache_bytes),
+        "column_cache_bytes", static_cast<unsigned long long>(plan->column_block_bytes),
         "recurrence_caches", static_cast<unsigned long long>(plan->rys_recurrence_caches.size()),
         "spherical_plans", static_cast<unsigned long long>(plan->rys_spherical_plans.size()),
         "primitive_pair_terms", primitive_pair_terms,
@@ -13003,6 +13248,133 @@ PyObject* direct_jk_spherical_plan(PyObject*, PyObject* args) {
         return nullptr;
     }
     return Py_BuildValue("NNLL", vj_obj, vk_obj, computed, skipped);
+}
+
+PyObject* eri_column_spherical_plan(PyObject*, PyObject* args) {
+    PyObject* plan_obj = nullptr;
+    int pivot = 0;
+    double screen_tol = 0.0;
+    if (!PyArg_ParseTuple(args, "Oid", &plan_obj, &pivot, &screen_tol)) return nullptr;
+    auto* plan = static_cast<SphericalDirectJKPlan*>(
+        PyCapsule_GetPointer(plan_obj, "pyqed.SphericalDirectJKPlan"));
+    if (!plan) return nullptr;
+    const int nshell = static_cast<int>(plan->shell_blocks.size());
+    const npy_intp npair = plan->nsph * (plan->nsph + 1) / 2;
+    if (pivot < 0 || pivot >= npair || screen_tol < plan->screen_tol) {
+        PyErr_SetString(PyExc_ValueError, "Invalid CD pivot or screening threshold.");
+        return nullptr;
+    }
+    for (int sh = 0; sh < nshell; ++sh) {
+        if (plan->shell_blocks[sh].l > 3) Py_RETURN_NONE;
+    }
+    int p = 0;
+    while (pair_index(p+1, 0) <= pivot) ++p;
+    const int q = pivot - pair_index(p, 0);
+    int ps = 0, qs = 0;
+    while (p >= plan->sph_stops[ps]) ++ps;
+    while (q >= plan->sph_stops[qs]) ++qs;
+    const auto active = static_cast<std::size_t>(pair_index(ps, qs));
+    PyObject* result = PyArray_ZEROS(1, &npair, NPY_DOUBLE, 0);
+    if (!result) return nullptr;
+    auto* column = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(result)));
+    long long computed = 0, skipped = 0;
+    const std::size_t cache_limit = plan->rys_recurrence_cache_max_bytes;
+    try {
+        std::vector<double> scratch;
+        const auto& geom = plan->pair_geom;
+        for (auto pos = plan->coulomb_task_offsets[active];
+             pos < plan->coulomb_task_offsets[active+1]; ++pos) {
+            const std::size_t index = plan->coulomb_task_indices[pos];
+            const auto& task = plan->tasks[index];
+            const auto& a = plan->shell_blocks[task.ish];
+            const auto& b = plan->shell_blocks[task.jsh];
+            const auto& c = plan->shell_blocks[task.ksh];
+            const auto& d = plan->shell_blocks[task.lsh];
+            const std::size_t ab = task.ish*nshell+task.jsh, cd = task.ksh*nshell+task.lsh;
+            const double density_bound = p == q ? 1.0 : 0.5;
+            if (screen_tol > 0 && plan->shell_pair_bounds[ab]*plan->shell_pair_bounds[cd]*density_bound < screen_tol) {
+                skipped += task.shell_count;
+                continue;
+            }
+            auto found = plan->column_blocks.find(index);
+            const std::vector<double>* values = nullptr;
+            if (found != plan->column_blocks.end()) values = &found->second;
+            else {
+                const auto aboff = ab*geom.pair_cap, cdoff = cd*geom.pair_cap;
+                const auto slot = plan->rys_recurrence_cache_slots[task.cache_index];
+                const RysQuadratureCache* quadrature = slot < 0 ? nullptr : &plan->rys_recurrence_caches[slot];
+                const bool identity_sp = a.l <= 1 && b.l <= 1 && c.l <= 1 && d.l <= 1
+                    && sparse_shell_transform_is_identity(plan->sparse_shell_transforms[task.ish])
+                    && sparse_shell_transform_is_identity(plan->sparse_shell_transforms[task.jsh])
+                    && sparse_shell_transform_is_identity(plan->sparse_shell_transforms[task.ksh])
+                    && sparse_shell_transform_is_identity(plan->sparse_shell_transforms[task.lsh]);
+                if (identity_sp) {
+                    if (!compute_sp_shell_quartet_rys_values_specialized(
+                        a.l | (b.l<<1) | (c.l<<2) | (d.l<<3),
+                        plan->origins, plan->weights, plan->nprim, plan->max_prim,
+                        a.start, b.start, c.start, d.start,
+                        geom.p.data()+aboff, geom.px.data()+aboff, geom.py.data()+aboff,
+                        geom.pz.data()+aboff, geom.k.data()+aboff, geom.weight.data()+aboff, geom.n[ab],
+                        geom.p.data()+cdoff, geom.px.data()+cdoff, geom.py.data()+cdoff,
+                        geom.pz.data()+cdoff, geom.k.data()+cdoff, geom.weight.data()+cdoff, geom.n[cd],
+                        quadrature, false, task.ish==task.jsh, task.ksh==task.lsh,
+                        task.ish==task.ksh && task.jsh==task.lsh, nullptr, scratch)) {
+                        throw std::runtime_error("CD shell-block evaluation failed");
+                    }
+                } else {
+                    std::vector<double> cart;
+                    if (!compute_l3_shell_quartet_rys_values(
+                            plan->shells, plan->origins, plan->weights, plan->nprim, plan->max_prim,
+                            a.start, a.stop, b.start, b.stop, c.start, c.stop, d.start, d.stop,
+                            geom.p.data()+aboff, geom.px.data()+aboff, geom.py.data()+aboff,
+                            geom.pz.data()+aboff, geom.k.data()+aboff, geom.weight.data()+aboff, geom.n[ab],
+                            geom.p.data()+cdoff, geom.px.data()+cdoff, geom.py.data()+cdoff,
+                            geom.pz.data()+cdoff, geom.k.data()+cdoff, geom.weight.data()+cdoff, geom.n[cd],
+                            cart, nullptr, quadrature))
+                        throw std::runtime_error("CD spherical shell-block evaluation failed");
+                    const auto& ta = plan->sparse_shell_transforms[task.ish];
+                    const auto& tb = plan->sparse_shell_transforms[task.jsh];
+                    const auto& tc = plan->sparse_shell_transforms[task.ksh];
+                    const auto& td = plan->sparse_shell_transforms[task.lsh];
+                    scratch.assign((2*a.l+1)*(2*b.l+1)*(2*c.l+1)*(2*d.l+1), 0.);
+                    std::size_t out = 0;
+                    for (int i=0; i<2*a.l+1; ++i) for (int j=0; j<2*b.l+1; ++j)
+                        for (int k=0; k<2*c.l+1; ++k) for (int l=0; l<2*d.l+1; ++l, ++out)
+                            for (auto ia=ta.offsets[i]; ia<ta.offsets[i+1]; ++ia)
+                                for (auto ib=tb.offsets[j]; ib<tb.offsets[j+1]; ++ib)
+                                    for (auto ic=tc.offsets[k]; ic<tc.offsets[k+1]; ++ic)
+                                        for (auto id=td.offsets[l]; id<td.offsets[l+1]; ++id) {
+                                            auto index = ((ta.cart_indices[ia]*(b.stop-b.start)+tb.cart_indices[ib])
+                                                *(c.stop-c.start)+tc.cart_indices[ic])*(d.stop-d.start)+td.cart_indices[id];
+                                            scratch[out] += ta.coefficients[ia]*tb.coefficients[ib]
+                                                *tc.coefficients[ic]*td.coefficients[id]*cart[index];
+                                        }
+                }
+                values = &scratch;
+                if (plan->column_block_bytes + scratch.size()*sizeof(double) <= cache_limit) {
+                    plan->column_block_bytes += scratch.size()*sizeof(double);
+                    values = &plan->column_blocks.emplace(index, scratch).first->second;
+                }
+            }
+            const int starts[4] = {static_cast<int>(plan->sph_starts[task.ish]),
+                static_cast<int>(plan->sph_starts[task.jsh]), static_cast<int>(plan->sph_starts[task.ksh]),
+                static_cast<int>(plan->sph_starts[task.lsh])};
+            std::size_t offset = 0;
+            for (int i=0; i<2*a.l+1; ++i) for (int j=0; j<2*b.l+1; ++j)
+                for (int k=0; k<2*c.l+1; ++k) for (int l=0; l<2*d.l+1; ++l, ++offset) {
+                    const int ij = pair_index(starts[0]+i, starts[1]+j);
+                    const int kl = pair_index(starts[2]+k, starts[3]+l);
+                    if (ij == pivot) column[kl] = (*values)[offset];
+                    if (kl == pivot) column[ij] = (*values)[offset];
+                }
+            computed += task.shell_count;
+        }
+    } catch (const std::exception& error) {
+        Py_DECREF(result);
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+    return Py_BuildValue("NLL", result, computed, skipped);
 }
 
 PyObject* direct_j_spherical_plan(PyObject*, PyObject* args) {
@@ -13312,14 +13684,16 @@ PyObject* compute_eri_s8_cartesian(PyObject*, PyObject* args) {
 PyObject* compute_eri_derivative_columns(PyObject*, PyObject* args) {
     PyObject *s, *o, *e, *w, *n, *a, *d, *t, *p;
     PyObject* sensitivity_obj = Py_None;
+    PyObject* pairs_obj = Py_None;
     int workers = 1;
     int early_contraction = 1, derivative_kernel = 0;
     double screen_tol = 0.;
-    int report = 0;
-    if (!PyArg_ParseTuple(args, "OOOOOOOOO|iOpidp", &s, &o, &e, &w, &n, &a, &d, &t, &p, &workers, &sensitivity_obj,
-                         &early_contraction, &derivative_kernel, &screen_tol, &report))
+    int report = 0, order = 1, derivative_pair = -1;
+    if (!PyArg_ParseTuple(args, "OOOOOOOOO|iOpidpiiO", &s, &o, &e, &w, &n, &a, &d, &t, &p, &workers, &sensitivity_obj,
+                         &early_contraction, &derivative_kernel, &screen_tol, &report, &order, &derivative_pair, &pairs_obj))
         return nullptr;
-    if (workers < 1 || derivative_kernel < 0 || derivative_kernel > 1 || !std::isfinite(screen_tol) || screen_tol < 0.
+    if ((order != 1 && order != 2) || (order == 2 && screen_tol != 0.)
+        || workers < 1 || derivative_kernel < 0 || derivative_kernel > 1 || !std::isfinite(screen_tol) || screen_tol < 0.
         || (screen_tol > 0. && (!early_contraction || sensitivity_obj == Py_None))) {
         PyErr_SetString(PyExc_ValueError, "Invalid derivative controls: screening requires early contracted columns.");
         return nullptr;
@@ -13395,18 +13769,48 @@ PyObject* compute_eri_derivative_columns(PyObject*, PyObject* args) {
         PyErr_SetString(PyExc_NotImplementedError, "CD derivative columns require complete Cartesian shells.");
         return nullptr;
     }
-    npy_intp dims[3] = {nmodes, ncolumn, npair};
-    if (contracted) dims[1] = nobservable;
-    PyObject* output = PyArray_ZEROS(contracted ? 2 : 3, dims, NPY_DOUBLE, 0);
+    if (derivative_pair < -1 || (derivative_pair >= 0 &&
+            (order != 2 || derivative_pair >= nmodes*nmodes))) {
+        PyErr_SetString(PyExc_ValueError, "Invalid mixed derivative pair.");
+        return nullptr;
+    }
+    std::vector<npy_intp> selected_derivatives;
+    if (pairs_obj != Py_None) {
+        ArrayRef pairs(pairs_obj,NPY_INT64,NPY_ARRAY_IN_ARRAY);
+        if (!pairs) return nullptr;
+        if (order != 2 || derivative_pair != -1 || PyArray_NDIM(pairs.obj) != 2 || PyArray_DIM(pairs.obj,1) != 2 || PyArray_DIM(pairs.obj,0) == 0) {
+            PyErr_SetString(PyExc_ValueError,"Expected nonempty second derivative pairs of shape (n,2).");
+            return nullptr;
+        }
+        const auto* values = static_cast<const npy_int64*>(PyArray_DATA(pairs.obj));
+        for (npy_intp i=0; i<PyArray_DIM(pairs.obj,0); ++i) {
+            if (values[2*i]<0 || values[2*i]>=nmodes || values[2*i+1]<0 || values[2*i+1]>=nmodes) {
+                PyErr_SetString(PyExc_ValueError,"Derivative pair outside directions.");
+                return nullptr;
+            }
+            selected_derivatives.push_back(values[2*i]*nmodes+values[2*i+1]);
+        }
+    }
+    npy_intp dims[4] = {derivative_pair < 0 ? nmodes : 1,
+                       derivative_pair < 0 ? nmodes : 1, ncolumn, npair};
+    if (!selected_derivatives.empty()) { dims[0]=selected_derivatives.size(); dims[1]=1; }
+    if (order == 1) {
+        dims[1] = contracted ? nobservable : ncolumn;
+        dims[2] = npair;
+    }
+    if (order == 2 && contracted) dims[2] = nobservable;
+    PyObject* output = PyArray_ZEROS(order == 2 ? (contracted ? 3 : 4) : (contracted ? 2 : 3), dims, NPY_DOUBLE, 0);
     if (!output) return nullptr;
     bool ok = false;
     std::atomic<std::size_t> screened{0};
-    std::atomic<std::size_t> plan_hits{0}, plan_misses{0};
-    std::size_t task_count = 0;
+    std::atomic<std::size_t> plan_hits{0}, plan_misses{0}, recurrence_workspace_bytes{0};
+    std::size_t task_count = 0, private_output_bytes = 0;
     Py_BEGIN_ALLOW_THREADS
     try {
         PairColumnProjection projection;
         projection.npair = npair;
+        projection.derivative_pair = derivative_pair;
+        projection.derivative_pairs = selected_derivatives.empty() ? nullptr : &selected_derivatives;
         projection.early_contraction = early_contraction;
         projection.derivative_kernel = derivative_kernel;
         projection.screen_tol = screen_tol;
@@ -13414,6 +13818,8 @@ PyObject* compute_eri_derivative_columns(PyObject*, PyObject* args) {
         projection.task_count = &task_count;
         projection.plan_hits = &plan_hits;
         projection.plan_misses = &plan_misses;
+        projection.private_output_bytes = &private_output_bytes;
+        projection.recurrence_workspace_bytes = &recurrence_workspace_bytes;
         projection.ncolumn = ncolumn;
         projection.nobservable = nobservable;
         projection.sensitivities = contracted
@@ -13449,7 +13855,7 @@ PyObject* compute_eri_derivative_columns(PyObject*, PyObject* args) {
                 }
             }
         ok = ncolumn == 0 || compute_directional_eri_derivatives_blocked(
-            sd, od, ed, wd, nd, ad, dd, natm, nmodes, nao, max_prim, 1,
+            sd, od, ed, wd, nd, ad, dd, natm, nmodes, nao, max_prim, order,
             std::max(1, workers),
             static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(output))),
             blocks, nullptr, nullptr, &projection);
@@ -13461,13 +13867,15 @@ PyObject* compute_eri_derivative_columns(PyObject*, PyObject* args) {
         return nullptr;
     }
     if (report) {
-        PyObject* info = Py_BuildValue("{s:K,s:K,s:d,s:i,s:K,s:K}",
+        PyObject* info = Py_BuildValue("{s:K,s:K,s:d,s:i,s:K,s:K,s:K,s:K}",
             "quartets", static_cast<unsigned long long>(task_count),
             "screened", static_cast<unsigned long long>(screened.load()),
             "error_bound", task_count ? screen_tol*screened.load()/task_count : 0.,
             "workers", workers,
             "plan_hits", static_cast<unsigned long long>(plan_hits.load()),
-            "plan_misses", static_cast<unsigned long long>(plan_misses.load()));
+            "plan_misses", static_cast<unsigned long long>(plan_misses.load()),
+            "private_output_bytes", static_cast<unsigned long long>(private_output_bytes),
+            "recurrence_workspace_bytes", static_cast<unsigned long long>(recurrence_workspace_bytes.load()));
         return Py_BuildValue("NN", output, info);
     }
     return output;
@@ -13660,8 +14068,13 @@ PyObject* compute_directional_eri_derivative_scalar(PyObject*, PyObject* args) {
 
     const npy_intp nao = PyArray_DIM(shells.obj, 0);
     const bool batched_density = PyArray_NDIM(dm_left.obj) == 3;
+    const bool quartet_weights = PyArray_NDIM(dm_left.obj) == 1;
+    const npy_intp npair = nao * (nao + 1) / 2;
     const int density_offset = batched_density ? 1 : 0;
-    if (
+    if (quartet_weights ? (
+        PyArray_DIM(dm_left.obj, 0) != npair * (npair + 1) / 2
+        || PyArray_NDIM(dm_right.obj) != 1 || PyArray_SIZE(dm_right.obj) != 0
+    ) : (
         PyArray_NDIM(dm_left.obj) != 2+density_offset
         || PyArray_NDIM(dm_right.obj) != 2+density_offset
         || PyArray_DIM(dm_left.obj, density_offset) != nao
@@ -13669,7 +14082,7 @@ PyObject* compute_directional_eri_derivative_scalar(PyObject*, PyObject* args) {
         || PyArray_DIM(dm_right.obj, density_offset) != nao
         || PyArray_DIM(dm_right.obj, density_offset+1) != nao
         || (batched_density && (order != 1 || PyArray_DIM(dm_left.obj, 0) != PyArray_DIM(dm_right.obj, 0)))
-    ) {
+    )) {
         PyErr_SetString(
             PyExc_ValueError,
             "Densities require matching (nao,nao) arrays, or (nobservable,nao,nao) for order=1."
@@ -13748,7 +14161,7 @@ PyObject* compute_directional_eri_derivative_scalar(PyObject*, PyObject* args) {
         out,
         shell_blocks,
         batched_density ? nullptr : dm_left_data,
-        batched_density ? nullptr : dm_right_data,
+        (batched_density || quartet_weights) ? nullptr : dm_right_data,
         batched_density ? &projection : nullptr,
         exchange_fraction
     );
@@ -13825,7 +14238,8 @@ PyObject* compute_directional_one_electron_derivatives(PyObject*, PyObject* args
             weights.obj,
             nprim.obj,
             atom_ids.obj,
-            directions.obj
+            directions.obj,
+            true
         )) {
         return nullptr;
     }
@@ -15202,6 +15616,65 @@ void contract_jk_s8_from_density(
 ) {
     const npy_intp npair = nao * (nao + 1) / 2;
     const S8IndexCache& cache = get_s8_index_cache(nao, npair);
+    if (density_is_symmetric(dmat, nao)) {
+        // Keep the streaming symmetry algorithm at every worker count. Each
+        // worker owns two AO-sized accumulators, never a private ERI tensor.
+        const std::size_t n2 = static_cast<std::size_t>(nao) * nao;
+        const int nthread = nao < 16 ? 1 : std::min(std::max(1, workers), static_cast<int>(nao));
+        std::vector<double> symmetric_dm(n2);
+        for (npy_intp i = 0; i < nao; ++i)
+            for (npy_intp j = 0; j < nao; ++j)
+                symmetric_dm[i * nao + j] = 0.5 * (dmat[i * nao + j] + dmat[j * nao + i]);
+        if (nthread == 1) {
+            std::fill(vj, vj + n2, 0.0);
+            std::fill(vk, vk + n2, 0.0);
+            npy_intp offset = 0;
+            for (npy_intp ij = 0; ij < npair; ++ij) {
+                const auto i = cache.pair_i[ij], j = cache.pair_j[ij];
+                for (npy_intp kl = 0; kl <= ij; ++kl, ++offset)
+                    direct_jk_add_unique_permutations_symmetric_density(
+                        vj, vk, symmetric_dm.data(), nao, eri[offset],
+                        i, j, cache.pair_i[kl], cache.pair_j[kl]
+                    );
+            }
+            return;
+        }
+        std::vector<double> partial(static_cast<std::size_t>(nthread) * 2 * n2, 0.0);
+        const double total = static_cast<double>(npair) * (npair + 1) / 2;
+        std::vector<npy_intp> boundaries(nthread + 1);
+        for (int t = 0; t <= nthread; ++t)
+            boundaries[t] = static_cast<npy_intp>((std::sqrt(1 + 8 * total * t / nthread) - 1) / 2);
+        boundaries.back() = npair;
+        auto accumulate = [&](int tid) {
+            double* local_j = partial.data() + static_cast<std::size_t>(tid) * 2 * n2;
+            double* local_k = local_j + n2;
+            npy_intp offset = boundaries[tid] * (boundaries[tid] + 1) / 2;
+            for (npy_intp ij = boundaries[tid]; ij < boundaries[tid + 1]; ++ij) {
+                const auto i = cache.pair_i[ij], j = cache.pair_j[ij];
+                for (npy_intp kl = 0; kl <= ij; ++kl, ++offset)
+                    direct_jk_add_unique_permutations_symmetric_density(
+                        local_j, local_k, symmetric_dm.data(), nao, eri[offset],
+                        i, j, cache.pair_i[kl], cache.pair_j[kl]
+                    );
+            }
+        };
+        try {
+            native_integral_worker_pool().run(nthread, accumulate);
+        } catch (...) {
+            std::fill(partial.begin(), partial.end(), 0.0);
+            boundaries[0] = 0;
+            boundaries[1] = npair;
+            accumulate(0);
+        }
+        std::fill(vj, vj + n2, 0.0);
+        std::fill(vk, vk + n2, 0.0);
+        for (int tid = 0; tid < nthread; ++tid)
+            for (std::size_t i = 0; i < n2; ++i) {
+                vj[i] += partial[static_cast<std::size_t>(tid) * 2 * n2 + i];
+                vk[i] += partial[(static_cast<std::size_t>(tid) * 2 + 1) * n2 + i];
+            }
+        return;
+    }
     std::vector<double> pair_dm(static_cast<std::size_t>(npair), 0.0);
     std::vector<double> j_pairs;
     build_pair_density(dmat, nao, pair_dm.data());
@@ -15851,7 +16324,83 @@ PyObject* ao2mo_s8(PyObject*, PyObject* args) {
     return out_obj;
 }
 
+// Independent RHS columns use the integral pool between shell-growth stages.
+PyObject* whiten_ri_block(PyObject*, PyObject* args) {
+    PyObject *operator_obj, *block_obj, *output_obj, *capsule;
+    int workers, triangular;
+    if (!PyArg_ParseTuple(args, "OOOipO", &operator_obj, &block_obj, &output_obj,
+                          &workers, &triangular, &capsule)) return nullptr;
+    ArrayRef op(operator_obj, NPY_DOUBLE, triangular ? NPY_ARRAY_FARRAY_RO : NPY_ARRAY_CARRAY_RO);
+    ArrayRef block(block_obj, NPY_DOUBLE, NPY_ARRAY_CARRAY_RO);
+    if (!op || !block) return nullptr;
+    if (!PyArray_Check(output_obj)) {
+        PyErr_SetString(PyExc_ValueError, "RI whitening output must be a writable float64 array.");
+        return nullptr;
+    }
+    auto* output = reinterpret_cast<PyArrayObject*>(output_obj);
+    if (PyArray_NDIM(op.obj) != 2 || PyArray_NDIM(block.obj) != 2 ||
+        PyArray_NDIM(output) != 2 || PyArray_TYPE(output) != NPY_DOUBLE ||
+        !PyArray_ISNOTSWAPPED(output) || !PyArray_ISALIGNED(output) || !PyArray_ISWRITEABLE(output)) {
+        PyErr_SetString(PyExc_ValueError, "RI whitening requires aligned real matrices and writable float64 output.");
+        return nullptr;
+    }
+    const auto naux = PyArray_DIM(block.obj, 0), width = PyArray_DIM(block.obj, 1);
+    const auto rank = PyArray_DIM(op.obj, 0);
+    if (workers < 1 || PyArray_DIM(op.obj, 1) != naux || (triangular && rank != naux) ||
+        PyArray_DIM(output, 0) != rank || PyArray_DIM(output, 1) != width ||
+        PyArray_STRIDE(output, 1) != sizeof(double) ||
+        PyArray_STRIDE(output, 0) < width * static_cast<npy_intp>(sizeof(double)) ||
+        PyArray_STRIDE(output, 0) % sizeof(double) ||
+        naux > std::numeric_limits<int>::max() || width > std::numeric_limits<int>::max() ||
+        PyArray_STRIDE(output, 0)/sizeof(double) > std::numeric_limits<int>::max()) {
+        PyErr_SetString(PyExc_ValueError, "Inconsistent RI whitening shapes, strides, or worker budget.");
+        return nullptr;
+    }
+    if (!width || !rank) Py_RETURN_NONE;
+    void* pointer = PyCapsule_GetPointer(capsule, PyCapsule_GetName(capsule));
+    if (!pointer) {
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_RuntimeError, "SciPy whitening BLAS entry point is unavailable.");
+        return nullptr;
+    }
+    using Trsm = void (*)(char*, char*, char*, char*, int*, int*, double*, double*, int*, double*, int*);
+    using Gemm = void (*)(char*, char*, int*, int*, int*, double*, double*, int*, double*, int*, double*, double*, int*);
+    auto* root = static_cast<double*>(PyArray_DATA(op.obj));
+    auto* source = static_cast<double*>(PyArray_DATA(block.obj));
+    auto* dest = static_cast<double*>(PyArray_DATA(output));
+    int stride = static_cast<int>(PyArray_STRIDE(output, 0)/sizeof(double));
+    // Keep small solves serial and give each worker a useful RHS panel.
+    const int count = std::min<int>(workers, std::max<npy_intp>(1, width/512));
+    auto solve = [&](int worker) {
+        const auto start = width*worker/count, stop = width*(worker+1)/count;
+        int m = static_cast<int>(stop-start), n = static_cast<int>(rank), k = static_cast<int>(naux);
+        double one = 1., zero = 0.;
+        if (triangular) {
+            for (int row = 0; row < k; ++row)
+                std::copy(source+row*width+start, source+row*width+stop, dest+row*stride+start);
+            char side = 'R', lower = 'L', transpose = 'T', diagonal = 'N';
+            reinterpret_cast<Trsm>(pointer)(&side, &lower, &transpose, &diagonal,
+                &m, &n, &one, root, &k, dest+start, &stride);
+        } else {
+            char normal = 'N';
+            int leading_source = static_cast<int>(width);
+            reinterpret_cast<Gemm>(pointer)(&normal, &normal, &m, &n, &k, &one,
+                source+start, &leading_source, root, &k, &zero, dest+start, &stride);
+        }
+    };
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        native_integral_worker_pool().run(count, solve);
+    } catch (const std::exception& error) {
+        PyEval_RestoreThread(state);
+        PyErr_SetString(PyExc_RuntimeError, error.what());
+        return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    Py_RETURN_NONE;
+}
+
 PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
+    int workers = 1;
     PyObject* pair_support_obj = nullptr;
     PyObject* sink = nullptr;
     Py_ssize_t block_size = 0;
@@ -15872,7 +16421,7 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
 
     if (!PyArg_ParseTuple(
             args,
-            "OOOOOOOOOOOd|OOOnO",
+            "OOOOOOOOOOOd|OOOnOi",
             &shells_obj,
             &origins_obj,
             &exps_obj,
@@ -15889,10 +16438,12 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
             &aux_transform_obj,
             &sink,
             &block_size,
-            &pair_support_obj
+            &pair_support_obj,
+            &workers
         )) {
         return nullptr;
     }
+    workers = std::max(1, workers);
     if (primary_transform_obj == Py_None) primary_transform_obj = nullptr;
     if (aux_transform_obj == Py_None) aux_transform_obj = nullptr;
     if (sink == Py_None) sink = nullptr;
@@ -16004,9 +16555,11 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
     auto* j3 = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(j3_obj)));
 
     const auto metric_start = std::chrono::steady_clock::now();
+    PyThreadState* metric_thread_state = PyEval_SaveThread();
     if (!auxiliary_metric_shells(aux_shells_data, aux_origins_data, aux_exps_data,
-                                aux_weights_data, aux_nprim_data, naux, aux_max_prim, metric)) {
-    for (npy_intp p = 0; p < naux; ++p) {
+                                aux_weights_data, aux_nprim_data, naux, aux_max_prim, metric, workers)) {
+    auto evaluate_metric = [&](int worker) {
+    for (npy_intp p = worker; p < naux; p += workers) {
         for (npy_intp q = 0; q <= p; ++q) {
             const double value = contracted_two_center_coulomb(
                 aux_shells_data,
@@ -16022,8 +16575,11 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
             metric[q * naux + p] = value;
         }
     }
+    };
+    native_integral_worker_pool().run(workers, evaluate_metric);
     }
 
+    PyEval_RestoreThread(metric_thread_state);
     const double metric_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - metric_start).count();
     if (sink) {
@@ -16069,7 +16625,8 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
             naux_sph,
             sink,
             block_size,
-            pair_support ? static_cast<const npy_bool*>(PyArray_DATA(pair_support.obj)) : nullptr
+            pair_support ? static_cast<const npy_bool*>(PyArray_DATA(pair_support.obj)) : nullptr,
+            workers
         )) {
         if (pair_support) {
             const auto* support = static_cast<const npy_bool*>(PyArray_DATA(pair_support.obj));
@@ -16104,9 +16661,13 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
         return nullptr;
     }
     std::fill(j3, j3 + naux * npair, 0.0);
+    std::vector<long long> computed_by_worker(workers), skipped_by_worker(workers);
+    auto evaluate_pairs = [&](int worker) {
+    auto& computed = computed_by_worker[worker];
+    auto& skipped = skipped_by_worker[worker];
     std::vector<PrimitivePair> pq_primitives;
-    npy_intp pair = 0;
-    for (npy_intp p = 0; p < nao; ++p) {
+    for (npy_intp p = worker; p < nao; p += workers) {
+        npy_intp pair = p*(p+1)/2;
         const double* A = origins_data + 3 * p;
         const std::int64_t* shell_p = shells_data + 3 * p;
         const int l1 = static_cast<int>(shell_p[0]);
@@ -16180,6 +16741,14 @@ PyObject* compute_ri_tensors_packed(PyObject*, PyObject* args) {
         }
     }
 
+    };
+    PyThreadState* pair_thread_state = PyEval_SaveThread();
+    native_integral_worker_pool().run(workers, evaluate_pairs);
+    PyEval_RestoreThread(pair_thread_state);
+    for (int worker = 0; worker < workers; ++worker) {
+        computed += computed_by_worker[worker];
+        skipped += skipped_by_worker[worker];
+    }
     const double triplet_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - triplet_start).count();
     return Py_BuildValue("NNLLidd", metric_obj, j3_obj, computed, skipped, 0,
@@ -16225,6 +16794,7 @@ PyMethodDef methods[] = {
     {"spherical_direct_jk_plan_stats", spherical_direct_jk_plan_stats, METH_VARARGS, "Return cache and angular-rank statistics for a spherical direct-J/K plan."},
     {"spherical_direct_jk_plan_diagonal", spherical_direct_jk_plan_diagonal, METH_VARARGS, "Return the packed exact spherical Coulomb diagonal for a native plan."},
     {"direct_jk_spherical_plan", direct_jk_spherical_plan, METH_VARARGS, "Compute direct spherical J/K from a persistent native basis plan."},
+    {"eri_column_spherical_plan", eri_column_spherical_plan, METH_VARARGS, "Extract an s/p/d/f ERI pivot column using a bounded shell-block cache."},
     {"direct_j_spherical_plan", direct_j_spherical_plan, METH_VARARGS, "Compute direct spherical J only from a persistent native basis plan."},
     {"direct_jk_spherical", direct_jk_spherical, METH_VARARGS, "Compute direct real-spherical J/K from fused shell-quartet blocks."},
     {"compute_eri_s8_cartesian", compute_eri_s8_cartesian, METH_VARARGS, "Compute eight-fold packed Cartesian ERIs through max_l."},
@@ -16236,6 +16806,7 @@ PyMethodDef methods[] = {
     {"compute_one_index_one_electron_derivatives", compute_one_index_one_electron_derivatives, METH_VARARGS, "Compute first or second one-index Cartesian overlap or kinetic derivatives."},
     {"direct_jk_cartesian", direct_jk_cartesian, METH_VARARGS, "Compute direct Cartesian J/K from AO shell data and a density matrix."},
     {"direct_veff_cartesian", direct_veff_cartesian, METH_VARARGS, "Compute direct Cartesian RHF J - 0.5 K from AO shell data and a density matrix."},
+    {"whiten_ri_block", whiten_ri_block, METH_VARARGS, "Whiten independent RI pair columns directly into packed storage."},
     {"compute_ri_tensors_packed", compute_ri_tensors_packed, METH_VARARGS, "Compute packed RI three-center tensors and the auxiliary Coulomb metric."},
     {"contract_ri_derivatives", contract_ri_derivatives, METH_VARARGS, "Contract RI three-center and metric derivatives into atomic gradients."},
     {"ri_derivative_columns", ri_derivative_columns, METH_VARARGS, "Evaluate one Cartesian RI derivative in packed AO pairs."},

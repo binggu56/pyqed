@@ -65,9 +65,9 @@ def test_molecular_qp_and_screening_reuse(monkeypatch, method, factorized):
         return g._casida_eigh(*g.rpa_AB_matrices(obj, method=kwargs.get('method', 'TDH')))
     monkeypatch.setattr(g, 'rpa', full_spin)
     controls = dict(max_cycle=2) if method == 'evgw' else {}
-    old = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=1e-3, freq_int='exact').run(method=method, **controls)
+    old = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=0., freq_int='exact').run(method=method, **controls)
     monkeypatch.setattr(g, 'rpa', original)
-    new = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=1e-3, freq_int='exact').run(method=method, **controls)
+    new = g.GW(mf, ao2mofn=pyscf.ao2mo.general, eta=0., freq_int='exact').run(method=method, **controls)
     np.testing.assert_allclose(new.e_qp, old.e_qp, atol=1e-9, rtol=0)
     assert np.all(new.qp_weights > 0)
     assert np.max(new.qp_residuals) <= 1e-9
