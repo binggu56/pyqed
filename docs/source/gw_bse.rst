@@ -520,6 +520,15 @@ references and screening methods.
 Restricted excitation windows with full screening
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Windowing supports both auxiliary dielectric and spectral screening. Only
+external orbital-pair factors are sliced; the full dielectric factor or all
+screening poles are shared with the reference. Window-specific contraction
+caches start empty, and the dielectric contraction block budget is preserved.
+
+BSE requires a restricted closed-shell reference, with doubly occupied
+orbitals followed by empty orbitals. Unrestricted, singly occupied, fractional,
+or reordered occupations raise an explicit error.
+
 ``BSE(gw, orbital_window=(no, nv))`` and ``TDA(gw, orbital_window=(no, nv))``
 use the highest ``no`` occupied and lowest ``nv`` virtual reference orbitals.
 Run contour GW for these target orbitals; unrequested QP energies may remain

@@ -19,7 +19,6 @@ from scipy.linalg import eigh as eig
 from pyqed.phys import eig_asymm
 import sys
 
-from functools import reduce
 
 from pyqed import is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
@@ -386,7 +385,8 @@ class BSE(object):
             screening = getattr(gw_ref, 'screening', screening)
             eta = getattr(gw_ref, 'eta', eta)
 
-        assert screening in ('TDH', 'TDHF', 'TDDFT')
+        if screening not in ('TDH', 'TDHF', 'TDDFT'):
+            raise ValueError('screening must be TDH, TDHF or TDDFT')
         
         self.mol = mf.mol
         self._scf = mf
@@ -400,7 +400,15 @@ class BSE(object):
         self.nocc = _nelectron(self.mol)//2
         self.full_nocc = self.nocc
         self.orbital_window = orbital_window
-        nmo = np.asarray(mf.mo_coeff).shape[1]
+        coefficients = np.asarray(mf.mo_coeff)
+        occupations = np.asarray(mf.mo_occ)
+        if coefficients.ndim != 2 or occupations.ndim != 1:
+            raise NotImplementedError('BSE requires a restricted closed-shell reference')
+        nmo = coefficients.shape[1]
+        expected_occupations = np.zeros(nmo)
+        expected_occupations[:self.nocc] = 2
+        if not np.array_equal(occupations, expected_occupations):
+            raise NotImplementedError('BSE requires doubly occupied orbitals followed by empty orbitals')
         self.orbital_indices = np.arange(nmo)
         if orbital_window is not None:
             if gw_ref is None:
@@ -423,58 +431,14 @@ class BSE(object):
             self._pair_factors = getattr(gw_ref, '_pair_factors', None)
             self.eri = _spatial_eri_from_gw_reference(gw_ref, ao2mofn)
         else:
-            try:
-                # DFT
-                mf.xc = mf.xc
-                v_mf = mf.get_veff() - mf.get_j()
-
-            except AttributeError:
-                # HF
-                v_mf = -_get_k(mf)
-
-        if gw_ref is not None:
-            pass
-        elif mf.mo_occ[0] == 2:
-            # RHF, convert to spin-orbitals
-#            nso = 2*len(mf.mo_energy)
-#            self.nso = nso
-#            self.e_mf = np.zeros(nso)
-#            self.e_mf[0::2] = self.e_mf[1::2] = mf.mo_energy
-#            b = np.zeros((nso//2,nso))
-#            b[:,0::2] = b[:,1::2] = mf.mo_coeff
-#            self.v_mf = 0.5 * reduce(np.dot, (b.T, v_mf, b))
-#            self.v_mf[::2,1::2] = self.v_mf[1::2,::2] = 0
-#            eri = ao2mofn(mf.mol, (b,b,b,b),
-#                          compact=False).reshape(nso,nso,nso,nso)
-#            eri[::2,1::2] = eri[1::2,::2] = eri[:,:,::2,1::2] = eri[:,:,1::2,::2] = 0
-#            # Integrals are in "chemist's notation"
-#            # eri[i,j,k,l] = (ij|kl) = \int i(1) j(1) 1/r12 k(r2) l(r2)
-#            print("Imag part of ERIs =", np.linalg.norm(eri.imag))
-#            self.eri = eri.real
-
-            nso = len(mf.mo_energy)
-            self.nso = nso
-            self.e_mf = mf.mo_energy
-            b = mf.mo_coeff
-            self.mo_coeff = np.asarray(b, dtype=float)
-            self.v_mf = reduce(np.dot, (b.T, v_mf, b))
-            self._pair_factors = _get_mo_pair_factors(mf, b)
-            self.eri = None if self._pair_factors is not None else _get_mo_eri(mf, b, ao2mofn)
-
-        else:
-            # ROHF or UHF, these are already spin-orbitals
-            print("\n*** Only supporting restricted calculations right now! ***\n")
-            raise NotImplementedError
-            nso = len(mf.mo_energy)
-            self.nso = nso
-            self.e_mf = mf.mo_energy
-            b = mf.mo_coeff
-            self.v_mf = reduce(np.dot, (b.T, v_mf, b))
-            eri = ao2mofn(mf.mol, (b,b,b,b),
-                          compact=False).reshape(nso,nso,nso,nso)
-            self.eri = eri
-
-        print("There are %d spatial orbitals"%(self.nso))
+            v_mf = mf.get_veff() - mf.get_j() if hasattr(mf, 'xc') else -_get_k(mf)
+            self.nso = nmo
+            self.e_mf = np.asarray(mf.mo_energy)
+            self.mo_coeff = np.asarray(coefficients, dtype=float)
+            self.v_mf = self.mo_coeff.T @ v_mf @ self.mo_coeff
+            self._pair_factors = _get_mo_pair_factors(mf, self.mo_coeff)
+            self.eri = (None if self._pair_factors is not None
+                        else _get_mo_eri(mf, self.mo_coeff, ao2mofn))
 
         self.screening = screening
         self.eta = eta
@@ -522,10 +486,9 @@ class BSE(object):
             first, stop = self.orbital_indices[0], self.orbital_indices[-1]+1
             self._pair_factors = self._pair_factors[:, first:stop, first:stop]
             if self._static_screening is not None:
-                self._static_screening = StaticScreening(
-                    self._pair_factors, self._static_screening.cholesky, self.max_memory)
+                self._static_screening = self._static_screening.with_factors(self._pair_factors)
             else:
-                self._M = FactorizedCouplings(self._pair_factors, self._M.projection, self._M.poles)
+                self._M = self._M.with_factors(self._pair_factors)
             self.mo_coeff = self.mo_coeff[:, first:stop]
             self.e_mf = self.e_mf[first:stop]
             self.v_mf = self.v_mf[first:stop, first:stop]

@@ -32,3 +32,17 @@ def test_gw_bse_derivatives_chain(mf):
     assert np.isfinite(gradient).all() and np.isfinite(hessian).all()
     np.testing.assert_array_equal(gw.e_qp, qp)
     assert bse._adjoint_workspace is None and bse._first_response_cache is None
+
+
+@pytest.mark.parametrize('occupations', [[1., 1.], [1.5, .5], [0., 2.], [[1., 0.], [1., 0.]]])
+def test_bse_rejects_unsupported_occupations(mf, occupations):
+    import copy
+    reference = copy.copy(mf)
+    reference.mo_occ = np.asarray(occupations)
+    with pytest.raises(NotImplementedError, match='requires'):
+        BSE(reference)
+
+
+def test_bse_rejects_unknown_screening(mf):
+    with pytest.raises(ValueError, match='screening'):
+        BSE(mf, screening='unknown')

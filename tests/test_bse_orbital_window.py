@@ -6,8 +6,8 @@ import numpy as np
 import pytest
 
 
-@pytest.fixture(scope="module")
-def reference():
+@pytest.fixture(scope="module", params=["spectral", "dielectric"])
+def reference(request):
     pyscf = pytest.importorskip("pyscf")
     from pyscf import df
     from pyqed.qchem.basis import PackedRIFactors
@@ -19,7 +19,20 @@ def reference():
     mf.kernel()
     fitted = df.DF(mol).build()
     mol.eri_factors = PackedRIFactors(np.concatenate(list(fitted.loop())), mol.nao)
-    return GW(mf, eta=1e-6, freq_int="contour").run(nw=64)
+    gw = GW(mf, eta=1e-6, freq_int="contour").run(nw=64)
+    if request.param == "spectral":
+        from pyqed.gw.gw import _charge_rpa, _charge_spatial_couplings
+        poles, vectors = _charge_rpa(gw)
+        gw._contour.static_screening = _charge_spatial_couplings(gw, poles, vectors)
+    else:
+        from scipy.linalg import cho_factor
+        from pyqed.gw.contour import ContourDeformation
+        from pyqed.gw.screening import StaticScreening
+        contour = ContourDeformation(gw, mf.mo_energy, [0], nw=8, prepare=False)
+        chol = cho_factor(contour.dielectric(0., imaginary=True), lower=True)
+        contour.static_screening = StaticScreening(gw._pair_factors, chol, gw.max_memory)
+        gw._contour = contour
+    return gw
 
 
 @pytest.mark.parametrize("window", [(2, 1), (3, 2), (5, 2)])
@@ -32,7 +45,17 @@ def test_window_operator_equals_full_kernel_submatrix(reference, window, monkeyp
                 for i in range(full.nocc-no, full.nocc) for v in range(nv)]
     expected_a, expected_b = [m[np.ix_(selected, selected)] for m in [a, bb]]
     restricted = b.BSE(reference, orbital_window=window, screening_energies='hf')
-    assert restricted._static_screening.cholesky is reference._contour.static_screening.cholesky
+    from pyqed.gw.screening import StaticScreening
+    original = reference._contour.static_screening
+    screened = restricted._static_screening
+    assert type(screened) is type(original)
+    if isinstance(original, StaticScreening):
+        assert screened.cholesky is original.cholesky
+        assert screened.block == original.block
+    else:
+        assert screened.projection is original.projection
+        np.testing.assert_array_equal(screened.poles, original.poles)
+    assert original.factors.shape[1:] == (7, 7)
     assert reference._contour.pairs.shape[1] == 10  # All five occupied x two virtual transitions.
     monkeypatch.setattr(b, "rpa", lambda *a, **k: pytest.fail("window screening rebuild"))
     actual_a, actual_b = b.bse_AB_matrices(restricted)

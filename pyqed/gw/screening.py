@@ -21,6 +21,12 @@ class StaticScreening:
         self.block = max(1, int(max(1e-6, max_memory) * 1e6 / (64 * len(factors))))
         self._occupied = self._ov = None
 
+    def with_factors(self, factors):
+        """Change external orbital pairs while retaining the full dielectric response."""
+        screened = StaticScreening(factors, self.cholesky)
+        screened.block = self.block
+        return screened
+
     def _transform(self, left, right):
         pairs = self.factors[:, left, right]
         out = np.empty(pairs.shape, dtype=self.dtype)
@@ -61,6 +67,10 @@ class FactorizedCouplings:
         self.shape = (*factors.shape[1:], len(poles))
         self.dtype = np.dtype(np.result_type(factors, projection))
         self._occupied = self._ov = self._static_metric = None
+
+    def with_factors(self, factors):
+        """Change external orbital pairs while retaining every screening pole."""
+        return FactorizedCouplings(factors, self.projection, self.poles)
 
     def __getitem__(self, key):
         key = key if isinstance(key, tuple) else (key,)
