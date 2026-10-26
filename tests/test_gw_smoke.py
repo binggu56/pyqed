@@ -193,7 +193,7 @@ def test_bse_and_tda_as_scanner_return_pes_arrays():
 
 def test_scgw_imaginary_axis_prototype_h2_shapes_are_finite():
     _use_source_tree_pyqed()
-    from pyqed.gw.scgw import SCGW
+    from pyqed.gw.experimental.scgw import SCGW
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
@@ -231,7 +231,7 @@ def test_scgw_imaginary_axis_prototype_h2_shapes_are_finite():
 
 def test_scgw0_uses_fixed_screened_interaction():
     _use_source_tree_pyqed()
-    from pyqed.gw.scgw import SCGW
+    from pyqed.gw.experimental.scgw import SCGW
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
@@ -295,7 +295,7 @@ def test_gw_driver_exposes_scgw_and_scgw0():
 
 def test_scgw_uses_factorized_backend_when_available():
     _use_source_tree_pyqed()
-    from pyqed.gw.scgw import SCGW
+    from pyqed.gw.experimental.scgw import SCGW
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
@@ -321,7 +321,7 @@ def test_scgw_uses_factorized_backend_when_available():
 
 def test_scgw_gm_and_lw_energy_components_are_consistent():
     _use_source_tree_pyqed()
-    from pyqed.gw.scgw import SCGW
+    from pyqed.gw.experimental.scgw import SCGW
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
@@ -351,7 +351,7 @@ def test_scgw_gm_and_lw_energy_components_are_consistent():
 
 def test_scgw_frequency_convergence_scan_reports_grid_deltas():
     _use_source_tree_pyqed()
-    from pyqed.gw.scgw import frequency_convergence
+    from pyqed.gw.experimental.scgw import frequency_convergence
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
@@ -392,7 +392,7 @@ def test_scgw_frequency_convergence_scan_reports_grid_deltas():
 
 def test_scgw_matsubara_density_matches_static_limit():
     _use_source_tree_pyqed()
-    from pyqed.gw.scgw import SCGW
+    from pyqed.gw.experimental.scgw import SCGW
     from pyqed.qchem import Molecule
     from pyqed.qchem.hf.rhf import RHF
 
@@ -798,7 +798,7 @@ def test_pyscf_style_gw_wrapper_h2():
     from pyscf import dft, gto, tddft
 
     _use_source_tree_pyqed()
-    from pyqed.gw.pyscf_gw import GW
+    from pyqed.gw.reference.pyscf_gw import GW
 
     mol = gto.M(
         atom="H 0 0 0; H 0 0 0.74",

@@ -41,6 +41,23 @@ mass- and frequency-weighted normal modes when derivatives with respect to
 those coordinates are wanted. The combined derivative call automatically
 releases its response workspace.
 
+Package organization
+--------------------
+
+``gw.py`` owns quasiparticle calculations; ``bse.py`` owns excitations and
+surface derivatives. ``rpa.py`` contains the shared dense RPA/Casida algebra,
+with explicit spin-orbital and spatial-singlet matrix adapters. Their Coulomb
+multiplicities and exchange conventions remain distinct. Optimized GW charge
+screening and BSE operator actions retain their existing numerical paths.
+
+The opt-in SCGW and shifted-solve prototypes live in
+``pyqed.gw.experimental``. Independent PySCF comparison code lives in
+``pyqed.gw.reference``. Historical demonstrations and incomplete translations
+are preserved as text under ``docs/reference/gw_legacy`` and
+``docs/reference/dmft_unfinished.txt``; they are not importable solvers.
+Production derivative helpers, including ``spectral_response``, remain in
+``pyqed.gw`` because they are used by the analytic gradient/Hessian driver.
+
 Default settings and PySCF comparison
 -------------------------------------
 
@@ -913,7 +930,7 @@ contexts:
 Experimental scGW Prototype
 ---------------------------
 
-``pyqed.gw.scgw.SCGW`` is a small finite-basis imaginary-axis prototype for
+``pyqed.gw.experimental.scgw.SCGW`` is a small finite-basis imaginary-axis prototype for
 self-consistent GW.  It stores full matrix Green's functions, polarizabilities,
 screened interactions, and correlation self-energies on a symmetric imaginary
 frequency grid.  The default grid is a tangent-mapped Gauss-Legendre
@@ -929,7 +946,7 @@ Green's-function density matrix.
 
 .. code-block:: python
 
-   from pyqed.gw.scgw import SCGW
+   from pyqed.gw.experimental.scgw import SCGW
 
    scgw0 = SCGW(mf, nfreq=17, wmax=20.0).scgw0(
        max_cycle=20,
@@ -977,7 +994,7 @@ sensitive to ``wmax``.
 
 .. code-block:: python
 
-   from pyqed.gw.scgw import frequency_convergence
+   from pyqed.gw.experimental.scgw import frequency_convergence
 
    rows = frequency_convergence(
        mf,
@@ -4193,7 +4210,7 @@ SPECTRAL_DIR``. Source snapshots and the validation script are in
 Matrix-free shifted-solve GW first-response prototype
 ----------------------------------------------------
 
-``pyqed.gw.shifted_response.ShiftedGW(energy, factors, nocc)`` evaluates the
+``pyqed.gw.experimental.shifted_response.ShiftedGW(energy, factors, nocc)`` evaluates the
 correlation self-energy and a supplied directional first derivative from
 real spatial MO energies and CD/RI MO factors. It reuses
 ``lanczos_response.casida_action`` and the SciPy restarted GMRES backend
@@ -4260,7 +4277,7 @@ quadrature and iterative solves introduce errors which must be converged.
 
 Example, with already prepared spatial MO factors and their derivative::
 
-   from pyqed.gw.shifted_response import ShiftedGW
+   from pyqed.gw.experimental.shifted_response import ShiftedGW
    response = ShiftedGW(energy, factors, nocc, solve_tol=1e-12,
                         tolerance=1e-10)
    sigma, dsigma = response.evaluate(p, omega,
@@ -4678,8 +4695,8 @@ collected reports and reproducible PNG/PDF figures are under
 ``/private/tmp/curvature-regression/final``. The shared cluster source and
 environment were not modified.
 
-Persistent adjoint workspace
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Scoped derivative workspace
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For a complete calculation with automatic workspace cleanup, use::
 
@@ -4697,8 +4714,17 @@ with the same cleanup policy. Method options follow ``gradient``/``hessian``;
 The underlying derivative formulation and restrictions are unchanged.
 
 
-``BSE.gradient()`` retains a geometry-local workspace that a subsequent
-``BSE.hessian()`` can reuse, including for a reordered subset of the supplied
+Standalone ``gradient()``, ``hessian()``, and ``derivatives()`` calls all
+release their derivative caches on success or failure. To reuse intermediates
+between calls, request an explicit scope::
+
+    with bse.derivative_workspace():
+        gradient = bse.gradient(state_ids=[0], modes=modes)
+        hessian = bse.hessian(state_ids=[0], modes=modes, columns=[0, 4, 9])
+
+The outermost scope releases the workspace automatically, including when a
+calculation raises. Nested scopes are supported. Copies do not inherit an
+active scope from their source object. Reuse supports reordered subsets of
 normal modes. It stores reference spectral intermediates, the RHF orbital
 solver, state-specific Z-vectors, and raw first integral/factor derivatives.
 The gradient does not solve directional CPHF equations or evaluate second
@@ -4712,9 +4738,9 @@ settings. Reference contents, requested states, response tolerances and
 contraction block settings enter the cache fingerprint. Large arrays are
 stored in a temporary disk workspace. Only one reference/configuration is
 retained per BSE object, and accumulating more than a Cartesian basis-sized
-set of different directions replaces that workspace. Call
-``bse.clear_derivative_cache()`` to release its files explicitly. A failed
-adjoint calculation also discards its workspace.
+set of different directions replaces that workspace. The scope boundary
+releases its files; ``clear_derivative_cache()`` can also discard intermediates
+early inside a scope. A failed derivative calculation discards its workspace.
 
 Derivative validation must follow the same quasiparticle branches at displaced
 geometries. Independently selecting the largest-weight Dyson root at every

@@ -10,7 +10,7 @@ from pathlib import Path
 from time import perf_counter,process_time
 import numpy as np
 import psutil
-from pyqed.gw.shifted_response import ShiftedGW
+from pyqed.gw.experimental.shifted_response import ShiftedGW
 from benchmarks.benchmark_gw_shifted_response import dense_reference
 
 

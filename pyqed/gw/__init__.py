@@ -1,5 +1,8 @@
 """Molecular and periodic GW/BSE helpers.
 
+Production drivers expose GW, BSE and TDA. Opt-in prototypes live in
+``experimental``; independent comparison implementations live in ``reference``.
+
 The canonical periodic Gaussian GW/BSE API lives in :mod:`pyqed.pbc.gw`.
 The ``pyqed.gw.pbc`` namespace is kept as a compatibility alias.
 """

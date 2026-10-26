@@ -1,6 +1,6 @@
 import numpy as np
 import pytest
-from pyqed.gw.shifted_response import ShiftedGW
+from pyqed.gw.experimental.shifted_response import ShiftedGW
 from test_gw_contour import model
 from benchmarks.benchmark_gw_shifted_response import dense_reference
 

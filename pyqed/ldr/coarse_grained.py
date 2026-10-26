@@ -1780,6 +1780,7 @@ class CGLDR:
         to_geometry=None,
         expansion_modes=None,
         electronic_cache=None,
+        derivative_frame="fixed",
         nuclear_kinetic_mpo=None,
         kinetic_exponential_options=None,
         backend="numpy",
@@ -1816,6 +1817,10 @@ class CGLDR:
             than already expressed in the expanded-coordinate basis.
         electronic_cache : path-like, optional
             Portable NPZ cache used by automatic electronic-data preparation.
+        derivative_frame : {"fixed", "relaxed"}, optional
+            Electronic derivative convention. ``relaxed`` explicitly selects
+            the effective moving-frame GW/BSE model; its transverse kinetic
+            connections are neglected by the Q-independent-link expansion.
         nuclear_kinetic_mpo : MPO, optional
             Nuclear kinetic-energy operator over the reordered DVR coordinates.
             When supplied, CGLDR uses the LDR overlap-projected kinetic
@@ -1909,6 +1914,9 @@ class CGLDR:
         self.tt_options = tt_options
         self.backend = backend
         self.solver = solver
+        if derivative_frame not in ("fixed", "relaxed"):
+            raise ValueError("derivative_frame must be 'fixed' or 'relaxed'")
+        self.derivative_frame = derivative_frame
         self.to_geometry = to_geometry
         self.expansion_modes = (
             None
@@ -2053,7 +2061,12 @@ class CGLDR:
         return self
 
     def prepare_electronic_data(self, *, force=False):
-        """Generate or load every electronic quantity required by CGLDR."""
+        """Prepare analytic local derivatives in the selected electronic frame.
+
+        Default fixed-state data exclude orbital response. Explicit relaxed
+        data use a moving effective electronic frame with Q-independent links.
+        Cache provenance must match the requested convention.
+        """
         if self.H_matrices is not None and not force:
             return self
 
@@ -2062,7 +2075,14 @@ class CGLDR:
             if self.electronic_cache.exists() and not force:
                 source_path = self.electronic_cache
         if source_path is not None:
-            return self.load_electronic_data(source_path)
+            data = CGLDRElectronicData.from_npz(source_path)
+            if self.nexpanded and data.metadata.get("derivative_frame") != self.derivative_frame:
+                raise ValueError(
+                    f"Automatic CGLDR caches require derivative_frame='{self.derivative_frame}'. "
+                    "Regenerate with prepare_electronic_data(force=True); "
+                    "old or unspecified derivative frames cannot be reused automatically."
+                )
+            return self.set_electronic_data(data)
 
         if self.solver is None:
             raise RuntimeError(
@@ -2178,6 +2198,7 @@ class CGLDR:
             "expansion_center": list(self.partition.center),
             "state_ids": list(self.state_ids),
             "derivative_source": "analytic_vibronic_couplings",
+            "derivative_frame": getattr(self, "derivative_frame", "fixed"),
         }
 
     def _electronic_derivatives(self, point):
@@ -2189,7 +2210,8 @@ class CGLDR:
                 "supported by automatic CGLDR preparation."
             )
 
-        kwargs = {"state_ids": self.state_ids}
+        kwargs = {"state_ids": self.state_ids,
+                  "frame": getattr(self, "derivative_frame", "fixed")}
         if self.expansion_modes is not None:
             kwargs["modes"] = self.expansion_modes
         first, second = method(**kwargs)

@@ -2,7 +2,7 @@
 import numpy as np
 from scipy.sparse.linalg import LinearOperator, gmres
 from scipy.special import roots_legendre
-from .lanczos_response import casida_action
+from ..lanczos_response import casida_action
 
 
 class ShiftedGW:

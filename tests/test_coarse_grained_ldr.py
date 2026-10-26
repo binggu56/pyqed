@@ -33,7 +33,8 @@ class _ToyElectronicPoint:
     def __array__(self, dtype=None, copy=None):
         return np.array(self.vectors, dtype=dtype, copy=copy)
 
-    def vibronic_couplings(self, state_ids=None, modes=None):
+    def vibronic_couplings(self, state_ids=None, modes=None, frame=None):
+        assert frame == "fixed"
         first_diabatic = np.array(
             [[0.2 * self.q, 0.2], [0.2, -0.2 * self.q]]
         )

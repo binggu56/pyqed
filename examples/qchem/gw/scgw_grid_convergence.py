@@ -1,6 +1,6 @@
 """Frequency-grid convergence check for the imaginary-axis scGW prototype."""
 
-from pyqed.gw.scgw import frequency_convergence
+from pyqed.gw.experimental.scgw import frequency_convergence
 from pyqed.qchem import Molecule
 from pyqed.qchem.hf.rhf import RHF
 

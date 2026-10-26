@@ -218,26 +218,27 @@ def test_gradient_never_requests_second_response(monkeypatch, eri):
     from pyqed.qchem.hf.hessian import RHFHessian
     from pyqed.qchem.hf.factor_curvature import FactorCurvature
     ref = _point(np.array([[0.,0.,-.7],[0.,0.,.7]]), BSE, eri=eri)
-    mode = np.array([[[0.,0.,-.5],[0.,0.,.5]]])
-    ref.hessian(modes=mode, method='polarization')
-    expected = ref.energy_gradient.copy()
-    ref._first_response_cache = None
-    def forbidden(*args, **kwargs):
-        raise AssertionError('Gradient requested second-order response')
-    monkeypatch.setattr(RHFHessian, '_second_order_mo_response_data', forbidden)
-    for name in ('directional_one_electron_derivatives', 'directional_eri_derivatives'):
-        original = getattr(bd, name)
-        def guarded(*args, _original=original, **kwargs):
-            assert kwargs.get('order', 1) == 1
-            return _original(*args, **kwargs)
-        monkeypatch.setattr(bd, name, guarded)
-    original = FactorCurvature.integrals
-    def factors(self, directions):
-        assert len(directions) == 1
-        return original(self, directions)
-    monkeypatch.setattr(FactorCurvature, 'integrals', factors)
-    np.testing.assert_allclose(ref.gradient(method="forward", modes=mode), expected, atol=1e-10)
-    assert ref.energy_hessian is None
+    with ref.derivative_workspace():
+        mode = np.array([[[0.,0.,-.5],[0.,0.,.5]]])
+        ref.hessian(modes=mode, method='polarization')
+        expected = ref.energy_gradient.copy()
+        ref._first_response_cache = None
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Gradient requested second-order response')
+        monkeypatch.setattr(RHFHessian, '_second_order_mo_response_data', forbidden)
+        for name in ('directional_one_electron_derivatives', 'directional_eri_derivatives'):
+            original = getattr(bd, name)
+            def guarded(*args, _original=original, **kwargs):
+                assert kwargs.get('order', 1) == 1
+                return _original(*args, **kwargs)
+            monkeypatch.setattr(bd, name, guarded)
+        original = FactorCurvature.integrals
+        def factors(self, directions):
+            assert len(directions) == 1
+            return original(self, directions)
+        monkeypatch.setattr(FactorCurvature, 'integrals', factors)
+        np.testing.assert_allclose(ref.gradient(method="forward", modes=mode), expected, atol=1e-10)
+        assert ref.energy_hessian is None
 
 
 @pytest.mark.parametrize('eri', ['dense', 'cd', 'ri'])
@@ -248,38 +249,39 @@ def test_hessian_reuses_first_response(monkeypatch, eri):
     coords = np.array([[0.,0.,-.7],[0.,0.,.7]])
     mode = np.array([[[0.,0.,-.5],[0.,0.,.5]]])
     ref = _point(coords, BSE, eri=eri)
-    expected = ref.hessian(modes=mode, method='polarization').copy()
-    ref._first_response_cache = None
-    grad = ref.gradient(method="forward", modes=mode).copy()
-    cache = ref._first_response_cache
-    with monkeypatch.context() as patch:
-        def forbidden(*args, **kwargs):
-            raise AssertionError('Repeated first-order orbital response')
-        patch.setattr(RHFHessian, '_first_order_mo_response_data', forbidden)
-        for name in ('directional_one_electron_derivatives', 'directional_eri_derivatives'):
-            original = getattr(bd, name)
-            def guarded(*args, _original=original, **kwargs):
-                assert kwargs['order'] == 2
-                return _original(*args, **kwargs)
-            patch.setattr(bd, name, guarded)
-        original = FactorCurvature.integrals
-        def factors(self, directions):
-            assert len(directions) == 2
-            return original(self, directions)
-        patch.setattr(FactorCurvature, 'integrals', factors)
-        np.testing.assert_allclose(ref.hessian(modes=mode, method='polarization'), expected, atol=1e-10)
-        np.testing.assert_allclose(ref.energy_gradient, grad, atol=1e-10)
+    with ref.derivative_workspace():
+        expected = ref.hessian(modes=mode, method='polarization').copy()
+        ref._first_response_cache = None
+        grad = ref.gradient(method="forward", modes=mode).copy()
+        cache = ref._first_response_cache
+        with monkeypatch.context() as patch:
+            def forbidden(*args, **kwargs):
+                raise AssertionError('Repeated first-order orbital response')
+            patch.setattr(RHFHessian, '_first_order_mo_response_data', forbidden)
+            for name in ('directional_one_electron_derivatives', 'directional_eri_derivatives'):
+                original = getattr(bd, name)
+                def guarded(*args, _original=original, **kwargs):
+                    assert kwargs['order'] == 2
+                    return _original(*args, **kwargs)
+                patch.setattr(bd, name, guarded)
+            original = FactorCurvature.integrals
+            def factors(self, directions):
+                assert len(directions) == 2
+                return original(self, directions)
+            patch.setattr(FactorCurvature, 'integrals', factors)
+            np.testing.assert_allclose(ref.hessian(modes=mode, method='polarization'), expected, atol=1e-10)
+            np.testing.assert_allclose(ref.energy_gradient, grad, atol=1e-10)
+            assert ref._first_response_cache is cache
+        mode *= 1.1
+        ref.gradient(method="forward", modes=mode)
+        assert ref._first_response_cache is not cache
+        cache = ref._first_response_cache
+        ref.gradient(method="forward", modes=mode)
         assert ref._first_response_cache is cache
-    mode *= 1.1
-    ref.gradient(method="forward", modes=mode)
-    assert ref._first_response_cache is not cache
-    cache = ref._first_response_cache
-    ref.gradient(method="forward", modes=mode)
-    assert ref._first_response_cache is cache
-    ref._scf.mo_coeff[:, 0] *= -1
-    ref.mo_coeff = ref._scf.mo_coeff.copy()
-    ref.gradient(method="forward", modes=mode)
-    assert ref._first_response_cache is not cache
+        ref._scf.mo_coeff[:, 0] *= -1
+        ref.mo_coeff = ref._scf.mo_coeff.copy()
+        ref.gradient(method="forward", modes=mode)
+        assert ref._first_response_cache is not cache
 
 
 @pytest.mark.parametrize('cls', [TDA, BSE])
@@ -291,44 +293,45 @@ def test_gw_bse_first_response_reuse(monkeypatch, cls, screening):
     modes[0,1,2] = 1
     modes[1,2,0] = 1
     ref = _point(coords, cls, screening, charge=1)
-    expected = ref.hessian(modes=modes, method='polarization').copy()
-    ref._first_response_cache = None
-    gradient = ref.gradient(method="forward", modes=modes).copy()
-    cache = ref._first_response_cache
-    paths = {}
-    def index(node, path=()):
-        paths[id(node)] = path
-        for key, value in node.items():
-            if isinstance(value, dict):
-                index(value, path+(key,))
-    index(cache)
-    original = response._cached_first
-    computed = []
-    def guarded(name, compute):
-        context = response._response_context.get()
-        assert context is not None
-        node, counts = context
-        key = (name, counts.get(name, 0))
-        def checked():
-            # Only Hessian-only mixed nuclear/frequency response may be new.
-            index(cache)
-            path = paths[id(node)]+(key,)
-            assert any(isinstance(k, tuple) and k[0] == '_self_energy_region' for k in path), path
-            assert name in ('resolvent', 'contract:rLp,rLq->pq', 'mul'), path
-            assert key not in node or 'data' not in node[key], path
-            computed.append(path)
-            return compute()
-        return original(name, checked)
-    monkeypatch.setattr(response, '_cached_first', guarded)
-    monkeypatch.setattr(subspace_response, '_cached_first', guarded)
-    np.testing.assert_allclose(ref.hessian(modes=modes, method='polarization'), expected, atol=1e-10)
-    np.testing.assert_allclose(ref.energy_gradient, gradient, atol=1e-10)
-    assert computed
-    computed.clear()
-    np.testing.assert_allclose(ref.gradient(method="forward", modes=modes), gradient, atol=1e-10)
-    np.testing.assert_allclose(ref.hessian(modes=modes, method='polarization'), expected, atol=1e-10)
-    assert not computed
-    assert response._response_context.get() is None
+    with ref.derivative_workspace():
+        expected = ref.hessian(modes=modes, method='polarization').copy()
+        ref._first_response_cache = None
+        gradient = ref.gradient(method="forward", modes=modes).copy()
+        cache = ref._first_response_cache
+        paths = {}
+        def index(node, path=()):
+            paths[id(node)] = path
+            for key, value in node.items():
+                if isinstance(value, dict):
+                    index(value, path+(key,))
+        index(cache)
+        original = response._cached_first
+        computed = []
+        def guarded(name, compute):
+            context = response._response_context.get()
+            assert context is not None
+            node, counts = context
+            key = (name, counts.get(name, 0))
+            def checked():
+                # Only Hessian-only mixed nuclear/frequency response may be new.
+                index(cache)
+                path = paths[id(node)]+(key,)
+                assert any(isinstance(k, tuple) and k[0] == '_self_energy_region' for k in path), path
+                assert name in ('resolvent', 'contract:rLp,rLq->pq', 'mul'), path
+                assert key not in node or 'data' not in node[key], path
+                computed.append(path)
+                return compute()
+            return original(name, checked)
+        monkeypatch.setattr(response, '_cached_first', guarded)
+        monkeypatch.setattr(subspace_response, '_cached_first', guarded)
+        np.testing.assert_allclose(ref.hessian(modes=modes, method='polarization'), expected, atol=1e-10)
+        np.testing.assert_allclose(ref.energy_gradient, gradient, atol=1e-10)
+        assert computed
+        computed.clear()
+        np.testing.assert_allclose(ref.gradient(method="forward", modes=modes), gradient, atol=1e-10)
+        np.testing.assert_allclose(ref.hessian(modes=modes, method='polarization'), expected, atol=1e-10)
+        assert not computed
+        assert response._response_context.get() is None
 
 
 def test_response_cache_key_includes_gw_bse_settings():
@@ -372,43 +375,45 @@ def test_disk_directional_response_matches_full(monkeypatch, cls, screening, eri
     modes[0,1,2] = 1
     modes[1,2,0] = 1
     ref = _point(coords, cls, screening, eri=eri, charge=1)
-    ids = np.arange(2)
-    groups = orbital_groups(ref._scf.mo_energy, ref.nocc, 1e-7)
-    expected = ref.hessian(modes=modes, method='polarization').copy()
-    expected_f, expected_g = ref.F.copy(), ref.G.copy()
-    ref._first_response_cache = None
-    directional_derivatives(ref, ids, modes, 'auto', groups, 4000, 1e-7, 1)
-    grad = ref.energy_gradient.copy()
-    def forbidden(*args, **kwargs):
-        raise AssertionError('Directional Hessian repeated first-order CPHF')
-    monkeypatch.setattr(RHFHessian, '_first_order_mo_response_data', forbidden)
-    # Public dispatch must recognize the existing directional cache.
-    result = ref.hessian(modes=modes, method=method)
-    np.testing.assert_allclose(result, expected, atol=1e-10)
-    np.testing.assert_allclose(ref.energy_gradient, grad, atol=1e-10)
-    np.testing.assert_allclose(ref.F, expected_f, atol=1e-10)
-    np.testing.assert_allclose(ref.G, expected_g, atol=1e-10)
-    assert 'directions' in ref._first_response_cache
+    with ref.derivative_workspace():
+        ids = np.arange(2)
+        groups = orbital_groups(ref._scf.mo_energy, ref.nocc, 1e-7)
+        expected = ref.hessian(modes=modes, method='polarization').copy()
+        expected_f, expected_g = ref.F.copy(), ref.G.copy()
+        ref._first_response_cache = None
+        directional_derivatives(ref, ids, modes, 'auto', groups, 4000, 1e-7, 1)
+        grad = ref.energy_gradient.copy()
+        def forbidden(*args, **kwargs):
+            raise AssertionError('Directional Hessian repeated first-order CPHF')
+        monkeypatch.setattr(RHFHessian, '_first_order_mo_response_data', forbidden)
+        # Public dispatch must recognize the existing directional cache.
+        result = ref.hessian(modes=modes, method=method)
+        np.testing.assert_allclose(result, expected, atol=1e-10)
+        np.testing.assert_allclose(ref.energy_gradient, grad, atol=1e-10)
+        np.testing.assert_allclose(ref.F, expected_f, atol=1e-10)
+        np.testing.assert_allclose(ref.G, expected_g, atol=1e-10)
+        assert 'directions' in ref._first_response_cache
 
 
 def test_response_memory_budget_dispatches_one_direction(monkeypatch):
     from pyqed.gw import response
     ref = _point(np.array([[0.,0.,0.],[0.,0.,1.5],[1.8,0.,.3]]), BSE, charge=1)
-    modes = np.zeros((2,3,3))
-    modes[0,1,2], modes[1,2,0] = 1, 1
-    expected = ref.hessian(modes=modes, method='polarization').copy()
-    ref._first_response_cache = None
-    original = response._reference_response
-    def guarded(bse, directions, *args, **kwargs):
-        assert len(directions) == (2 if response._mixed_response.get() else 1)
-        return original(bse, directions, *args, **kwargs)
-    monkeypatch.setattr(response, '_reference_response', guarded)
-    ref.gradient(method="forward", modes=modes, max_memory=.015)
-    store = ref._first_response_cache['store']
-    np.testing.assert_allclose(ref.hessian(modes=modes, max_memory=.015, method='mixed'), expected, atol=1e-10)
-    assert ref._first_response_cache['store'] is store
-    ref.gradient(method="forward", modes=1.1*modes, max_memory=.015)
-    assert ref._first_response_cache['store'] is not store
+    with ref.derivative_workspace():
+        modes = np.zeros((2,3,3))
+        modes[0,1,2], modes[1,2,0] = 1, 1
+        expected = ref.hessian(modes=modes, method='polarization').copy()
+        ref._first_response_cache = None
+        original = response._reference_response
+        def guarded(bse, directions, *args, **kwargs):
+            assert len(directions) == (2 if response._mixed_response.get() else 1)
+            return original(bse, directions, *args, **kwargs)
+        monkeypatch.setattr(response, '_reference_response', guarded)
+        ref.gradient(method="forward", modes=modes, max_memory=.015)
+        store = ref._first_response_cache['store']
+        np.testing.assert_allclose(ref.hessian(modes=modes, max_memory=.015, method='mixed'), expected, atol=1e-10)
+        assert ref._first_response_cache['store'] is store
+        ref.gradient(method="forward", modes=1.1*modes, max_memory=.015)
+        assert ref._first_response_cache['store'] is not store
 
 
 def test_directional_reference_shared_across_modes(monkeypatch):
@@ -418,32 +423,33 @@ def test_directional_reference_shared_across_modes(monkeypatch):
     modes = np.zeros((2,3,3))
     modes[0,1,2], modes[1,2,0] = 1, 1
     ref = _point(coords, BSE, 'hf', eri='cd', charge=1)
-    expected = ref.hessian(modes=modes, method='polarization').copy()
-    ref._first_response_cache = None
-    groups = orbital_groups(ref._scf.mo_energy, ref.nocc, 1e-7)
-    counts = []
-    original_eigh, original_derivatives = np.linalg.eigh, response._derivatives
-    calls = []
-    def eigh(*args, **kwargs):
-        calls.append(args[0].shape)
-        return original_eigh(*args, **kwargs)
-    def derivatives(*args, **kwargs):
-        start = len(calls)
-        result = original_derivatives(*args, **kwargs)
-        counts.append(len(calls)-start)
-        return result
-    monkeypatch.setattr(np.linalg, 'eigh', eigh)
-    monkeypatch.setattr(response, '_derivatives', derivatives)
-    monkeypatch.setattr(response_storage, '_ARRAY_MEMORY_BYTES', 0)
-    response_storage.directional_derivatives(ref, np.arange(2), modes, 'auto', groups, 4000, 1e-7, 1)
-    assert counts[0] > 0
-    assert counts[1] == 0
-    shared = ref._first_response_cache['reference']
-    np.testing.assert_allclose(ref.hessian(modes=modes, method='polarization'), expected, atol=1e-10)
-    assert all(count == 0 for count in counts[1:])
-    assert ref._first_response_cache['reference'] is shared
-    ref.gradient(method="forward", modes=modes*1.1, max_memory=.1)
-    assert ref._first_response_cache.get('reference') is not shared
+    with ref.derivative_workspace():
+        expected = ref.hessian(modes=modes, method='polarization').copy()
+        ref._first_response_cache = None
+        groups = orbital_groups(ref._scf.mo_energy, ref.nocc, 1e-7)
+        counts = []
+        original_eigh, original_derivatives = np.linalg.eigh, response._derivatives
+        calls = []
+        def eigh(*args, **kwargs):
+            calls.append(args[0].shape)
+            return original_eigh(*args, **kwargs)
+        def derivatives(*args, **kwargs):
+            start = len(calls)
+            result = original_derivatives(*args, **kwargs)
+            counts.append(len(calls)-start)
+            return result
+        monkeypatch.setattr(np.linalg, 'eigh', eigh)
+        monkeypatch.setattr(response, '_derivatives', derivatives)
+        monkeypatch.setattr(response_storage, '_ARRAY_MEMORY_BYTES', 0)
+        response_storage.directional_derivatives(ref, np.arange(2), modes, 'auto', groups, 4000, 1e-7, 1)
+        assert counts[0] > 0
+        assert counts[1] == 0
+        shared = ref._first_response_cache['reference']
+        np.testing.assert_allclose(ref.hessian(modes=modes, method='polarization'), expected, atol=1e-10)
+        assert all(count == 0 for count in counts[1:])
+        assert ref._first_response_cache['reference'] is shared
+        ref.gradient(method="forward", modes=modes*1.1, max_memory=.1)
+        assert ref._first_response_cache.get('reference') is not shared
 
 
 @pytest.mark.parametrize('screening', ['hf', 'qp'])

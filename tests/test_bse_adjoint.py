@@ -143,22 +143,23 @@ def test_adjoint_hessian_cleanup_on_failure(monkeypatch):
     from pyqed.gw import adjoint
     from pyqed.gw.response_storage import ResponseStore
     ref = _point(np.array([[0., 0., 0.], [0., 0., 1.5], [1.8, 0., .3]]), BSE, charge=1)
-    modes = np.eye(9)[[5, 6]]
-    ref.gradient(method='forward', modes=modes)
-    previous = ref._first_response_cache
-    paths = []
-    original = ResponseStore.__init__
-    def tracked(self):
-        original(self)
-        paths.append(self.directory.name)
-    def fail(*args, **kwargs):
-        raise RuntimeError('deliberate Hessian pullback failure')
-    monkeypatch.setattr(ResponseStore, '__init__', tracked)
-    monkeypatch.setattr(adjoint, '_gradients', fail)
-    with pytest.raises(RuntimeError, match='deliberate Hessian'):
-        ref.hessian(modes=modes, method='adjoint')
-    assert ref._first_response_cache is previous
-    assert paths and all(not Path(path).exists() for path in paths)
+    with ref.derivative_workspace():
+        modes = np.eye(9)[[5, 6]]
+        ref.gradient(method='forward', modes=modes)
+        previous = ref._first_response_cache
+        paths = []
+        original = ResponseStore.__init__
+        def tracked(self):
+            original(self)
+            paths.append(self.directory.name)
+        def fail(*args, **kwargs):
+            raise RuntimeError('deliberate Hessian pullback failure')
+        monkeypatch.setattr(ResponseStore, '__init__', tracked)
+        monkeypatch.setattr(adjoint, '_gradients', fail)
+        with pytest.raises(RuntimeError, match='deliberate Hessian'):
+            ref.hessian(modes=modes, method='adjoint')
+        assert ref._first_response_cache is None
+        assert paths and all(not Path(path).exists() for path in paths)
 
 
 def test_cd_hessian_avoids_second_factor_tensors(monkeypatch):
@@ -234,29 +235,30 @@ def test_hessian_reuses_only_geometry_local_spectral_data(monkeypatch):
     from pyqed.gw import response_storage
     ref = _point(np.array([[0., 0., 0.], [0., 0., 1.5], [1.8, 0., .3]]),
                  BSE, 'qp', 'cd', charge=1)
-    modes = np.eye(9)[[5, 6]]
-    expected = ref.hessian(modes=modes, method='polarization')
-    original = response_storage.reference_value
-    counts = Counter()
-    def tracked(name, compute):
-        def counted():
-            if isinstance(name, tuple) and name[0] == 'adjoint':
-                counts[name] += 1
-            return compute()
-        return original(name, counted)
-    monkeypatch.setattr(response_storage, 'reference_value', tracked)
-    actual = ref.hessian(modes=modes)
-    np.testing.assert_allclose(actual, expected, atol=2e-8, rtol=1e-8)
-    assert counts and set(counts.values()) == {1}
-    assert ('adjoint', 'qp_basis') in counts
-    assert ('adjoint', 'excitation_basis') in counts
-    assert any(isinstance(key[1], tuple) and key[1][0] == 'qp_vectors' for key in counts)
-    # A new public call reuses the same geometry, including a mode subset.
-    ref.hessian(modes=modes[:1])
-    assert set(counts.values()) == {1}
-    ref.clear_derivative_cache()
-    ref.hessian(modes=modes[:1])
-    assert set(counts.values()) == {2}
+    with ref.derivative_workspace():
+        modes = np.eye(9)[[5, 6]]
+        expected = ref.hessian(modes=modes, method='polarization')
+        original = response_storage.reference_value
+        counts = Counter()
+        def tracked(name, compute):
+            def counted():
+                if isinstance(name, tuple) and name[0] == 'adjoint':
+                    counts[name] += 1
+                return compute()
+            return original(name, counted)
+        monkeypatch.setattr(response_storage, 'reference_value', tracked)
+        actual = ref.hessian(modes=modes)
+        np.testing.assert_allclose(actual, expected, atol=2e-8, rtol=1e-8)
+        assert counts and set(counts.values()) == {1}
+        assert ('adjoint', 'qp_basis') in counts
+        assert ('adjoint', 'excitation_basis') in counts
+        assert any(isinstance(key[1], tuple) and key[1][0] == 'qp_vectors' for key in counts)
+        # A new public call reuses the same geometry, including a mode subset.
+        ref.hessian(modes=modes[:1])
+        assert set(counts.values()) == {1}
+        ref.clear_derivative_cache()
+        ref.hessian(modes=modes[:1])
+        assert set(counts.values()) == {2}
 
 
 @pytest.mark.parametrize('mapped', [False, True])
@@ -528,77 +530,80 @@ def test_gradient_workspace_reused_by_subset_hessian(response, monkeypatch):
     from pyqed.qchem import basis_derivatives
     from pyqed.qchem.orbital_response import OrbitalResponse
     ref = _point(np.array([[0.,0.,0.],[0.,0.,1.5],[1.8,0.,.3]]),BSE,'hf','cd',charge=1)
-    modes=np.random.default_rng(92).normal(size=(3,9))
-    options=dict(state_ids=[0],gw_response='spectral',excitation_response=response)
-    gradient=ref.gradient(modes=modes,**options).copy()
-    workspace=ref._adjoint_workspace
-    original=basis_derivatives.directional_one_electron_derivatives
-    def no_first(*args,**kwargs):
-        assert kwargs.get('order',2) != 1, 'Repeated first-order integral work'
-        return original(*args,**kwargs)
-    monkeypatch.setattr(basis_derivatives,'directional_one_electron_derivatives',no_first)
-    def no_rebuild(*args,**kwargs):
-        raise AssertionError('Rebuilt cached orbital solver')
-    from pyqed.qchem.eri_response import CoulombIntegrals
-    columns=CoulombIntegrals._cd_columns
-    def no_first_columns(*args,**kwargs):
-        assert kwargs.get('order',1) != 1, 'Repeated first CD integral columns'
-        return columns(*args,**kwargs)
-    from pyqed.qchem.hf.hessian import RHFHessian
-    solve=RHFHessian._solve_orbital_system
-    def shared_solve(self,*args,**kwargs):
-        assert kwargs.get('orbital_solver') is workspace['reference']['adjoint_orbital_solver']
-        return solve(self,*args,**kwargs)
-    with monkeypatch.context() as patch:
-        patch.setattr(OrbitalResponse,'rhf',no_rebuild)
-        patch.setattr(RHFHessian,'_solve_orbital_system',shared_solve)
-        patch.setattr(CoulombIntegrals,'_cd_columns',no_first_columns)
-        warm=ref.hessian(modes=modes[[2,0]],**options).copy()
-    assert ref._adjoint_workspace is workspace
-    np.testing.assert_allclose(ref.energy_gradient,gradient[:,[2,0]],atol=2e-10,rtol=0)
-    from pathlib import Path
-    folder=Path(workspace['store'].directory.name)
-    assert folder.exists()
-    ref.clear_derivative_cache()
-    assert not folder.exists()
-    monkeypatch.setattr(basis_derivatives,'directional_one_electron_derivatives',original)
-    cold=ref.hessian(modes=modes[[2,0]],**options)
-    np.testing.assert_allclose(warm,cold,atol=2e-10,rtol=0)
+    with ref.derivative_workspace():
+        modes=np.random.default_rng(92).normal(size=(3,9))
+        options=dict(state_ids=[0],gw_response='spectral',excitation_response=response)
+        gradient=ref.gradient(modes=modes,**options).copy()
+        workspace=ref._adjoint_workspace
+        original=basis_derivatives.directional_one_electron_derivatives
+        def no_first(*args,**kwargs):
+            assert kwargs.get('order',2) != 1, 'Repeated first-order integral work'
+            return original(*args,**kwargs)
+        monkeypatch.setattr(basis_derivatives,'directional_one_electron_derivatives',no_first)
+        def no_rebuild(*args,**kwargs):
+            raise AssertionError('Rebuilt cached orbital solver')
+        from pyqed.qchem.eri_response import CoulombIntegrals
+        columns=CoulombIntegrals._cd_columns
+        def no_first_columns(*args,**kwargs):
+            assert kwargs.get('order',1) != 1, 'Repeated first CD integral columns'
+            return columns(*args,**kwargs)
+        from pyqed.qchem.hf.hessian import RHFHessian
+        solve=RHFHessian._solve_orbital_system
+        def shared_solve(self,*args,**kwargs):
+            assert kwargs.get('orbital_solver') is workspace['reference']['adjoint_orbital_solver']
+            return solve(self,*args,**kwargs)
+        with monkeypatch.context() as patch:
+            patch.setattr(OrbitalResponse,'rhf',no_rebuild)
+            patch.setattr(RHFHessian,'_solve_orbital_system',shared_solve)
+            patch.setattr(CoulombIntegrals,'_cd_columns',no_first_columns)
+            warm=ref.hessian(modes=modes[[2,0]],**options).copy()
+        assert ref._adjoint_workspace is workspace
+        np.testing.assert_allclose(ref.energy_gradient,gradient[:,[2,0]],atol=2e-10,rtol=0)
+        from pathlib import Path
+        folder=Path(workspace['store'].directory.name)
+        assert folder.exists()
+        ref.clear_derivative_cache()
+        assert not folder.exists()
+        monkeypatch.setattr(basis_derivatives,'directional_one_electron_derivatives',original)
+        cold=ref.hessian(modes=modes[[2,0]],**options)
+        np.testing.assert_allclose(warm,cold,atol=2e-10,rtol=0)
 
 
 def test_adjoint_workspace_invalidates_changed_reference():
     from pathlib import Path
     ref=_point(np.array([[0.,0.,0.],[0.,0.,1.5],[1.8,0.,.3]]),BSE,'hf','cd',charge=1)
-    modes=np.eye(9)[:1]
-    ref.gradient(state_ids=[0],modes=modes)
-    previous=ref._adjoint_workspace
-    path=Path(previous['store'].directory.name)
-    # In-place input changes must invalidate even if object identity survives.
-    ref.e[0]+=1e-10
-    ref.gradient(state_ids=[0],modes=modes)
-    assert ref._adjoint_workspace is not previous
-    assert not path.exists()
+    with ref.derivative_workspace():
+        modes=np.eye(9)[:1]
+        ref.gradient(state_ids=[0],modes=modes)
+        previous=ref._adjoint_workspace
+        path=Path(previous['store'].directory.name)
+        # In-place input changes must invalidate even if object identity survives.
+        ref.e[0]+=1e-10
+        ref.gradient(state_ids=[0],modes=modes)
+        assert ref._adjoint_workspace is not previous
+        assert not path.exists()
 
 
 def test_copied_bse_does_not_own_original_workspace():
     from copy import copy, deepcopy
     from pathlib import Path
     ref=_point(np.array([[0.,0.,0.],[0.,0.,1.5],[1.8,0.,.3]]),BSE,'hf','cd',charge=1)
-    modes=np.eye(9)[:1]
-    expected=ref.gradient(state_ids=[0],modes=modes)
-    original=ref._adjoint_workspace
-    folder=Path(original['store'].directory.name)
-    assert deepcopy(original) is original
-    clone=copy(ref)
-    clone.clear_derivative_cache()
-    assert folder.exists()
-    clone=copy(ref)
-    np.testing.assert_allclose(clone.gradient(state_ids=[0],modes=modes),expected,atol=1e-12)
-    assert clone._adjoint_workspace is not original
-    clone.clear_derivative_cache()
-    assert folder.exists()
-    ref.clear_derivative_cache()
-    assert not folder.exists()
+    with ref.derivative_workspace():
+        modes=np.eye(9)[:1]
+        expected=ref.gradient(state_ids=[0],modes=modes)
+        original=ref._adjoint_workspace
+        folder=Path(original['store'].directory.name)
+        assert deepcopy(original) is original
+        clone=copy(ref)
+        clone.clear_derivative_cache()
+        assert folder.exists()
+        clone=copy(ref)
+        np.testing.assert_allclose(clone.gradient(state_ids=[0],modes=modes),expected,atol=1e-12)
+        assert clone._adjoint_workspace is not original
+        clone.clear_derivative_cache()
+        assert folder.exists()
+        ref.clear_derivative_cache()
+        assert not folder.exists()
 
 
 @pytest.mark.parametrize('cls', [BSE, TDA])
@@ -608,7 +613,6 @@ def test_combined_derivatives_and_cleanup(cls, monkeypatch):
     modes = np.random.default_rng(104).normal(size=(2,9))
     options = dict(state_ids=[0], modes=modes, excitation_response='physical')
     expected_gradient = ref.gradient(**options).copy()
-    folder = Path(ref._adjoint_workspace['store'].directory.name)
     expected_hessian = ref.hessian(columns=[1], **options).copy()
     def forbidden(*args, **kwargs):
         raise AssertionError('Combined derivatives must not run a separate gradient')
@@ -619,7 +623,6 @@ def test_combined_derivatives_and_cleanup(cls, monkeypatch):
     np.testing.assert_allclose(hessian, expected_hessian, atol=2e-10, rtol=0)
     assert gradient is ref.energy_gradient and hessian is ref.energy_hessian
     assert ref._adjoint_workspace is None and ref._first_response_cache is None
-    assert not folder.exists()
     np.testing.assert_allclose(ref.derivatives(order=1, **options), expected_gradient, atol=2e-10)
     assert ref._adjoint_workspace is None
 
@@ -627,14 +630,11 @@ def test_combined_derivatives_and_cleanup(cls, monkeypatch):
 def test_combined_derivatives_cleanup_on_failure(monkeypatch):
     from pathlib import Path
     ref = _point(np.array([[0.,0.,0.],[0.,0.,1.5],[1.8,0.,.3]]), BSE, 'hf', 'cd', charge=1)
-    ref.gradient(state_ids=[0], modes=np.eye(9)[:1])
-    folder = Path(ref._adjoint_workspace['store'].directory.name)
     def fail(*args, **kwargs):
         raise RuntimeError('response failed')
     monkeypatch.setattr(ref, 'hessian', fail)
     with pytest.raises(RuntimeError, match='response failed'):
         ref.derivatives(order=2)
-    assert not folder.exists()
     assert ref._adjoint_workspace is None and ref._first_response_cache is None
     with pytest.raises(ValueError, match='order'):
         ref.derivatives(order=3)

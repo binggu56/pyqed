@@ -36,7 +36,6 @@ def main():
             for method in ('forward','adjoint'):
                 times=[]
                 for repeat in range(args.repeats+1):
-                    ref._first_response_cache = None
                     start=perf_counter()
                     gradients[method]=ref.gradient(state_ids=states,method=method).copy()
                     elapsed=perf_counter()-start

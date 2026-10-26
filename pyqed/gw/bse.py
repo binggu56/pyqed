@@ -15,12 +15,12 @@ Based on the PySCF implementation
 
 import numpy as np
 import scipy.linalg
-from scipy.linalg import eigh as eig
-from pyqed.phys import eig_asymm
+from .rpa import _symmetrize, _positive_matrix_power, _casida_eigh, diagonalize
+from .rpa import singlet_matrices as rpa_AB_matrices
 import sys
+from contextlib import contextmanager
 
 
-from pyqed import is_positive_def
 from pyqed.qchem.hf.rhf import _cross_ao_overlap_matrix
 from pyqed.gw.screening import FactorizedCouplings, StaticScreening
 
@@ -206,42 +206,6 @@ def _eri(gw, p, q, r, s):
     if pq is None or rs is None:
         return 0.0
     return float(np.dot(pq, rs))
-
-
-def _symmetrize(mat):
-    mat = np.asarray(mat)
-    return 0.5 * (mat + mat.T.conjugate())
-
-
-def _positive_matrix_power(mat, power, name, thresh=1e-10):
-    evals, evecs = scipy.linalg.eigh(_symmetrize(mat))
-    if evals[0] < -thresh:
-        raise np.linalg.LinAlgError(
-            f"{name} is not positive semidefinite; lowest eigenvalue = {evals[0]:.6e}."
-        )
-    evals = np.clip(evals, 0.0, None)
-    if power < 0 and np.any(evals <= thresh):
-        raise np.linalg.LinAlgError(
-            f"{name} is numerically singular; cannot form inverse power."
-        )
-    powered = evals ** power
-    return (evecs * powered) @ evecs.T.conjugate(), evals
-
-
-def _casida_eigh(A, B, thresh=1e-10):
-    """Stable dense RPA/Casida diagonalization without scipy.sqrtm."""
-    a_minus_b = _symmetrize(A - B)
-    a_plus_b = _symmetrize(A + B)
-    sqrt_a_minus_b, _ = _positive_matrix_power(a_minus_b, 0.5, "A-B", thresh=thresh)
-    casida_h = _symmetrize(sqrt_a_minus_b @ a_plus_b @ sqrt_a_minus_b)
-    omega2, t = scipy.linalg.eigh(casida_h)
-    if omega2[0] < -thresh:
-        raise np.linalg.LinAlgError(
-            f"Casida matrix has negative eigenvalue = {omega2[0]:.6e}."
-        )
-    omega = np.sqrt(np.clip(omega2, 0.0, None))
-    order = np.argsort(omega)
-    return omega[order], t[:, order]
 
 
 def _pseudo_normalize_full_bse_vectors(vectors, dim, thresh=1e-14):
@@ -865,7 +829,31 @@ class BSE(object):
         """Release the geometry-local adjoint workspace and its disk files."""
         from .adjoint_workspace import clear
         clear(self)
+        self._adjoint_workspace = None
         self._first_response_cache = None
+
+    @contextmanager
+    def derivative_workspace(self):
+        """Reuse derivative intermediates within a block; release them on exit.
+
+        Standalone gradient(), hessian(), and derivatives() calls each own
+        a temporary workspace. Nesting them inside this context retains
+        compatible intermediates until the outermost block exits. A failed
+        calculation clears the workspace immediately. Copies do not inherit
+        the original object's active context.
+        """
+        owner, depth = getattr(self, '_derivative_context', (None, 0))
+        depth = depth if owner == id(self) else 0
+        self._derivative_context = (id(self), depth + 1)
+        try:
+            yield self
+        except BaseException:
+            self.clear_derivative_cache()
+            raise
+        finally:
+            self._derivative_context = (id(self), depth)
+            if depth == 0:
+                self.clear_derivative_cache()
 
     def derivatives(self, state_ids=None, modes=None, *, order=2, **kwargs):
         """Return a gradient (order=1) or (gradient, Hessian) (order=2).
@@ -878,15 +866,13 @@ class BSE(object):
         remain available as energy_gradient and energy_hessian. Selected
         Hessian columns retain the gradient along all requested modes.
         """
-        try:
+        with self.derivative_workspace():
             if isinstance(order, (bool, np.bool_)) or order not in (1, 2):
                 raise ValueError('Derivative order must be 1 or 2.')
             if order == 1:
                 return self.gradient(state_ids, modes, **kwargs)
             hessian = self.hessian(state_ids, modes, **kwargs)
             return self.energy_gradient, hessian
-        finally:
-            self.clear_derivative_cache()
 
     def gradient(self, state_ids=None, modes=None, *, method="adjoint", **kwargs):
         """Return relaxed total-energy gradients, shape (nstates, nmodes).
@@ -901,27 +887,26 @@ class BSE(object):
         Individual surface derivatives are NaN at electronic degeneracies.
         The default method="adjoint" uses state-specific Z-vectors (optional PyTorch),
         currently requiring nondegenerate HF orbitals; see gw.adjoint for
-        fidelity and limits. Geometry-local spectra, Z-vectors, orbital solver
-        and raw first integral derivatives are retained for an adjoint Hessian
-        with matching response settings. Directional electronic responses are
-        computed only by hessian(), never by gradient(). Reference/state or
-        response-setting changes invalidate the workspace; clear_derivative_cache()
-        releases it explicitly. Saved graph tensors use temporary disk storage;
-        storage="memory" retains them in RAM.
+        fidelity and limits. Standalone calls release their derivative caches
+        on return or failure. Use ``with bse.derivative_workspace():`` to
+        reuse spectra, Z-vectors, and first integral derivatives across calls.
+        Saved graph tensors use temporary disk storage by default;
+        storage="memory" retains them in RAM until the workspace exits.
         Explicit method="forward" computes only first derivatives.
         Integral, RHF, GW and BSE first-order
-        responses are cached for subsequent gradient/hessian calls. Content checks
+        responses can be reused inside derivative_workspace(). Content checks
         invalidate the cache when the reference or requested directions change.
         Above the memory budget, directions are processed individually and
         reusable first responses are stored in temporary disk files.
         """
-        if method == 'adjoint':
-            from .adjoint import gradients
-            return gradients(self, state_ids, modes, **kwargs)
-        if method != 'forward':
-            raise ValueError("Gradient method must be forward or adjoint.")
-        from .response import energy_derivatives
-        return energy_derivatives(self, state_ids, modes, order=1, **kwargs)[0]
+        with self.derivative_workspace():
+            if method == 'adjoint':
+                from .adjoint import gradients
+                return gradients(self, state_ids, modes, **kwargs)
+            if method != 'forward':
+                raise ValueError("Gradient method must be forward or adjoint.")
+            from .response import energy_derivatives
+            return energy_derivatives(self, state_ids, modes, order=1, **kwargs)[0]
 
     def hessian(self, state_ids=None, modes=None, *, method='adjoint', **kwargs):
         """Return relaxed total-energy Hessians, shape (nstates, nmodes, nmodes).
@@ -956,11 +941,12 @@ class BSE(object):
         keep all mixed entries without finite differences. Small requests use
         the full analytic response tensor with either selection.
         """
-        if method == "adjoint":
-            from .adjoint import hessians
-            return hessians(self, state_ids, modes, **kwargs)
-        from .response import energy_derivatives
-        return energy_derivatives(self, state_ids, modes, hessian_method=method, **kwargs)[1]
+        with self.derivative_workspace():
+            if method == "adjoint":
+                from .adjoint import hessians
+                return hessians(self, state_ids, modes, **kwargs)
+            from .response import energy_derivatives
+            return energy_derivatives(self, state_ids, modes, hessian_method=method, **kwargs)[1]
 
     def vibronic_couplings(self, state_ids=None, modes=None, frame='relaxed',
                            *, backend='auto', max_memory=None, degeneracy_tol=1e-7):
@@ -1114,7 +1100,8 @@ class GWBSEScanner:
 
     def _prepare_mol(self, mol_or_geom):
         if isinstance(mol_or_geom, np.ndarray):
-            mol = self.mol
+            from .response import _detached
+            mol = _detached(self.mol)
             mol.set_geom(np.asarray(mol_or_geom, dtype=float).reshape(mol.natom, 3))
             return _rebuild_scan_mol(mol)
 
@@ -1184,39 +1171,17 @@ class GWBSEScanner:
 
 
 
+    def point(self, geometry):
+        """Return a detached BSE point with analytic derivative capabilities.
 
-def rpa_AB_matrices(gw, method='TDHF'):
-    '''Get the RPA A and B matrices, using TDH, TDHF, or TDDFT.
-    '''
-    assert method in ('TDH','TDHF','TDDFT')
-    nso = gw.nso
-    nocc = gw.nocc
-    nvir = nso - nocc
+        CGLDR must select ``derivative_frame='relaxed'``. Use converged BSE
+        roots; explicit caller run controls take precedence.
+        """
+        self.run_kwargs.setdefault('tol',1e-9)
+        self(geometry)
+        return self.bse
 
-    dim_rpa = nocc*nvir
-    A = np.zeros((dim_rpa,dim_rpa))
-    B = np.zeros((dim_rpa,dim_rpa))
 
-    ia = 0
-    for i in range(nocc):
-        for a in range(nocc,nso):
-            A[ia, ia] = gw.e_mf[a] - gw.e_mf[i]
-            jb = 0
-            for j in range(nocc):
-                for b in range(nocc,nso):
-                    A[ia,jb] += 2.*_eri(gw, a, i, b, j)
-                    B[ia,jb] += 2.*_eri(gw, i, a, j, b)
-                    
-                    if method == 'TDHF':
-                        A[ia,jb] -= _eri(gw, a, b, i, j)
-                        B[ia,jb] -= _eri(gw, a, j, i, b)
-                    jb += 1
-            ia += 1
-
-    assert np.allclose(A, A.transpose())
-    assert np.allclose(B, B.transpose())
-
-    return A, B
 
 def rpa(gw, using_tda=False, using_casida=True, method='TDHF'):
     r'''Get the RPA eigenvalues and eigenvectors.
@@ -1234,17 +1199,7 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDHF'):
     '''
     A, B = rpa_AB_matrices(gw, method=method)
 
-    if using_tda:
-        ham_rpa = A
-        e, x = eig(ham_rpa)
-        return e, x
-    else:
-        if not using_casida:
-            ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-            e, xy = eig_asymm(ham_rpa)
-            return e, xy
-        else:
-            return _casida_eigh(A, B)
+    return diagonalize(A, B, using_tda=using_tda, using_casida=using_casida)
 
 
 def get_m_rpa(gw, e_rpa, t_rpa, *, factorized=True):
@@ -2076,14 +2031,4 @@ def bse(gw, using_tda=False, using_casida=True):
 
     A, B = bse_AB_matrices(gw)
 
-    if using_tda:
-        ham_rpa = A
-        e, x = eig(ham_rpa)
-        return e, x
-    else:
-        if not using_casida:
-            ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-            e, xy = eig_asymm(ham_rpa)
-            return e, xy
-        else:
-            return _casida_eigh(A, B)
+    return diagonalize(A, B, using_tda=using_tda, using_casida=using_casida)

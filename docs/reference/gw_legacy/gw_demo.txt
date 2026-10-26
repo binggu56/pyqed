@@ -1,0 +1,25 @@
+if __name__ == '__main__':
+    from pyscf import scf, gto
+    mol = gto.Mole()
+    mol.verbose = 1
+    #mol.atom = [['Ne' , (0., 0., 0.)]]
+    #mol.basis = {'Ne': '6-31G'}
+    # This is from G2/97 i.e. MP2/6-31G*
+    mol.atom = [['H' , (0.,      0., 0.)],
+                ['F', (1.1, 0., 0.)]]
+                # ['F' , (0.91, 0., 0.)]]
+    mol.basis = '631g'
+    mol.build()
+    mf = scf.RHF(mol)
+    #print(mf.scf())
+    mf.kernel()
+
+    gw = GW(mf, screening='TDHF')
+    egw = gw.run()
+    print('HF    vs.   GW ')
+    for emf, eqp in zip(mf.mo_energy, egw):
+        print("%0.6f %0.6f"%(emf, eqp))
+
+    nocc = mol.nelectron//2
+    ehomo = egw[nocc-1]
+    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")

@@ -12,8 +12,8 @@ Refs
 
 import numpy as np
 import scipy.linalg
-from scipy.linalg import eigh as eig
-from pyqed.phys import eig_asymm, is_positive_def
+from .rpa import _symmetrize, _positive_matrix_power, _casida_eigh, diagonalize
+from .rpa import spin_matrices as rpa_AB_matrices
 import sys
 import tempfile
 from scipy.optimize import brentq
@@ -69,42 +69,6 @@ def _canonical_freq_int(freq_int):
         )
     allowed = sorted(set(_SUPPORTED_FREQ_INTEGRATION) | set(_FREQ_INTEGRATION_TODO))
     raise ValueError(f"Unknown GW frequency integration {freq_int!r}. Expected one of {allowed}.")
-
-
-def _symmetrize(mat):
-    mat = np.asarray(mat)
-    return 0.5 * (mat + mat.T.conjugate())
-
-
-def _positive_matrix_power(mat, power, name, thresh=1e-10):
-    evals, evecs = scipy.linalg.eigh(_symmetrize(mat))
-    if evals[0] < -thresh:
-        raise np.linalg.LinAlgError(
-            f"{name} is not positive semidefinite; lowest eigenvalue = {evals[0]:.6e}."
-        )
-    evals = np.clip(evals, 0.0, None)
-    if power < 0 and np.any(evals <= thresh):
-        raise np.linalg.LinAlgError(
-            f"{name} is numerically singular; cannot form inverse power."
-        )
-    powered = evals ** power
-    return (evecs * powered) @ evecs.T.conjugate(), evals
-
-
-def _casida_eigh(A, B, thresh=1e-10):
-    """Stable dense RPA/Casida diagonalization without scipy.sqrtm."""
-    a_minus_b = _symmetrize(A - B)
-    a_plus_b = _symmetrize(A + B)
-    sqrt_a_minus_b, _ = _positive_matrix_power(a_minus_b, 0.5, "A-B", thresh=thresh)
-    casida_h = _symmetrize(sqrt_a_minus_b @ a_plus_b @ sqrt_a_minus_b)
-    omega2, t = scipy.linalg.eigh(casida_h)
-    if omega2[0] < -thresh:
-        raise np.linalg.LinAlgError(
-            f"Casida matrix has negative eigenvalue = {omega2[0]:.6e}."
-        )
-    omega = np.sqrt(np.clip(omega2, 0.0, None))
-    order = np.argsort(omega)
-    return omega[order], t[:, order]
 
 
 def _nelectron(mol):
@@ -381,66 +345,6 @@ def g0(gw, omega):
     return g0
 
 
-def rpa_AB_matrices(gw, method='TDH'):
-    '''Compute the RPA A and B matrices, using TDH, TDHF, or TDDFT.
-    '''
-    assert method in ('TDH','TDHF','TDDFT')
-    nso = gw.nso
-    nocc = gw.nocc
-    nvir = nso - nocc
-
-    dim_rpa = nocc*nvir
-    A = np.zeros((dim_rpa, dim_rpa))
-    B = np.zeros((dim_rpa, dim_rpa))
-    energy = _active_energy(gw)
-
-    if method == 'TDH':
-        occ_idx = np.repeat(np.arange(nocc), nvir)
-        vir_idx = np.tile(np.arange(nocc, nso), nocc)
-        delta = energy[vir_idx] - energy[occ_idx]
-        if gw.eri is not None:
-            A += gw.eri[
-                vir_idx[:, None],
-                occ_idx[:, None],
-                occ_idx[None, :],
-                vir_idx[None, :],
-            ]
-            B += gw.eri[
-                vir_idx[:, None],
-                occ_idx[:, None],
-                vir_idx[None, :],
-                occ_idx[None, :],
-            ]
-        else:
-            pair_ai = _spin_pair_factors(gw)[:, vir_idx, occ_idx].T
-            coulomb = pair_ai @ pair_ai.T
-            A += coulomb
-            B += coulomb
-        A[np.diag_indices(dim_rpa)] += delta
-        assert np.allclose(A, A.transpose())
-        assert np.allclose(B, B.transpose())
-        return A, B
-
-    ai = 0
-    for i in range(nocc):
-        for a in range(nocc,nso):
-            A[ai,ai] = energy[a] - energy[i]
-            bj = 0
-            for j in range(nocc):
-                for b in range(nocc,nso):
-                    A[ai,bj] += _eri(gw, a, i, j, b)
-                    B[ai,bj] += _eri(gw, a, i, b, j)
-                    if method == 'TDHF':
-                        A[ai,bj] -= _eri(gw, a, b, j, i)
-                        B[ai,bj] -= _eri(gw, a, j, b, i)
-                    bj += 1
-            ai += 1
-
-    assert np.allclose(A, A.transpose())
-    assert np.allclose(B, B.transpose())
-
-    return A, B
-
 def _charge_rpa(gw):
     """Exact restricted TDH charge block of the spin-orbital Casida problem.
 
@@ -547,17 +451,7 @@ def rpa(gw, using_tda=False, using_casida=True, method='TDH'):
         return _charge_rpa(gw)
     A, B = rpa_AB_matrices(gw, method=method)
 
-    if using_tda:
-        ham_rpa = A
-        e, x = eig(ham_rpa)
-        return e, x
-    else:
-        if not using_casida:
-            ham_rpa = np.array(np.bmat([[A,B],[-B,-A]]))
-            e, xy = eig_asymm(ham_rpa)
-            return e, xy
-        else:
-            return _casida_eigh(A, B)
+    return diagonalize(A, B, using_tda=using_tda, using_casida=using_casida)
 
 
 def rpa_correlation_energy(gw, mo_energy=None, method='direct', use_qp=False):
@@ -1341,7 +1235,7 @@ class GW(object):
             self.e_qp = qsgw_kernel(self, mo_energy, mo_coeff, verbose=self.verbose, **kwargs)
             self.method = 'qsgw'
         elif method in ('scgw0', 'sc-gw0', 'self-consistent-gw0'):
-            from pyqed.gw.scgw import SCGW
+            from pyqed.gw.experimental.scgw import SCGW
 
             init_keys = {
                 "nfreq",
@@ -1364,7 +1258,7 @@ class GW(object):
             self.converged = self.scgw_result.converged
             self.method = 'scgw0'
         elif method in ('scgw', 'sc-gw', 'self-consistent-gw'):
-            from pyqed.gw.scgw import SCGW
+            from pyqed.gw.experimental.scgw import SCGW
 
             init_keys = {
                 "nfreq",
@@ -1509,29 +1403,3 @@ class GW(object):
 
     def rpa_AB_matrices(self, method='TDH'):
         return rpa_AB_matrices(self, method)
-
-if __name__ == '__main__':
-    from pyscf import scf, gto
-    mol = gto.Mole()
-    mol.verbose = 1
-    #mol.atom = [['Ne' , (0., 0., 0.)]]
-    #mol.basis = {'Ne': '6-31G'}
-    # This is from G2/97 i.e. MP2/6-31G*
-    mol.atom = [['H' , (0.,      0., 0.)],
-                ['F', (1.1, 0., 0.)]]
-                # ['F' , (0.91, 0., 0.)]]
-    mol.basis = '631g'
-    mol.build()
-    mf = scf.RHF(mol)
-    #print(mf.scf())
-    mf.kernel()
-
-    gw = GW(mf, screening='TDHF')
-    egw = gw.run()
-    print('HF    vs.   GW ')
-    for emf, eqp in zip(mf.mo_energy, egw):
-        print("%0.6f %0.6f"%(emf, eqp))
-
-    nocc = mol.nelectron//2
-    ehomo = egw[nocc-1]
-    print("GW -IP = GW HOMO =", ehomo, "au =", ehomo * au2ev, "eV")

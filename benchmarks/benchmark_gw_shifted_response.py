@@ -47,7 +47,7 @@ def main():
     from pyqed.gw import GW,BSE
     from pyqed.gw.response import _reference_response
     from pyqed.gw.subspace_response import orbital_groups
-    from pyqed.gw.shifted_response import ShiftedGW
+    from pyqed.gw.experimental.shifted_response import ShiftedGW
     preparation_start=perf_counter()
     from examples.qchem.gw.pyrazine_gw_bse import ATOM
     atom=ATOM if args.system=='pyrazine' else [('O',(0,0,0)),('H',(0,.7409,.5821)),('H',(.1058,-.8467,.5292))]
