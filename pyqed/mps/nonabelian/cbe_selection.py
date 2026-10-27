@@ -16,108 +16,13 @@ def _svd(matrix, cutoff):
     return u[:, :rank], s[:rank], vh[:rank]
 
 
-def _largest(spectra, count):
-    candidates = [(float(s), q, i) for q, values in spectra.items()
-                  for i, s in enumerate(values)]
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    selected = {}
-    for _, q, i in candidates[:count]:
-        selected.setdefault(q, []).append(i)
-    return selected
-
-
 def shrewd_subspace(matrices, halves, *, direction, expansion_size,
                     preselection_size=None, cutoff=1e-12, state_factors=None):
-    """Select whole multiplets using the four SVDs of Fig. S-2.
-
-    ``halves[(out_sector, in_sector, channel)] = (L, R)`` means
-    H(M)[out] += L @ M[in] @ R.T, in orthonormal coordinates. ``channel``
-    retains the shared MPO bond. Preselection is over input multiplicities;
-    final selection is over output multiplicities. Exact DD selection is
-    recovered when preselection is untruncated, up to numerical rank cutoff.
-    """
-    if direction not in ('lr', 'rl') or expansion_size < 1:
-        raise ValueError('Invalid CBE direction or expansion size')
-    if preselection_size is not None and (
-            int(preselection_size) != preselection_size or preselection_size < 1):
-        raise ValueError('cbe_preselection must be a positive multiplet count')
-    if direction == 'lr':
-        matrices = {q: m.conj().T for q, m in matrices.items()}
-        halves = {key: (r.conj(), l.conj()) for key, (l, r) in halves.items()}
-        if state_factors is not None:
-            state_factors = {q: (r.conj().T, l.conj().T) for q, (l,r) in state_factors.items()}
-    states = ({q: _svd(m, cutoff) for q, m in matrices.items()} if state_factors is None
-              else {q: canonical_factors(l, r, cutoff) for q, (l,r) in state_factors.items()})
-    left, right, groups = {}, {}, {}
-    for key, (l, r) in halves.items():
-        out, inp, _ = key
-        u, s, vh = states[inp]
-        if not len(s):
-            continue
-        uo, _, vo = states[out]
-        x = l @ u
-        x -= uo @ (uo.conj().T @ x)
-        y = (s[:, None] * vh) @ r.T
-        y -= (y @ vo.conj().T) @ vo
-        # Relative tests reject numerical remnants of exact kept-space terms.
-        if (np.linalg.norm(x) <= cutoff * max(np.linalg.norm(l), 1e-30) or
-                np.linalg.norm(y) <= cutoff * max(np.linalg.norm(r)*np.linalg.norm(s), 1e-30)):
-            continue
-        left[key], right[key] = x, y
-        groups.setdefault(inp, []).append(key)
-    w = max(1, len({key[2] for key in left}))
-    bond_size = sum(len(s) for _, s, _ in states.values())
-    budget = (max(1, int(np.ceil(max(bond_size, expansion_size)/w)))
-              if preselection_size is None else int(preselection_size))
-    pieces, decompositions, spectra = {}, {}, {}
-    for inp, keys in groups.items():
-        # (a): transfer weights of the right discarded half to the MPS bond.
-        u, s, _ = _svd(np.concatenate([right[key] for key in keys], axis=1), cutoff)
-        us = u * s
-        blocks = [left[key] @ us for key in keys]
-        # (b): truncate the MPS bond with the MPO leg still open.
-        u, s, _ = _svd(np.concatenate(blocks, axis=0), cutoff)
-        decompositions[inp] = (u, s)
-        spectra[inp] = s
-        pieces[inp] = [(key, block.shape[0]) for key, block in zip(keys, blocks)]
-    chosen = _largest(spectra, budget)
-    pre = {q: [] for q in matrices}
-    for inp, (u, s) in decompositions.items():
-        keep = chosen.get(inp, [])
-        us = u[:, keep] * s[keep]
-        offset = 0
-        for key, size in pieces[inp]:
-            pre[key[0]].append(us[offset:offset+size])
-            offset += size
-    complements, spectra = {}, {}
-    pre_dimension = 0
-    for out, matrix in matrices.items():
-        old = states[out][0]
-        if not pre[out]:
-            complements[out] = np.empty((matrix.shape[0], 0), dtype=matrix.dtype)
-            spectra[out] = np.empty(0)
-            continue
-        # (c): redirect the MPO leg, remove null vectors, safely reorthogonalize.
-        candidate = np.concatenate(pre[out], axis=1)
-        candidate -= old @ (old.conj().T @ candidate)
-        basis, _, _ = _svd(candidate, cutoff)
-        pre_dimension += basis.shape[1]
-        # (d): close the MPO bond only after projecting to the preselected space.
-        projected = np.zeros((basis.shape[1], matrix.shape[1]), dtype=complex)
-        for key in left:
-            if key[0] == out:
-                projected += (basis.conj().T @ left[key]) @ right[key]
-        u, s, _ = _svd(projected, cutoff)
-        complements[out], spectra[out] = basis @ u, s
-    chosen = _largest(spectra, int(expansion_size))
-    bases = {}
-    for q in matrices:
-        columns = np.concatenate((states[q][0], complements[q][:, chosen.get(q, [])]), axis=1)
-        bases[q] = np.linalg.qr(columns, mode='reduced')[0]
-    return bases, sum(map(len, chosen.values())), {
-        'cbe_selection': 'shrewd', 'cbe_preselection_budget': budget,
-        'cbe_preselected_multiplets': pre_dimension, 'cbe_operator_channels': w,
-    }
+    """Compiled four-stage whole-multiplet selection; see the module reference."""
+    from ._su2_kernel import multiplet_cbe_selection
+    return multiplet_cbe_selection(matrices, halves, direction=direction,
+        expansion_size=expansion_size, preselection_size=preselection_size,
+        cutoff=cutoff, state_factors=state_factors)
 
 
 def whiten_halves(halves, weights):

@@ -67,8 +67,10 @@ def test_complete_E_sites_and_repeated_MPS_multiplets(group,e,monkeypatch):
     reps = {g:np.kron(np.eye(2),u) for g,u in irrep_representation_matrices(group,e).items()}
     h = np.kron([[.1,.3],[.3,.7]],np.eye(2))
     solver = MultipletDMRG.from_integrals(h,np.zeros((4,)*4),nelec=1,spin=1,D=2,
-        orbital_representations=reps,wfnsym=e,point_group=group).run(nstates=2,nsweeps=4)
+        orbital_representations=reps,wfnsym=e,point_group=group,contractions='reduced').run(nstates=2,nsweeps=4)
     assert solver.success and solver.spatial_multiplet_count==2
+    assert solver.diagnostics["sweep_control"]=="shared"
+    assert solver.diagnostics["max_bond_mode"]=="per_sector"
     np.testing.assert_allclose(solver.e_tot,np.linalg.eigvalsh(h),atol=1e-10)
     diagnostics = solver.symmetry_diagnostics()
     assert diagnostics['orthogonality_error']<1e-10 and diagnostics['covariance_error']<1e-10
@@ -100,7 +102,7 @@ def test_two_electron_product_sectors_and_orbital_rotation(group,e,target,spin):
     assert solver.symmetry_diagnostics()['covariance_error']<1e-10
 
 
-from spatial_dmrg_fixtures import benzene, independent_integrals
+from dmrg_molecule_fixtures import benzene, independent_integrals
 
 
 @pytest.mark.parametrize('target', ['A1g','E1u','E2g'])
@@ -116,7 +118,7 @@ def test_benzene_multiplet_dmrg_independent_reference(benzene,independent_integr
     diagnostics = solver.symmetry_diagnostics()
     assert max(diagnostics['covariance_error'],diagnostics['orthogonality_error'])<1e-10
     np.testing.assert_allclose(diagnostics['partner_energies_hartree'],solver.e_tot,atol=1e-9,rtol=0)
-    assert driver.spatial_method=='multiplet'
+    assert driver.spatial_method=='complementary'
     assert solver.nsites==driver.nsites==4
     assert driver.d is None and sorted(driver.physical_site_dimensions)==[4,4,16,16]
     if target == 'A1g':
@@ -130,7 +132,7 @@ def test_benzene_multiplet_dmrg_independent_reference(benzene,independent_integr
 
 
 
-from spatial_dmrg_fixtures import h3plus
+from dmrg_molecule_fixtures import h3plus
 
 
 @pytest.mark.parametrize('target', ["A1'","E'"])
@@ -180,7 +182,7 @@ def test_local_workspace_guard_precedes_dense_allocation(monkeypatch):
     from types import SimpleNamespace
     reps = irrep_representation_matrices('D3h',"E'")
     solver = MultipletDMRG.from_integrals(np.eye(2),np.zeros((2,)*4),nelec=1,
-        spin=1,D=1,point_group='D3h',wfnsym="E'",orbital_representations=reps)
+        spin=1,D=1,point_group='D3h',wfnsym="E'",orbital_representations=reps,contractions='reduced')
     from pyqed.mps.nonabelian import multiplet_sweep
     monkeypatch.setattr(multiplet_sweep,'_diagonal_norm',lambda *args:None)
     monkeypatch.setattr(solver,'fusion_maps',(SimpleNamespace(parameter_count=10**4),))

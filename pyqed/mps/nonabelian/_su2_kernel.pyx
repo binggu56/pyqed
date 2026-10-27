@@ -6,7 +6,7 @@ import hashlib
 import numpy as np
 import mmap as _mmap
 cimport numpy as cnp
-from scipy.linalg.cython_lapack cimport zgesvd, zgeqrf, zungqr
+from scipy.linalg.cython_lapack cimport zgesvd, zgeqrf, zungqr, zheev
 from cython.operator cimport dereference as deref
 from cpython.ref cimport PyObject
 from libc.stdint cimport int32_t, int64_t, uint64_t
@@ -18,6 +18,40 @@ from libcpp.complex cimport complex as cpp_complex
 from libcpp.map cimport map as cpp_map
 from libcpp.string cimport string
 from libcpp.vector cimport vector
+
+
+cdef extern from "orbital_rank.hpp" namespace "pyqed::su2":
+    cdef enum OrbitalGroupCode "pyqed::su2::OrbitalGroup":
+        pass
+    cdef cppclass OrbitalRankData "pyqed::su2::OrbitalRank":
+        OrbitalRankData() except +
+        int32_t order
+        int32_t reflection
+        int32_t parity
+    vector[OrbitalRankData] fuse_orbital_ranks(OrbitalGroupCode, const OrbitalRankData&, const OrbitalRankData&) except +
+    int64_t orbital_dimension(OrbitalGroupCode, const OrbitalRankData&) except +
+    cpp_bool orbital_rank_allows(OrbitalGroupCode, const OrbitalRankData&, const OrbitalRankData&, const OrbitalRankData&) except +
+
+
+cdef OrbitalRankData _orbital_rank(object values) except *:
+    cdef OrbitalRankData rank
+    if len(values) != 3 or any(int(value) != value for value in values):
+        raise ValueError('An orbital rank requires integer (order, reflection, parity).')
+    rank.order,rank.reflection,rank.parity = values
+    return rank
+
+
+def orbital_rank_fusion(int group, left, right):
+    """Exact whole-irrep fusion in the NC engine (1=Coov, 2=Dooh, 3=SO3)."""
+    cdef vector[OrbitalRankData] ranks = fuse_orbital_ranks(
+        <OrbitalGroupCode>group,_orbital_rank(left),_orbital_rank(right))
+    cdef size_t i
+    return [(ranks[i].order,ranks[i].reflection,ranks[i].parity) for i in range(ranks.size())]
+
+
+def orbital_rank_dimension(int group, values):
+    """Number of structural rows; numerical truncation retains the whole irrep."""
+    return orbital_dimension(<OrbitalGroupCode>group,_orbital_rank(values))
 
 
 cdef void _factor_svd(char* jobu, char* jobv, int* m, int* n,
@@ -558,6 +592,66 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
         vector[CppNormalComplementaryComponentAction] component_actions
         uint64_t family_transition_counts[6]
 
+    cdef cppclass SpatialNCChannelData "pyqed::su2::SpatialNCChannel":
+        int32_t kind
+        int64_t first
+        int64_t second
+    cdef cppclass SpatialNCTransitionData "pyqed::su2::SpatialNCTransition":
+        int64_t source
+        int64_t target
+        int64_t primitive
+        double coefficient
+        uint64_t family_mask
+    cdef cppclass SpatialNCPrimitiveData "pyqed::su2::SpatialNCPrimitive":
+        vector[int64_t] word
+        cpp_bool right_parity
+        vector[double] values
+    cdef cppclass SpatialNCQuantumNumberData "pyqed::su2::SpatialNCQuantumNumber":
+        int64_t charge
+        int32_t two_j
+        OrbitalRankData orbital
+    cdef cppclass SpatialNCChannelExpansionData "pyqed::su2::SpatialNCChannelExpansion":
+        int64_t rank
+        int64_t copy
+        int64_t row
+        double value
+    cdef cppclass SpatialNCPhysicalExpansionData "pyqed::su2::SpatialNCPhysicalExpansion":
+        int64_t bra
+        int64_t ket
+        int64_t rank
+        int64_t bra_copy
+        int64_t ket_copy
+        int64_t row
+        cpp_complex[double] value
+    cdef cppclass SpatialNCCouplingData "pyqed::su2::SpatialNCCoupling":
+        int64_t left
+        int64_t local
+        int64_t right
+        vector[double] values
+    cdef cppclass SpatialNCReducedTransitionData "pyqed::su2::SpatialNCReducedTransition":
+        int64_t left
+        int64_t right
+        int64_t bra
+        int64_t ket
+        int64_t rank
+        int64_t left_copy
+        int64_t right_copy
+        int64_t bra_copy
+        int64_t ket_copy
+        cpp_complex[double] value
+        uint64_t family_mask
+
+    cdef cppclass SpatialNCSitePlanData "pyqed::su2::SpatialNCSitePlan":
+        int64_t physical_dimension
+        vector[SpatialNCPrimitiveData] primitives
+        vector[SpatialNCTransitionData] transitions
+        vector[SpatialNCReducedTransitionData] reduced_transitions
+    cdef cppclass SpatialNCScheduleData "pyqed::su2::SpatialNCSchedule":
+        vector[int64_t] shell_offsets
+        vector[vector[SpatialNCChannelData]] channels
+        vector[SpatialNCSitePlanData] sites
+        uint64_t integral_revision
+
     cdef cppclass CppSystem "pyqed::su2::System":
         CppSystem(
             const double* h1,
@@ -570,6 +664,14 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
             double cutoff,
             cpp_bool include_half,
         ) except +
+        void configure_spatial_shells(const vector[int64_t]&) except +
+        void reduce_spatial_normal_complementary(OrbitalGroupCode,
+            const vector[SpatialNCQuantumNumberData]&,
+            const vector[vector[vector[SpatialNCChannelExpansionData]]]&,
+            const vector[vector[vector[SpatialNCPhysicalExpansionData]]]&,
+            const vector[SpatialNCCouplingData]&,
+            const vector[int64_t]&, const vector[int64_t]&) except + nogil
+        const SpatialNCScheduleData& spatial_normal_complementary_schedule() except +
         size_t n_sites() noexcept
         int64_t n_elec() noexcept
         int64_t two_s() noexcept
@@ -796,6 +898,21 @@ cdef extern from "su2_dmrg_engine.hpp" namespace "pyqed::su2":
 
     cdef cppclass CppMovingEnvironment "pyqed::su2::MovingEnvironment"(SectorDecompositionCore):
         CppMovingEnvironment(const CppSystem* system) except +
+        void install_spatial_nc_boundary(const string&,int64_t,const vector[cpp_complex[double]]&,
+            const vector[int64_t]&,const vector[int64_t]&,const vector[int64_t]&) except +
+        void advance_spatial_nc_boundary(const string&,int64_t,int64_t,int64_t,
+            const vector[vector[int64_t]]&,const vector[double]&,
+            const vector[cpp_complex[double]]&,const vector[int64_t]&,const vector[int64_t]&,
+            const vector[cpp_complex[double]]&,const vector[int64_t]&,const vector[int64_t]&,
+            const vector[int64_t]&,const vector[int64_t]&,const vector[int64_t]&) except + nogil
+        void install_spatial_nc_local_plan(const string&,int64_t,const vector[vector[int64_t]]&,
+            const vector[double]&,const vector[int64_t]&,const vector[int64_t]&) except +
+        void release_spatial_nc_local_plan(const string&) noexcept
+        void spatial_nc_local_matvec(const string&,const cpp_complex[double]*,cpp_complex[double]*,size_t) except + nogil
+        void spatial_nc_local_diagonal(const string&,cpp_complex[double]*,size_t) except + nogil
+        CppDavidsonResult spatial_nc_local_solve(const string&,const vector[int64_t]&,
+            const vector[double]&,const vector[cpp_complex[double]]&,
+            const vector[cpp_complex[double]]&,double) except + nogil
         void set_num_threads(int n_threads) except +
         int num_threads() noexcept
         cpp_bool openmp_available() noexcept
@@ -2206,6 +2323,7 @@ cdef class SU2MovingEnvironment:
 
     cdef CppSystem* _system
     cdef CppMovingEnvironment* _engine
+    cdef uint64_t spatial_action_serial
     cdef dict _boundary_value_owners
     cdef object _local_operator_owner
     cdef object _factor_route_owners
@@ -2635,6 +2753,149 @@ cdef class SU2MovingEnvironment:
                 "Q": int(plan.family_transition_counts[5]),
             },
         }
+
+    cdef object _spatial_nc_boundary_view(self,string side,int64_t bond):
+        cdef CppComplexBoundaryBufferHandle* handle = self._engine.retain_complex_boundary_buffer(side,bond,False)
+        cdef size_t n = complex_boundary_buffer_size(handle)
+        cdef _SU2ComplexBoundaryBuffer owner = _SU2ComplexBoundaryBuffer.__new__(_SU2ComplexBoundaryBuffer)
+        owner._handle = handle
+        cdef cnp.npy_intp shape[1]
+        shape[0] = n
+        cdef cnp.ndarray result = cnp.PyArray_SimpleNewFromData(1,shape,cnp.NPY_COMPLEX128,
+            <void*>complex_boundary_buffer_data(handle))
+        cnp.set_array_base(result,owner)
+        return result
+
+    def install_spatial_nc_boundary(self,side,long long bond,packed):
+        """Own a multiplicity-only NC boundary in the compiled moving environment."""
+        cdef string side_name = str(side).encode()
+        cdef vector[cpp_complex[double]] values = np.asarray(packed[0],dtype=complex).ravel().tolist()
+        cdef vector[int64_t] offsets = np.asarray(packed[1],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] shapes = np.asarray(packed[2],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] labels = np.asarray(packed[3],dtype=np.int64).ravel().tolist()
+        self._engine.install_spatial_nc_boundary(side_name,bond,values,offsets,shapes,labels)
+        return self._spatial_nc_boundary_view(side_name,bond)
+
+    def advance_spatial_nc_boundary(self,side,long long parent,long long child,long long site,
+                                   routes,weights,bra,ket,output):
+        """Execute direct rank-resolved NC environment updates in C++."""
+        cdef string side_name = str(side).encode()
+        cdef vector[vector[int64_t]] route_data = routes
+        cdef vector[double] coefficients = weights
+        cdef vector[cpp_complex[double]] a = np.asarray(bra[0],dtype=complex).ravel().tolist()
+        cdef vector[int64_t] ao = np.asarray(bra[1],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] ash = np.asarray(bra[2],dtype=np.int64).ravel().tolist()
+        cdef vector[cpp_complex[double]] b = np.asarray(ket[0],dtype=complex).ravel().tolist()
+        cdef vector[int64_t] bo = np.asarray(ket[1],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] bsh = np.asarray(ket[2],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] oo = np.asarray(output[0],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] osh = np.asarray(output[1],dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] labels = np.asarray(output[2],dtype=np.int64).ravel().tolist()
+        with nogil:
+            self._engine.advance_spatial_nc_boundary(side_name,parent,child,site,route_data,
+                coefficients,a,ao,ash,b,bo,bsh,oo,osh,labels)
+        return self._spatial_nc_boundary_view(side_name,child)
+
+    def install_spatial_nc_local(self,long long site,routes,weights,offsets,shapes):
+        """Prepare an owned sparse NC action without building a local Hamiltonian."""
+        self.spatial_action_serial += 1
+        cdef string key = f'spatial_nc:{site}:{self.spatial_action_serial}'.encode()
+        cdef vector[vector[int64_t]] route_data = routes
+        cdef vector[double] coefficients = weights
+        cdef vector[int64_t] off = np.asarray(offsets,dtype=np.int64).ravel().tolist()
+        cdef vector[int64_t] dims = np.asarray(shapes,dtype=np.int64).ravel().tolist()
+        self._engine.install_spatial_nc_local_plan(key,site,route_data,coefficients,off,dims)
+        return SpatialNCLocalAction(self,key.decode(),int(off[off.size()-1]))
+
+    def configure_spatial_shells(self, offsets):
+        """Build direct NC shell schedules in the persistent integral owner."""
+        cdef vector[int64_t] bounds = offsets
+        self._system.configure_spatial_shells(bounds)
+
+    def reduce_spatial_normal_complementary(self,int group,quantum_numbers,channel_maps,physical_maps,cg_maps,finite_dimensions=(),finite_products=()):
+        """Install structural CG maps and reduce the owned NC integral routes."""
+        cdef vector[SpatialNCQuantumNumberData] ranks
+        cdef vector[vector[vector[SpatialNCChannelExpansionData]]] channels
+        cdef vector[vector[vector[SpatialNCPhysicalExpansionData]]] physical
+        cdef vector[int64_t] dimensions = finite_dimensions
+        cdef vector[int64_t] products = finite_products
+        cdef vector[SpatialNCCouplingData] couplings
+        cdef SpatialNCQuantumNumberData q
+        cdef SpatialNCChannelExpansionData c
+        cdef SpatialNCPhysicalExpansionData p
+        cdef SpatialNCCouplingData cg
+        cdef size_t i,j
+        for values in quantum_numbers:
+            if len(values) != 5:
+                raise ValueError('NC rank requires charge, spin, order, reflection, parity.')
+            q.charge,q.two_j,q.orbital.order,q.orbital.reflection,q.orbital.parity = values
+            ranks.push_back(q)
+        channels.resize(len(channel_maps))
+        for i in range(len(channel_maps)):
+            channels[i].resize(len(channel_maps[i]))
+            for j in range(len(channel_maps[i])):
+                for values in channel_maps[i][j]:
+                    c.rank,c.copy,c.row,c.value = values
+                    channels[i][j].push_back(c)
+        physical.resize(len(physical_maps))
+        for i in range(len(physical_maps)):
+            physical[i].resize(len(physical_maps[i]))
+            for j in range(len(physical_maps[i])):
+                for values in physical_maps[i][j]:
+                    p.bra,p.ket,p.rank,p.bra_copy,p.ket_copy,p.row,p.value = values
+                    physical[i][j].push_back(p)
+        for values in cg_maps:
+            cg.left,cg.local,cg.right = values[:3]
+            cg.values = np.asarray(values[3],dtype=float).ravel().tolist()
+            couplings.push_back(cg)
+        with nogil:
+            self._system.reduce_spatial_normal_complementary(<OrbitalGroupCode>group,ranks,channels,physical,couplings,dimensions,products)
+
+    def spatial_nc_rank_plan(self,long long site_index):
+        """Return multiplicity-only NC transitions for one complete shell."""
+        cdef const SpatialNCScheduleData* schedule = &self._system.spatial_normal_complementary_schedule()
+        if site_index < 0 or site_index >= <long long>schedule.sites.size():
+            raise IndexError('NC shell index is out of range.')
+        cdef const SpatialNCSitePlanData* site = &schedule.sites[site_index]
+        cdef size_t i
+        cdef cnp.ndarray[cnp.int64_t,ndim=2] labels = np.empty((site.reduced_transitions.size(),9),dtype=np.int64)
+        cdef cnp.ndarray[cnp.complex128_t,ndim=1] values = np.empty(site.reduced_transitions.size(),dtype=complex)
+        cdef cnp.ndarray[cnp.uint64_t,ndim=1] masks = np.empty(site.reduced_transitions.size(),dtype=np.uint64)
+        cdef SpatialNCReducedTransitionData entry
+        for i in range(site.reduced_transitions.size()):
+            entry = site.reduced_transitions[i]
+            labels[i,0],labels[i,1],labels[i,2],labels[i,3],labels[i,4] = entry.left,entry.right,entry.bra,entry.ket,entry.rank
+            labels[i,5],labels[i,6],labels[i,7],labels[i,8] = entry.left_copy,entry.right_copy,entry.bra_copy,entry.ket_copy
+            values[i] = entry.value.real()+1j*entry.value.imag()
+            masks[i] = entry.family_mask
+        return labels,values,masks
+
+    def spatial_normal_complementary_schedule(self):
+        """Return diagnostic copies of direct shell primitives and NC routes."""
+        cdef const SpatialNCScheduleData* schedule = &self._system.spatial_normal_complementary_schedule()
+        cdef size_t i,j
+        cdef const SpatialNCSitePlanData* site
+        cdef cnp.ndarray[cnp.double_t, ndim=2] values
+        channels = []
+        for i in range(schedule.channels.size()):
+            channels.append([(schedule.channels[i][j].kind,schedule.channels[i][j].first,
+                              schedule.channels[i][j].second) for j in range(schedule.channels[i].size())])
+        sites = []
+        for i in range(schedule.sites.size()):
+            site = &schedule.sites[i]
+            primitives = []
+            for j in range(site.primitives.size()):
+                values = np.empty((site.physical_dimension,site.physical_dimension),dtype=float)
+                memcpy(<void*>cnp.PyArray_DATA(values),<const void*>site.primitives[j].values.data(),site.primitives[j].values.size()*sizeof(double))
+                primitives.append(values)
+            sites.append({'primitives':primitives,
+                          'words':[list(site.primitives[j].word) for j in range(site.primitives.size())],
+                          'parity':[bool(site.primitives[j].right_parity) for j in range(site.primitives.size())],
+                          'transitions':[(site.transitions[j].source,site.transitions[j].target,
+                              site.transitions[j].primitive,site.transitions[j].coefficient,
+                              site.transitions[j].family_mask) for j in range(site.transitions.size())]})
+        return {'offsets':list(schedule.shell_offsets),'channels':channels,'sites':sites,
+                'integral_revision':int(schedule.integral_revision)}
 
     def normal_complementary_primitives(self, long long site):
         """Return a diagnostic copy of the C++-owned local primitive table."""
@@ -10226,23 +10487,31 @@ cdef class MultipletLocalAction:
     """Owned reduced factors for product-irrep local assembly and application.
 
     Routes contain (output offset, input offset, left, operator, right,
-    structural weight). Factors have multiplicity axes only. Reuses the
+    structural weight). Factors have multiplicity axes only. Small routes
+    share a call-local scratch buffer, so concurrent calls remain independent.
+    Reuses the
     rank-coupled SU(2) factorization with the product-group structural weights.
     """
     cdef list entries
     cdef list matrix_entries
     cdef Py_ssize_t count
+    cdef Py_ssize_t owned_bytes
+    cdef Py_ssize_t scratch_elements
 
     def __init__(self, Py_ssize_t count, routes):
         cdef object ao, bo, left, op, right, weight, factor, key
         cdef dict factors = {}
         cdef dict packed = {}
+        cdef dict right_factors = {}
+        cdef dict right_matrices = {}
         cdef object right_matrix
         cdef Py_ssize_t A,B,Y,P,Q,C,D,work,packed_elements=0
         cdef Py_ssize_t elements = 0, size
         if count < 1:
             raise ValueError('Local dimension must be positive')
         self.count = count
+        self.owned_bytes = 0
+        self.scratch_elements = 0
         self.entries = []
         self.matrix_entries = []
         for ao,bo,left,op,right,weight in routes:
@@ -10266,8 +10535,14 @@ cdef class MultipletLocalAction:
                     raise MemoryError('Reduced factor workspace exceeds 64 MiB')
                 factor = _factorize_rank_coupled_left_complex(left.transpose(1,0,2),op)
                 factors[key] = (left,op,factor)
+            if id(right) not in right_factors:
+                size = right.size
+                packed_elements += size
+                if (elements+packed_elements)*16 > 64*1024**2:
+                    raise MemoryError('Reduced factor workspace exceeds 64 MiB')
+                right_factors[id(right)] = (right,np.array(right,dtype=np.complex128,order='C',copy=True))
             self.entries.append((int(ao),int(bo),factors[key][2],
-                np.array(right,dtype=np.complex128,order='C',copy=True),complex(weight)))
+                right_factors[id(right)][1],complex(weight)))
             factor = factors[key][2]
             A,B,Y,P,Q = factor.shape
             C,D = right.shape[0],right.shape[2]
@@ -10278,13 +10553,21 @@ cdef class MultipletLocalAction:
                     if (elements+packed_elements)*16 > 64*1024**2:
                         raise MemoryError('Reduced packed factor workspace exceeds 64 MiB')
                     packed[key] = np.ascontiguousarray(factor.transpose(0,3,1,4,2)).reshape(A*P,B*Q*Y)
-                packed_elements += right.size
-                if (elements+packed_elements)*16 > 64*1024**2:
-                    raise MemoryError('Reduced packed factor workspace exceeds 64 MiB')
-                right_matrix = np.array(right.transpose(2,0,1),dtype=np.complex128,order='C',copy=True).reshape(D,C*Y)
+                if id(right) not in right_matrices:
+                    packed_elements += right.size
+                    if (elements+packed_elements)*16 > 64*1024**2:
+                        raise MemoryError('Reduced packed factor workspace exceeds 64 MiB')
+                    right_matrices[id(right)] = np.array(right.transpose(2,0,1),dtype=np.complex128,order='C',copy=True).reshape(D,C*Y)
+                right_matrix = right_matrices[id(right)]
                 self.matrix_entries.append((packed[key],right_matrix))
             else:
                 self.matrix_entries.append(None)
+                self.scratch_elements = max(self.scratch_elements, B*Q*C*Y)
+        self.owned_bytes = (elements+packed_elements)*16
+
+    @property
+    def resident_bytes(self):
+        return self.owned_bytes
 
     def assemble(self):
         cdef cnp.complex128_t[:,::1] out = np.zeros((self.count,self.count),complex)
@@ -10313,7 +10596,7 @@ cdef class MultipletLocalAction:
         cdef cnp.complex128_t[::1] out = np.zeros(self.count,complex)
         cdef const cnp.complex128_t[:,:,:,:,::1] f
         cdef const cnp.complex128_t[:,:,::1] r
-        cdef cnp.complex128_t[:,:,:,::1] tmp
+        cdef cnp.complex128_t[::1] tmp = np.empty(self.scratch_elements,complex)
         cdef Py_ssize_t ao,bo,a,b,y,p,q,c,d,A,B,Y,P,Q,C,D,index
         cdef object matrices, product
         cdef cnp.complex128_t weight,value
@@ -10330,7 +10613,6 @@ cdef class MultipletLocalAction:
                 continue
             if B*Q*C*Y*16 > 64*1024**2:
                 raise MemoryError('Reduced action workspace exceeds 64 MiB')
-            tmp = np.empty((B,Q,C,Y),complex)
             with nogil:
                 for b in range(B):
                     for q in range(Q):
@@ -10339,7 +10621,7 @@ cdef class MultipletLocalAction:
                                 value = 0
                                 for d in range(D):
                                     value += v[bo+(b*Q+q)*D+d]*r[c,y,d]
-                                tmp[b,q,c,y] = value
+                                tmp[((b*Q+q)*C+c)*Y+y] = value
                 for a in range(A):
                     for p in range(P):
                         for c in range(C):
@@ -10347,7 +10629,7 @@ cdef class MultipletLocalAction:
                             for b in range(B):
                                 for q in range(Q):
                                     for y in range(Y):
-                                        value += f[a,b,y,p,q]*tmp[b,q,c,y]
+                                        value += f[a,b,y,p,q]*tmp[((b*Q+q)*C+c)*Y+y]
                             out[ao+(a*P+p)*C+c] += weight*value
         return np.asarray(out)
 
@@ -10399,3 +10681,67 @@ def reduce_operator_channel(block, coupling):
                                 for y in range(Y):
                                     out[i,j,r,y] += b[i,x,j,k,y]*coeff
     return np.asarray(out)
+
+
+cdef class SpatialNCLocalAction:
+    """Compiled sparse product-rank NC Hamiltonian action and exact diagonal."""
+    cdef SU2MovingEnvironment owner
+    cdef string key
+    cdef size_t dimension
+
+    def __init__(self,SU2MovingEnvironment owner,key,size_t dimension):
+        self.owner = owner
+        self.key = str(key).encode()
+        self.dimension = dimension
+
+    def __dealloc__(self):
+        if self.owner is not None and self.owner._engine != NULL:
+            self.owner._engine.release_spatial_nc_local_plan(self.key)
+
+    def __call__(self,vector):
+        cdef cnp.ndarray[cnp.complex128_t,ndim=1,mode='c'] source = np.ascontiguousarray(vector,dtype=complex).reshape(-1)
+        if source.size != self.dimension:
+            raise ValueError('Vector size differs from the direct NC local layout.')
+        cdef cnp.ndarray[cnp.complex128_t,ndim=1,mode='c'] output = np.empty(self.dimension,dtype=complex)
+        with nogil:
+            self.owner._engine.spatial_nc_local_matvec(self.key,
+                <const cpp_complex[double]*>cnp.PyArray_DATA(source),
+                <cpp_complex[double]*>cnp.PyArray_DATA(output),self.dimension)
+        return output
+
+    def diagonal(self):
+        cdef cnp.ndarray[cnp.complex128_t,ndim=1,mode='c'] output = np.empty(self.dimension,dtype=complex)
+        with nogil:
+            self.owner._engine.spatial_nc_local_diagonal(self.key,
+                <cpp_complex[double]*>cnp.PyArray_DATA(output),self.dimension)
+        return output
+
+    def solve(self,guess,indices,scales,transform,double tolerance):
+        cdef vector[int64_t] kept = indices
+        cdef vector[double] metric_scales = scales
+        cdef vector[cpp_complex[double]] mapping = np.asarray(transform,dtype=complex).ravel()
+        cdef vector[cpp_complex[double]] initial = np.asarray(guess,dtype=complex).ravel()
+        cdef CppDavidsonResult result
+        with nogil:
+            result = self.owner._engine.spatial_nc_local_solve(self.key,kept,metric_scales,mapping,initial,tolerance)
+        return (result.energy,np.asarray(result.vector,dtype=complex),
+                {'iterations':result.iterations,'residual_norm':result.residual_norm,
+                 'matvec_calls':result.matvec_calls,'local_solver':'davidson'})
+
+    def assemble(self):
+        if self.dimension > 256:
+            raise MemoryError('Explicit NC local matrices are limited to 256 parameters.')
+        unit = np.zeros(self.dimension,complex)
+        output = np.empty((self.dimension,self.dimension),complex)
+        for i in range(self.dimension):
+            unit[i] = 1
+            output[:,i] = self(unit)
+            unit[i] = 0
+        return output
+
+
+include "nc_multiplet_sweep.pxi"
+
+include "nc_cbe.pxi"
+
+include "nc_two_site.pxi"

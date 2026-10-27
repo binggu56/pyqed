@@ -10,6 +10,7 @@ import numpy as np
 from scipy.sparse import coo_matrix
 from pyqed.symmetry import Irrep, Leg, ProductSymmetry, SU2Symmetry, U1Symmetry
 from pyqed.symmetry.point_group import PointGroupSymmetry
+from pyqed.symmetry.continuous import OrbitalRotationSymmetry
 from pyqed.mps.su2 import SU2Irrep
 from .coupling import clebsch_gordan, ordered_two_m_values
 
@@ -26,7 +27,7 @@ def irrep_coupling(symmetry, left, right, fused):
         out = np.array([[[clebsch_gordan(a,b,c,ma,mb,mc)
                          for mc in ordered_two_m_values(c)]
                         for mb in ordered_two_m_values(b)] for ma in ordered_two_m_values(a)])
-    elif isinstance(symmetry, PointGroupSymmetry):
+    elif isinstance(symmetry, (PointGroupSymmetry, OrbitalRotationSymmetry)):
         out = symmetry.coupling(left, right, fused)
     elif isinstance(symmetry, ProductSymmetry):
         out = np.ones((1, 1, 1))

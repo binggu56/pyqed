@@ -12,14 +12,20 @@ from pyqed.symmetry import Irrep, Leg, ProductSymmetry, SU2Symmetry, U1Symmetry,
 from pyqed.symmetry.point_group import irrep_subspaces
 from pyqed.qchem.symmetry import irrep_representation_matrices
 from pyqed.qchem.dmrg.spatial_terms import spatial_local_ops
+from pyqed.symmetry.continuous import OrbitalRotationSymmetry, orbital_subspaces
 
 
 def molecular_symmetry(group):
-    return ProductSymmetry((U1Symmetry(), SU2Symmetry(), PointGroupSymmetry(group)))
+    spatial = (OrbitalRotationSymmetry(group) if group in ('Coov','Dooh','SO3')
+               else PointGroupSymmetry(group))
+    return ProductSymmetry((U1Symmetry(), SU2Symmetry(), spatial))
 
 
-def orbital_multiplets(group, representations):
+def orbital_multiplets(group, representations, *, subspaces=None):
     """Orthonormal orbital change of basis with one complete multiplet per site."""
+    if group in ('Coov','Dooh','SO3'):
+        spaces = orbital_subspaces(group, representations) if subspaces is None else subspaces
+        return _multiplet_columns(spaces)
     definition = PointGroupSymmetry(group).group if isinstance(group,str) else group
     if all(d==1 for d in definition.irrep_dimensions.values()):
         matrices = np.stack([representations[op] for op in definition.operation_names])
@@ -35,6 +41,10 @@ def orbital_multiplets(group, representations):
             if all(label is not None for label in labels):
                 return eye,tuple(labels),tuple((i,) for i in range(len(eye)))
     spaces = irrep_subspaces(group, representations)
+    return _multiplet_columns(spaces)
+
+
+def _multiplet_columns(spaces):
     columns, labels, blocks = [], [], []
     offset = 0
     for label, space in spaces.items():
@@ -89,10 +99,12 @@ class OrbitalMultipletSite:
 
     def _build(self, group, orbital_irrep):
         self.group, self.orbital_irrep = group, orbital_irrep
-        matrices = irrep_representation_matrices(group, orbital_irrep)
+        continuous = group in ('Coov','Dooh','SO3')
+        matrices = (OrbitalRotationSymmetry(group).generators(orbital_irrep) if continuous
+                    else irrep_representation_matrices(group, orbital_irrep))
         self.norb = next(iter(matrices.values())).shape[0]
-        self.representations = {op: _local_fock_representation(matrix)
-                                for op,matrix in matrices.items()}
+        self.representations = (_local_fock_generators(matrices) if continuous else
+                               {op: _local_fock_representation(matrix) for op,matrix in matrices.items()})
         self.symmetry = molecular_symmetry(group)
         ops = spatial_local_ops()
         n = np.zeros((4**self.norb,)*2, complex)
@@ -120,7 +132,8 @@ class OrbitalMultipletSite:
                     continue
                 reps = {op: highest.conj().T @ matrix @ highest
                         for op,matrix in self.representations.items()}
-                for label, spaces in irrep_subspaces(group, reps).items():
+                spaces_by_label = orbital_subspaces(group,reps) if continuous else irrep_subspaces(group,reps)
+                for label, spaces in spaces_by_label.items():
                     sector = Irrep((charge,j2,label))
                     sectors[sector] = spaces.shape[1]
                     for copy in range(spaces.shape[1]):
@@ -135,3 +148,30 @@ class OrbitalMultipletSite:
             raise ArithmeticError('Incomplete orbital-multiplet local basis.')
         self.spin_squared = self.basis.conj().T @ s2 @ self.basis
         self.number = self.basis.conj().T @ n @ self.basis
+
+
+def _local_fock_generators(generators):
+    """Second-quantize generators within one complete orbital shell only."""
+    norb = len(generators['Lz'])
+    size = 4**norb
+    if size*size*16*(2*norb+8) > 512*1024**2:
+        raise MemoryError('Complete orbital-shell construction exceeds its 512 MiB workspace budget.')
+    ops = spatial_local_ops()
+    annihilators = []
+    for p in range(norb):
+        for spin in ('cu','cd'):
+            a = np.ones((1,1))
+            for q in range(norb):
+                a = np.kron(a,ops['JW'] if q<p else ops[spin] if q==p else ops['I'])
+            annihilators.append(a)
+    result = {}
+    for name,matrix in generators.items():
+        if not name.startswith('L'):
+            result[name] = _local_fock_representation(matrix)
+            continue
+        out = np.zeros((size,size),complex)
+        for p,q in zip(*np.nonzero(matrix)):
+            for spin in range(2):
+                out += matrix[p,q]*(annihilators[2*p+spin].conj().T@annihilators[2*q+spin])
+        result[name] = out
+    return result

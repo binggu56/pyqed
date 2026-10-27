@@ -3480,6 +3480,22 @@ std::size_t System::memory_bytes() const noexcept {
         total += family.values.capacity() * sizeof(double);
     }
     total += normal_complementary_memory_bytes();
+    if (spatial_schedule_) {
+        total += spatial_schedule_->shell_offsets.capacity()*sizeof(std::int64_t);
+        total += spatial_schedule_->ranks.capacity()*sizeof(SpatialNCQuantumNumber);
+        for (const auto& cut : spatial_schedule_->channels)
+            total += cut.capacity()*sizeof(SpatialNCChannel);
+        for (const auto& cut : spatial_schedule_->rank_channels)
+            for (const auto& channel : cut)
+                total += channel.capacity()*sizeof(SpatialNCChannelExpansion);
+        for (const auto& site : spatial_schedule_->sites) {
+            total += site.transitions.capacity()*sizeof(SpatialNCTransition);
+            total += site.reduced_transitions.capacity()*sizeof(SpatialNCReducedTransition);
+            for (const auto& primitive : site.primitives)
+                total += primitive.word.capacity()*sizeof(std::int64_t)
+                    + primitive.values.capacity()*sizeof(double);
+        }
+    }
     return total;
 }
 
@@ -3722,6 +3738,7 @@ void MovingEnvironment::clear_boundaries() {
     metric_boundaries_.clear();
     complex_boundaries_.clear();
     complex_metric_boundaries_.clear();
+    spatial_nc_local_plans_.clear();
 }
 
 void MovingEnvironment::decode_boundary_shapes(PackedArena& arena) {
@@ -5186,6 +5203,7 @@ bool MovingEnvironment::advance_normal_complementary_boundary(
             : topology_revision
         );
         boundary_action.output_topology_revision = topology_revision;
+        boundary_action.site_topology_revision = 0;
         boundary_action.output_offsets.assign(
             output_offsets,
             output_offsets + n_output_offsets
@@ -42789,3 +42807,43 @@ std::int64_t MovingEnvironment::active_bond() const noexcept {
 }
 
 }  // namespace pyqed::su2
+
+
+namespace pyqed::su2 {
+
+std::vector<double> System::local_fermion_operator(
+    std::int64_t begin, std::int64_t end,
+    const std::vector<std::int64_t>& word, bool right_parity
+) const {
+    if (begin < 0 || end <= begin || end > static_cast<std::int64_t>(n_sites_)
+        || word.size() > 4)
+        throw std::invalid_argument("Invalid bounded-shell fermion operator.");
+    std::vector<FermionSpec> specs;
+    for (auto mode : word) {
+        const auto orbital = (std::abs(mode)-1)/2;
+        if (mode == 0 || orbital < begin || orbital >= end)
+            throw std::invalid_argument("Fermion mode is outside its NC shell.");
+        specs.push_back({mode>0,static_cast<std::int32_t>((std::abs(mode)-1)%2),orbital});
+    }
+    constexpr std::size_t max_elements = 128*1024*1024/sizeof(double);
+    std::size_t dimension = 1;
+    std::vector<double> result{1.};
+    for (auto site = begin; site < end; ++site) {
+        if (dimension > max_elements/16/dimension)
+            throw std::length_error("Local NC operator exceeds 128 MiB.");
+        const auto next = 4*dimension;
+        auto local = component_string_site_operator(site,specs);
+        if (right_parity) local = multiply4(local,jordan_wigner4());
+        std::vector<double> values(next*next);
+        for (std::size_t a = 0; a < dimension; ++a)
+            for (std::size_t b = 0; b < dimension; ++b)
+                for (std::size_t p = 0; p < 4; ++p)
+                    for (std::size_t q = 0; q < 4; ++q)
+                        values[(4*a+p)*next+4*b+q] = result[a*dimension+b]*local[4*p+q];
+        result = std::move(values);
+        dimension = next;
+    }
+    return result;
+}
+
+} // namespace pyqed::su2

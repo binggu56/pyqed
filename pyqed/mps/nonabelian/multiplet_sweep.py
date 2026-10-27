@@ -70,11 +70,10 @@ class ReducedMultipletDMRG(MultipletDMRG):
     reuse rank-coupled factors and packed matrix products; NumPy remains the
     fallback when the extension is absent or factor storage exceeds 64 MiB.
 
-    ``run(algorithm="one_site_cbe", cbe_expansion=8)`` enables the shrewd-selection
-    adaptation of Gleis, Li and von Delft, PRL 130, 246402 (2023),
-    doi:10.1103/PhysRevLett.130.246402. Selection uses one-sided reduced MPO factors and four SVDs
-    (supplement Fig. S-2/Table I), followed by a genuine one-site solve.
-    Intermediate sector budgets and operator storage are adapted to product Legs.
+    ``run(algorithm="one_site_cbe", cbe_expansion=8)`` enables the explicit
+    DD-residual adaptation of Gleis, Li and von Delft, PRL 130, 246402 (2023),
+    doi:10.1103/PhysRevLett.130.246402. Selection joins two reduced MPO routes;
+    it does not implement shrewd selection or its single-site cost guarantee.
     Only one target multiplet is supported. All E partners share coefficients
     and survive multiplicity expansion/truncation together.
     """
@@ -104,8 +103,7 @@ class ReducedMultipletDMRG(MultipletDMRG):
     def _expand_bond(self,bond,direction,left,right,norm_left,norm_right):
         from .cbe import expand_multiplet_bond
         added = expand_multiplet_bond(self,bond,direction,left,right,norm_left,norm_right,
-                                     self._cbe_expansion,
-                                     selection=self._cbe_selection,
+                                     self._cbe_expansion,selection=self._cbe_selection,
                                      preselection_size=self._cbe_preselection)
         self.diagnostics["cbe_added_multiplets"] = self.diagnostics.get("cbe_added_multiplets", 0) + added
         return added
@@ -187,6 +185,9 @@ class ReducedMultipletDMRG(MultipletDMRG):
                 row[fusion.blocks[bk][0]]+=weight*value.ravel()
             rows.append(row)
         return rows
+
+    def _hamiltonian_action(self,site,left,right,*,assemble=False):
+        return self._local_action(site,self.mpo[site],left,right,assemble=assemble)
 
     def _local_action(self,site,core,left,right,*,assemble=False):
         fusion=self.fusion_maps[site]
@@ -275,10 +276,10 @@ class ReducedMultipletDMRG(MultipletDMRG):
             pull=lambda vector:complement.conj().T@base_pull(vector)
             guess=complement.conj().T@guess
         if count<=256:
-            h=self._local_action(site,self.mpo[site],left,right,assemble=True)
+            h=self._hamiltonian_action(site,left,right,assemble=True)
             action=lambda v:h@v
         else:
-            action=self._local_action(site,self.mpo[site],left,right)
+            action=self._hamiltonian_action(site,left,right)
         apply=lambda v:pull(action(lift(v)))
         if rank<=2:
             local=np.column_stack([apply(v) for v in np.eye(rank)])

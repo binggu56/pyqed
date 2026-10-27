@@ -37,6 +37,11 @@ class PointGroupSymmetry:
     def group(self):
         return _group(self.name)
 
+    @property
+    def identity(self):
+        return next(q for q in self.group.irrep_names
+                    if all(abs(x-1) < 1e-12 for x in self.group.character_table[q]))
+
     @lru_cache(maxsize=32)
     def dual(self, irrep):
         return self.group.irrep_names[self.group.irrep_id(irrep)]

@@ -1793,6 +1793,8 @@ def _solve_packed_generalized_davidson(
     Retain the measured projected overlap even after metric orthogonalization:
     finite-precision Krylov vectors need not have an identity Gram matrix.
     This small overlap matrix follows the same bounded subspace as Hs.
+    Convergence requires fresh Ritz actions; disagreement with cached actions
+    restarts from the Ritz vector within the original iteration budget.
     """
     timing = {
         "davidson": 0.0,
@@ -2048,6 +2050,7 @@ def _solve_packed_generalized_davidson(
         return theta_local, coeff_local
 
     correction_fallbacks = 0
+    residual_refreshes = 0
     for iterations in range(1, itermax + 1):
         t0 = time.perf_counter() if profile else None
         theta, coeff = _lowest_projected_root_with_reference(Hs, Ns)
@@ -2076,8 +2079,27 @@ def _solve_packed_generalized_davidson(
         )
         convergence_streak = convergence_streak + 1 if convergence_candidate else 0
         if convergence_streak >= convergence_confirmations:
-            converged = True
-            break
+            fresh_h = np.asarray(H(ritz_p), dtype=complex).reshape(-1)
+            fresh_n = np.asarray(N(ritz_p), dtype=complex).reshape(-1)
+            fresh_residual = float(np.linalg.norm(fresh_h-theta*fresh_n))
+            if fresh_residual <= tol_res:
+                converged = True
+                break
+            # Rebuild from the actual Ritz vector when cached basis actions
+            # cancel differently. Continue correcting the true residual.
+            metric_norm = float(np.vdot(ritz_p, fresh_n).real)
+            if not np.isfinite(metric_norm) or metric_norm <= 0:
+                raise ArithmeticError('Invalid Ritz norm during residual refresh')
+            scale = np.sqrt(metric_norm)
+            Vp = (ritz_p/scale)[:, None]
+            AVp = (fresh_h/scale)[:, None]
+            BVp = (fresh_n/scale)[:, None]
+            Hs = Vp.conj().T @ AVp
+            Ns = Vp.conj().T @ BVp
+            convergence_streak = 0
+            prev_theta = None
+            residual_refreshes += 1
+            continue
 
         t0 = time.perf_counter() if profile else None
         corr_p = precondition(resid_p, theta, ritz_p)
@@ -2238,6 +2260,7 @@ def _solve_packed_generalized_davidson(
         "metric_orthonormal_krylov": metric_orthonormal_krylov,
         "metric_direction_floor": metric_floor,
         "correction_fallbacks": correction_fallbacks,
+        "residual_refreshes": residual_refreshes,
         "projected_problem": "generalized",
         "preconditioner_mode": preconditioner_mode,
         "reduced_preconditioner": False,

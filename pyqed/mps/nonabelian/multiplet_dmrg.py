@@ -4,8 +4,9 @@ A fixed-multiplicity, one-site variational MPS algorithm adapted from the
 symmetry-factorized tensors of Singh, Pfeifer and Vidal, PRA 82, 050301
 (2010), doi:10.1103/PhysRevA.82.050301. Local generalized Rayleigh--Ritz
 problems use reduced Hamiltonian actions. CG maps fix all spin/spatial
-partners; only reduced multiplicity tensors are optimized. The default
-reduced implementation carries only multiplicities in MPOs and environments.
+partners; only reduced multiplicity tensors are optimized. Finite and continuous molecular groups default to direct compiled NC two-site sweeps.
+Explicit ``contractions="reduced"`` selects the independent reduced MPO
+reference.
 ``contractions="components"`` retains explicit irrep rows for comparisons.
 Small reduced local matrices are assembled up to 256 parameters; larger
 Hamiltonian actions are matrix-free.
@@ -14,6 +15,7 @@ Hamiltonian. D caps whole reduced multiplicities. The reduced subclass also
 supports one-site CBE; see cbe.py for its reference and fidelity limitations.
 """
 from functools import lru_cache
+from .sweep_control import SweepControl
 from numbers import Integral
 import numpy as np
 from scipy.linalg import eigh, null_space
@@ -96,7 +98,8 @@ class MultipletMPS(MPS):
 
 def _bond_legs(sites, target, D):
     symmetry = sites[0].symmetry
-    identity = symmetry.factors[-1].group.irrep_names[0]
+    spatial = symmetry.factors[-1]
+    identity = spatial.identity if hasattr(spatial,'identity') else spatial.group.irrep_names[0]
     vacuum = Irrep((0,0,identity))
     counts = [{vacuum:1}]
     for site in sites:
@@ -164,12 +167,34 @@ class MultipletDMRG:
     @classmethod
     def from_integrals(cls, h1e, eri, *, nelec, spin=0, D=32, ecore=0.,
                        orbital_representations, wfnsym, point_group='D3h',
-                       seed=11, n_threads=None, cutoff=1e-12, contractions="reduced"):
-        if contractions not in ('components','reduced'):
-            raise ValueError("contractions must be 'components' or 'reduced'.")
-        if contractions == 'reduced' and cls is MultipletDMRG:
+                       seed=11, n_threads=None, cutoff=1e-12, contractions=None):
+        """Build reduced charge × spin × orbital multiplet DMRG.
+
+        ``orbital_representations`` contains unitary operation matrices for
+        finite groups. For Coov/Dooh/SO3 it contains Hermitian L generators
+        and unitary reflection/inversion matrices, as returned by
+        ``mo_symmetry_representations(..., generators=True)``. Every site
+        contains a complete orbital multiplet. Fusion follows the
+        Wigner–Eckart construction of Singh and Vidal, PRB 86, 195114 (2012),
+        https://doi.org/10.1103/PhysRevB.86.195114, adapted to a direct product
+        of charge, spin and spatial symmetry. No spin-orbit coupling is included.
+        All supported finite and continuous groups default to direct NC; request ``contractions="reduced"``
+        explicitly for the independent MPO reference.
+        Local shell Fock construction has a 512 MiB estimated workspace limit;
+        it does not expand the molecular determinant space.
+        """
+        if contractions is None:
+            contractions = 'nc'
+        if contractions not in ('components','reduced','nc'):
+            raise ValueError("contractions must be components, reduced or nc.")
+        if contractions == 'nc':
+            from .nc_multiplet import NCMultipletDMRG
+            cls = NCMultipletDMRG
+        if contractions == 'reduced':
             from .multiplet_sweep import ReducedMultipletDMRG
             cls = ReducedMultipletDMRG
+        elif contractions == 'components':
+            cls = MultipletDMRG
         if not isinstance(D,Integral) or isinstance(D,bool) or D<1:
             raise ValueError('D must be a positive integer.')
         obj = cls()
@@ -182,11 +207,16 @@ class MultipletDMRG:
         if not isinstance(obj.n_threads,Integral) or isinstance(obj.n_threads,bool) or obj.n_threads<1:
             raise ValueError('n_threads must be positive.')
         obj.workers = 1
-        obj.spatial_symmetry = SpatialGroupAction(orbital_representations,wfnsym,point_group=point_group)
+        if point_group in ('Coov','Dooh','SO3'):
+            from pyqed.symmetry.continuous import OrbitalGeneratorAction
+            obj.spatial_symmetry = OrbitalGeneratorAction(orbital_representations,wfnsym,point_group=point_group)
+        else:
+            obj.spatial_symmetry = SpatialGroupAction(orbital_representations,wfnsym,point_group=point_group)
         obj.spatial_symmetry.validate_hamiltonian(h1e,eri)
         obj.wfnsym = obj.spatial_symmetry.wfnsym
         obj.partner_dimension = obj.spatial_symmetry.dimension
-        transform, labels, blocks = orbital_multiplets(point_group,orbital_representations)
+        transform, labels, blocks = orbital_multiplets(point_group,orbital_representations,
+            subspaces=getattr(obj.spatial_symmetry, "subspaces", None))
         obj.orbital_transform, obj.orbital_blocks = transform,blocks
         obj.sites = tuple(OrbitalMultipletSite(point_group,label) for label in labels)
         obj.nsites = len(obj.sites)
@@ -199,7 +229,7 @@ class MultipletDMRG:
         h = transform.conj().T @ np.asarray(h1e) @ transform
         v = np.einsum('pa,qb,rc,sd,pqrs->abcd',transform.conj(),transform,
                       transform.conj(),transform,np.asarray(eri),optimize=True)
-        obj.mpo = obj._make_mpo(h,v,obj.sites,blocks,cutoff)
+        obj._build_hamiltonian(h,v,obj.sites,blocks,cutoff)
         obj._seed = int(seed)
         obj._initialize(seed)
         obj.states, obj.history = (), []
@@ -209,10 +239,20 @@ class MultipletDMRG:
                            'orbital_multiplets':labels,'physical_dimensions':tuple(s.leg.full_dim for s in obj.sites),
                            'reduced_physical_dimensions':tuple(s.leg.dim for s in obj.sites),
                            'contraction_representation':contractions,
-                           'mpo_reduced':contractions=='reduced','environments_reduced':contractions=='reduced'}
+                           'mpo_reduced':contractions=='reduced','environments_reduced':contractions in ('reduced','nc')}
+        obj.diagnostics.update(obj._hamiltonian_diagnostics())
         return obj
 
     _make_mpo = staticmethod(_group_mpo)
+
+    def _build_hamiltonian(self,h,v,sites,blocks,cutoff):
+        self.mpo = self._make_mpo(h,v,sites,blocks,cutoff)
+
+    def _hamiltonian_diagnostics(self):
+        return {'hamiltonian_representation':'mpo','hamiltonian_mpo':True}
+
+    def _state_energy(self,state):
+        return float(state.expectation(self.mpo).real+self.ecore)
 
     def _edge(self, right=False):
         if not right:
@@ -334,9 +374,25 @@ class MultipletDMRG:
     def _finish_cycle(self, h, norm):
         self._refresh()
 
+    def _configure_sweeps(self,nsweeps,algorithm,tol,min_sweeps,max_bond_mode):
+        self._sweep_control = SweepControl(nsweeps, algorithm=algorithm, tolerance=tol,
+            min_steps=min_sweeps, max_bond_mode=max_bond_mode, default_bond_mode="per_sector")
+        if self._sweep_control.max_bond_mode != "per_sector":
+            raise ValueError("Spatial multiplet D counts multiplicities per sector; use max_bond_mode=per_sector.")
+        self.diagnostics.update(self._sweep_control.diagnostics())
+
+    def _complete_cycle(self,cycle,before,records):
+        record = dict(cycle=cycle+1, energy=self.energy, sites=records)
+        self.history.append(record)
+        self.success = self.converged = self._sweep_control.finish(record,
+            step=cycle+1, energy_delta=abs(self.energy-before),
+            local_converged=all(r.get('converged',True) for r in records))
+        return self.success
+
     def _run_multiplet(self, *, nsweeps=12, tol=1e-9, metric_rtol=1e-10,
             local_tol=1e-11, verbose=0, algorithm="one_site", cbe_expansion=8,
-            cbe_selection="shrewd", cbe_preselection=None):
+            cbe_selection="shrewd", cbe_preselection=None, min_sweeps=1, max_bond_mode="per_sector"):
+        self._configure_sweeps(nsweeps,algorithm,tol,min_sweeps,max_bond_mode)
         if algorithm not in {"one_site", "one_site_cbe"}:
             raise ValueError("Multiplet algorithm must be one_site or one_site_cbe")
         self._cbe_expansion = 0
@@ -348,13 +404,11 @@ class MultipletDMRG:
             self._cbe_expansion = int(cbe_expansion)
             self._cbe_selection = cbe_selection
             self._cbe_preselection = cbe_preselection
-        if not isinstance(nsweeps,Integral) or isinstance(nsweeps,bool) or nsweeps<1:
-            raise ValueError('nsweeps must be positive.')
         if any(not np.isfinite(value) or value <= 0 for value in (tol,local_tol,metric_rtol)) or metric_rtol >= 1:
             raise ValueError('Tolerances must be finite and positive, with metric_rtol < 1.')
         fixed = None
         with threadpool_limits(limits=1):
-            for cycle in range(nsweeps):
+            for cycle in self._sweep_control.steps:
                 before = self.energy
                 records = []
                 for direction in ('lr','rl'):
@@ -393,13 +447,15 @@ class MultipletDMRG:
                     # pass. Refresh scales site zero only, outside lr suffixes.
                     fixed = next_h,next_n
                 self._finish_cycle(moving_h,moving_n)
-                self.history.append({'cycle':cycle+1,'energy':self.energy,'sites':records})
+                done = self._complete_cycle(cycle,before,records)
                 if verbose:
                     print(f'Multiplet DMRG {cycle+1}: {self.energy:.12f}',flush=True)
-                if abs(self.energy-before)<tol:
-                    self.success = self.converged = True
+                if done:
                     break
         self.message = 'converged' if self.success else 'sweep limit reached'
+        return self._store_multiplet_states()
+
+    def _store_multiplet_states(self):
         tensors = [f.tensor(v) for f,v in zip(self.fusion_maps,self.vectors)]
         states = []
         for row in range(self.partner_dimension):
@@ -490,16 +546,25 @@ class MultipletDMRG:
     def symmetry_diagnostics(self):
         """Check every returned partner against every finite-group operation."""
         from pyqed.qchem.symmetry import irrep_representation_matrices
-        matrices = irrep_representation_matrices(self.spatial_symmetry.group,self.wfnsym)
+        from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+        group = self.spatial_symmetry.group
+        continuous = isinstance(group,OrbitalRotationSymmetry)
+        matrices = group.generators(self.wfnsym) if continuous else irrep_representation_matrices(group,self.wfnsym)
         chains = [state.component_tensors() for state in self.states]
         gram = np.array([[_overlap(a,b) for b in chains] for a in chains])
         error = 0.
         for op,matrix in matrices.items():
             local = [site.basis.conj().T @ site.representations[op] @ site.basis for site in self.sites]
-            transformed = [[np.einsum('pq,aqb->apb',u,a) for u,a in zip(local,chain)] for chain in chains]
-            actual = np.array([[_overlap(a,b) for b in transformed] for a in chains])
+            if continuous and op.startswith('L'):
+                actual = np.zeros((len(chains),len(chains)),complex)
+                for site,u in enumerate(local):
+                    transformed = [chain[:site]+[np.einsum('pq,aqb->apb',u,chain[site])]+chain[site+1:] for chain in chains]
+                    actual += np.array([[_overlap(a,b) for b in transformed] for a in chains])
+            else:
+                transformed = [[np.einsum('pq,aqb->apb',u,a) for u,a in zip(local,chain)] for chain in chains]
+                actual = np.array([[_overlap(a,b) for b in transformed] for a in chains])
             expected = np.kron(np.eye(self.spatial_multiplet_count),matrix)
             error = max(error,float(np.max(abs(actual-expected))))
         return {'orthogonality_error':float(np.max(abs(gram-np.eye(len(chains))))),
                 'covariance_error':error,
-                'partner_energies_hartree':[float(state.expectation(self.mpo).real+self.ecore) for state in self.states]}
+                'partner_energies_hartree':[self._state_energy(state) for state in self.states]}

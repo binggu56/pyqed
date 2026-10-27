@@ -232,7 +232,7 @@ def test_qchem_su2_fused_output_openmp_matches_serial(monkeypatch, tasked, budge
             n_threads=n_threads,
             require_convergence=False,
             su2_kernel_backend="cpp",
-            conv_tol=-1.0,
+            conv_tol=0.0,
             bond_multiplicity=4,
             seed=20260828,
             davidson_tol=1.0e-4,

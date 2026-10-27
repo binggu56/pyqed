@@ -32,6 +32,7 @@ from .contraction import (
     normalize_site_tensor_layout,
     split_mps_sites_from_packed,
 )
+from .sweep_control import SweepControl
 from .decompose import state_averaged_svd_two_site
 from .linalg import sector_state_weight
 from .mps import MPS
@@ -2839,6 +2840,9 @@ def run_sweeps(
         trace. Without ``mpo_factors``, ``energy`` falls back to the objective
         trace if available.
     """
+    control = SweepControl(nsweeps, algorithm=algorithm, tolerance=conv_tol,
+                           max_bond_mode=max_bond_mode)
+    max_bond_mode = control.max_bond_mode
     if algorithm == "one_site_cbe":
         if getattr(sites, "bc", "finite") != "finite":
             raise ValueError("CBE currently requires open MPS boundaries")
@@ -2941,7 +2945,7 @@ def run_sweeps(
             else None
         )
 
-    for sweep_idx in range(int(nsweeps)):
+    for sweep_idx in control.steps:
         resolved_schedule = _resolve_local_solver_schedule(
             local_solver_schedule,
             sweep_idx=sweep_idx,
@@ -3254,43 +3258,15 @@ def run_sweeps(
             not converge_on_full_sweeps
             or direction == full_sweep_end_direction
         )
-        if conv_tol is not None and convergence_boundary:
-            if (
-                sweep_nlocal_states > 1
-                and energy_delta is not None
-                and energy_delta <= float(conv_tol)
-                and history[-1].get("state_average_energy") is not None
-            ):
-                converged = True
-                history[-1]["converged"] = True
-                history[-1]["convergence_metric"] = "energy_delta"
-                break
-            if (
-                sweep_nlocal_states > 1
-                and energy_delta is not None
-                and energy_delta <= float(conv_tol)
-                and metric <= float(conv_tol)
-            ):
-                converged = True
-                history[-1]["converged"] = True
-                history[-1]["convergence_metric"] = "energy_delta+metric"
-                break
-            if sweep_nlocal_states <= 1:
-                if mpo_factors is not None and "energy" in history[-1]:
-                    if (
-                        energy_delta is not None
-                        and energy_delta <= float(conv_tol)
-                        and metric <= float(conv_tol)
-                    ):
-                        converged = True
-                        history[-1]["converged"] = True
-                        history[-1]["convergence_metric"] = "energy_delta+metric"
-                        break
-                elif metric <= conv_tol:
-                    converged = True
-                    history[-1]["converged"] = True
-                    history[-1]["convergence_metric"] = "metric"
-                    break
+        has_energy = mpo_factors is not None and "energy" in history[-1]
+        needs_delta = sweep_nlocal_states > 1 or has_energy
+        state_average = sweep_nlocal_states > 1 and history[-1].get("state_average_energy") is not None
+        if control.finish(history[-1], step=sweep_idx+1,
+                energy_delta=energy_delta if needs_delta else None,
+                metric=None if state_average else metric,
+                boundary=convergence_boundary and (not needs_delta or energy_delta is not None)):
+            converged = True
+            break
         if alternate:
             direction = "rl" if direction == "lr" else "lr"
 
@@ -3385,6 +3361,7 @@ def run_sweeps(
         else None
     )
     return {
+        "diagnostics": control.diagnostics(),
         "sites": final_sites,
         "mps": MPS(
             final_sites,

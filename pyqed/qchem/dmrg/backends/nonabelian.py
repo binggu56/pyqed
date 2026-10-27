@@ -1388,6 +1388,7 @@ def _run_spatial_qchem_dmrg(
     moving_stats = final_history.get("moving_environment_stats") or {}
     engine_stats = moving_stats.get("su2_moving_environment") or {}
     solver.diagnostics = {
+        **result["diagnostics"],
         "kernel_backend": final_history.get("su2_kernel_backend_actual"),
         "kernel_policy": final_history.get("su2_kernel_policy"),
         "timing": final_history.get("timing"),

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "../../linalg/davidson.hpp"
+#include "orbital_rank.hpp"
+#include "nc_spatial_plan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -198,6 +200,22 @@ public:
         std::size_t n_output
     ) const;
 
+    void configure_spatial_shells(const std::vector<std::int64_t>& offsets);
+    void reduce_spatial_normal_complementary(
+        OrbitalGroup group, const std::vector<SpatialNCQuantumNumber>& ranks,
+        const std::vector<std::vector<std::vector<SpatialNCChannelExpansion>>>& channels,
+        const std::vector<std::vector<std::vector<SpatialNCPhysicalExpansion>>>& physical,
+        const std::vector<SpatialNCCoupling>& couplings,
+        const std::vector<std::int64_t>& finite_dimensions,
+        const std::vector<std::int64_t>& finite_products
+    );
+    const SpatialNCSchedule& spatial_normal_complementary_schedule() const;
+    std::uint64_t spatial_normal_complementary_revision() const noexcept;
+    std::vector<double> local_fermion_operator(
+        std::int64_t begin, std::int64_t end,
+        const std::vector<std::int64_t>& word, bool right_parity
+    ) const;
+
     const std::vector<double>& h1() const noexcept;
     const std::vector<double>& eri() const noexcept;
     const std::vector<std::int64_t>& orb_sym() const noexcept;
@@ -221,6 +239,8 @@ private:
     std::map<std::int32_t, FamilyData> families_;
     std::vector<NormalComplementaryPlan> normal_complementary_plans_;
     std::vector<double> normal_complementary_primitives_;
+    std::shared_ptr<SpatialNCSchedule> spatial_schedule_;
+    std::uint64_t spatial_revision_ = 0;
 };
 
 struct PackedArena {
@@ -270,6 +290,17 @@ struct ComplexPackedArena {
     std::vector<std::int64_t> shapes;
     std::uint64_t topology_revision = 0;
     std::uint64_t numeric_revision = 0;
+};
+
+struct SpatialNCLocalPlan {
+    std::int64_t site = 0;
+    std::size_t dimension = 0;
+    std::uint64_t revision = 0;
+    std::vector<std::int64_t> offsets, shapes;
+    std::vector<std::array<std::int64_t,5>> routes;
+    std::vector<double> weights;
+    std::vector<std::vector<std::size_t>> output_routes;
+    ComplexPackedArena left, right;
 };
 
 struct ComplexBoundaryBufferHandle {
@@ -1806,6 +1837,42 @@ public:
     int openmp_version() const noexcept;
     std::uint64_t openmp_parallel_regions() const noexcept;
     std::uint64_t openmp_tasks() const noexcept;
+
+    void install_spatial_nc_boundary(
+        const std::string& side, std::int64_t bond,
+        const std::vector<Complex>& values,
+        const std::vector<std::int64_t>& offsets,
+        const std::vector<std::int64_t>& shapes,
+        const std::vector<std::int64_t>& labels
+    );
+    void advance_spatial_nc_boundary(
+        const std::string& side, std::int64_t parent_bond, std::int64_t child_bond,
+        std::int64_t site, const std::vector<std::vector<std::int64_t>>& routes,
+        const std::vector<double>& weights,
+        const std::vector<Complex>& bra, const std::vector<std::int64_t>& bra_offsets,
+        const std::vector<std::int64_t>& bra_shapes,
+        const std::vector<Complex>& ket, const std::vector<std::int64_t>& ket_offsets,
+        const std::vector<std::int64_t>& ket_shapes,
+        const std::vector<std::int64_t>& output_offsets,
+        const std::vector<std::int64_t>& output_shapes,
+        const std::vector<std::int64_t>& output_labels
+    );
+    void install_spatial_nc_local_plan(
+        const std::string& key, std::int64_t site,
+        const std::vector<std::vector<std::int64_t>>& routes,
+        const std::vector<double>& weights,
+        const std::vector<std::int64_t>& offsets,
+        const std::vector<std::int64_t>& shapes
+    );
+    void release_spatial_nc_local_plan(const std::string& key) noexcept;
+    void spatial_nc_local_matvec(const std::string& key,
+        const Complex* input, Complex* output, std::size_t dimension) const;
+    void spatial_nc_local_diagonal(const std::string& key,
+        Complex* output, std::size_t dimension) const;
+    pyqed::linalg::DavidsonResult spatial_nc_local_solve(
+        const std::string& key, const std::vector<std::int64_t>& indices,
+        const std::vector<double>& scales, const std::vector<Complex>& transform,
+        const std::vector<Complex>& guess, double tolerance);
 
     bool install_boundary(
         const std::string& side,
@@ -3414,6 +3481,7 @@ private:
     std::unordered_map<std::string, PackedArena> boundaries_;
     std::unordered_map<std::string, PackedArena> metric_boundaries_;
     std::unordered_map<std::string, ComplexPackedArena> complex_boundaries_;
+    std::unordered_map<std::string, SpatialNCLocalPlan> spatial_nc_local_plans_;
     std::unordered_map<std::string, ComplexPackedArena>
         complex_metric_boundaries_;
     std::unordered_map<std::int64_t, PackedArena> split_sites_;

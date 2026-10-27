@@ -18,6 +18,11 @@ from .symmetry import get_point_group, irrep_representation_matrices, mo_symmetr
 def resolve_spatial_target(group, wfnsym=None):
     if wfnsym is None:
         return None
+    if getattr(group,'continuous',False):
+        from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+        if not isinstance(wfnsym,str):
+            raise ValueError('Continuous orbital targets require a whole-irrep label.')
+        return OrbitalRotationSymmetry(group.name).dual(wfnsym)
     index = group.irrep_id(wfnsym) if isinstance(wfnsym, str) else int(wfnsym)
     if index < 0 or index >= len(group.irrep_names):
         raise ValueError('Invalid spatial irrep id.')
@@ -35,6 +40,8 @@ class SpatialGroupAction:
 
     def __init__(self, orbital_representations, wfnsym, *, point_group='D3h', tol=1e-8):
         self.group = get_point_group(point_group) if isinstance(point_group, str) else point_group
+        if self.group.continuous:
+            raise ValueError('Use angular generators and the reduced multiplet solver for continuous groups.')
         self.wfnsym = resolve_spatial_target(self.group, wfnsym)
         if self.wfnsym is None:
             raise ValueError('A target spatial irrep is required.')
@@ -285,7 +292,11 @@ def run_spatial_ci(model, *, nstates, mo_coeff=None, ci0=None, use_cholesky=None
         model.binary = get_fci_string_basis(mo_occ=_reference_active_occupations(model.nelecas_spin, model.ncas))
     action = getattr(model, '_spatial_ci_action', None)
     if action is None:
-        action = CISpatialGroupAction(model, target)
+        if group.continuous:
+            from .orbital_symmetry import CIOrbitalAction
+            action = CIOrbitalAction(model,target)
+        else:
+            action = CISpatialGroupAction(model, target)
     else:
         if action.wfnsym != target or action.norb != model.ncas or action.ndet != len(model.binary):
             raise ValueError('Cached spatial CI action does not match this solve.')

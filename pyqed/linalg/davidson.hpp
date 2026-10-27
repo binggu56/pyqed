@@ -1101,6 +1101,7 @@ DavidsonResult davidson(
             workspace.correction[index] =
                 workspace.residual[index] / denominator;
         }
+        const double correction_scale = norm2(workspace.correction);
         for (int pass = 0; pass < 2; ++pass) {
             for (
                 std::size_t basis_index = 0;
@@ -1118,9 +1119,11 @@ DavidsonResult davidson(
             }
         }
         const double correction_norm = norm2(workspace.correction);
-        if (correction_norm < 1.0e-10 || basis_size >= workspace.capacity) {
+        const double dependence_threshold = 32.0 * std::numeric_limits<double>::epsilon()
+            * correction_scale;
+        if (correction_norm <= dependence_threshold || basis_size >= workspace.capacity) {
             if (
-                correction_norm < 1.0e-10
+                correction_norm <= dependence_threshold
                 || workspace.capacity < 2
             ) {
                 break;
@@ -2948,6 +2951,7 @@ DavidsonResult real_davidson(
                     olsen_scale * workspace.h_ritz[index];
             }
         }
+        const double correction_scale = real_norm(workspace.correction.data(), dimension);
         for (int pass = 0; pass < 2; ++pass) {
             for (
                 std::size_t basis_index = 0;
@@ -2970,12 +2974,14 @@ DavidsonResult real_davidson(
             workspace.correction.data(),
             dimension
         );
+        const double dependence_threshold = 32.0 * std::numeric_limits<double>::epsilon()
+            * correction_scale;
         if (
-            correction_norm < 1.0e-10
+            correction_norm <= dependence_threshold
             || basis_size >= workspace.capacity
         ) {
             if (
-                correction_norm < 1.0e-10
+                correction_norm <= dependence_threshold
                 || workspace.capacity < 2
             ) {
                 break;

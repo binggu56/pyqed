@@ -181,41 +181,8 @@ def solve_cbe(merged, operator, *, norm_operator=None, canonical_norm=False,
 
 
 def multiplet_pair(driver, bond):
-    """Reduced parent matrices for two complete orbital-multiplet sites."""
-    from pyqed.symmetry import Irrep, Leg
-    from .fusion import TensorFusionMap
-    a, b = driver.fusion_maps[bond:bond+2]
-    sym = a.legs[0].symmetry
-    sectors = {Irrep(q) for l in a.legs[0].sectors for p in a.legs[1].sectors
-               for q in sym.fuse(l.charge,p.charge)}
-    sectors = {q for q in sectors if any(r.charge in sym.fuse(q.charge,p.charge)
-               for p in b.legs[1].sectors for r in b.legs[2].sectors)}
-    leg = Leg({q:1 for q in sorted(sectors,key=repr)},symmetry=sym)
-    left = TensorFusionMap(a.legs[0],a.legs[1],leg)
-    right = TensorFusionMap(leg,b.legs[1],b.legs[2])
-    ad, bd = a.unpack(driver.vectors[bond]), b.unpack(driver.vectors[bond+1])
-    layouts, matrices = {}, {}
-    for q in leg.sectors:
-        rows,cols={},{}
-        for keys,axis,output in ((left.blocks,2,rows),(right.blocks,0,cols)):
-            offset=0
-            for key in keys:
-                if key[axis]!=q: continue
-                shape = keys[key][1]
-                size = shape[0]*shape[1] if axis==2 else shape[1]*shape[2]
-                output[key]=(slice(offset,offset+size),shape)
-                offset+=size
-        nr=sum(x[0].stop-x[0].start for x in rows.values())
-        nc=sum(x[0].stop-x[0].start for x in cols.values())
-        if (sum(m.size for m in matrices.values()) + nr*nc)*128 > 256*1024**2:
-            raise MemoryError('CBE reduced pair workspace exceeds 256 MiB')
-        matrix=np.zeros((nr,nc),complex)
-        for ak,(rs,ashape) in rows.items():
-            for bk,(cs,bshape) in cols.items():
-                if ak in ad and bk in bd:
-                    matrix[rs,cs]=ad[ak].reshape(ashape[0]*ashape[1],-1)@bd[bk].reshape(bd[bk].shape[0],-1)
-        matrices[q]=matrix; layouts[q]=(rows,cols)
-    return matrices,layouts,left,right
+    from ._su2_kernel import multiplet_pair as execute
+    return execute(driver,bond)
 
 
 def multiplet_pair_action(driver,bond,matrices,layouts,left_map,right_map,left_env,right_env):
@@ -243,21 +210,8 @@ def multiplet_pair_action(driver,bond,matrices,layouts,left_map,right_map,left_e
 
 
 def install_multiplet_pair(driver,bond,layouts,left_values,right_values):
-    from pyqed.symmetry import Leg
-    from .fusion import TensorFusionMap
-    a,b=driver.fusion_maps[bond:bond+2]
-    dims={q:v.shape[1] for q,v in left_values.items() if v.shape[1]}
-    leg=Leg(dims,symmetry=a.legs[0].symmetry)
-    lm=TensorFusionMap(a.legs[0],a.legs[1],leg)
-    rm=TensorFusionMap(leg,b.legs[1],b.legs[2])
-    lv=np.zeros(lm.parameter_count,complex);rv=np.zeros(rm.parameter_count,complex)
-    for q in dims:
-        rows,cols=layouts[q]
-        for key,(rs,shape) in rows.items(): lv[lm.blocks[key][0]]=left_values[q][rs].ravel()
-        for key,(cs,shape) in cols.items(): rv[rm.blocks[key][0]]=right_values[q][:,cs].ravel()
-    maps=list(driver.fusion_maps);maps[bond:bond+2]=[lm,rm];driver.fusion_maps=tuple(maps)
-    driver.vectors[bond:bond+2]=[lv,rv]
-    driver.bond_legs[bond+1]=leg
+    from ._su2_kernel import install_multiplet_pair as execute
+    return execute(driver,bond,layouts,left_values,right_values)
 
 
 def expand_multiplet_bond(driver,bond,direction,left_env,right_env,norm_left,norm_right,expansion_size,
@@ -318,50 +272,5 @@ def expand_multiplet_bond(driver,bond,direction,left_env,right_env,norm_left,nor
 
 
 def truncate_multiplet_bond(driver,bond,direction):
-    """Truncate complete spatial multiplets from site factors in the compiled engine."""
-    from .multiplet_operator import dimension
-    from ._su2_kernel import SectorDecomposition
-    engine = getattr(driver, '_cbe_decomposition', None)
-    if engine is None:
-        driver._cbe_decomposition = engine = SectorDecomposition()
-    a, b = driver.fusion_maps[bond:bond+2]
-    ad, bd = a.unpack(driver.vectors[bond]), b.unpack(driver.vectors[bond+1])
-    layouts, left_factors, right_factors, metrics = {}, [], [], []
-    for q in a.legs[2].sectors:
-        rows, cols = {}, {}
-        lv, rv, weights = [], [], []
-        for data, axis, table, pieces in ((ad, 2, rows, lv), (bd, 0, cols, rv)):
-            offset = 0
-            for key, value in data.items():
-                if key[axis] != q:
-                    continue
-                shape = value.shape
-                size = shape[0]*shape[1] if axis == 2 else shape[1]*shape[2]
-                table[key] = (slice(offset, offset+size), shape)
-                offset += size
-                pieces.append(value.reshape(size, shape[2]) if axis == 2
-                              else value.reshape(shape[0], size))
-                if axis == 0:
-                    weights.extend([np.sqrt(dimension(driver.mpo.symmetry, key[2])
-                                    / dimension(driver.mpo.symmetry, q))]*size)
-        if not lv or not rv:
-            continue
-        layouts[q] = rows, cols
-        left_factors.append(np.concatenate(lv, axis=0))
-        metrics.append(np.asarray(weights))
-        right_factors.append(np.concatenate(rv, axis=1)*metrics[-1][None, :])
-    result = engine.blockwise_svd(left_factors,
-        [dimension(driver.mpo.symmetry, q) for q in layouts],
-        right_factors=right_factors, cutoff=0., max_bond=driver.D, max_bond_mode='per_sector')
-    left, right = {}, {}
-    for i, q in enumerate(layouts):
-        s = result['singular_values'][i]
-        keep = result['kept_indices'][i]
-        keep = keep[s[keep] > 1e-12*max(s.max(initial=0), 1e-30)]
-        u, vh = result['left'][i][:, keep], result['right'][i][keep]/metrics[i][None, :]
-        if direction == 'lr':
-            left[q], right[q] = u, s[keep, None]*vh
-        else:
-            left[q], right[q] = u*s[keep], vh
-    install_multiplet_pair(driver,bond,layouts,left,right)
-    driver.diagnostics['cbe_compiled_update'] = True
+    from ._su2_kernel import truncate_multiplet_bond as execute
+    return execute(driver,bond,direction)

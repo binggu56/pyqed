@@ -37,6 +37,10 @@ def _sector_dim_from_data(tensor, axis):
             dims[sector] = 1
             continue
         dims[sector] = int(tensor.legs[axis].dims[sector])
+        if axis == 1 and isinstance(sector, SpinChargeSector):
+            # Sparse expanded sites may have no block for this physical irrep.
+            # Its magnetic partners still belong to the local Hilbert space.
+            dims[sector] = max(dims[sector], int(sector.irrep.dim))
     return dims
 
 

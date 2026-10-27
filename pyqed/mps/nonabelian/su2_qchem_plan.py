@@ -12,6 +12,7 @@ from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 import hashlib
+from functools import lru_cache
 
 import numpy as np
 
@@ -2493,6 +2494,16 @@ class PackedSU2QChemCompiledTerms:
 
         left_family_masks = entry_family_masks(left)
         right_family_masks = entry_family_masks(right)
+        # Complex storage does not imply a complex operator. Convert exact
+        # real payloads locally, without changing shared pools or dropping
+        # small physical imaginary components.
+        from .environment import _real64_contiguous_or_none
+        def real_payload(pool):
+            values = np.asarray(pool.data)
+            if np.iscomplexobj(values) and np.any(values.imag):
+                return None
+            return _real64_contiguous_or_none(values)
+
         if has_raw_sources:
             raw_tables = (
                 left.factor_boundary_pool,
@@ -2500,7 +2511,8 @@ class PackedSU2QChemCompiledTerms:
                 right.factor_boundary_pool,
                 right.factor_w_pool,
             )
-            if any(np.iscomplexobj(pool.data) for pool in raw_tables):
+            payloads = {id(pool): real_payload(pool) for pool in raw_tables}
+            if any(values is None for values in payloads.values()):
                 return False
             topology_revision = _stable_array_revision(
                 self.in_indices,
@@ -2537,9 +2549,9 @@ class PackedSU2QChemCompiledTerms:
                 right.factor_w_pool.data,
             )
         else:
+            payloads = {id(pool): real_payload(pool) for pool in (left_pool, right_pool)}
             if (
-                np.iscomplexobj(left_pool.data)
-                or np.iscomplexobj(right_pool.data)
+                any(values is None for values in payloads.values())
                 or len(left_pool.offsets) < 2
                 or len(right_pool.offsets) < 2
                 or not np.asarray(left_pool.data).size
@@ -2580,11 +2592,11 @@ class PackedSU2QChemCompiledTerms:
                     boundary_pool.offsets,
                     boundary_pool.shape_offsets,
                     boundary_pool.shapes,
-                    boundary_pool.data,
+                    payloads[id(boundary_pool)],
                     w_pool.offsets,
                     w_pool.shape_offsets,
                     w_pool.shapes,
-                    w_pool.data,
+                    payloads[id(w_pool)],
                 )
 
             try:
@@ -2606,7 +2618,7 @@ class PackedSU2QChemCompiledTerms:
                     left_family_masks,
                     right_family_masks,
                 )
-            except (TypeError, ValueError, RuntimeError):
+            except (TypeError, ValueError, RuntimeError, IndexError):
                 owner.clear_factor_routes()
                 return False
             left.release_materialized_factors()
@@ -2624,12 +2636,12 @@ class PackedSU2QChemCompiledTerms:
                 left_pool.offsets,
                 left_pool.shape_offsets,
                 left_pool.shapes,
-                left_pool.data,
+                payloads[id(left_pool)],
                 right.factor_indices,
                 right_pool.offsets,
                 right_pool.shape_offsets,
                 right_pool.shapes,
-                right_pool.data,
+                payloads[id(right_pool)],
                 int(self.total_dim),
                 int(topology_revision),
                 int(numeric_revision),
@@ -4622,6 +4634,58 @@ class CppReducedMetricCompiledTerms:
         packed_apply.cpp_metric_key = self._cpp_metric_key
         return packed_apply
 
+def _route_sector_pair(sector):
+    charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
+    if charge is None and hasattr(sector, "labels"):
+        labels = tuple(str(label).lower() for label in sector.labels)
+        for label in ("charge", "n", "particle_number"):
+            if label in labels:
+                charge = sector.components[labels.index(label)]
+                break
+    irrep = getattr(sector, "irrep", None)
+    two_j = getattr(irrep, "two_j", None)
+    if two_j is None:
+        two_j = getattr(sector, "two_j", None)
+    if two_j is None and hasattr(sector, "labels"):
+        labels = tuple(str(label).lower() for label in sector.labels)
+        if "su2" in labels:
+            component = sector.components[labels.index("su2")]
+            two_j = getattr(component, "two_j", component)
+    if charge is None or two_j is None:
+        raise ValueError(
+            f"Cannot encode SU(2) sector {sector!r} for metric routes."
+        )
+    return int(charge), int(two_j)
+
+
+@lru_cache(maxsize=64)
+def _contextual_basis_arrays(entries, left_ids, right_ids):
+    """Pack immutable fusion topology shared by Hamiltonian and norm routes.
+
+    Keys include offsets, multiplicities and boundary codec IDs. Numerical
+    environments are deliberately excluded and are installed on every update.
+    """
+    arrays = (
+        np.asarray([offset for key, shape, offset in entries], dtype=np.int64),
+        np.asarray([shape for key, shape, offset in entries], dtype=np.int64),
+        np.asarray([[v for sector in key for v in _route_sector_pair(sector)]
+                    for key, shape, offset in entries], dtype=np.int64),
+        np.asarray(left_ids, dtype=np.int64),
+        np.asarray(right_ids, dtype=np.int64),
+    )
+    return arrays
+
+
+def _pack_contextual_basis(basis, left_boundary, right_boundary):
+    entries = tuple(basis)
+    signature = tuple((entry.key, entry.shape, int(entry.offset)) for entry in entries)
+    left_ids = tuple(left_boundary.sector_codec.index[e.key[0]] for e in entries)
+    right_ids = tuple(right_boundary.sector_codec.index[e.key[4]] for e in entries)
+    # Avoid retaining exceptionally large graph layouts in the global cache.
+    pack = (_contextual_basis_arrays if len(entries) <= 4096
+            else _contextual_basis_arrays.__wrapped__)
+    return pack(signature, left_ids, right_ids)
+
 
 def _build_cpp_reduced_metric_terms(
     basis,
@@ -4701,64 +4765,10 @@ def _build_cpp_reduced_metric_terms(
                 route_count=int(result["metric_route_count"]),
             )
 
-    def sector_pair(sector):
-        charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
-        if charge is None and hasattr(sector, "labels"):
-            labels = tuple(str(label).lower() for label in sector.labels)
-            for label in ("charge", "n", "particle_number"):
-                if label in labels:
-                    charge = sector.components[labels.index(label)]
-                    break
-        irrep = getattr(sector, "irrep", None)
-        two_j = getattr(irrep, "two_j", None)
-        if two_j is None:
-            two_j = getattr(sector, "two_j", None)
-        if two_j is None and hasattr(sector, "labels"):
-            labels = tuple(str(label).lower() for label in sector.labels)
-            if "su2" in labels:
-                component = sector.components[labels.index("su2")]
-                two_j = getattr(component, "two_j", component)
-        if charge is None or two_j is None:
-            raise ValueError(
-                f"Cannot encode SU(2) sector {sector!r} for metric routes."
-            )
-        return int(charge), int(two_j)
-
-    entries = tuple(basis)
     try:
-        basis_offsets = np.asarray(
-            [int(entry.offset) for entry in entries],
-            dtype=np.int64,
-        )
-        basis_shapes = np.asarray(
-            [tuple(int(dim) for dim in entry.shape) for entry in entries],
-            dtype=np.int64,
-        )
-        basis_quantum_numbers = np.asarray(
-            [
-                [
-                    value
-                    for sector in entry.key
-                    for value in sector_pair(sector)
-                ]
-                for entry in entries
-            ],
-            dtype=np.int64,
-        )
-        left_sector_ids = np.asarray(
-            [
-                left_boundary.sector_codec.index[entry.key[0]]
-                for entry in entries
-            ],
-            dtype=np.int64,
-        )
-        right_sector_ids = np.asarray(
-            [
-                right_boundary.sector_codec.index[entry.key[4]]
-                for entry in entries
-            ],
-            dtype=np.int64,
-        )
+        (basis_offsets, basis_shapes, basis_quantum_numbers,
+         left_sector_ids, right_sector_ids) = _pack_contextual_basis(
+            basis, left_boundary, right_boundary)
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -4957,63 +4967,10 @@ def build_contextual_channel_compiled_terms(
                 compiled.contextual_channel_resolved = True
                 return compiled
 
-        def sector_pair(sector):
-            charge = getattr(sector, "packed_charge", getattr(sector, "charge", None))
-            if charge is None and hasattr(sector, "labels"):
-                labels = tuple(str(label).lower() for label in sector.labels)
-                for label in ("charge", "n", "particle_number"):
-                    if label in labels:
-                        charge = sector.components[labels.index(label)]
-                        break
-            irrep = getattr(sector, "irrep", None)
-            two_j = getattr(irrep, "two_j", None)
-            if two_j is None:
-                two_j = getattr(sector, "two_j", None)
-            if two_j is None and hasattr(sector, "labels"):
-                labels = tuple(str(label).lower() for label in sector.labels)
-                if "su2" in labels:
-                    component = sector.components[labels.index("su2")]
-                    two_j = getattr(component, "two_j", component)
-            if charge is None or two_j is None:
-                raise ValueError(
-                    f"Cannot encode SU(2) sector {sector!r} for C++ routes."
-                )
-            return int(charge), int(two_j)
-
         try:
-            basis_offsets = np.asarray(
-                [int(entry.offset) for entry in entries],
-                dtype=np.int64,
-            )
-            basis_shapes = np.asarray(
-                [tuple(int(dim) for dim in entry.shape) for entry in entries],
-                dtype=np.int64,
-            )
-            basis_quantum_numbers = np.asarray(
-                [
-                    [
-                        value
-                        for sector in entry.key
-                        for value in sector_pair(sector)
-                    ]
-                    for entry in entries
-                ],
-                dtype=np.int64,
-            )
-            left_sector_ids = np.asarray(
-                [
-                    left_boundary.sector_codec.index[entry.key[0]]
-                    for entry in entries
-                ],
-                dtype=np.int64,
-            )
-            right_sector_ids = np.asarray(
-                [
-                    right_boundary.sector_codec.index[entry.key[4]]
-                    for entry in entries
-                ],
-                dtype=np.int64,
-            )
+            (basis_offsets, basis_shapes, basis_quantum_numbers,
+             left_sector_ids, right_sector_ids) = _pack_contextual_basis(
+                basis, left_boundary, right_boundary)
         except (KeyError, TypeError, ValueError):
             basis_quantum_numbers = None
         if basis_quantum_numbers is not None:

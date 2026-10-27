@@ -376,10 +376,18 @@ def _extensions_to_build():
                 [
                     "pyqed/mps/nonabelian/_su2_kernel.pyx",
                     "pyqed/mps/nonabelian/su2_dmrg_engine.cpp",
+                    "pyqed/mps/nonabelian/nc_spatial_plan.cpp",
+                    "pyqed/mps/nonabelian/nc_spatial_sweep.cpp",
                 ],
                 depends=[
                     "pyqed/mps/nonabelian/su2_dmrg_engine.hpp",
                     "pyqed/mps/nonabelian/su2_coupling_core.hpp",
+                    "pyqed/mps/nonabelian/orbital_rank.hpp",
+                    "pyqed/mps/nonabelian/nc_spatial_plan.hpp",
+                    "pyqed/mps/nonabelian/nc_multiplet_sweep.pxi",
+                    "pyqed/mps/nonabelian/nc_cbe.pxi",
+                    "pyqed/mps/nonabelian/nc_two_site.pxi",
+                    "pyqed/mps/nonabelian/nc_pair_action.hpp",
                     "pyqed/linalg/davidson.hpp",
                 ],
                 include_dirs=cpp_include_dirs,

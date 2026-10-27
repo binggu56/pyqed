@@ -6,14 +6,15 @@ Local operator multiplets use Wigner--Eckart CG maps. Numerical sweeps carry
 multiplicities only; finite irrep rows enter cached structural coefficients.
 MPO conversion uses local tensor-train gauges, never a molecular Hilbert basis.
 """
-from functools import lru_cache
+from functools import lru_cache, cached_property
 import numpy as np
 from scipy.linalg import svd
-from scipy.sparse import csr_matrix
+from scipy.sparse import csr_matrix, coo_matrix
 from pyqed.symmetry import Irrep, Leg, ProductSymmetry
 from .fusion import irrep_coupling, full_slices
 
 
+@lru_cache(maxsize=4096)
 def dimension(symmetry, q):
     return Leg._irrep_dimension(symmetry, q.charge)
 
@@ -31,23 +32,33 @@ class OperatorBasis:
         self.leg = Leg({k:len(v) for k,v in groups.items()},symmetry=sym)
         self.entries = groups
         spans, opspans = full_slices(leg),full_slices(self.leg)
-        self.basis = np.zeros((leg.full_dim,leg.full_dim,self.leg.full_dim),complex)
+        rows,columns,values = [],[],[]
         for k,entries in groups.items():
             dk = dimension(sym,k)
             for copy,(p,q,i,j) in enumerate(entries):
                 dp,dq = dimension(sym,p),dimension(sym,q)
                 cg = irrep_coupling(sym,q.charge,k.charge,p.charge).transpose(2,0,1)*np.sqrt(dk/dp)
-                self.basis[spans[p].start+i*dp:spans[p].start+(i+1)*dp,
-                           spans[q].start+j*dq:spans[q].start+(j+1)*dq,
-                           opspans[k].start+copy*dk:opspans[k].start+(copy+1)*dk] = cg
+                a,b,c = np.nonzero(cg)
+                rows.extend(opspans[k].start+copy*dk+c)
+                columns.extend((spans[p].start+i*dp+a)*leg.full_dim+spans[q].start+j*dq+b)
+                values.extend(cg[a,b,c].conj())
 
-        self.transform = csr_matrix(self.basis.reshape(leg.full_dim**2,-1).conj().T)
+        self.physical_dimension = leg.full_dim
+        self.transform = coo_matrix((values,(rows,columns)),
+            shape=(self.leg.full_dim,leg.full_dim**2)).tocsr()
+
+    @cached_property
+    def basis(self):
+        """Component expansion for explicit references; reduced construction uses CSR."""
+        value = self.transform.conj().T.toarray().reshape(
+            self.physical_dimension,self.physical_dimension,self.leg.full_dim)
+        value.setflags(write=False)
+        return value
 
 
 @lru_cache(maxsize=16)
 def _operator_basis(symmetry, sectors):
     basis = OperatorBasis(Leg(dict(sectors),symmetry=symmetry))
-    basis.basis.setflags(write=False)
     return basis
 
 
@@ -72,7 +83,7 @@ class MultipletMPO:
     @classmethod
     def identity(cls, physical_legs):
         sym = physical_legs[0].symmetry
-        zero = Irrep((0,0,sym.factors[-1].group.irrep_names[0]))
+        zero = Irrep((0,0,(sym.factors[-1].identity if hasattr(sym.factors[-1], 'identity') else sym.factors[-1].group.irrep_names[0])))
         leg = Leg({zero:1},symmetry=sym)
         cores = [{(zero,zero,p,p,zero):np.eye(site.dims[p])[None,None,:,:]
                   for p in site.sectors} for site in physical_legs]
@@ -98,17 +109,18 @@ class MultipletMPO:
         """
         from .multiplet_construction import hamiltonian_operator_train
         physical_legs = [site.leg for site in sites]
-        arrays = hamiltonian_operator_train(h,v,sites,blocks,cutoff)
+        arrays = hamiltonian_operator_train(h,v,sites,blocks,cutoff,factored=True)
         if arrays is None:
             mpo = cls.identity(physical_legs)
             for value in mpo.cores[0].values():value[:] = 0
             return mpo
         local = [_operator_basis(leg.symmetry,tuple(leg.dims.items())) for leg in physical_legs]
-        return cls._from_operator_train(arrays,physical_legs,local)
+        return cls._from_operator_train(arrays[0],physical_legs,local,spans=arrays[1])
 
     @classmethod
-    def _from_operator_train(cls,arrays,physical_legs,local,*,tolerance=1e-12):
+    def _from_operator_train(cls,arrays,physical_legs,local,*,tolerance=1e-12,spans=None):
         from .environment import _su2_kernel_module
+        from .multiplet_construction import _check_workspace
         reduce_channel = getattr(_su2_kernel_module(),'reduce_operator_channel',None)
         sym = physical_legs[0].symmetry
         # Right-canonical local gauges make each left-prefix support invariant.
@@ -117,20 +129,28 @@ class MultipletMPO:
             q,r = np.linalg.qr(arrays[i].reshape(shape[0],-1).T,mode='reduced')
             arrays[i] = q.T.reshape(-1,*shape[1:])
             arrays[i-1] = np.einsum('apb,bc->apc',arrays[i-1],r.T,optimize=True)
-        zero = Irrep((0,0,sym.factors[-1].group.irrep_names[0]))
+        zero = Irrep((0,0,(sym.factors[-1].identity if hasattr(sym.factors[-1], 'identity') else sym.factors[-1].group.irrep_names[0])))
         left = Leg({zero:1},symmetry=sym)
         legs, reduced = [left],[]
         for index,(array,operator) in enumerate(zip(arrays,local)):
             ls,ps = full_slices(left),full_slices(operator.leg)
             sectors = {}
+            threshold = tolerance*np.linalg.norm(array)
+            channels = tuple(k for k in operator.leg.sectors if spans is None or
+                             np.linalg.norm(spans[index][:,ps[k]]) > tolerance)
             for a in left.sectors:
-                for k in operator.leg.sectors:
+                for k in channels:
+                    _check_workspace((ls[a].stop-ls[a].start,ps[k].stop-ps[k].start,array.shape[-1]))
+                    channel = (array[ls[a],ps[k],:] if spans is None else
+                               np.einsum('aqb,qp->apb',array[ls[a]],spans[index][:,ps[k]],optimize=True))
+                    if np.linalg.norm(channel) <= threshold:
+                        continue
+                    block = channel.reshape(left.dims[a],dimension(sym,a),
+                        operator.leg.dims[k],dimension(sym,k),array.shape[-1])
                     for charge in sym.fuse(a.charge,k.charge):
                         c = Irrep(charge)
                         if index == len(arrays)-1 and c != zero:
                             continue
-                        block = array[ls[a],ps[k],:].reshape(left.dims[a],dimension(sym,a),
-                            operator.leg.dims[k],dimension(sym,k),array.shape[-1])
                         cg = irrep_coupling(sym,a.charge,k.charge,c.charge)
                         z = (reduce_channel(block,cg) if reduce_channel is not None else
                              np.einsum('ixjky,xkr->ijry',block,cg.conj(),optimize=True))
@@ -211,8 +231,13 @@ def boundary(state_leg, operator_leg, right):
 def structural_weight(sym,a,p,c,b,q,d,l,k,r):
     """Closed six-CG network (a product-group 9j coefficient with dimensions)."""
     if isinstance(sym,ProductSymmetry):
-        return np.prod([structural_weight(factor,*(label[i] for label in (a,p,c,b,q,d,l,k,r)))
-                        for i,factor in enumerate(sym.factors)]).item()
+        value=1.
+        for i,factor in enumerate(sym.factors):
+            weight=structural_weight(factor,*(label[i] for label in (a,p,c,b,q,d,l,k,r)))
+            if weight==0:
+                return 0.
+            value*=weight
+        return value
     if a not in sym.fuse(b,l) or c not in sym.fuse(d,r):
         return 0.
     bra,ket = irrep_coupling(sym,a,p,c),irrep_coupling(sym,b,q,d)

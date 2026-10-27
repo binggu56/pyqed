@@ -472,7 +472,10 @@ class _MPSTensorOwner:
 
 
 class SpatialSymmetryDMRG(SpatialMultipletSweep):
-    """One-site MPS DMRG with a finite spatial-group structural leg.
+    """Spatial DMRG factory, defaulting to direct compiled NC two-site sweeps.
+
+    Explicit ``contractions="group_action"`` selects the independent legacy
+    one-site MPO reference described below.
 
     Uses the MPS module's reduced tensors, orbital gates, and cached MPO
     environments. No LETTA object, graph, or parameterization is involved.
@@ -485,7 +488,14 @@ class SpatialSymmetryDMRG(SpatialMultipletSweep):
     @classmethod
     def from_integrals(cls, h1e, eri, *, nelec, spin=0, D=2, ecore=0.,
                        orbital_representations, wfnsym, point_group='D3h',
-                       seed=11, n_threads=None, cutoff=1e-10):
+                       seed=11, n_threads=None, cutoff=1e-10, contractions='nc'):
+        if contractions == 'nc':
+            from .nc_multiplet import NCMultipletDMRG
+            return NCMultipletDMRG.from_integrals(h1e,eri,nelec=nelec,spin=spin,D=D,
+                ecore=ecore,orbital_representations=orbital_representations,wfnsym=wfnsym,
+                point_group=point_group,seed=seed,n_threads=n_threads,cutoff=cutoff)
+        if contractions != 'group_action':
+            raise ValueError('contractions must be nc or group_action.')
         from pyqed.qchem.dmrg.backends.reduced import build_spatial_reduced_hamiltonian_mpo
         SpatialGroupAction(orbital_representations, wfnsym,
                            point_group=point_group).validate_hamiltonian(h1e, eri)

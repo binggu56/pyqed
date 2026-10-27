@@ -1,6 +1,7 @@
 """Shared symmetry-sector spaces and block operators."""
 
 from .point_group import PointGroupSymmetry
+from .continuous import OrbitalRotationSymmetry
 
 from .irrep import (
     Irrep,
@@ -23,6 +24,7 @@ from .irrep import (
 
 __all__ = [
     "PointGroupSymmetry",
+    "OrbitalRotationSymmetry",
     "Irrep",
     "IrrepTensor",
     "Leg",

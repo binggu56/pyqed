@@ -57,7 +57,7 @@ def test_fully_reduced_sweep_and_matrix_free_action(group,e,compiled,monkeypatch
         patch.setattr(TensorFusionMap,'matrix',property(forbidden))
         patch.setattr(MultipletMPO,'component_cores',forbidden)
         solver=MultipletDMRG.from_integrals(h,np.zeros((4,)*4),nelec=1,spin=1,D=2,
-            point_group=group,wfnsym=e,orbital_representations=reps).run(nstates=2,nsweeps=4)
+            point_group=group,wfnsym=e,orbital_representations=reps,contractions='reduced').run(nstates=2,nsweeps=4)
     assert not hasattr(solver,'components')
     np.testing.assert_allclose(solver.e_tot,np.linalg.eigvalsh(h),atol=1e-10)
     assert solver.success and solver.symmetry_diagnostics()['covariance_error']<1e-12
@@ -108,7 +108,7 @@ def test_batched_environment_complex_values_and_plan_reuse(group,e,target,compil
     from pyqed.mps.nonabelian.multiplet_operator import routes,dimension,_advance_plan
     reps={g:np.kron(np.eye(2),u) for g,u in irrep_representation_matrices(group,e).items()}
     solver=MultipletDMRG.from_integrals(np.kron([[.1,.3],[.3,.7]],np.eye(2)),
-        np.zeros((4,)*4),nelec=2,D=2,point_group=group,wfnsym=target,orbital_representations=reps)
+        np.zeros((4,)*4),nelec=2,D=2,point_group=group,wfnsym=target,orbital_representations=reps,contractions='reduced')
     rng=np.random.default_rng(91)
     def complex_blocks(blocks):
         return {k:rng.normal(size=v.shape)+1j*rng.normal(size=v.shape) for k,v in blocks.items()}
@@ -143,7 +143,7 @@ def test_batched_environment_complex_values_and_plan_reuse(group,e,target,compil
 def test_reverse_sweep_reuses_environments(monkeypatch):
     reps={g:np.kron(np.eye(2),u) for g,u in irrep_representation_matrices('D3h',"E'").items()}
     solver=MultipletDMRG.from_integrals(np.kron([[.1,.3],[.3,.7]],np.eye(2)),
-        np.zeros((4,)*4),nelec=2,D=2,point_group='D3h',wfnsym="A1'",orbital_representations=reps)
+        np.zeros((4,)*4),nelec=2,D=2,point_group='D3h',wfnsym="A1'",orbital_representations=reps,contractions='reduced')
     calls=[];original=solver._boundaries
     def record(direction):
         calls.append(direction)
@@ -208,7 +208,7 @@ def test_local_reduced_contraction_fallback(monkeypatch):
     from pyqed.mps.nonabelian import multiplet_sweep
     reps={g:np.kron(np.eye(2),u) for g,u in irrep_representation_matrices('D3h',"E'").items()}
     h=np.kron([[.1,.3],[.3,.7]],np.eye(2));v=np.zeros((4,)*4)
-    solver=MultipletDMRG.from_integrals(h,v,nelec=2,D=2,point_group='D3h',wfnsym="A1'",orbital_representations=reps)
+    solver=MultipletDMRG.from_integrals(h,v,nelec=2,D=2,point_group='D3h',wfnsym="A1'",orbital_representations=reps,contractions='reduced')
     lh,_=solver._boundaries('rl');rh,_=solver._boundaries('lr')
     expected=solver._local_action(0,solver.mpo[0],lh[0],rh[1],assemble=True)
     monkeypatch.setattr(multiplet_sweep,'_su2_kernel_module',lambda:None)
@@ -283,7 +283,7 @@ def test_diagonal_norm_matches_general_metric(group,e,target,monkeypatch):
     reps={g:np.kron(np.eye(4),u) for g,u in irrep_representation_matrices(group,e).items()}
     n=len(next(iter(reps.values())))
     solver=MultipletDMRG.from_integrals(np.eye(n),np.zeros((n,)*4),nelec=2,D=3,
-        point_group=group,wfnsym=target,orbital_representations=reps)
+        point_group=group,wfnsym=target,orbital_representations=reps,contractions='reduced')
     _,left=solver._boundaries('rl');_,right=solver._boundaries('lr')
     rng=np.random.default_rng(71)
     checked=False
@@ -304,7 +304,7 @@ def test_diagonal_norm_matches_general_metric(group,e,target,monkeypatch):
     assert checked
     # Force the general whitening route and compare its physical solution.
     fast=MultipletDMRG.from_integrals(np.eye(n),np.zeros((n,)*4),nelec=2,D=3,
-        point_group=group,wfnsym=target,orbital_representations=reps).run(nsweeps=4)
+        point_group=group,wfnsym=target,orbital_representations=reps,contractions='reduced').run(nsweeps=4)
     from pyqed.mps.nonabelian import multiplet_sweep
     monkeypatch.setattr(multiplet_sweep,'_diagonal_norm',lambda *args:None)
     solver.run(nsweeps=4)

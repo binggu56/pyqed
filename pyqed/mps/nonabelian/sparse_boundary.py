@@ -100,6 +100,11 @@ class _SparseChannels(Mapping):
     def __getitem__(self, channel):
         return self.boundary.array(self.indices[channel])
 
+    def sparse_components(self, channel):
+        from scipy.sparse import csr_matrix, issparse
+        parts = self.boundary.blocks[self.boundary.keys[self.indices[channel]]]
+        return tuple(p.tocsr() if issparse(p) else csr_matrix(p) for p in parts)
+
 
 class SparseBoundary:
     """Real rank-coupled blocks with an explicitly bounded dense decode cache.

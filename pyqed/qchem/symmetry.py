@@ -1,18 +1,10 @@
 """Native point-group helpers for molecular calculations.
 
-The implementation here is intentionally small and explicit.  It supports
-Abelian point groups and the full non-Abelian D3h and D6h groups. Automatic geometry
-detection supports translated and rotated molecules; explicit names retain
-the standard orientation.
-D3h and D6h rotate normalized Cartesian or real-spherical Gaussian shells using the
-existing Cartesian-to-spherical transforms, retaining both E partners.
-Abelian groups also cover the common linear-molecule subgroup workflow, e.g. treating
-``C_inf_v`` diatomics in ``C2v`` with the molecular axis along ``z``.
-
-The ``Coov`` and ``Dooh`` entries follow PySCF's cylindrical-label convention:
-the actual AO operations descend to ``C2v`` or ``D2h``, while orbital labels
-carry the additional axial angular-momentum tag, e.g. ``E1x``/``E1y`` and
-``E2x``/``E2y``.
+Finite Abelian groups, D3h and D6h use exact group representations. Coov,
+Dooh and orbital SO3 use analytic angular-momentum generators and complete
+multiplets, with no finite-subgroup approximation. Automatic detection handles
+translated/rotated molecules; explicit groups use standard body axes. Continuous
+irrep labels name entire multiplets (E1, E1g, L1), never separate partner rows.
 """
 
 from __future__ import annotations
@@ -29,7 +21,7 @@ _AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
 
 @dataclass(frozen=True)
 class PointGroup:
-    """Finite molecular point group, or linear cylindrical-label convention."""
+    """Molecular symmetry metadata; continuous irrep catalogues list present AO sectors."""
 
     name: str
     operation_names: tuple[str, ...]
@@ -38,17 +30,38 @@ class PointGroup:
     character_table: dict[str, tuple[int, ...]]
     linear: bool = False
     base_group_name: str | None = None
+    continuous: bool = False
 
     @property
     def irrep_dimensions(self) -> dict[str, int]:
+        if self.continuous:
+            from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+            symmetry = OrbitalRotationSymmetry(self.name)
+            class Dimensions(dict):
+                def __missing__(self, key):
+                    return symmetry.dimension(key)
+            return Dimensions({name:symmetry.dimension(name) for name in self.irrep_names})
         return {name: chars[0] for name, chars in self.character_table.items()}
 
     @property
     def abelian(self) -> bool:
+        if self.continuous:
+            return False
         return all(dim == 1 for dim in self.irrep_dimensions.values())
 
     def irrep_product_decomposition(self, *irreps: str) -> dict[str, int]:
         """Return multiplicities in a finite-group tensor product."""
+        if self.continuous:
+            from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+            symmetry = OrbitalRotationSymmetry(self.name)
+            counts = {symmetry.identity:1}
+            for irrep in irreps:
+                following = {}
+                for left,n in counts.items():
+                    for right in symmetry.fuse(left,irrep):
+                        following[right] = following.get(right,0)+n
+                counts = following
+            return counts
         if self.linear:
             raise NotImplementedError("Cylindrical labels are not finite-group characters.")
         chars = np.ones(len(self.operation_names), dtype=int)
@@ -57,6 +70,9 @@ class PointGroup:
         return decompose_characters(self, chars)
 
     def irrep_id(self, name: str) -> int:
+        if self.continuous:
+            from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+            return OrbitalRotationSymmetry(self.name).irrep_id(name)
         if self.linear:
             return linear_irrep_symb2id(self.name, str(name))
         key = canonical_irrep_name(name)
@@ -90,6 +106,7 @@ class MolecularSymmetry:
     base_ao_irrep_labels: tuple[str | None, ...] | None = None
     base_ao_irrep_ids: tuple[int | None, ...] | None = None
     multiplets: dict[str, np.ndarray] | None = None
+    ao_generators: dict[str, np.ndarray] | None = None
 
     @property
     def groupname(self) -> str:
@@ -144,13 +161,14 @@ def canonical_group_name(name) -> str:
         "cinfv": "Coov",
         "c∞v": "Coov",
         "dooh": "Dooh",
+        "so3": "SO3",
         "dinfh": "Dooh",
         "d∞h": "Dooh",
     }
     if key not in aliases:
         raise ValueError(
             f"Unsupported point group {name!r}. "
-            "Supported groups are C1, Cs, C2, Ci, C2v, D2, C2h, D2h, D3h, D6h, Coov, and Dooh."
+            "Supported groups are C1, Cs, C2, Ci, C2v, D2, C2h, D2h, D3h, D6h, Coov, Dooh, and SO3."
         )
     return aliases[key]
 
@@ -290,6 +308,9 @@ def _linear_irrep_names(groupname: str, max_momentum: int = 4) -> tuple[str, ...
 def irrep_id_to_name(point_group, irrep_id: int) -> str:
     group = _resolve_point_group(point_group)
     irrep_id = int(irrep_id)
+    if group.continuous:
+        from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+        return OrbitalRotationSymmetry(group.name).irrep_name(irrep_id)
     if group.linear:
         return linear_irrep_id2symb(group.name, irrep_id)
     return group.irrep_names[irrep_id]
@@ -461,7 +482,7 @@ def _d6h_point_group() -> PointGroup:
 
 
 def irrep_representation_matrices(point_group, irrep):
-    """Return real orthogonal matrices for a finite-group irrep.
+    """Return finite-group matrices or continuous-group angular/discrete generators.
 
     D3h E' uses (x,y); E'' uses (xz,yz). The z axis is C3 and x is C2.
     D6h uses D6 angular harmonics (cos(m phi), sin(m phi)), m=1,2,
@@ -469,6 +490,9 @@ def irrep_representation_matrices(point_group, irrep):
     These are exact representations, not two independent Abelian row labels.
     """
     group = _resolve_point_group(point_group)
+    if group.continuous:
+        from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+        return OrbitalRotationSymmetry(group.name).generators(irrep)
     name = group.irrep_names[group.irrep_id(irrep)]
     if group.linear:
         raise NotImplementedError("Cylindrical labels do not define finite-group irreps.")
@@ -493,6 +517,12 @@ def symmetry_partner_projectors(point_group, representations, irrep):
     introduced by this helper.
     """
     group = _resolve_point_group(point_group)
+    if group.continuous:
+        from pyqed.symmetry.continuous import orbital_subspaces, OrbitalRotationSymmetry
+        dim = OrbitalRotationSymmetry(group.name).dimension(irrep)
+        space = orbital_subspaces(group.name,representations).get(irrep)
+        n = len(next(iter(representations.values())))
+        return np.zeros((dim,dim,n,n),complex) if space is None else np.einsum('nci,mcj->ijnm',space,space.conj())
     matrices = irrep_representation_matrices(group, irrep)
     dim = next(iter(matrices.values())).shape[0]
     return dim / len(matrices) * sum(
@@ -509,8 +539,8 @@ def decompose_characters(point_group, characters, *, tol=1.0e-7) -> dict[str, in
     representation to within ``tol``; incomplete E multiplets are rejected.
     """
     group = _resolve_point_group(point_group)
-    if group.linear:
-        raise NotImplementedError("Cylindrical labels are not finite-group characters.")
+    if group.linear or group.continuous:
+        raise NotImplementedError("Continuous groups require angular generators, not finite characters.")
     chars = np.asarray(characters)
     if chars.shape != (len(group.operation_names),) or not np.all(np.isfinite(chars)):
         raise ValueError("Supply one finite character per group operation.")
@@ -574,8 +604,9 @@ def get_point_group(name, *, axis: str = "z") -> PointGroup:
         return _d6h_point_group()
     if groupname == "D3h":
         return _d3h_point_group()
-    if groupname in ("Coov", "Dooh"):
-        return _linear_point_group(groupname)
+    if groupname in ("Coov", "Dooh", "SO3"):
+        from .orbital_symmetry import continuous_point_group
+        return continuous_point_group(groupname)
     return _standard_point_group(groupname)
 
 
@@ -918,13 +949,25 @@ def atom_permutation(mol, matrix: np.ndarray, tol: float = 1.0e-8, origin=None) 
     return perm
 
 
-def _rotated_cartesian_shell(shells, matrix):
+def _rotated_cartesian_shell(shells, matrix, *, generator=False):
     from pyqed.qchem.basis import _odd_double_factorial
 
     indices = {tuple(powers): i for i, powers in enumerate(shells)}
     norms = np.array([np.prod([_odd_double_factorial(2 * p - 1) for p in powers]) ** -0.5
                       for powers in shells])
     out = np.zeros((len(shells), len(shells)))
+    if generator:
+        for source,powers in enumerate(shells):
+            for axis,power in enumerate(powers):
+                if not power:
+                    continue
+                for target_axis in range(3):
+                    key = list(powers)
+                    key[axis] -= 1
+                    key[target_axis] += 1
+                    target = indices[tuple(key)]
+                    out[target,source] += power*matrix[target_axis,axis]*norms[source]/norms[target]
+        return out
     for source, powers in enumerate(shells):
         polynomial = {(0, 0, 0): 1.0}
         for axis, power in enumerate(powers):
@@ -943,7 +986,7 @@ def _rotated_cartesian_shell(shells, matrix):
     return out
 
 
-def _rotating_ao_representation(mol, matrix, tol, origin=None, atom_perm=None):
+def _rotating_ao_representation(mol, matrix, tol, origin=None, atom_perm=None, *, generator=False):
     from pyqed.qchem.basis import _cart_shell_blocks, _cart2sph_unit_block
 
     basis = mol._bas
@@ -979,7 +1022,7 @@ def _rotating_ao_representation(mol, matrix, tol, origin=None, atom_perm=None):
                     not np.allclose(source_fn.exps, target_fn.exps, atol=1e-12, rtol=1e-12) or
                     not np.allclose(source_fn.prim_weights, target_fn.prim_weights, atol=1e-12, rtol=1e-12)):
                 raise ValueError("Equivalent atoms must have matching basis contractions.")
-        rotated = _rotated_cartesian_shell([fn.shell for fn in basis[start:stop]], matrix)
+        rotated = _rotated_cartesian_shell([fn.shell for fn in basis[start:stop]], matrix, generator=generator)
         if spherical:
             transform = _cart2sph_unit_block(l)
             rotated = np.linalg.lstsq(transform, rotated @ transform, rcond=None)[0]
@@ -1048,7 +1091,7 @@ def detect_point_group(mol, *, tol=1e-8):
         return True
 
     if np.max(np.linalg.norm(centered, axis=1)) <= tol:
-        return get_point_group("D2h"), origin, np.eye(3)
+        return get_point_group("SO3"), origin, np.eye(3)
     z = axes[:, -1]
     if np.max(np.linalg.norm(centered, axis=1)) > tol and np.max(
             np.linalg.norm(centered - np.outer(centered @ z, z), axis=1)) <= tol:
@@ -1097,6 +1140,11 @@ def build_molecular_symmetry(
         point_group, origin, axes = detect_point_group(mol, tol=tol)
     else:
         point_group = get_point_group(group, axis=axis)
+    if point_group.continuous:
+        from .orbital_symmetry import build_continuous_molecular_symmetry
+        if group is not True:
+            origin = np.asarray(mol.atom_coords()).mean(axis=0)
+        return build_continuous_molecular_symmetry(mol,point_group,origin,axes,tol=tol)
     point_group = replace(point_group, operation_matrices=tuple(
         axes @ operation @ axes.T for operation in point_group.operation_matrices))
     base_group = (replace(_standard_point_group(point_group.base_group_name),
@@ -1235,7 +1283,7 @@ def assign_mo_irreps(mol, mo_coeff, *, overlap=None, purity_tol: float = 0.85):
     return tuple(labels), tuple(ids), weights
 
 
-def mo_symmetry_representations(mol, mo_coeff, *, tol=1.0e-7):
+def mo_symmetry_representations(mol, mo_coeff, *, tol=1.0e-7, generators=False):
     """Return group matrices in a complete invariant MO space.
 
     Checks metric orthonormality and closure, so splitting an E pair across
@@ -1253,7 +1301,10 @@ def mo_symmetry_representations(mol, mo_coeff, *, tol=1.0e-7):
     if not np.allclose(metric_bra @ coeff, np.eye(coeff.shape[1]), atol=tol, rtol=0):
         raise ValueError("MO coefficients must be metric orthonormal.")
     representations = {}
-    for name, rep in info.ao_representations.items():
+    source = info.ao_generators if generators else info.ao_representations
+    if source is None:
+        raise ValueError('This molecular symmetry has no continuous orbital generators.')
+    for name, rep in source.items():
         rotated = rep @ coeff
         reduced = metric_bra @ rotated
         residual = rotated - coeff @ reduced
@@ -1273,6 +1324,10 @@ def representation_projectors(point_group, representations):
     E projectors retain both partners and every equivalent copy.
     """
     group = _resolve_point_group(point_group)
+    if group.continuous:
+        from pyqed.symmetry.continuous import orbital_subspaces
+        return {label:space.reshape(len(space),-1)@space.reshape(len(space),-1).conj().T
+                for label,space in orbital_subspaces(group.name,representations).items()}
     if group.linear:
         raise NotImplementedError("Use molecular projectors for cylindrical labels.")
     reps = [np.asarray(representations[name]) for name in group.operation_names]
@@ -1290,7 +1345,7 @@ def _symmetry_ao_coeff(mf, coeff):
 
 
 def ci_symmetry_representations(state_model, *, state_ids=None, tol=1.0e-7):
-    """Return full point-group matrices between existing CASCI roots.
+    """Return finite-group matrices or continuous generators between CASCI roots.
 
     Reuses exact Slater overlap transformations from ``orbital_rotation_ci_overlap``;
     this is state analysis, not a projected solver. Core, active orbitals, and
@@ -1300,6 +1355,18 @@ def ci_symmetry_representations(state_model, *, state_ids=None, tol=1.0e-7):
     from pyqed.qchem.geometric import orbital_rotation_ci_overlap
 
     mol = state_model.mol
+    if mol.symmetry_info.group.continuous:
+        from .orbital_symmetry import CIOrbitalAction
+        from pyqed.symmetry.continuous import OrbitalRotationSymmetry
+        action = getattr(state_model,'spatial_symmetry',None)
+        if not isinstance(action,CIOrbitalAction):
+            action = CIOrbitalAction(state_model,OrbitalRotationSymmetry(mol.groupname).identity)
+        ids = range(len(state_model.ci)) if state_ids is None else state_ids
+        coeff = np.column_stack([state_model.ci[i] for i in ids])
+        result = {name:coeff.conj().T@g@coeff for name,g in action.generators.items()}
+        if any(np.linalg.norm(g@coeff-coeff@result[name])>tol for name,g in action.generators.items()):
+            raise ValueError('Selected CI roots omit continuous-symmetry partners.')
+        return result
     coeff = getattr(state_model, "mo_coeff", None)
     if coeff is None:
         coeff = state_model.mf.mo_coeff
@@ -1327,9 +1394,10 @@ def assign_ci_irreps(state_model, *, state_ids=None, purity_tol=0.85, tol=1.0e-7
     group = state_model.mol.symmetry_info.group
     reps = ci_symmetry_representations(state_model, state_ids=state_ids, tol=tol)
     projectors = representation_projectors(group, reps)
-    weights = np.column_stack([np.diag(projectors[name]).real for name in group.irrep_names])
+    names = tuple(projectors) if group.continuous else group.irrep_names
+    weights = np.column_stack([np.diag(projectors[name]).real for name in names])
     best = weights.argmax(axis=1)
-    labels = tuple(group.irrep_names[i] if row[i] >= purity_tol else "?"
+    labels = tuple(names[i] if row[i] >= purity_tol else "?"
                    for i, row in zip(best, weights))
     ids = tuple(group.irrep_id(name) if name != "?" else -1 for name in labels)
     return labels, ids, weights
@@ -1701,6 +1769,10 @@ def assign_mode_irreps(mol, modes, *, purity_tol=1-1e-6):
         rep = np.zeros((3*len(masses), 3*len(masses)))
         for source, target in enumerate(perm):
             rep[3*target:3*target+3, 3*source:3*source+3] = rotation
+        if info.group.continuous and name.startswith('L'):
+            from .orbital_symmetry import _cross
+            axis = info.axes[:, {'Lx':0,'Ly':1,'Lz':2}[name]]
+            rep = np.kron(np.eye(len(masses)), 1j*_cross(axis))
         reps[name] = rep
     vectors = (modes * np.sqrt(masses)[None, :, None]).reshape(len(modes), 3*len(masses)).T
     norms = np.sum(abs(vectors)**2, axis=0)
@@ -1708,7 +1780,7 @@ def assign_mode_irreps(mol, modes, *, purity_tol=1-1e-6):
     weights = np.column_stack([np.einsum('ik,ij,jk->k', vectors.conj(), p, vectors).real
                                / np.maximum(norms, 1e-30) for p in projectors.values()])
     best = weights.argmax(axis=1)
-    labels = tuple(info.group.irrep_names[i] if row[i] >= purity_tol else "?"
+    labels = tuple(tuple(projectors)[i] if row[i] >= purity_tol else "?"
                    for i, row in zip(best, weights))
     return labels, weights
 
@@ -1755,7 +1827,7 @@ class SymmetryEigensolver:
                 out += row @ (reduced @ dual)
         return np.real_if_close(out)
 
-    def eigh(self, operator):
+    def eigh(self, operator, *, nocc=None):
         """Return energy-ordered eigenpairs without assigning occupations.
 
         ``orbital_multiplet_ids`` labels the partner sets in the returned
@@ -1775,4 +1847,7 @@ class SymmetryEigensolver:
             orbitals.append(partners.reshape(len(operator), -1))
         order = np.argsort(energies, kind='stable')
         self.orbital_multiplet_ids = self.multiplet_ids[order]
+        if nocc is not None and 0<int(nocc)<len(order) and (
+                self.orbital_multiplet_ids[int(nocc)-1] == self.orbital_multiplet_ids[int(nocc)]):
+            raise ValueError('Closed-shell occupations would split a complete symmetry multiplet.')
         return np.asarray(energies)[order], np.column_stack(orbitals)[:, order]

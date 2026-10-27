@@ -176,13 +176,20 @@ def _openmp_build_setup():
         archive = library / "libomp.a"
         runtime = dylib if dylib.exists() else archive
         if (include / "omp.h").exists() and runtime.exists():
+            if not explicit:
+                torch_spec = importlib.util.find_spec("torch")
+                if torch_spec is not None and torch_spec.origin:
+                    shared = Path(torch_spec.origin).parent / "lib" / "libomp.dylib"
+                    if shared.exists():
+                        runtime = shared
+                        library = shared.parent
             link_flags = [str(runtime)]
             if runtime.suffix == ".dylib":
                 link_flags.append("-Wl,-rpath," + str(library))
             return (
                 ["-Xpreprocessor", "-fopenmp", "-I" + str(include)],
                 link_flags,
-                str(prefix),
+                str(runtime) + "|pinned-install-name",
             )
     if requested in {"1", "true", "yes", "on", "required"}:
         raise RuntimeError(
@@ -285,6 +292,15 @@ def _compile_extension():
         cmd.extend(["-undefined", "dynamic_lookup", "-framework", "Accelerate"])
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if sys.platform == "darwin":
+            for flag in openmp_link_flags:
+                runtime = Path(flag)
+                if runtime.is_absolute() and runtime.name == "libomp.dylib":
+                    identity = subprocess.run(["otool", "-D", str(runtime)],
+                        check=True, capture_output=True, text=True).stdout
+                    subprocess.run(["install_name_tool", "-change",
+                        identity.splitlines()[-1].strip(), str(runtime), str(ext_path)],
+                        check=True, capture_output=True, text=True)
         stamp_path.write_text(compile_signature)
         try:
             fail_stamp_path.unlink()
