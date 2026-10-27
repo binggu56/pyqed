@@ -26,6 +26,8 @@ def test_per_sector_budget_uses_owned_sweeps_and_matches_ed(core_shift, arithmet
     solver.run(nsweeps=12, conv_tol=1e-9, max_bond_mode="per_sector",
                su2_kernel_backend="cpp", mixer_zero_block_noise_scale=0., require_convergence=False,
                local_solver_kwargs={"workspace_budget_bytes": workspace_bytes})
+    assert solver.dmrg.diagnostics["sweep_control"] == "shared"
+    assert solver.dmrg.diagnostics["max_bond_mode"] == "per_sector"
     assert all(row["cpp_owned_half_sweep"] for row in solver.dmrg.history)
     assert all(row["max_bond_mode"] == "per_sector" for row in solver.dmrg.history)
     assert all(update["local_objective"]["estimated_basis_workspace_bytes"] <= workspace_bytes

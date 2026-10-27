@@ -15,7 +15,7 @@ def test_local_metric_compression_matches_full_group(nelec, spin, target):
     reps = {op: np.kron(np.eye(2), matrix)
             for op, matrix in irrep_representation_matrices('D6h', 'E1u').items()}
     h = np.kron([[.1, .3], [.3, .7]], np.eye(2))
-    solver = SpatialSymmetryDMRG.from_integrals(h, np.zeros((4,)*4), nelec=nelec,
+    solver = SpatialSymmetryDMRG.from_integrals(h, np.zeros((4,)*4), contractions='group_action', nelec=nelec,
         spin=spin, D=1, seed=3, orbital_representations=reps, wfnsym=target, point_group='D6h')
     try:
         site = 1
@@ -69,7 +69,7 @@ def test_shared_block_actions_preserve_complex_orbits():
     reps = {op: block_diag(*(component[op] for component in components))
             for op in components[0]}
     solver = SpatialSymmetryDMRG.from_integrals(np.diag([.2,.4,.4,.7]),
-        np.zeros((4,)*4), nelec=2, D=1, orbital_representations=reps,
+        np.zeros((4,)*4), contractions='group_action', nelec=2, D=1, orbital_representations=reps,
         wfnsym='A1g', point_group='D6h')
     try:
         assert any(len(set(labels)) < len(solver._matrices)

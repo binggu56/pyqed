@@ -1933,6 +1933,25 @@ def test_cpp_su2_engine_advances_direct_normal_complementary_boundary(side):
     assert engine.stats["cached_boundary_replays"] == 1
     assert engine.stats["split_site_boundary_uses"] == 2
 
+    # Replacing an owned-site action by compact explicit bra/ket pools must
+    # invalidate its split-site replay marker, even with identical route IDs.
+    routes = np.asarray([[0, 0, 0, transition, 1, 0, 0,
+        q_lb.two_j, q_lk.two_j, q_pb.two_j, q_pk.two_j,
+        q_rb.two_j, q_rk.two_j]], dtype=np.int64)
+    engine.advance_normal_complementary_boundary(
+        side, parent_bond, child_bond, 0, False, routes,
+        bra_data, bra_offsets, bra_shape_offsets, bra_shapes,
+        ket_data, ket_offsets, ket_shape_offsets, ket_shapes,
+        output_offsets, output_shape_offsets, output_shapes, output_labels,
+        32, 5, route_topology_revision=17)
+    restored, _ = engine.advance_normal_complementary_boundary_from_split_site(
+        side, parent_bond, child_bond, 0, False, routes,
+        (bra_key,), (ket_key,), site_tensor.metadata['_cpp_split_site'],
+        output_offsets, output_shape_offsets, output_shapes, output_labels,
+        32, 6, route_topology_revision=17)
+    np.testing.assert_allclose(restored.reshape(output_shape), expected,
+                               rtol=1e-12, atol=1e-12)
+
 
 @pytest.mark.parametrize("side", ("left", "right"))
 def test_cpp_su2_engine_replays_metric_boundary_from_split_site(side):
