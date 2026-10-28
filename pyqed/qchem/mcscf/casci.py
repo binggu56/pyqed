@@ -2146,6 +2146,15 @@ class CASCI:
 
         return dm1, dm2
 
+    def local_spin(self, atoms=None, *, aolst=None, state_id=0, with_core=True):
+        """Fragment <S^2> using PySCF's AO-overlap restriction.
+
+        See :func:`pyqed.qchem.mcscf.local_spin.local_spin` for the definition,
+        reference, zero-based selections, core treatment, and limitations.
+        """
+        from .local_spin import local_spin
+        return local_spin(self, atoms, aolst=aolst, state_id=state_id, with_core=with_core)
+
     def spin_square(self, state_id=0):
         """Evaluate S² directly when the current direct-CI result is available.
 

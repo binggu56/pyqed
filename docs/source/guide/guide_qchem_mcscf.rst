@@ -395,6 +395,44 @@ full-run RSS, timing, and energy-difference figures. Rebuild the CASSCF extensio
 to use the blocked CBLAS workspace; ``factor_hessian_workspace_info`` reports
 its scratch bytes, auxiliary block size, and retained cache sizes.
 
+Fragment Local Spin
+-------------------
+
+CASCI and converged CASSCF expose a per-root fragment spin analysis::
+
+    # Zero-based atom indices belonging to the first monomer.
+    s2_fragment = mc.local_spin(atoms=[0, 1, 2], state_id=0)
+    s2_from_aos = mc.local_spin(aolst=[0, 1, 2, 3], state_id=0)
+    s2_total = mc.local_spin(state_id=0)
+    s2_active_only = mc.local_spin(atoms=[0, 1, 2], with_core=False)
+
+The return value is a scalar expectation in units of hbar squared, not a
+spin multiplicity. Atom and AO indices must be unique, nonnegative integers;
+pass only one selection type. Omitting both selects the whole molecule;
+an explicit empty list returns zero. State averaging does not change this
+per-root analysis: select each root with ``state_id``.
+
+This is an adaptation of `PySCF fci.spin_op.local_spin
+<https://pyscf.org/_modules/pyscf/fci/spin_op.html#local_spin>`_ and
+``spin_square_general`` for real restricted molecular orbitals. The AO overlap
+is zeroed outside the fragment on both indices, and transformed to the MO
+basis. The implementation reproduces that restricted definition using
+spin-traced active RDMs, including the linear-overlap one-electron term.
+It does not replace the overlap restriction by an orthogonal spatial
+projector. Fragment values are basis-dependent and nonadditive: the sum of
+fragment values omits cross-fragment spin correlations. The overlap mask is
+not an orthogonal projector, so the reported quantity need not be positive;
+small negative values are retained rather than clipped. A whole-molecule
+selection recovers the total spin square.
+
+By default, closed-core contributions are included analytically. No
+core-inclusive four-index RDM or full-space ERI tensor is constructed. Set
+``with_core=False`` to match a PySCF call using only the active CI and active
+MO coefficients. Complex CI coefficients are supported with real orbitals;
+complex orbitals and unrestricted alpha/beta orbital sets are unsupported.
+Unlike PySCF's empty ``aolst`` shorthand, an explicit empty selection here
+means an empty fragment.
+
 Convergence Controls
 --------------------
 
