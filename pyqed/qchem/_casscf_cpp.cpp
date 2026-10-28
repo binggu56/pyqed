@@ -451,12 +451,21 @@ struct FactorHessianWorkspace {
     npy_intp nocc = 0;
     npy_intp naux = 0;
     npy_intp factor_width = 0;
+    npy_intp ncore = -1;
+    npy_intp block_aux = 0;
+    bool packed_pairs = false;
+    bool symmetric_response = false;
     std::vector<double> d_by_p;
     std::vector<double> right_response;
     std::vector<double> d_occ_aux;
     std::vector<double> contracted_response;
     std::vector<double> dh1;
     std::vector<double> dfock_occ;
+    std::vector<double> active_pairs;
+    std::vector<double> active_contracted;
+    std::vector<double> pair_block_matrix;
+    std::vector<double> contracted_block;
+    std::vector<double> dense_pair_block;
 
     ~FactorHessianWorkspace() {
         Py_XDECREF(h1);
@@ -473,7 +482,8 @@ struct FactorHessianWorkspace {
         PyObject* dm1_obj,
         PyObject* dm2_obj,
         PyObject* pair_matrix_obj,
-        PyObject* contracted_base_obj
+        PyObject* contracted_base_obj,
+        npy_intp core = -1
     ) {
 #ifndef PYQED_HAVE_CBLAS
         PyErr_SetString(
@@ -494,7 +504,7 @@ struct FactorHessianWorkspace {
         }
         if (
             PyArray_NDIM(h1_ref.obj) != 2 ||
-            PyArray_NDIM(pair_ref.obj) != 3 ||
+            (PyArray_NDIM(pair_ref.obj) != 2 && PyArray_NDIM(pair_ref.obj) != 3) ||
             PyArray_NDIM(dm1_ref.obj) != 2 ||
             PyArray_NDIM(dm2_ref.obj) != 4 ||
             PyArray_NDIM(pair_matrix_ref.obj) != 2 ||
@@ -510,6 +520,12 @@ struct FactorHessianWorkspace {
         nmo = PyArray_DIM(h1_ref.obj, 0);
         naux = PyArray_DIM(pair_ref.obj, 0);
         nocc = PyArray_DIM(dm1_ref.obj, 0);
+        ncore = core;
+        packed_pairs = PyArray_NDIM(pair_ref.obj) == 2;
+        if (packed_pairs && ncore < 0) {
+            PyErr_SetString(PyExc_ValueError, "Packed factors require core/active RDMs.");
+            return false;
+        }
         if (nmo <= 0 || nocc <= 0 || naux <= 0 || nocc > nmo) {
             PyErr_SetString(PyExc_ValueError, "factor-Hessian dimensions must be positive and nocc <= nmo.");
             return false;
@@ -518,21 +534,26 @@ struct FactorHessianWorkspace {
         const npy_intp nocc2 = nocc * nocc;
         if (
             PyArray_DIM(h1_ref.obj, 1) != nmo ||
-            PyArray_DIM(pair_ref.obj, 1) != nmo ||
-            PyArray_DIM(pair_ref.obj, 2) != nmo ||
+            (packed_pairs ? PyArray_DIM(pair_ref.obj, 1) != nmo*(nmo+1)/2 :
+                (PyArray_DIM(pair_ref.obj, 1) != nmo || PyArray_DIM(pair_ref.obj, 2) != nmo)) ||
             PyArray_DIM(dm1_ref.obj, 1) != nocc ||
-            PyArray_DIM(pair_matrix_ref.obj, 0) != nmo ||
+            (ncore < 0 && (PyArray_DIM(pair_matrix_ref.obj, 0) != nmo ||
             PyArray_DIM(pair_matrix_ref.obj, 1) != factor_width ||
             PyArray_DIM(contracted_ref.obj, 0) != naux ||
             PyArray_DIM(contracted_ref.obj, 1) != nocc ||
-            PyArray_DIM(contracted_ref.obj, 2) != nocc
+            PyArray_DIM(contracted_ref.obj, 2) != nocc))
         ) {
             PyErr_SetString(PyExc_ValueError, "factor-Hessian matrix dimensions are inconsistent.");
             return false;
         }
+        if (ncore < -1 || ncore > nocc) {
+            PyErr_SetString(PyExc_ValueError, "Invalid core dimension.");
+            return false;
+        }
+        const npy_intp density_size = ncore < 0 ? nocc : nocc - ncore;
         for (int axis = 0; axis < 4; ++axis) {
-            if (PyArray_DIM(dm2_ref.obj, axis) != nocc) {
-                PyErr_SetString(PyExc_ValueError, "dm2 must have shape (nocc, nocc, nocc, nocc).");
+            if (PyArray_DIM(dm2_ref.obj, axis) != density_size) {
+                PyErr_SetString(PyExc_ValueError, "dm2 dimensions must match the occupied or active space.");
                 return false;
             }
         }
@@ -559,17 +580,185 @@ struct FactorHessianWorkspace {
         contracted_base = contracted_ref.obj;
 
         try {
-            d_by_p.resize(static_cast<std::size_t>(nmo * factor_width));
-            right_response.resize(static_cast<std::size_t>(naux * nmo * nocc));
-            d_occ_aux.resize(static_cast<std::size_t>(naux * nocc2));
-            contracted_response.resize(static_cast<std::size_t>(naux * nocc2));
+            block_aux = naux;
+            if (ncore >= 0) {
+                symmetric_response = packed_pairs && nmo < 2*nocc;
+                const npy_intp per_aux = 2*nmo*nocc
+                    + nmo*(symmetric_response ? nmo : nocc) + 3*nocc2 + 2*density_size*density_size
+                    + (packed_pairs ? nmo*nmo : 0);
+                block_aux = std::min(naux, std::max<npy_intp>(1, (64*1024*1024)/
+                    (sizeof(double)*per_aux)));
+                pair_block_matrix.resize(static_cast<std::size_t>(block_aux*nmo*nocc));
+                contracted_block.resize(static_cast<std::size_t>(block_aux*nocc2));
+                if (packed_pairs) dense_pair_block.resize(static_cast<std::size_t>(block_aux*nmo*nmo));
+            }
+            d_by_p.resize(static_cast<std::size_t>(block_aux * nmo * nocc));
+            right_response.resize(static_cast<std::size_t>(
+                block_aux * nmo * (symmetric_response ? nmo : nocc)));
+            d_occ_aux.resize(static_cast<std::size_t>(block_aux * nocc2));
+            contracted_response.resize(static_cast<std::size_t>(block_aux * nocc2));
             dh1.resize(static_cast<std::size_t>(nmo * nmo));
             dfock_occ.resize(static_cast<std::size_t>(nmo * nocc));
+            if (ncore >= 0) {
+                active_pairs.resize(static_cast<std::size_t>(block_aux * density_size * density_size));
+                active_contracted.resize(active_pairs.size());
+            }
         } catch (...) {
             PyErr_SetString(PyExc_MemoryError, "Failed to allocate factor-Hessian workspace buffers.");
             return false;
         }
         return true;
+#endif
+    }
+
+    void contract_core_active(const double* source, double* target, npy_intp count) {
+#ifdef PYQED_HAVE_CBLAS
+        const npy_intp a = nocc - ncore;
+        const npy_intp a2 = a*a;
+        const double* d1 = static_cast<const double*>(PyArray_DATA(dm1));
+        const double* d2 = static_cast<const double*>(PyArray_DATA(dm2));
+        for (npy_intp p = 0; p < count; ++p)
+            for (npy_intp i = 0; i < a; ++i)
+                for (npy_intp j = 0; j < a; ++j)
+                    active_pairs[p*a2+i*a+j] = source[(p*nocc+ncore+i)*nocc+ncore+j];
+        if (a2)
+            cblas_dgemm(101, 111, 112, static_cast<int>(count), static_cast<int>(a2),
+                static_cast<int>(a2), 1., active_pairs.data(), static_cast<int>(a2),
+                d2, static_cast<int>(a2), 0., active_contracted.data(), static_cast<int>(a2));
+        for (npy_intp p = 0; p < count; ++p) {
+            const double* b = source + p*nocc*nocc;
+            double* out = target + p*nocc*nocc;
+            double trace = 0., charge = 0.;
+            for (npy_intp i = 0; i < ncore; ++i) trace += b[i*nocc+i];
+            for (npy_intp i = 0; i < a; ++i)
+                for (npy_intp j = 0; j < a; ++j)
+                    charge += b[(ncore+i)*nocc+ncore+j]*d1[(ncore+i)*nocc+ncore+j];
+            for (npy_intp i = 0; i < ncore; ++i) {
+                for (npy_intp j = 0; j < ncore; ++j)
+                    out[i*nocc+j] = -2*b[j*nocc+i] + (i == j ? 4*trace+2*charge : 0.);
+                for (npy_intp j = 0; j < a; ++j) {
+                    double ca = 0., ac = 0.;
+                    for (npy_intp k = 0; k < a; ++k) {
+                        const double d = d1[(ncore+j)*nocc+ncore+k];
+                        ca -= b[i*nocc+ncore+k]*d;
+                        ac -= d*b[(ncore+k)*nocc+i];
+                    }
+                    out[i*nocc+ncore+j] = ca;
+                    out[(ncore+j)*nocc+i] = ac;
+                }
+            }
+            for (npy_intp i = 0; i < a; ++i)
+                for (npy_intp j = 0; j < a; ++j)
+                    out[(ncore+i)*nocc+ncore+j] = active_contracted[p*a2+i*a+j]
+                        + 2*trace*d1[(ncore+i)*nocc+ncore+j];
+        }
+#endif
+    }
+
+    std::size_t scratch_bytes() const {
+        return sizeof(double)*(d_by_p.size()+right_response.size()+d_occ_aux.size()
+            +contracted_response.size()+dh1.size()+dfock_occ.size()+active_pairs.size()
+            +active_contracted.size()+pair_block_matrix.size()+contracted_block.size()+dense_pair_block.size());
+    }
+
+    bool apply_core_active(const double* kappa, double* gradient) {
+#ifdef PYQED_HAVE_CBLAS
+        const int n = static_cast<int>(nmo), o = static_cast<int>(nocc);
+        const double* h = static_cast<const double*>(PyArray_DATA(h1));
+        const double* b = static_cast<const double*>(PyArray_DATA(pair));
+        const double* d = static_cast<const double*>(PyArray_DATA(dm1));
+        cblas_dgemm(101, 111, 111, n, n, n, 1., h, n, kappa, n, 0., dh1.data(), n);
+        cblas_dgemm(101, 111, 111, n, n, n, -1., kappa, n, h, n, 1., dh1.data(), n);
+        cblas_dgemm(101, 111, 111, n, o, o, 1., dh1.data(), n, d, o, 0., dfock_occ.data(), o);
+        bool zero_virtual_rotation = symmetric_response;
+        for (npy_intp p = nocc; p < nmo && zero_virtual_rotation; ++p)
+            for (npy_intp q = nocc; q < nmo; ++q)
+                if (kappa[p*nmo+q] != 0.) { zero_virtual_rotation = false; break; }
+        for (npy_intp start = 0; start < naux; start += block_aux) {
+            const npy_intp count = std::min(block_aux, naux-start);
+            const int width = static_cast<int>(count*nocc);
+            const double* batch = nullptr;
+            if (packed_pairs) {
+                const npy_intp npair = nmo*(nmo+1)/2;
+                for (npy_intp aux = 0; aux < count; ++aux)
+                    for (npy_intp p = 0; p < nmo; ++p)
+                        for (npy_intp q = 0; q <= p; ++q) {
+                            const double value = b[(start+aux)*npair+p*(p+1)/2+q];
+                            dense_pair_block[(aux*nmo+p)*nmo+q] = value;
+                            dense_pair_block[(aux*nmo+q)*nmo+p] = value;
+                        }
+                batch = dense_pair_block.data();
+            } else {
+                batch = b + start*nmo*nmo;
+            }
+            for (npy_intp p = 0; p < nmo; ++p)
+                for (npy_intp aux = 0; aux < count; ++aux)
+                    std::copy(batch+(aux*nmo+p)*nmo, batch+(aux*nmo+p)*nmo+nocc,
+                        pair_block_matrix.data()+p*width+aux*nocc);
+            if (zero_virtual_rotation) {
+                const int v = n-o;
+                // Only occupied response columns and their virtual transpose
+                // are needed. K_vv=0 removes the latter product's virtual rows.
+                cblas_dgemm(101, 111, 111, static_cast<int>(count*nmo), o, n,
+                    1., batch, n, kappa, n, 0., right_response.data(), o);
+                double* virtual_response = right_response.data()+count*nmo*nocc;
+                if (v > 0)
+                    for (npy_intp aux = 0; aux < count; ++aux)
+                        cblas_dgemm(101, 111, 111, o, v, o, 1.,
+                            batch+aux*nmo*nmo, n, kappa+o, n, 0.,
+                            virtual_response+aux*nocc*v, v);
+                for (npy_intp p = 0; p < nmo; ++p)
+                    for (npy_intp aux = 0; aux < count; ++aux)
+                        for (npy_intp r = 0; r < nocc; ++r)
+                            d_by_p[p*width+aux*nocc+r] =
+                                right_response[(aux*nmo+p)*nocc+r]
+                                + (p < nocc ? right_response[(aux*nmo+r)*nocc+p]
+                                    : virtual_response[(aux*nocc+r)*v+p-nocc]);
+            } else if (symmetric_response) {
+                // For symmetric B, K^T B + B K = (B K)^T + B K.
+                // A full product costs less than two occupied-column products
+                // when nmo < 2*nocc; packing guarantees the required symmetry.
+                cblas_dgemm(101, 111, 111, static_cast<int>(count*nmo), n, n,
+                    1., batch, n, kappa, n, 0., right_response.data(), n);
+                for (npy_intp p = 0; p < nmo; ++p)
+                    for (npy_intp aux = 0; aux < count; ++aux)
+                        for (npy_intp r = 0; r < nocc; ++r)
+                            d_by_p[p*width+aux*nocc+r] =
+                                right_response[(aux*nmo+p)*nmo+r]
+                                + right_response[(aux*nmo+r)*nmo+p];
+            } else {
+                cblas_dgemm(101, 112, 111, n, width, n, 1., kappa, n,
+                    pair_block_matrix.data(), width, 0., d_by_p.data(), width);
+                cblas_dgemm(101, 111, 111, static_cast<int>(count*nmo), o, n,
+                    1., batch, n, kappa, n, 0., right_response.data(), o);
+                for (npy_intp p = 0; p < nmo; ++p)
+                    for (npy_intp aux = 0; aux < count; ++aux)
+                        for (npy_intp r = 0; r < nocc; ++r)
+                            d_by_p[p*width+aux*nocc+r] += right_response[(aux*nmo+p)*nocc+r];
+            }
+            for (npy_intp aux = 0; aux < count; ++aux)
+                for (npy_intp p = 0; p < nocc; ++p)
+                    std::copy(d_by_p.data()+p*width+aux*nocc,
+                        d_by_p.data()+p*width+(aux+1)*nocc,
+                        d_occ_aux.data()+(aux*nocc+p)*nocc);
+            contract_core_active(d_occ_aux.data(), contracted_response.data(), count);
+            for (npy_intp aux = 0; aux < count; ++aux)
+                for (npy_intp p = 0; p < nocc; ++p)
+                    std::copy(batch+(aux*nmo+p)*nmo, batch+(aux*nmo+p)*nmo+nocc,
+                        d_occ_aux.data()+(aux*nocc+p)*nocc);
+            contract_core_active(d_occ_aux.data(), contracted_block.data(), count);
+            cblas_dgemm(101, 111, 111, n, o, width, 1., d_by_p.data(), width,
+                contracted_block.data(), o, 1., dfock_occ.data(), o);
+            cblas_dgemm(101, 111, 111, n, o, width, 1., pair_block_matrix.data(), width,
+                contracted_response.data(), o, 1., dfock_occ.data(), o);
+        }
+        for (npy_intp p = 0; p < nmo; ++p)
+            for (npy_intp q = 0; q < nmo; ++q)
+                gradient[p*nmo+q] = 2*((q < nocc ? dfock_occ[p*nocc+q] : 0.)
+                    -(p < nocc ? dfock_occ[q*nocc+p] : 0.));
+        return true;
+#else
+        return false;
 #endif
     }
 
@@ -579,6 +768,7 @@ struct FactorHessianWorkspace {
         (void)gradient;
         return false;
 #else
+        if (ncore >= 0) return apply_core_active(kappa, gradient);
         constexpr int row_major = 101;
         constexpr int no_trans = 111;
         constexpr int trans = 112;
@@ -701,15 +891,17 @@ PyObject* create_factor_hessian_workspace(PyObject*, PyObject* args) {
     PyObject* dm2_obj = nullptr;
     PyObject* pair_matrix_obj = nullptr;
     PyObject* contracted_base_obj = nullptr;
+    Py_ssize_t ncore = -1;
     if (!PyArg_ParseTuple(
             args,
-            "OOOOOO",
+            "OOOOOO|n",
             &h1_obj,
             &pair_obj,
             &dm1_obj,
             &dm2_obj,
             &pair_matrix_obj,
-            &contracted_base_obj
+            &contracted_base_obj,
+            &ncore
         )) {
         return nullptr;
     }
@@ -723,7 +915,8 @@ PyObject* create_factor_hessian_workspace(PyObject*, PyObject* args) {
             dm1_obj,
             dm2_obj,
             pair_matrix_obj,
-            contracted_base_obj
+            contracted_base_obj,
+            static_cast<npy_intp>(ncore)
         )) {
         delete workspace;
         return nullptr;
@@ -733,6 +926,21 @@ PyObject* create_factor_hessian_workspace(PyObject*, PyObject* args) {
         factor_hessian_workspace_capsule_name,
         destroy_factor_hessian_workspace
     );
+}
+
+PyObject* factor_hessian_workspace_info(PyObject*, PyObject* args) {
+    PyObject* capsule = nullptr;
+    if (!PyArg_ParseTuple(args, "O", &capsule)) return nullptr;
+    auto* workspace = static_cast<FactorHessianWorkspace*>(
+        PyCapsule_GetPointer(capsule, factor_hessian_workspace_capsule_name));
+    if (workspace == nullptr) return nullptr;
+    return Py_BuildValue("{s:n,s:K,s:K,s:K,s:O,s:K}",
+        "auxiliary_block_size", static_cast<Py_ssize_t>(workspace->block_aux),
+        "scratch_bytes", static_cast<unsigned long long>(workspace->scratch_bytes()),
+        "packed_factor_bytes", static_cast<unsigned long long>(PyArray_NBYTES(workspace->pair_matrix)),
+        "contracted_base_bytes", static_cast<unsigned long long>(PyArray_NBYTES(workspace->contracted_base)),
+        "packed_pairs", workspace->packed_pairs ? Py_True : Py_False,
+        "factor_storage_bytes", static_cast<unsigned long long>(PyArray_NBYTES(workspace->pair)));
 }
 
 PyObject* apply_factor_hessian_workspace(PyObject*, PyObject* args) {
@@ -9188,7 +9396,7 @@ PyObject* native_capabilities(PyObject*, PyObject*) {
     const char* blas_provider = "none";
 #endif
     return Py_BuildValue(
-        "{s:O,s:s,s:O,s:O,s:O,s:O,s:O,s:O,s:i}",
+        "{s:O,s:s,s:O,s:O,s:O,s:O,s:O,s:O,s:O,s:i}",
         "cblas", have_cblas ? Py_True : Py_False,
         "blas_provider", blas_provider,
         "rhf_davidson", have_cblas ? Py_True : Py_False,
@@ -9196,6 +9404,7 @@ PyObject* native_capabilities(PyObject*, PyObject*) {
         "spin0_multiroot", Py_True,
         "spin0_initial_guess", Py_True,
         "factor_hessian_workspace", have_cblas ? Py_True : Py_False,
+        "core_active_hessian", have_cblas ? Py_True : Py_False,
         "state_average_rdms", Py_True,
         "spin0_native_max_roots", std::numeric_limits<int>::max()
     );
@@ -9207,6 +9416,7 @@ PyMethodDef methods[] = {
     {"ci_hamiltonian", ci_hamiltonian, METH_VARARGS, "Build the dense Slater-Condon CI Hamiltonian."},
     {"orbital_hessian_action_from_integrals", orbital_hessian_action_from_integrals, METH_VARARGS, "Apply the dense orbital Hessian action without materializing derivative ERIs."},
     {"create_factor_hessian_workspace", create_factor_hessian_workspace, METH_VARARGS, "Create a persistent native factorized orbital-Hessian workspace."},
+    {"factor_hessian_workspace_info", factor_hessian_workspace_info, METH_VARARGS, "Describe Hessian workspace scratch and auxiliary blocking."},
     {"apply_factor_hessian_workspace", apply_factor_hessian_workspace, METH_VARARGS, "Apply a native factorized orbital-Hessian workspace to one or more rotations."},
     {"scatter_opposite_spin_rdm2", scatter_opposite_spin_rdm2, METH_VARARGS, "Accumulate opposite-spin spin-string RDM2 contractions in place."},
     {"state_average_spin_rdms", state_average_spin_rdms, METH_VARARGS, "Build weighted multiroot spin-traced active-space 1- and 2-RDMs."},

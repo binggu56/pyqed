@@ -327,6 +327,74 @@ pair factors:
 
 This is the recommended path for larger basis sets and larger active spaces.
 
+Second-order full-factor orbital rotations process auxiliary-index blocks,
+using a right-transform scratch buffer targeted at 64 MiB (at least one
+auxiliary matrix). The full rotated factor output remains in memory. QN
+microiterations release current RDM references after creating the independent
+frozen Hessian copies, before the line search.
+
+The RI/CD orbital-gradient and frozen-density Hessian path stores only the
+active-space 2-RDM, with storage proportional to ``ncas**4``. Closed-core and
+mixed core/active contributions are contracted analytically using the existing
+core-embedding convention. This is an exact algebraic reordering of the dense
+reference; no new density fitting, screening, or response approximation is
+introduced. The CBLAS Hessian workspace accepts the active 2-RDM and the core
+count directly. Pair-factor responses, core/active contractions, and trial J/K
+builds process auxiliary blocks with scratch targeted at 64 MiB (at least one
+auxiliary slice, plus small one-electron/output matrices). The compact CBLAS
+workspace does not retain full-rank packed-factor or contracted-RDM caches.
+The NumPy Hessian fallback is also blocked. Real QN calculations with analytic
+Hessian actions and full CI microiterations retain MO factors as unscaled
+lower-triangular orbital pairs, requiring ``nmo*(nmo+1)//2`` entries per
+auxiliary index. This uses matrix symmetry, not molecular point-group symmetry,
+and therefore also applies to asymmetric molecules. Transformations, trial
+J/K, gradients, and CBLAS Hessian actions unpack only auxiliary blocks; the
+scratch target includes unpacking storage. Complex factors/orbitals and other
+microiteration modes retain full storage. Packing adds no approximation.
+For packed factors with ``nmo < 2*nocc``, the CBLAS Hessian forms each factor
+response from one full matrix product and its transpose, instead of two
+occupied-column products. When the virtual/virtual rotation block is zero,
+it further restricts these products to the required occupied and virtual
+response blocks, omitting multiplications by that zero block. The kernel
+checks this condition exactly. Other dimensions retain the two-product route;
+both obey the same auxiliary-block scratch target.
+The complete packed factors remain resident, so total process memory exceeds
+the scratch target.
+Unused trial references and QN workspaces are released before the next step
+or macroframe. Dense reference and separate response workflows can still use
+core-inclusive RDMs.
+
+``benchmarks/casscf_memory_regression.py`` provides separate preparation,
+solve, and comparison phases for a six-singlet CAS(4e,4o) regression and an
+idealized pentacene dimer. Run old and new solves in separate processes from
+the same RHF snapshot. The benchmark explicitly selects CI multiplicity,
+checks every final root's spin, requires CBLAS Hessian workspace applications,
+and writes energies, RSS samples, timings, source hashes, and a comparison
+figure. Its STO-3G default is a software validation setting.
+Use ``--require-packed`` for a solve that additionally checks packed CBLAS
+workspace use and rejects implicit expansion of the complete factor tensor.
+
+``benchmarks/core_active_hessian_scaling.py`` isolates the contraction cost
+using four active orbitals, 64 auxiliary factors, and 16--128 core orbitals.
+Run ``run --representation dense`` and ``run --representation compact`` in
+separate processes with the same ``--output`` directory, then run ``compare``.
+It verifies the Hessian arrays and plots application time and 2-RDM storage.
+This synthetic check does not measure converged molecular CASSCF performance.
+
+``benchmarks/pentacene_core_active_action.py`` instead reads ``--data`` from
+the molecular regression's preparation phase. Its ``run`` phase accepts the
+same two representations and measures a single state-averaged Fock/Hessian
+operation in the saved RHF frame. ``compare`` verifies CI energies, Fock
+matrices, and Hessian actions, and plots timings and process RSS. This separates
+kernel equivalence from the cost of converging the complete optimizer.
+
+``benchmarks/compare_casscf_memory_runs.py`` compares completed reports with
+``--before``, ``--after``, and ``--output``. It requires identical molecular
+settings and RHF-checkpoint hashes, verifies six singlet energies, and writes
+full-run RSS, timing, and energy-difference figures. Rebuild the CASSCF extension
+to use the blocked CBLAS workspace; ``factor_hessian_workspace_info`` reports
+its scratch bytes, auxiliary block size, and retained cache sizes.
+
 Convergence Controls
 --------------------
 

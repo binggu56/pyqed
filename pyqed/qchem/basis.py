@@ -4892,7 +4892,7 @@ def _contract_jk_ri_occ_full(eri_factors, mo_coeff, mo_occ, nao, block_size=None
 
 class PackedRIFactors:
     """
-    Lazy compatibility wrapper for RI/DF factors stored over unique AO pairs.
+    Real symmetric RI/DF factors stored over unique AO or MO pairs.
 
     NumPy sees this as the traditional ``(naux, nao, nao)`` tensor when an
     array is requested, while pair-aware code can consume ``pair_factors``
@@ -4932,6 +4932,16 @@ class PackedRIFactors:
 
     def copy(self):
         return PackedRIFactors(self.pair_factors.copy(), self.nao)
+
+    def block(self, start, stop):
+        """Expand only an auxiliary block, in the current AO or MO frame."""
+        return _pair_factors_to_full(self.pair_factors[start:stop], self.nao)
+
+    def select(self, left, right):
+        """Read an orbital-pair subblock without expanding spectator orbitals."""
+        rows, cols = np.atleast_1d(np.arange(self.nao)[left]), np.atleast_1d(np.arange(self.nao)[right])
+        hi, lo = np.maximum(rows[:, None], cols), np.minimum(rows[:, None], cols)
+        return self.pair_factors[:, hi*(hi+1)//2+lo]
 
 
 def _as_ri_pair_factors(eri_factors, nao):
@@ -5430,15 +5440,43 @@ def contract_veff_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=None):
     return vj - 0.5 * vk
 
 
-def mo_pair_factors(eri_factors, mo_left, mo_right=None):
+def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False):
     """
-    Transform AO RI factors to an MO pair block without forcing packed factors
-    through a generic einsum backend.
+    Transform RI factors to an orbital pair block.
+
+    With ``packed=True``, equal real coefficient matrices and symmetric real
+    factors produce unscaled lower-triangular MO pairs in auxiliary blocks.
+    This matrix symmetry does not require molecular point-group symmetry.
     """
     if mo_right is None:
         mo_right = mo_left
     mo_left = np.asarray(mo_left)
     mo_right = np.asarray(mo_right)
+    if packed:
+        source = (eri_factors.pair_factors if isinstance(eri_factors, PackedRIFactors)
+                  else np.asarray(eri_factors))
+        if (np.iscomplexobj(source) or np.iscomplexobj(mo_left)
+                or np.iscomplexobj(mo_right) or not np.array_equal(mo_left, mo_right)):
+            raise ValueError('Packed MO factors require equal real coefficient matrices.')
+        nao, nmo = mo_left.shape
+        if source.ndim == 2:
+            source = _as_ri_pair_factors(eri_factors, nao)
+        elif source.shape[1:] != (nao, nao):
+            raise ValueError('Factor dimensions do not match the coefficient matrix.')
+        rows, cols = np.tril_indices(nmo)
+        result = np.empty((len(source), len(rows)), dtype=np.float64)
+        block = max(1, (64 << 20)//max(1, 8*(3*nao**2+nao*nmo+nmo**2+len(rows))))
+        indices = _ao_pair_index_matrix(nao) if source.ndim == 2 else None
+        for start in range(0, len(source), block):
+            stop = min(start+block, len(source))
+            dense = source[start:stop, indices] if indices is not None else source[start:stop]
+            if indices is None and not np.allclose(dense, dense.transpose(0,2,1), rtol=1e-12, atol=1e-12):
+                raise ValueError('Packed MO factors require symmetric real input factors.')
+            work = dense @ mo_left
+            rotated = mo_left.T @ work
+            result[start:stop] = rotated[:, rows, cols]
+            del dense, work, rotated
+        return PackedRIFactors(result, nmo)
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, mo_left.shape[0])
         transform_work = (

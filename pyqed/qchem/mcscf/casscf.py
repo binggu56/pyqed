@@ -12,6 +12,7 @@ import math
 
 import numpy as np
 from scipy.linalg import expm
+from ..basis import PackedRIFactors
 
 from .casci import (
     _get_mf_cholesky_factors,
@@ -28,11 +29,13 @@ from .direct_ci import (
     _sigma_compact_derivative_batch_numba,
 )
 from .orbopt import (
+    CoreActiveRDM,
     apply_factor_hessian_workspace,
     augmented_hessian_direction,
     create_factor_hessian_workspace,
     create_factor_response_action,
     create_integral_hessian_action,
+    core_active_factor_hessian_action,
     davidson_augmented_hessian_direction,
     diagonal_hessian,
     diagonal_inverse_hessian,
@@ -604,6 +607,19 @@ class FirstOrderCASSCF:
         self._update_casci_cache(mc)
         return dm1, dm2
 
+    def _effective_factor_rdms(self, mc, state_id):
+        from .casci import make_state_average_rdms
+        weights = np.zeros(len(mc.ci)) if self.weights is None else self.weights
+        if self.weights is None:
+            weights[state_id] = 1.
+        active1, active2 = make_state_average_rdms(mc.ci[:len(weights)], weights, mc.binary)
+        density = CoreActiveRDM(mc.ncore, active1, active2)
+        dm1 = np.zeros((density.nocc, density.nocc), dtype=density.dtype)
+        dm1[:mc.ncore, :mc.ncore] = 2*np.eye(mc.ncore)
+        dm1[mc.ncore:, mc.ncore:] = active1
+        self._update_casci_cache(mc)
+        return dm1, density
+
     def _objective_energy(self, mc, state_id):
         if self.weights is None:
             return float(np.real(mc.e_tot[state_id]))
@@ -652,7 +668,7 @@ class FirstOrderCASSCF:
     def _evaluate(self, mo_coeff, nstates, state_id, ci0=None):
         mc = self._make_casci(mo_coeff, nstates=nstates, ci0=ci0)
         if self.use_cholesky:
-            dm1_occ, dm2_occ = self._effective_rdms_occ(mc, state_id)
+            dm1_occ, dm2_occ = self._effective_factor_rdms(mc, state_id)
             h1_mo = self._get_hcore_mo(mo_coeff)
             occ_mo = mo_coeff[:, :mc.ncore + mc.ncas]
             if hasattr(self.mf, "mo_factors"):
@@ -1345,9 +1361,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     Real state-averaged analytic QN calculations use exact occupied integral
     blocks and compact RDMs with packed-s8 or dense AO sources. Microsteps
     rebuild these blocks from the unchanged AO source, rather than storing or
-    rotating a full MO tensor. CD sources use batched occupied blocks when
-    these require less storage than full MO factors; their trial steps build
-    only CI/gradient blocks. Other modes retain their dense/factorized paths.
+    rotating a full MO tensor. RI/CD sources retain pair factors and only
+    active-space 2-RDMs. The core terms in gradient and frozen-RDM Hessian
+    contractions are evaluated analytically, exactly reproducing the existing
+    core-inclusive RDM algebra without constructing its quartic tensor. This
+    changes contraction/storage order, not the integral approximation, QN
+    model, orbital coordinates, or convergence criteria. Dense validation
+    helpers and other response workflows can still use core-inclusive RDMs.
 
     The inner AH solve allows 30 iterations and a 40-vector subspace by
     default, including the initial-subspace path. These are iteration limits,
@@ -1706,8 +1726,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self._h1_mo = np.array(h1_mo, copy=True)
             # Trial factor arrays are never updated in place. Keep a read-only
             # view so accepted CI and QN workspaces can share their storage.
-            self.eri_factors = np.asarray(pair_factors).view()
-            self.eri_factors.flags.writeable = False
+            if isinstance(pair_factors, PackedRIFactors):
+                view = pair_factors.pair_factors.view()
+                view.flags.writeable = False
+                self.eri_factors = PackedRIFactors(view, pair_factors.nao)
+            else:
+                self.eri_factors = np.asarray(pair_factors).view()
+                self.eri_factors.flags.writeable = False
             self.cholesky_jk = True
             self.cholesky_tol = getattr(parent_mf, "cholesky_tol", None)
             self.cholesky_max_rank = getattr(parent_mf, "cholesky_max_rank", None)
@@ -1728,17 +1753,43 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         def get_eri_mo(self, mo_coeff=None, notation="chem"):
             raise AssertionError("dense MO ERIs should not be built in factorized CASSCF")
 
+        def mo_factors(self, left, right=None):
+            right = left if right is None else right
+            indices = []
+            for coefficient in (left, right):
+                coefficient = np.asarray(coefficient)
+                rows = (np.argmax(abs(coefficient), axis=0) if coefficient.shape[1]
+                        else np.empty(0, dtype=int))
+                if not np.array_equal(coefficient, np.eye(self.nmo)[:, rows]):
+                    break
+                indices.append(rows)
+            if len(indices) == 2:
+                if isinstance(self.eri_factors, PackedRIFactors):
+                    return self.eri_factors.select(*indices)
+                return self.eri_factors[np.ix_(np.arange(len(self.eri_factors)), *indices)]
+            return transform_eri_factors_to_mo_pair(self.eri_factors, left, right)
+
         def get_veff(self, dm):
             dm = np.asarray(dm)
-            factors = self.eri_factors
             occupied = np.flatnonzero(np.any(dm != 0, axis=0) | np.any(dm != 0, axis=1))
             density = dm[np.ix_(occupied, occupied)]
-            left = factors[:, :, occupied]
-            right = factors[:, occupied, :]
-            coeff = np.einsum("Pkl,lk->P", left[:, occupied, :], density, optimize=True)
-            j = np.einsum("P,Pij->ij", coeff, factors, optimize=True)
-            k = np.einsum("Pil,lk,Pkj->ij", left, density, right, optimize=True)
-            return j - 0.5 * k
+            n, o = len(dm), len(occupied)
+            packed = isinstance(self.eri_factors, PackedRIFactors)
+            dtype = np.result_type(dm, self.eri_factors.dtype)
+            potential = np.zeros(dm.shape, dtype=dtype)
+            if not o:
+                return potential
+            block = max(1, (64 << 20)//max(1, np.dtype(dtype).itemsize*(3*n*o+o*o+(n*n if packed else 0))))
+            for start in range(0, len(self.eri_factors), block):
+                factors = (self.eri_factors.block(start,start+block) if packed
+                           else self.eri_factors[start:start+block])
+                left = factors[:, :, occupied]
+                right = factors[:, occupied, :]
+                coeff = np.einsum("Pkl,lk->P", left[:, occupied, :], density, optimize=True)
+                potential += np.einsum("P,Pij->ij", coeff, factors, optimize=True)
+                potential -= .5*np.einsum("Pil,lk,Pkj->ij", left, density, right, optimize=True)
+                del factors, left, right, coeff
+            return potential
 
     def _transform_frozen_integrals(self, h1_ref, eri_ref, U):
         h1 = U.conj().T @ h1_ref @ U
@@ -1757,19 +1808,28 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
     def _transform_frozen_factor_integrals(self, h1_ref, pair_ref, U):
         h1 = U.conj().T @ h1_ref @ U
-        pair_factors = U.conj().T @ (pair_ref @ U)
+        if isinstance(pair_ref, PackedRIFactors):
+            return h1, transform_eri_factors_to_mo_pair(pair_ref,U,
+                                                       packed=not np.iscomplexobj(U))
+        # Keep the right-transform scratch bounded while retaining the full
+        # output required by the integral and Hessian consumers.
+        dtype = np.result_type(pair_ref, U)
+        naux, nao, _ = pair_ref.shape
+        nmo = U.shape[1]
+        block = max(1, min(naux, (64 << 20) // max(1, nao*nmo*dtype.itemsize)))
+        pair_factors = np.empty((naux, nmo, nmo), dtype=dtype)
+        scratch = np.empty((block, nao, nmo), dtype=dtype)
+        left = U.conj().T
+        for start in range(0, naux, block):
+            stop = min(start + block, naux)
+            work = scratch[:stop-start]
+            np.matmul(pair_ref[start:stop], U, out=work)
+            np.matmul(left, work, out=pair_factors[start:stop])
         return h1, pair_factors
 
     def _factor_block_source(self, coefficients):
-        if (self.use_cholesky and self.coupling == 'qn'
-                and self.ah_hessian != 'finite_difference'
-                and self.micro_ci_mode == 'full' and self.nstates > 1
-                and not np.iscomplexobj(coefficients)):
-            factors = _get_mf_cholesky_factors(self.mf)
-            source = getattr(factors, 'pair_factors', factors)
-            nocc = self._default_ncore() + self.ncas
-            if not np.iscomplexobj(source) and 2*nocc**2 <= source.shape[0]:
-                return source
+        # Keep RI/CD in pair factors so core+active quartic blocks and RDMs
+        # are never needed by the orbital-gradient/Hessian path.
         return None
 
     def _block_integral_source(self, coefficients):
@@ -2390,7 +2450,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self.nstates,
             ci0=ci0,
         )
-        dm1_trial, dm2_trial = self._effective_rdms_occ(trial_mc, self.state_id)
+        dm1_trial, dm2_trial = self._effective_factor_rdms(trial_mc, self.state_id)
         grad_trial_vec = self._factor_frozen_orbital_gradient_vector(
             trial_mc,
             h1_trial,
@@ -2431,7 +2491,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         nocc_like = mc.ncore + mc.ncas
         fock = generalized_fock_from_factors(
             h1_mo,
-            pair_factors[:, :, :nocc_like],
+            pair_factors if isinstance(pair_factors,PackedRIFactors) else pair_factors[:, :, :nocc_like],
             dm1_occ,
             dm2_occ,
         )
@@ -2468,6 +2528,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         return d_full_occ, d_full_occ[:, :nocc_like, :]
 
     def _contract_factor_dm2(self, right_occ_occ, dm2_occ):
+        if isinstance(dm2_occ, CoreActiveRDM):
+            return dm2_occ.contract(right_occ_occ)
         right_occ_occ = np.asarray(right_occ_occ)
         dm2_occ = np.asarray(dm2_occ)
         naux, nocc, _ = right_occ_occ.shape
@@ -2503,10 +2565,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         kappa,
         factor_cache=None,
     ):
+        if isinstance(dm2_occ, CoreActiveRDM):
+            return core_active_factor_hessian_action(
+                h1_mo, pair_factors, dm1_occ, dm2_occ, kappa, factor_cache)
         h1_mo = np.asarray(h1_mo)
         pair_factors = np.asarray(pair_factors)
         dm1_occ = np.asarray(dm1_occ)
-        dm2_occ = np.asarray(dm2_occ)
+        if not isinstance(dm2_occ, CoreActiveRDM):
+            dm2_occ = np.asarray(dm2_occ)
         kappa = np.asarray(kappa)
         nocc_like = int(dm1_occ.shape[0])
 
@@ -2562,7 +2628,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             factor_cache=factor_cache,
         )
 
-        dfock = np.zeros_like(h1_mo, dtype=np.result_type(h1_mo, pair_factors, dm2_occ))
+        dfock = np.zeros_like(h1_mo, dtype=np.result_type(h1_mo, pair_factors, dm2_occ.dtype))
         dfock[:, :nocc_like] = np.einsum(
             "pr,rq->pq",
             dh1[:, :nocc_like],
@@ -2592,10 +2658,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         kappas,
         factor_cache=None,
     ):
+        if isinstance(dm2_occ, CoreActiveRDM):
+            return core_active_factor_hessian_action(
+                h1_mo, pair_factors, dm1_occ, dm2_occ, kappas, factor_cache)
         h1_mo = np.asarray(h1_mo)
         pair_factors = np.asarray(pair_factors)
         dm1_occ = np.asarray(dm1_occ)
-        dm2_occ = np.asarray(dm2_occ)
+        if not isinstance(dm2_occ, CoreActiveRDM):
+            dm2_occ = np.asarray(dm2_occ)
         kappas = np.asarray(kappas)
         if kappas.ndim != 3:
             raise ValueError("kappas must have shape (nvec, nmo, nmo).")
@@ -2652,9 +2722,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         d_full_occ = left_response + right_response
         d_occ_occ = d_full_occ[:, :, :nocc, :]
 
-        dm2_matrix_t = dm2_occ.reshape(nocc * nocc, nocc * nocc).T
-        contracted_response = (
-            d_occ_occ.reshape(nvec * naux, nocc * nocc) @ dm2_matrix_t
+        contracted_response = self._contract_factor_dm2(
+            d_occ_occ.reshape(nvec*naux, nocc, nocc), dm2_occ,
         ).reshape(nvec, naux, nocc, nocc)
         d_left_matrix = np.ascontiguousarray(
             d_full_occ.transpose(0, 2, 1, 3)
@@ -2671,7 +2740,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         dh1 = np.matmul(h1_mo, kappas) - np.matmul(kappas, h1_mo)
         dfock = np.zeros(
             (nvec, nmo, nmo),
-            dtype=np.result_type(h1_mo, pair_factors, dm2_occ),
+            dtype=np.result_type(h1_mo, pair_factors, dm2_occ.dtype),
         )
         dfock[:, :, :nocc] = np.matmul(dh1[:, :, :nocc], dm1_occ)
         dfock[:, :, :nocc] += two_electron
@@ -5202,9 +5271,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self.mo_coeff_ref = mo_coeff
             h1_ref = self.mf.get_hcore_mo(mo_coeff)
             if factorized:
+                source_factors = _get_mf_cholesky_factors(self.mf)
                 pair_ref = transform_eri_factors_to_mo_pair(
-                    _get_mf_cholesky_factors(self.mf),
+                    source_factors,
                     mo_coeff,
+                    packed=(not np.iscomplexobj(mo_coeff) and self.coupling == 'qn'
+                            and not np.iscomplexobj(getattr(source_factors,'pair_factors',source_factors))
+                            and self.ah_hessian != 'finite_difference' and self.micro_ci_mode == 'full'),
                 )
                 eri_ref = None
             else:
@@ -5238,6 +5311,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             accepted_ci = None
 
             for micro in range(1, self.max_micro_cycle + 1):
+                if factorized:
+                    # Accepted roots have their own owners. Trial bookkeeping
+                    # must not retain older full-factor tensors into this step.
+                    primary_result = fallback_result = chosen_result = trial_mc = None
+                    frozen = None
                 if micro == 1:
                     h1_cur, eri_cur, pair_cur = h1_ref, eri_ref, pair_ref
                 elif accepted_ci is not None and accepted_ci[0] is U:
@@ -5302,11 +5380,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 accepted_ci = None
                 energy = self._objective_energy(mc, self.state_id)
                 if factorized:
-                    dm1_occ, dm2_occ = self._effective_rdms_occ(mc, self.state_id)
+                    dm1_occ, dm2_occ = self._effective_factor_rdms(mc, self.state_id)
                     nocc_like = mc.ncore + mc.ncas
                     fock = generalized_fock_from_factors(
                         h1_cur,
-                        pair_cur[:, :, :nocc_like],
+                        pair_cur if isinstance(pair_cur,PackedRIFactors) else pair_cur[:, :, :nocc_like],
                         dm1_occ,
                         dm2_occ,
                     )
@@ -5444,7 +5522,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                         pair_qn = None
                         eri_qn = eri_cur if isinstance(eri_cur, IntegralBlocks) else np.array(eri_cur, copy=True)
                     dm1_qn = np.array(dm1, copy=True)
-                    dm2_qn = np.array(dm2, copy=True)
+                    dm2_qn = dm2.copy()
                     ncore_qn = mc.ncore
                     ncas_qn = mc.ncas
                     nmo_qn = self.nmo
@@ -5537,6 +5615,12 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                             )
 
                 if self.coupling == "qn":
+                    # QN actions use the independent frozen RDMs above. Drop
+                    # every current-RDM alias before allocating trial integrals
+                    # or constructing the next microiteration's RDMs.
+                    dm1 = dm2 = None
+                    if factorized:
+                        dm1_occ = dm2_occ = None
                     hessian_action = lambda vec: self._qn_hessian_action(
                         vec,
                         qn_base_hessian_action,
@@ -6208,6 +6292,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     micro_record["keyframe_refresh"] = "interval"
                     break
 
+            if factorized and self.coupling == 'qn':
+                factor_hessian_cache.clear()
+                qn_factor_hessian_cache.clear()
+                qn_base_hessian_action = qn_base_hessian_action_block = None
+                hessian_action = hessian_action_block = None
+                base_hessian_action = base_hessian_action_block = None
+                h1_qn = pair_qn = eri_qn = dm1_qn = dm2_qn = None
+                pair_ref = pair_cur = None
+                mc = keyframe_mc = ci_keyframe_mc = accepted_ci = frozen = None
+                primary_result = fallback_result = chosen_result = trial_mc = None
             mo_coeff = mo_coeff @ U
             self.history.append(
                 {

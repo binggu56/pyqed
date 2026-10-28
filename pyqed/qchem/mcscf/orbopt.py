@@ -8,6 +8,7 @@ import numpy as np
 import importlib
 from scipy.linalg import expm
 from .integral_blocks import IntegralBlocks
+from ..basis import PackedRIFactors
 
 _CASSCF_CPP_UNINITIALIZED = object()
 _casscf_cpp = _CASSCF_CPP_UNINITIALIZED
@@ -74,6 +75,44 @@ def generalized_fock(h1_mo, eri_mo, dm1, dm2, nocc=None):
     return f1 + f2
 
 
+class CoreActiveRDM:
+    """Closed-core embedding represented by active-space RDMs alone.
+
+    This exactly reorders PyQED's existing core-inclusive RDM contraction;
+    it introduces no screening, fitting, or changes to its index convention.
+    Storage is O(ncas**4), independently of the number of core orbitals.
+    """
+    def __init__(self, ncore, dm1, dm2):
+        self.ncore = int(ncore)
+        self.dm1 = np.array(dm1, copy=True)
+        self.dm2 = np.array(dm2, copy=True)
+        self.nocc = self.ncore + len(self.dm1)
+        self.dtype = np.result_type(self.dm1, self.dm2)
+        if self.ncore < 0 or self.dm1.shape != (len(self.dm1),)*2 or self.dm2.shape != (len(self.dm1),)*4:
+            raise ValueError('Expected nonnegative ncore and active square 1-/2-RDMs.')
+
+    def copy(self):
+        return type(self)(self.ncore, self.dm1, self.dm2)
+
+    def contract(self, factors):
+        """Return B[P,st] Gamma[r,q,s,t] without expanding Gamma."""
+        b = np.asarray(factors)
+        c, o = self.ncore, self.nocc
+        if b.ndim != 3 or b.shape[1:] != (o, o):
+            raise ValueError('Expected core+active pair-factor blocks.')
+        result = np.empty(b.shape, dtype=np.result_type(b, self.dtype))
+        trace = np.trace(b[:, :c, :c], axis1=1, axis2=2)
+        charge = np.einsum('Pab,ab->P', b[:, c:, c:], self.dm1, optimize=True)
+        result[:, :c, :c] = -2*b[:, :c, :c].transpose(0, 2, 1)
+        ids = np.arange(c)
+        result[:, ids, ids] += (4*trace + 2*charge)[:, None]
+        result[:, :c, c:] = -b[:, :c, c:] @ self.dm1.T
+        result[:, c:, :c] = -self.dm1 @ b[:, c:, :c]
+        result[:, c:, c:] = np.einsum('Pst,rqst->Prq', b[:, c:, c:], self.dm2, optimize=True)
+        result[:, c:, c:] += 2*trace[:, None, None]*self.dm1
+        return result
+
+
 def generalized_fock_from_factors(h1_mo, pair_factors_full_occ, dm1_occ, dm2_occ):
     """
     Build the generalized Fock matrix from MO Cholesky pair factors.
@@ -82,13 +121,15 @@ def generalized_fock_from_factors(h1_mo, pair_factors_full_occ, dm1_occ, dm2_occ
     ----------
     h1_mo : ndarray, shape (nmo, nmo)
         One-electron Hamiltonian in the current MO basis.
-    pair_factors_full_occ : ndarray, shape (naux, nmo, nocc_like)
+    pair_factors_full_occ : ndarray or PackedRIFactors
+        A full-MO packed tensor, or an array of shape (naux, nmo, nocc_like).
         Cholesky pair factors ``B[P,p,r]`` transformed with the full MO basis on
         the left and the core+active orbitals on the right.
     dm1_occ : ndarray, shape (nocc_like, nocc_like)
         Spin-traced 1-RDM including core occupations.
-    dm2_occ : ndarray, shape (nocc_like, nocc_like, nocc_like, nocc_like)
-        Spin-traced 2-RDM in the same core+active space.
+    dm2_occ : CoreActiveRDM or ndarray
+        Active-space RDMs with an analytic closed core, or an explicitly
+        embedded spin-traced 2-RDM for dense references.
 
     Returns
     -------
@@ -98,30 +139,46 @@ def generalized_fock_from_factors(h1_mo, pair_factors_full_occ, dm1_occ, dm2_occ
         an embedded CAS RDM with zero virtual blocks.
     """
     h1_mo = np.asarray(h1_mo)
-    pair_factors_full_occ = np.asarray(pair_factors_full_occ)
+    packed = isinstance(pair_factors_full_occ, PackedRIFactors)
+    if not packed:
+        pair_factors_full_occ = np.asarray(pair_factors_full_occ)
     dm1_occ = np.asarray(dm1_occ)
-    dm2_occ = np.asarray(dm2_occ)
+    compact = isinstance(dm2_occ, CoreActiveRDM)
+    if not compact:
+        dm2_occ = np.asarray(dm2_occ)
 
     nmo = h1_mo.shape[0]
     nocc_like = dm1_occ.shape[0]
     if pair_factors_full_occ.ndim != 3:
         raise ValueError("pair_factors_full_occ must have shape (naux, nmo, nocc_like).")
-    if pair_factors_full_occ.shape[1] != nmo or pair_factors_full_occ.shape[2] != nocc_like:
+    if (pair_factors_full_occ.shape[1] != nmo or
+            (pair_factors_full_occ.shape[2] < nocc_like if packed else
+             pair_factors_full_occ.shape[2] != nocc_like)):
         raise ValueError("pair_factors_full_occ is inconsistent with h1_mo/dm1_occ.")
-    if dm2_occ.shape != (nocc_like, nocc_like, nocc_like, nocc_like):
+    if (dm2_occ.nocc != nocc_like if compact else
+            dm2_occ.shape != (nocc_like, nocc_like, nocc_like, nocc_like)):
         raise ValueError("dm2_occ must have shape (nocc_like, nocc_like, nocc_like, nocc_like).")
 
     # Only the core+active columns contribute because the CAS density has no
     # virtual blocks in this spin-free formulation.
     fock_occ = np.einsum("pr,rq->pq", h1_mo[:, :nocc_like], dm1_occ, optimize=True)
-
-    pair_factors_occ_occ = pair_factors_full_occ[:, :nocc_like, :]
-    contracted_dm2 = np.einsum(
-        "Pst,rqst->Prq", pair_factors_occ_occ, dm2_occ, optimize=True
-    )
-    fock_occ += np.einsum(
-        "Ppr,Prq->pq", pair_factors_full_occ, contracted_dm2, optimize=True
-    )
+    if compact or packed:
+        fock_occ = np.asarray(fock_occ,
+            dtype=np.result_type(h1_mo, pair_factors_full_occ.dtype, dm1_occ, dm2_occ.dtype))
+        itemsize = np.dtype(np.result_type(pair_factors_full_occ.dtype, dm2_occ.dtype)).itemsize
+        block = max(1, (64 << 20)//max(1, itemsize*(nmo*nocc_like+3*nocc_like**2+(nmo**2 if packed else 0))))
+        for start in range(0, len(pair_factors_full_occ), block):
+            factors = (pair_factors_full_occ.block(start,start+block)[:, :, :nocc_like] if packed
+                       else pair_factors_full_occ[start:start+block])
+            contracted = (dm2_occ.contract(factors[:, :nocc_like]) if compact else
+                np.einsum('Pst,rqst->Prq',factors[:, :nocc_like],dm2_occ,optimize=True))
+            left = np.ascontiguousarray(factors.transpose(1, 0, 2)).reshape(nmo, -1)
+            fock_occ += left @ contracted.reshape(-1, nocc_like)
+            del factors, left, contracted
+    else:
+        contracted_dm2 = np.einsum("Pst,rqst->Prq",
+            pair_factors_full_occ[:, :nocc_like, :], dm2_occ, optimize=True)
+        fock_occ += np.einsum("Ppr,Prq->pq", pair_factors_full_occ, contracted_dm2, optimize=True)
 
     fock = np.zeros_like(h1_mo, dtype=np.result_type(fock_occ, h1_mo))
     fock[:, :nocc_like] = fock_occ
@@ -202,6 +259,8 @@ def create_factor_response_action(h1, factors, dm1, dm2):
     repeated Hessian products. Larger/complex cases retain the factor action.
     The bound covers the three principal blocks, not total process memory.
     """
+    if isinstance(dm2, CoreActiveRDM):
+        return None
     nmo, nocc = h1.shape[0], dm1.shape[0]
     if any(np.iscomplexobj(a) for a in (h1, factors, dm1, dm2)):
         return None
@@ -243,20 +302,30 @@ def create_factor_hessian_workspace(
     pair_factors,
     dm1_occ,
     dm2_occ,
-    pair_matrix,
-    contracted_dm2,
+    pair_matrix=None,
+    contracted_dm2=None,
 ):
-    """Create the optional persistent C++ factor-Hessian workspace."""
-    arrays = (h1_mo, pair_factors, dm1_occ, dm2_occ, pair_matrix, contracted_dm2)
+    """Create a persistent CBLAS workspace with dense or core/active RDMs.
+
+    CoreActiveRDM uses the same exact frozen-density Hessian, evaluating core
+    blocks analytically and multiplying only the active four-index block.
+    """
+    compact = isinstance(dm2_occ, CoreActiveRDM)
+    if compact:
+        pair_matrix = np.empty((h1_mo.shape[0], 0))
+        contracted_dm2 = np.empty((0, dm2_occ.nocc, dm2_occ.nocc))
+    factors = (pair_factors.pair_factors
+               if isinstance(pair_factors, PackedRIFactors) else pair_factors)
+    arrays = (h1_mo, factors, dm1_occ, dm2_occ.dm2 if compact else dm2_occ,
+              pair_matrix, contracted_dm2)
     if any(np.iscomplexobj(array) for array in arrays):
         return None
     create = _cpp_attr("create_factor_hessian_workspace")
     if create is None:
         return None
     try:
-        return create(
-            *(np.ascontiguousarray(array, dtype=np.float64) for array in arrays)
-        )
+        arguments = tuple(np.ascontiguousarray(array, dtype=np.float64) for array in arrays)
+        return create(*arguments, dm2_occ.ncore) if compact else create(*arguments)
     except Exception:
         return None
 
@@ -272,6 +341,45 @@ def apply_factor_hessian_workspace(workspace, kappas):
         return apply(workspace, np.ascontiguousarray(kappas, dtype=np.float64))
     except Exception:
         return None
+
+
+def core_active_factor_hessian_action(h1, factors, dm1, dm2, kappas, cache=None):
+    """Exact frozen-RDM Hessian with auxiliary-block response scratch.
+
+    CBLAS and NumPy paths use bounded blocks, without full-rank packed factor
+    copies or persistent occupied-pair contractions. The input factor tensor
+    stays resident. Only contraction order changes relative to the reference.
+    """
+    cache = {} if cache is None else cache
+    if 'native_workspace' not in cache:
+        cache['native_workspace'] = create_factor_hessian_workspace(h1, factors, dm1, dm2)
+    result = apply_factor_hessian_workspace(cache['native_workspace'], kappas)
+    if result is not None:
+        return result
+    kappas = np.asarray(kappas)
+    single = kappas.ndim == 2
+    vectors = kappas[None] if single else kappas
+    n, o = len(h1), len(dm1)
+    packed = isinstance(factors, PackedRIFactors)
+    dtype = np.result_type(h1, factors.dtype, dm1, dm2.dtype, kappas)
+    block = max(1, (64 << 20)//max(1, np.dtype(dtype).itemsize*(3*n*o+3*o**2+(n*n if packed else 0))))
+    gradients = []
+    for k in vectors:
+        df = np.asarray(((h1@k-k@h1)[:, :o]) @ dm1, dtype=dtype)
+        for start in range(0, len(factors), block):
+            b = factors.block(start,start+block) if packed else factors[start:start+block]
+            left = b[:, :, :o]
+            derivative = k.T @ left + b @ k[:, :o]
+            base = dm2.contract(left[:, :o])
+            response = dm2.contract(derivative[:, :o])
+            df += np.einsum('Ppr,Prq->pq', derivative, base, optimize=True)
+            df += np.einsum('Ppr,Prq->pq', left, response, optimize=True)
+            del derivative, base, response
+            del b, left
+        full = np.zeros(h1.shape, dtype=dtype)
+        full[:, :o] = df
+        gradients.append(orbital_gradient(full))
+    return gradients[0] if single else np.stack(gradients)
 
 
 def orbital_gradient(fock):
