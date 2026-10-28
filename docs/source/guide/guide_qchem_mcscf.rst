@@ -414,21 +414,22 @@ per-root analysis: select each root with ``state_id``.
 
 This is an adaptation of `PySCF fci.spin_op.local_spin
 <https://pyscf.org/_modules/pyscf/fci/spin_op.html#local_spin>`_ and
-``spin_square_general`` for real restricted molecular orbitals. The AO overlap
-is zeroed outside the fragment on both indices, and transformed to the MO
-basis. The implementation reproduces that restricted definition using
-spin-traced active RDMs, including the linear-overlap one-electron term.
-It does not replace the overlap restriction by an orthogonal spatial
-projector. Fragment values are basis-dependent and nonadditive: the sum of
-fragment values omits cross-fragment spin correlations. The overlap mask is
-not an orthogonal projector, so the reported quantity need not be positive;
-small negative values are retained rather than clipped. A whole-molecule
-selection recovers the total spin square.
+``spin_square_general`` for real restricted molecular orbitals, evaluated in
+symmetric Lowdin AOs with identity overlap. Both ``local_spin`` and
+``local_charge`` use :math:`T=S^{1/2}C` and :math:`P_A=T_A^\dagger T_A`.
+The orthogonalization follows P.-O. Lowdin, J. Chem. Phys. 18, 365 (1950),
+https://doi.org/10.1063/1.1747632. This changes the fragment definition from
+PySCF's default mask of the original nonorthogonal AO overlap.
+The linear one-electron term retains the exact full-AO projector identity;
+the truncated core+active projector must not be squared instead.
+Fragment values are nonnegative up to numerical roundoff, basis-dependent,
+and nonadditive: their sum omits cross-fragment spin correlations.
+A whole-molecule selection recovers the total spin square.
 
 By default, closed-core contributions are included analytically. No
 core-inclusive four-index RDM or full-space ERI tensor is constructed. Set
 ``with_core=False`` to match a PySCF call using only the active CI and active
-MO coefficients. Complex CI coefficients are supported with real orbitals;
+MO coefficients transformed into Lowdin AOs with identity overlap. Complex CI coefficients are supported with real orbitals;
 complex orbitals and unrestricted alpha/beta orbital sets are unsupported.
 Unlike PySCF's empty ``aolst`` shorthand, an explicit empty selection here
 means an empty fragment.
@@ -486,3 +487,39 @@ Related Pages
 * :doc:`../backends`
 * :doc:`../hf_analysis`
 * :doc:`../qchem_architecture`
+
+Fragment charge fluctuations
+----------------------------
+
+CASCI and CASSCF expose per-root fragment moments::
+
+    stats = mc.local_charge([[0, 1], [2, 3]], state_id=0)
+    stats['charge_mean']  # nuclear charge minus electron population
+    stats['variance']     # charge variance, in e**2
+    stats['covariance']   # fragment charge covariance matrix, in e**2
+
+Fragments are disjoint lists of zero-based atom indices; incomplete partitions
+and empty fragments are allowed. The partition uses symmetric Lowdin AOs,
+with MO coefficients :math:`T=S^{1/2}C` and fragment projectors
+:math:`P_A=T_A^\dagger T_A`. This is the pure symmetric orthogonalization of
+P.-O. Lowdin, J. Chem. Phys. 18, 365 (1950),
+https://doi.org/10.1063/1.1747632, also implemented by
+`PySCF lo.orth.lowdin <https://pyscf.org/_modules/pyscf/lo/orth.html#lowdin>`_.
+It is not meta-Lowdin population analysis.
+
+The implementation contracts the number-operator identities exactly with
+active-space one- and two-particle RDMs and analytic doubly occupied core terms.
+It retains the virtual intermediate contribution through the full AO projector
+identity :math:`Q_AQ_B=\delta_{AB}Q_A`, without forming a core-inclusive 2-RDM.
+Real restricted orbitals, complex CI densities, and positive-definite AO overlap
+are supported. Covariance is
+:math:`\langle N_A N_B\rangle-\langle N_A\rangle\langle N_B\rangle`;
+charge covariance is identical because nuclear charges are fixed.
+
+These are basis-dependent population moments, not exact ionic-sector weights.
+An ideal symmetric superposition of opposite single-charge-transfer states has
+zero mean fragment charge and unit variance, whereas a neutral fixed-population
+state has zero variance. Covalent delocalization also contributes fluctuations.
+Use charge fluctuations together with local spin and wavefunction information
+when assigning CT character. For a complete partition of a fixed-electron-number
+state, covariance rows sum to zero. No molecular point-group symmetry is needed.

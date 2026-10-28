@@ -1,10 +1,12 @@
-"""Fragment spin using the AO-overlap restriction of PySCF local_spin.
+"""Fragment spin in the symmetric-Lowdin AO partition.
 
 Reference: PySCF, ``pyscf.fci.spin_op.local_spin`` and ``spin_square_general``
 https://pyscf.org/_modules/pyscf/fci/spin_op.html
 This is a spin-traced adaptation for real restricted orbitals, with analytic
-closed-core contributions. It reproduces the restricted PySCF definition;
-it is not an orthogonal real-space fragment projector or a local multiplicity.
+closed-core contributions. It applies the PySCF spin contraction in orthogonalized AOs, rather than
+masking the original nonorthogonal overlap. The partition follows P.-O. Lowdin,
+J. Chem. Phys. 18, 365 (1950), https://doi.org/10.1063/1.1747632.
+It is basis dependent, not a real-space partition or a local multiplicity.
 """
 
 import numpy as np
@@ -13,8 +15,9 @@ import numpy as np
 def local_spin_from_rdms(dm1, dm2, projected_overlap, *, ncore=0):
     """Contract active spin-traced RDMs with a restricted fragment overlap.
 
-    ``projected_overlap`` is C.T @ S_fragment @ C in the core+active MO basis.
-    Uses PySCF's linear-overlap one-electron term, not its matrix square.
+    ``projected_overlap`` is T_A.T @ T_A, with T = S**(1/2) @ C, in the
+    core+active MO basis. The linear one-electron term follows the full AO
+    projector identity Q_A**2 = Q_A; squaring its truncated MO block is wrong.
     Closed-core contributions are analytic; storage never scales as nocc**4.
     See this module's reference and fidelity description.
     """
@@ -41,6 +44,18 @@ def local_spin_from_rdms(dm1, dm2, projected_overlap, *, ncore=0):
     return float(np.real(value))
 
 
+def _lowdin_coefficients(overlap, coefficients):
+    """Transform real AO coefficients with a positive-definite overlap root."""
+    from ..hf.rhf import _lowdin_sqrt_overlap
+    if not np.all(np.isfinite(overlap)) or not np.allclose(overlap, overlap.T, atol=1e-12, rtol=1e-12):
+        raise ValueError('AO overlap must be finite and symmetric.')
+    try:
+        np.linalg.cholesky(overlap)
+    except np.linalg.LinAlgError as error:
+        raise ValueError('Lowdin fragments require positive-definite AO overlap.') from error
+    return _lowdin_sqrt_overlap(overlap) @ coefficients
+
+
 def _indices(selection, size, name):
     values = np.asarray(selection)
     if values.ndim == 0:
@@ -62,12 +77,13 @@ def local_spin(mc, atoms=None, *, aolst=None, state_id=0, with_core=True):
     Both omitted selects the whole molecule; an explicit empty selection gives
     zero (unlike PySCF's empty-list shorthand for the whole molecule).
     The default includes the closed core; ``with_core=False`` analyzes only
-    the active electrons, as a call to PySCF local_spin with the active CI does.
+    the active electrons. AO indices label symmetrically orthogonalized AOs.
 
     Adapts PySCF ``fci.spin_op.local_spin`` for real restricted orbitals:
     https://pyscf.org/_modules/pyscf/fci/spin_op.html
-    Mask the AO overlap on both indices, then contract spin-traced active RDMs
-    plus analytic closed-core terms. Fragment values are basis-dependent and
+    Apply its contraction in symmetric-Lowdin AOs (identity overlap), using
+    spin-traced active RDMs plus analytic closed-core terms. This uses the
+    same partition as local_charge, rather than PySCF's original AO mask. Fragment values are basis-dependent and
     nonadditive; cross-fragment spin correlations are omitted. No local spin
     multiplicity is inferred. Complex/unrestricted orbitals are unsupported.
     """
@@ -106,6 +122,7 @@ def local_spin(mc, atoms=None, *, aolst=None, state_id=0, with_core=True):
     c = coefficients[:, :stop] if with_core else coefficients[:, ncore:stop]
     if not np.allclose(c.T @ overlap @ c, np.eye(c.shape[1]), atol=1e-7, rtol=1e-7):
         raise ValueError('Local spin requires orthonormal molecular orbitals.')
-    projected = c[aos].T @ overlap[np.ix_(aos, aos)] @ c[aos]
+    transformed = _lowdin_coefficients(overlap, c)
+    projected = transformed[aos].T @ transformed[aos]
     dm1, dm2 = make_state_average_rdms([target.ci[state_id]], [1.], target.binary)
     return local_spin_from_rdms(dm1, dm2, projected, ncore=ncore if with_core else 0)

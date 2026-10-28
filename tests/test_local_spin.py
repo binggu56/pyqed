@@ -27,8 +27,11 @@ def test_restricted_contraction_matches_pyscf(nelec):
     vals, vecs = np.linalg.eigh(overlap)
     coefficients = ((vecs/np.sqrt(vals))@vecs.T)@np.linalg.qr(rng.normal(size=(6,6)))[0][:,:n]
     aos = [0,2,5]
+    from pyqed.qchem.mcscf.local_spin import _lowdin_coefficients
+    coefficients = _lowdin_coefficients(overlap, coefficients)
+    overlap = np.eye(6)
     c = coefficients[aos]
-    projected = c.T@overlap[np.ix_(aos,aos)]@c
+    projected = c.T@c
     expected = spin_op.local_spin(ci,n,nelec,coefficients,overlap,aos)[0]
     assert local_spin_from_rdms(dm1,dm2,projected) == pytest.approx(expected,abs=2e-12)
 
@@ -120,7 +123,9 @@ def test_molecular_api_matches_pyscf(molecular_solvers,solver_id,with_core):
                 ci[positions[0][(abits<<core)|((1<<core)-1)],
                    positions[1][(bbits<<core)|((1<<core)-1)]] = matrix[i,j]
         c = mc.mo_coeff[:,:n] if with_core else mc.mo_coeff[:,target.ncore:target.ncore+target.ncas]
-        expected = spin_op.local_spin(ci,n,counts,c,mc.mf.get_ovlp(),[0,1])[0]
+        from pyqed.qchem.mcscf.local_spin import _lowdin_coefficients
+        c = _lowdin_coefficients(mc.mf.get_ovlp(), c)
+        expected = spin_op.local_spin(ci,n,counts,c,np.eye(len(c)),[0,1])[0]
         assert mc.local_spin([0,1],state_id=root,with_core=with_core) == pytest.approx(expected,abs=2e-10)
 
 
@@ -171,3 +176,15 @@ def test_complex_ci_with_real_orbitals_matches_real_components():
     expected = sum(spin_op.local_spin(part,n,(1,1),c,np.eye(n),[0,1])[0]
                    for part in (ci.real.copy(),ci.imag.copy()))
     assert local_spin_from_rdms(d1,d2,p) == pytest.approx(expected,abs=2e-12)
+
+
+@pytest.mark.parametrize('solver_id',[0,1])
+def test_fragment_charge_api(molecular_solvers,solver_id):
+    mc = molecular_solvers[solver_id]
+    for state in range(2):
+        result = mc.local_charge([[0,1],[2,3]],state_id=state)
+        np.testing.assert_allclose(result['electron_mean'].sum(),4,atol=1e-10)
+        np.testing.assert_allclose(result['covariance'].sum(axis=0),0,atol=1e-10)
+        assert np.min(result['variance']) >= -1e-10
+        whole = mc.local_charge([[0,1,2,3],[]],state_id=state)
+        np.testing.assert_allclose(whole['variance'],0,atol=1e-10)

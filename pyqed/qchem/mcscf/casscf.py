@@ -1307,8 +1307,17 @@ class FirstOrderCASSCF:
         self._finalize_spin_diagnostics()
         return self
 
+    def local_charge(self, fragments, *, state_id=0):
+        """Lowdin fragment populations, charges and number fluctuations.
+
+        See :func:`pyqed.qchem.mcscf.fragment_charge.local_charge`
+        for the atom-index partition, reference, returned fields and limitations.
+        """
+        from .fragment_charge import local_charge
+        return local_charge(self, fragments, state_id=state_id)
+
     def local_spin(self, atoms=None, *, aolst=None, state_id=0, with_core=True):
-        """Fragment <S^2> using PySCF's AO-overlap restriction.
+        """Fragment <S^2> using the symmetric-Lowdin AO partition.
 
         See :func:`pyqed.qchem.mcscf.local_spin.local_spin` for the definition,
         reference, zero-based selections, core treatment, and limitations.
