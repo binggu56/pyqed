@@ -590,7 +590,8 @@ def test_rhf_mo_components_builtin_h2():
     mo0 = analysis[0]
     assert mo0['mo_index'] == 0
     np.testing.assert_allclose(mo0['contribution_sum'], 1.0, atol=1e-8)
-    assert [entry['label'] for entry in mo0['components']] == ['0 H 1s', '1 H 1s']
+    # Symmetry-equivalent contributions can swap order at roundoff level.
+    assert sorted(entry['label'] for entry in mo0['components']) == ['0 H 1s', '1 H 1s']
     np.testing.assert_allclose(
         [entry['contribution'] for entry in mo0['components']],
         [0.5, 0.5],

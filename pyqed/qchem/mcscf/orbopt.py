@@ -168,7 +168,8 @@ def generalized_fock_from_factors(h1_mo, pair_factors_full_occ, dm1_occ, dm2_occ
         itemsize = np.dtype(np.result_type(pair_factors_full_occ.dtype, dm2_occ.dtype)).itemsize
         block = max(1, (64 << 20)//max(1, itemsize*(nmo*nocc_like+3*nocc_like**2+(nmo**2 if packed else 0))))
         for start in range(0, len(pair_factors_full_occ), block):
-            factors = (pair_factors_full_occ.block(start,start+block)[:, :, :nocc_like] if packed
+            factors = (pair_factors_full_occ.select(slice(None), slice(0, nocc_like),
+                                                   slice(start, start+block)) if packed
                        else pair_factors_full_occ[start:start+block])
             contracted = (dm2_occ.contract(factors[:, :nocc_like]) if compact else
                 np.einsum('Pst,rqst->Prq',factors[:, :nocc_like],dm2_occ,optimize=True))

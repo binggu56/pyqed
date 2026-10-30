@@ -425,21 +425,21 @@ def _resolve_use_cholesky(mf, use_cholesky=None):
     )
 
 
-def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False):
+def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False, out=None):
     """
     Transform AO Cholesky factors ``L_P[mu,nu]`` to an MO pair basis.
     """
     if mo_right is None:
         mo_right = mo_left
     from pyqed.qchem.basis import mo_pair_factors as _basis_mo_pair_factors
-    return _basis_mo_pair_factors(eri_factors, mo_left, mo_right, packed=packed)
+    return _basis_mo_pair_factors(eri_factors, mo_left, mo_right, packed=packed, out=out)
 
 
-def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None, *, packed=False):
+def transform_eri_factors_to_mo_pair(eri_factors, mo_left, mo_right=None, *, packed=False, out=None):
     """
     Compatibility alias for :func:`mo_pair_factors`.
     """
-    return mo_pair_factors(eri_factors, mo_left, mo_right, packed=packed)
+    return mo_pair_factors(eri_factors, mo_left, mo_right, packed=packed, out=out)
 
 
 def assemble_spatial_eri_from_factors(pair_factors_pq, pair_factors_rs=None):

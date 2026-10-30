@@ -841,7 +841,9 @@ def test_first_order_casscf_factorized_fock_matches_dense():
     np.testing.assert_allclose(fock_factor, fock_dense, atol=1e-8)
 
 
-def test_factorized_orbital_hessian_cached_blas_matches_dense():
+def test_factorized_orbital_hessian_cached_blas_matches_dense(monkeypatch):
+    # Exercise the cached BLAS path rather than the small-system response action.
+    monkeypatch.setattr(casscf_module, 'create_factor_response_action', lambda *args: None)
     rng = np.random.default_rng(14)
     naux, nmo, nocc = 7, 6, 3
     pair_factors = rng.normal(size=(naux, nmo, nmo))
@@ -1660,7 +1662,8 @@ def test_orbital_hessian_action_from_integrals_matches_finite_difference():
         max_step=0.25,
     )[1]
 
-    step_vec = np.array([0.03, -0.02, 0.01], dtype=float)
+    size = len(pack_nonredundant(grad0, mc.ncore, mc.ncas, mf.nmo))
+    step_vec = np.linspace(0.03, -0.02, size)
     kappa = unpack_nonredundant(step_vec, mc.ncore, mc.ncas, mf.nmo)
     analytic = orbital_hessian_action_from_integrals(h1_mo, eri_mo, dm1, dm2, kappa)
 
@@ -1711,13 +1714,13 @@ def test_analytic_hessian_action_reuses_reference_cache(monkeypatch):
         mf.mo_coeff,
         mc,
         grad_vec,
-        np.array([0.02, -0.01, 0.005], dtype=float),
+        np.linspace(0.02, -0.01, len(grad_vec)),
     )
     solver._orbital_hessian_action(
         mf.mo_coeff,
         mc,
         grad_vec,
-        np.array([-0.01, 0.015, -0.004], dtype=float),
+        np.linspace(-0.01, 0.015, len(grad_vec)),
     )
 
     assert calls == {"rdms": 1, "integrals": 1}
@@ -1727,7 +1730,7 @@ def test_analytic_hessian_action_reuses_reference_cache(monkeypatch):
         mf.mo_coeff,
         mc,
         grad_vec,
-        np.array([0.01, 0.0, -0.003], dtype=float),
+        np.linspace(0.01, -0.003, len(grad_vec)),
     )
 
     assert calls == {"rdms": 2, "integrals": 2}
@@ -1766,7 +1769,7 @@ def test_evaluate_populates_analytic_hessian_cache_for_state_average(monkeypatch
         mf.mo_coeff,
         mc,
         grad_vec,
-        np.array([0.02, -0.01, 0.005], dtype=float),
+        np.linspace(0.02, -0.01, len(grad_vec)),
     )
 
     assert calls == {"rdms": 0, "integrals": 0}

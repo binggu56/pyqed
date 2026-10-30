@@ -416,6 +416,7 @@ class RHF:
     with energies and ``mo_occ`` permuted together.
     """
     def __init__(self, mol, init_guess='minao', verbose=0):
+        self.chkfile = None
         self.mol = mol
         self.max_cycle = 100
         self.init_guess = init_guess
@@ -494,6 +495,28 @@ class RHF:
         self.orb_irrep_weights = None
 
     def run(self, **kwargs):
+        """Run RHF with optional density restart checkpoints.
+
+        Set ``chkfile`` to enable atomic HDF5 iteration/final checkpoints.
+        ``restart=True`` validates molecular identity and restores the density;
+        integrals are rebuilt or cached normally and DIIS history is not saved.
+        Checkpointing is opt-in and requires h5py.
+        """
+        restart = kwargs.pop('restart', False)
+        checkpoint = None
+        if restart or self.chkfile is not None:
+            from . import checkpoint as checkpoint_io
+            import h5py  # Fail before SCF if checkpoint support is unavailable.
+            if kwargs.get('density_fit', False):
+                raise NotImplementedError('RHF checkpoints require the PyQED integral path')
+            if restart:
+                if self.chkfile is None:
+                    raise ValueError('Set mf.chkfile before requesting restart')
+                if kwargs.get('dm0') is not None:
+                    raise ValueError('Specify restart or dm0, not both')
+                kwargs['dm0'] = checkpoint_io.load_density(self.chkfile, self.mol)
+            def checkpoint(**state):
+                checkpoint_io.write(self.chkfile, self.mol, **state)
         verbose = int(kwargs.pop('verbose', self.verbose))
         self.verbose = verbose
         x2c_kw = kwargs.pop('x2c', False)
@@ -634,6 +657,7 @@ class RHF:
                         with_solvent=with_solvent,
                         init_guess=init_guess,
                         return_info=True,
+                        checkpoint=checkpoint,
                         verbose=verbose,
                         **kwargs,
                     )
@@ -686,6 +710,10 @@ class RHF:
             self.orbsym = labels
             self.orb_sym = ids
             self.orb_irrep_weights = weights
+        if checkpoint is not None:
+            checkpoint(e_tot=self.e_tot, mo_coeff=self.mo_coeff, mo_energy=self.mo_energy,
+                       mo_occ=self.mo_occ, dm=self.dm, converged=self.converged,
+                       cycle=self.scf_info.get("iterations", 0))
         return self
 
     def save(self, filename):
@@ -3380,7 +3408,7 @@ def hartree_fock(mol, dm0=None, init_guess='minao', max_cycle=50, tol=1e-8,
                  stability_analysis=True, stability_gap_tol=0.15,
                  stability_rotation=0.25, stability_curvature_step=1e-3,
                  stability_curvature_tol=1e-5, stability_max_restarts=4,
-                 verbose=0, return_info=False):
+                 verbose=0, return_info=False, checkpoint=None):
     verbose = int(verbose)
 
     #calculate the overlap matrix S
@@ -3911,6 +3939,10 @@ def hartree_fock(mol, dm0=None, init_guess='minao', max_cycle=50, tol=1e-8,
             )
 
         fock_last = F
+
+        if checkpoint is not None:
+            checkpoint(e_tot=total_energy, mo_coeff=mo_coeff, mo_energy=mo_energy,
+                       mo_occ=mo_occ, dm=dm_new, cycle=scf_iter + 1)
 
         if scf_iter > 2 and de < tol and orbital_grad_rms < conv_tol_grad:
             dm = dm_new

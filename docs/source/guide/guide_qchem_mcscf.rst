@@ -329,7 +329,9 @@ This is the recommended path for larger basis sets and larger active spaces.
 
 Second-order full-factor orbital rotations process auxiliary-index blocks,
 using a right-transform scratch buffer targeted at 64 MiB (at least one
-auxiliary matrix). The full rotated factor output remains in memory. QN
+auxiliary matrix). Rotated factor outputs larger than 32 MiB use anonymous
+disk-backed mappings, including packed real MO factors and full complex trial
+factors. QN
 microiterations release current RDM references after creating the independent
 frozen Hessian copies, before the line search.
 
@@ -358,8 +360,91 @@ it further restricts these products to the required occupied and virtual
 response blocks, omitting multiplications by that zero block. The kernel
 checks this condition exactly. Other dimensions retain the two-product route;
 both obey the same auxiliary-block scratch target.
-The complete packed factors remain resident, so total process memory exceeds
-the scratch target.
+The complete packed factors remain accessible through the mappings; the OS
+can reclaim their file-backed pages. This is not a hard process-memory limit:
+BLAS, CI, Hessian batches, and the file cache also consume memory. The exact
+orbital Hessian still requires all orbital pairs, including virtual pairs;
+these are stored on disk rather than omitted. Generalized Fock and trial J/K
+contractions select occupied columns in auxiliary blocks without unpacking
+spectator pairs. Packed line searches reuse discarded trial storage while
+preserving the best trial's immutable factors. These changes are exact storage
+and contraction reorderings, with no change to the RI approximation.
+
+Set ``PYQED_SCRATCH_DIR`` to a local SSD directory with enough free space.
+The default is ``/private/tmp`` on macOS and ``/tmp`` otherwise, independent
+of the working directory and Python's temporary-directory override. Mapping
+files are anonymous and released when their last array owner is released.
+Several complete factor sets may coexist, so budget disk space accordingly.
+For the 1298-AO, 6430-auxiliary example, each packed set is about 40.4 GiB.
+
+To run the single-point script with both scratch and relative outputs outside
+OneDrive, use::
+
+    PYTHONPATH=. python examples/qchem/run_local_scratch.py /absolute/path/to/ccpvdz_cas6e6o_sp.py
+
+The launcher defaults to ``/private/tmp/pyqed-runs`` and accepts an override
+through ``PYQED_SCRATCH_DIR``. It sets BLAS/OpenMP thread environment variables
+to one before loading the script; explicit thread settings inside the target
+script still take precedence. Keep its ``threadpool_limits`` contexts at one
+and use ``pyqed.num_workers()`` for integral and CI worker budgets. A declared
+``max_memory`` is advisory and does not cap mapped pages or all allocations.
+
+``examples/qchem/tdi_casscf_local.py`` reproduces the cc-pVDZ, six-singlet
+CAS(6e,6o) single point using the included 112-atom TDI FC geometry. For an
+explicitly requested local run, record process RSS once per second and the
+OS lifetime peak with::
+
+    PYTHONPATH=. python examples/qchem/monitor_local_calculation.py --out /private/tmp/tdi-cas66 -- python -u examples/qchem/tdi_casscf_local.py --out /private/tmp/tdi-cas66
+
+Use a fresh output directory. The monitor writes ``memory.csv``,
+``memory_status.json``, ``calculation.log``, and a periodically updated
+``tdi_ccpvdz_cas66_memory.png``. Regenerate figures from saved outputs using
+``monitor_local_calculation.py --out /private/tmp/tdi-cas66 --plot-only``.
+The calculation saves source and extension hashes, the RHF snapshot,
+CASSCF history and final states, local observables, optics, and active-orbital
+cubes. This is a single-point run, not a geometry optimization.
+It now enables a local disk RI cache (``--cache-dir``), writes a persistent
+``rhf.chk``, logs RHF iterations, and checkpoints each CASSCF macroiteration.
+Pass ``--restart-rhf /absolute/path/to/rhf.chk`` with a fresh output directory
+to restart from a validated density without overwriting the source checkpoint.
+DIIS history is not restored. A matching RI cache avoids integral rebuilding;
+an earlier run with caching disabled needs one rebuild.
+
+Large-metric RI whitening splits narrow RHS panels across the central worker
+budget without per-worker explicit tensor scratch. Small metrics retain the
+larger serial-panel threshold. BLAS threads remain one. BLAS may retain its
+own per-thread workspaces in addition to the explicit panel budget.
+``benchmarks/benchmark_ri_whitening_panels.py`` measures this operation at the
+TDI metric dimension and packed destination stride without rebuilding molecular
+integrals. These kernel timings are not whole-build speedup guarantees.
+
+Large real occupied RI J/K contractions split the AO rows across the central
+integral worker pool. Workers share one expanded auxiliary factor and one
+occupied transform; disjoint exchange tiles use GEMM off the diagonal and SYRK
+on the diagonal. The explicit factor/transform workspace is proportional to
+``nao**2 + nao*nocc``, independent of the worker count and auxiliary rank.
+Only one factor is expanded at a time; the RI factors remain packed and may
+be disk-backed. BLAS stays single-threaded. Nonnegative occupations are
+absorbed into the occupied orbitals by their square roots. This is an exact
+reordering of the existing RI J/K contraction, with no extra screening or
+physical approximation. Smaller systems and explicit helper block sizes use
+the NumPy reference. ``benchmarks/benchmark_ri_occupied_panels.py`` compares
+TDI-sized kernels in separate processes and records wall time and peak RSS.
+``benchmarks/benchmark_tdi_rhf_iteration.py`` measures a complete RHF loop
+iteration from a validated checkpoint, including diagonalization, occupied J/K,
+energy and density updates. It stops at the first iteration callback, before
+final canonicalization or stability analysis. Restart setup J/K is timed
+separately and uses the checkpoint's validated occupied density factorization.
+DIIS starts empty, so this measures throughput rather than continuation of
+the old DIIS trajectory. Run it through the local calculation monitor with
+``--out``, ``--checkpoint``, and ``--geometry``. Its persistent RI cache is
+reused by later runs; the original job and checkpoint are untouched.
+
+The current constrained ``COCAS`` implementation is not a memory-saving
+substitute for this packed second-order path: it transforms full MO factors
+and embeds closed-core 2-RDMs in its state-average kernel. Those consumers
+would need their own blocked core/active implementation before a meaningful
+low-memory optimizer comparison.
 Unused trial references and QN workspaces are released before the next step
 or macroframe. Dense reference and separate response workflows can still use
 core-inclusive RDMs.

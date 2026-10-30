@@ -15860,6 +15860,108 @@ PyObject* contract_veff_s8_occ(PyObject*, PyObject* args) {
     return veff_obj;
 }
 
+PyObject* contract_jk_ri_occupied(PyObject*, PyObject* args) {
+    PyObject *pairs_obj, *coeff_obj, *gemm_capsule, *syrk_capsule;
+    int workers;
+    if (!PyArg_ParseTuple(args, "OOiOO", &pairs_obj, &coeff_obj, &workers,
+                          &gemm_capsule, &syrk_capsule)) return nullptr;
+    ArrayRef pairs(pairs_obj, NPY_DOUBLE, NPY_ARRAY_CARRAY_RO);
+    ArrayRef coeff(coeff_obj, NPY_DOUBLE, NPY_ARRAY_CARRAY_RO);
+    if (!pairs || !coeff) return nullptr;
+    if (PyArray_NDIM(pairs.obj) != 2 || PyArray_NDIM(coeff.obj) != 2 || workers < 1) {
+        PyErr_SetString(PyExc_ValueError, "Occupied RI contraction requires matrices and positive workers.");
+        return nullptr;
+    }
+    const npy_intp n = PyArray_DIM(coeff.obj, 0), o = PyArray_DIM(coeff.obj, 1);
+    const npy_intp p = PyArray_DIM(pairs.obj, 0);
+    if (n > std::numeric_limits<int>::max() || o > std::numeric_limits<int>::max()) {
+        PyErr_SetString(PyExc_ValueError, "Occupied RI dimensions exceed BLAS integer limits.");
+        return nullptr;
+    }
+    const npy_intp npair = n*(n+1)/2;
+    if (PyArray_DIM(pairs.obj, 1) != npair) {
+        PyErr_SetString(PyExc_ValueError, "Inconsistent occupied RI dimensions.");
+        return nullptr;
+    }
+    void* gemm_ptr = PyCapsule_GetPointer(gemm_capsule, PyCapsule_GetName(gemm_capsule));
+    if (!gemm_ptr) return nullptr;
+    void* syrk_ptr = PyCapsule_GetPointer(syrk_capsule, PyCapsule_GetName(syrk_capsule));
+    if (!syrk_ptr) return nullptr;
+    using Gemm = void (*)(char*, char*, int*, int*, int*, double*, double*, int*, double*, int*, double*, double*, int*);
+    using Syrk = void (*)(char*, char*, int*, int*, double*, double*, int*, double*, double*, int*);
+    const auto gemm = reinterpret_cast<Gemm>(gemm_ptr);
+    const auto syrk = reinterpret_cast<Syrk>(syrk_ptr);
+    npy_intp dims[2] = {n, n};
+    auto* j_obj = reinterpret_cast<PyArrayObject*>(PyArray_ZEROS(2, dims, NPY_DOUBLE, 0));
+    auto* k_obj = reinterpret_cast<PyArrayObject*>(PyArray_ZEROS(2, dims, NPY_DOUBLE, 0));
+    if (!j_obj || !k_obj) { Py_XDECREF(j_obj); Py_XDECREF(k_obj); return nullptr; }
+    if (!n || !o || !p) return Py_BuildValue("NN", j_obj, k_obj);
+    auto* j = static_cast<double*>(PyArray_DATA(j_obj));
+    auto* k = static_cast<double*>(PyArray_DATA(k_obj));
+    auto* c = static_cast<double*>(PyArray_DATA(coeff.obj));
+    auto* source = static_cast<double*>(PyArray_DATA(pairs.obj));
+    std::vector<double> dense, bc, jp;
+    try {
+        dense.resize(static_cast<std::size_t>(n*n));
+        bc.resize(static_cast<std::size_t>(n*o));
+        jp.resize(static_cast<std::size_t>(npair));
+    } catch (const std::bad_alloc&) {
+        Py_DECREF(j_obj); Py_DECREF(k_obj); return PyErr_NoMemory();
+    }
+    // All workers share one factor and one occupied transform. Each owns
+    // disjoint AO rows and lower-triangle tiles, with no worker-local tensors.
+    constexpr npy_intp tile = 128;
+    const int count = std::min<npy_intp>(workers, (n+tile-1)/tile);
+    int ni = static_cast<int>(n), oi = static_cast<int>(o);
+    PyThreadState* state = PyEval_SaveThread();
+    try {
+        for (npy_intp aux = 0; aux < p; ++aux) {
+            const double* packed = source+aux*npair;
+            native_integral_worker_pool().run(count, [&](int worker) {
+                for (npy_intp start = worker*tile; start < n; start += count*tile) {
+                    int rows = static_cast<int>(std::min(tile, n-start));
+                    for (npy_intp i = start; i < start+rows; ++i)
+                        for (npy_intp q = 0; q < n; ++q) {
+                            const npy_intp hi = std::max(i,q), lo = std::min(i,q);
+                            dense[i*n+q] = packed[hi*(hi+1)/2+lo];
+                        }
+                    char normal = 'N'; double one = 1., zero = 0.;
+                    gemm(&normal, &normal, &oi, &rows, &ni, &one, c, &oi,
+                         dense.data()+start*n, &ni, &zero, bc.data()+start*o, &oi);
+                }
+            });
+            double charge = 0.;
+            for (npy_intp i = 0; i < n*o; ++i) charge += c[i]*bc[i];
+            native_integral_worker_pool().run(count, [&](int worker) {
+                for (npy_intp pair = npair*worker/count; pair < npair*(worker+1)/count; ++pair)
+                    jp[pair] += charge*packed[pair];
+                for (npy_intp start = worker*tile; start < n; start += count*tile) {
+                    int rows = static_cast<int>(std::min(tile, n-start));
+                    char transpose = 'T', normal = 'N', upper = 'U'; double one = 1.;
+                    if (start) {
+                        int columns = static_cast<int>(start);
+                        gemm(&transpose, &normal, &columns, &rows, &oi, &one,
+                             bc.data(), &oi, bc.data()+start*o, &oi, &one, k+start*n, &ni);
+                    }
+                    syrk(&upper, &transpose, &rows, &oi, &one, bc.data()+start*o,
+                         &oi, &one, k+start*n+start, &ni);
+                }
+            });
+        }
+        for (npy_intp i = 0; i < n; ++i)
+            for (npy_intp q = 0; q <= i; ++q) {
+                j[i*n+q] = j[q*n+i] = jp[i*(i+1)/2+q];
+                k[q*n+i] = k[i*n+q];
+            }
+    } catch (const std::exception& error) {
+        PyEval_RestoreThread(state);
+        Py_DECREF(j_obj); Py_DECREF(k_obj);
+        PyErr_SetString(PyExc_RuntimeError, error.what()); return nullptr;
+    }
+    PyEval_RestoreThread(state);
+    return Py_BuildValue("NN", j_obj, k_obj);
+}
+
 PyObject* contract_jk_ri_occ_packed(PyObject*, PyObject* args) {
     PyObject* pair_factors_obj = nullptr;
     PyObject* mo_coeff_obj = nullptr;
@@ -16368,14 +16470,16 @@ PyObject* whiten_ri_block(PyObject*, PyObject* args) {
     auto* source = static_cast<double*>(PyArray_DATA(block.obj));
     auto* dest = static_cast<double*>(PyArray_DATA(output));
     int stride = static_cast<int>(PyArray_STRIDE(output, 0)/sizeof(double));
-    // Keep small solves serial and give each worker a useful RHS panel.
-    const int count = std::min<int>(workers, std::max<npy_intp>(1, width/512));
+    // Large metrics amortize scheduling even with narrow streamed RHS panels.
+    const npy_intp panel = naux >= 512 ? 64 : 512;
+    const int count = std::min<int>(workers, std::max<npy_intp>(1, width/panel));
     auto solve = [&](int worker) {
         const auto start = width*worker/count, stop = width*(worker+1)/count;
         int m = static_cast<int>(stop-start), n = static_cast<int>(rank), k = static_cast<int>(naux);
         double one = 1., zero = 0.;
         if (triangular) {
-            for (int row = 0; row < k; ++row)
+            // Packed row offsets can exceed INT32_MAX even with BLAS int sizes.
+            for (npy_intp row = 0; row < naux; ++row)
                 std::copy(source+row*width+start, source+row*width+stop, dest+row*stride+start);
             char side = 'R', lower = 'L', transpose = 'T', diagonal = 'N';
             reinterpret_cast<Trsm>(pointer)(&side, &lower, &transpose, &diagonal,
@@ -16814,6 +16918,7 @@ PyMethodDef methods[] = {
     {"contract_veff_s8", contract_veff_s8, METH_VARARGS, "Contract eight-fold packed ERIs with a density matrix and return J - 0.5 K."},
     {"contract_veff_s8_occ", contract_veff_s8_occ, METH_VARARGS, "Contract eight-fold packed ERIs for an occupied RHF MO density and return J - 0.5 K."},
     {"contract_jk_ri_occ_packed", contract_jk_ri_occ_packed, METH_VARARGS, "Contract packed RI factors for occupied MO density."},
+    {"contract_jk_ri_occupied", contract_jk_ri_occupied, METH_VARARGS, "Share bounded occupied RI panels across AO-row BLAS tasks."},
     {"mo_pair_factors", transform_ri_factors_to_mo_pair, METH_VARARGS, "Transform packed RI factors to an MO-pair tensor."},
     {"transform_ri_factors_to_mo_pair", transform_ri_factors_to_mo_pair, METH_VARARGS, "Transform packed RI factors to an MO-pair tensor."},
     {"ao2mo_s8", ao2mo_s8, METH_VARARGS, "Transform eight-fold packed AO ERIs to a dense chemist-notation MO tensor."},

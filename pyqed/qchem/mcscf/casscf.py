@@ -12,7 +12,7 @@ import math
 
 import numpy as np
 from scipy.linalg import expm
-from ..basis import PackedRIFactors
+from ..basis import PackedRIFactors, _ri_storage, _pair_factors_to_full
 
 from .casci import (
     _get_mf_cholesky_factors,
@@ -1799,8 +1799,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 return potential
             block = max(1, (64 << 20)//max(1, np.dtype(dtype).itemsize*(3*n*o+o*o+(n*n if packed else 0))))
             for start in range(0, len(self.eri_factors), block):
-                factors = (self.eri_factors.block(start,start+block) if packed
-                           else self.eri_factors[start:start+block])
+                if packed:
+                    panel = slice(start, start+block)
+                    left = self.eri_factors.select(slice(None), occupied, panel)
+                    coeff = np.einsum('Pkl,lk->P', left[:, occupied, :], density, optimize=True)
+                    coulomb = coeff @ self.eri_factors.pair_factors[panel]
+                    potential += _pair_factors_to_full(coulomb[None, :], n)[0]
+                    potential -= .5*np.einsum('Pil,lk,Pjk->ij', left, density, left, optimize=True)
+                    del left, coeff, coulomb
+                    continue
+                factors = self.eri_factors[start:start+block]
                 left = factors[:, :, occupied]
                 right = factors[:, occupied, :]
                 coeff = np.einsum("Pkl,lk->P", left[:, occupied, :], density, optimize=True)
@@ -1824,18 +1832,18 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         )
         return h1, eri
 
-    def _transform_frozen_factor_integrals(self, h1_ref, pair_ref, U):
+    def _transform_frozen_factor_integrals(self, h1_ref, pair_ref, U, *, out=None):
         h1 = U.conj().T @ h1_ref @ U
         if isinstance(pair_ref, PackedRIFactors):
             return h1, transform_eri_factors_to_mo_pair(pair_ref,U,
-                                                       packed=not np.iscomplexobj(U))
+                                                       packed=not np.iscomplexobj(U), out=out)
         # Keep the right-transform scratch bounded while retaining the full
         # output required by the integral and Hessian consumers.
         dtype = np.result_type(pair_ref, U)
         naux, nao, _ = pair_ref.shape
         nmo = U.shape[1]
         block = max(1, min(naux, (64 << 20) // max(1, nao*nmo*dtype.itemsize)))
-        pair_factors = np.empty((naux, nmo, nmo), dtype=dtype)
+        pair_factors = _ri_storage((naux, nmo, nmo), dtype=dtype)
         scratch = np.empty((block, nao, nmo), dtype=dtype)
         left = U.conj().T
         for start in range(0, naux, block):
@@ -2093,6 +2101,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     ):
         scale = 1.0
         best = None
+        best_factors = scratch = None
         minimum_decrease = max(1.0e-14, min(1.0e-10, 1.0e-5 * self.conv_tol))
         while scale >= 0.125:
             trial_U = self._apply_orbital_update(U, scale * kappa)
@@ -2100,6 +2109,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 h1_ref,
                 pair_ref,
                 trial_U,
+                **({"out": scratch} if scratch is not None else {}),
             )
             if relax_ci:
                 trial_mc = self._make_factor_integral_casci(
@@ -2118,9 +2128,16 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 )
             trial_energy = self._objective_energy(trial_mc, self.state_id)
             if best is None or trial_energy < best[1]:
+                scratch, best_factors = best_factors, pair_trial
                 best = (trial_U, trial_energy, trial_mc, scale)
+            else:
+                scratch = pair_trial if isinstance(pair_trial, PackedRIFactors) else None
             if trial_energy < energy - minimum_decrease:
                 return True, trial_U, trial_energy, trial_mc, scale
+            # The best CI retains immutable factors; recycle only discarded storage.
+            if not isinstance(scratch, PackedRIFactors):
+                scratch = None
+            trial_mc = pair_trial = None
             scale *= 0.5
         if best is None:
             return False, U, energy, None, 0.0
@@ -5200,7 +5217,14 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         ci0=None,
         use_cholesky=None,
         active_orbitals=None,
+        macro_callback=None,
     ):
+        """Optimize orbitals, optionally checkpointing each completed macrostep.
+
+        ``macro_callback`` receives the physical MO coefficients, a shallow CI
+        snapshot with matching coefficients, and scalar diagnostics. Treat
+        these as read-only and copy any arrays retained by the callback.
+        """
         if isinstance(self.mf.mo_coeff, tuple):
             raise NotImplementedError(
                 "SecondOrderCASSCF currently supports restricted references only."
@@ -6339,6 +6363,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 micro_cycles=micro,
             )
             self.casci = micro_mc
+            if macro_callback is not None:
+                checkpoint_ci = copy.copy(micro_mc)
+                checkpoint_ci.mo_coeff = np.array(mo_coeff, copy=True)
+                macro_callback(dict(casci=checkpoint_ci, mo_coeff=mo_coeff,
+                                    diagnostics=dict(self.history[-1])))
 
             zero_step_plateau = bool(
                 micro_ci_relaxed

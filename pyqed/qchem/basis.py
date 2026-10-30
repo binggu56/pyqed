@@ -21,6 +21,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import lru_cache
 
 import numpy as np
+from scipy.linalg.blas import dsyrk
 from scipy.linalg import cython_blas as _ri_blas
 import pyqed
 _CYTHON_COMPILED = False
@@ -2610,14 +2611,17 @@ def _matrix_free_spherical_cd_factors(
     return factors, info
 
 
-def _ri_storage(shape):
+def _ri_storage(shape, dtype=np.float64):
     """Packed RI workspace, using anonymous local disk above 32 MiB."""
-    size = int(np.prod(shape)) * 8
+    size = math.prod(shape) * np.dtype(dtype).itemsize
     if size <= 32 * 2**20:
-        return np.empty(shape, dtype=np.float64)
-    with tempfile.TemporaryFile() as file:
+        return np.empty(shape, dtype=dtype)
+    scratch = os.environ.get("PYQED_SCRATCH_DIR") or (
+        "/private/tmp" if os.path.isdir("/private/tmp") else "/tmp")
+    os.makedirs(scratch, exist_ok=True)
+    with tempfile.TemporaryFile(dir=scratch) as file:
         file.truncate(size)
-        return np.memmap(file, mode="r+", dtype=np.float64, shape=shape)
+        return np.memmap(file, mode="r+", dtype=dtype, shape=shape)
 
 
 def _transform_ri_tensors_to_spherical(metric, j3_pair, primary_transform, aux_transform):
@@ -4836,6 +4840,13 @@ def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=N
 
     c_occ = np.ascontiguousarray(mo_coeff[:, occ_idx], dtype=np.float64)
     occ = mo_occ[occ_idx]
+    if (block_size is None and nao >= 256 and np.all(occ >= 0)
+            and _integrals_cpp is not None
+            and hasattr(_integrals_cpp, 'contract_jk_ri_occupied')):
+        weighted = np.ascontiguousarray(c_occ*np.sqrt(occ)[None, :])
+        return _integrals_cpp.contract_jk_ri_occupied(
+            pair_factors, weighted, workers, _ri_blas.__pyx_capi__['dgemm'],
+            _ri_blas.__pyx_capi__['dsyrk'])
     c_weighted = np.ascontiguousarray(c_occ * occ[None, :], dtype=np.float64)
     nocc = c_occ.shape[1]
     if block_size is None:
@@ -4844,7 +4855,7 @@ def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=N
         block_size = max(1, int(block_size))
 
     j_pairs = np.zeros(pair_factors.shape[1], dtype=np.float64)
-    vk = np.zeros((nao, nao), dtype=np.float64)
+    vk = np.zeros((nao, nao), dtype=np.float64, order='F')
     for start in range(0, pair_factors.shape[0], block_size):
         stop = min(start + block_size, pair_factors.shape[0])
         packed = pair_factors[start:stop]
@@ -4852,8 +4863,16 @@ def _contract_jk_ri_occ_packed(pair_factors, mo_coeff, mo_occ, nao, block_size=N
         bc = np.einsum("pij,ja->pia", factors, c_occ, optimize=True)
         coeff = np.einsum("ia,pia->p", c_weighted, bc, optimize=True)
         j_pairs += coeff @ packed
+        # Release expanded factors before packing occupied columns for SYRK.
+        # The live panel remains within the existing auxiliary scratch budget.
+        del factors
         bc *= np.sqrt(np.abs(occ))[None, None, :]
-        vk += np.einsum("pia,pja->ij", bc, bc, optimize=True)
+        matrix = np.ascontiguousarray(bc.transpose(1, 0, 2)).reshape(nao, -1)
+        vk = dsyrk(1., matrix.T, trans=1, beta=1., c=vk, lower=1, overwrite_c=1)
+        del matrix, bc
+
+    for row in range(nao):
+        vk[row, row+1:] = vk[row+1:, row]
 
     vj = _pair_vector_to_symmetric_matrix(j_pairs, nao)
     return vj, vk
@@ -4937,11 +4956,11 @@ class PackedRIFactors:
         """Expand only an auxiliary block, in the current AO or MO frame."""
         return _pair_factors_to_full(self.pair_factors[start:stop], self.nao)
 
-    def select(self, left, right):
+    def select(self, left, right, auxiliary=slice(None)):
         """Read an orbital-pair subblock without expanding spectator orbitals."""
         rows, cols = np.atleast_1d(np.arange(self.nao)[left]), np.atleast_1d(np.arange(self.nao)[right])
         hi, lo = np.maximum(rows[:, None], cols), np.minimum(rows[:, None], cols)
-        return self.pair_factors[:, hi*(hi+1)//2+lo]
+        return self.pair_factors[auxiliary, hi*(hi+1)//2+lo]
 
 
 def _as_ri_pair_factors(eri_factors, nao):
@@ -5412,9 +5431,17 @@ def contract_jk_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=None):
     ``dm = C occ C.T`` but avoids the full-density exchange contraction.
     Packed factors use auxiliary-blocked BLAS contractions by default, with
     only one block expanded to symmetric AO matrices. This exact contraction
-    reordering leaves the RI approximation unchanged. BLAS controls threading;
-    ``workers`` applies only to the opt-in scalar integral-extension reference
-    (``PYQED_QCHEM_CPP_RI_JK=1``).
+    reordering leaves the RI approximation unchanged. BLAS controls threading.
+    Exchange is accumulated in place with symmetric rank-k BLAS updates;
+    expanded panels are released before occupied columns are packed, keeping
+    the same auxiliary scratch bound and avoiding the generic einsum loop.
+    For large real packed systems with nonnegative occupations, AO-row BLAS
+    tasks use ``workers`` while sharing one factor and one occupied transform.
+    Exchange tasks own disjoint lower-triangle tiles; no worker-local factor
+    or exchange matrices are allocated. Explicit ``block_size`` in the helper
+    selects the NumPy reference. The scalar integral-extension reference is
+    opt-in (``PYQED_QCHEM_CPP_RI_JK=1``). All routes are exact contraction
+    reorderings of the same RI approximation, with BLAS threads kept at one.
     """
     workers = resolve_workers(workers)
     nao = int(nao)
@@ -5440,7 +5467,7 @@ def contract_veff_ri_mo(eri_factors, mo_coeff, mo_occ, nao, workers=None):
     return vj - 0.5 * vk
 
 
-def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False):
+def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False, out=None):
     """
     Transform RI factors to an orbital pair block.
 
@@ -5464,7 +5491,12 @@ def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False):
         elif source.shape[1:] != (nao, nao):
             raise ValueError('Factor dimensions do not match the coefficient matrix.')
         rows, cols = np.tril_indices(nmo)
-        result = np.empty((len(source), len(rows)), dtype=np.float64)
+        shape = (len(source), len(rows))
+        result = _ri_storage(shape) if out is None else out.pair_factors
+        if (result.shape != shape or result.dtype != np.float64 or
+                not result.flags.c_contiguous or not result.flags.writeable or
+                np.shares_memory(source, result)):
+            raise ValueError('Packed factor output must be writable, disjoint float64 storage of the required shape.')
         block = max(1, (64 << 20)//max(1, 8*(3*nao**2+nao*nmo+nmo**2+len(rows))))
         indices = _ao_pair_index_matrix(nao) if source.ndim == 2 else None
         for start in range(0, len(source), block):
@@ -5477,6 +5509,8 @@ def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False):
             result[start:stop] = rotated[:, rows, cols]
             del dense, work, rotated
         return PackedRIFactors(result, nmo)
+    if out is not None:
+        raise ValueError('Reusable factor output requires packed=True.')
     if isinstance(eri_factors, PackedRIFactors) or np.asarray(eri_factors).ndim == 2:
         pair_factors = _as_ri_pair_factors(eri_factors, mo_left.shape[0])
         transform_work = (
@@ -5492,7 +5526,7 @@ def mo_pair_factors(eri_factors, mo_left, mo_right=None, *, packed=False):
             bytes_per_aux = itemsize * nao * (nao + mo_right.shape[1])
             block_size = max(1, min(pair_factors.shape[0], (64 << 20) // bytes_per_aux))
             rows, cols = np.tril_indices(nao)
-            out = np.empty(
+            out = _ri_storage(
                 (pair_factors.shape[0], mo_left.shape[1], mo_right.shape[1]),
                 dtype=dtype,
             )
