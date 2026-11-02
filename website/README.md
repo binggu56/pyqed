@@ -24,10 +24,14 @@ The local site runs at `http://localhost:3000`.
 ```bash
 npm run lint
 npm test
+npm audit --omit=dev --audit-level=high
 ```
 
 `npm test` creates the production static export in `out/` and checks the
 rendered pages, metadata, landmarks, and finished-site assets.
+The dependency checks allow exact stable Next.js versions at or above 16.4.1,
+with `eslint-config-next` and both lockfile entries aligned to the same version.
+The runtime audit checks for current security advisories beyond that baseline.
 
 ## Project shape
 

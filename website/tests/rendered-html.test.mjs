@@ -39,6 +39,83 @@ function float32Base64(values) {
   return Buffer.from(buffer).toString("base64");
 }
 
+function assertNextVersions(packageJson, packageLock) {
+  const next = packageJson.dependencies.next;
+  assert.match(next, /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/,
+    "Next.js must use an exact stable version");
+  const [major, minor, patch] = next.split(".").map(Number);
+  // Keep the existing security baseline while allowing later stable updates.
+  // The CI runtime audit remains responsible for newly disclosed advisories.
+  assert.ok(
+    major > 16 || (major === 16 && (minor > 4 || (minor === 4 && patch >= 1))),
+    "Next.js must be at least 16.4.1",
+  );
+  assert.equal(packageJson.devDependencies["eslint-config-next"], next,
+    "eslint-config-next must match Next.js");
+
+  for (const [name, group] of [["next", "dependencies"], ["eslint-config-next", "devDependencies"]]) {
+    assert.equal(packageLock.packages[""][group][name], next,
+      `lockfile root ${name} must match package.json`);
+    assert.equal(packageLock.packages[`node_modules/${name}`].version, next,
+      `locked ${name} must match package.json`);
+  }
+}
+
+function nextVersionFixture(version) {
+  return {
+    packageJson: {
+      dependencies: { next: version },
+      devDependencies: { "eslint-config-next": version },
+    },
+    packageLock: {
+      packages: {
+        "": {
+          dependencies: { next: version },
+          devDependencies: { "eslint-config-next": version },
+        },
+        "node_modules/next": { version },
+        "node_modules/eslint-config-next": { version },
+      },
+    },
+  };
+}
+
+test("Next.js version policy accepts aligned stable updates", () => {
+  for (const version of ["16.4.1", "16.4.3", "16.4.10", "16.5.0", "16.10.0", "17.0.0"]) {
+    const { packageJson, packageLock } = nextVersionFixture(version);
+    assertNextVersions(packageJson, packageLock);
+  }
+});
+
+test("Next.js version policy rejects downgrades and non-stable specifications", () => {
+  for (const version of ["15.9.9", "16.3.99", "16.4.0"]) {
+    const { packageJson, packageLock } = nextVersionFixture(version);
+    assert.throws(() => assertNextVersions(packageJson, packageLock), /at least 16\.4\.1/);
+  }
+  for (const version of ["^16.4.3", "~16.4.3", ">=16.4.1", "latest", "16.4", "16.04.3", "16.4.3-canary.1", "17.0.0-rc.1"]) {
+    const { packageJson, packageLock } = nextVersionFixture(version);
+    assert.throws(() => assertNextVersions(packageJson, packageLock), /exact stable version/);
+  }
+});
+
+test("Next.js version policy rejects manifest and lockfile drift", () => {
+  const { packageJson, packageLock } = nextVersionFixture("16.4.3");
+  packageJson.devDependencies["eslint-config-next"] = "16.4.1";
+  assert.throws(() => assertNextVersions(packageJson, packageLock), /eslint-config-next must match/);
+
+  for (const [name, group] of [["next", "dependencies"], ["eslint-config-next", "devDependencies"]]) {
+    const rootDrift = nextVersionFixture("16.4.3");
+    rootDrift.packageLock.packages[""][group][name] = "16.4.1";
+    assert.throws(() => assertNextVersions(rootDrift.packageJson, rootDrift.packageLock),
+      new RegExp(`lockfile root ${name} must match`));
+
+    const resolvedDrift = nextVersionFixture("16.4.3");
+    resolvedDrift.packageLock.packages[`node_modules/${name}`].version = "16.4.1";
+    assert.throws(() => assertNextVersions(resolvedDrift.packageJson, resolvedDrift.packageLock),
+      new RegExp(`locked ${name} must match`));
+  }
+});
+
 test("exports the research-first PyQED homepage", async () => {
   const html = await page();
 
@@ -626,8 +703,8 @@ test("uses a static, repository-owned deployment", async () => {
   assert.match(nextConfig, /trailingSlash:\s*true/);
   assert.match(nextConfig, /unoptimized:\s*true/);
   assert.match(packageJson.scripts.build, /^next build$/);
-  assert.equal(packageJson.dependencies.next, "16.4.1");
-  assert.equal(packageJson.devDependencies["eslint-config-next"], packageJson.dependencies.next);
+  const packageLock = JSON.parse(await readFile(new URL("package-lock.json", projectRoot), "utf8"));
+  assertNextVersions(packageJson, packageLock);
   assert.equal(packageJson.dependencies["3dmol"], "2.5.5");
   assert.doesNotMatch(packageText, /vinext|wrangler|drizzle|cloudflare/i);
   assert.doesNotMatch(layout, /Analytics/);
