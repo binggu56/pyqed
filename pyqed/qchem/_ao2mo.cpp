@@ -101,17 +101,21 @@ PyObject* dense_pair_transform(PyObject*, PyObject* args) {
 }
 
 PyObject* packed_half_transform(PyObject*, PyObject* args) {
-    PyObject *source, *coefficients;
+    PyObject *source, *coefficients, *right_coefficients = nullptr;
     Py_ssize_t start = 0, stop = -1;
-    if (!PyArg_ParseTuple(args, "OO|nn", &source, &coefficients, &start, &stop)) return nullptr;
+    if (!PyArg_ParseTuple(args, "OO|nnO", &source, &coefficients, &start, &stop, &right_coefficients)) return nullptr;
     auto* eri = reinterpret_cast<PyArrayObject*>(PyArray_FROM_OTF(source, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
     auto* coeff = reinterpret_cast<PyArrayObject*>(PyArray_FROM_OTF(coefficients, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY));
     if (!eri || !coeff) { Py_XDECREF(eri); Py_XDECREF(coeff); return nullptr; }
+    auto* right = right_coefficients ? reinterpret_cast<PyArrayObject*>(PyArray_FROM_OTF(right_coefficients, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY)) : nullptr;
+    if (right_coefficients && !right) { Py_DECREF(eri); Py_DECREF(coeff); return nullptr; }
     const int rank = PyArray_NDIM(eri);
     bool valid = (rank == 1 || rank == 2) && PyArray_NDIM(coeff) == 2;
     const npy_intp nao = valid ? PyArray_DIM(coeff, 0) : 0;
     const npy_intp nmo = valid ? PyArray_DIM(coeff, 1) : 0;
-    const npy_intp ap = nao * (nao + 1) / 2, mp = nmo * (nmo + 1) / 2;
+    const npy_intp nr = right && PyArray_NDIM(right) == 2 ? PyArray_DIM(right, 1) : nmo;
+    valid = valid && (!right || (PyArray_NDIM(right) == 2 && PyArray_DIM(right, 0) == nao && nr < INT_MAX));
+    const npy_intp ap = nao * (nao + 1) / 2, mp = right ? nmo * nr : nmo * (nmo + 1) / 2;
     const npy_intp rows = rank == 1 ? ap : rank == 2 ? PyArray_DIM(eri, 0) : 0;
     if (stop < 0) stop = rows;
     valid = valid && nao > 0 && nao < INT_MAX && nmo < INT_MAX &&
@@ -119,7 +123,7 @@ PyObject* packed_half_transform(PyObject*, PyObject* args) {
     if (valid) valid = rank == 1 ? PyArray_DIM(eri, 0) == ap * (ap + 1) / 2
                                 : PyArray_DIM(eri, 1) == ap;
     if (!valid) {
-        Py_DECREF(eri); Py_DECREF(coeff);
+        Py_DECREF(eri); Py_DECREF(coeff); Py_XDECREF(right);
         PyErr_SetString(PyExc_ValueError, "Expected s8 ERIs or packed AO-pair rows, coefficients, and a valid row interval.");
         return nullptr;
     }
@@ -129,10 +133,11 @@ PyObject* packed_half_transform(PyObject*, PyObject* args) {
     if (result && nmo && stop > start) {
         const auto* input = static_cast<const double*>(PyArray_DATA(eri));
         const auto* c = static_cast<const double*>(PyArray_DATA(coeff));
+        const auto* cr = right ? static_cast<const double*>(PyArray_DATA(right)) : c;
         auto* output = static_cast<double*>(PyArray_DATA(result));
         Py_BEGIN_ALLOW_THREADS
         try {
-            std::vector<double> work(nao * nao), tmp(nao * nmo), block(nmo * nmo);
+            std::vector<double> work(nao * nao), tmp(nao * nr), block(nmo * nr);
             for (npy_intp row = start; row < stop; ++row) {
                 npy_intp pair = 0;
                 for (npy_intp i = 0; i < nao; ++i)
@@ -142,8 +147,12 @@ PyObject* packed_half_transform(PyObject*, PyObject* args) {
                         work[i * nao + j] = value;
                         work[j * nao + i] = value;
                     }
-                multiply(work.data(), c, tmp.data(), nao, nmo, nao);
-                multiply(c, tmp.data(), block.data(), nmo, nmo, nao, true);
+                multiply(work.data(), cr, tmp.data(), nao, nr, nao);
+                multiply(c, tmp.data(), block.data(), nmo, nr, nao, true);
+                if (right) {
+                    std::copy(block.begin(), block.end(), output + (row - start) * mp);
+                    continue;
+                }
                 npy_intp pair_mo = 0;
                 for (npy_intp i = 0; i < nmo; ++i)
                     for (npy_intp j = 0; j <= i; ++j, ++pair_mo)
@@ -152,7 +161,7 @@ PyObject* packed_half_transform(PyObject*, PyObject* args) {
         } catch (const std::bad_alloc&) { failed = true; }
         Py_END_ALLOW_THREADS
     }
-    Py_DECREF(eri); Py_DECREF(coeff);
+    Py_DECREF(eri); Py_DECREF(coeff); Py_XDECREF(right);
     if (failed) { Py_DECREF(result); return PyErr_NoMemory(); }
     return reinterpret_cast<PyObject*>(result);
 }

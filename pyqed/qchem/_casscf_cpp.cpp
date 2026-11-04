@@ -6785,7 +6785,8 @@ double caspt2_connected_element_words(
                         const double* factor = factors + auxiliary * stride;
                         integral += factor[pq] * factor[rs];
                     }
-                    factor_cache->emplace(key, integral);
+                    // Bound per-worker storage across a full external-space pass.
+                    if (factor_cache->size() < 65536) factor_cache->emplace(key, integral);
                 }
             }
             value += 0.5 * static_cast<double>(phase1 * phase2 * phase3 * phase4) * integral;
@@ -6831,9 +6832,10 @@ PyObject* caspt2_direct_couplings_words(PyObject*, PyObject* args) {
     PyObject* indices_obj = Py_None;
     PyObject* groups_obj = Py_None;
     Py_ssize_t nmo_arg = 0;
+    int threads = 1;
     if (!PyArg_ParseTuple(
             args,
-            "OOOOOn|OOO",
+            "OOOOOn|OOOi",
             &rows_obj,
             &refs_obj,
             &ci_obj,
@@ -6842,7 +6844,12 @@ PyObject* caspt2_direct_couplings_words(PyObject*, PyObject* args) {
             &nmo_arg,
             &offsets_obj,
             &indices_obj,
-            &groups_obj)) {
+            &groups_obj,
+            &threads)) {
+        return nullptr;
+    }
+    if (threads < 1) {
+        PyErr_SetString(PyExc_ValueError, "threads must be positive.");
         return nullptr;
     }
     ArrayRef rows(rows_obj, NPY_UINT64, NPY_ARRAY_IN_ARRAY);
@@ -6977,7 +6984,7 @@ PyObject* caspt2_direct_couplings_words(PyObject*, PyObject* args) {
 
     Py_BEGIN_ALLOW_THREADS
     #ifdef _OPENMP
-    #pragma omp parallel
+    #pragma omp parallel num_threads(threads) if(threads > 1 && nrows >= 64)
     #endif
     {
     std::unordered_map<std::uint64_t, double> factor_cache;
@@ -8467,6 +8474,38 @@ void apply_spin_free_pair(
     }
 }
 
+void fill_evecs_and_t2(
+    const double* ci,
+    const std::vector<std::vector<SpinFreeLink>>& links,
+    npy_intp n,
+    npy_intp ndet,
+    double* evecs,
+    double* t2
+) {
+    const npy_intp n2 = n * n;
+
+    for (npy_intp pair = 0; pair < n2; ++pair) {
+        apply_spin_free_pair(
+            links[static_cast<std::size_t>(pair)],
+            ci,
+            evecs + pair * ndet,
+            ndet
+        );
+    }
+
+    for (npy_intp second = 0; second < n2; ++second) {
+        const double* base = evecs + second * ndet;
+        for (npy_intp first = 0; first < n2; ++first) {
+            apply_spin_free_pair(
+                links[static_cast<std::size_t>(first)],
+                base,
+                t2 + (first * n2 + second) * ndet,
+                ndet
+            );
+        }
+    }
+}
+
 void build_evecs_and_t2(
     const double* ci,
     const std::vector<std::vector<SpinFreeLink>>& links,
@@ -8475,31 +8514,9 @@ void build_evecs_and_t2(
     std::vector<double>& evecs,
     std::vector<double>& t2
 ) {
-    const npy_intp n2 = n * n;
-    const npy_intp n4 = n2 * n2;
-    evecs.assign(static_cast<std::size_t>(n2 * ndet), 0.0);
-    t2.assign(static_cast<std::size_t>(n4 * ndet), 0.0);
-
-    for (npy_intp pair = 0; pair < n2; ++pair) {
-        apply_spin_free_pair(
-            links[static_cast<std::size_t>(pair)],
-            ci,
-            evecs.data() + pair * ndet,
-            ndet
-        );
-    }
-
-    for (npy_intp second = 0; second < n2; ++second) {
-        const double* base = evecs.data() + second * ndet;
-        for (npy_intp first = 0; first < n2; ++first) {
-            apply_spin_free_pair(
-                links[static_cast<std::size_t>(first)],
-                base,
-                t2.data() + (first * n2 + second) * ndet,
-                ndet
-            );
-        }
-    }
+    evecs.resize(static_cast<std::size_t>(n * n * ndet));
+    t2.resize(static_cast<std::size_t>(n * n * n * n * ndet));
+    fill_evecs_and_t2(ci, links, n, ndet, evecs.data(), t2.data());
 }
 
 double dot_product(const double* lhs, const double* rhs, npy_intp n) {
@@ -8673,6 +8690,170 @@ PyObject* make_nevpt_terms_result(npy_intp n, PyObject** out0, PyObject** out1, 
     PyTuple_SET_ITEM(tuple, 1, *out1);
     PyTuple_SET_ITEM(tuple, 2, *out2);
     return tuple;
+}
+
+PyObject* contract_rdm_plan(PyObject*, PyObject* args) {
+    PyObject *lo,*ro,*mo,*po,*doo; int n;
+    if (!PyArg_ParseTuple(args,"OOOOOi",&lo,&ro,&mo,&po,&doo,&n)) return nullptr;
+    ArrayRef l(lo,NPY_INT64,NPY_ARRAY_IN_ARRAY),r(ro,NPY_INT64,NPY_ARRAY_IN_ARRAY),
+        mid(mo,NPY_INT64,NPY_ARRAY_IN_ARRAY),plan(po,NPY_INT64,NPY_ARRAY_IN_ARRAY),dm(doo,NPY_DOUBLE,NPY_ARRAY_IN_ARRAY);
+    if (!l||!r||!mid||!plan||!dm) return nullptr;
+    if (n<0 || n>64 || PyArray_NDIM(l.obj)!=2 || PyArray_NDIM(r.obj)!=2 || PyArray_NDIM(mid.obj)!=1 ||
+        PyArray_NDIM(plan.obj)!=2 || PyArray_DIM(plan.obj,1)<8 || PyArray_DIM(plan.obj,1)%2 || PyArray_NDIM(dm.obj)!=1) {
+        PyErr_SetString(PyExc_ValueError,"Invalid RDM contraction arrays."); return nullptr;
+    }
+    const auto nr=PyArray_DIM(l.obj,0),nc=PyArray_DIM(r.obj,0),nl=PyArray_DIM(l.obj,1),
+        nm=PyArray_SIZE(mid.obj),nv=nl+nm+PyArray_DIM(r.obj,1),width=PyArray_DIM(plan.obj,1);
+    auto *lv=(int64_t*)PyArray_DATA(l.obj),*rv=(int64_t*)PyArray_DATA(r.obj),*mv=(int64_t*)PyArray_DATA(mid.obj),*pv=(int64_t*)PyArray_DATA(plan.obj);
+    npy_intp offsets[4]={0,1,1+n*n,1+n*n+n*n*n*n};
+    if (PyArray_SIZE(dm.obj)!=offsets[3]+static_cast<npy_intp>(n)*n*n*n*n*n) {
+        PyErr_SetString(PyExc_ValueError,"Invalid packed RDM size."); return nullptr;
+    }
+    for (auto pair : {std::make_pair(lv,PyArray_SIZE(l.obj)),std::make_pair(rv,PyArray_SIZE(r.obj)),std::make_pair(mv,nm)})
+        for (npy_intp i=0;i<pair.second;++i) if(pair.first[i]<0 || pair.first[i]>=n) {
+            PyErr_SetString(PyExc_ValueError,"Active index outside RDM."); return nullptr;
+        }
+    for(npy_intp k=0;k<PyArray_DIM(plan.obj,0);++k) {
+        auto* t=pv+k*width;
+        if(t[1]<0||t[1]>6||t[1]%2) {PyErr_SetString(PyExc_ValueError,"Invalid RDM rank.");return nullptr;}
+        for(npy_intp j=2;j<width;++j) if((j<2+t[1] || j>=8) && (t[j]<-1||t[j]>=nv)) {
+            PyErr_SetString(PyExc_ValueError,"Invalid plan variable.");return nullptr;
+        }
+        for(npy_intp j=2;j<2+t[1];++j) if(t[j]<0) {PyErr_SetString(PyExc_ValueError,"Missing plan index.");return nullptr;}
+    }
+    npy_intp dims[2]={nr,nc};PyObject* out=PyArray_ZEROS(2,dims,NPY_DOUBLE,0);if(!out)return nullptr;
+    auto* y=(double*)PyArray_DATA((PyArrayObject*)out);auto* d=(double*)PyArray_DATA(dm.obj);
+    std::vector<int64_t> variables(nv);
+    Py_BEGIN_ALLOW_THREADS
+    for(npy_intp i=0;i<nr;++i) {
+        std::copy(lv+i*nl,lv+(i+1)*nl,variables.begin());std::copy(mv,mv+nm,variables.begin()+nl);
+        for(npy_intp j=0;j<nc;++j) {
+            std::copy(rv+j*(nv-nl-nm),rv+(j+1)*(nv-nl-nm),variables.begin()+nl+nm);
+            double value=0;
+            for(npy_intp k=0;k<PyArray_DIM(plan.obj,0);++k) {
+                auto* t=pv+k*width;bool keep=true;
+                for(npy_intp z=8;z+1<width && t[z]>=0;z+=2)
+                    if(t[z+1]<0 || variables[t[z]]!=variables[t[z+1]]) {keep=false;break;}
+                if(!keep)continue;
+                npy_intp index=0;for(int z=0;z<t[1];++z)index=index*n+variables[t[2+z]];
+                value+=t[0]*d[offsets[t[1]/2]+index];
+            }
+            y[i*nc+j]=value;
+        }
+    }
+    Py_END_ALLOW_THREADS
+    return out;
+}
+
+void fic_product(int m,int n,int k,const double* a,const double* b,double* c,bool transpose_b,double alpha,double beta) {
+#ifdef PYQED_HAVE_CBLAS
+    cblas_dgemm(101,111,transpose_b?112:111,m,n,k,alpha,a,k,b,transpose_b?k:n,beta,c,n);
+#else
+    for(int i=0;i<m;++i)for(int j=0;j<n;++j) {
+        double sum=0;for(int z=0;z<k;++z)sum+=a[i*k+z]*b[transpose_b?j*k+z:z*n+j];
+        c[i*n+j]=alpha*sum+(beta?beta*c[i*n+j]:0.);
+    }
+#endif
+}
+
+PyObject* apply_fic_graph(PyObject*,PyObject* args) {
+    PyObject *xo,*doo,*edges,*wo,*zo;
+    if(!PyArg_ParseTuple(args,"OOOOO",&xo,&doo,&edges,&wo,&zo))return nullptr;
+    ArrayRef x(xo,NPY_DOUBLE,NPY_ARRAY_IN_ARRAY),d(doo,NPY_DOUBLE,NPY_ARRAY_IN_ARRAY);
+    if(!x||!d)return nullptr;
+    auto valid=[](PyObject* o,int type){return PyArray_Check(o)&&PyArray_TYPE((PyArrayObject*)o)==type&&PyArray_ISCARRAY((PyArrayObject*)o);};
+    if(!PyList_Check(edges)||!valid(wo,NPY_DOUBLE)||!valid(zo,NPY_DOUBLE)||PyArray_NDIM(x.obj)!=1||PyArray_SIZE(x.obj)!=PyArray_SIZE(d.obj)) {
+        PyErr_SetString(PyExc_ValueError,"Invalid FIC action arrays.");return nullptr;
+    }
+    struct Edge {Py_ssize_t s,t,ns,nt,rs,rt;int64_t *ptr,*col;double *data,*matrix;};
+    std::vector<Edge> graph;
+    const auto size=PyArray_SIZE(x.obj);
+    for(Py_ssize_t i=0;i<PyList_Size(edges);++i) {
+        Edge e;PyObject *p,*c,*v,*m;
+        if(!PyArg_ParseTuple(PyList_GET_ITEM(edges,i),"nnnnnnOOOO",&e.s,&e.t,&e.ns,&e.nt,&e.rs,&e.rt,&p,&c,&v,&m))return nullptr;
+        if(!valid(p,NPY_INT64)||!valid(c,NPY_INT64)||!valid(v,NPY_DOUBLE)||!valid(m,NPY_DOUBLE)||
+           e.s<0||e.t<0||e.ns<0||e.nt<0||e.rs<=0||e.rt<=0||e.s>size||e.t>size||
+           e.ns>(size-e.s)/e.rs||e.nt>(size-e.t)/e.rt||
+           std::max({e.ns,e.nt,e.rs,e.rt})>std::numeric_limits<int>::max()||
+           PyArray_SIZE((PyArrayObject*)p)!=e.nt+1||PyArray_SIZE((PyArrayObject*)c)!=PyArray_SIZE((PyArrayObject*)v)||
+           PyArray_SIZE((PyArrayObject*)m)!=e.rs*e.rt||
+           PyArray_SIZE((PyArrayObject*)wo)<std::max(e.ns,e.nt)*std::min(e.rs,e.rt)||PyArray_SIZE((PyArrayObject*)zo)<std::max(e.ns,e.nt)*std::min(e.rs,e.rt)) {
+            PyErr_SetString(PyExc_ValueError,"Invalid FIC edge dimensions.");return nullptr;
+        }
+        e.ptr=(int64_t*)PyArray_DATA((PyArrayObject*)p);e.col=(int64_t*)PyArray_DATA((PyArrayObject*)c);
+        e.data=(double*)PyArray_DATA((PyArrayObject*)v);e.matrix=(double*)PyArray_DATA((PyArrayObject*)m);
+        if(e.ptr[0]!=0||e.ptr[e.nt]!=PyArray_SIZE((PyArrayObject*)v)) {PyErr_SetString(PyExc_ValueError,"Invalid CSR pointers.");return nullptr;}
+        for(Py_ssize_t j=0;j<e.nt;++j)if(e.ptr[j]<0||e.ptr[j]>e.ptr[j+1]) {PyErr_SetString(PyExc_ValueError,"Invalid CSR row.");return nullptr;}
+        for(Py_ssize_t j=0;j<e.ptr[e.nt];++j)if(e.col[j]<0||e.col[j]>=e.ns) {PyErr_SetString(PyExc_ValueError,"Invalid CSR column.");return nullptr;}
+        graph.push_back(e);
+    }
+    PyObject* out=PyArray_SimpleNew(1,&size,NPY_DOUBLE);if(!out)return nullptr;
+    auto *y=(double*)PyArray_DATA((PyArrayObject*)out),*v=(double*)PyArray_DATA(x.obj),*diag=(double*)PyArray_DATA(d.obj),
+         *w=(double*)PyArray_DATA((PyArrayObject*)wo),*z=(double*)PyArray_DATA((PyArrayObject*)zo);
+    Py_BEGIN_ALLOW_THREADS
+    for(npy_intp i=0;i<size;++i)y[i]=v[i]*diag[i];
+    for(const auto& e:graph) {
+        const auto *xs=v+e.s,*xt=v+e.t;auto *ys=y+e.s,*yt=y+e.t;
+        if(e.rt<=e.rs) {
+            fic_product(e.ns,e.rt,e.rs,xs,e.matrix,w,true,1.,0.);
+            std::fill(z,z+e.ns*e.rt,0.);
+            for(Py_ssize_t i=0;i<e.nt;++i)for(auto k=e.ptr[i];k<e.ptr[i+1];++k)
+                for(Py_ssize_t a=0;a<e.rt;++a) {yt[i*e.rt+a]-=e.data[k]*w[e.col[k]*e.rt+a];z[e.col[k]*e.rt+a]+=e.data[k]*xt[i*e.rt+a];}
+            fic_product(e.ns,e.rs,e.rt,z,e.matrix,ys,false,-1.,1.);
+        } else {
+            std::fill(w,w+e.nt*e.rs,0.);
+            for(Py_ssize_t i=0;i<e.nt;++i)for(auto k=e.ptr[i];k<e.ptr[i+1];++k)
+                for(Py_ssize_t a=0;a<e.rs;++a)w[i*e.rs+a]+=e.data[k]*xs[e.col[k]*e.rs+a];
+            fic_product(e.nt,e.rt,e.rs,w,e.matrix,yt,true,-1.,1.);
+            fic_product(e.nt,e.rs,e.rt,xt,e.matrix,z,false,1.,0.);
+            for(Py_ssize_t i=0;i<e.nt;++i)for(auto k=e.ptr[i];k<e.ptr[i+1];++k)
+                for(Py_ssize_t a=0;a<e.rs;++a)ys[e.col[k]*e.rs+a]-=e.data[k]*z[i*e.rs+a];
+        }
+    }
+    Py_END_ALLOW_THREADS
+    return out;
+}
+
+PyObject* spin_free_excitation_pairs(PyObject*, PyObject* args) {
+    PyObject *ci_obj = nullptr, *binary_obj = nullptr;
+    int packed = 0;
+    if (!PyArg_ParseTuple(args, "OO|p", &ci_obj, &binary_obj, &packed)) return nullptr;
+    ArrayRef ci(ci_obj, NPY_DOUBLE, NPY_ARRAY_IN_ARRAY);
+    ArrayRef binary(binary_obj, NPY_INT8, NPY_ARRAY_IN_ARRAY);
+    if (!ci || !binary || !validate_nevpt_ci_binary_inputs(ci.obj, binary.obj)) return nullptr;
+    const npy_intp n = PyArray_DIM(binary.obj, 2);
+    const npy_intp ndet = PyArray_DIM(ci.obj, 0);
+    std::vector<std::vector<SpinFreeLink>> links;
+    std::vector<std::uint64_t> bits;
+    if (!build_spin_free_links(binary.obj, links, bits)) return nullptr;
+    if (packed) {
+        const npy_intp n2 = n*n;
+        npy_intp sdims[3] = {n,n,ndet}, pdims[2] = {n2*(n2+1)/2,ndet};
+        PyObject* singles = PyArray_SimpleNew(3,sdims,NPY_DOUBLE);
+        PyObject* pairs = PyArray_SimpleNew(2,pdims,NPY_DOUBLE);
+        if (!singles || !pairs) { Py_XDECREF(singles); Py_XDECREF(pairs); return nullptr; }
+        auto* e = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(singles)));
+        auto* t = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pairs)));
+        const auto* c = static_cast<const double*>(PyArray_DATA(ci.obj));
+        Py_BEGIN_ALLOW_THREADS
+        for (npy_intp a=0;a<n2;++a) apply_spin_free_pair(links[a],c,e+a*ndet,ndet);
+        npy_intp row=0;
+        for (npy_intp a=0;a<n2;++a)
+            for (npy_intp b=a;b<n2;++b,++row)
+                apply_spin_free_pair(links[a],e+b*ndet,t+row*ndet,ndet);
+        Py_END_ALLOW_THREADS
+        return Py_BuildValue("NN",singles,pairs);
+    }
+    npy_intp dims[5] = {n, n, n, n, ndet};
+    PyObject* result = PyArray_SimpleNew(5, dims, NPY_DOUBLE);
+    if (!result) return nullptr;
+    std::vector<double> evecs(static_cast<std::size_t>(n * n * ndet));
+    auto* output = static_cast<double*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(result)));
+    const auto* input = static_cast<const double*>(PyArray_DATA(ci.obj));
+    Py_BEGIN_ALLOW_THREADS
+    fill_evecs_and_t2(input, links, n, ndet, evecs.data(), output);
+    Py_END_ALLOW_THREADS
+    return result;
 }
 
 PyObject* nevpt_spin_free_rdms123(PyObject*, PyObject* args) {
@@ -9437,6 +9618,9 @@ PyMethodDef methods[] = {
     {"caspt2_strong_contract", caspt2_strong_contract, METH_VARARGS, "Reduce CASPT2 determinant couplings into strongly contracted class energies."},
     {"caspt2_en_coupled_contract", caspt2_en_coupled_contract, METH_VARARGS, "Build the coupled strong-contracted EN CASPT2 metric and denominator matrix."},
     {"caspt2_solve_contracted", caspt2_solve_contracted, METH_VARARGS, "Solve a dense real-shifted contracted CASPT2 linear system."},
+    {"contract_rdm_plan", contract_rdm_plan, METH_VARARGS, "Evaluate spin-free RDM plans without broadcast temporaries."},
+    {"apply_fic_graph", apply_fic_graph, METH_VARARGS, "Apply coupled FIC blocks with reusable work buffers."},
+    {"spin_free_excitation_pairs", spin_free_excitation_pairs, METH_VARARGS, "Build E_pq E_rs CI using compiled excitation links."},
     {"nevpt_spin_free_rdms123", nevpt_spin_free_rdms123, METH_VARARGS, "Build spin-free active 1-, 2-, and 3-RDMs for native SC-NEVPT2."},
     {"nevpt_a22_4rdm_energy", nevpt_a22_4rdm_energy, METH_VARARGS, "Contract the SC-NEVPT2 Si A22 4-RDM numerator terms without materializing A22."},
     {"nevpt_a16_4rdm_terms", nevpt_a16_4rdm_terms, METH_VARARGS, "Build contracted A16 4-RDM terms without materializing the full 4-RDM."},

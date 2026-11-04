@@ -48,7 +48,7 @@ def test_caspt2_theory_note_describes_fully_contracted_solver():
     assert "imaginary shift" in theory
     assert "fully internally contracted" in theory
     assert "metric" in theory
-    assert "contraction=\"strong\"" in theory
+    assert 'contraction="strong"' in theory
 
 
 def test_openmolcas_benchmark_parses_full_precision_final_result():
@@ -182,9 +182,15 @@ def test_caspt2_lih_cas22_runs_with_components():
     assert pt.couplings.shape == pt.denominators.shape
     assert pt.external_kernel_backend in {"cpp", "python"}
     assert pt.contraction_backend == "python_fully_internally_contracted"
-    assert pt.contracted_basis_size > pt.contracted_basis_rank > len(CASPT2.perturber_classes)
+    assert (
+        pt.contracted_basis_size
+        > pt.contracted_basis_rank
+        > len(CASPT2.perturber_classes)
+    )
     assert pt.contracted_metric.shape == (pt.contracted_basis_rank,) * 2
-    np.testing.assert_allclose(pt.contracted_metric, np.eye(pt.contracted_basis_rank), atol=1.0e-11)
+    np.testing.assert_allclose(
+        pt.contracted_metric, np.eye(pt.contracted_basis_rank), atol=1.0e-11
+    )
     assert pt.contracted_residual_norm < 1.0e-10
     assert 0.0 < pt.reference_weight <= 1.0
 
@@ -232,16 +238,10 @@ def test_direct_signature_blocks_match_semicanonical_enumerated_reference():
     eri = probe._eri_mo(coefficients)
     fock, _fock_b, _reference = probe._generalized_fock_mo(h1, eri)
     fock = rotation.T @ fock @ rotation
-    ncore = probe._ncore
-    nocc = ncore + probe._ncas
-    projected_fock = np.zeros_like(fock)
-    projected_fock[:ncore, :ncore] = np.diag(np.diag(fock[:ncore, :ncore]))
-    projected_fock[ncore:nocc, ncore:nocc] = fock[ncore:nocc, ncore:nocc]
-    projected_fock[nocc:, nocc:] = np.diag(np.diag(fock[nocc:, nocc:]))
     explicit = CASPT2(
         rotated,
         ic_basis_backend="dense",
-        fock_matrix=projected_fock,
+        fock_matrix=fock,
     )
 
     np.testing.assert_allclose(direct_energy, explicit.run(), atol=2.0e-13)
@@ -296,13 +296,13 @@ def test_native_direct_rhs_matches_python_fallback():
     native = CASPT2(mc, ic_basis_backend="direct")
     native_energy = native.run()
 
-    old_cpp = caspt2_module._casscf_cpp
-    caspt2_module._casscf_cpp = None
+    old_cpp = caspt2_module._mr_kernels
+    caspt2_module._mr_kernels = None
     try:
         fallback = CASPT2(mc, ic_basis_backend="direct")
         fallback_energy = fallback.run()
     finally:
-        caspt2_module._casscf_cpp = old_cpp
+        caspt2_module._mr_kernels = old_cpp
 
     np.testing.assert_allclose(native_energy, fallback_energy, atol=2.0e-13)
     for label in CASPT2.perturber_classes:
@@ -357,7 +357,7 @@ def test_direct_tensor_builder_matches_online_reference():
 
     np.testing.assert_allclose(tensor.run(), online.run(), atol=2.0e-13)
     assert tensor.contracted_basis_rank == online.contracted_basis_rank
-    assert tensor.ic_metric_backend == "signature_active_tensor_mgs"
+    assert tensor.ic_metric_backend == "signature_factorized_canonical"
     assert online.ic_metric_backend == "signature_block_online_mgs"
 
 
@@ -366,8 +366,9 @@ def test_direct_symmetry_screening_reduces_rows_without_changing_energy():
         atom="Li 0 0 0; H 0 0 1.6",
         unit="angstrom",
         basis="sto-3g",
+        symmetry="c2v",
     )
-    mol.build(symmetry="c2v")
+    mol.build()
     mf = RHF(mol).run()
     mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(
         nstates=1,
@@ -431,13 +432,11 @@ def test_frozen_core_removes_core_hole_perturbers():
     frozen_mask = 1 | (1 << frozen._nmo)
     assert len(frozen.external_determinants) < len(all_electron.external_determinants)
     assert all(det & frozen_mask == frozen_mask for det in frozen.external_determinants)
-    assert (
-        frozen.work_estimate["estimated_external_determinants"]
-        == len(frozen.external_determinants)
+    assert frozen.work_estimate["estimated_external_determinants"] == len(
+        frozen.external_determinants
     )
-    assert (
-        all_electron.work_estimate["estimated_external_determinants"]
-        == len(all_electron.external_determinants)
+    assert all_electron.work_estimate["estimated_external_determinants"] == len(
+        all_electron.external_determinants
     )
     assert frozen.work_estimate["frozen_core_orbitals"] == 1
     assert np.isfinite(frozen.e_corr)
@@ -604,13 +603,13 @@ def test_caspt2_cpp_external_kernel_matches_python_fallback():
     native = CASPT2(mc, zeroth_order="fock")
     e_native = native.run()
 
-    old_cpp = caspt2_module._casscf_cpp
-    caspt2_module._casscf_cpp = None
+    old_cpp = caspt2_module._mr_kernels
+    caspt2_module._mr_kernels = None
     try:
         fallback = CASPT2(mc, zeroth_order="fock")
         e_fallback = fallback.run()
     finally:
-        caspt2_module._casscf_cpp = old_cpp
+        caspt2_module._mr_kernels = old_cpp
 
     assert native.external_kernel_backend == "cpp"
     assert fallback.external_kernel_backend == "python"
@@ -678,7 +677,9 @@ def test_sparse_fock_action_matches_dense_determinant_matrix():
     determinants = sorted(external)
     trial = np.arange(pt._nmo * pt._nmo, dtype=float).reshape(pt._nmo, pt._nmo)
     matrix = 0.5 * (trial + trial.T) / (pt._nmo * pt._nmo)
-    vectors = np.arange(2 * len(determinants), dtype=float).reshape(len(determinants), 2)
+    vectors = np.arange(2 * len(determinants), dtype=float).reshape(
+        len(determinants), 2
+    )
     vectors /= max(1, vectors.size)
 
     dense = caspt2_module._one_body_matrix_in_determinant_space(
@@ -696,10 +697,10 @@ def test_sparse_fock_action_matches_dense_determinant_matrix():
     )
     sparse_matrix, sparse_backend = (
         caspt2_module._one_body_sparse_matrix_in_determinant_space(
-        determinants,
-        matrix,
-        matrix,
-        pt._nmo,
+            determinants,
+            matrix,
+            matrix,
+            pt._nmo,
         )
     )
 
@@ -725,7 +726,9 @@ def test_caspt2_strong_contraction_uses_standard_perturber_classes():
         sum(component.energy for component in pt.components.values()),
         atol=1.0e-14,
     )
-    np.testing.assert_allclose(e_corr, np.dot(pt.couplings, pt.amplitudes), atol=1.0e-14)
+    np.testing.assert_allclose(
+        e_corr, np.dot(pt.couplings, pt.amplitudes), atol=1.0e-14
+    )
     assert any(component.norm > 0.0 for component in pt.components.values())
 
 
@@ -818,13 +821,13 @@ def test_caspt2_cpp_strong_contract_matches_python_fallback():
     native = CASPT2(mc, zeroth_order="fock", contraction="strong")
     e_native = native.run()
 
-    old_cpp = caspt2_module._casscf_cpp
-    caspt2_module._casscf_cpp = None
+    old_cpp = caspt2_module._mr_kernels
+    caspt2_module._mr_kernels = None
     try:
         fallback = CASPT2(mc, zeroth_order="fock", contraction="strong")
         e_fallback = fallback.run()
     finally:
-        caspt2_module._casscf_cpp = old_cpp
+        caspt2_module._mr_kernels = old_cpp
 
     assert native.contraction_backend == "cpp"
     assert native.contracted_solver_backend == "cpp"
@@ -839,7 +842,9 @@ def test_caspt2_cpp_strong_contract_matches_python_fallback():
         np.testing.assert_allclose(ncomp.energy, pcomp.energy, atol=1.0e-12)
         np.testing.assert_allclose(ncomp.norm, pcomp.norm, atol=1.0e-12)
         np.testing.assert_allclose(ncomp.denominator, pcomp.denominator, atol=1.0e-12)
-        np.testing.assert_allclose(ncomp.denominator_moment, pcomp.denominator_moment, atol=1.0e-12)
+        np.testing.assert_allclose(
+            ncomp.denominator_moment, pcomp.denominator_moment, atol=1.0e-12
+        )
         np.testing.assert_allclose(ncomp.amplitude, pcomp.amplitude, atol=1.0e-12)
 
     native_system = native.contracted_linear_system()
@@ -860,13 +865,13 @@ def test_caspt2_cpp_en_coupled_contract_matches_python_fallback():
     native = CASPT2(mc, zeroth_order="en", contraction="strong")
     e_native = native.run()
 
-    old_cpp = caspt2_module._casscf_cpp
-    caspt2_module._casscf_cpp = None
+    old_cpp = caspt2_module._mr_kernels
+    caspt2_module._mr_kernels = None
     try:
         fallback = CASPT2(mc, zeroth_order="en", contraction="strong")
         e_fallback = fallback.run()
     finally:
-        caspt2_module._casscf_cpp = old_cpp
+        caspt2_module._mr_kernels = old_cpp
 
     assert native.contracted_matrix_kind == "en_coupled"
     assert fallback.contracted_matrix_kind == "en_coupled"
@@ -888,7 +893,9 @@ def test_ms_caspt2_builds_symmetric_effective_hamiltonian():
     energies = ms.run()
 
     assert len(ms.state_specific) == 2
-    np.testing.assert_allclose(ms.effective_hamiltonian, ms.effective_hamiltonian.T, atol=1.0e-14)
+    np.testing.assert_allclose(
+        ms.effective_hamiltonian, ms.effective_hamiltonian.T, atol=1.0e-14
+    )
     np.testing.assert_allclose(
         energies,
         np.linalg.eigvalsh(ms.effective_hamiltonian),
@@ -923,14 +930,20 @@ def test_xms_caspt2_diagonalizes_state_average_model_fock():
     xms = XMSCASPT2(mc, roots=(0, 1))
     energies = xms.run()
 
-    rotated_fock = xms.reference_rotation.T @ xms.reference_fock_matrix @ xms.reference_rotation
-    np.testing.assert_allclose(rotated_fock, np.diag(np.diag(rotated_fock)), atol=1.0e-12)
+    rotated_fock = (
+        xms.reference_rotation.T @ xms.reference_fock_matrix @ xms.reference_rotation
+    )
+    np.testing.assert_allclose(
+        rotated_fock, np.diag(np.diag(rotated_fock)), atol=1.0e-12
+    )
     np.testing.assert_allclose(
         xms.effective_hamiltonian_original,
         xms.reference_rotation @ xms.effective_hamiltonian @ xms.reference_rotation.T,
         atol=1.0e-13,
     )
-    np.testing.assert_allclose(energies, np.linalg.eigvalsh(xms.effective_hamiltonian), atol=1.0e-13)
+    np.testing.assert_allclose(
+        energies, np.linalg.eigvalsh(xms.effective_hamiltonian), atol=1.0e-13
+    )
 
 
 def test_direct_xms_uses_compressed_transition_amplitudes():
@@ -1000,3 +1013,115 @@ def test_ms_and_xms_match_openmolcas_zero_ipea_lih_casci_reference():
     np.testing.assert_allclose(
         abs(xms.effective_hamiltonian[0, 1]), 0.02117032, atol=6.0e-8
     )
+
+
+def test_direct_coupling_openmp_rows_match_serial():
+    from itertools import combinations
+
+    engine = pytest.importorskip("pyqed.qchem._casscf_cpp")
+    rng = np.random.default_rng(309)
+    nmo = 6
+    strings = [sum(1 << i for i in occ) for occ in combinations(range(nmo), 3)]
+    words = caspt2_module._determinants_to_words(
+        [a | (b << nmo) for a in strings for b in strings]
+    )
+    refs = words[::13].copy()
+    ci = rng.normal(size=len(refs))
+    h1 = rng.normal(size=(nmo, nmo))
+    h1 = (h1 + h1.T) / 2
+    factors = rng.normal(size=(9, nmo, nmo))
+    factors = (factors + factors.transpose(0, 2, 1)) / 2
+    offsets = np.array([0, len(refs)], dtype=np.intp)
+    indices = np.arange(len(refs), dtype=np.int32)
+    groups = np.zeros(len(words), dtype=np.int32)
+    args = (words, refs, ci, h1, factors, nmo, offsets, indices, groups)
+    serial = engine.caspt2_direct_couplings_words(*args, 1)
+    np.testing.assert_array_equal(
+        engine.caspt2_direct_couplings_words(*args, 4), serial
+    )
+    with pytest.raises(ValueError, match="threads"):
+        engine.caspt2_direct_couplings_words(*args, 0)
+
+
+@pytest.mark.parametrize("frozen", [0, 1])
+def test_shared_excitation_integrals_match_full_transform(frozen, monkeypatch):
+    mol = Molecule(atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g").build(
+        eri="s8"
+    )
+    mc = direct_ci.CASCI(RHF(mol).run(), ncas=2, nelecas=2).run(
+        nstates=1, method="direct_ci"
+    )
+    options = dict(
+        ic_basis_backend="direct",
+        direct_build_backend="shared",
+        ic_convention="molcas",
+        fock_contraction="rdm",
+        imaginary_shift=0.25,
+        frozen_core=frozen,
+    )
+    compact = CASPT2(mc, **options)
+    compact.run()
+    assert compact.direct_integral_backend == "excitation_pairs"
+    monkeypatch.setattr(CASPT2, "_reference_integrals", lambda self, c: None)
+    full = CASPT2(mc, **options)
+    full.run()
+    assert full.direct_integral_backend == "full_mo_eri"
+    np.testing.assert_allclose(compact.e_tot, full.e_tot, atol=2e-12, rtol=0)
+    np.testing.assert_allclose(
+        compact.first_order_norm, full.first_order_norm, atol=2e-12, rtol=0
+    )
+    assert compact.contracted_basis_rank == full.contracted_basis_rank
+
+
+@pytest.mark.parametrize("variant", ["ms", "xms"])
+def test_shifted_shared_multistate_matches_external_reference(variant):
+    mc = _lih_cas22(nstates=4)
+    options = dict(
+        roots=(0, 2), variant=variant, imaginary_shift=0.25, ic_basis_backend="direct"
+    )
+    reference = MSCASPT2(mc, **options)
+    reference.run()
+    shared = MSCASPT2(
+        mc,
+        **options,
+        direct_build_backend="shared",
+        fock_contraction="rdm",
+        metric_norm_tol=1e-10,
+    )
+    shared.run()
+    np.testing.assert_allclose(
+        shared.effective_hamiltonian_original,
+        reference.effective_hamiltonian_original,
+        atol=2e-9,
+    )
+    phased = copy.copy(mc)
+    phased.ci = np.array(mc.ci).copy()
+    phased.ci[2] *= -1
+    got = MSCASPT2(
+        phased,
+        **options,
+        direct_build_backend="shared",
+        fock_contraction="rdm",
+        metric_norm_tol=1e-10,
+    )
+    np.testing.assert_allclose(got.run(), shared.e_tot, atol=2e-9)
+
+
+@pytest.mark.parametrize("variant", ["ms", "xms"])
+def test_multistate_molcas_auto_contractions_match_explicit_rdm(variant):
+    mc = _lih_cas22(nstates=4)
+    options = dict(
+        roots=(0, 2),
+        variant=variant,
+        imaginary_shift=0.25,
+        ic_basis_backend="DIRECT",
+        direct_build_backend="SHARED",
+        ic_convention="MOLCAS",
+    )
+    automatic = MSCASPT2(mc, **options)
+    explicit = MSCASPT2(mc, **options, fock_contraction="RDM")
+    np.testing.assert_allclose(automatic.run(), explicit.run(), atol=1e-12)
+    np.testing.assert_allclose(
+        automatic.effective_hamiltonian, explicit.effective_hamiltonian, atol=1e-12
+    )
+    assert all(pt.fock_contraction == "rdm" for pt in automatic.state_specific)

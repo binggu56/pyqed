@@ -593,6 +593,111 @@ def _spin_free_e_vectors(ci, binary):
     return vectors, det_bits, det_index
 
 
+def _spin_free_excitation_pairs(ci, binary, packed=False):
+    """Build E_pq E_rs |CI>, reusing the excitation-link kernel.
+
+    With ``packed``, return singles and pairs with pq <= rs in upper-triangle
+    order. The excitation commutator reconstructs the omitted ordering.
+    """
+    builder = _cpp_attr("spin_free_excitation_pairs")
+    if builder is not None:
+        return builder(
+            np.ascontiguousarray(ci, dtype=float),
+            np.ascontiguousarray(binary, dtype=np.int8),
+            packed,
+        )
+    from scipy.sparse import csr_matrix
+
+    n = binary.shape[2]
+    bits = _determinant_bits_from_binary(binary)
+    index = {b: i for i, b in enumerate(bits)}
+    operators = []
+    for p in range(n):
+        for q in range(n):
+            rows, cols, values = [], [], []
+            for ket, b in enumerate(bits):
+                for spin in range(2):
+                    b1, s1 = _annihilate_bit(b, spin * n + q)
+                    if not s1:
+                        continue
+                    b2, s2 = _create_bit(b1, spin * n + p)
+                    bra = index.get(b2)
+                    if s2 and bra is not None:
+                        rows.append(bra)
+                        cols.append(ket)
+                        values.append(s1 * s2)
+            operators.append(
+                csr_matrix((values, (rows, cols)), shape=(ci.size, ci.size))
+            )
+    e = np.stack([op @ ci for op in operators])
+    if packed:
+        a, b = np.triu_indices(n * n)
+        return e.reshape(n, n, ci.size), np.stack(
+            [operators[p] @ e[q] for p, q in zip(a, b)]
+        )
+    t = np.empty((n * n, n * n, ci.size))
+    for pq, op in enumerate(operators):
+        t[pq] = (op @ e.T).T
+    return t.reshape((n,) * 4 + (ci.size,))
+
+
+def _rdm_excitation_closure(ci, binary, depth=1):
+    """Zero-pad a restricted reference into its excitation-reachable rows.
+
+    Depth one suffices for <E>, <EE>, and <EEE>: the latter is evaluated
+    between single-excitation vectors. Intermediate rows outside the RAS
+    reference are retained without changing the reference wavefunction.
+    """
+    from math import comb
+
+    binary = np.asarray(binary, dtype=np.int8)
+    ci = np.asarray(ci)
+    n = binary.shape[2]
+    na, nb = binary[0].sum(axis=1)
+    if len(binary) == comb(n, int(na)) * comb(n, int(nb)):
+        return ci, binary
+    bits = _determinant_bits_from_binary(binary)
+    rows = np.asarray(bits, dtype=np.uint64 if 2 * n <= 64 else object)
+    original = rows.copy()
+    for _ in range(depth):
+        if 2 * n <= 64:
+            from .perturber_templates import _spin_excitation
+
+            pieces = [rows]
+            for spin in (0, 1):
+                for p in range(n):
+                    for q in range(n):
+                        pieces.append(
+                            _spin_excitation(rows, spin * n + p, spin * n + q)[1]
+                        )
+            rows = np.unique(np.concatenate(pieces))
+            continue
+        # Discover spin channels independently: cancellations in a spin-free
+        # action on a dummy vector must not remove reachable determinants.
+        reached = set(map(int, rows))
+        from .casci import _annihilate_bit, _create_bit
+
+        for det in rows:
+            for spin in (0, 1):
+                for q in range(n):
+                    ket, sign = _annihilate_bit(int(det), spin * n + q)
+                    if not sign:
+                        continue
+                    for p in range(n):
+                        bra, sign = _create_bit(ket, spin * n + p)
+                        if sign:
+                            reached.add(bra)
+        rows = np.asarray(sorted(reached), dtype=rows.dtype)
+    if len(rows) == len(original):
+        return ci, binary
+    expanded = np.zeros(len(rows), dtype=ci.dtype)
+    expanded[np.searchsorted(rows, original)] = ci
+    occupations = np.array(
+        [[(int(det) >> k) & 1 for k in range(2 * n)] for det in rows], dtype=np.int8
+    ).reshape(-1, 2, n)
+    return expanded, occupations
+
+
 def _spin_free_rdms123(ci, binary):
     """
     Return PySCF/SC-NEVPT ordered spin-free active 1-, 2-, and 3-RDMs.
@@ -600,6 +705,7 @@ def _spin_free_rdms123(ci, binary):
     ``dm2[p,q,r,s] = <E_pq E_rs>`` and
     ``dm3[p,q,r,s,t,u] = <E_pq E_rs E_tu>``.
     """
+    ci, binary = _rdm_excitation_closure(ci, binary)
     rdm_builder = _cpp_attr("nevpt_spin_free_rdms123")
     if rdm_builder is not None:
         return tuple(

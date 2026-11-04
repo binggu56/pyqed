@@ -93,49 +93,109 @@ def ao2mo_packed(eri_s8, mo_coeff, *, workers=None):
     return _transform_pairs(source,c,kernel=kernel,workers=workers)
 
 
-def _transform_pairs(source, c, *, kernel, workers):
+def _transform_pairs(source, c, *, kernel, workers, right=None):
     """Shared pair-half engine, including the real dense/packed fallback."""
-    nao,nmo = c.shape
-    ap,mp = nao*(nao+1)//2,nmo*(nmo+1)//2
-    source,c = np.ascontiguousarray(source,dtype=float),np.ascontiguousarray(c,dtype=float)
+    nao, nmo = c.shape
+    ap = nao * (nao + 1) // 2
+    mp = nmo * (nmo + 1) // 2 if right is None else nmo * right.shape[1]
+    source, c = np.ascontiguousarray(source, dtype=float), np.ascontiguousarray(
+        c, dtype=float
+    )
     from .basis import _ao_pair_index_matrix, _packed_pair_pair_indices
+
     ao_pairs = _ao_pair_index_matrix(nao)
-    ai,aj = np.tril_indices(nao)
-    mi,mj = np.tril_indices(nmo)
-    def transform_rows(data,start,stop):
+    ai, aj = np.tril_indices(nao)
+    mi, mj = np.tril_indices(nmo)
+
+    def transform_rows(data, start, stop):
         if kernel is not None:
-            return kernel(data,c,start,stop)
+            return (
+                kernel(data, c, start, stop)
+                if right is None
+                else kernel(data, c, start, stop, right)
+            )
         if data.ndim == 1:
-            rows = np.arange(start,stop)[:,None,None]
-            matrices = data[_packed_pair_pair_indices(rows,ao_pairs)]
+            rows = np.arange(start, stop)[:, None, None]
+            matrices = data[_packed_pair_pair_indices(rows, ao_pairs)]
         elif data.ndim == 2:
-            matrices = data[start:stop,ao_pairs]
+            matrices = data[start:stop, ao_pairs]
         else:
-            matrices = data[ai[start:stop],aj[start:stop]]
-        transformed = c.T @ (matrices @ c)
-        return transformed[:,mi,mj]
-    count = 1 if nao < 40 or kernel is None else min(int(workers),max(1,min(ap,mp)//64))
+            matrices = data[ai[start:stop], aj[start:stop]]
+        transformed = c.T @ (matrices @ (c if right is None else right))
+        return (
+            transformed[:, mi, mj]
+            if right is None
+            else transformed.reshape(stop - start, mp)
+        )
+
+    count = (
+        1
+        if nao < 40 or kernel is None
+        else min(int(workers), max(1, min(ap, mp) // 64))
+    )
     pool = ThreadPoolExecutor(max_workers=count) if count > 1 else None
     try:
-        def half(data,nrows):
-            result = np.empty((nrows,mp))
-            batch = max(16,(nrows+count*4-1)//(count*4)) if kernel is not None else 32
+
+        def half(data, nrows):
+            result = np.empty((nrows, mp))
+            batch = (
+                max(16, (nrows + count * 4 - 1) // (count * 4))
+                if kernel is not None
+                else 32
+            )
             if pool is None:
-                for start in range(0,nrows,batch):
-                    stop = min(nrows,start+batch)
-                    result[start:stop] = transform_rows(data,start,stop)
+                for start in range(0, nrows, batch):
+                    stop = min(nrows, start + batch)
+                    result[start:stop] = transform_rows(data, start, stop)
             else:
-                intervals = [(start,min(nrows,start+batch)) for start in range(0,nrows,batch)]
-                futures = [pool.submit(transform_rows,data,start,stop) for start,stop in intervals]
-                for (start,stop),future in zip(intervals,futures):
+                intervals = [
+                    (start, min(nrows, start + batch))
+                    for start in range(0, nrows, batch)
+                ]
+                futures = [
+                    pool.submit(transform_rows, data, start, stop)
+                    for start, stop in intervals
+                ]
+                for (start, stop), future in zip(intervals, futures):
                     result[start:stop] = future.result()
             return result
-        first = half(source,ap)
+
+        first = half(source, ap)
         rows = np.ascontiguousarray(first.T)
         del first
-        pairs = half(rows,mp)
+        pairs = half(rows, mp)
     finally:
         if pool is not None:
             pool.shutdown(wait=True)
+    if right is not None:
+        return pairs.reshape(nmo, right.shape[1], nmo, right.shape[1])
     ids = _ao_pair_index_matrix(nmo)
-    return pairs[ids[:,:,None,None],ids[None,None,:,:]]
+    return pairs[ids[:, :, None, None], ids[None, None, :, :]]
+
+
+def ao2mo_excitation(eri_s8, mo_coeff, noccupied, *, workers=None):
+    """Exact (p i|q j) integrals, with i,j in inactive plus active orbitals.
+
+    Reuses the packed half-transform with rectangular target pairs. No AO
+    tensor is expanded and no three-/four-virtual integrals are formed.
+    This supplies H|reference> for CAS and RAS; it is not the complete MO ERI.
+    """
+    c, source = np.asarray(mo_coeff), np.asarray(eri_s8)
+    if c.ndim != 2 or np.iscomplexobj(c) or np.iscomplexobj(source):
+        raise ValueError("Expected real coefficients and packed real integrals.")
+    if (
+        isinstance(noccupied, bool)
+        or not isinstance(noccupied, Integral)
+        or not 0 < noccupied <= c.shape[1]
+    ):
+        raise ValueError("noccupied must select a nonempty prefix of the MO space.")
+    ap = c.shape[0] * (c.shape[0] + 1) // 2
+    if source.shape != (ap * (ap + 1) // 2,):
+        raise ValueError("s8 integral shape is inconsistent with the coefficients.")
+    return _transform_pairs(
+        source,
+        c,
+        kernel=_compiled_blas_kernel("packed_half_transform"),
+        workers=resolve_workers(workers),
+        right=np.ascontiguousarray(c[:, :noccupied], dtype=float),
+    )

@@ -1,0 +1,28 @@
+&GATEWAY
+Coord
+6
+H6 coupling regression
+H 0 0 0
+H 0 0 0.7
+H 1.1 0 0.1
+H 1.4 0.2 0.8
+H 2 -0.3 0.2
+H 2.5 0.4 0.7
+Basis = STO-3G
+Group = C1
+&SEWARD
+&RASSCF
+FileOrb = orbitals.RasOrb
+Spin = 1
+Nactel = 2 0 0
+Inactive = 2
+Ras2 = 2
+CIroot = 1 1 1
+CIONLY
+Tight = 1e-12 1e-6
+&CASPT2
+Frozen = 0
+IPEA = 0
+Imaginary = 0.0
+Convergence = 1e-11
+MaxIter = 100

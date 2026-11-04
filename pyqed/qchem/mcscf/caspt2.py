@@ -1,4 +1,4 @@
-"""Single-state internally contracted CASPT2.
+"""Single-state and multistate internally contracted CASPT2.
 
 The production path builds the first-order interacting space by applying
 spin-free one- and two-body excitation operators to the complete CAS reference.
@@ -10,23 +10,24 @@ available as explicit diagnostic approximations.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
-from itertools import combinations, combinations_with_replacement, permutations
-from functools import reduce
-import importlib
 import copy
+import importlib
 import math
 import os
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from functools import reduce
+from itertools import combinations, combinations_with_replacement, permutations
 from time import perf_counter
 
 import numpy as np
 
+from pyqed.parallel import resolve_workers
 from pyqed.qchem.mcscf.casci import (
     _annihilate_bit,
     _create_bit,
-    _get_veff_for_dm,
     _get_mf_cholesky_factors,
+    _get_veff_for_dm,
     _is_uhf_reference,
     _resolve_use_cholesky,
     assemble_spatial_eri_from_factors,
@@ -34,21 +35,21 @@ from pyqed.qchem.mcscf.casci import (
     transform_spatial_eri_to_mo,
 )
 
-_CASSCF_CPP_UNINITIALIZED = object()
-_casscf_cpp = _CASSCF_CPP_UNINITIALIZED
+_MR_KERNELS_UNINITIALIZED = object()
+_mr_kernels = _MR_KERNELS_UNINITIALIZED
 
 
 def _cpp_attr(*names):
-    global _casscf_cpp
-    if _casscf_cpp is _CASSCF_CPP_UNINITIALIZED:
+    global _mr_kernels
+    if _mr_kernels is _MR_KERNELS_UNINITIALIZED:
         try:
-            _casscf_cpp = importlib.import_module("pyqed.qchem._casscf_cpp")
+            _mr_kernels = importlib.import_module("pyqed.qchem._casscf_cpp")
         except Exception:  # pragma: no cover - optional accelerator
-            _casscf_cpp = None
-    if _casscf_cpp is None:
+            _mr_kernels = None
+    if _mr_kernels is None:
         return None
     for name in names:
-        attr = getattr(_casscf_cpp, name, None)
+        attr = getattr(_mr_kernels, name, None)
         if attr is not None:
             return attr
     return None
@@ -71,9 +72,9 @@ and adds the second-order interaction with determinants outside the complete
 active space,
 
 $$
-E^{(2)} = \\sum_\\mu
-\\frac{|\\langle \\Phi_\\mu | H | \\Psi_0 \\rangle|^2}
-     {E_0^{(0)} - E_\\mu^{(0)}} .
+E^{(2)} = \sum_\mu
+\frac{|\langle \Phi_\mu | H | \Psi_0 \rangle|^2}
+     {E_0^{(0)} - E_\mu^{(0)}} .
 $$
 
 The default PyQED path uses a fully internally contracted external first-order space
@@ -101,7 +102,7 @@ the denominator magnitude for the usual negative-energy perturbers, while an
 imaginary shift evaluates the diagonal damping expression
 
 $$
-|V_\\mu|^2 \\frac{D_\\mu}{D_\\mu^2 + \\eta^2}
+|V_\mu|^2 \frac{D_\mu}{D_\mu^2 + \eta^2}
 $$
 
 to damp intruder-state singularities.
@@ -128,7 +129,9 @@ class CASPT2:
     Parameters
     ----------
     mc
-        A converged PyQED CASCI/CASSCF-like object.
+        A converged PyQED CASCI/CASSCF-like object. RASCI/RASSCF references
+        with ``ras_spaces`` use a partition-diagonal active Fock operator
+        on the direct backend, matching the OpenMolcas RASPT2 convention.
     root
         CAS root index.
     zeroth_order
@@ -152,8 +155,31 @@ class CASPT2:
         Forwarded to the MO integral transformer when RI/Cholesky factors are
         available on the reference.
     lindep_tol
-        Relative metric-eigenvalue threshold for removing redundant internally
-        contracted functions.
+        Threshold on the diagonally normalized metric eigenvalues. Defaults to
+        1e-10 for ``projected`` and OpenMolcas THRSHS=1e-8 for ``molcas``.
+    fock_contraction
+        ``"auto"`` (default) selects ``"rdm"`` for the direct shared Molcas
+        convention and ``"operator"`` otherwise. ``"rdm"`` builds metrics,
+        pseudocanonical Fock moments and inter-class couplings from RAS-safe
+        active 1--3 RDMs and energy-weighted RDMs, with no external determinant
+        templates or four-RDM. It requires metric_norm_tol >= 1e-12.
+        ``"operator"`` retains sparse operator projection. ``"density"`` is
+        the exact annihilation-factor alternative, retaining template metrics.
+        All three evaluate the same supported coupled equations.
+    metric_norm_tol
+        Squared raw-column norm cutoff for shared templates. Defaults to zero
+        for ``projected`` and OpenMolcas THRSHN=1e-10 for ``molcas``.
+    ic_convention
+        ``"projected"`` (default) projects the Fock operator exactly onto the
+        contracted space. ``"molcas"`` uses OpenMolcas's ordered raw metrics,
+        active pseudocanonical orbitals with counterrotated CI, and A/E
+        interclass coupling convention. Its Si/Sijr coupling is sqrt(2) times
+        the determinant-projected one, as in SGM cases 4/5 and MKLIST 14/15:
+        https://github.com/Molcas/OpenMolcas/tree/master/src/caspt2.
+        This is a reproduction of those single-state zero-IPEA equations, not
+        an empirical energy fit. Requires the direct shared-template solver;
+        IPEA, additional CVS and PT2 dipole corrections are unsupported.
+        MS/XMS couplings are supported with RDM contractions.
     max_ic_operators
         Safety cap on the number of raw internally contracted excitation
         operators before metric compression.
@@ -172,12 +198,45 @@ class CASPT2:
         matrix-free Krylov solve above ``direct_solver_max_rank``. The
         ``"direct"`` and ``"iterative"`` values force either path.
     direct_workers
-        Worker limit for independent direct tensor components and signature
-        blocks. ``None`` or ``"auto"`` enables bounded automatic selection.
+        Worker limit for direct tensor components, OpenMP coupling rows, and
+        signature blocks in successive stages (no nested pools). ``None`` or
+        ``"auto"`` uses the central worker default,
+        capped by the number of available blocks.
+    cvs_core_orbitals
+        Optional absolute MO indices for a fixed one-hole CVS sector. Requires
+        a complete active CI within that sector and the direct FIC backend.
+        Applies the CVS projector to the first-order space as well as the
+        reference. This single-state Fock-PT2 adaptation is not RMS-RASPT2;
+        extra RAS restrictions and multistate CVS mixing are unsupported.
+        Leave this unset for ordinary RASPT2: its first-order space includes
+        occupations outside the one-hole reference sector.
+        CVS: Cederbaum et al., Phys. Rev. A 22, 206 (1980),
+        doi:10.1103/PhysRevA.22.206. Core RAS application: Chang et al.,
+        Nat. Phys. 21, 137 (2025), doi:10.1038/s41567-024-02703-w.
     direct_build_backend
         ``"tensor"`` builds compact signature x active-state tensors before
         orthogonalization. ``"online"`` retains the incremental reference
-        builder for numerical cross-checks.
+        builder for numerical cross-checks. ``"shared"`` reuses active
+        excitation templates across external orbital labels, retaining the
+        complete coupled single-state FIC space without repeated determinant
+        rows. MS/XMS uses ordered transition RDMs with ``fock_contraction="rdm"``.
+        The additional CVS projector is unsupported here.
+
+    Notes
+    -----
+    The complete-CAS formulation follows Andersson, Malmqvist and Roos,
+    J. Chem. Phys. 96, 1218 (1992), doi:10.1063/1.462209. This restricted-real,
+    zero-IPEA implementation supports the projected and documented OpenMolcas
+    contraction conventions; it does not provide analytic gradients.
+
+    The direct RAS path is an external-space, fully internally contracted
+    implementation of single-state RASPT2 (Malmqvist et al., J. Chem. Phys.
+    128, 204109, 2008, doi:10.1063/1.2920188), validated on the reduced
+    pyrazine core benchmark. It does not implement RMS-RASPT2, IPEA shifts,
+    or PT2 transition-dipole corrections. Inter-block Fock couplings are
+    retained; the imaginary shift acts in each diagonalized signature block
+    as in OpenMolcas, following Forsberg and Malmqvist, Chem. Phys. Lett.
+    274, 196 (1997), doi:10.1016/S0009-2614(97)00669-6.
     """
 
     supported_zeroth_orders = ("fock", "en")
@@ -192,7 +251,7 @@ class CASPT2:
     )
     supported_contracted_matrices = ("auto", "diagonal", "en_coupled")
     supported_ic_basis_backends = ("auto", "dense", "streaming", "direct")
-    supported_direct_build_backends = ("tensor", "online")
+    supported_direct_build_backends = ("tensor", "online", "shared")
     supported_linear_solvers = ("auto", "direct", "iterative")
     perturber_classes = CASPT2_PERTURBER_CLASSES
 
@@ -209,7 +268,7 @@ class CASPT2:
         frozen_core: int = 0,
         use_cholesky=None,
         contracted_matrix: str = "auto",
-        lindep_tol: float = 1.0e-10,
+        lindep_tol: float | None = None,
         max_ic_operators: int | None = 100000,
         ic_basis_backend: str = "auto",
         max_memory_mb: float | None = 2048.0,
@@ -219,10 +278,17 @@ class CASPT2:
         direct_solver_max_rank: int = 500,
         direct_workers: int | str | None = None,
         direct_build_backend: str = "tensor",
+        ic_convention: str = "projected",
+        metric_norm_tol: float | None = None,
+        fock_contraction: str = "auto",
         fock_matrix=None,
+        cvs_core_orbitals=None,
         verbose: int = 0,
     ):
         self.mc = mc
+        self.cvs_core_orbitals = (
+            () if cvs_core_orbitals is None else tuple(cvs_core_orbitals)
+        )
         self.root = int(root)
         self.zeroth_order = str(zeroth_order).lower().replace("-", "_")
         self.contraction = str(contraction).lower().replace("-", "_")
@@ -231,21 +297,61 @@ class CASPT2:
         self.imaginary_shift = float(imaginary_shift)
         self.denominator_tol = float(denominator_tol)
         self.max_external_determinants = (
-            None if max_external_determinants is None else int(max_external_determinants)
+            None
+            if max_external_determinants is None
+            else int(max_external_determinants)
         )
         self.frozen_core = int(frozen_core)
         self.use_cholesky = use_cholesky
-        self.lindep_tol = float(lindep_tol)
-        self.max_ic_operators = None if max_ic_operators is None else int(max_ic_operators)
         self.ic_basis_backend_request = str(ic_basis_backend).lower().replace("-", "_")
+        self.direct_build_backend = str(direct_build_backend).lower().replace("-", "_")
+        self.ic_convention = str(ic_convention).lower()
+        fock_contraction = str(fock_contraction).lower()
+        shared_templates = (
+            self.ic_basis_backend_request == "direct"
+            and self.direct_build_backend == "shared"
+        )
+        if fock_contraction == "auto":
+            fock_contraction = (
+                "rdm"
+                if self.ic_convention == "molcas" and shared_templates
+                else "operator"
+            )
+        self.fock_contraction = fock_contraction
+        if fock_contraction not in ("operator", "density", "rdm"):
+            raise ValueError(
+                "fock_contraction must be 'operator', 'density', or 'rdm'."
+            )
+        if fock_contraction in ("density", "rdm") and not shared_templates:
+            raise ValueError(
+                "Density contractions require the direct shared-template solver."
+            )
+        self.lindep_tol = float(
+            lindep_tol
+            if lindep_tol is not None
+            else (1e-8 if self.ic_convention == "molcas" else 1e-10)
+        )
+        self.metric_norm_tol = float(
+            metric_norm_tol
+            if metric_norm_tol is not None
+            else (1e-10 if self.ic_convention == "molcas" else 0.0)
+        )
+        if fock_contraction == "rdm" and self.metric_norm_tol < 1e-12:
+            raise ValueError(
+                "RDM contractions require metric_norm_tol >= 1e-12; use operator contractions for smaller norms."
+            )
+        self.max_ic_operators = (
+            None if max_ic_operators is None else int(max_ic_operators)
+        )
         self.max_memory_mb = None if max_memory_mb is None else float(max_memory_mb)
         self.linear_solver_request = str(linear_solver).lower().replace("-", "_")
         self.solver_tol = float(solver_tol)
         self.max_solver_iterations = int(max_solver_iterations)
         self.direct_solver_max_rank = int(direct_solver_max_rank)
         self.direct_workers = direct_workers
-        self.direct_build_backend = str(direct_build_backend).lower().replace("-", "_")
-        self.fock_matrix = None if fock_matrix is None else np.asarray(fock_matrix, dtype=float)
+        self.fock_matrix = (
+            None if fock_matrix is None else np.asarray(fock_matrix, dtype=float)
+        )
         self.verbose = int(verbose)
 
         self.components: dict[str, CASPT2Component] = {}
@@ -291,6 +397,7 @@ class CASPT2:
         self.direct_integral_backend: str | None = None
         self.direct_determinant_words: np.ndarray | None = None
         self.direct_first_order: np.ndarray | None = None
+        self.transition_couplings: np.ndarray | None = None
         self.direct_candidate_offsets: np.ndarray | None = None
         self.direct_candidate_indices: np.ndarray | None = None
         self.direct_candidate_groups: np.ndarray | None = None
@@ -305,16 +412,18 @@ class CASPT2:
 
     @staticmethod
     def theory():
-        """Return a compact theory note for the native CASPT2 starter."""
+        """Return a compact theory note for the CASPT2 solvers."""
         return CASPT2_THEORY
 
     def estimate_external_space(self):
-        """Return exact complete-CAS FOIS counts without transforming integrals."""
+        """Return complete-CAS FOIS counts without transforming integrals.
+
+        These are upper bounds for a CVS-restricted reference, before the
+        one-core-hole projector is applied.
+        """
         self._validate_reference()
         if self.frozen_core < 0 or self.frozen_core > self._ncore:
-            raise ValueError(
-                f"frozen_core must be between 0 and ncore={self._ncore}."
-            )
+            raise ValueError(f"frozen_core must be between 0 and ncore={self._ncore}.")
         class_counts = _estimate_external_class_counts(
             self._binary,
             self._ncore,
@@ -334,6 +443,7 @@ class CASPT2:
             "raw_ic_operators_upper_bound": int(raw_operators),
             "one_body_transitions": len(transitions),
             "frozen_core_orbitals": self.frozen_core,
+            "counts_are_cvs_upper_bounds": bool(self.cvs_core_orbitals),
         }
 
     def run(self):
@@ -360,16 +470,18 @@ class CASPT2:
         self.contracted_metric_pivots = None
         self._validate_reference()
         if self.frozen_core < 0 or self.frozen_core > self._ncore:
-            raise ValueError(
-                f"frozen_core must be between 0 and ncore={self._ncore}."
-            )
+            raise ValueError(f"frozen_core must be between 0 and ncore={self._ncore}.")
         if self.zeroth_order not in self.supported_zeroth_orders:
             raise ValueError(
                 "zeroth_order must be one of {}.".format(self.supported_zeroth_orders)
             )
         if self.contraction == "strongly_contracted":
             self.contraction = "strong"
-        if self.contraction in {"fully_contracted", "fully_internally_contracted", "fic"}:
+        if self.contraction in {
+            "fully_contracted",
+            "fully_internally_contracted",
+            "fic",
+        }:
             self.contraction = "full"
         if self.contraction not in self.supported_contractions:
             raise ValueError(
@@ -397,18 +509,56 @@ class CASPT2:
                     self.supported_direct_build_backends
                 )
             )
+        if self.ic_convention not in ("projected", "molcas"):
+            raise ValueError("ic_convention must be 'projected' or 'molcas'.")
+        if self.metric_norm_tol < 0 or self.lindep_tol <= 0:
+            raise ValueError(
+                "Metric thresholds must be nonnegative, with lindep_tol positive."
+            )
+        if self.ic_convention == "molcas" and (
+            self.contraction != "full"
+            or self.zeroth_order != "fock"
+            or self.ic_basis_backend_request != "direct"
+            or self.direct_build_backend != "shared"
+        ):
+            raise NotImplementedError(
+                "ic_convention='molcas' requires full Fock PT2 with "
+                "ic_basis_backend='direct', direct_build_backend='shared'."
+            )
+        if self.metric_norm_tol and (
+            self.ic_basis_backend_request != "direct"
+            or self.direct_build_backend != "shared"
+        ):
+            raise NotImplementedError(
+                "metric_norm_tol requires the direct shared-template solver."
+            )
         if self.max_memory_mb is not None and self.max_memory_mb <= 0.0:
             raise ValueError("max_memory_mb must be positive or None.")
         if self.solver_tol <= 0.0:
             raise ValueError("solver_tol must be positive.")
         if self.max_solver_iterations < 1 or self.direct_solver_max_rank < 1:
-            raise ValueError("Solver iteration and direct-rank limits must be positive.")
-        if self.contraction not in {"strong", "full"} and self.contracted_matrix == "en_coupled":
-            raise ValueError("contracted_matrix='en_coupled' requires a contracted calculation.")
+            raise ValueError(
+                "Solver iteration and direct-rank limits must be positive."
+            )
+        if (
+            self.contraction not in {"strong", "full"}
+            and self.contracted_matrix == "en_coupled"
+        ):
+            raise ValueError(
+                "contracted_matrix='en_coupled' requires a contracted calculation."
+            )
         if self.contracted_matrix == "en_coupled" and self.zeroth_order != "en":
-            raise NotImplementedError("The coupled contracted matrix is currently implemented for EN CASPT2.")
-        if self.contraction == "strong" and self.contracted_matrix == "en_coupled" and self.imaginary_shift != 0.0:
-            raise NotImplementedError("Coupled contracted EN CASPT2 currently supports real shifts only.")
+            raise NotImplementedError(
+                "The coupled contracted matrix is currently implemented for EN CASPT2."
+            )
+        if (
+            self.contraction == "strong"
+            and self.contracted_matrix == "en_coupled"
+            and self.imaginary_shift != 0.0
+        ):
+            raise NotImplementedError(
+                "Coupled contracted EN CASPT2 currently supports real shifts only."
+            )
         if self.real_shift < 0.0:
             raise ValueError("real_shift must be non-negative.")
         if self.imaginary_shift < 0.0:
@@ -420,15 +570,11 @@ class CASPT2:
         self.work_estimate = {
             "estimated_external_determinants": estimated_external,
             "estimated_external_class_counts": estimated_class_counts,
-            "raw_ic_operators_upper_bound": preflight[
-                "raw_ic_operators_upper_bound"
-            ],
+            "raw_ic_operators_upper_bound": preflight["raw_ic_operators_upper_bound"],
             "one_body_transitions": preflight["one_body_transitions"],
             "frozen_core_orbitals": self.frozen_core,
         }
-        direct_compatible = (
-            self.contraction == "full" and self.zeroth_order == "fock"
-        )
+        direct_compatible = self.contraction == "full" and self.zeroth_order == "fock"
         use_direct_backend = self.ic_basis_backend_request == "direct" or (
             self.ic_basis_backend_request == "auto"
             and direct_compatible
@@ -436,8 +582,7 @@ class CASPT2:
         )
         if (
             not use_direct_backend
-            and
-            self.max_external_determinants is not None
+            and self.max_external_determinants is not None
             and estimated_external > self.max_external_determinants
         ):
             raise MemoryError(
@@ -450,20 +595,36 @@ class CASPT2:
 
         integral_start = perf_counter()
         mo_coeff = self._mo_coeff()
+        ci = np.asarray(self._ci_vector(), dtype=float)
         direct_fock = None
         if use_direct_backend:
             mo_coeff, direct_fock = self._direct_semicanonical_orbitals(mo_coeff)
+            if self.ic_convention == "molcas" or (
+                self.direct_build_backend == "shared" and self.fock_contraction == "rdm"
+            ):
+                if getattr(self, "_transition_ci", None) is not None:
+                    self._transition_ci = [
+                        self._active_fock_frame(v, mo_coeff, direct_fock)[0]
+                        for v in self._transition_ci
+                    ]
+                ci, mo_coeff, direct_fock = self._active_fock_frame(
+                    ci, mo_coeff, direct_fock
+                )
         h1_mo = self._hcore_mo(mo_coeff)
-        if (
-            use_direct_backend
-            and self._use_cholesky()
-        ):
+        if use_direct_backend and self._use_cholesky():
             eri_factors = _get_mf_cholesky_factors(self.mc.mf)
             eri_mo = np.asarray(
                 mo_pair_factors(eri_factors, mo_coeff, mo_coeff),
                 dtype=float,
             )
             self.direct_integral_backend = "cholesky_pair_factors"
+        elif (
+            use_direct_backend
+            and self.direct_build_backend == "shared"
+            and (reference_integrals := self._reference_integrals(mo_coeff)) is not None
+        ):
+            eri_mo = reference_integrals
+            self.direct_integral_backend = "excitation_pairs"
         else:
             eri_mo = self._eri_mo(mo_coeff)
             if use_direct_backend:
@@ -480,7 +641,6 @@ class CASPT2:
             self._ncas,
             self._nmo,
         )
-        ci = np.asarray(self._ci_vector(), dtype=float)
         if use_direct_backend:
             if self.contraction != "full" or self.zeroth_order != "fock":
                 raise NotImplementedError(
@@ -539,7 +699,10 @@ class CASPT2:
             classes = classes[keep]
         self.timings["external_space_s"] = perf_counter() - external_start
 
-        if self.max_external_determinants is not None and len(determinants) > self.max_external_determinants:
+        if (
+            self.max_external_determinants is not None
+            and len(determinants) > self.max_external_determinants
+        ):
             raise MemoryError(
                 f"CASPT2 external space has {len(determinants)} determinants, "
                 f"exceeding max_external_determinants={self.max_external_determinants}."
@@ -562,16 +725,18 @@ class CASPT2:
             e_nuc,
         )
         if native is None:
-            couplings, denominators, energies, amplitudes = self._python_external_kernel(
-                determinants,
-                ref_bits,
-                ci,
-                h1_mo,
-                eri_mo,
-                mo_energy,
-                occ_average,
-                e_ref,
-                e_nuc,
+            couplings, denominators, energies, amplitudes = (
+                self._python_external_kernel(
+                    determinants,
+                    ref_bits,
+                    ci,
+                    h1_mo,
+                    eri_mo,
+                    mo_energy,
+                    occ_average,
+                    e_ref,
+                    e_nuc,
+                )
             )
             self.external_kernel_backend = "python"
         else:
@@ -581,16 +746,18 @@ class CASPT2:
 
         contraction_start = perf_counter()
         if self.contraction == "full":
-            energies, amplitudes, components = self._fully_internally_contracted_components(
-                determinants,
-                ref_bits,
-                ci,
-                couplings,
-                classes,
-                h1_mo,
-                eri_mo,
-                e_ref,
-                e_nuc,
+            energies, amplitudes, components = (
+                self._fully_internally_contracted_components(
+                    determinants,
+                    ref_bits,
+                    ci,
+                    couplings,
+                    classes,
+                    h1_mo,
+                    eri_mo,
+                    e_ref,
+                    e_nuc,
+                )
             )
             self.contraction_backend = "python_fully_internally_contracted"
         elif self.contraction == "strong":
@@ -600,10 +767,12 @@ class CASPT2:
                 classes,
             )
             if native_contract is None:
-                energies, amplitudes, components = self._python_strongly_contracted_components(
-                    couplings,
-                    denominators,
-                    classes,
+                energies, amplitudes, components = (
+                    self._python_strongly_contracted_components(
+                        couplings,
+                        denominators,
+                        classes,
+                    )
                 )
                 self.contraction_backend = "python"
             else:
@@ -667,7 +836,9 @@ class CASPT2:
         ``(denominator_matrix - real_shift * metric) t = rhs``.
         """
         if self.contracted_metric is None:
-            raise ValueError("Run CASPT2 with contraction='strong' before requesting the contracted linear system.")
+            raise ValueError(
+                "Run CASPT2 with contraction='strong' before requesting the contracted linear system."
+            )
         if self.contracted_denominator_matrix is None:
             raise ValueError(
                 "The projected denominator matrix was applied matrix-free and was "
@@ -691,9 +862,13 @@ class CASPT2:
         ``imaginary_shift == 0``.
         """
         if self.contracted_metric is None:
-            raise ValueError("Run CASPT2 with contraction='strong' before solving the contracted linear system.")
+            raise ValueError(
+                "Run CASPT2 with contraction='strong' before solving the contracted linear system."
+            )
         if self.imaginary_shift != 0.0:
-            raise NotImplementedError("The real contracted linear solve is not used for imaginary-shift CASPT2.")
+            raise NotImplementedError(
+                "The real contracted linear solve is not used for imaginary-shift CASPT2."
+            )
 
         rhs = np.asarray(self.contracted_rhs, dtype=float)
         amplitudes = np.zeros_like(rhs)
@@ -705,8 +880,12 @@ class CASPT2:
             return amplitudes.copy()
 
         denom = np.asarray(self.contracted_denominator_matrix, dtype=float)
-        active_metric = np.ascontiguousarray(metric[np.ix_(active, active)], dtype=np.float64)
-        active_denom = np.ascontiguousarray(denom[np.ix_(active, active)], dtype=np.float64)
+        active_metric = np.ascontiguousarray(
+            metric[np.ix_(active, active)], dtype=np.float64
+        )
+        active_denom = np.ascontiguousarray(
+            denom[np.ix_(active, active)], dtype=np.float64
+        )
         active_rhs = np.ascontiguousarray(rhs[active], dtype=np.float64)
 
         solved = None
@@ -735,6 +914,13 @@ class CASPT2:
 
     def _validate_reference(self):
         mc = self.mc
+        spaces = getattr(mc, "ras_spaces", (0, self._ncas, 0))
+        if (spaces[0] or spaces[2]) and (
+            self.ic_basis_backend_request != "direct" or self.contraction != "full"
+        ):
+            raise NotImplementedError(
+                "RASPT2 requires full contraction and the direct backend"
+            )
         if getattr(mc, "ci", None) is None:
             raise ValueError("Run CASCI/CASSCF before CASPT2.")
         if self._binary is None:
@@ -743,11 +929,50 @@ class CASPT2:
         if mo_coeff is None:
             raise ValueError("CASPT2 requires molecular orbitals on the CAS object.")
         if _is_uhf_reference(mo_coeff):
-            raise NotImplementedError("Native CASPT2 currently supports restricted references only.")
+            raise NotImplementedError(
+                "Native CASPT2 currently supports restricted references only."
+            )
         if self.root < 0 or self.root >= len(mc.ci):
-            raise IndexError(f"CASPT2 root {self.root} is outside the available CI roots.")
+            raise IndexError(
+                f"CASPT2 root {self.root} is outside the available CI roots."
+            )
+        if self.cvs_core_orbitals:
+            if self.ic_basis_backend_request != "direct" or self.contraction != "full":
+                raise ValueError(
+                    "CVS-PT2 requires full contraction and the direct backend"
+                )
+            if len(set(self.cvs_core_orbitals)) != len(self.cvs_core_orbitals):
+                raise ValueError("Duplicate CVS orbital")
+            active = [i - self._ncore for i in self.cvs_core_orbitals]
+            if min(active) < 0 or max(active) >= self._ncas:
+                raise ValueError("CVS orbitals must be in the active space")
+            binary = np.asarray(self._binary)
+            if not np.all(binary[:, :, active].sum(axis=(1, 2)) == 2 * len(active) - 1):
+                raise ValueError("CVS reference must contain exactly one core hole")
+            # Within this CVS sector the remaining active orbitals must be full CI.
+            na, nb = binary[0].sum(axis=1)
+            if (
+                not np.all((binary == 0) | (binary == 1))
+                or not np.all(binary.sum(axis=2) == (na, nb))
+                or len(np.unique(binary, axis=0)) != len(binary)
+            ):
+                raise ValueError(
+                    "CVS determinant basis must be unique with fixed spin populations"
+                )
+            k, rest = len(active), self._ncas - len(active)
+
+            def choose(n, r):
+                return math.comb(n, r) if 0 <= r <= n else 0
+
+            expected = k * choose(rest, int(na) - k + 1) * choose(
+                rest, int(nb) - k
+            ) + k * choose(rest, int(na) - k) * choose(rest, int(nb) - k + 1)
+            if len(binary) != expected:
+                raise ValueError("CVS-PT2 requires a complete one-hole active sector")
         if self._mo_energy().shape != (self._nmo,):
-            raise ValueError("CASPT2 requires one MO energy per restricted spatial orbital.")
+            raise ValueError(
+                "CASPT2 requires one MO energy per restricted spatial orbital."
+            )
 
     @property
     def _ncore(self):
@@ -786,7 +1011,9 @@ class CASPT2:
         if mo_energy is None:
             mo_energy = getattr(getattr(self.mc, "mf", None), "mo_energy", None)
         if mo_energy is None:
-            raise ValueError("CASPT2 requires MO energies; canonicalize or run RHF/CASSCF first.")
+            raise ValueError(
+                "CASPT2 requires MO energies; canonicalize or run RHF/CASSCF first."
+            )
         return np.asarray(mo_energy, dtype=float)
 
     def _reference_energy(self):
@@ -828,6 +1055,45 @@ class CASPT2:
             dtype=float,
         )
 
+    def _reference_integrals(self, mo_coeff):
+        """Build only H|reference> integrals for the shared Fock-PT2 solver.
+
+        This is an exact data-layout change for CAS/RAS references: the two
+        annihilators act in the inactive/active space. Closed-shell normal
+        ordering is evaluated with the existing packed-AO Fock contraction.
+        """
+        mf = self.mc.mf
+        if (
+            callable(getattr(mf, "transform_eri", None))
+            or getattr(mf, "eri", None) is not None
+        ):
+            return None
+        if getattr(mf, "eri_s4", None) is not None:
+            return None
+        source = getattr(mf, "eri_s8", None)
+        mol = getattr(mf, "mol", None)
+        if source is None and getattr(mol, "eri_s4", None) is None:
+            source = getattr(mol, "eri_s8", None)
+        if source is None:
+            return None
+        from pyqed.qchem.ao2mo import ao2mo_excitation
+
+        from .perturber_templates import ReferenceIntegrals
+
+        pair = ao2mo_excitation(
+            source,
+            mo_coeff,
+            self._ncore + self._ncas,
+            workers=getattr(mol, "workers", None),
+        )
+        core = mo_coeff[:, : self._ncore]
+        potential = (
+            _get_veff_for_dm(mf, 2 * (core @ core.T))
+            if self._ncore
+            else np.zeros((len(mo_coeff), len(mo_coeff)))
+        )
+        return ReferenceIntegrals(pair, mo_coeff.T @ potential @ mo_coeff)
+
     def _average_spinorbital_occupations(self):
         dm_a, dm_b = self._spin_rdm1_mo()
         return np.concatenate((np.diag(dm_a).real, np.diag(dm_b).real))
@@ -839,8 +1105,8 @@ class CASPT2:
         dm_a = np.zeros((self._nmo, self._nmo), dtype=float)
         dm_b = np.zeros_like(dm_a)
         if self._ncore:
-            dm_a[:self._ncore, :self._ncore] = np.eye(self._ncore)
-            dm_b[:self._ncore, :self._ncore] = np.eye(self._ncore)
+            dm_a[: self._ncore, : self._ncore] = np.eye(self._ncore)
+            dm_b[: self._ncore, : self._ncore] = np.eye(self._ncore)
         if not self._ncas:
             self._spin_rdm1_cache = (dm_a, dm_b)
             return self._spin_rdm1_cache
@@ -863,7 +1129,9 @@ class CASPT2:
             dm_a = active_a.copy()
             dm_b = active_b.copy()
         else:
-            raise ValueError("CASPT2 received one-particle densities with an unexpected shape.")
+            raise ValueError(
+                "CASPT2 received one-particle densities with an unexpected shape."
+            )
         self._spin_rdm1_cache = (dm_a, dm_b)
         return self._spin_rdm1_cache
 
@@ -880,10 +1148,33 @@ class CASPT2:
                 raise ValueError("fock_matrix must have shape (nmo, nmo).")
             fock = self.fock_matrix.copy()
         fock = 0.5 * (fock + fock.T)
-        reference_fock_energy = float(
-            np.einsum("pq,qp->", fock, dm_tot, optimize=True)
-        )
+        reference_fock_energy = float(np.einsum("pq,qp->", fock, dm_tot, optimize=True))
         return fock, fock.copy(), reference_fock_energy
+
+    def _ras_fock(self, fock):
+        """Use the partition-diagonal active Fock operator of OpenMolcas RASPT2.
+
+        OpenMolcas constructs active H0 from EPSA in mkfg3/mkrptorb. These
+        orbital energies diagonalize each RAS partition separately. Keeping
+        each full diagonal partition here is the same operator in the saved
+        orbitals, without rotating their CI coefficients.
+        """
+        spaces = getattr(self.mc, "ras_spaces", None)
+        if spaces is None:
+            return fock
+        from pyqed.qchem.mcscf.rasscf import normalize_ras_spaces
+
+        spaces = normalize_ras_spaces(self._ncas, spaces)
+        fock = fock.copy()
+        edges = self._ncore + np.r_[0, np.cumsum(spaces)]
+        for i in range(3):
+            for j in range(i):
+                left, right = slice(edges[i], edges[i + 1]), slice(
+                    edges[j], edges[j + 1]
+                )
+                fock[left, right] = 0.0
+                fock[right, left] = 0.0
+        return fock
 
     def _direct_semicanonical_orbitals(self, mo_coeff):
         """Semicanonicalize frozen, correlated-core, and virtual subspaces."""
@@ -899,6 +1190,7 @@ class CASPT2:
         else:
             fock_mo = np.asarray(self.fock_matrix, dtype=float)
         fock_mo = 0.5 * (fock_mo + fock_mo.T)
+        fock_mo = self._ras_fock(fock_mo)
         rotation = np.eye(self._nmo)
         nocc = self._ncore + self._ncas
         spaces = (
@@ -916,9 +1208,11 @@ class CASPT2:
         self._direct_orbital_irrep_ids = orbital_irreps
         self._direct_irrep_product_table = None
         if orbital_irreps is not None:
-            symmetry_info = getattr(getattr(self.mc.mf, "mol", None), "symmetry_info", None)
+            symmetry_info = getattr(
+                getattr(self.mc.mf, "mol", None), "symmetry_info", None
+            )
             group = None if symmetry_info is None else symmetry_info.group
-            if group is not None and not group.linear:
+            if group is not None and not group.linear and group.abelian:
                 from pyqed.qchem.symmetry import irrep_product_table
 
                 self._direct_irrep_product_table = irrep_product_table(group)
@@ -940,6 +1234,54 @@ class CASPT2:
         self._direct_semicanonical_rotation = rotation
         return mo_coeff @ rotation, rotation.T @ fock_mo @ rotation
 
+    def _active_fock_frame(self, ci, coeff, fock):
+        """Pseudocanonicalize each active RAS partition and counterrotate CI.
+
+        Mirrors OpenMolcas MKRPTORB/ORBCTL. The reference object is untouched;
+        a finite scaled-metric cutoff depends on this orbital frame.
+        """
+        from .casci import (
+            _cached_spin_string_basis,
+            _ci_to_spin_string_matrix,
+            _string_transform_matrix,
+        )
+
+        ncas, nc = self._ncas, self._ncore
+        rotation = np.eye(ncas)
+        energies = np.zeros(ncas)
+        edges = np.r_[0, np.cumsum(getattr(self.mc, "ras_spaces", (0, ncas, 0)))]
+        for start, stop in zip(edges[:-1], edges[1:]):
+            if stop > start:
+                energies[start:stop], rotation[start:stop, start:stop] = np.linalg.eigh(
+                    fock[nc + start : nc + stop, nc + start : nc + stop]
+                )
+        if ncas:
+            alpha, beta, matrix = _ci_to_spin_string_matrix(ci, self._binary)
+            a = _string_transform_matrix(rotation, alpha, float)
+            b = _string_transform_matrix(rotation, beta, float)
+            matrix = a.T @ matrix @ b
+            _, _, ia, ib = _cached_spin_string_basis(
+                tuple(self._binary.shape),
+                np.ascontiguousarray(self._binary, dtype=np.int8).tobytes(),
+            )
+            rotated = matrix[ia, ib]
+            if not np.isclose(
+                np.linalg.norm(rotated), np.linalg.norm(ci), atol=1e-10, rtol=1e-10
+            ):
+                raise ValueError(
+                    "Active Fock rotation does not preserve the reference determinant space."
+                )
+            ci = rotated
+        full = np.eye(self._nmo)
+        full[nc : nc + ncas, nc : nc + ncas] = rotation
+        self._direct_active_rotation = rotation
+        canonical = full.T @ fock @ full
+        # The chosen pseudocanonical operator is diagonal in this block.
+        # Store its eigenvalues directly instead of roundoff off-diagonals,
+        # which would otherwise create spurious sparse determinant couplings.
+        canonical[nc : nc + ncas, nc : nc + ncas] = np.diag(energies)
+        return ci, coeff @ full, canonical
+
     def _run_direct_signature_blocks(
         self,
         ref_bits,
@@ -951,6 +1293,8 @@ class CASPT2:
         run_start,
     ):
         """Solve FIC-CASPT2 in compressed external-signature blocks."""
+        if self.direct_build_backend == "shared":
+            return self._run_shared_fois(ci, h1_mo, eri_mo, fock, e_ref, run_start)
         build_start = perf_counter()
         builder = (
             _build_direct_tensor_blocks
@@ -974,6 +1318,7 @@ class CASPT2:
             max_operators=self.max_ic_operators,
             orbital_irrep_ids=self._direct_orbital_irrep_ids,
             irrep_product_table=self._direct_irrep_product_table,
+            cvs_core_orbitals=self.cvs_core_orbitals,
             **build_options,
         )
         self.timings["direct_block_build_s"] = perf_counter() - build_start
@@ -1012,24 +1357,22 @@ class CASPT2:
         self.contraction_backend = "python_direct_fully_internally_contracted"
         self.ic_basis_backend = "direct"
         self.ic_metric_backend = (
-            "signature_active_tensor_mgs"
+            "signature_factorized_canonical"
             if self.direct_build_backend == "tensor"
             else "signature_block_online_mgs"
         )
-        self.linear_solver = "block_direct"
+        self.linear_solver = (
+            "coupled_block_gmres" if result["coupled_iterations"] else "block_direct"
+        )
         self.contracted_basis_size = int(raw_count)
         self.contracted_basis_rank = int(result["rank"])
         self.contracted_residual_norm = float(result["residual_norm"])
-        self.contracted_relative_residual_norm = float(
-            result["relative_residual_norm"]
-        )
+        self.contracted_relative_residual_norm = float(result["relative_residual_norm"])
         self.first_order_norm = float(result["first_order_norm"])
         self.reference_weight = float(1.0 / (1.0 + self.first_order_norm))
         self.e_corr_nonvariational = float(result["nonvariational_energy"])
         self.e_corr_variational = float(result["variational_energy"])
-        self.shift_correction = (
-            self.e_corr_variational - self.e_corr_nonvariational
-        )
+        self.shift_correction = self.e_corr_variational - self.e_corr_nonvariational
         self.e_corr = self.e_corr_variational
         self.e_tot = float(e_ref + self.e_corr)
         self.components = result["components"]
@@ -1046,17 +1389,14 @@ class CASPT2:
                 "direct_active_rows": int(result["rows"]),
                 "retained_ic_rank": self.contracted_basis_rank,
                 "selected_backend": "direct",
-                "selected_linear_solver": "block_direct",
+                "selected_linear_solver": self.linear_solver,
+                "coupled_iterations": result["coupled_iterations"],
                 "direct_integral_backend": self.direct_integral_backend,
                 "direct_two_electron_bytes": int(np.asarray(eri_mo).nbytes),
                 "direct_workers": int(result["workers"]),
                 "direct_build_backend": self.direct_build_backend,
-                "direct_candidate_groups": int(
-                    len(result["candidate_offsets"]) - 1
-                ),
-                "direct_candidate_indices": int(
-                    len(result["candidate_indices"])
-                ),
+                "direct_candidate_groups": int(len(result["candidate_offsets"]) - 1),
+                "direct_candidate_indices": int(len(result["candidate_indices"])),
                 "direct_symmetry_screening": bool(
                     self._direct_irrep_product_table is not None
                 ),
@@ -1064,6 +1404,104 @@ class CASPT2:
         )
         self.timings["total_s"] = perf_counter() - run_start
         return self.e_corr
+
+    def _run_shared_fois(self, ci, h1, eri, fock, e_ref, run_start):
+        from .perturber_templates import solve_shared_fois
+
+        if self.cvs_core_orbitals:
+            raise NotImplementedError(
+                "Shared FIC templates do not implement the additional CVS projector."
+            )
+        if self.linear_solver_request == "direct":
+            raise NotImplementedError(
+                "Shared FIC templates require the matrix-free iterative solver."
+            )
+        requested = self.work_estimate["raw_ic_operators_upper_bound"]
+        if self.max_ic_operators is not None and requested > self.max_ic_operators:
+            raise MemoryError(
+                f"Shared FIC-CASPT2 requests {requested} raw operators, "
+                f"exceeding max_ic_operators={self.max_ic_operators}."
+            )
+        dm_a, dm_b = _active_spin_rdms_from_determinants(self._binary, ci)
+        active = slice(self._ncore, self._ncore + self._ncas)
+        reference_active_fock = float(np.sum(fock[active, active] * (dm_a + dm_b)))
+        result = solve_shared_fois(
+            self._binary,
+            ci,
+            self._ncore,
+            self._ncas,
+            h1,
+            eri,
+            fock,
+            reference_active_fock,
+            frozen_core=self.frozen_core,
+            imaginary_shift=self.imaginary_shift,
+            real_shift=self.real_shift,
+            screen_tol=self.denominator_tol,
+            lindep_tol=self.lindep_tol,
+            solver_tol=self.solver_tol,
+            max_iterations=self.max_solver_iterations,
+            max_memory_mb=self.max_memory_mb,
+            ic_convention=self.ic_convention,
+            norm_tol=self.metric_norm_tol,
+            fock_contraction=self.fock_contraction,
+            transition_ci=getattr(self, "_transition_ci", None),
+            progress=(
+                (lambda message: print(message, flush=True)) if self.verbose else None
+            ),
+        )
+        self.transition_couplings = result["transition_couplings"]
+        self.e_corr = self.e_corr_variational = result["energy"]
+        self.e_corr_nonvariational = result["nonvariational"]
+        self.shift_correction = self.e_corr - self.e_corr_nonvariational
+        self.e_tot = float(e_ref + self.e_corr)
+        self.first_order_norm = result["norm"]
+        self.reference_weight = 1 / (1 + self.first_order_norm)
+        self.components = result["components"]
+        self.contracted_basis_size = result["raw_count"]
+        self.contracted_basis_rank = result["rank"]
+        self.contracted_residual_norm = result["residual"]
+        self.contracted_relative_residual_norm = result["relative_residual"]
+        self.solver_iterations = result["iterations"]
+        self.solver_history = result["history"]
+        self.ic_basis_backend = "direct"
+        self.ic_metric_backend = (
+            "shared_active_rdms"
+            if self.fock_contraction == "rdm"
+            else "shared_active_templates"
+        )
+        self.external_space_backend = self.ic_metric_backend
+        self.external_kernel_backend = "spin_free_operator_coefficients"
+        self.contraction_backend = "fully_internally_contracted"
+        self.linear_solver = "coupled_template_gmres"
+        self.work_estimate.update(
+            {
+                "selected_backend": "direct",
+                "selected_linear_solver": self.linear_solver,
+                "ic_convention": self.ic_convention,
+                "metric_norm_tol": self.metric_norm_tol,
+                "fock_contraction": self.fock_contraction,
+                "component_count_kind": (
+                    "contracted_parameters"
+                    if self.fock_contraction == "rdm"
+                    else "template_rows"
+                ),
+                "metric_eigenvalue_tol": self.lindep_tol,
+                "retained_ic_rank": result["rank"],
+                "shared_templates": result["template_count"],
+                "shared_template_rows": result["template_rows"],
+                "logical_external_rows": result["logical_rows"],
+                "external_orbital_groups": result["groups"],
+                "fock_graph_terms": result["graph_terms"],
+                "planned_workspace_bytes": result["planned_bytes"],
+                "regularized_relative_residual": result["equation_residual"],
+                "nonvariational_class_energies": result["nonvariational_components"],
+                "direct_integral_backend": self.direct_integral_backend,
+            }
+        )
+        self.timings.update(result["timings"])
+        self.timings["total_s"] = perf_counter() - run_start
+        return float(self.e_corr)
 
     def _fully_internally_contracted_components(
         self,
@@ -1087,17 +1525,13 @@ class CASPT2:
             self._nmo,
             frozen_core=self.frozen_core,
         )
-        dense_basis_bytes = 8 * (
-            len(external) * requested + requested * requested
-        )
+        dense_basis_bytes = 8 * (len(external) * requested + requested * requested)
         rank_bound = min(len(external), requested)
         streaming_basis_bytes = 8 * len(external) * rank_bound
         solver_plan = self.linear_solver_request
         if solver_plan == "auto":
             solver_plan = (
-                "iterative"
-                if rank_bound > self.direct_solver_max_rank
-                else "direct"
+                "iterative" if rank_bound > self.direct_solver_max_rank else "direct"
             )
         projected_bytes = (
             16 * rank_bound * rank_bound
@@ -1117,18 +1551,20 @@ class CASPT2:
             )
         basis_bytes = dense_basis_bytes if backend == "dense" else streaming_basis_bytes
         planned_bytes = basis_bytes + projected_bytes
-        self.work_estimate.update({
-            "external_determinants": len(external),
-            "frozen_core_orbitals": self.frozen_core,
-            "raw_ic_operators": requested,
-            "rank_upper_bound": rank_bound,
-            "dense_basis_bytes": dense_basis_bytes,
-            "streaming_basis_bytes": streaming_basis_bytes,
-            "projected_solver_bytes": projected_bytes,
-            "planned_linear_solver": solver_plan,
-            "selected_backend": backend,
-            "selected_bytes_upper_bound": planned_bytes,
-        })
+        self.work_estimate.update(
+            {
+                "external_determinants": len(external),
+                "frozen_core_orbitals": self.frozen_core,
+                "raw_ic_operators": requested,
+                "rank_upper_bound": rank_bound,
+                "dense_basis_bytes": dense_basis_bytes,
+                "streaming_basis_bytes": streaming_basis_bytes,
+                "projected_solver_bytes": projected_bytes,
+                "planned_linear_solver": solver_plan,
+                "selected_backend": backend,
+                "selected_bytes_upper_bound": planned_bytes,
+            }
+        )
         if memory_limit is not None and planned_bytes > memory_limit:
             raise MemoryError(
                 f"CASPT2 {backend} IC basis is estimated to require up to "
@@ -1199,10 +1635,14 @@ class CASPT2:
             self.shift_correction = 0.0
             self.first_order_norm = 0.0
             self.reference_weight = 1.0
-            return np.zeros_like(couplings), np.zeros_like(couplings), {
-                label: CASPT2Component(label, 0, 0.0)
-                for label in self.perturber_classes
-            }
+            return (
+                np.zeros_like(couplings),
+                np.zeros_like(couplings),
+                {
+                    label: CASPT2Component(label, 0, 0.0)
+                    for label in self.perturber_classes
+                },
+            )
 
         metric_start = perf_counter()
         if backend == "streaming":
@@ -1230,8 +1670,10 @@ class CASPT2:
                 h1_mo,
                 eri_mo,
             )
-            fock_operator, operator_backend = _one_body_sparse_matrix_in_determinant_space(
-                external, fock_a, fock_b, self._nmo
+            fock_operator, operator_backend = (
+                _one_body_sparse_matrix_in_determinant_space(
+                    external, fock_a, fock_b, self._nmo
+                )
             )
             self.external_operator_backend = operator_backend
             self.external_operator_nnz = int(fock_operator.nnz)
@@ -1247,10 +1689,8 @@ class CASPT2:
             matrix_kind = "fock_projected"
 
             def apply_denominator(vectors):
-                return (
-                    reference_fock_energy * vectors
-                    - fock_operator @ vectors
-                )
+                return reference_fock_energy * vectors - fock_operator @ vectors
+
         else:
             external_operator = _hamiltonian_matrix_in_determinant_space(
                 external,
@@ -1258,13 +1698,14 @@ class CASPT2:
                 eri_mo,
                 self._nmo,
             )
-            denominator_operator = (
-                (float(e_ref) - float(e_nuc)) * np.eye(len(external)) - external_operator
-            )
+            denominator_operator = (float(e_ref) - float(e_nuc)) * np.eye(
+                len(external)
+            ) - external_operator
             matrix_kind = "en_projected"
 
             def apply_denominator(vectors):
                 return denominator_operator @ vectors
+
         self.timings["denominator_operator_s"] = perf_counter() - operator_start
 
         solve_start = perf_counter()
@@ -1322,13 +1763,8 @@ class CASPT2:
                 eigen_amplitudes = rhs_eigen * shifted / (shifted * shifted + eta * eta)
                 complex_amplitudes = rhs_eigen / (shifted - 1j * eta)
                 complex_residual = (
-                    (
-                        denominator_matrix
-                        - (self.real_shift + 1j * eta) * np.eye(len(rhs))
-                    )
-                    @ (eigenvectors @ complex_amplitudes)
-                    - rhs
-                )
+                    denominator_matrix - (self.real_shift + 1j * eta) * np.eye(len(rhs))
+                ) @ (eigenvectors @ complex_amplitudes) - rhs
                 residual_norm = float(np.linalg.norm(complex_residual))
                 solver_backend = "canonical_imaginary_shift"
             else:
@@ -1349,10 +1785,15 @@ class CASPT2:
 
         external_amplitudes = orthonormal_basis @ contracted_amplitudes
         denominator_action = apply_denominator(external_amplitudes)
-        energies = 2.0 * couplings * external_amplitudes - external_amplitudes * denominator_action
+        energies = (
+            2.0 * couplings * external_amplitudes
+            - external_amplitudes * denominator_action
+        )
         nonvariational = float(np.dot(couplings, external_amplitudes))
         variational = float(np.sum(energies))
-        self.contracted_labels = tuple(f"ic{idx}" for idx in range(self.contracted_basis_rank))
+        self.contracted_labels = tuple(
+            f"ic{idx}" for idx in range(self.contracted_basis_rank)
+        )
         self.contracted_metric = np.eye(self.contracted_basis_rank)
         self.contracted_denominator_matrix = denominator_matrix
         self.contracted_rhs = rhs
@@ -1377,7 +1818,9 @@ class CASPT2:
                 label=label,
                 count=int(np.count_nonzero(mask)),
                 energy=float(np.sum(energies[mask])),
-                norm=float(np.dot(external_amplitudes[mask], external_amplitudes[mask])),
+                norm=float(
+                    np.dot(external_amplitudes[mask], external_amplitudes[mask])
+                ),
             )
         return energies, external_amplitudes, components
 
@@ -1467,13 +1910,17 @@ class CASPT2:
         if rhs is None:
             rhs = norms.copy()
         self.contracted_metric = np.asarray(metric_matrix, dtype=float).copy()
-        self.contracted_denominator_matrix = np.asarray(denominator_matrix, dtype=float).copy()
+        self.contracted_denominator_matrix = np.asarray(
+            denominator_matrix, dtype=float
+        ).copy()
         self.contracted_rhs = np.asarray(rhs, dtype=float).copy()
         self.contracted_amplitudes = class_amplitudes.copy()
         self.contracted_matrix_kind = str(matrix_kind)
         self.contracted_matrix_backend = matrix_backend
 
-    def _apply_contracted_amplitudes(self, couplings, classes, components, class_amplitudes):
+    def _apply_contracted_amplitudes(
+        self, couplings, classes, components, class_amplitudes
+    ):
         couplings = np.asarray(couplings, dtype=float)
         classes = np.asarray(classes, dtype=np.int8)
         class_amplitudes = np.asarray(class_amplitudes, dtype=float)
@@ -1622,11 +2069,17 @@ class CASPT2:
         if matrix_kind == "diagonal":
             return
         if matrix_kind != "en_coupled":
-            raise NotImplementedError(f"Unsupported contracted matrix kind {matrix_kind!r}.")
+            raise NotImplementedError(
+                f"Unsupported contracted matrix kind {matrix_kind!r}."
+            )
         if self.zeroth_order != "en":
-            raise NotImplementedError("The coupled contracted matrix is currently implemented for EN CASPT2.")
+            raise NotImplementedError(
+                "The coupled contracted matrix is currently implemented for EN CASPT2."
+            )
         if self.imaginary_shift != 0.0:
-            raise NotImplementedError("Coupled contracted EN CASPT2 currently supports real shifts only.")
+            raise NotImplementedError(
+                "Coupled contracted EN CASPT2 currently supports real shifts only."
+            )
 
         native = self._native_en_coupled_contracted_system(
             determinants,
@@ -1638,14 +2091,16 @@ class CASPT2:
             e_nuc,
         )
         if native is None:
-            metric, denominator_matrix, rhs, counts = self._python_en_coupled_contracted_system(
-                determinants,
-                couplings,
-                classes,
-                h1_mo,
-                eri_mo,
-                e_ref,
-                e_nuc,
+            metric, denominator_matrix, rhs, counts = (
+                self._python_en_coupled_contracted_system(
+                    determinants,
+                    couplings,
+                    classes,
+                    h1_mo,
+                    eri_mo,
+                    e_ref,
+                    e_nuc,
+                )
             )
             backend = "python"
         else:
@@ -1755,7 +2210,9 @@ class CASPT2:
                     projected = float(e_ref - e_nuc - h_mu_nu)
                 else:
                     projected = float(-h_mu_nu)
-                denominator_matrix[class_mu, class_nu] += coupling_mu * coupling_nu * projected
+                denominator_matrix[class_mu, class_nu] += (
+                    coupling_mu * coupling_nu * projected
+                )
 
         denominator_matrix = 0.5 * (denominator_matrix + denominator_matrix.T)
         return metric, denominator_matrix, rhs, counts
@@ -1832,7 +2289,9 @@ class CASPT2:
             couplings[mu] = coupling
 
             if self.zeroth_order == "fock":
-                denominators[mu] = _fock_denominator(det_bits, occ_average, mo_energy, self._nmo)
+                denominators[mu] = _fock_denominator(
+                    det_bits, occ_average, mo_energy, self._nmo
+                )
             else:
                 ext_diag = e_nuc + _hamiltonian_element_bits(
                     det_bits,
@@ -1858,6 +2317,23 @@ class MSCASPT2:
     ``variant="xms"`` first rotates the model states to diagonalize their
     state-average generalized Fock operator and uses that common Fock operator
     in every first-order equation.
+
+    The state interaction follows Finley et al., Chem. Phys. Lett. 288,
+    299 (1998), doi:10.1016/S0009-2614(98)00252-8. The XMS reference rotation
+    follows Shiozaki et al., J. Chem. Phys. 135, 081106 (2011),
+    doi:10.1063/1.3633329. Each ket retains its own internally contracted
+    space; this is not the union-space implementation of that paper.
+
+    Imaginary shifts reuse Forsberg and Malmqvist, Chem. Phys. Lett. 274,
+    196 (1997), doi:10.1016/S0009-2614(97)00669-6. Effective couplings follow
+    OpenMolcas MCCTL/HEFVAL/MLTCTL:
+    https://github.com/Molcas/OpenMolcas/tree/master/src/caspt2.
+    Shift-corrected Hylleraas energies occupy the diagonal; off-diagonal
+    Hamiltonian couplings use the shifted real amplitudes and are symmetrized.
+    This reproduces that energy convention, not a full multistate Hylleraas
+    functional. Real shifts, IPEA and correlated transition properties remain
+    unsupported. Shared templates require ``fock_contraction="rdm"`` and
+    reuse ordered transition 1--3 RDMs without enumerating external states.
     """
 
     supported_variants = ("ms", "xms")
@@ -1915,18 +2391,30 @@ class MSCASPT2:
             raise ValueError("Multi-state CASPT2 roots must be unique.")
         navailable = len(getattr(self.mc, "ci", ()))
         if any(root < 0 or root >= navailable for root in self.roots):
-            raise IndexError("A multi-state CASPT2 root is outside the available CI roots.")
-        if self.caspt2_options.get("contraction", "full") not in {
+            raise IndexError(
+                "A multi-state CASPT2 root is outside the available CI roots."
+            )
+        settings = CASPT2(self.mc, root=self.roots[0], **self.caspt2_options)
+        if (
+            settings.direct_build_backend == "shared"
+            and settings.fock_contraction != "rdm"
+        ):
+            raise NotImplementedError(
+                "Shared multistate couplings require RDM contractions."
+            )
+        if settings.contraction not in {
             "full",
             "fully_contracted",
             "fully_internally_contracted",
             "fic",
         }:
-            raise ValueError("MS/XMS-CASPT2 requires the fully internally contracted solver.")
-        if float(self.caspt2_options.get("real_shift", 0.0)) != 0.0:
-            raise NotImplementedError("Shift-corrected MS/XMS effective couplings are not implemented yet.")
-        if float(self.caspt2_options.get("imaginary_shift", 0.0)) != 0.0:
-            raise NotImplementedError("Imaginary-shift MS/XMS effective couplings are not implemented yet.")
+            raise ValueError(
+                "MS/XMS-CASPT2 requires the fully internally contracted solver."
+            )
+        if settings.real_shift != 0.0:
+            raise NotImplementedError(
+                "Real-shift MS/XMS effective couplings are not implemented yet."
+            )
         reference_energies = np.array(
             [_root_energy(self.mc, root) for root in self.roots],
             dtype=float,
@@ -1961,10 +2449,16 @@ class MSCASPT2:
             if common_fock is not None:
                 options["fock_matrix"] = common_fock
             pt = CASPT2(work_mc, root=root, **options)
+            pt._transition_ci = [np.asarray(work_mc.ci[k]) for k in work_roots]
             pt.run()
             calculations.append(pt)
 
-        if calculations[0].ic_basis_backend == "direct":
+        if calculations[0].direct_build_backend == "shared":
+            transition = np.column_stack(
+                [pt.transition_couplings for pt in calculations]
+            )
+            correction = 0.5 * (transition + transition.T)
+        elif calculations[0].ic_basis_backend == "direct":
             correction = self._direct_multistate_correction(
                 calculations,
                 work_mc,
@@ -1973,9 +2467,7 @@ class MSCASPT2:
         else:
             couplings = np.column_stack([pt.couplings for pt in calculations])
             amplitudes = np.column_stack([pt.amplitudes for pt in calculations])
-            correction = 0.5 * (
-                couplings.T @ amplitudes + amplitudes.T @ couplings
-            )
+            correction = 0.5 * (couplings.T @ amplitudes + amplitudes.T @ couplings)
         for state, pt in enumerate(calculations):
             correction[state, state] = pt.e_corr
         effective = reference_hamiltonian + correction
@@ -2016,6 +2508,10 @@ class MSCASPT2:
         ]
         transition = np.zeros((len(calculations), len(calculations)), dtype=float)
         for ket, calculation in enumerate(calculations):
+            ci_vectors = [
+                np.ascontiguousarray(v, dtype=np.float64)
+                for v in calculation._transition_ci
+            ]
             for bra, ci in enumerate(ci_vectors):
                 couplings = np.asarray(
                     kernel(
@@ -2031,9 +2527,7 @@ class MSCASPT2:
                     ),
                     dtype=float,
                 )
-                transition[bra, ket] = float(
-                    couplings @ calculation.direct_first_order
-                )
+                transition[bra, ket] = float(couplings @ calculation.direct_first_order)
         return 0.5 * (transition + transition.T)
 
     def kernel(self):
@@ -2043,7 +2537,9 @@ class MSCASPT2:
         if self.weights is None:
             return np.full(nstate, 1.0 / nstate)
         if self.weights.shape != (nstate,) or np.any(self.weights < 0.0):
-            raise ValueError("weights must be a non-negative vector with one entry per root.")
+            raise ValueError(
+                "weights must be a non-negative vector with one entry per root."
+            )
         total = float(np.sum(self.weights))
         if total <= 0.0:
             raise ValueError("At least one state-average weight must be positive.")
@@ -2131,30 +2627,11 @@ def _embed_active_determinants(binary, ncore, ncas, nmo):
 
 
 def _active_spin_rdms_from_determinants(binary, ci):
-    """Build active alpha/beta 1-RDMs from the native determinant basis."""
-    binary = np.asarray(binary, dtype=np.int8)
+    """Build active spin densities using the shared compiled link contractions."""
+    from .casci import _make_tdm1s_link_contractions
+
     ci = np.asarray(ci, dtype=float)
-    ncas = int(binary.shape[-1])
-    active_bits = _embed_active_determinants(binary, 0, ncas, ncas)
-    index = {bits: idx for idx, bits in enumerate(active_bits)}
-    rdms = []
-    for spin in range(2):
-        dm = np.zeros((ncas, ncas), dtype=float)
-        offset = spin * ncas
-        for ket_idx, (ket, coeff) in enumerate(zip(active_bits, ci)):
-            if coeff == 0.0:
-                continue
-            for q in range(ncas):
-                bits1, phase1 = _annihilate_bit(ket, offset + q)
-                if phase1 == 0:
-                    continue
-                for p in range(ncas):
-                    bra, phase2 = _create_bit(bits1, offset + p)
-                    bra_idx = index.get(bra)
-                    if phase2 and bra_idx is not None:
-                        dm[p, q] += ci[bra_idx] * coeff * phase1 * phase2
-        rdms.append(dm)
-    return tuple(rdms)
+    return _make_tdm1s_link_contractions(ci, ci, np.asarray(binary, dtype=np.int8))
 
 
 def _apply_spatial_one_body(state, p, q, nmo):
@@ -2231,7 +2708,9 @@ def _build_fully_contracted_basis(
     columns = []
     labels = []
     for p, q in transitions:
-        column = _project_sparse_state(first_actions[(p, q)], external_index, len(external))
+        column = _project_sparse_state(
+            first_actions[(p, q)], external_index, len(external)
+        )
         if np.linalg.norm(column) > screen_tol:
             columns.append(column)
             labels.append(f"E({p},{q})")
@@ -2427,6 +2906,14 @@ def _direct_determinant_irrep(
     return irrep
 
 
+def _in_cvs_sector(det, orbitals, nmo):
+    return (
+        not orbitals
+        or sum((int(det) >> (i + spin * nmo)) & 1 for i in orbitals for spin in (0, 1))
+        == 2 * len(orbitals) - 1
+    )
+
+
 def _build_direct_signature_blocks(
     ref_bits,
     ci,
@@ -2440,6 +2927,7 @@ def _build_direct_signature_blocks(
     max_operators=None,
     orbital_irrep_ids=None,
     irrep_product_table=None,
+    cvs_core_orbitals=(),
 ):
     """Build orthonormal IC vectors independently for each external signature."""
     reference = {
@@ -2469,7 +2957,7 @@ def _build_direct_signature_blocks(
         external_mask |= ((1 << (nmo - nocc)) - 1) << (offset + nocc)
     signature_blocks = {}
     determinant_metadata = {}
-    target_irrep = None
+    reference_irrep = None
     irrep_identity = 0
     if orbital_irrep_ids is not None and irrep_product_table is not None:
         orbital_irrep_ids = np.asarray(orbital_irrep_ids, dtype=int)
@@ -2498,7 +2986,7 @@ def _build_direct_signature_blocks(
                 if abs(coefficient) > screen_tol
             }
             if len(reference_irreps) == 1:
-                target_irrep = reference_irreps.pop()
+                reference_irrep = reference_irreps.pop()
     raw_count = 0
 
     def retain(state):
@@ -2506,6 +2994,8 @@ def _build_direct_signature_blocks(
         grouped = {}
         for det, value in state.items():
             det = int(det)
+            if not _in_cvs_sector(det, cvs_core_orbitals, nmo):
+                continue
             if (
                 det in reference_set
                 or abs(value) <= screen_tol
@@ -2517,20 +3007,22 @@ def _build_direct_signature_blocks(
                 metadata = (
                     _caspt2_external_class_id(det, ncore, ncas, nmo),
                     det & external_mask,
-                    None
-                    if target_irrep is None
-                    else _direct_determinant_irrep(
-                        det,
-                        orbital_irrep_ids,
-                        irrep_product_table,
-                        irrep_identity,
-                        irrep_bit_masks,
+                    (
+                        None
+                        if reference_irrep is None
+                        else _direct_determinant_irrep(
+                            det,
+                            orbital_irrep_ids,
+                            irrep_product_table,
+                            irrep_identity,
+                            irrep_bit_masks,
+                        )
                     ),
                 )
                 determinant_metadata[det] = metadata
             class_id, signature, determinant_irrep = metadata
             if class_id < 0 or (
-                target_irrep is not None and determinant_irrep != target_irrep
+                reference_irrep is not None and determinant_irrep != reference_irrep
             ):
                 continue
             grouped.setdefault((class_id, signature), {})[det] = value
@@ -2574,8 +3066,7 @@ def _build_direct_signature_blocks(
                 merged_basis[old_rows:, old_rank:] = other["basis"]
                 block["basis"] = merged_basis
                 block["index"].update(
-                    (det, old_rows + index)
-                    for index, det in enumerate(other["rows"])
+                    (det, old_rows + index) for index, det in enumerate(other["rows"])
                 )
                 block["rows"].extend(other["rows"])
                 block["signatures"].update(other["signatures"])
@@ -2618,7 +3109,7 @@ def _build_direct_signature_blocks(
         for transition in transitions
     }
     transition_irreps = None
-    if target_irrep is not None:
+    if reference_irrep is not None:
         transition_irreps = {
             transition: int(
                 irrep_product_table[
@@ -2632,12 +3123,16 @@ def _build_direct_signature_blocks(
         if transition_irreps is None or transition_irreps[transition] == irrep_identity:
             retain(first_actions[transition])
     for left, right in combinations_with_replacement(transitions, 2):
-        if transition_irreps is not None and int(
-            irrep_product_table[
-                transition_irreps[left],
-                transition_irreps[right],
-            ]
-        ) != irrep_identity:
+        if (
+            transition_irreps is not None
+            and int(
+                irrep_product_table[
+                    transition_irreps[left],
+                    transition_irreps[right],
+                ]
+            )
+            != irrep_identity
+        ):
             continue
         retain(_apply_spatial_one_body(first_actions[right], *left, nmo))
     unique_blocks = {id(block): block for block in signature_blocks.values()}
@@ -2658,6 +3153,29 @@ def _direct_full_bits(signature, active, ncore, ncas, nmo):
     return int(signature) | (alpha << ncore) | (beta << (nmo + ncore))
 
 
+class _FactorizedContractedBasis:
+    """Sparse excitation columns times their canonical metric transform."""
+
+    def __init__(self, columns, transform):
+        self.columns = columns
+        self.transform = transform
+        self.shape = (columns.shape[0], transform.shape[1])
+
+    def __matmul__(self, vector):
+        return self.columns @ (self.transform @ vector)
+
+    @property
+    def T(self):
+        from scipy.sparse.linalg import LinearOperator
+
+        return LinearOperator(
+            self.shape[::-1],
+            dtype=float,
+            matvec=lambda x: self.transform.T @ (self.columns.T @ x),
+            matmat=lambda x: self.transform.T @ (self.columns.T @ x),
+        )
+
+
 def _build_direct_tensor_blocks(
     ref_bits,
     ci,
@@ -2672,6 +3190,7 @@ def _build_direct_tensor_blocks(
     orbital_irrep_ids=None,
     irrep_product_table=None,
     workers=None,
+    cvs_core_orbitals=(),
 ):
     """Build compact signature x active-state IC tensors in two phases."""
     if 2 * ncas > 64:
@@ -2687,6 +3206,7 @@ def _build_direct_tensor_blocks(
             max_operators=max_operators,
             orbital_irrep_ids=orbital_irrep_ids,
             irrep_product_table=irrep_product_table,
+            cvs_core_orbitals=cvs_core_orbitals,
         )
     reference = {
         int(det): float(coeff)
@@ -2714,15 +3234,14 @@ def _build_direct_tensor_blocks(
         external_mask |= ((1 << ncore) - 1) << offset
         external_mask |= ((1 << (nmo - nocc)) - 1) << (offset + nocc)
 
-    target_irrep = None
+    reference_irrep = None
     irrep_identity = 0
     if orbital_irrep_ids is not None and irrep_product_table is not None:
         orbital_irrep_ids = np.asarray(orbital_irrep_ids, dtype=int)
         irrep_product_table = np.asarray(irrep_product_table, dtype=int)
         identities = np.flatnonzero(
             np.all(
-                irrep_product_table
-                == np.arange(len(irrep_product_table))[None, :],
+                irrep_product_table == np.arange(len(irrep_product_table))[None, :],
                 axis=1,
             )
         )
@@ -2743,7 +3262,7 @@ def _build_direct_tensor_blocks(
                 for det in reference
             }
             if len(reference_irreps) == 1:
-                target_irrep = reference_irreps.pop()
+                reference_irrep = reference_irreps.pop()
 
     signature_ids = {}
     signature_values = []
@@ -2770,39 +3289,40 @@ def _build_direct_tensor_blocks(
         if left != right:
             parent[right] = left
 
-    determinant_metadata = {}
+    signature_classes = {}
     columns = []
 
     def retain(state):
         grouped = {}
         for det, value in state.items():
             det = int(det)
+            if not _in_cvs_sector(det, cvs_core_orbitals, nmo):
+                continue
             if (
                 det in reference_set
                 or abs(value) <= screen_tol
                 or det & frozen_mask != frozen_mask
             ):
                 continue
-            metadata = determinant_metadata.get(det)
-            if metadata is None:
-                metadata = (
-                    _caspt2_external_class_id(det, ncore, ncas, nmo),
-                    det & external_mask,
-                    _direct_active_bits(det, ncore, ncas, nmo),
-                    None
-                    if target_irrep is None
-                    else _direct_determinant_irrep(
-                        det,
-                        orbital_irrep_ids,
-                        irrep_product_table,
-                        irrep_identity,
-                        irrep_bit_masks,
-                    ),
+            signature = det & external_mask
+            class_id = signature_classes.get(signature)
+            if class_id is None:
+                class_id = _caspt2_external_class_id(det, ncore, ncas, nmo)
+                signature_classes[signature] = class_id
+            active = _direct_active_bits(det, ncore, ncas, nmo)
+            determinant_irrep = (
+                None
+                if reference_irrep is None
+                else _direct_determinant_irrep(
+                    det,
+                    orbital_irrep_ids,
+                    irrep_product_table,
+                    irrep_identity,
+                    irrep_bit_masks,
                 )
-                determinant_metadata[det] = metadata
-            class_id, signature, active, determinant_irrep = metadata
+            )
             if class_id < 0 or (
-                target_irrep is not None and determinant_irrep != target_irrep
+                reference_irrep is not None and determinant_irrep != reference_irrep
             ):
                 continue
             grouped.setdefault((class_id, signature), []).append((active, value))
@@ -2835,12 +3355,8 @@ def _build_direct_tensor_blocks(
             union(touched[0], signature_id)
         columns.append((class_ids.pop(), pieces))
 
-    first_actions = {
-        transition: _apply_spatial_one_body(reference, *transition, nmo)
-        for transition in transitions
-    }
     transition_irreps = None
-    if target_irrep is not None:
+    if reference_irrep is not None:
         transition_irreps = {
             transition: int(
                 irrep_product_table[
@@ -2850,18 +3366,24 @@ def _build_direct_tensor_blocks(
             )
             for transition in transitions
         }
-    for transition in transitions:
-        if transition_irreps is None or transition_irreps[transition] == irrep_identity:
-            retain(first_actions[transition])
-    for left, right in combinations_with_replacement(transitions, 2):
-        if transition_irreps is not None and int(
-            irrep_product_table[
-                transition_irreps[left],
-                transition_irreps[right],
-            ]
-        ) != irrep_identity:
-            continue
-        retain(_apply_spatial_one_body(first_actions[right], *left, nmo))
+    # Each right action is reused for its singles and doubles, then released.
+    # Keeping every first action scales as n_transitions * reference_size.
+    for right_index, right in enumerate(transitions):
+        first_action = _apply_spatial_one_body(reference, *right, nmo)
+        if transition_irreps is None or transition_irreps[right] == irrep_identity:
+            retain(first_action)
+        for left in transitions[: right_index + 1]:
+            if (
+                transition_irreps is not None
+                and int(
+                    irrep_product_table[
+                        transition_irreps[left], transition_irreps[right]
+                    ]
+                )
+                != irrep_identity
+            ):
+                continue
+            retain(_apply_spatial_one_body(first_action, *left, nmo))
 
     columns_by_component = {}
     for column_id, (_class_id, pieces) in enumerate(columns):
@@ -2883,30 +3405,38 @@ def _build_direct_tensor_blocks(
                         row_keys.append(key)
         if len(class_ids) != 1:
             raise RuntimeError("A direct tensor component spans multiple classes.")
-        raw = np.zeros((len(row_keys), len(component_columns)), dtype=float)
+        from scipy.sparse import coo_matrix
+
+        row_parts, column_parts, value_parts = [], [], []
         for local_column, column_id in enumerate(component_columns):
             _class_id, pieces = columns[column_id]
             for signature_id, active_values, values in pieces:
                 rows = np.fromiter(
-                    (row_index[(signature_id, int(active))] for active in active_values),
+                    (
+                        row_index[(signature_id, int(active))]
+                        for active in active_values
+                    ),
                     dtype=np.intp,
                 )
-                raw[rows, local_column] = values
-        rank_bound = min(raw.shape)
-        basis = np.empty((raw.shape[0], rank_bound), dtype=float)
-        rank = 0
-        for column in range(raw.shape[1]):
-            vector = raw[:, column].copy()
-            original_norm = float(np.linalg.norm(vector))
-            if rank:
-                active_basis = basis[:, :rank]
-                for _ in range(2):
-                    vector -= active_basis @ (active_basis.T @ vector)
-            residual_norm = float(np.linalg.norm(vector))
-            if residual_norm <= max(screen_tol, lindep_tol * original_norm):
-                continue
-            basis[:, rank] = vector / residual_norm
-            rank += 1
+                row_parts.append(rows)
+                column_parts.append(np.full(len(rows), local_column, dtype=np.intp))
+                value_parts.append(values)
+        raw = coo_matrix(
+            (
+                np.concatenate(value_parts),
+                (np.concatenate(row_parts), np.concatenate(column_parts)),
+            ),
+            shape=(len(row_keys), len(component_columns)),
+        ).tocsr()
+        norms = np.sqrt(np.asarray(raw.power(2).sum(axis=0)).ravel())
+        nonzero = norms > screen_tol
+        raw = raw[:, nonzero].multiply(1.0 / norms[nonzero]).tocsr()
+        metric = (raw.T @ raw).toarray()
+        metric = (metric + metric.T) * 0.5
+        values, vectors = np.linalg.eigh(metric)
+        threshold = max(lindep_tol, np.finfo(float).eps * len(metric))
+        keep = values > threshold
+        transform = vectors[:, keep] / np.sqrt(values[keep])
         rows = [
             _direct_full_bits(
                 signature_values[signature_id],
@@ -2920,7 +3450,7 @@ def _build_direct_tensor_blocks(
         return {
             "class_id": class_ids.pop(),
             "rows": rows,
-            "basis": basis[:, :rank].copy(),
+            "basis": _FactorizedContractedBasis(raw, transform),
         }
 
     component_columns = list(columns_by_component.values())
@@ -2930,9 +3460,21 @@ def _build_direct_tensor_blocks(
         len(component_columns),
         build_work,
     )
-    if worker_count > 1:
+    # Tiny components spend more time in Python dispatch than in released-GIL
+    # numerical work. Preserve their order, and only dispatch substantial ones.
+    large = [i for i, group in enumerate(component_columns) if len(group) >= 64]
+    if worker_count > 1 and len(large) > 1:
+        large_set = set(large)
+        blocks = [
+            None if i in large_set else orthogonalize(group)
+            for i, group in enumerate(component_columns)
+        ]
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            blocks = list(executor.map(orthogonalize, component_columns))
+            for i, block in zip(
+                large,
+                executor.map(orthogonalize, (component_columns[i] for i in large)),
+            ):
+                blocks[i] = block
     else:
         blocks = [orthogonalize(group) for group in component_columns]
     return tuple(blocks), len(columns)
@@ -3011,10 +3553,41 @@ def _direct_local_fock_matrix(rows, fock, ncore, ncas, nmo):
                     bra, phase2 = _create_bit(bits1, offset + p)
                     bra_index = index.get(bra)
                     if phase2 and bra_index is not None:
-                        result[bra_index, ket_index] += (
-                            phase1 * phase2 * fock[p, q]
-                        )
+                        result[bra_index, ket_index] += phase1 * phase2 * fock[p, q]
     return 0.5 * (result + result.T)
+
+
+def _direct_local_fock_sparse(rows, fock, ncore, ncas, nmo):
+    """Factor fixed external occupations from the sparse active Fock action."""
+    from scipy.sparse import coo_matrix
+
+    active_mask = ((1 << ncas) - 1) << ncore
+    external_mask = ((1 << (2 * nmo)) - 1) ^ (active_mask | (active_mask << nmo))
+    groups = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(int(row) & external_mask, []).append(index)
+    rr, cc, vv = [], [], []
+    active = fock[ncore : ncore + ncas, ncore : ncore + ncas]
+    diagonal = np.diag(fock)
+    for signature, indices in groups.items():
+        determinants = [
+            _direct_active_bits(int(rows[i]), ncore, ncas, nmo) for i in indices
+        ]
+        operator, _ = _one_body_sparse_matrix_in_determinant_space(
+            determinants, active, active, ncas
+        )
+        operator = operator.tocoo()
+        indices = np.asarray(indices, dtype=np.intp)
+        rr.extend((indices[operator.row], indices))
+        cc.extend((indices[operator.col], indices))
+        shift = sum(diagonal[i % nmo] for i in _iter_set_bits(signature))
+        vv.extend((operator.data, np.full(len(indices), shift)))
+    if not rr:
+        return coo_matrix((0, 0)).tocsr()
+    return coo_matrix(
+        (np.concatenate(vv), (np.concatenate(rr), np.concatenate(cc))),
+        shape=(len(rows), len(rows)),
+    ).tocsr()
 
 
 def _determinants_to_words(determinants):
@@ -3049,6 +3622,21 @@ def _direct_candidate_group_ids(
         )
         for reference in ref_bits
     )
+    # Screen connected references in C-level vector operations, rather than
+    # scanning every CI determinant in Python for every distinct active row.
+    reference_array = (
+        np.asarray(
+            [(a >> ncore, b >> ncore) for a, b in reference_active], dtype=np.uint64
+        )
+        if ncas <= 64 and hasattr(np, "bitwise_count")
+        else None
+    )
+    reference_packed = [
+        (a >> ncore) | ((b >> ncore) << ncas) for a, b in reference_active
+    ]
+    electron_counts = {bits.bit_count() for bits in reference_packed}
+    electrons = next(iter(electron_counts)) if len(electron_counts) == 1 else None
+    subset_indexes = cache.setdefault("reference_subset_indexes", {})
     row_groups = np.empty(len(rows), dtype=np.int32)
     for row_index, row in enumerate(rows):
         row = int(row)
@@ -3064,16 +3652,50 @@ def _direct_candidate_group_ids(
         if candidates is None:
             active_alpha, active_beta, core_holes_alpha, core_holes_beta = key
             core_holes = core_holes_alpha + core_holes_beta
-            candidates = tuple(
-                index
-                for index, (reference_alpha, reference_beta) in enumerate(
-                    reference_active
-                )
-                if core_holes
-                + (reference_alpha & ~active_alpha).bit_count()
-                + (reference_beta & ~active_beta).bit_count()
-                <= 2
+            holes = 2 - core_holes
+            # Index the reference by its zero-, one-, or two-hole subsets.
+            # External rows then need only a few lookups, not an O(n_CI) scan.
+            # Bound construction for large references and use vector screening
+            # when the subset table would itself become too large.
+            indexed = (
+                electrons is not None
+                and 0 <= holes <= electrons
+                and len(ref_bits) * math.comb(electrons, holes) <= 2_000_000
             )
+            if indexed:
+                if holes not in subset_indexes:
+                    table = {}
+                    for ref_index, bits in enumerate(reference_packed):
+                        occupied = [1 << i for i in _iter_set_bits(bits)]
+                        for removed in combinations(occupied, holes):
+                            table.setdefault(bits ^ sum(removed), []).append(ref_index)
+                    subset_indexes[holes] = table
+                table = subset_indexes[holes]
+                bits = (active_alpha >> ncore) | ((active_beta >> ncore) << ncas)
+                remove = bits.bit_count() - (electrons - holes)
+                connected = set()
+                if 0 <= remove <= 2:
+                    occupied = [1 << i for i in _iter_set_bits(bits)]
+                    for removed in combinations(occupied, remove):
+                        connected.update(table.get(bits ^ sum(removed), ()))
+                candidates = tuple(sorted(connected))
+            elif reference_array is not None:
+                active_row = np.array(
+                    [active_alpha >> ncore, active_beta >> ncore], dtype=np.uint64
+                )
+                distances = np.bitwise_count(reference_array & ~active_row).sum(axis=1)
+                candidates = tuple(np.flatnonzero(distances + core_holes <= 2))
+            else:
+                candidates = tuple(
+                    index
+                    for index, (reference_alpha, reference_beta) in enumerate(
+                        reference_active
+                    )
+                    if core_holes
+                    + (reference_alpha & ~active_alpha).bit_count()
+                    + (reference_beta & ~active_beta).bit_count()
+                    <= 2
+                )
             cache[key] = candidates
         group = group_ids.get(key)
         if group is None:
@@ -3102,22 +3724,10 @@ def _resolve_direct_workers(requested, nblocks, nrows):
         value = requested.strip().lower()
         if value in {"", "false", "off", "none"}:
             return 1
-        if value != "auto":
-            requested = value
-        else:
-            requested = None
+        requested = None if value == "auto" else value
     if requested is None:
-        environment = os.environ.get("PYQED_CASPT2_WORKERS")
-        if environment is not None:
-            requested = environment
-        elif nrows < 250_000 or nblocks < 2:
-            return 1
-        else:
-            return max(1, min(os.cpu_count() or 1, 4, nblocks))
-    try:
-        return max(1, min(int(requested), max(nblocks, 1)))
-    except (TypeError, ValueError):
-        raise ValueError("direct_workers must be a positive integer, 'auto', or None.") from None
+        requested = os.environ.get("PYQED_CASPT2_WORKERS")
+    return min(resolve_workers(requested), max(nblocks, 1))
 
 
 def _solve_one_direct_signature_block(
@@ -3139,12 +3749,14 @@ def _solve_one_direct_signature_block(
     imaginary_shift,
     denominator_tol,
     native_couplings,
-    native_fock,
+    prepared_coupling=None,
 ):
     rows = block["rows"]
     basis = block["basis"]
     row_words = _determinants_to_words(rows)
-    if native_couplings is not None:
+    if prepared_coupling is not None:
+        coupling = prepared_coupling
+    elif native_couplings is not None:
         coupling = np.asarray(
             native_couplings(
                 row_words,
@@ -3179,17 +3791,17 @@ def _solve_one_direct_signature_block(
                 if ci[idx] != 0.0
             )
 
-    if native_fock is not None:
-        fock_local = np.asarray(
-            native_fock(row_words, fock, ncore, ncas, nmo),
-            dtype=float,
-        )
+    # External orbitals are semicanonical. Only active off-diagonal elements
+    # act within each signature; never allocate the determinant-space square.
+    fock_local = _direct_local_fock_sparse(rows, fock, ncore, ncas, nmo)
+    denominator = reference_fock_energy * np.eye(basis.shape[1])
+    if isinstance(basis, _FactorizedContractedBasis):
+        projected = (basis.columns.T @ fock_local @ basis.columns).toarray()
+        denominator -= basis.transform.T @ projected @ basis.transform
     else:
-        fock_local = _direct_local_fock_matrix(rows, fock, ncore, ncas, nmo)
-    denominator = (
-        reference_fock_energy * np.eye(basis.shape[1])
-        - basis.T @ fock_local @ basis
-    )
+        for start in range(0, basis.shape[1], 64):
+            stop = min(start + 64, basis.shape[1])
+            denominator[:, start:stop] -= basis.T @ (fock_local @ basis[:, start:stop])
     denominator = 0.5 * (denominator + denominator.T)
     rhs = basis.T @ coupling
     eigenvalues, eigenvectors = np.linalg.eigh(denominator)
@@ -3226,7 +3838,116 @@ def _solve_one_direct_signature_block(
         "norm": block_norm,
         "residual2": float(residual @ residual),
         "rhs2": float(rhs @ rhs),
+        "denominator": denominator,
+        "rhs": rhs,
+        "eigenvalues": eigenvalues,
+        "eigenvectors": eigenvectors,
     }
+
+
+def _couple_direct_blocks(
+    blocks, solved, fock, ncore, ncas, nmo, real_shift, imaginary_shift, tolerance
+):
+    """Restore inter-space Fock couplings with a matrix-free contracted solve.
+
+    The block eigensystems precondition GMRES. Only a sparse determinant-space
+    one-body operator is stored, not a square over all contracted vectors.
+    """
+    from scipy.sparse.linalg import LinearOperator, gmres
+
+    if not blocks:
+        return 0
+    off = np.asarray(fock).copy()
+    np.fill_diagonal(off, 0.0)
+    off[ncore : ncore + ncas, ncore : ncore + ncas] = 0.0
+    if not np.any(off):
+        return 0
+    rows = [row for block in blocks for row in block["rows"]]
+    operator, _ = _one_body_sparse_matrix_in_determinant_space(rows, off, off, nmo)
+    if not operator.nnz:
+        return 0
+    row_offsets = np.cumsum([0] + [len(block["rows"]) for block in blocks])
+    offsets = np.cumsum([0] + [len(item["rhs"]) for item in solved])
+    slices = [slice(a, b) for a, b in zip(offsets[:-1], offsets[1:])]
+    row_slices = [slice(a, b) for a, b in zip(row_offsets[:-1], row_offsets[1:])]
+    rhs = np.concatenate([item["rhs"] for item in solved])
+
+    def action(vector):
+        expanded = np.empty(len(rows), dtype=vector.dtype)
+        result = np.empty_like(vector)
+        for block, item, s, rs in zip(blocks, solved, slices, row_slices):
+            expanded[rs] = block["basis"] @ vector[s]
+            result[s] = item["denominator"] @ vector[s]
+        expanded = operator @ expanded
+        for block, s, rs in zip(blocks, slices, row_slices):
+            result[s] -= block["basis"].T @ expanded[rs]
+        return result
+
+    # OpenMolcas applies eta^2 / delta in the diagonalized *block* basis,
+    # then solves with inter-block couplings retained. A complex resolvent
+    # of the entire coupled matrix is a different regularization.
+    shifted_values = []
+    for item in solved:
+        values = item["eigenvalues"] - real_shift
+        safe = np.where(abs(values) > tolerance, values, np.copysign(tolerance, values))
+        shifted_values.append((safe, safe + imaginary_shift**2 / safe))
+
+    def shifted_action(vector):
+        result = action(vector) - real_shift * vector
+        if imaginary_shift:
+            for item, s, (values, _) in zip(solved, slices, shifted_values):
+                vectors = item["eigenvectors"]
+                result[s] += vectors @ (
+                    (imaginary_shift**2 / values) * (vectors.T @ vector[s])
+                )
+        return result
+
+    def precondition(vector):
+        result = np.empty_like(vector)
+        for item, s, (_, values) in zip(solved, slices, shifted_values):
+            vectors = item["eigenvectors"]
+            result[s] = vectors @ ((vectors.T @ vector[s]) / values)
+        return result
+
+    size = len(rhs)
+    lhs = LinearOperator((size, size), matvec=shifted_action, dtype=float)
+    pre = LinearOperator((size, size), matvec=precondition, dtype=float)
+    iterations = 0
+
+    def count(_):
+        nonlocal iterations
+        iterations += 1
+
+    solution, info = gmres(
+        lhs,
+        rhs,
+        M=pre,
+        rtol=1e-11,
+        atol=1e-14,
+        restart=40,
+        maxiter=100,
+        callback=count,
+        callback_type="pr_norm",
+    )
+    if info or np.linalg.norm(lhs @ solution - rhs) > max(
+        1e-12, 1e-9 * np.linalg.norm(rhs)
+    ):
+        raise RuntimeError(f"Coupled direct CASPT2 did not converge: GMRES info={info}")
+    amplitude = solution.real
+    applied = action(amplitude)
+    residual = applied - real_shift * amplitude - rhs
+    for block, item, s in zip(blocks, solved, slices):
+        external = block["basis"] @ amplitude[s]
+        item.update(
+            first_order_amplitudes=external,
+            nonvariational_energy=float(rhs[s] @ amplitude[s]),
+            variational_energy=float(
+                2 * rhs[s] @ amplitude[s] - amplitude[s] @ applied[s]
+            ),
+            norm=float(external @ external),
+            residual2=float(residual[s] @ residual[s]),
+        )
+    return iterations
 
 
 def _solve_direct_signature_blocks(
@@ -3265,7 +3986,6 @@ def _solve_direct_signature_blocks(
     first_order_blocks = []
     candidate_group_blocks = []
     native_couplings = _cpp_attr("caspt2_direct_couplings_words")
-    native_fock = _cpp_attr("caspt2_direct_fock_words")
     if native_couplings is None and np.asarray(eri).ndim == 3:
         eri = assemble_spatial_eri_from_factors(eri)
     reference_words = (
@@ -3286,14 +4006,34 @@ def _solve_direct_signature_blocks(
                 grouped_candidates,
             )
         )
-    candidate_offsets, candidate_indices = _pack_candidate_groups(
-        grouped_candidates
-    )
+    candidate_offsets, candidate_indices = _pack_candidate_groups(grouped_candidates)
 
     ci = np.ascontiguousarray(ci, dtype=np.float64)
     h1 = np.ascontiguousarray(h1, dtype=np.float64)
     eri = np.ascontiguousarray(eri, dtype=np.float64)
     fock = np.ascontiguousarray(fock, dtype=np.float64)
+    # One coupling pass shares each worker's integral cache across signatures.
+    # The following block solves use the same budget in a separate stage.
+    coupling_blocks = [None] * len(active_blocks)
+    if native_couplings is not None and active_blocks:
+        sizes = [len(block["rows"]) for block in active_blocks]
+        all_words = _determinants_to_words(
+            [row for block in active_blocks for row in block["rows"]]
+        )
+        coupling_threads = _resolve_direct_workers(workers, sum(sizes), sum(sizes))
+        couplings = native_couplings(
+            all_words,
+            reference_words,
+            ci,
+            h1,
+            eri,
+            nmo,
+            candidate_offsets,
+            candidate_indices,
+            np.concatenate(candidate_group_blocks),
+            coupling_threads,
+        )
+        coupling_blocks = np.split(couplings, np.cumsum(sizes)[:-1])
     block_arguments = [
         (
             block,
@@ -3314,9 +4054,11 @@ def _solve_direct_signature_blocks(
             imaginary_shift,
             denominator_tol,
             native_couplings,
-            native_fock,
+            coupling,
         )
-        for block, groups in zip(active_blocks, candidate_group_blocks)
+        for block, groups, coupling in zip(
+            active_blocks, candidate_group_blocks, coupling_blocks
+        )
     ]
     worker_count = _resolve_direct_workers(
         workers,
@@ -3327,11 +4069,34 @@ def _solve_direct_signature_blocks(
     def solve(arguments):
         return _solve_one_direct_signature_block(*arguments)
 
-    if worker_count > 1:
+    large = [
+        i for i, block in enumerate(active_blocks) if block["basis"].shape[1] >= 64
+    ]
+    if worker_count > 1 and len(large) > 1:
+        large_set = set(large)
+        solved_blocks = [
+            None if i in large_set else solve(arguments)
+            for i, arguments in enumerate(block_arguments)
+        ]
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            solved_blocks = list(executor.map(solve, block_arguments))
+            for i, solved in zip(
+                large, executor.map(solve, (block_arguments[i] for i in large))
+            ):
+                solved_blocks[i] = solved
     else:
         solved_blocks = [solve(arguments) for arguments in block_arguments]
+
+    coupled_iterations = _couple_direct_blocks(
+        active_blocks,
+        solved_blocks,
+        fock,
+        ncore,
+        ncas,
+        nmo,
+        real_shift,
+        imaginary_shift,
+        denominator_tol,
+    )
 
     for solved in solved_blocks:
         determinant_word_blocks.append(solved["determinant_words"])
@@ -3368,6 +4133,7 @@ def _solve_direct_signature_blocks(
         "residual_norm": residual_norm,
         "relative_residual_norm": residual_norm
         / max(float(np.sqrt(rhs2)), np.finfo(float).tiny),
+        "coupled_iterations": coupled_iterations,
         "determinant_words": (
             np.vstack(determinant_word_blocks)
             if determinant_word_blocks
@@ -3495,8 +4261,7 @@ def _orthonormalize_ic_class_blocks(
             spectra[index] = (values, vectors)
 
     rank = sum(
-        int(np.count_nonzero(values > threshold))
-        for values, _vectors in spectra
+        int(np.count_nonzero(values > threshold)) for values, _vectors in spectra
     )
     if rank == 0:
         raise np.linalg.LinAlgError(
@@ -3564,6 +4329,8 @@ def _one_body_sparse_matrix_in_determinant_space(
     from scipy.sparse import coo_matrix
 
     size = len(determinants)
+    if nmo == 0:
+        return coo_matrix((size, size)).tocsr(), "empty_active_space"
     native = _cpp_attr("caspt2_one_body_coo")
     if native is not None and 2 * nmo < 63:
         rows, columns, data = native(
@@ -3794,10 +4561,7 @@ def _estimate_external_class_counts(
                         continue
                     active_alpha = active_electrons[0] + holes_alpha - virt_alpha
                     active_beta = active_electrons[1] + holes_beta - virt_beta
-                    if not (
-                        0 <= active_alpha <= ncas
-                        and 0 <= active_beta <= ncas
-                    ):
+                    if not (0 <= active_alpha <= ncas and 0 <= active_beta <= ncas):
                         continue
                     count = (
                         math.comb(correlated_core, holes_alpha)
@@ -3825,9 +4589,7 @@ def _generate_external_determinants(
     external: dict[int, int] = {}
     for bits in ref_bits:
         occ = tuple(
-            orbital
-            for orbital in _iter_set_bits(bits)
-            if orbital % nmo >= frozen_core
+            orbital for orbital in _iter_set_bits(bits) if orbital % nmo >= frozen_core
         )
         unocc = tuple(_iter_set_bits((~bits) & all_mask))
 

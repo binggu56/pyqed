@@ -1,269 +1,261 @@
 CASPT2
 ======
 
-Status
-------
+Status and scope
+----------------
 
-The restricted-real, zero-IPEA, fully internally contracted SS, MS, and XMS
-energy drivers are **Beta**. They have analytic-limit and invariance tests plus
-matched OpenMolcas validation. Broader molecular, active-space, intruder-state,
-and platform coverage is still needed before any Stable claim.
+``CASPT2``, ``MSCASPT2`` and ``XMSCASPT2`` provide restricted-real, zero-IPEA,
+fully internally contracted energy calculations. They are **Beta**: focused
+analytic-limit, invariance and matched OpenMolcas tests pass, but broader
+molecular, active-space, intruder-state and platform coverage is still needed.
+Analytic gradients, IPEA shifts, RMS-CASPT2 and correlated transition
+properties are not implemented. MS/XMS supports imaginary shifts; real-shift
+effective-Hamiltonian couplings are not implemented.
 
-The implementation currently supports restricted real-orbital CASCI and
-CASSCF references. It does not yet provide IPEA shifts, analytic gradients,
-RAS references, or shifted MS/XMS effective-Hamiltonian couplings. The current
-reference algorithm explicitly enumerates the external determinant space, so
-``max_external_determinants`` and ``max_ic_operators`` should be used as safety
-limits for larger calculations. ``frozen_core`` excludes the requested number
-of lowest doubly occupied spatial orbitals from that external space while
-retaining their mean-field contribution. The complete-CAS external-space size
-and all eight class counts are evaluated combinatorially before integral
-transformation. They are exposed as ``estimated_external_determinants`` and
-``estimated_external_class_counts`` in ``work_estimate``. A violated
-``max_external_determinants`` limit therefore fails without building integrals
-or determinants. The Python builder also excludes frozen-core holes while it
-generates the space instead of generating and later discarding them.
-``CASPT2(mc, frozen_core=...).estimate_external_space()`` exposes the same
-counts as a read-only preflight operation, so orbital-space planning does not
-require trial calculations.
-
-For large single-state Fock-CASPT2 calculations,
-``ic_basis_backend="direct"`` uses the non-enumerating production path. It
-groups spin-adapted internally contracted functions in compact
-external-signature x active-state tensors and solves the semicanonical
-signature blocks independently. The two-phase tensor builder is the default;
-``direct_build_backend="online"`` retains the older online-MGS implementation
-as a numerical reference. Inactive and virtual orbitals are semicanonicalized
-before the integral transformation. ``direct_workers="auto"`` parallelizes
-independent tensor components and signature solves for large jobs; an integer
-sets an explicit worker limit, and ``PYQED_CASPT2_WORKERS`` provides the same
-process-level default.
-
-The connected Hamiltonian RHS uses a native three-word determinant kernel, so
-spaces with more than 31 spatial orbitals do not fall back to the old 64-bit
-builder. The enumerated dense backend remains the small-system numerical
-reference. ``use_cholesky=True`` keeps transformed pair factors instead of
-assembling the four-index MO tensor. Its native RHS caches symmetry-equivalent
-pair-factor dot products within each block, avoiding repeated auxiliary-index
-contractions. Excitation-connected CAS references are stored once in globally
-shared candidate groups rather than repeated for every direct row, and the
-same representation is reused for SS/MS/XMS contractions. Local signature
-Fock matrices and three-word Slater--Condon contractions are built by native
-kernels, avoiding determinant-sized Python loops.
-
-When the molecular orbitals carry native Abelian point-group labels, the
-direct backend semicanonicalizes each irrep separately, rejects forbidden
-one- and two-body excitation operators before determinant generation, and
-retains only first-order rows with the reference-state irrep. Use a molecular
-orientation consistent with the native point-group convention. This early
-selection is important for production performance; merely filtering the final
-rows would not reduce tensor-build cost.
-
-``ic_basis_backend="auto"`` selects this direct path before FOIS generation
-when the exact preflight count is at least 250,000 determinants and the request
-is compatible with fully internally contracted Fock CASPT2. Smaller jobs keep
-the dense/streaming reference selection. Thus a large calculation does not
-need an empirical ``max_external_determinants`` or external-virtual cutoff to
-discover the safe backend; all requested virtual orbitals can be retained and
-the exact combinatorial count remains available from
-``estimate_external_space()``.
-Direct MS and XMS transition corrections are supported. Each term
-:math:`\langle\Psi_I|H|\Psi_J^{(1)}\rangle` is evaluated in root :math:`J`'s
-own semicanonical inactive/virtual basis. This is exact because rotations
-within the fully occupied inactive and empty virtual subspaces leave the CAS
-reference invariant. XMS roots naturally share the state-average Fock basis;
-MS roots retain their state-specific Fock bases.
-
-``max_memory_mb`` is a hard pre-allocation guard. ``ic_basis_backend="auto"`` uses dense canonical metric reduction for
-small jobs and switches to streaming rank-revealing orthogonalization when the
-raw metric would exceed that memory budget. The selected backend and byte
-estimates are retained in ``ic_basis_backend`` and ``work_estimate``;
-``success`` and ``message`` always reflect the final run state.
-``linear_solver="auto"`` similarly keeps dense canonical diagonalization for
-small retained spaces and switches to a matrix-free MINRES solve for larger
-real-shift problems. Imaginary shifts use matrix-free GMRES. Convergence is
-reported through ``solver_iterations``, ``solver_history``, and
-``contracted_residual_norm``/``contracted_relative_residual_norm``; forcing
-``linear_solver="direct"`` remains the reference path for cross-checks.
-The Fock operator graph is assembled by the native C++ kernel, converted once
-to sparse CSR form, and reused by every projected Krylov product. The raw IC
-functions are built directly as compact, disjoint support components inside
-their eight perturber classes, so the dense path never materializes the mostly
-zero global raw basis or metric. Component-local canonical reduction removes
-metric null modes. ``external_operator_nnz`` and the byte estimates in
-``work_estimate`` expose these costs. ``solver_history`` retains the final true
-MINRES residual and the inexpensive per-iteration GMRES residuals for
-imaginary-shift solves.
+The reference must contain the important near-degenerate configurations.
+Perturbation theory does not repair an inadequate active space. Inspect the
+reference weight, retained metric rank and convergence diagnostics, and check
+sensitivity to the active space, basis, metric thresholds and level shift.
 
 Single-state calculation
 ------------------------
-
-``CASPT2`` defaults to full internal contraction. The first-order space is
-generated by applying spin-free one- and two-body excitation operators to the
-whole CAS reference. Metric null modes are removed before solving the complete
-projected generalized-Fock amplitude matrix.
 
 .. code-block:: python
 
    from pyqed.qchem import CASPT2, CASSCF, Molecule
 
    mol = Molecule(
-       atom="Li 0 0 0; H 0 0 1.6",
-       unit="angstrom",
-       basis="sto-3g",
-   )
-   mol.build()
-   mf = mol.RHF().run()
-   mc = CASSCF(mf, ncas=2, nelecas=2).run()
+       atom="Li 0 0 0; H 0 0 1.6", unit="angstrom", basis="sto-3g"
+   ).build(eri="s8")
+   mc = CASSCF(mol.RHF().run(), ncas=2, nelecas=2).run()
 
    pt = CASPT2(
        mc,
        ic_basis_backend="direct",
-       direct_workers="auto",
-       use_cholesky=True,
-       real_shift=0.0,
-       imaginary_shift=0.0,
+       direct_build_backend="shared",
+       ic_convention="molcas",
+       imaginary_shift=0.25,
        max_memory_mb=2048,
    )
    e_corr = pt.run()
    print(pt.e_tot, e_corr, pt.reference_weight)
 
-For a symmetry-enabled production calculation, attach orbital irreps at the
-integral/SCF stage, for example ``mol.build(symmetry="c2v")`` for a molecule in the standard C2v orientation. The selected
-tensor, integral, worker, candidate-group, and symmetry paths are reported in
-``ic_metric_backend``, ``direct_integral_backend``, and ``work_estimate``.
+``run()`` returns the correlation correction and populates the driver.
+``e_tot`` includes the reference energy. ``success`` and ``message`` report
+whether the run completed; failures raise an exception.
+``frozen_core`` excludes the requested number of lowest doubly occupied
+orbitals from the first-order space while retaining their mean-field effect.
 
-The nonorthogonal contracted functions are canonically orthogonalized. In the
-retained basis, amplitudes satisfy
+Contraction conventions
+-----------------------
 
-.. math::
-
-   (K-sI)t=b,
-
-where :math:`K` is the projected :math:`E_0-F` operator and :math:`s` is the
-real level shift in PyQED's negative-denominator convention. For shifted
-calculations, ``e_corr`` is the variational Hylleraas value
+``contraction="full"`` is the default. Spin-free single and double excitation
+operators act on the entire CAS reference, and metric null modes are removed
+before solving the coupled amplitude equation. In an orthonormal retained
+basis, PyQED uses the negative-denominator convention
 
 .. math::
 
-   E^{(2)} = 2 b^Tt - t^T K t.
+   (K-sI)t=b, \qquad K=P(E_0^{(0)}-F)P.
 
-``e_corr_nonvariational`` and ``shift_correction`` expose the two reported
-parts. ``contracted_residual_norm``, ``contracted_basis_size``,
-``contracted_basis_rank``, ``first_order_norm``, and ``reference_weight`` are
-available for reliability checks.
+Here :math:`b` is the projected Hamiltonian coupling and :math:`s` is the real
+level shift. The reported correction is the Hylleraas value
 
-Multi-state calculations
-------------------------
+.. math::
 
-``MSCASPT2`` builds and diagonalizes the symmetrized second-order effective
-Hamiltonian from state-specific first-order solutions:
+   E^{(2)}=2b^Tt-t^TKt.
+
+``e_corr_nonvariational`` retains :math:`b^Tt`, and ``shift_correction`` is
+the difference between that value and the reported variational-functional
+correction. This terminology does not make the total CASPT2 energy a
+variational upper bound.
+
+Two explicit conventions are available:
+
+* ``ic_convention="projected"`` is the default exact Galerkin projection of
+  the generalized Fock operator onto the retained contracted space.
+* ``ic_convention="molcas"`` reproduces OpenMolcas's ordered generators,
+  metric reduction and A/E (Si/Sijr) coupling convention for the supported
+  zero-IPEA equations. It requires ``ic_basis_backend="direct"`` and
+  ``direct_build_backend="shared"``. The A/E coupling is :math:`\sqrt{2}`
+  times the determinant-projected coupling, following ``SGM`` cases 4/5 and
+  ``MKLIST`` lists 14/15. The convention is explicit, rather than an energy fit.
+
+In the Molcas convention, CI coefficients are counterrotated while the active
+Fock operator is diagonalized within each RAS partition. Redundant singles
+are folded into number-operator traces. ``metric_norm_tol`` screens squared
+raw-column norms, whereas ``lindep_tol`` screens diagonally scaled metric
+eigenvalues. Their defaults are respectively ``1e-10`` and ``1e-8`` for
+Molcas, and zero and ``1e-10`` for projected calculations. Near a cutoff,
+small integral or orbital-frame changes can alter the retained rank.
+
+``DiagonalCASPT2`` is an explicit determinant-diagonal diagnostic.
+``contraction="strong"`` retains only eight class vectors. Neither should be
+reported as fully internally contracted CASPT2. ``zeroth_order="en"`` is an
+Epstein--Nesbet diagnostic rather than the production Fock-CASPT2 formulation.
+
+Choosing the first-order representation
+---------------------------------------
+
+``ic_basis_backend="auto"`` uses dense or streaming canonical reduction for
+small spaces. Compatible Fock-CASPT2 requests with at least 250,000 estimated
+external determinants select the direct representation before enumeration.
+
+``ic_basis_backend="direct"`` supports these builders:
+
+* ``direct_build_backend="tensor"`` is the default compact
+  external-signature by active-state representation. It retains inter-block
+  Fock couplings and uses block eigensystems to precondition GMRES.
+* ``direct_build_backend="shared"`` reuses active templates across external
+  orbital labels. Hamiltonian coefficients and a sparse Fock graph replace
+  repeated determinant-to-reference loops. It supports the projected and
+  Molcas conventions, with no extra external-virtual cutoff.
+* ``direct_build_backend="online"`` is the incremental orthogonalization
+  reference for numerical comparisons.
+
+For the shared builder, ``fock_contraction="operator"`` uses sparse operator
+projection and ``"density"`` uses exact annihilation-factor contractions.
+``"rdm"`` evaluates metrics, Fock moments and inter-class couplings using
+RAS-safe active 1--3 RDMs and energy-weighted RDMs, without a four-RDM or
+external-determinant templates. It requires a pseudocanonical active Fock
+operator and ``metric_norm_tol >= 1e-12``. The default ``"auto"`` selects RDM
+contractions for the direct shared Molcas convention, and operator
+contractions otherwise.
+
+``max_memory_mb`` guards planned basis, matrix and solver allocations.
+``max_ic_operators`` caps raw excitation operators before metric reduction.
+``max_external_determinants`` caps the estimated enumerated space, and
+``estimate_external_space()`` provides a read-only preflight without integral
+transformation. Counts are upper bounds when a CVS projector is requested.
+The direct representation avoids global external-space enumeration, but still
+has active-space and contracted-space costs.
+
+``use_cholesky=True`` retains available transformed RI/Cholesky pair factors.
+For packed AO integrals, the shared solver transforms only
+:math:`(pi|qj)` with :math:`i,j` in the inactive plus active space; it does not
+build three- or four-virtual integrals. This is an exact data-layout change,
+subject to any integral approximation already present in the reference.
+
+``direct_workers="auto"`` uses the central ``pyqed.num_workers()`` budget.
+An explicit integer or ``PYQED_CASPT2_WORKERS`` sets the solver limit.
+Independent build, coupling and solve stages reuse that budget without nested
+pools; keep BLAS threads at one. Small components run serially. Root-package
+builds honor ``PYQED_QCHEM_OPENMP=required`` when OpenMP is needed; automatic
+builds retain the serial coupling path if OpenMP is unavailable.
+
+Multistate calculations
+-----------------------
 
 .. code-block:: python
 
    from pyqed.qchem import MSCASPT2, XMSCASPT2
 
-   ms = MSCASPT2(mc, roots=(0, 1))
-   ms_energies = ms.run()
-
-   xms = XMSCASPT2(mc, roots=(0, 1))
-   xms_energies = xms.run()
-
-For larger XMS calculations, all rotated roots can share the direct,
-factorized backend:
-
-.. code-block:: python
-
-   xms = XMSCASPT2(
-       mc,
-       roots=(0, 1),
+   options = dict(
+       roots=(0, 2),
        ic_basis_backend="direct",
-       use_cholesky=True,
-       frozen_core=nfrozen,
+       direct_build_backend="shared",
+       ic_convention="molcas",
+       imaginary_shift=0.25,
    )
+   ms = MSCASPT2(mc, **options)
+   ms_energies = ms.run()
+   xms = XMSCASPT2(mc, **options)
    xms_energies = xms.run()
 
-XMS first diagonalizes the state-average generalized Fock operator in the
-selected model space, rotates the references, and uses the same Fock operator
-for all first-order equations. ``effective_hamiltonian``,
-``reference_rotation``, and ``mixing`` retain the state-interaction data.
-For determinant-based CI references, ``roots`` indexes the full fixed-
-:math:`M_S` spectrum. Select spin-pure roots deliberately: in the LiH CAS(2,2)
-validation the two OpenMolcas singlets correspond to PyQED roots ``(0, 2)``
-because the triplet :math:`M_S=0` component lies between them.
+The reference must have been solved for all requested roots. ``roots`` indexes
+the reference solver's spectrum: determinant-based fixed-:math:`M_S` spectra
+can contain both singlets and triplets. Select spin-pure states deliberately;
+the LiH CAS(2,2) singlet validation uses roots ``(0, 2)``.
 
-Diagnostic approximations
--------------------------
+MS solves each selected root with its state-specific generalized Fock operator.
+XMS diagonalizes the state-average Fock operator in the selected model space,
+rotates the references and uses that common operator for the first-order
+problems. Each ket retains its own internally contracted space; this is not
+the union-space implementation in Shiozaki et al. (2011). ``weights`` specifies the XMS state-average weights.
+``effective_hamiltonian``, ``reference_rotation``, ``mixing`` and
+``state_specific`` retain the assembly and individual solves.
 
-``DiagonalCASPT2`` is an explicit determinant-diagonal diagnostic. The legacy
-``contraction="strong"`` option uses only eight class vectors and must not be
-reported as fully internally contracted CASPT2.
+Shared multistate calculations require RDM contractions. Ordered transition
+1--3 RDMs retain both transition orientations and intermediate determinants
+outside a RAS reference. Each transition reference is counterrotated into the
+ket's active Fock frame. The other direct builders evaluate transitions in
+each ket's semicanonical inactive/virtual frame.
 
-Validation
-----------
+The imaginary shift follows the diagonalized signature-block prescription of
+Forsberg and Malmqvist. Effective-Hamiltonian diagonals contain the
+shift-corrected Hylleraas energies; off-diagonal terms use shifted real
+amplitudes and are symmetrized, following OpenMolcas ``MCCTL``, ``HEFVAL`` and
+``MLTCTL``. This reproduces that energy convention, rather than a full
+multistate Hylleraas functional. The selected state window still requires
+convergence checks.
 
-Run the focused tests and external comparison harness from the repository
-root:
+RAS references and CVS
+----------------------
 
-.. code-block:: bash
+The direct single-state path accepts restricted-real RASCI/RASSCF references.
+Active Fock rotations preserve the RAS partitions, and density contractions
+retain the excitation-reachable intermediate space outside the reference RAS.
+Ordinary RASPT2 includes first-order occupations outside a one-core-hole
+reference sector.
 
-   PYTHONPATH=. pytest -q tests/test_caspt2.py
+``cvs_core_orbitals`` optionally applies an additional fixed one-hole
+core-valence projector to both reference and first-order space. It requires a
+complete active CI within that sector and the tensor or online direct builder.
+The shared builder and multistate CVS mixing do not support this extra
+projector. This projected Fock-PT2 adaptation is not RMS-RASPT2.
 
-   PYTHONPATH=. python benchmarks/caspt2_openmolcas.py \
-       --cases all --contraction full --zeroth-order fock
+Diagnostics and validation
+--------------------------
 
-The benchmark writes matched zero-IPEA OpenMolcas input, JSON diagnostics, and
-a component/rank figure. With every inactive orbital correlated, the matched
-LiH/STO-3G CAS(2,2) total energies differed by
-:math:`2.34\times10^{-7}\ E_h`; the H\ :sub:`2`\ O/STO-3G CAS(4,4) totals
-differed by :math:`1.89\times10^{-8}\ E_h`. The corresponding PyQED/OpenMolcas
-contracted ranks were 57/58 and 138/138; the one-vector LiH difference reflects
-the programs' different metric-reduction conventions and has negligible energy
-effect. A larger LiH/cc-pVDZ CAS(2,2) CIONLY gate used 3,077 external
-determinants and retained 915 of 1,525 nonzero raw contracted functions. The
-automatic compact-basis, matrix-free calculation converged in 3 preconditioned
-MINRES iterations with a relative residual of :math:`9.34\times10^{-11}` and
-differed from OpenMolcas by :math:`5.41\times10^{-9}\ E_h`. The benchmark explicitly selects the Prascher
-Li cc-pVDZ variant used by OpenMolcas; its CASCI references agree within
-:math:`6.31\times10^{-10}\ E_h`, and unmatched references are flagged rather
-than accepted as release comparisons. These runs used OpenMolcas commit
-``cd52dbe08cf9611a376e0a434ef72d71659627ff``. The raw artifacts are written
-under ``/private/tmp`` by the command above; this is one representative
-validation set, not a broad accuracy claim.
+Inspect ``contracted_basis_size``, ``contracted_basis_rank``,
+``first_order_norm``, ``reference_weight``, ``solver_iterations`` and
+``solver_history``. ``work_estimate`` records representation, integral,
+workspace and shared-template details; ``timings`` records calculation stages.
+For imaginary shifts, the unregularized residual can remain nonzero:
+``work_estimate["regularized_relative_residual"]`` reports the shared solver's
+actual equation residual.
 
-On the same single-threaded machine, ten finalized repetitions gave isolated
-PyQED/OpenMolcas CASPT2-kernel medians of 0.00486/0.03469 seconds for
-LiH/STO-3G, 0.01202/0.03311 seconds for H\ :sub:`2`\ O/STO-3G, and
-0.04511/0.04715 seconds for LiH/cc-pVDZ. Thus the representative larger gate is
-at timing parity (PyQED/OpenMolcas ratio 0.957), while the two small gates are
-faster in PyQED. The cc-pVDZ path uses a 125,649-nonzero native sparse Fock
-operator, 105,984 bytes of compact raw IC blocks instead of the 56,832,192-byte
-global dense-basis upper bound, component-local metric reduction, and a
-projected-diagonal MINRES preconditioner. Timings are machine-specific; the
-benchmark JSON records all repetitions and its generated figure compares the
-current medians and minima. Very short external module lifetimes are sampled,
-so sub-millisecond observations are omitted rather than reported as zero.
+Run focused checks from the repository root::
 
-A larger native-builtin phenol CAS(6,6)/6-31G gate retained all 47 external
-virtual orbitals while freezing 21 core orbitals. Its exact preflight FOIS
-count was 3,730,040 determinants. C2v screening, compact tensor construction,
-four direct workers, and cached Cholesky pair contractions reduced this to
-736,738 active rows and rank 18,108. The correction was
-:math:`-0.0536909642312\ E_h` with relative residual
-:math:`9.89\times10^{-16}`; the CASPT2 step took 11.80 seconds on the local
-test machine (10.21 seconds build, 1.37 seconds solve). The preceding C1
-implementation with the same energy took 352.8 seconds, so these architecture
-changes provide a 29.9x end-to-end CASPT2 speedup for this gate. This is a
-PyQED before/after measurement, not an OpenMolcas parity claim; a matched
-OpenMolcas phenol executable was not available on that machine.
+   PYTHONPATH=. OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 \
+     VECLIB_MAXIMUM_THREADS=1 NUMEXPR_NUM_THREADS=1 python -m pytest -q \
+     tests/test_caspt2.py tests/test_perturber_templates.py \
+     tests/test_cvs_pt2.py tests/test_ras_density_contractions.py \
+     tests/test_fic_contractions.py
 
-For the same LiH fixed-orbital CIONLY reference, the two-state zero-IPEA
-MS-CASPT2 energies agree with OpenMolcas within
-:math:`3\times10^{-8}\ E_h`, and XMS-CASPT2 within
-:math:`2\times10^{-8}\ E_h`. The effective-Hamiltonian off-diagonal elements
-are included in ``tests/test_caspt2.py`` as independent regression values.
+These cover the MP2 limit, dense/streaming/direct/shared agreement, shifts,
+frozen core, orbital and phase invariance, MS/XMS effective Hamiltonians,
+RAS intermediate closure, memory guards, and compiled/Python contractions.
+The nonstationary H6/STO-3G CAS(2,2) regression exercises the A/E convention
+against fixed-orbital OpenMolcas corrections at imaginary shifts zero and
+0.25 hartree. Its reproducible decks are in
+``benchmarks/data/caspt2_h6_nonstationary/``. The tests do not require OpenMolcas.
+``benchmarks/caspt2_openmolcas.py`` provides the external comparison harness.
 
-OpenMolcas describes production CASPT2 as an
-iterative solution in a fully internally contracted first-order space; see the
-`OpenMolcas CASPT2 manual
-<https://molcas.gitlab.io/OpenMolcas/sphinx/users.guide/programs/caspt2.html>`_.
+Method references and fidelity
+-------------------------------
+
+* K. Andersson, P.-A. Malmqvist and B. O. Roos, *J. Chem. Phys.* **96**,
+  1218--1226 (1992), doi:10.1063/1.462209: complete-CAS second-order theory.
+* P.-A. Malmqvist et al., *J. Chem. Phys.* **128**, 204109 (2008),
+  doi:10.1063/1.2920188: the RASPT2 formulation used by the direct RAS path.
+* J. Finley et al., *Chem. Phys. Lett.* **288**, 299--306 (1998),
+  doi:10.1016/S0009-2614(98)00252-8: multistate state interaction.
+* T. Shiozaki et al., *J. Chem. Phys.* **135**, 081106 (2011),
+  doi:10.1063/1.3633329: the extended multistate reference rotation; the
+  contracted-space distinction above limits implementation fidelity.
+* N. Forsberg and P.-A. Malmqvist, *Chem. Phys. Lett.* **274**, 196 (1997),
+  doi:10.1016/S0009-2614(97)00669-6: imaginary level shifts.
+* `OpenMolcas CASPT2 sources
+  <https://github.com/Molcas/OpenMolcas/tree/master/src/caspt2>`_ and
+  `manual <https://molcas.gitlab.io/OpenMolcas/sphinx/users.guide/programs/caspt2.html>`_:
+  ordered metrics, A/E couplings and shifted multistate energy assembly.
+* L. S. Cederbaum et al., *Phys. Rev. A* **22**, 206 (1980),
+  doi:10.1103/PhysRevA.22.206: the core-valence separation underlying the
+  optional projected single-state adaptation.
+
+The sparse, template and RDM implementations reorganize the supported equations
+without cumulant approximations. The explicit projected/Molcas distinction,
+zero-IPEA restriction, unsupported properties and CVS restrictions above are
+material limits; general accuracy claims for other CASPT2 variants do not
+carry over automatically.
