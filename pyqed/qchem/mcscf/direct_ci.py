@@ -685,6 +685,16 @@ def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore, use_chol
     This avoids storing a full ``2 x 2`` block tensor when the direct solver
     only needs the spatial integrals plus the spin-resolved occupation patterns.
     """
+    compact = getattr(mf, "active_space_integrals", None)
+    if use_cholesky and callable(compact) and not _is_uhf_reference(mo_coeff):
+        result = compact(mo_coeff, ncore, ncas)
+        if result is not None:
+            h1, factors, energy_core = result
+            return (
+                h1,
+                np.einsum("Ppq,Prs->pqrs", factors, factors, optimize=True),
+                energy_core,
+            )
     h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
     if _is_uhf_reference(mo_coeff):
         mo_cas_a = mo_coeff[0][:, ncore:ncore+ncas]
@@ -727,6 +737,12 @@ def transform_active_space_spatial_integrals(mf, mo_coeff, ncas, ncore, use_chol
                     return h1, eri_active, energy_core
 
     mo_cas = mo_coeff[:, ncore:ncore+ncas]
+    if use_cholesky and hasattr(mf, "mo_factors") and getattr(mf, "cholesky_jk", False):
+        pair_factors = mf.mo_factors(mo_cas, mo_cas)
+        eri_spatial = np.einsum(
+            "Ppq,Prs->pqrs", pair_factors, pair_factors, optimize=True
+        )
+        return h1, eri_spatial, energy_core
     eri_spatial = transform_spatial_eri_to_mo(
         mf,
         mo_cas,
@@ -743,9 +759,18 @@ def transform_active_space_pair_factors(mf, mo_coeff, ncas, ncore, eri_factors=N
     """
     Build active-space MO-pair Cholesky factors for the direct-CI solver.
     """
+    compact = getattr(mf, "active_space_integrals", None)
+    if eri_factors is None and callable(compact) and not _is_uhf_reference(mo_coeff):
+        result = compact(mo_coeff, ncore, ncas)
+        if result is not None:
+            return result
     h1, energy_core = h1e_for_cas(mf, ncas=ncas, ncore=ncore, mo_coeff=mo_coeff)
     use_mf_factor_transform = eri_factors is None and hasattr(mf, "mo_factors")
-    if eri_factors is None:
+    if eri_factors is None and (
+        not use_mf_factor_transform
+        or _is_uhf_reference(mo_coeff)
+        or not getattr(mf, "cholesky_jk", False)
+    ):
         eri_factors = _get_mf_cholesky_factors(mf)
 
     if _is_uhf_reference(mo_coeff):
@@ -1661,7 +1686,6 @@ def _compute_diag_compact_factors_uhf(h1a, h1b, pair_factors_a, pair_factors_b, 
                         )
 
     return H_diag
-
 
 
 def hamiltonian_matrix_elements(Binary, H1, H2, SC1, SC2):
@@ -5816,9 +5840,6 @@ class CASCI(mcscf.casci.CASCI):
         )
 
 
-
-
-
 def sigma(SC1, SC2, H_diag, H_A, H_B, H_AA, H_BB, H_AB, c):
     """
     Avoid explicitly construct the CI Hamiltonian Matrix
@@ -5925,9 +5946,6 @@ def sigma(SC1, SC2, H_diag, H_A, H_B, H_AA, H_BB, H_AB, c):
     return sigma_vec
 
 
-
-
-
 # def fcisolver(mo_occ):
 #     # mo_occ = [self.mf.mo_occ[ncore: ncore+ncas]//2, ] * 2
 #     binary = get_fci_combos(mo_occ = mo_occ)
@@ -5947,8 +5965,6 @@ def sigma(SC1, SC2, H_diag, H_A, H_B, H_AA, H_BB, H_AB, c):
 #     E, X = eigsh(H_CI, k=nstates, which='SA')
 
 #     return E, X
-
-
 
 
 def contract_with_tdm1(cibra, ciket, binary, SC1, h1e):
@@ -6104,9 +6120,6 @@ def make_tdm1(cibra, ciket, binary, SC1):
 
 
     return mcscf.casci.make_tdm1(cibra, ciket, binary, SC1)
-
-
-
 
 
 def contract_with_rdm2(ci, H2, Binary, SC1, SC2):

@@ -8,6 +8,7 @@ import numpy as np
 import importlib
 from scipy.linalg import expm
 from .integral_blocks import IntegralBlocks
+from .ri_orbitals import OrbitalRIFactors
 from ..basis import PackedRIFactors
 
 _CASSCF_CPP_UNINITIALIZED = object()
@@ -138,6 +139,8 @@ def generalized_fock_from_factors(h1_mo, pair_factors_full_occ, dm1_occ, dm2_occ
         columns are non-zero, which matches the dense full-space contraction for
         an embedded CAS RDM with zero virtual blocks.
     """
+    if isinstance(pair_factors_full_occ, OrbitalRIFactors):
+        return pair_factors_full_occ.generalized_fock(h1_mo, dm1_occ, dm2_occ)
     h1_mo = np.asarray(h1_mo)
     packed = isinstance(pair_factors_full_occ, PackedRIFactors)
     if not packed:
@@ -351,6 +354,8 @@ def core_active_factor_hessian_action(h1, factors, dm1, dm2, kappas, cache=None)
     copies or persistent occupied-pair contractions. The input factor tensor
     stays resident. Only contraction order changes relative to the reference.
     """
+    if isinstance(factors, OrbitalRIFactors):
+        return factors.hessian_action(h1, dm1, dm2, kappas)
     cache = {} if cache is None else cache
     if 'native_workspace' not in cache:
         cache['native_workspace'] = create_factor_hessian_workspace(h1, factors, dm1, dm2)

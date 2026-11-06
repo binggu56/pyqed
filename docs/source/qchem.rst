@@ -30,6 +30,81 @@ A typical native calculation follows this structure:
    mf = mol.RHF().run()
    print(mf.e_tot)
 
+Packed-RI CASSCF memory
+----------------------
+
+Real packed-AO RI ``SecondOrderCASSCF`` with analytic QN coupling, full
+microiteration CI relaxation and ``ci_method="direct_ci"`` no longer builds
+a full MO-factor reference. The core energy, active one-electron Hamiltonian
+and active factors are accumulated together in one AO pass. Trial CI does
+not build a full J/K matrix or make a separate active-factor pass.
+
+The macroiteration caches only ``B[P, p, i]`` with core/active ``i``. Trial
+orbital frames share the AO factors and retain no such cache. Gradients use
+these occupied columns; the Hessian contracts their response directly from
+AO panels. For real orbital generators ``k`` and AO-to-MO coefficients ``C``::
+
+    L[P] = C.T @ B_AO[P] @ C[:, :nocc]
+    dL[P] = k.T @ L[P] + C.T @ B_AO[P] @ (C @ k[:, :nocc])
+
+The existing compact core/active RDM contractions then form the same
+frozen-density Hessian action as the full-MO reference. No extra fitting,
+screening, approximate Hessian or changed QN model is introduced. This is an
+algebraic storage/contraction reordering of the existing method, not a new
+literature algorithm or convergence guarantee. Numerical roundoff can change
+AH decisions and the convergence trajectory.
+
+``trial_memory_mb=384`` now controls a shared RI panel-workspace target in
+MiB for trial, gradient and Hessian contractions. Workers come from
+``pyqed.num_workers()``; their count is reduced if one panel per worker would
+exceed the budget. BLAS uses one thread within each parallel region. Tasks
+write disjoint factor ranges; Hessian vectors reuse AO panels. There is no
+unbounded queue of panel results or per-worker copy of the AO factors.
+Each macroiteration's ``history`` entry includes ``ri_storage`` with AO and
+occupied-cache sizes, zero full-MO storage, and the last contraction's planned
+worker/panel workspace. Those planned bytes are distinct from OS peak RSS.
+
+The target excludes inputs, returned matrices, CI data and the occupied
+factor cache. At least one panel must fit, so it is not a total RSS limit.
+Complex/unpacked AO factors, other coupling modes and fixed-CI microsteps
+retain their existing paths. Previous QN macroiteration owners are released
+before creating the next cache; callbacks that retain entire CI objects can
+extend that lifetime. The AO-backed action uses blocked BLAS contractions
+rather than the full-factor native Hessian workspace; diagnostics requiring
+that workspace specifically do not describe this path.
+
+Set ``PYQED_SCRATCH_DIR`` to a fast local filesystem. Large factor arrays,
+occupied caches and response-coefficient buffers use disk-backed storage
+there. ``TMPDIR`` alone does not select this directory. Memory mapping does
+not guarantee low RSS or fast execution when the working set exceeds RAM.
+
+For TDI with 2,156 spherical AOs, 6,594 auxiliaries and 267 core plus eight
+active orbitals, packed AO factors occupy 114.2 GiB and occupied MO columns
+occupy 29.1 GiB: about 143.4 GiB combined. The previous full MO reference
+alone occupied 114.2 GiB. These are tensor storage sizes, not measured TDI
+peak RSS values. The 384-MiB panel target allows four TDI-sized Hessian
+workers; a smaller target can reduce parallelism substantially.
+
+``examples/qchem/benchmark_casscf_orbital_ri.py`` compares full-MO storage
+with one-worker and central-worker AO-backed contractions in fresh
+subprocesses. It covers fused active integrals, gradients, repeated batched
+Hessian actions and retained trial geometries. It writes OS peak RSS,
+per-phase timings, numerical differences and a diagnostic figure. Run from
+the repository root with ``PYTHONPATH=.`` and
+``--out /private/tmp/casscf-orbital-ri``. The synthetic benchmark is not a
+substitute for a complete molecular run. In particular, the AO-backed
+Hessian can be slower with only one worker even when total time and memory
+improve; compare both Hessian and total timings for the intended workload.
+
+For a molecular timing check, run
+``PYTHONPATH=. python examples/qchem/benchmark_casscf_macroiteration.py --out /private/tmp/benzene-casscf``.
+The default is benzene/aug-cc-pVDZ with six singlets and CAS(8,8).
+It converges RHF, checks the CI roots and active-space overlap, and stops
+after one CASSCF macroiteration. The saved iterate is not converged CASSCF.
+Reports include source hashes, contraction timings, process peak RSS and
+reproducible diagnostic plots. Use ``--smoke`` for LiH/STO-3G, or wrap the
+command with ``examples/qchem/monitor_local_calculation.py`` to sample RSS.
+
 Main Components
 ---------------
 

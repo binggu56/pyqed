@@ -13,6 +13,7 @@ import math
 import numpy as np
 from scipy.linalg import expm
 from ..basis import PackedRIFactors, _ri_storage, _pair_factors_to_full
+from .ri_orbitals import OrbitalRIFactors
 
 from .casci import (
     _get_mf_cholesky_factors,
@@ -1387,6 +1388,19 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
     model, orbital coordinates, or convergence criteria. Dense validation
     helpers and other response workflows can still use core-inclusive RDMs.
 
+    Real packed-AO RI direct-CI/QN calculations keep no full MO factor tensor.
+    Core energy, active h1 and active factors are computed in one pass. Only
+    core/active MO columns are cached for the reference gradient and Hessian;
+    Hessian responses are contracted directly from AO panels. Trial geometries
+    share the AO factors and do not retain occupied-column caches. Other
+    derivative paths retain their existing materialized representation.
+    ``trial_memory_mb`` (default 384 MiB) is the shared RI panel-workspace
+    target across the central worker budget, with single-thread BLAS and a
+    one-panel minimum. It excludes outputs and disk-backed occupied columns,
+    and is not a total RSS limit. Use ``PYQED_SCRATCH_DIR`` for factor/cache
+    storage. This is an exact contraction reordering within the same RI
+    approximation, not a new CASSCF method or convergence guarantee.
+
     The inner AH solve allows 30 iterations and a 40-vector subspace by
     default, including the initial-subspace path. These are iteration limits,
     not a guarantee that each inner solve reaches its residual tolerance.
@@ -1456,6 +1470,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         coupled_accept_min_ratio=0.05,
         coupled_fallback=True,
         coupled_reuse_subspace=False,
+        trial_memory_mb=384,
         orbital_parameterization="exponential",
         internal_preopt_steps=0,
         internal_preopt_max_step=None,
@@ -1591,6 +1606,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self.coupled_accept_min_ratio = float(coupled_accept_min_ratio)
         self.coupled_fallback = bool(coupled_fallback)
         self.coupled_reuse_subspace = bool(coupled_reuse_subspace)
+        self.trial_memory_mb = float(trial_memory_mb)
+        if not np.isfinite(self.trial_memory_mb) or self.trial_memory_mb <= 0:
+            raise ValueError("trial_memory_mb must be finite and positive.")
         self.orbital_parameterization = str(orbital_parameterization).lower().replace(
             "-",
             "_",
@@ -1744,7 +1762,9 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self._h1_mo = np.array(h1_mo, copy=True)
             # Trial factor arrays are never updated in place. Keep a read-only
             # view so accepted CI and QN workspaces can share their storage.
-            if isinstance(pair_factors, PackedRIFactors):
+            if isinstance(pair_factors, OrbitalRIFactors):
+                self.eri_factors = pair_factors
+            elif isinstance(pair_factors, PackedRIFactors):
                 view = pair_factors.pair_factors.view()
                 view.flags.writeable = False
                 self.eri_factors = PackedRIFactors(view, pair_factors.nao)
@@ -1756,6 +1776,26 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             self.cholesky_max_rank = getattr(parent_mf, "cholesky_max_rank", None)
             self.low_rank_tol = getattr(parent_mf, "low_rank_tol", None)
             self.low_rank_max_rank = getattr(parent_mf, "low_rank_max_rank", None)
+            self._active_factor_cache = {}
+
+        def active_space_integrals(self, coefficients, ncore, ncas):
+            if not isinstance(self.eri_factors, OrbitalRIFactors):
+                return None
+            return self._active_from_source(self.eri_factors, coefficients, ncore, ncas)
+
+        def _active_from_source(self, source, coefficients, ncore, ncas):
+            identity = np.array_equal(coefficients, np.eye(self.nmo))
+            key = (ncore, ncas)
+            if identity and key in self._active_factor_cache:
+                return self._active_factor_cache[key]
+            h1 = self._h1_mo
+            if not identity:
+                source = source.rotate(coefficients)
+                h1 = coefficients.T @ h1 @ coefficients
+            result = source.active_integrals(h1, ncore, ncas, self._energy_nuc)
+            if identity:
+                self._active_factor_cache[key] = result
+            return result
 
         def energy_nuc(self):
             return self._energy_nuc
@@ -1773,6 +1813,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
         def mo_factors(self, left, right=None):
             right = left if right is None else right
+            if isinstance(self.eri_factors, OrbitalRIFactors):
+                return self.eri_factors.mo_factors(left, right)
             indices = []
             for coefficient in (left, right):
                 coefficient = np.asarray(coefficient)
@@ -1789,6 +1831,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
         def get_veff(self, dm):
             dm = np.asarray(dm)
+            if isinstance(self.eri_factors, OrbitalRIFactors):
+                return self.eri_factors.veff(dm)
             occupied = np.flatnonzero(np.any(dm != 0, axis=0) | np.any(dm != 0, axis=1))
             density = dm[np.ix_(occupied, occupied)]
             n, o = len(dm), len(occupied)
@@ -1817,6 +1861,57 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 del factors, left, right, coeff
             return potential
 
+    class _RotatedFactorRHF(_FrozenFactorRHF):
+        """Deferred real trial rotation, sharing AO-backed contraction helpers."""
+
+        def __init__(self, parent_mf, h1_mo, source, rotation, mo_coeff, memory_mb):
+            super().__init__(parent_mf, h1_mo, source, mo_coeff)
+            self._source = self._materialized
+            self._materialized = None
+            self._rotation = np.array(rotation, copy=True)
+            self._rotation.flags.writeable = False
+            self._streamed_factors = OrbitalRIFactors(
+                self._source, rotation, memory_mb=memory_mb, cache_occupied=False
+            )
+
+        @property
+        def eri_factors(self):
+            if self._materialized is None:
+                self._materialized = transform_eri_factors_to_mo_pair(
+                    self._source, self._rotation, packed=True
+                )
+                self._materialized.pair_factors.flags.writeable = False
+                self._source = self._streamed_factors = None
+            return self._materialized
+
+        @eri_factors.setter
+        def eri_factors(self, value):
+            self._materialized = value
+
+        def active_space_integrals(self, coefficients, ncore, ncas):
+            if self._materialized is not None:
+                return super().active_space_integrals(coefficients, ncore, ncas)
+            return self._active_from_source(
+                self._streamed_factors, coefficients, ncore, ncas
+            )
+
+        def mo_factors(self, left, right=None):
+            if self._materialized is not None:
+                return super().mo_factors(left, right)
+            return self._streamed_factors.mo_factors(left, right)
+
+        def get_veff(self, dm):
+            if self._materialized is not None:
+                return super().get_veff(dm)
+            return self._streamed_factors.veff(np.asarray(dm))
+
+        def generalized_fock(self, dm1, dm2):
+            if self._materialized is not None:
+                return generalized_fock_from_factors(
+                    self._h1_mo, self._materialized, dm1, dm2
+                )
+            return self._streamed_factors.generalized_fock(self._h1_mo, dm1, dm2)
+
     def _transform_frozen_integrals(self, h1_ref, eri_ref, U):
         h1 = U.conj().T @ h1_ref @ U
         if isinstance(eri_ref, IntegralBlocks):
@@ -1834,6 +1929,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
     def _transform_frozen_factor_integrals(self, h1_ref, pair_ref, U, *, out=None):
         h1 = U.conj().T @ h1_ref @ U
+        if isinstance(pair_ref, OrbitalRIFactors):
+            return h1, pair_ref.rotate(U)
         if isinstance(pair_ref, PackedRIFactors):
             return h1, transform_eri_factors_to_mo_pair(pair_ref,U,
                                                        packed=not np.iscomplexobj(U), out=out)
@@ -1966,8 +2063,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         mo_coeff,
         nstates,
         ci0=None,
+        frozen_mf=None,
     ):
-        frozen_mf = self._FrozenFactorRHF(self.mf, h1_mo, pair_factors, mo_coeff)
+        if frozen_mf is None:
+            frozen_mf = self._FrozenFactorRHF(self.mf, h1_mo, pair_factors, mo_coeff)
         mc = CASCI(
             frozen_mf,
             ncas=self.ncas,
@@ -2102,16 +2201,42 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         scale = 1.0
         best = None
         best_factors = scratch = None
+        streamed = (
+            isinstance(pair_ref, PackedRIFactors)
+            and relax_ci
+            and getattr(self, "ci_method", None) == "direct_ci"
+            and not np.iscomplexobj(U)
+        )
         minimum_decrease = max(1.0e-14, min(1.0e-10, 1.0e-5 * self.conv_tol))
         while scale >= 0.125:
             trial_U = self._apply_orbital_update(U, scale * kappa)
-            h1_trial, pair_trial = self._transform_frozen_factor_integrals(
-                h1_ref,
-                pair_ref,
-                trial_U,
-                **({"out": scratch} if scratch is not None else {}),
-            )
-            if relax_ci:
+            if streamed:
+                h1_trial = trial_U.T @ h1_ref @ trial_U
+                pair_trial = None
+                frozen = self._RotatedFactorRHF(
+                    self.mf,
+                    h1_trial,
+                    pair_ref,
+                    trial_U,
+                    self.mo_coeff_ref,
+                    self.trial_memory_mb,
+                )
+                trial_mc = self._make_factor_integral_casci(
+                    h1_trial,
+                    None,
+                    self.mo_coeff_ref,
+                    self.nstates,
+                    ci0=ci0,
+                    frozen_mf=frozen,
+                )
+            else:
+                h1_trial, pair_trial = self._transform_frozen_factor_integrals(
+                    h1_ref,
+                    pair_ref,
+                    trial_U,
+                    **({"out": scratch} if scratch is not None else {}),
+                )
+            if relax_ci and not streamed:
                 trial_mc = self._make_factor_integral_casci(
                     h1_trial,
                     pair_trial,
@@ -2119,7 +2244,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     self.nstates,
                     ci0=ci0,
                 )
-            else:
+            elif not relax_ci:
                 trial_mc = self._fixed_factor_ci_trial(
                     template_mc,
                     h1_trial,
@@ -2526,7 +2651,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         nocc_like = mc.ncore + mc.ncas
         fock = generalized_fock_from_factors(
             h1_mo,
-            pair_factors if isinstance(pair_factors,PackedRIFactors) else pair_factors[:, :, :nocc_like],
+            (
+                pair_factors
+                if isinstance(pair_factors, (PackedRIFactors, OrbitalRIFactors))
+                else pair_factors[:, :, :nocc_like]
+            ),
             dm1_occ,
             dm2_occ,
         )
@@ -5127,6 +5256,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             coupled_accept_min_ratio=self.coupled_accept_min_ratio,
             coupled_fallback=self.coupled_fallback,
             coupled_reuse_subspace=self.coupled_reuse_subspace,
+            trial_memory_mb=self.trial_memory_mb,
             orbital_parameterization=self.orbital_parameterization,
             internal_preopt_steps=self.internal_preopt_steps,
             internal_preopt_max_step=self.internal_preopt_max_step,
@@ -5305,6 +5435,10 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
 
         for macro in range(1, self.max_cycle + 1):
             mo_coeff, ci_guess = self._internal_preopt(mo_coeff, ci_guess, macro)
+            if factorized and self.coupling == "qn":
+                # CI guesses have been copied. Release the previous macro's
+                # factor owners before allocating the next reference tensor.
+                self.casci = micro_mc = checkpoint_ci = None
             self._full_derivative_cache = None
             self._integral_hessian_cache = None
             self._full_derivative_sigma_cache = None
@@ -5314,13 +5448,31 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             h1_ref = self.mf.get_hcore_mo(mo_coeff)
             if factorized:
                 source_factors = _get_mf_cholesky_factors(self.mf)
-                pair_ref = transform_eri_factors_to_mo_pair(
-                    source_factors,
-                    mo_coeff,
-                    packed=(not np.iscomplexobj(mo_coeff) and self.coupling == 'qn'
-                            and not np.iscomplexobj(getattr(source_factors,'pair_factors',source_factors))
-                            and self.ah_hessian != 'finite_difference' and self.micro_ci_mode == 'full'),
-                )
+                if (
+                    isinstance(source_factors, PackedRIFactors)
+                    and not np.iscomplexobj(mo_coeff)
+                    and self.coupling == "qn"
+                    and self.ah_hessian != "finite_difference"
+                    and self.micro_ci_mode == "full"
+                    and self.ci_method == "direct_ci"
+                ):
+                    pair_ref = OrbitalRIFactors(
+                        source_factors, mo_coeff, memory_mb=self.trial_memory_mb
+                    )
+                else:
+                    pair_ref = transform_eri_factors_to_mo_pair(
+                        source_factors,
+                        mo_coeff,
+                        packed=(
+                            not np.iscomplexobj(mo_coeff)
+                            and self.coupling == "qn"
+                            and not np.iscomplexobj(
+                                getattr(source_factors, "pair_factors", source_factors)
+                            )
+                            and self.ah_hessian != "finite_difference"
+                            and self.micro_ci_mode == "full"
+                        ),
+                    )
                 eri_ref = None
             else:
                 pair_ref = None
@@ -5353,6 +5505,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             accepted_ci = None
 
             for micro in range(1, self.max_micro_cycle + 1):
+                streamed_gradient = False
                 if factorized:
                     # Accepted roots have their own owners. Trial bookkeeping
                     # must not retain older full-factor tensors into this step.
@@ -5364,7 +5517,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     frozen = accepted_ci[1].mf
                     h1_cur = frozen._h1_mo
                     eri_cur = None if factorized else frozen.eri
-                    pair_cur = frozen.eri_factors if factorized else None
+                    streamed_gradient = (
+                        factorized
+                        and self.coupling == "qn"
+                        and self.ah_hessian != "finite_difference"
+                        and isinstance(frozen, SecondOrderCASSCF._RotatedFactorRHF)
+                    )
+                    pair_cur = (
+                        frozen.eri_factors
+                        if factorized and not streamed_gradient
+                        else None
+                    )
                 elif factorized:
                     h1_cur, pair_cur = self._transform_frozen_factor_integrals(
                         h1_ref,
@@ -5424,12 +5587,21 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                 if factorized:
                     dm1_occ, dm2_occ = self._effective_factor_rdms(mc, self.state_id)
                     nocc_like = mc.ncore + mc.ncas
-                    fock = generalized_fock_from_factors(
-                        h1_cur,
-                        pair_cur if isinstance(pair_cur,PackedRIFactors) else pair_cur[:, :, :nocc_like],
-                        dm1_occ,
-                        dm2_occ,
-                    )
+                    if streamed_gradient:
+                        fock = frozen.generalized_fock(dm1_occ, dm2_occ)
+                    else:
+                        fock = generalized_fock_from_factors(
+                            h1_cur,
+                            (
+                                pair_cur
+                                if isinstance(
+                                    pair_cur, (PackedRIFactors, OrbitalRIFactors)
+                                )
+                                else pair_cur[:, :, :nocc_like]
+                            ),
+                            dm1_occ,
+                            dm2_occ,
+                        )
                     grad = orbital_gradient(fock)
                     gnorm = self._gradient_norm(grad, mc.ncore, mc.ncas, self.nmo)
                     grad_vec = self._pack_orbitals(grad, mc.ncore, mc.ncas, self.nmo)
@@ -6334,6 +6506,11 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     micro_record["keyframe_refresh"] = "interval"
                     break
 
+            ri_storage = (
+                pair_ref.storage_info()
+                if isinstance(pair_ref, OrbitalRIFactors)
+                else None
+            )
             if factorized and self.coupling == 'qn':
                 factor_hessian_cache.clear()
                 qn_factor_hessian_cache.clear()
@@ -6355,6 +6532,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     "ci_relaxed": bool(micro_ci_relaxed),
                 }
             )
+            if ri_storage is not None:
+                self.history[-1]["ri_storage"] = ri_storage
             self._log_casscf_cycle(
                 macro,
                 micro_energy,

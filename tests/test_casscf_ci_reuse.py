@@ -30,6 +30,23 @@ def test_micro_ci_reuse_requires_solved_matching_roots(mode, coupling, converged
 
 @pytest.mark.parametrize('factorized', [False, True])
 def test_accepted_ci_reuse_matches_fresh_solves(monkeypatch, factorized):
+    if factorized:
+        from pyqed.qchem.mcscf.orbopt import generalized_fock_from_factors
+
+        # Isolate CI reuse from the separately validated streamed gradient's
+        # contraction order, just as the dense trial transforms below do.
+        monkeypatch.setattr(
+            SecondOrderCASSCF._RotatedFactorRHF,
+            "generalized_fock",
+            lambda frozen, d1, d2: generalized_fock_from_factors(
+                frozen._h1_mo, frozen.eri_factors, d1, d2
+            ),
+        )
+        monkeypatch.setattr(
+            SecondOrderCASSCF._RotatedFactorRHF,
+            "active_space_integrals",
+            lambda *args: None,
+        )
     mol = Molecule(atom='Li 0 0 0; H 0 0 1.6', unit='angstrom', basis='sto-3g')
     mol.build()
     mf = mol.RHF().run()
