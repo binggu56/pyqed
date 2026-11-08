@@ -13,18 +13,18 @@
   },
   "dependencies": {
     "3dmol": "2.5.5",
-    "next": "16.4.3",
+    "next": "16.4.5",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "@tailwindcss/postcss": "4.3.3",
+    "@tailwindcss/postcss": "4.3.4",
     "@types/node": "22.20.5",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.4.3",
-    "tailwindcss": "4.3.3",
+    "eslint-config-next": "16.4.5",
+    "tailwindcss": "4.3.4",
     "typescript": "5.9.3"
   },
   "type": "module"
