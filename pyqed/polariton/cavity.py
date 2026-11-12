@@ -6,6 +6,8 @@ Created on Tue Mar 26 17:26:02 2019
 @author: binggu
 """
 
+from copy import copy
+
 import numpy as np
 import scipy
 from scipy.sparse import lil_matrix, csr_matrix, kron, identity, linalg, issparse
@@ -401,6 +403,47 @@ def fft(t, x, freq=np.linspace(0,0.1)):
 #         return a * np.exp(-(t-delay)**2/2./sigma**2)*np.cos(omegac * (t-delay))
 
 
+def dress_cavity_integrals(mol, omega_c, coupling, q, polarization=(0, 0, 1)):
+    r"""Return a dressed molecule copy, nuclear offset, and photon potential.
+
+    For a built, symmetry-unrestricted GTO molecule with s8 ERIs, add the
+    electronic terms of the length-gauge Pauli–Fierz potential
+    :math:`(\omega_c q-\lambda\mu)^2/2` in atomic units. The returned
+    nuclear offset accounts for the scalar terms from the nuclear dipole.
+    This is the single-mode, long-wavelength form with the photon coordinate
+    clamped and photon kinetic energy omitted. See Rokaj et al.,
+    J. Phys. B 51, 034005 (2018), doi:10.1088/1361-6455/aa9c99.
+    """
+    if mol.eri_s8 is None or mol.symmetry_info is not None:
+        raise ValueError("Build the molecule with eri='s8' and symmetry disabled.")
+    direction = np.asarray(polarization, dtype=float)
+    if direction.shape != (3,) or not np.isclose(np.linalg.norm(direction), 1):
+        raise ValueError("polarization must be a unit Cartesian vector.")
+    if omega_c <= 0 or not np.all(np.isfinite([omega_c, coupling, q])):
+        raise ValueError("Require a positive frequency and finite coupling and displacement.")
+
+    position = np.einsum("x,xij->ij", direction, mol.position_integral())
+    pmol = mol.topyscf()
+    ao = mol.pyscf_ao_permutation(pmol)
+    rr = pmol.intor("int1e_rr", comp=9).reshape(3, 3, mol.nao, mol.nao)
+    position2 = np.einsum("x,y,xyij->ij", direction, direction, rr)[np.ix_(ao, ao)]
+    nuclear_dipole = mol.atom_charges() @ mol.atom_coords() @ direction
+    displacement = omega_c * q
+    centered = displacement - coupling * nuclear_dipole
+
+    dressed = copy(mol)
+    dressed.hcore = mol.hcore + coupling * centered * position + 0.5 * coupling**2 * position2
+    dressed.eri_s8 = mol.eri_s8.copy()
+    pairs = position[np.tril_indices(mol.nao)]
+    start = 0
+    for i, value in enumerate(coupling**2 * pairs, 1):
+        dressed.eri_s8[start:start + i] += value * pairs[:i]
+        start += i
+    photon = 0.5 * displacement**2
+    nuclear_offset = -displacement * coupling * nuclear_dipole + 0.5 * (coupling * nuclear_dipole)**2
+    return dressed, nuclear_offset, photon
+
+
 class Cavity():
     def __init__(self, freq, n_cav=None, x=None, decay=None, g=None):
         """
@@ -410,8 +453,8 @@ class Cavity():
         ----------
         freq : TYPE
             DESCRIPTION.
-        n_cav : TYPE, optional
-            DESCRIPTION. The default is None.
+        n_cav : int, optional
+            Fock basis size. Omit for fixed-coordinate calculations.
         x : TYPE, optional
             DESCRIPTION. The default is None.
         decay : float, optional
@@ -427,11 +470,11 @@ class Cavity():
         self.ncav = self.n_cav = n_cav
         self.n = self.dim = n_cav
 
-        self.idm = identity(n_cav)
+        self.idm = identity(n_cav) if n_cav is not None else None
         # self.create = self.get_create()
 
         # self.a = self.get_annihilate()
-        self.H = self.getH()
+        self.H = self.getH() if n_cav is not None else None
 
         # number of grid points to represent quadrature
         if x is not None:
@@ -581,26 +624,97 @@ class Cavity():
 
 
 class Polariton(Composite):
+    """Molecule–cavity system in a product basis or at fixed photon coordinates."""
 
     def __init__(self, mol, cav, g=None, gauge='length'):
+        if isinstance(mol, Mol):
+            super().__init__(mol, cav)
+        else:
+            from pyqed.qchem.mol import Molecule
 
-        super(Polariton, self).__init__(mol, cav)
-
-        assert isinstance(mol, Mol)
+            if not isinstance(mol, Molecule):
+                raise TypeError("Expected a model Mol or a GTO Molecule.")
+            if g is not None:
+                raise ValueError("Pass the length-gauge coupling to dressed_states() for a GTO molecule.")
 
         self.mol = mol
         self.cav = cav
         self._ham = self.H = None
         self.dip = None
         self.cav_leak = None
-
-        self.dims = [mol.dim, cav.n_cav]
-        self.dim = mol.dim * cav.n_cav
         self.gauge = gauge
-        #self.dm = kron(mol.dm, cav.get_dm())
-
         self._g = g
-        self.H = None
+
+    def dressed_states(
+        self, q, *, solver, coupling, polarization=(0, 0, 1), nstates=1, weights=None
+    ):
+        """Compute fixed-geometry CASSCF surfaces and overlaps for LDR.
+
+        Supply the mass-weighted photon grid `q` and length-gauge coupling
+        `coupling` (lambda) in atomic units. `solver(mf)` constructs a fresh
+        CASSCF solver from each dressed RHF reference. Multiple roots use
+        equal weights unless configured on the solver or supplied here.
+        Returns this polariton with `energies`
+        (including the nuclear offset), separate `photon_potential`, compact
+        `frames`, and dense `overlaps[i, a, j, b]` in local root order and phase.
+        """
+        from pyqed.ldr.overlap import full
+
+        if isinstance(self.mol, Mol) or self.gauge not in ("length", "dipole", "dip"):
+            raise ValueError("Dressed states require a GTO molecule and the length gauge.")
+
+        q = np.array(q, dtype=float, copy=True)
+        if q.ndim != 1 or not q.size or not np.all(np.isfinite(q)):
+            raise ValueError("q must be a nonempty finite one-dimensional grid.")
+        if not isinstance(nstates, (int, np.integer)) or nstates < 1:
+            raise ValueError("nstates must be a positive integer.")
+        if weights is not None:
+            weights = np.asarray(weights, dtype=float)
+            if weights.shape != (nstates,) or not np.all(np.isfinite(weights)):
+                raise ValueError("Supply one finite weight per root.")
+
+        frames, energies, photon_potential = [], [], []
+        for point in q:
+            dressed, offset, photon = dress_cavity_integrals(
+                self.mol, self.cav.omega, coupling, point, polarization
+            )
+            mf = dressed.RHF(verbose=0).run()
+            mc = solver(mf)
+            if weights is not None:
+                mc.state_average(weights)
+            elif nstates > 1 and mc.weights is None:
+                mc.state_average(np.ones(nstates))
+            mc.run(nstates=nstates)
+            if not mc.converged or np.size(mc.e_tot) != nstates:
+                raise RuntimeError(f"CASSCF did not converge all {nstates} roots at q={point:g}.")
+            frames.append(mc.casci.frame())
+            energies.append(np.ravel(mc.e_tot) + offset)
+            photon_potential.append(photon)
+
+        overlaps = full(frames, lambda left, right: left.overlap(right), nstates=nstates)
+        self.q, self.frames = q, tuple(frames)
+        self.energies = np.asarray(energies)
+        self.photon_potential = np.asarray(photon_potential)
+        self.overlaps = overlaps
+        return self
+
+    def LDR(
+        self, dvr, *, solver, coupling, polarization=(0, 0, 1), nstates=1, weights=None
+    ):
+        """Scan dressed states and build an LDR on a unit-mass photon DVR."""
+        from pyqed.dvr import DVR
+        from pyqed.ldr import LDR
+
+        if not isinstance(dvr, DVR) or dvr.ndim != 1 or dvr.mass[0] != 1.0:
+            raise ValueError("Use a one-dimensional DVR with mass=1 for the photon coordinate.")
+        self.dressed_states(
+            dvr.x[0], solver=solver, coupling=coupling, polarization=polarization,
+            nstates=nstates, weights=weights,
+        )
+        return LDR(
+            dvr, nstates=nstates, energies=self.energies + self.photon_potential[:, None],
+            overlaps=self.overlaps,
+        )
 
     @property
     def g(self):

@@ -846,6 +846,32 @@ class LDR:
             )
         return self.kinetic_matrix() + np.diag(diagonal)
 
+    def eigenstates(self, roots=None, *, time=0.0, matrix_free=False):
+        """Return ascending eigenvalues and column eigenvectors of the Hermitian LDR Hamiltonian.
+
+        By default return the full spectrum. With `roots`, return the lowest
+        requested states. Matrix-free iteration requires fewer than
+        `self.size - 1` roots. Each vector can be reshaped to
+        `(*self.shape, self.nstates)`.
+        """
+        if roots is not None and (
+            isinstance(roots, (bool, np.bool_))
+            or not isinstance(roots, (int, np.integer))
+            or not 1 <= roots <= self.size
+        ):
+            raise ValueError(f"roots must be an integer from 1 to {self.size}.")
+        if matrix_free:
+            if roots is None or roots >= self.size - 1:
+                raise ValueError("matrix-free diagonalization requires roots < size - 1.")
+            energies, vectors = sla.eigsh(
+                self.hamiltonian(time, matrix_free=True), k=roots, which="SA"
+            )
+            order = np.argsort(energies)
+            return energies[order], vectors[:, order]
+
+        subset = None if roots is None or roots == self.size else (0, roots - 1)
+        return scipy.linalg.eigh(self.hamiltonian(time), subset_by_index=subset)
+
     def _trace(self, time=0.0):
         if self.kinetic is None and self.axis_kinetics is not None:
             kinetic_trace = sum(
