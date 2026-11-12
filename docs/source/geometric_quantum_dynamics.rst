@@ -906,3 +906,24 @@ Related Pages
 * :doc:`pyqed.namd`
 * :doc:`tddft_ehrenfest`
 * :doc:`qchem`
+
+
+Interpolating precomputed linked LDR data
+----------------------------------------
+
+Use ``ldr.interpolate(fine_dvr)`` to build a new linked LDR from static local
+energies and complete nearest-neighbor overlaps. Both DVRs must be
+nonperiodic and use the same coordinates and masses. The default linear fit
+requires three source nodes per axis. A cubic fit requires five.
+For a sine DVR, ``ldr.interpolate(npts=(nx, ny))`` uses the outermost
+sampled nodes as walls and copies the source masses and axis names.
+``ldr.refine()`` instead keeps the source nodes and inserts a midpoint
+between each neighboring pair along every axis.
+
+The implementation synchronizes the electronic gauge, fits the local
+Hamiltonian and odd and even parts of the midpoint link logarithms, and
+rotates the interpolated data into the new local eigenbasis. It adapts the
+single-spacing fit in the saved pyrazine example and the linked-product
+formulation of Xie and Gu (https://arxiv.org/abs/2501.05003). Boundary
+midpoint fits can extrapolate by half a source cell, and the fitted links
+have no positive Gram consistency guarantee.

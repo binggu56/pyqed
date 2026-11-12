@@ -641,6 +641,68 @@ class LDR:
         self.kinetic_info = {"backend": "unbuilt"}
         return self
 
+    def refine(self, *, method="linear"):
+        """Insert one midpoint between each pair of source nodes on every axis.
+
+        The new sine DVR contains all original nodes and uses walls one
+        refined grid step outside the outermost nodes.
+        """
+        if not isinstance(self.dvr, DVR):
+            raise ValueError("Midpoint refinement requires a product DVR.")
+        bounds = [
+            (x[0] - dx / 2, x[-1] + dx / 2)
+            for x, dx in zip(self.x, self.dvr.dx)
+        ]
+        dvr = DVR(
+            bounds,
+            npts=tuple(2 * n - 1 for n in self.shape),
+            mass=self.dvr.mass,
+            names=self.dvr.names,
+        )
+        return self.interpolate(dvr, method=method)
+
+    def interpolate(self, dvr=None, *, npts=None, method="linear"):
+        """Return a linked LDR on a finer DVR in the same coordinates.
+
+        Supply a target DVR or use `npts` to construct a sine DVR with the
+        outermost source nodes as walls and the source masses and axis names.
+
+        Synchronize the electronic gauge, interpolate the local Hamiltonian
+        and midpoint link logarithms, then rotate back to local eigenstates.
+        This adapts the single-spacing fit in the saved pyrazine example and
+        the linked-product formulation of Xie and Gu (arXiv:2501.05003).
+        Link interpolation is approximate and does not ensure a positive
+        Gram matrix. Boundary link midpoints can require half-cell extrapolation.
+        """
+        from .interpolation import interpolate_linked
+
+        if (dvr is None) == (npts is None):
+            raise ValueError("Supply either a target DVR or npts.")
+        if not isinstance(self.dvr, DVR) or self.grid_periodic_axes:
+            raise ValueError("Interpolation requires nonperiodic product DVRs.")
+        if npts is not None:
+            bounds = [(axis[0], axis[-1]) for axis in self.x]
+            dvr = DVR(bounds, npts, mass=self.dvr.mass, names=self.dvr.names)
+        if not isinstance(dvr, DVR) or dvr.ndim != self.ndim or dvr.periodic_axes:
+            raise ValueError("Target must be a nonperiodic DVR with the same number of axes.")
+        if self.links is None or self.energies is None or callable(self.energies):
+            raise ValueError("Supply static local energies and nearest-neighbor links.")
+        if self.axis_kinetics is None or dvr.mass != self.dvr.mass:
+            raise ValueError("Use product DVR kinetics with the same masses on both grids.")
+        if method not in ("linear", "cubic"):
+            raise ValueError("method must be 'linear' or 'cubic'.")
+        energies, links = interpolate_linked(
+            self.dvr, dvr, self._energies(), self.links, method=method
+        )
+        return LDR(
+            dvr,
+            self.nstates,
+            energies=energies,
+            links=links,
+            average_paths=self.average_paths,
+            kinetic_backend=self.kinetic_backend,
+        )
+
     def set_diabatic(self, potential, *, representation="full", unitarize=False):
         """Diagonalize a diabatic potential field and construct local overlaps."""
 
