@@ -930,6 +930,17 @@ def test_xms_caspt2_diagonalizes_state_average_model_fock():
     xms = XMSCASPT2(mc, roots=(0, 1))
     energies = xms.run()
 
+    fock = xms._state_average_fock(np.full(2, 0.5))
+    nmo = mc.mo_coeff.shape[1]
+    bits = caspt2_module._embed_active_determinants(
+        mc.binary, int(mc.ncore), int(mc.ncas), nmo
+    )
+    dense = caspt2_module._one_body_matrix_in_determinant_space(bits, fock, fock, nmo)
+    ci = np.column_stack(mc.ci)
+    np.testing.assert_allclose(
+        xms.reference_fock_matrix, ci.T @ dense @ ci, atol=1e-12, rtol=0.0
+    )
+
     rotated_fock = (
         xms.reference_rotation.T @ xms.reference_fock_matrix @ xms.reference_rotation
     )
@@ -1125,3 +1136,62 @@ def test_multistate_molcas_auto_contractions_match_explicit_rdm(variant):
         automatic.effective_hamiltonian, explicit.effective_hamiltonian, atol=1e-12
     )
     assert all(pt.fock_contraction == "rdm" for pt in automatic.state_specific)
+
+
+@pytest.mark.parametrize("imaginary_shift,frozen_core", [(0.0, 0), (0.25, 1)])
+def test_xms_eliminates_external_doubles_with_ri(
+    imaginary_shift, frozen_core, monkeypatch
+):
+    atom = "H 0 0 0; H 0 0 .7; H 1.1 0 .1; H 1.4 .2 .8; " "H 2 -.3 .2; H 2.5 .4 .7"
+    mol = Molecule(atom=atom, basis="sto-3g", unit="angstrom").build(
+        eri="ri", auxbasis="def2-universal-jkfit"
+    )
+    mf = RHF(mol).run()
+    orbitals = mf.mo_coeff.copy()
+    angle = 0.1
+    orbitals[:, [0, 5]] = orbitals[:, [0, 5]] @ np.array(
+        [[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]]
+    )
+    mc = direct_ci.CASCI(mf, ncas=2, nelecas=2).run(
+        mo_coeff=orbitals, nstates=2, method="direct_spin0"
+    )
+    options = dict(
+        roots=(0, 1),
+        use_cholesky=True,
+        ic_basis_backend="direct",
+        direct_build_backend="shared",
+        ic_convention="molcas",
+        fock_contraction="rdm",
+        imaginary_shift=imaginary_shift,
+        frozen_core=frozen_core,
+    )
+    reference = XMSCASPT2(mc, **options)
+    reference.run()
+    transform = caspt2_module.mo_pair_factors
+    pair_shapes = []
+
+    def count_transform(factors, left, right):
+        pair_shapes.append((left.shape[1], right.shape[1]))
+        return transform(factors, left, right)
+
+    monkeypatch.setattr(caspt2_module, "mo_pair_factors", count_transform)
+    eliminated = XMSCASPT2(mc, eliminate_external_doubles=True, **options)
+    np.testing.assert_allclose(eliminated.run(), reference.e_tot, atol=1e-10, rtol=0.0)
+    np.testing.assert_allclose(
+        eliminated.effective_hamiltonian,
+        reference.effective_hamiltonian,
+        atol=1e-10,
+        rtol=0.0,
+    )
+    assert pair_shapes == [(6, 4 - frozen_core)]
+    assert [
+        root.work_estimate["active_pair_integrals_reused"]
+        for root in eliminated.state_specific
+    ] == [False, True]
+    for root in eliminated.state_specific:
+        assert root.direct_integral_backend == "cholesky_excitation_pairs"
+        assert root.work_estimate["active_pair_integral_bytes"] > 0
+        assert root.work_estimate["eliminated_external_double_groups"] == (
+            3 if frozen_core else 9
+        )
+        assert root.work_estimate["regularized_relative_residual"] < 1e-9

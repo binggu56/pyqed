@@ -182,7 +182,8 @@ class CASPT2:
         MS/XMS couplings are supported with RDM contractions.
     max_ic_operators
         Safety cap on the number of raw internally contracted excitation
-        operators before metric compression.
+        operators before metric compression. The Schur-eliminated external-double
+        class is excluded when ``eliminate_external_doubles=True``.
     ic_basis_backend
         ``"auto"`` selects dense canonical metric reduction for small spaces
         and streaming rank-revealing orthogonalization when the dense raw
@@ -221,6 +222,16 @@ class CASPT2:
         complete coupled single-state FIC space without repeated determinant
         rows. MS/XMS uses ordered transition RDMs with ``fock_contraction="rdm"``.
         The additional CVS projector is unsupported here.
+
+    eliminate_external_doubles
+        For direct shared RDM contractions, exactly eliminate the diagonal
+        two-inactive-hole/two-external-particle block by a Schur complement.
+        All interclass terms and the chosen level-shift equations are preserved.
+        With RI/Cholesky integrals, generate pair integrals from rectangular
+        factors in tiles. This is a storage and solver adaptation of
+        XMS-CASPT2 (Shiozaki et al., J. Chem. Phys. 135, 081106, 2011,
+        doi:10.1063/1.3633329), with the same zero-IPEA energy scope as the
+        shared solver. Remaining classes retain their existing storage.
 
     Notes
     -----
@@ -284,6 +295,7 @@ class CASPT2:
         fock_matrix=None,
         cvs_core_orbitals=None,
         verbose: int = 0,
+        eliminate_external_doubles: bool = False,
     ):
         self.mc = mc
         self.cvs_core_orbitals = (
@@ -318,6 +330,13 @@ class CASPT2:
                 else "operator"
             )
         self.fock_contraction = fock_contraction
+        self.eliminate_external_doubles = bool(eliminate_external_doubles)
+        if self.eliminate_external_doubles and (
+            not shared_templates or fock_contraction != "rdm"
+        ):
+            raise ValueError(
+                "External-doubles elimination requires direct shared RDM contractions."
+            )
         if fock_contraction not in ("operator", "density", "rdm"):
             raise ValueError(
                 "fock_contraction must be 'operator', 'density', or 'rdm'."
@@ -593,6 +612,23 @@ class CASPT2:
                 "no integrals or external determinants were generated."
             )
 
+        if (
+            use_direct_backend
+            and self.direct_build_backend == "shared"
+            and self.max_ic_operators is not None
+        ):
+            requested = self.work_estimate["raw_ic_operators_upper_bound"]
+            if self.eliminate_external_doubles:
+                transitions = (self._ncore - self.frozen_core) * (
+                    self._nmo - self._ncore - self._ncas
+                )
+                requested -= transitions * (transitions + 1) // 2
+            if requested > self.max_ic_operators:
+                raise MemoryError(
+                    f"Shared FIC-CASPT2 requests {requested} raw operators, "
+                    f"exceeding max_ic_operators={self.max_ic_operators}."
+                )
+
         integral_start = perf_counter()
         mo_coeff = self._mo_coeff()
         ci = np.asarray(self._ci_vector(), dtype=float)
@@ -613,11 +649,14 @@ class CASPT2:
         h1_mo = self._hcore_mo(mo_coeff)
         if use_direct_backend and self._use_cholesky():
             eri_factors = _get_mf_cholesky_factors(self.mc.mf)
-            eri_mo = np.asarray(
-                mo_pair_factors(eri_factors, mo_coeff, mo_coeff),
-                dtype=float,
-            )
-            self.direct_integral_backend = "cholesky_pair_factors"
+            if self.eliminate_external_doubles:
+                eri_mo = self._excitation_pair_factors(eri_factors, mo_coeff)
+                self.direct_integral_backend = "cholesky_excitation_pairs"
+            else:
+                eri_mo = np.asarray(
+                    mo_pair_factors(eri_factors, mo_coeff, mo_coeff), dtype=float
+                )
+                self.direct_integral_backend = "cholesky_pair_factors"
         elif (
             use_direct_backend
             and self.direct_build_backend == "shared"
@@ -1094,6 +1133,35 @@ class CASPT2:
         )
         return ReferenceIntegrals(pair, mo_coeff.T @ potential @ mo_coeff)
 
+    def _inactive_potential_mo(self, mo_coeff):
+        core = mo_coeff[:, : self._ncore]
+        mf = self.mc.mf
+        potential = (
+            _get_veff_for_dm(mf, 2 * (core @ core.T))
+            if self._ncore
+            else np.zeros((len(mo_coeff), len(mo_coeff)))
+        )
+        return mo_coeff.T @ potential @ mo_coeff
+
+    def _excitation_pair_factors(self, eri_factors, mo_coeff):
+        from .perturber_templates import ReferencePairFactors
+
+        cache = getattr(self, "_xms_pair_cache", None)
+        if cache and np.array_equal(cache["orbitals"], mo_coeff):
+            return cache["integrals"]
+        if cache is not None:
+            cache.clear()
+        occupied = mo_coeff[:, self.frozen_core : self._ncore + self._ncas]
+        # Transform the smaller right-hand space first. Real RI factors are
+        # symmetric in their two orbital indices.
+        factors = mo_pair_factors(eri_factors, mo_coeff, occupied).transpose(0, 2, 1)
+        result = ReferencePairFactors(
+            factors, self._inactive_potential_mo(mo_coeff), self.frozen_core
+        )
+        if cache is not None:
+            cache.update(orbitals=mo_coeff, integrals=result)
+        return result
+
     def _average_spinorbital_occupations(self):
         dm_a, dm_b = self._spin_rdm1_mo()
         return np.concatenate((np.diag(dm_a).real, np.diag(dm_b).real))
@@ -1416,12 +1484,6 @@ class CASPT2:
             raise NotImplementedError(
                 "Shared FIC templates require the matrix-free iterative solver."
             )
-        requested = self.work_estimate["raw_ic_operators_upper_bound"]
-        if self.max_ic_operators is not None and requested > self.max_ic_operators:
-            raise MemoryError(
-                f"Shared FIC-CASPT2 requests {requested} raw operators, "
-                f"exceeding max_ic_operators={self.max_ic_operators}."
-            )
         dm_a, dm_b = _active_spin_rdms_from_determinants(self._binary, ci)
         active = slice(self._ncore, self._ncore + self._ncas)
         reference_active_fock = float(np.sum(fock[active, active] * (dm_a + dm_b)))
@@ -1445,6 +1507,9 @@ class CASPT2:
             ic_convention=self.ic_convention,
             norm_tol=self.metric_norm_tol,
             fock_contraction=self.fock_contraction,
+            eliminate_external_doubles=self.eliminate_external_doubles,
+            direct_workers=self.direct_workers,
+            excitation_pair_cache=getattr(self, "_xms_pair_cache", None),
             transition_ci=getattr(self, "_transition_ci", None),
             progress=(
                 (lambda message: print(message, flush=True)) if self.verbose else None
@@ -1473,7 +1538,7 @@ class CASPT2:
         self.external_space_backend = self.ic_metric_backend
         self.external_kernel_backend = "spin_free_operator_coefficients"
         self.contraction_backend = "fully_internally_contracted"
-        self.linear_solver = "coupled_template_gmres"
+        self.linear_solver = result["solver"]
         self.work_estimate.update(
             {
                 "selected_backend": "direct",
@@ -1489,6 +1554,15 @@ class CASPT2:
                 "metric_eigenvalue_tol": self.lindep_tol,
                 "retained_ic_rank": result["rank"],
                 "shared_templates": result["template_count"],
+                "iterative_ic_rank": result["iterative_rank"],
+                "eliminated_external_double_groups": result["eliminated_groups"],
+                "external_double_workers": result["external_double_workers"],
+                "planned_work_vectors": result["work_vectors"],
+                "external_orbital_label_bytes": result["orbital_label_bytes"],
+                "fock_topology_bytes": result["fock_topology_bytes"],
+                "fock_graph_bytes": result["fock_graph_bytes"],
+                "active_pair_integral_bytes": result["active_pair_bytes"],
+                "active_pair_integrals_reused": result["active_pair_reused"],
                 "shared_template_rows": result["template_rows"],
                 "logical_external_rows": result["logical_rows"],
                 "external_orbital_groups": result["groups"],
@@ -2444,14 +2518,25 @@ class MSCASPT2:
             self.reference_fock_matrix = reference_fock
 
         calculations = []
+        pair_cache = (
+            {}
+            if common_fock is not None and settings.eliminate_external_doubles
+            else None
+        )
         for root in work_roots:
             options = dict(self.caspt2_options)
             if common_fock is not None:
                 options["fock_matrix"] = common_fock
             pt = CASPT2(work_mc, root=root, **options)
             pt._transition_ci = [np.asarray(work_mc.ci[k]) for k in work_roots]
-            pt.run()
+            pt._xms_pair_cache = pair_cache
+            try:
+                pt.run()
+            finally:
+                del pt._xms_pair_cache
             calculations.append(pt)
+        if pair_cache is not None:
+            pair_cache.clear()
 
         if calculations[0].direct_build_backend == "shared":
             transition = np.column_stack(
@@ -2564,19 +2649,16 @@ class MSCASPT2:
 
     def _model_space_fock(self, fock, ci_matrix):
         probe = CASPT2(self.mc, root=self.roots[0])
-        ref_bits = _embed_active_determinants(
-            probe._binary,
-            probe._ncore,
-            probe._ncas,
-            probe._nmo,
+        ncore, ncas = probe._ncore, probe._ncas
+        active = slice(ncore, ncore + ncas)
+        active_fock = fock[active, active]
+        ref_bits = _embed_active_determinants(probe._binary, 0, ncas, ncas)
+        action, _ = _one_body_sparse_matrix_in_determinant_space(
+            ref_bits, active_fock, active_fock, ncas
         )
-        fock_determinants = _one_body_matrix_in_determinant_space(
-            ref_bits,
-            fock,
-            fock,
-            probe._nmo,
-        )
-        model_fock = ci_matrix.T @ fock_determinants @ ci_matrix
+        # The inactive shell is a scalar on every CAS determinant.
+        inactive_fock = 2 * np.trace(fock[:ncore, :ncore])
+        model_fock = ci_matrix.T @ (action @ ci_matrix + inactive_fock * ci_matrix)
         return 0.5 * (model_fock + model_fock.T)
 
 

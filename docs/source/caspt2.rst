@@ -204,6 +204,137 @@ complete active CI within that sector and the tensor or online direct builder.
 The shared builder and multistate CVS mixing do not support this extra
 projector. This projected Fock-PT2 adaptation is not RMS-RASPT2.
 
+Tiled elimination of external doubles
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The shared RDM solver can eliminate the class with two holes in correlated
+inactive orbitals and two particles in external virtual orbitals.
+
+.. code-block:: python
+
+    xms = XMSCASPT2(
+        mc, roots=roots, frozen_core=nfrozen, use_cholesky=True,
+        ic_basis_backend='direct', direct_build_backend='shared',
+        fock_contraction='rdm', ic_convention='molcas',
+        eliminate_external_doubles=True, max_ic_operators=None,
+        max_memory_mb=workspace_mib,
+    )
+    xms.run()
+
+In the semicanonical orbital basis this class has a diagonal within-class
+operator. The solver takes its exact Schur complement, retaining the
+off-diagonal Fock couplings to the other classes. It constructs direct and
+exchange integral tiles from rectangular RI/Cholesky factors and recovers
+external-double amplitudes only within a tile. The same replay accumulates
+the unshifted Hylleraas energy, the XMS state-interaction terms, and the
+full-equation residual. The amplitude equations use the same level shifts
+as the original shared solver. A singular coupled diagonal block requires
+an imaginary shift. This adapts the storage and linear algebra
+of zero-IPEA XMS-CASPT2 (Shiozaki et al., J. Chem. Phys. **135**, 081106
+(2011), `doi:10.1063/1.3633329 <https://doi.org/10.1063/1.3633329>`_).
+The blocked RI integral evaluation follows the pair-factor representation
+used for CASPT2 by Aquilante et al., J. Chem. Phys. **131**, 034113 (2009),
+`doi:10.1063/1.3157463 <https://doi.org/10.1063/1.3157463>`_.
+Fock couplings that share a virtual index use batched matrix products within
+each integral tile. During the iterative solve, a compiled loop applies the Schur feedback
+using shared Fock blocks and implicit pair indices. Large applications use
+the ``direct_workers`` budget. Each round contains disjoint occupied pairs,
+so workers accumulate into the output without copying the Krylov vector.
+``external_doubles_matvec_s`` measures this step over the solve. The transition
+corrections reuse each integral batch over
+all bra roots. XMS roots in the same pseudocanonical orbital frame share the
+rectangular RI transform. Its occupied-side indices include the correlated
+inactive and active orbitals.
+
+The shared Schur equations are real symmetric for both the unshifted and
+blockwise imaginary-shift forms. The reduced solve uses a buffer-reusing adaptation of MINRES with a
+positive diagonal preconditioner and checks the actual residual. The short
+recurrence of Paige and Saunders, SIAM J. Numer. Anal. **12**, 617--629
+(1975), `doi:10.1137/0712047 <https://doi.org/10.1137/0712047>`_, avoids a
+full stored Krylov basis. PyQED reserves the equivalent of 10 full-length
+vectors for the reduced solve, including the RHS, recurrence buffers, and
+temporary vectors. The unshifted and shifted action diagonals are reconstructed in
+bounded blocks from separate hole, virtual, and active energy arrays, rather
+than stored as full-length vectors. The positive diagonal preconditioner
+uses the same block generator, so it also needs no full-length storage.
+The Hamiltonian RHS is built directly into one packed buffer. During MINRES,
+this buffer holds the Schur RHS; afterward the original Hamiltonian RHS is
+regenerated into it for energies and full-equation checks. This trades an
+additional retained-RHS construction for one fewer live vector. Final residual
+norms are accumulated in blocks from the unshifted action and the exact
+shifted-minus-unshifted diagonal correction, without full residual arrays.
+MINRES scales its oldest Lanczos residual and accumulates the next Schur
+operator product directly into that buffer. Two rotating buffers hold the
+previous residual and current preconditioned Lanczos vector. After the solution
+update, the latter is converted back to its unpreconditioned residual using
+the diagonal and Lanczos normalization. This removes both a separate
+matrix-vector output and a separate preconditioned-residual allocation. The
+true residual is still recomputed independently before accepting convergence.
+The initial guess retains the signed denominators. Recurrence updates reuse the initial guess and two direction buffers,
+and array temporaries are limited to 65,536 entries. Residual restarts use the
+original equation, and inconsistent singular systems are rejected rather than
+accepted as least-squares solutions. Orbital groups store separate compact hole and virtual axes. The
+builder derives product rows by indexing those axes.
+
+Every retained two-body excitation has an active orbital index. For the RI
+path, matrix products assemble only the Gram block between transition pairs
+with an active index and all allowed transition pairs. Ket and bra projections
+look up the same integrals. XMS roots in the same orbital frame share this
+block. Before MINRES, the block is released because the Schur action uses RI
+factors directly. It is rebuilt after the solve for RHS restoration and
+transition couplings, preventing overlap with the Krylov workspace. The memory
+estimate takes the maximum of the solve and projection stages instead of
+adding their allocations. This adds a Gram-block reconstruction per solve. When the block and its construction workspace exceed the solver
+budget, the solver evaluates the requested pair contractions on demand.
+The eliminated external-double class still evaluates its integral tiles
+directly from the RI factors.
+
+This option retains the requested virtual space and avoids a class-sized
+label list, integral array, amplitude vector and Fock graph. The retained
+Fock graph skips insertions into absent classes before allocating candidate
+edge arrays. It generates the remaining insertions in bounded batches and
+computes row indices directly from the orbital axes. The reduced solver
+stores the active transition matrices per pair of templates and insertion
+pattern. During a bounded discovery pass it caches external row, column, and
+insertion labels only while they fit a 16 MiB cap. The cap is reduced to at
+most one quarter of the workspace remaining after graph-generation and
+transition-construction reserves. If the cap is exceeded, cached batches are
+discarded and external labels are regenerated in batches of at most 16,384
+candidates at each action. The cache is also discarded if active matrices
+need that memory. Thus small graphs avoid repeated edge generation while
+large graphs retain bounded edge storage. Active orbitals share the indices
+and read Fock weights from the orbital matrix. The per-solve cache does not
+persist across roots; the assembled reference path retains its separate cache.
+The action shares projections onto the smaller active rank when they fit
+two fixed scratch panels. Larger blocks use batches of edges, gathering and
+projecting only the current batch in each direction. Both paths retain all
+couplings, including repeated edge indices. Each panel holds at most 65,536
+values (or one active row if larger); a third panel-equivalent is reserved
+for gather/product temporaries. Scratch no longer scales with orbital groups.
+Batching may repeat projections and increase runtime. ``fock_topology_bytes`` reports the
+persistent edge indices (zero when the adaptive Schur path selects streaming), while
+``fock_graph_bytes`` includes active matrices and the bounded edge-generation
+and contraction workspace. The assembled reference path still stores edges.
+Evaluating
+the tiles still requires quartic pair work. The other classes retain their
+existing storage and can dominate the workspace. The raw-operator cap,
+when set, applies to those remaining classes. The workspace budget covers
+the contracted solver and tile workspace and excludes input integrals and
+the AO-to-MO transformation. Each root reports
+``eliminated_external_double_groups`` and ``iterative_ic_rank`` in
+``work_estimate``. ``retained_ic_rank`` still counts the full contracted
+rank. Shifted and unshifted coupled comparisons and a two-root molecular RI
+test cover this option. TDI-scale runtime and peak memory are unmeasured.
+
+A matched two-root naphthalene/cc-pVDZ CAS(8,8) benchmark, with four workers
+and single-threaded BLAS, measured 15.65 seconds and 1.09 GiB peak RSS with
+the adaptive edge cache. Unconditional streaming took 17.44 seconds and
+1.08 GiB. The effective Hamiltonian was identical at stored precision and
+full relative residuals stayed below 9e-13. The cache selected 4.78 MiB of
+edge indices; graphs exceeding its memory cap are streamed. These are
+single-run comparisons, not TDI-scale measurements. Process RSS includes
+allocations outside the solver workspace budget.
+
 Diagnostics and validation
 --------------------------
 
