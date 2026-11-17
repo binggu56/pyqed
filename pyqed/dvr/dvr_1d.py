@@ -1142,12 +1142,15 @@ class FEDVR(DVR):
 class LegendreDVR(DVR):
     r"""Gauss-Legendre DVR on a finite interval.
 
-    This DVR is useful for bounded angular coordinates.  The grid points are
-    the Gauss-Legendre quadrature nodes mapped from ``[-1, 1]`` to
-    ``[xmin, xmax]``.  Coordinate-dependent operators are diagonal on this
-    grid.  The derivative/momentum operators are represented with the
+    The grid points are the Gauss-Legendre quadrature nodes mapped from
+    ``[-1, 1]`` to ``[xmin, xmax]``.  Coordinate-dependent operators are diagonal
+    on this grid.  The derivative/momentum operators are represented with the
     Lagrange-cardinal differentiation matrix in the quadrature-normalized DVR
-    basis.
+    basis.  The coordinate measure is ``dx``.  :meth:`t` uses a flat-coordinate
+    kinetic-energy quadratic form with natural (Neumann) boundary conditions;
+    it is not the angular rotor operator merely because the nodes are Legendre
+    nodes.  Angular metrics must be supplied separately, for example in the
+    triatomic metric-weighted momentum construction.
     """
 
     def __init__(self, xmin, xmax, npts, mass=1.0):
@@ -1171,9 +1174,7 @@ class LegendreDVR(DVR):
         self.w = scale * wy
         self.dx = float(np.mean(self.w))
         self.k_max = None
-        self.v = None
         self._D = None
-        self._D2 = None
         self.T = None
 
     @property
@@ -1206,16 +1207,35 @@ class LegendreDVR(DVR):
         return self._D
 
     def t(self, hc=1.0, mc2=None):
+        r"""Return the flat-coordinate kinetic energy in the polynomial basis.
+
+        The Galerkin quadratic form is
+
+        .. math::
+
+            T_{ij} = \frac{\hbar^2}{2m}
+                \int_{x_{\min}}^{x_{\max}} f_i'(x)^* f_j'(x)\,dx.
+
+        Gauss-Legendre quadrature integrates these polynomial products exactly,
+        giving ``D.conj().T @ D`` in the quadrature-normalized basis.  This is
+        positive semidefinite and has the constant function as a zero mode.
+        The unrestricted polynomial trial space imposes natural Neumann
+        boundary conditions in the variational limit, not hard-wall Dirichlet
+        conditions.  Use ``SineDVR`` for a hard-wall flat-coordinate interval.
+        Squaring the cardinal derivative and then symmetrizing does not impose
+        either boundary condition and can produce negative kinetic energies.
+
+        By default atomic units are used (``hc=1`` and ``self.mass``).  When
+        ``mc2`` is supplied the prefactor is ``hc**2 / (2 * mc2)``, preserving
+        the existing energy/length unit convention.  This method does not add
+        an angular metric: for ``x = cos(theta)`` the m=0 rotor instead needs
+        ``D.conj().T @ diag(1 - x**2) @ D / (2 * I)`` in atomic units.
+        """
         D = self._differentiation_matrix()
-        D2 = D @ D
-        self._D2 = D2
-        T = -0.5 / self.mass * D2
-        if hc != 1.0 or mc2 is not None:
-            scale = hc ** 2
-            if mc2 is not None:
-                scale *= self.mass / mc2
-            T = scale * T
-        self.T = 0.5 * (T + T.conj().T)
+        mass = self.mass if mc2 is None else mc2
+        if not np.isfinite(mass) or mass <= 0:
+            raise ValueError("The kinetic-energy mass must be finite and positive.")
+        self.T = (hc ** 2 / (2 * mass)) * (D.conj().T @ D)
         return self.T
 
     def momentum(self):
