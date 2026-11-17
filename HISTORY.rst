@@ -5,6 +5,16 @@ History
 Unreleased
 ----------
 
+* Corrected ``LegendreDVR.t()`` to use the positive-semidefinite derivative
+  quadratic form, rather than symmetrizing the squared cardinal derivative.
+  Its flat-coordinate convention is now explicitly documented as natural
+  Neumann boundaries. This changes previously incorrect kinetic energies;
+  it does not supply the angular rotor metric or hard-wall boundaries.
+  The grid, basis and momentum operator (including triatomic callers) are
+  unchanged.
+* Removed a stale ``LegendreDVR`` potential placeholder that shadowed the
+  inherited ``v(V)`` method and broke ``h(V)`` and ``run(V)``.
+
 0.3.0 (2026-09-02)
 ------------------
 
