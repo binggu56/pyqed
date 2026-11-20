@@ -684,14 +684,13 @@ class Polariton(Composite):
         return at_coordinate
 
     def dressed_states(
-        self, q, *, solver, coupling, polarization=(0, 0, 1), nstates=1, weights=None
+        self, q, *, solver, coupling, polarization=(0, 0, 1)
     ):
         """Compute fixed-geometry CASSCF surfaces and overlaps for LDR.
 
         Supply the mass-weighted photon grid `q` and length-gauge coupling
         `coupling` (lambda) in atomic units. `solver(mf)` constructs a fresh
-        CASSCF solver from each dressed RHF reference. Multiple roots use
-        equal weights unless configured on the solver or supplied here.
+        CASSCF solver from each dressed RHF reference. Configure weights and nroots on that solver.
         Returns this polariton with `energies`
         (including the nuclear offset), separate `photon_potential`, compact
         `frames`, and dense `overlaps[i, a, j, b]` in local root order and phase.
@@ -704,31 +703,21 @@ class Polariton(Composite):
         q = np.array(q, dtype=float, copy=True)
         if q.ndim != 1 or not q.size or not np.all(np.isfinite(q)):
             raise ValueError("q must be a nonempty finite one-dimensional grid.")
-        if not isinstance(nstates, (int, np.integer)) or nstates < 1:
-            raise ValueError("nstates must be a positive integer.")
-        if weights is not None:
-            weights = np.asarray(weights, dtype=float)
-            if weights.shape != (nstates,) or not np.all(np.isfinite(weights)):
-                raise ValueError("Supply one finite weight per root.")
-
         electronic = self.electronic_hamiltonian(coupling=coupling, polarization=polarization)
         frames, energies, photon_potential = [], [], []
         for point in q:
             local = electronic(point)
             mf = local.RHF(verbose=0).run()
-            mc = solver(mf)
-            if weights is not None:
-                mc.state_average(weights)
-            elif nstates > 1 and mc.weights is None:
-                mc.state_average(np.ones(nstates))
-            mc.run(nstates=nstates)
-            if not mc.converged or np.size(mc.e_tot) != nstates:
-                raise RuntimeError(f"CASSCF did not converge all {nstates} roots at q={point:g}.")
+            mc = solver(mf).run()
+            if not mc.converged:
+                raise RuntimeError(f"CASSCF did not converge at q={point:g}.")
+            if energies and np.size(mc.e_tot) != energies[0].size:
+                raise ValueError("The solver must return the same root count at every photon point.")
             frames.append(mc.casci.frame())
             energies.append(np.ravel(mc.e_tot) + local.nuclear_dipole_energy)
             photon_potential.append(local.photon_potential)
 
-        overlaps = full(frames, lambda left, right: left.overlap(right), nstates=nstates)
+        overlaps = full(frames, lambda left, right: left.overlap(right), nstates=energies[0].size)
         self.q, self.frames = q, tuple(frames)
         self.energies = np.asarray(energies)
         self.photon_potential = np.asarray(photon_potential)
@@ -736,7 +725,7 @@ class Polariton(Composite):
         return self
 
     def LDR(
-        self, dvr, *, solver, coupling, polarization=(0, 0, 1), nstates=1, weights=None
+        self, dvr, *, solver, coupling, polarization=(0, 0, 1)
     ):
         """Scan dressed states and build an LDR on a unit-mass photon DVR."""
         from pyqed.dvr import DVR
@@ -746,10 +735,9 @@ class Polariton(Composite):
             raise ValueError("Use a one-dimensional DVR with mass=1 for the photon coordinate.")
         self.dressed_states(
             dvr.x[0], solver=solver, coupling=coupling, polarization=polarization,
-            nstates=nstates, weights=weights,
         )
         return LDR(
-            dvr, nstates=nstates, energies=self.energies + self.photon_potential[:, None],
+            dvr, nstates=self.energies.shape[1], energies=self.energies + self.photon_potential[:, None],
             overlaps=self.overlaps,
         )
 

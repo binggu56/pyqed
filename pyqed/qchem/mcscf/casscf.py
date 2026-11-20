@@ -381,8 +381,8 @@ class FirstOrderCASSCF:
         weights = np.asarray(weights, dtype=float)
         if weights.ndim != 1 or weights.size == 0:
             raise ValueError("weights must be a non-empty 1D array.")
-        if np.any(weights < 0):
-            raise ValueError("state-average weights must be non-negative.")
+        if not np.all(np.isfinite(weights)) or np.any(weights < 0):
+            raise ValueError("state-average weights must be finite and non-negative.")
         total = float(np.sum(weights))
         if total <= 0.0:
             raise ValueError("state-average weights must sum to a positive value.")
@@ -1489,6 +1489,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         exact_state_specific_gradient=False,
         max_cycles=None,
         verbose=0,
+        weights=None,
+        nroots=None,
     ):
         if max_cycles is not None:
             if int(max_cycle) != 50 and int(max_cycle) != int(max_cycles):
@@ -1531,6 +1533,13 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             max_cycles=None,
             verbose=verbose,
         )
+        if weights is not None:
+            self.state_average(weights)
+        if nroots is not None and (
+            isinstance(nroots, bool) or not isinstance(nroots, (int, np.integer)) or nroots < 1
+        ):
+            raise ValueError("nroots must be a positive integer.")
+        self.nroots = nroots
         self.max_micro_cycle = int(max_micro_cycle)
         self.ah_pspace_size = int(ah_pspace_size)
         self.ah_pspace_max_cycle = int(ah_pspace_max_cycle)
@@ -5393,6 +5402,8 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
                     )
                 )
 
+        if self.nroots is not None and self.nroots < nstates:
+            raise ValueError("nroots must include all orbital-optimization states.")
         self.nstates = int(nstates)
         self.state_id = int(state_id)
         self.history = []
@@ -6621,8 +6632,7 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
             if active_orbitals is None and finite_energies:
                 self._try_active_restarts(initial_mo_coeff, min(finite_energies))
             if self.converged:
-                self._finalize_spin_diagnostics()
-                return self
+                return self._finish_ci()
             self.mo_coeff = np.array(mo_coeff, copy=True)
             self.casci = self._make_casci(
                 self.mo_coeff,
@@ -6659,6 +6669,17 @@ class SecondOrderCASSCF(FirstOrderCASSCF):
         self.ncore = self.casci.ncore
         if active_orbitals is None:
             self._try_active_restarts(initial_mo_coeff, float(np.ravel(self.e_tot)[0]))
+        return self._finish_ci()
+
+    def _finish_ci(self):
+        """Return the requested CI spectrum on the optimized orbitals."""
+        if self.nroots is not None and self.nroots > self.nstates:
+            self.converged = False
+            self.casci = self._make_casci(self.mo_coeff, nstates=self.nroots)
+            self._require_converged_ci(self.casci, self.nroots)
+            self.ci = self.casci.ci
+            self.e_tot = self.casci.e_tot
+            self.converged = True
         self._finalize_spin_diagnostics()
         return self
 
