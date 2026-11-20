@@ -406,20 +406,30 @@ def fft(t, x, freq=np.linspace(0,0.1)):
 def dress_cavity_integrals(mol, omega_c, coupling, q, polarization=(0, 0, 1)):
     r"""Return a dressed molecule copy, nuclear offset, and photon potential.
 
-    For a built, symmetry-unrestricted GTO molecule with s8 ERIs, add the
+    For a built, symmetry-unrestricted GTO molecule with s8 ERIs or RI factors, add the
     electronic terms of the length-gauge Pauli–Fierz potential
     :math:`(\omega_c q-\lambda\mu)^2/2` in atomic units. The returned
     nuclear offset accounts for the scalar terms from the nuclear dipole.
     This is the single-mode, long-wavelength form with the photon coordinate
-    clamped and photon kinetic energy omitted. See Rokaj et al.,
+    clamped and photon kinetic energy omitted. This adaptation retains any
+    Coulomb RI approximation and adds the dipole self-energy as an exact
+    extra factor, without fitting it. See Rokaj et al.,
     J. Phys. B 51, 034005 (2018), doi:10.1088/1361-6455/aa9c99.
     """
-    if mol.eri_s8 is None or mol.symmetry_info is not None:
-        raise ValueError("Build the molecule with eri='s8' and symmetry disabled.")
+    prepared, position, nuclear_dipole = _prepare_cavity_integrals(
+        mol, omega_c, coupling, polarization
+    )
+    return _cavity_at_coordinate(prepared, position, nuclear_dipole, omega_c, coupling, q)
+
+
+def _prepare_cavity_integrals(mol, omega_c, coupling, polarization):
+    factors = getattr(mol, 'eri_factors', None)
+    if (mol.eri_s8 is None and factors is None) or mol.symmetry_info is not None:
+        raise ValueError("Build with eri='s8' or eri='ri' and symmetry disabled.")
     direction = np.asarray(polarization, dtype=float)
     if direction.shape != (3,) or not np.isclose(np.linalg.norm(direction), 1):
         raise ValueError("polarization must be a unit Cartesian vector.")
-    if omega_c <= 0 or not np.all(np.isfinite([omega_c, coupling, q])):
+    if omega_c <= 0 or not np.all(np.isfinite([omega_c, coupling])):
         raise ValueError("Require a positive frequency and finite coupling and displacement.")
 
     position = np.einsum("x,xij->ij", direction, mol.position_integral())
@@ -428,17 +438,28 @@ def dress_cavity_integrals(mol, omega_c, coupling, q, polarization=(0, 0, 1)):
     rr = pmol.intor("int1e_rr", comp=9).reshape(3, 3, mol.nao, mol.nao)
     position2 = np.einsum("x,y,xyij->ij", direction, direction, rr)[np.ix_(ao, ao)]
     nuclear_dipole = mol.atom_charges() @ mol.atom_coords() @ direction
-    displacement = omega_c * q
-    centered = displacement - coupling * nuclear_dipole
-
     dressed = copy(mol)
-    dressed.hcore = mol.hcore + coupling * centered * position + 0.5 * coupling**2 * position2
-    dressed.eri_s8 = mol.eri_s8.copy()
+    dressed.hcore = mol.hcore - coupling**2 * nuclear_dipole * position + 0.5 * coupling**2 * position2
     pairs = position[np.tril_indices(mol.nao)]
-    start = 0
-    for i, value in enumerate(coupling**2 * pairs, 1):
-        dressed.eri_s8[start:start + i] += value * pairs[:i]
-        start += i
+    if factors is not None:
+        extra = coupling * (pairs if factors.ndim == 2 else position)
+        dressed.eri_factors = np.concatenate((factors, extra[None]), axis=0)
+        dressed.eri = dressed.eri_s4 = dressed.eri_s8 = None
+    else:
+        dressed.eri_s8 = mol.eri_s8.copy()
+        start = 0
+        for i, value in enumerate(coupling**2 * pairs, 1):
+            dressed.eri_s8[start:start + i] += value * pairs[:i]
+            start += i
+    return dressed, position, nuclear_dipole
+
+
+def _cavity_at_coordinate(prepared, position, nuclear_dipole, omega_c, coupling, q):
+    if not np.isfinite(q):
+        raise ValueError("Require a finite photon displacement.")
+    displacement = omega_c * q
+    dressed = copy(prepared)
+    dressed.hcore = prepared.hcore + coupling * displacement * position
     photon = 0.5 * displacement**2
     nuclear_offset = -displacement * coupling * nuclear_dipole + 0.5 * (coupling * nuclear_dipole)**2
     return dressed, nuclear_offset, photon
@@ -673,10 +694,13 @@ class Polariton(Composite):
             if weights.shape != (nstates,) or not np.all(np.isfinite(weights)):
                 raise ValueError("Supply one finite weight per root.")
 
+        prepared, position, nuclear_dipole = _prepare_cavity_integrals(
+            self.mol, self.cav.omega, coupling, polarization
+        )
         frames, energies, photon_potential = [], [], []
         for point in q:
-            dressed, offset, photon = dress_cavity_integrals(
-                self.mol, self.cav.omega, coupling, point, polarization
+            dressed, offset, photon = _cavity_at_coordinate(
+                prepared, position, nuclear_dipole, self.cav.omega, coupling, point
             )
             mf = dressed.RHF(verbose=0).run()
             mc = solver(mf)
