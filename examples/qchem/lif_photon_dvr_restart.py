@@ -9,7 +9,7 @@ from pyscf import gto, lib
 from pyqed import num_workers
 from pyqed.dvr import DVR
 from pyqed.ldr.overlap import full
-from pyqed.polariton.cavity import _cavity_at_coordinate, _prepare_cavity_integrals
+from pyqed.polariton.cavity import Cavity, Polariton
 from pyqed.qchem import Molecule
 from pyqed.qchem.mcscf.casscf import CASSCF
 from pyqed.units import eV
@@ -31,14 +31,14 @@ def main():
     basis = {atom: gto.basis.load("aug-cc-pVQZ", atom) for atom in ("Li", "F")}
     mol = Molecule(atom="Li 0 0 0; F 0 0 1.55", basis=basis, unit="angstrom")
     mol.build(eri="ri", auxbasis="def2-universal-jkfit", workers=num_workers())
-    prepared = _prepare_cavity_integrals(mol, omega, coupling, (0, 0, 1))
+    electronic = Polariton(mol, Cavity(omega)).electronic_hamiltonian(coupling=coupling)
     limit = args.box / np.sqrt(omega)
     dvr = DVR([(-limit, limit)], [args.nodes], mass=1)
     with np.load(args.checkpoints / "scan.npz") as previous:
         old_x = previous["x"]
     frames, energies, potentials = [], [], []
     for i, q in enumerate(dvr.x[0]):
-        dressed, offset, photon = _cavity_at_coordinate(*prepared, omega, coupling, q)
+        dressed, offset, photon = electronic(q)
         nearest = np.argmin(abs(old_x - np.sqrt(omega) * q))
         with np.load(args.checkpoints / f"state_{nearest:02d}.npz") as checkpoint:
             orbitals, ci = checkpoint["mo_coeff"], list(checkpoint["ci"])

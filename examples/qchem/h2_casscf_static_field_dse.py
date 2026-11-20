@@ -3,7 +3,7 @@
 import numpy as np
 from pyqed.qchem import Molecule
 from pyqed.qchem.mcscf.casscf import CASSCF
-from pyqed.polariton.cavity import dress_cavity_integrals
+from pyqed.polariton.cavity import Cavity, Polariton
 from pyqed.units import eV
 
 
@@ -19,7 +19,7 @@ def calculate(q, coupling=COUPLING):
     ao = mol.pyscf_ao_permutation(pmol)
     z2 = pmol.intor("int1e_rr", comp=9)[8][np.ix_(ao, ao)]
 
-    mol, offset, _ = dress_cavity_integrals(mol, OMEGA_C, coupling, q)
+    mol, offset, _ = Polariton(mol, Cavity(OMEGA_C)).electronic_hamiltonian(coupling=coupling)(q)
 
     mc = CASSCF(mol.RHF(verbose=0).run(), 2, 2, verbose=0).run()
     if not mc.converged:

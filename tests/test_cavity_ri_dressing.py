@@ -5,7 +5,7 @@ import pytest
 from pyscf import ao2mo
 
 from pyqed.qchem import Molecule
-from pyqed.polariton.cavity import dress_cavity_integrals
+from pyqed.polariton.cavity import Cavity, Polariton
 
 
 @pytest.mark.parametrize('packed', [False, True])
@@ -24,8 +24,9 @@ def test_ri_dressing_matches_same_integrals_packed(packed):
     else:
         mol.eri_factors = factors
     original = mol.eri_factors.copy()
-    dressed, offset, photon = dress_cavity_integrals(mol, .24, -.15, -1.9)
-    exact, offset_ref, photon_ref = dress_cavity_integrals(reference, .24, -.15, -1.9)
+    point = Polariton(mol, Cavity(.24)).electronic_hamiltonian(coupling=-.15)(-1.9)
+    dressed, offset, photon = point
+    exact, offset_ref, photon_ref = Polariton(reference, Cavity(.24)).electronic_hamiltonian(coupling=-.15)(-1.9)
     out = dressed.eri_factors
     if packed:
         from pyscf import lib
@@ -36,7 +37,7 @@ def test_ri_dressing_matches_same_integrals_packed(packed):
     np.testing.assert_allclose(dressed.hcore, exact.hcore)
     assert (offset, photon) == (offset_ref, photon_ref)
     assert dressed.eri_s8 is None
-    e_ri = dressed.RHF(verbose=0).run().e_tot
+    e_ri = point.RHF(verbose=0).run().e_tot
     e_ref = exact.RHF(verbose=0).run().e_tot
     np.testing.assert_allclose(e_ri, e_ref, atol=1e-9)
     from pyqed.qchem.mcscf.casscf import CASSCF
@@ -59,7 +60,7 @@ def test_scan_reuses_dressing_without_changing_coordinates():
     hcore = prepared.hcore.copy()
     for q in (-2., 0., 3.):
         dressed, offset, photon = _cavity_at_coordinate(prepared, position, nuclear, .24, -.15, q)
-        reference, ref_offset, ref_photon = dress_cavity_integrals(mol, .24, -.15, q)
+        reference, ref_offset, ref_photon = Polariton(mol, Cavity(.24)).electronic_hamiltonian(coupling=-.15)(q)
         assert dressed.eri_factors is prepared.eri_factors
         np.testing.assert_allclose(dressed.hcore, reference.hcore)
         assert (offset, photon) == (ref_offset, ref_photon)

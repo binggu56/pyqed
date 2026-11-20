@@ -6,6 +6,7 @@ Created on Tue Mar 26 17:26:02 2019
 @author: binggu
 """
 
+from typing import NamedTuple
 from copy import copy
 
 import numpy as np
@@ -403,23 +404,16 @@ def fft(t, x, freq=np.linspace(0,0.1)):
 #         return a * np.exp(-(t-delay)**2/2./sigma**2)*np.cos(omegac * (t-delay))
 
 
-def dress_cavity_integrals(mol, omega_c, coupling, q, polarization=(0, 0, 1)):
-    r"""Return a dressed molecule copy, nuclear offset, and photon potential.
+class PhotonCoordinate(NamedTuple):
+    """Molecular Hamiltonian and additive energies at fixed photon displacement."""
 
-    For a built, symmetry-unrestricted GTO molecule with s8 ERIs or RI factors, add the
-    electronic terms of the length-gauge Pauli–Fierz potential
-    :math:`(\omega_c q-\lambda\mu)^2/2` in atomic units. The returned
-    nuclear offset accounts for the scalar terms from the nuclear dipole.
-    This is the single-mode, long-wavelength form with the photon coordinate
-    clamped and photon kinetic energy omitted. This adaptation retains any
-    Coulomb RI approximation and adds the dipole self-energy as an exact
-    extra factor, without fitting it. See Rokaj et al.,
-    J. Phys. B 51, 034005 (2018), doi:10.1088/1361-6455/aa9c99.
-    """
-    prepared, position, nuclear_dipole = _prepare_cavity_integrals(
-        mol, omega_c, coupling, polarization
-    )
-    return _cavity_at_coordinate(prepared, position, nuclear_dipole, omega_c, coupling, q)
+    molecule: object
+    nuclear_dipole_energy: float
+    photon_potential: float
+
+    def RHF(self, **kwargs):
+        """Construct an RHF solver for this photon displacement."""
+        return self.molecule.RHF(**kwargs)
 
 
 def _prepare_cavity_integrals(mol, omega_c, coupling, polarization):
@@ -461,8 +455,8 @@ def _cavity_at_coordinate(prepared, position, nuclear_dipole, omega_c, coupling,
     dressed = copy(prepared)
     dressed.hcore = prepared.hcore + coupling * displacement * position
     photon = 0.5 * displacement**2
-    nuclear_offset = -displacement * coupling * nuclear_dipole + 0.5 * (coupling * nuclear_dipole)**2
-    return dressed, nuclear_offset, photon
+    nuclear_dipole_energy = -displacement * coupling * nuclear_dipole + 0.5 * (coupling * nuclear_dipole)**2
+    return PhotonCoordinate(dressed, nuclear_dipole_energy, photon)
 
 
 class Cavity():
@@ -666,6 +660,29 @@ class Polariton(Composite):
         self.gauge = gauge
         self._g = g
 
+    def electronic_hamiltonian(self, *, coupling, polarization=(0, 0, 1)):
+        """Prepare the electronic Hamiltonian as a function of photon coordinate Q.
+
+        Call the returned function with a mass-weighted displacement in atomic units.
+        Its molecule can be passed to RHF/CASSCF. Add nuclear_dipole_energy to the
+        electronic total energies and photon_potential once when building the DVR.
+        Coordinates share the prepared two-electron integrals.
+
+        This fixed-coordinate adaptation of the single-mode length-gauge
+        Pauli–Fierz Hamiltonian includes the dipole self-energy and omits photon
+        kinetic energy. RI approximates the Coulomb integrals only. See Rokaj
+        et al., J. Phys. B 51, 034005 (2018), doi:10.1088/1361-6455/aa9c99.
+        """
+        if isinstance(self.mol, Mol) or self.gauge not in ("length", "dipole", "dip"):
+            raise ValueError("A fixed photon coordinate requires a GTO molecule and the length gauge.")
+        omega = self.cav.omega
+        prepared = _prepare_cavity_integrals(self.mol, omega, coupling, polarization)
+
+        def at_coordinate(q):
+            return _cavity_at_coordinate(*prepared, omega, coupling, q)
+
+        return at_coordinate
+
     def dressed_states(
         self, q, *, solver, coupling, polarization=(0, 0, 1), nstates=1, weights=None
     ):
@@ -694,15 +711,11 @@ class Polariton(Composite):
             if weights.shape != (nstates,) or not np.all(np.isfinite(weights)):
                 raise ValueError("Supply one finite weight per root.")
 
-        prepared, position, nuclear_dipole = _prepare_cavity_integrals(
-            self.mol, self.cav.omega, coupling, polarization
-        )
+        electronic = self.electronic_hamiltonian(coupling=coupling, polarization=polarization)
         frames, energies, photon_potential = [], [], []
         for point in q:
-            dressed, offset, photon = _cavity_at_coordinate(
-                prepared, position, nuclear_dipole, self.cav.omega, coupling, point
-            )
-            mf = dressed.RHF(verbose=0).run()
+            local = electronic(point)
+            mf = local.RHF(verbose=0).run()
             mc = solver(mf)
             if weights is not None:
                 mc.state_average(weights)
@@ -712,8 +725,8 @@ class Polariton(Composite):
             if not mc.converged or np.size(mc.e_tot) != nstates:
                 raise RuntimeError(f"CASSCF did not converge all {nstates} roots at q={point:g}.")
             frames.append(mc.casci.frame())
-            energies.append(np.ravel(mc.e_tot) + offset)
-            photon_potential.append(photon)
+            energies.append(np.ravel(mc.e_tot) + local.nuclear_dipole_energy)
+            photon_potential.append(local.photon_potential)
 
         overlaps = full(frames, lambda left, right: left.overlap(right), nstates=nstates)
         self.q, self.frames = q, tuple(frames)

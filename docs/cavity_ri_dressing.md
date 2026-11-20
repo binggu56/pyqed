@@ -43,3 +43,16 @@ gradient tolerance of 1e-5. `ldr_inputs.npz` stores physical `Q`, electronic
 energies (nuclear offset included), separate photon potential, and full
 pairwise electronic overlaps in DVR order. Add the photon potential once
 when forming the LDR potential.
+
+For a custom electronic solver, prepare the coordinate-dependent Hamiltonian
+once and evaluate it at the DVR nodes:
+
+```python
+system = Polariton(mol, Cavity(omega))
+electronic = system.electronic_hamiltonian(coupling=lam)
+for q in dvr.x[0]:
+    point = electronic(q)
+    mf = point.RHF(verbose=0).run()
+    # After solving for electronic energies on mf:
+    # potential = ci.e_tot + point.nuclear_dipole_energy + point.photon_potential
+```
